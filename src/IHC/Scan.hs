@@ -34,6 +34,8 @@ module IHC.Scan
       -- * Instance declarations
     , InstanceDecl(..)
     , scanInstanceDecls
+      -- * Phase 3.2 + 3.4: type family / type instance skip helper
+    , skipTypeDecl
     ) where
 
 import Data.ByteString (ByteString)
@@ -104,6 +106,10 @@ scanAllTopLevelNames src = go [] startCursor
                     curSkipped <- skipThroughBinding src name cur'
                     let acc' = if name `elem` acc then acc else name : acc
                     go acc' curSkipped
+            -- Phase 3.2 + 3.4: explicitly skip top-level type / type family /
+            -- type instance declarations (DataKinds + TypeFamilies). These are
+            -- not value bindings and must not be reported as names.
+            TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
 
 -- | Skip through all consecutive clauses of the given binding name so
@@ -154,6 +160,9 @@ findBinding src ref target = do
             TkIdent name
                 | tkCol tok == 1 -> handleTopIdent acc name tok cur'
                 | otherwise      -> go acc cur'
+            -- Phase 3.2 + 3.4: explicitly skip type family / type instance /
+            -- type synonym declarations so they are never mistaken for bindings.
+            TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
 
     -- We saw `name` at column 1. Scan through its params+rhs to find
@@ -302,6 +311,35 @@ findBodyEnd s = scanBody
         Just _    -> lastNl        -- col-1 content: body ends at last newline.
 
 --------------------------------------------------------------------------------
+-- Phase 3.2 + 3.4: type family / type instance skip helper
+--------------------------------------------------------------------------------
+
+-- | Skip an entire top-level @type@ declaration (synonym, family, or
+-- instance) after the @type@ keyword has already been consumed. The
+-- cursor is positioned just after @type@.
+--
+-- This covers:
+--
+--   * @type Foo = Bar@                  — plain synonym
+--   * @type family Elem c :: Type@      — open type family
+--   * @type instance Elem [a] = a@      — type instance
+--   * @type family Foo x where@         — closed type family with equations
+--
+-- For a closed family, all the indented @where@-equations are consumed
+-- so the scanner doesn't accidentally process them as value bindings.
+-- We rely on 'findBodyEnd' to skip the whole indented block in one shot.
+skipTypeDecl :: Source -> Cursor -> Cursor
+skipTypeDecl src cur0 =
+    -- Find the first column-1 non-blank, non-newline token (= end of decl).
+    -- 'findBodyEnd' uses the same "indented continuation" heuristic as the
+    -- binding-body scanner.  We start from cur0 (just after 'type') and
+    -- let findBodyEnd run from there.  The result is the byte offset of the
+    -- last newline before the next top-level declaration; we wrap it in a
+    -- Cursor with dummy line/col (the scanner only uses cPos).
+    let bodyEnd = findBodyEnd src (cPos cur0)
+    in Cursor bodyEnd 0 1
+
+--------------------------------------------------------------------------------
 -- Data declarations
 --------------------------------------------------------------------------------
 
@@ -338,6 +376,12 @@ scanDataDecls src = go Map.empty Map.empty startCursor
             TkData | tkCol tok == 1 -> do
                 ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
                 go dReg' fReg' curAfter
+            -- Phase 3.2 + 3.4: skip top-level type / type family / type instance
+            -- declarations. These are discarded (no reduction needed for our
+            -- interpreter). The skipTypeDecl helper advances past the entire
+            -- declaration body including any 'where' equations.
+            TkTypeKw | tkCol tok == 1 ->
+                go dReg fReg (skipTypeDecl src cur')
             _ -> go dReg fReg cur'
 
     -- Parse: (TkConId tyvar*) '=' ctor ('|' ctor)*  until the decl ends.
@@ -730,6 +774,14 @@ scanInstanceDecls src = go [] startCursor
                         let lhs  = BindingLhs (reverse moreClauses)
                             acc' = Map.insert name lhs acc
                         scanMethods acc' curFinal
+            -- Phase 3.2: skip associated-type declarations inside instance bodies.
+            -- 'type Elem [] = ()' appears inside 'instance C T where' blocks.
+            -- We use findLineEnd to skip only the current line so we don't
+            -- accidentally consume sibling method bindings at the same indent.
+            TkTypeKw | tkCol tok > 1 ->
+                let lineEnd = findLineEnd src (cPos cur')
+                    curNext = Cursor lineEnd 0 (tkCol tok)
+                in scanMethods acc curNext
             -- Stop when we hit a new column-1 token (next top-level decl).
             _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (Map.toList acc)
               | otherwise -> scanMethods acc cur'

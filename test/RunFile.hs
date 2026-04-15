@@ -55,6 +55,10 @@ captureStdout action = do
     removeFile path
     pure (r, out)
 
+isSubstring :: String -> String -> Bool
+isSubstring needle haystack =
+    any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
+
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "runs `main = 42`" do
@@ -743,3 +747,41 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 let msg = displayException err
                 msg `shouldSatisfy` (":2:" `isInfixOf`)
                 msg `shouldSatisfy` ("parse error at" `isInfixOf`)
+
+    --------------------------------------------------------------------
+    -- Phase 3.2 + 3.4: type families + DataKinds (parse-discard)
+    --------------------------------------------------------------------
+    it "type family: open type family + type instance declarations are parsed and discarded" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/type_family_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "123\n"
+
+    it "type family: closed type family with where-block is parsed and discarded" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/type_family_closed.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "type family: associated type in class + instance is parsed and discarded" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/associated_type.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    it "DataKinds: kind signatures (:: *) in type sigs are parsed and discarded" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/datakinds_kind_sig.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "5\n"
+
+    it "DataKinds: promoted constructor tick ('Nothing) in type sig is discarded" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/promoted_nothing.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n"
+
+    it "IHP patterns: ModelSupport-style type families parse cleanly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/ihp_patterns.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, IHP!\n"
+
+    it "IHP integration: full ModelSupport.Types-style file with all type-family patterns" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/ihp_integration.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "IHP integration OK\n42\n"
