@@ -31,11 +31,14 @@ library
         IHC
       , IHC.CodeBuffer
       , IHC.Driver
+      , IHC.Emit
       , IHC.Encode
+      , IHC.IR
       , IHC.Jit
       , IHC.Lexer
       , IHC.Parser
       , IHC.Scan
+      , IHC.Scheduler
       , IHC.Source
     build-depends:
         base             >= 4.19 && < 5

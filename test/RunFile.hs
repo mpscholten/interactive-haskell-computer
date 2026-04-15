@@ -32,3 +32,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "evaluates `100 - 10 - 5` → 85 (- is left-associative)" do
         n <- runFile "test/Fixtures/arith_assoc.hs"
         n `shouldBe` 85
+
+    it "resolves cross-binding references: `main = a + b` → 42" do
+        n <- runFile "test/Fixtures/cross.hs"
+        n `shouldBe` 42
+
+    it "resolves a 3-deep chain of bindings: main -> a -> b -> c = 41" do
+        n <- runFile "test/Fixtures/chain.hs"
+        n `shouldBe` 41
+
+    it "ignores bindings not reachable from main (demand-driven)" do
+        n <- runFile "test/Fixtures/cross_with_noise.hs"
+        n `shouldBe` 99

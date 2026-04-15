@@ -14,6 +14,12 @@ module IHC.Encode
       -- * Stack push/pop (single 64-bit register)
     , pushX0
     , popX1
+      -- * Function prologue / epilogue
+    , pushFpLr
+    , popFpLr
+    , movFpSp
+      -- * Indirect call
+    , blrX16
       -- * Composed: materialize a signed 64-bit into a register
     , loadInt64
     ) where
@@ -79,6 +85,22 @@ pushX0 = 0xF81F0FE0
 -- | @LDR X1, [SP], #16@ — post-index load, increments SP by 16.
 popX1 :: Word32
 popX1 = 0xF84107E1
+
+-- | @STP X29, X30, [SP, #-16]!@ — push FP+LR pair, decrement SP by 16.
+pushFpLr :: Word32
+pushFpLr = 0xA9BF7BFD
+
+-- | @LDP X29, X30, [SP], #16@ — pop FP+LR pair, increment SP by 16.
+popFpLr :: Word32
+popFpLr = 0xA8C17BFD
+
+-- | @MOV X29, SP@ — alias for @ADD X29, SP, #0@.
+movFpSp :: Word32
+movFpSp = 0x910003FD
+
+-- | @BLR X16@ — branch with link through register x16 (scratch).
+blrX16 :: Word32
+blrX16 = 0xD63F0200
 
 -- | Materialize a 64-bit integer into register @Xrd@, using up to four
 -- MOVZ/MOVK instructions (covers the full 64-bit range). For small

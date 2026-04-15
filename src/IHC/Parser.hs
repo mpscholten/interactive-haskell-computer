@@ -2,32 +2,29 @@
 
 -- | Single-pass recursive-descent parser for binding bodies.
 --
--- Does not build an AST. As it parses tokens, it calls into the
--- 'CodeBuffer' to emit aarch64 instructions directly. Each subexpression
--- leaves its value in @x0@; binary operators push the left operand to
--- the stack, evaluate the right, then pop and combine.
+-- Parses the body's bytes once, producing a small 'Item' list. No AST;
+-- items map 1:1 to tiny instruction groups that the emitter later
+-- expands into aarch64. This decoupling from the code buffer is what
+-- lets the scheduler safely recur into dependency compilation without
+-- scrambling bump-pointer layout.
 --
--- Grammar (Phase 1.1):
+-- Grammar (Phase 1.2):
 --
 -- @
 -- body  ::= expr
--- expr  ::= term (('+' | '-') term)*      -- left-associative
--- term  ::= atom ('*' atom)*              -- left-associative, tighter
+-- expr  ::= term (('+' | '-') term)*       -- left-associative
+-- term  ::= atom ('*' atom)*               -- left-associative, tighter
 -- atom  ::= INT
+--         | ident                           -- refers to another binding
 -- @
---
--- Adding new forms (function application, class methods, TH, \...) is a
--- matter of extending 'parseAtom' with new branches that emit more
--- instructions.
 module IHC.Parser
-    ( parseBody
+    ( parseBodyItems
     , ParseError(..)
     ) where
 
 import Control.Exception (Exception, throwIO)
 
-import IHC.CodeBuffer
-import IHC.Encode
+import IHC.IR
 import IHC.Lexer
 import IHC.Source
 
@@ -35,68 +32,55 @@ newtype ParseError = ParseError String
     deriving stock (Show)
     deriving anyclass (Exception)
 
--- | Parse the body of a top-level binding whose text spans the given
--- byte range, emitting the corresponding aarch64 code into @cb@.
---
--- The caller is responsible for positioning the 'CodeBuffer' where the
--- entry point should land and for being inside a 'withWritable'
--- bracket.
-parseBody :: Source -> Span -> CodeBuffer -> IO ()
-parseBody src (start, _end) cb = do
+-- | Parse a binding body's span, returning its 'Item' list.
+parseBodyItems :: Source -> Span -> IO [Item]
+parseBodyItems src (start, _end) = do
     let cur0 = Cursor start 1 1
-    _ <- parseExpr src cur0 cb
-    emitInsn cb retX30
+    (items, _cur1) <- parseExpr src cur0 []
+    pure (reverse items)
 
--- | Parse and emit code for an expression; returns the cursor positioned
--- at (or past) the first token that wasn't part of the expression.
-parseExpr :: Source -> Cursor -> CodeBuffer -> IO Cursor
-parseExpr src cur0 cb = do
-    cur1 <- parseTerm src cur0 cb
-    loop cur1
+-- | Parse an expression. Items are accumulated in reverse for O(1)
+-- prepends; the caller reverses once at the top.
+parseExpr :: Source -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseExpr src cur0 acc0 = do
+    (acc1, cur1) <- parseTerm src cur0 acc0
+    loop acc1 cur1
   where
-    loop cur =
+    loop acc cur =
         let (tok, curN) = nextToken src cur in
         case tkKind tok of
             TkPlus -> do
-                emitInsn cb pushX0                -- save left
-                cur2 <- parseTerm src curN cb     -- right → x0
-                emitInsn cb popX1                 -- left → x1
-                emitInsn cb (addXXX 0 1 0)        -- x0 = x1 + x0
-                loop cur2
+                (acc', cur') <- parseTerm src curN (IPushX0 : acc)
+                loop (IAddX1X0 : IPopX1 : acc') cur'
             TkMinus -> do
-                emitInsn cb pushX0
-                cur2 <- parseTerm src curN cb
-                emitInsn cb popX1
-                emitInsn cb (subXXX 0 1 0)        -- x0 = x1 - x0
-                loop cur2
-            _ -> pure cur                          -- leave tok unconsumed
+                (acc', cur') <- parseTerm src curN (IPushX0 : acc)
+                loop (ISubX1X0 : IPopX1 : acc') cur'
+            _ -> pure (acc, cur)
 
-parseTerm :: Source -> Cursor -> CodeBuffer -> IO Cursor
-parseTerm src cur0 cb = do
-    cur1 <- parseAtom src cur0 cb
-    loop cur1
+parseTerm :: Source -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseTerm src cur0 acc0 = do
+    (acc1, cur1) <- parseAtom src cur0 acc0
+    loop acc1 cur1
   where
-    loop cur =
+    loop acc cur =
         let (tok, curN) = nextToken src cur in
         case tkKind tok of
             TkStar -> do
-                emitInsn cb pushX0
-                cur2 <- parseAtom src curN cb
-                emitInsn cb popX1
-                emitInsn cb (mulXXX 0 1 0)        -- x0 = x1 * x0
-                loop cur2
-            _ -> pure cur
+                (acc', cur') <- parseAtom src curN (IPushX0 : acc)
+                loop (IMulX1X0 : IPopX1 : acc') cur'
+            _ -> pure (acc, cur)
 
-parseAtom :: Source -> Cursor -> CodeBuffer -> IO Cursor
-parseAtom src cur0 cb = do
+parseAtom :: Source -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseAtom src cur0 acc0 = do
     let (tok, cur1) = nextToken src cur0
     case tkKind tok of
-        TkInt n -> do
-            emitInsns cb (loadInt64 0 (fromInteger n))
-            pure cur1
+        TkInt n ->
+            pure (ILitInt (fromInteger n) : acc0, cur1)
+        TkIdent name ->
+            pure (ICall name : acc0, cur1)
         TkEof ->
             throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
         other ->
-            throwIO (ParseError ("expected Int literal at offset "
+            throwIO (ParseError ("expected Int literal or identifier at offset "
                                  <> show (tkStart tok)
                                  <> " but saw " <> show other))

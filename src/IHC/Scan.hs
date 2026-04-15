@@ -18,12 +18,14 @@ module IHC.Scan
     , SymbolInfo(..)
     , findBinding
     , lookupSymbol
+    , markCompiled
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
+import Foreign.Ptr (Ptr)
 
 import IHC.Lexer
 import IHC.Source
@@ -31,7 +33,7 @@ import IHC.Source
 -- | What we know about a top-level name.
 data SymbolInfo
     = SpanOnly !Span           -- ^ we've skimmed past it; body lives in this span
-    | Compiled !Int            -- ^ already JITted; this is the code-pointer addr
+    | Compiled !(Ptr ())       -- ^ already JITted; this is the entry pointer
     deriving (Eq, Show)
 
 -- | Shared mutable table. IORef for Phase 1.0; a concurrent map in Phase 6.
@@ -45,6 +47,10 @@ lookupSymbol ref name = do
     (m, _) <- readIORef ref
     pure (Map.lookup name m)
 
+markCompiled :: KnownSymbols -> ByteString -> Ptr () -> IO ()
+markCompiled ref name ptr =
+    modifyIORef' ref (\(m, c) -> (Map.insert name (Compiled ptr) m, c))
+
 -- | Advance the lexer looking for a top-level binding named @target@.
 -- Every other top-level binding we pass along the way is registered as
 -- 'SpanOnly'. Returns 'Just' with the body span once found.
@@ -57,7 +63,7 @@ findBinding src ref target = do
     existing <- lookupSymbol ref target
     case existing of
         Just (SpanOnly s) -> pure (Just s)
-        Just (Compiled _) -> pure Nothing  -- (phase 1.0: shouldn't happen for target)
+        Just (Compiled _) -> pure Nothing  -- caller should use requireCode instead
         Nothing -> do
             (m0, c0) <- readIORef ref
             go m0 c0
