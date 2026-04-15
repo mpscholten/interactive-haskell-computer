@@ -50,6 +50,7 @@ data TokenKind
                               --   basic \\n \\t \\\\ \\\" escapes)
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
+    | TkPlusPlus              -- ^ @++@ (string / list concat)
     | TkMinus                 -- ^ @-@ (only when not followed by another '-')
     | TkStar                  -- ^ @*@
     | TkLParen                -- ^ @(@
@@ -133,6 +134,8 @@ nextToken s c0 =
                                -> let c' = step (step c) in (mkTok TkAnd  c c', c')  -- '&&'
             | b == 0x7C, Just 0x7C <- peekByte s (cPos c + 1)
                                -> let c' = step (step c) in (mkTok TkOr   c c', c')  -- '||'
+            | b == 0x2B, Just 0x2B <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkPlusPlus c c', c') -- '++'
             | b == 0x3D        -> (mkTok TkEq     c (step c), step c)  -- '='
             | b == 0x2B        -> (mkTok TkPlus   c (step c), step c)  -- '+'
             | b == 0x2A        -> (mkTok TkStar   c (step c), step c)  -- '*'

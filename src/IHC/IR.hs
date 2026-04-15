@@ -70,14 +70,16 @@ sizeOfItems :: [Item] -> Int
 sizeOfItems = sum . map sizeOfItem
 
 -- | Frame size in bytes for @arity@ arguments. Aligned to 16.
+-- Layout: [saved fp, saved lr, arg0, arg1, arg2, arg3, padding...].
 frameSize :: Int -> Int
 frameSize arity
     | arity == 0 = 16          -- just fp + lr
-    | arity <= 2 = 32          -- fp + lr + 2 arg slots (1 may be padding)
-    | otherwise  = error ("IHC.IR.frameSize: arity > 2 not supported yet: "
+    | arity <= 2 = 32          -- fp + lr + 2 arg slots
+    | arity <= 4 = 48          -- fp + lr + 4 arg slots
+    | otherwise  = error ("IHC.IR.frameSize: arity > 4 not supported yet: "
                           <> show arity)
 
--- | Prologue: stp + mov, plus one str per argument.
+-- | Prologue: stp + mov, plus one @str@ per argument.
 prologueBytes :: [ByteString] -> Int
 prologueBytes params = 8 + 4 * length params
 

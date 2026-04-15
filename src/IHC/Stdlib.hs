@@ -22,7 +22,7 @@ module IHC.Stdlib
     ) where
 
 import Data.ByteString (ByteString)
-import Foreign.C.String (CString, peekCString)
+import Foreign.C.String (CString, newCAString, peekCString)
 import Foreign.Ptr (Ptr, FunPtr, castFunPtrToPtr)
 import System.IO (hFlush, stdout)
 
@@ -61,6 +61,25 @@ ihcMin = min
 ihcMax :: Int -> Int -> Int
 ihcMax = max
 
+-- | @show :: Int -> String@ — monomorphised to Int. Returns a fresh
+-- C-allocated NUL-terminated string. The host process exits shortly
+-- after a JIT run, so leaking is acceptable.
+ihcShowInt :: Int -> IO CString
+ihcShowInt n = newCAString (show n)
+
+-- | @(++) :: String -> String -> String@ on C strings. Allocates a
+-- new buffer holding the concatenation.
+ihcConcat :: CString -> CString -> IO CString
+ihcConcat a b = do
+    sa <- peekCString a
+    sb <- peekCString b
+    newCAString (sa ++ sb)
+
+-- | @getLine :: IO String@ — read a line from stdin, return as fresh
+-- C-allocated string (without the trailing newline).
+ihcGetLine :: IO CString
+ihcGetLine = getLine >>= newCAString
+
 --------------------------------------------------------------------------------
 -- Foreign exports + re-imports (to take their address)
 --------------------------------------------------------------------------------
@@ -97,6 +116,18 @@ foreign export ccall "ihc_max" ihcMax :: Int -> Int -> Int
 foreign import ccall unsafe "&ihc_max"
     p_ihcMax :: FunPtr (Int -> Int -> Int)
 
+foreign export ccall "ihc_showInt" ihcShowInt :: Int -> IO CString
+foreign import ccall unsafe "&ihc_showInt"
+    p_ihcShowInt :: FunPtr (Int -> IO CString)
+
+foreign export ccall "ihc_concat" ihcConcat :: CString -> CString -> IO CString
+foreign import ccall unsafe "&ihc_concat"
+    p_ihcConcat :: FunPtr (CString -> CString -> IO CString)
+
+foreign export ccall "ihc_getLine" ihcGetLine :: IO CString
+foreign import ccall unsafe "&ihc_getLine"
+    p_ihcGetLine :: FunPtr (IO CString)
+
 --------------------------------------------------------------------------------
 -- Registry: name -> (entry ptr, arity)
 --------------------------------------------------------------------------------
@@ -119,4 +150,9 @@ builtins =
     , ("abs",      Builtin (castFunPtrToPtr p_ihcAbs)      1)
     , ("min",      Builtin (castFunPtrToPtr p_ihcMin)      2)
     , ("max",      Builtin (castFunPtrToPtr p_ihcMax)      2)
+    , ("show",     Builtin (castFunPtrToPtr p_ihcShowInt)  1)
+    , ("getLine",  Builtin (castFunPtrToPtr p_ihcGetLine)  0)
+      -- (++) is bound at the operator level via a synthetic ICall
+      -- with this name; see IHC.Parser.parseSum.
+    , ("##concat", Builtin (castFunPtrToPtr p_ihcConcat)   2)
     ]

@@ -193,6 +193,13 @@ parseSum src params resolve cur0 acc0 = do
             TkMinus -> do
                 (acc', cur') <- parseTerm src params resolve curN (IPushX0 : acc)
                 loop (ISubX1X0 : IPopX1 : acc') cur'
+            TkPlusPlus -> do
+                -- `a ++ b` desugars into ICall "##concat" 2 with both
+                -- operands pushed left-to-right (matches our normal
+                -- 2-arg call convention so the same pop+blr emit path
+                -- runs).
+                (acc', cur') <- parseTerm src params resolve curN (IPushX0 : acc)
+                loop (ICall "##concat" 2 : IPushX0 : acc') cur'
             _ -> pure (acc, cur)
 
 parseTerm :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)

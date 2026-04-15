@@ -18,11 +18,14 @@ module IHC.Encode
     , pushFpLr
     , popFpLr
     , movFpSp
-      -- * Function prologue / epilogue (32-byte frame — includes arg slot)
+      -- * Function prologue / epilogue (32-byte frame — 1-2 arg slots)
     , pushFpLr32
     , popFpLr32
     , strX0ArgSlot
     , ldrX0ArgSlot
+      -- * Function prologue / epilogue (48-byte frame — 3-4 arg slots)
+    , pushFpLr48
+    , popFpLr48
       -- * Generic stack/frame memory ops for multi-arg functions
     , strXnToSp
     , ldrXnFromSp
@@ -153,6 +156,15 @@ strX0ArgSlot = 0xF9000BE0
 -- (e.g. via pushX0 spills during expression evaluation).
 ldrX0ArgSlot :: Word32
 ldrX0ArgSlot = 0xF9400BA0
+
+-- | @STP X29, X30, [SP, #-48]!@ — push FP+LR, allocate 48-byte frame.
+-- Layout: [fp+0..8]=saved fp, [fp+8..16]=saved lr, [fp+16..40]=4 arg slots.
+pushFpLr48 :: Word32
+pushFpLr48 = 0xA9BD7BFD
+
+-- | @LDP X29, X30, [SP], #48@ — pop FP+LR, deallocate 48-byte frame.
+popFpLr48 :: Word32
+popFpLr48 = 0xA8C37BFD
 
 -- | @CMP X1, X0@ — alias for @SUBS XZR, X1, X0@; sets NZCV.
 --

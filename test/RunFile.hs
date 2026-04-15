@@ -183,3 +183,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             \is 100 prime?\n\
             \0\n\
             \done.\n"
+
+    it "show + (++) + putStrLn produce composed messages" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/strings.hs")
+        n   `shouldBe` 0
+        out `shouldBe`
+            "Hello, world! The answer is 42\n\
+            \fib 10 = 55\n"
+
+    it "3- and 4-argument functions: fma 3 4 5 = 17, ws 10 20 30 40 = 300" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/three_args.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "17\n10\n300\n"

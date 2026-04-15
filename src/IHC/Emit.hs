@@ -37,16 +37,21 @@ emitPrologue cb arity
     | arity <= 2 = do
         emitInsn cb pushFpLr32       -- 32-byte frame
         emitInsn cb movFpSp
-        -- Save x0..x(arity-1) into frame arg slots at [sp, #16], [sp, #24].
+        mapM_ (\i -> emitInsn cb (strXnToSp i (16 + 8 * i))) [0 .. arity - 1]
+    | arity <= 4 = do
+        emitInsn cb pushFpLr48       -- 48-byte frame
+        emitInsn cb movFpSp
         mapM_ (\i -> emitInsn cb (strXnToSp i (16 + 8 * i))) [0 .. arity - 1]
     | otherwise =
-        error ("IHC.Emit.emitPrologue: arity > 2 not supported yet: " <> show arity)
+        error ("IHC.Emit.emitPrologue: arity > 4 not supported yet: " <> show arity)
 
 emitEpilogue :: CodeBuffer -> Int -> IO ()
 emitEpilogue cb arity = do
-    if arity == 0
-        then emitInsn cb popFpLr
-        else emitInsn cb popFpLr32
+    case arity of
+        0                 -> emitInsn cb popFpLr
+        n | n <= 2        -> emitInsn cb popFpLr32
+          | n <= 4        -> emitInsn cb popFpLr48
+          | otherwise     -> error ("IHC.Emit.emitEpilogue: arity > 4 not supported yet: " <> show n)
     emitInsn cb retX30
 
 emitItem :: CodeBuffer -> Map ByteString (Ptr ()) -> Map ByteString CString -> Item -> IO ()
