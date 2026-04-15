@@ -69,6 +69,8 @@ data TokenKind
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
     | TkSemi                  -- ^ @;@
+    | TkDColon                -- ^ @::@ (type-signature separator)
+    | TkArrow                 -- ^ @->@ (type-arrow; also lambda body)
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -115,6 +117,10 @@ nextToken s c0 =
             | isUpperStart b   -> lexIdent True  c
             -- Two-char operators MUST be tested before their single-char
             -- subset (e.g. '==' before '=', '<=' before '<').
+            | b == 0x3A, Just 0x3A <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkDColon c c', c') -- '::'
+            | b == 0x2D, Just 0x3E <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkArrow  c c', c') -- '->'
             | b == 0x3D, Just 0x3D <- peekByte s (cPos c + 1)
                                -> let c' = step (step c) in (mkTok TkEqEq c c', c')  -- '=='
             | b == 0x3C, Just 0x3D <- peekByte s (cPos c + 1)

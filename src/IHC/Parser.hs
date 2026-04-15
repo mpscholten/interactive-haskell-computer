@@ -75,24 +75,46 @@ parseExpr src params resolve cur0 acc0 = do
         TkDo -> parseDo     src params resolve cur1 acc0
         _    -> parseOr     src params resolve cur0 acc0
 
--- @do { stmt ; stmt ; ... ; stmt }@. Each stmt is a full expression;
--- intermediate results overwrite x0 (the @>>@ semantics for actions
--- whose result type is the unit-like 0). The block's value is the
--- last stmt's value.
+-- @do { stmt ; ... ; stmt }@ (explicit braces) or layout form
+--
+-- @
+-- do
+--     stmt1
+--     stmt2
+--     stmt3
+-- @
+--
+-- Each stmt's items emit in source order; intermediate results
+-- overwrite x0 (the @>>@ semantics for IO () actions). The block's
+-- value is the last stmt's value.
 parseDo :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseDo src params resolve cur0 acc0 = do
-    let (lb, curB) = nextSig src cur0
-    case tkKind lb of
-        TkLBrace -> stmts curB acc0
-        _        -> parseErr "expected `{` after `do`" lb
+    let (firstTok, curAfter) = nextSig src cur0
+    case tkKind firstTok of
+        TkLBrace -> bracedStmts curAfter acc0
+        TkEof    -> pure (acc0, cur0)
+        _        -> layoutStmts (tkCol firstTok) cur0 acc0
   where
-    stmts cur acc = do
+    -- Explicit braces: stmts separated by `;`, terminated by `}`.
+    bracedStmts cur acc = do
         (acc', cur')  <- parseExpr src params resolve cur acc
         let (sep, curN) = nextSig src cur'
         case tkKind sep of
-            TkSemi   -> stmts curN acc'
+            TkSemi   -> bracedStmts curN acc'
             TkRBrace -> pure (acc', curN)
             _        -> parseErr "expected `;` or `}` in do-block" sep
+
+    -- Layout form: each stmt begins at exactly @stmtCol@; a token at
+    -- a lower column ends the block. The expression parser already
+    -- returns its cursor before unrecognised tokens, so we just
+    -- check the next sig token's column to decide whether to loop.
+    layoutStmts stmtCol cur acc = do
+        (acc', cur') <- parseExpr src params resolve cur acc
+        let (nextTok, _) = nextSig src cur'
+        case tkKind nextTok of
+            TkEof -> pure (acc', cur')
+            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' acc'
+              | otherwise                -> pure (acc', cur')
 
 parseIf :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseIf src params resolve cur0 acc0 = do

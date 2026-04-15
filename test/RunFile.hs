@@ -158,3 +158,28 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/do_with_recursion.hs")
         n   `shouldBe` 0
         out `shouldBe` "Computing fibonacci numbers:\n5\n55\n610\n"
+
+    it "skips type signatures (parsed harmlessly): `fact 6` -> 720" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/typesig.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "720\n"
+
+    it "layout-aware do-block (no explicit braces)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/do_layout.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Layout works!\n42\nAll three lines run.\n"
+
+    it "real-style Haskell program (sigs, layout do, recursion, builtins)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/realprogram.hs")
+        n   `shouldBe` 0
+        out `shouldBe`
+            "=== math demo ===\n\
+            \fact 10 =\n\
+            \3628800\n\
+            \fib 20 =\n\
+            \6765\n\
+            \is 97 prime?\n\
+            \1\n\
+            \is 100 prime?\n\
+            \0\n\
+            \done.\n"
