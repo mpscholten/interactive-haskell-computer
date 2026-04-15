@@ -82,20 +82,23 @@ findBinding src ref target = do
             _ -> go acc cur'
 
     handleTopIdent acc name startTok cur = do
-        -- Read up to one optional parameter ident, then expect '='.
-        let (t1, cur1) = nextToken src cur
-        case tkKind t1 of
-            TkIdent pname -> do
-                let (t2, cur2) = nextToken src cur1
-                case tkKind t2 of
-                    TkEq  -> finish acc name [pname] cur2 startTok
-                    _     -> skipBadBinding acc startTok cur
-            TkEq -> finish acc name [] cur1 startTok
+        -- Read zero or more parameter idents, then expect '='.
+        (params, curAfter) <- collectParams [] cur
+        let (t, curN) = nextToken src curAfter
+        case tkKind t of
+            TkEq -> finish acc name params curN startTok
             _    -> skipBadBinding acc startTok cur
+
+    collectParams :: [ByteString] -> Cursor -> IO ([ByteString], Cursor)
+    collectParams acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkIdent p -> collectParams (p : acc) cur'
+            _         -> pure (reverse acc, cur)
 
     finish acc name params cur startTok = do
         let bodyStart = cPos (skipTrivia src cur)
-            bodyEnd   = findLineEnd src bodyStart
+            bodyEnd   = findBodyEnd src bodyStart
             lhs       = BindingLhs params (bodyStart, bodyEnd)
             acc'      = Map.insert name (SpanOnly lhs) acc
             curAfter  = Cursor bodyEnd (tkLine startTok) 1
@@ -110,9 +113,34 @@ findBinding src ref target = do
             cur'   = Cursor eolPos (tkLine startTok) 1
         in go acc cur'
 
+-- | Scan until the end of the current line (or EOF). Used only for
+-- recovering after a malformed LHS; the real body-extent logic is
+-- 'findBodyEnd'.
 findLineEnd :: Source -> Pos -> Pos
 findLineEnd s p = case peekByte s p of
     Nothing   -> p
     Just 0x0A -> p
     Just 0x0D -> p
     Just _    -> findLineEnd s (p + 1)
+
+-- | A body extends until either EOF or the next column-1 non-whitespace
+-- byte (the start of the next top-level binding). Indented continuation
+-- lines and blank lines are part of the body.
+findBodyEnd :: Source -> Pos -> Pos
+findBodyEnd s = scanBody
+  where
+    -- Keep scanning bytes; at each newline, decide whether the body
+    -- continues (next line is indented or blank) or ends.
+    scanBody p = case peekByte s p of
+        Nothing   -> p
+        Just 0x0A -> checkNext (p + 1) p
+        Just 0x0D -> checkNext (p + 1) p
+        Just _    -> scanBody (p + 1)
+
+    checkNext q lastNl = case peekByte s q of
+        Nothing   -> lastNl        -- EOF terminates body.
+        Just 0x20 -> scanBody q    -- space: indented continuation, keep going.
+        Just 0x09 -> scanBody q    -- tab: same.
+        Just 0x0A -> checkNext (q + 1) q   -- blank line, check after.
+        Just 0x0D -> checkNext (q + 1) q
+        Just _    -> lastNl        -- col-1 content: body ends at last newline.

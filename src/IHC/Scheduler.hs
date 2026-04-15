@@ -94,10 +94,24 @@ discover s name = do
                 Nothing -> error ("IHC.Scheduler.discover: no binding `"
                                   <> BC.unpack name <> "`")
                 Just lhs -> do
-                    items <- Parser.parseBodyItems (schedSrc s) (lhsParams lhs) (lhsBody lhs)
+                    items <- Parser.parseBodyItems
+                                (schedSrc s)
+                                (lhsParams lhs)
+                                (arityResolver s)
+                                (lhsBody lhs)
                     let b = Binding (lhsParams lhs) items
                     modifyIORef' (schedBodies s) (Map.insert name b)
                     mapM_ (discover s) (callees items)
+
+-- | Arity resolver used by the parser: look up (or lazily discover)
+-- a referenced binding's LHS and report its param count.
+arityResolver :: Scheduler -> ByteString -> IO Int
+arityResolver s name = do
+    mLhs <- findOrResolveLhs s name
+    case mLhs of
+        Just lhs -> pure (length (lhsParams lhs))
+        Nothing  -> error ("IHC.Scheduler.arityResolver: unknown binding `"
+                           <> BC.unpack name <> "`")
 
 findOrResolveLhs :: Scheduler -> ByteString -> IO (Maybe BindingLhs)
 findOrResolveLhs s name = do
@@ -110,9 +124,10 @@ findOrResolveLhs s name = do
 callees :: [Item] -> [ByteString]
 callees = concatMap toCall
   where
-    toCall (ICall  n) = [n]
-    toCall (ICall1 n) = [n]
-    toCall _          = []
+    toCall (ICall n _)  = [n]
+    toCall (IIfThenElse c t e) =
+        concatMap toCall c ++ concatMap toCall t ++ concatMap toCall e
+    toCall _            = []
 
 -- | Dump the code buffer as hex groups of 4 bytes per line. Prints
 -- "name:" at entries that match an address.

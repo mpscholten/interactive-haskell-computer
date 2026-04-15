@@ -76,3 +76,23 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "self-recursion with two recursive calls: fib 10 → 55" do
         n <- runFile "test/Fixtures/fib.hs"
         n `shouldBe` 55
+
+    it "parses multi-line if-then-else" do
+        n <- runFile "test/Fixtures/multiline_if.hs"
+        n `shouldBe` 100
+
+    it "parses multi-line recursive body (fact 6)" do
+        n <- runFile "test/Fixtures/multiline_fact.hs"
+        n `shouldBe` 720
+
+    it "2-arg function: `add2 3 4` → 7" do
+        n <- runFile "test/Fixtures/fn_add2.hs"
+        n `shouldBe` 7
+
+    it "2-arg recursion: sumTo 1 10 → 55" do
+        n <- runFile "test/Fixtures/fn_gcd.hs"
+        n `shouldBe` 55
+
+    it "2-arg with 1-arg args: `mul2 (inc 3) (inc 9)` → 40" do
+        n <- runFile "test/Fixtures/fn_mixed.hs"
+        n `shouldBe` 40

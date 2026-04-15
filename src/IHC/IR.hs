@@ -1,12 +1,6 @@
--- | A tiny per-binding item list used as an ephemeral intermediate
--- between parse and emit.
---
--- This is /not/ a persistent IR — it exists only as long as a single
--- compile session, never serialized, never optimized over. Its purpose
--- is to let us (a) parse each binding in isolation, (b) discover
--- dependencies transitively, (c) lay out all reachable bindings in the
--- code buffer with known addresses, and then (d) emit each binding in
--- one contiguous shot.
+-- | A tiny per-binding item list — an ephemeral intermediate between
+-- parse and emit. Not an IR in the persistent sense; lives only for
+-- one compile session.
 module IHC.IR
     ( Item(..)
     , Binding(..)
@@ -15,6 +9,7 @@ module IHC.IR
     , prologueBytes
     , epilogueBytes
     , bindingBytes
+    , frameSize
     ) where
 
 import Data.ByteString (ByteString)
@@ -23,25 +18,21 @@ import Data.Int (Int64)
 import IHC.Encode (loadInt64)
 
 data Item
-    = IPushX0                 -- spill accumulator to stack
-    | IPopX1                  -- pop previous accumulator into x1
-    | ILitInt   !Int64        -- materialize literal into x0
-    | IAddX1X0                -- x0 = x1 + x0
-    | ISubX1X0                -- x0 = x1 - x0
-    | IMulX1X0                -- x0 = x1 * x0
-    | ICmpLe                  -- x0 = (x1 <= x0) ? 1 : 0 (cmp + cset)
-    | IArg                    -- load the first argument from arg-slot into x0
-    | ICall     !ByteString   -- call nullary binding, result in x0
-    | ICall1    !ByteString   -- call 1-arg binding with arg in x0, result in x0
+    = IPushX0                       -- spill accumulator to stack
+    | IPopX1                        -- pop previous accumulator into x1
+    | ILitInt   !Int64              -- materialize literal into x0
+    | IAddX1X0                      -- x0 = x1 + x0
+    | ISubX1X0                      -- x0 = x1 - x0
+    | IMulX1X0                      -- x0 = x1 * x0
+    | ICmpLe                        -- x0 = (x1 <= x0) ? 1 : 0 (cmp + cset)
+    | IArg      !Int                -- load nth parameter (0-indexed) into x0
+    | ICall     !ByteString !Int    -- call; arity=N means pop N values from
+                                    --   stack into x0..x(N-1), then blr
     | IIfThenElse [Item] [Item] [Item]
-                              -- ^ cond; then-branch; else-branch. Emits
-                              --   cond items, CBZ over then, then items,
-                              --   B over else, else items.
     deriving (Eq, Show)
 
--- | A discovered + parsed top-level binding.
 data Binding = Binding
-    { bindParams :: ![ByteString]  -- ^ zero or one in Phase 1.3
+    { bindParams :: ![ByteString]
     , bindItems  :: ![Item]
     } deriving (Eq, Show)
 
@@ -54,29 +45,36 @@ sizeOfItem = \case
     ISubX1X0      -> 4
     IMulX1X0      -> 4
     ICmpLe        -> 8                      -- cmp + cset
-    IArg          -> 4
-    ICall _       -> 20                     -- 4 movz/movk + 1 blr
-    ICall1 _      -> 20                     -- same shape
+    IArg _        -> 4
+    ICall _ 0     -> 20                     -- 4 movz/movk + 1 blr
+    ICall _ n     -> 4 * n                  --   n ldrs (one per arg)
+                   + 4                      -- + 1 add sp
+                   + 20                     -- + 4 addr-load + 1 blr
     IIfThenElse c t e ->
         sizeOfItems c
-        + 4                                  -- cbz over then
+        + 4
         + sizeOfItems t
-        + 4                                  -- b over else
+        + 4
         + sizeOfItems e
 
 sizeOfItems :: [Item] -> Int
 sizeOfItems = sum . map sizeOfItem
 
--- | Prologue size depends on arity. Zero-arg uses the 16-byte frame
--- (stp+mov); one-arg uses the 32-byte frame (stp+mov+str).
-prologueBytes :: [ByteString] -> Int
-prologueBytes [] = 8           -- stp + mov
-prologueBytes _  = 12          -- stp + mov + str
+-- | Frame size in bytes for @arity@ arguments. Aligned to 16.
+frameSize :: Int -> Int
+frameSize arity
+    | arity == 0 = 16          -- just fp + lr
+    | arity <= 2 = 32          -- fp + lr + 2 arg slots (1 may be padding)
+    | otherwise  = error ("IHC.IR.frameSize: arity > 2 not supported yet: "
+                          <> show arity)
 
--- | Epilogue size matches the prologue's frame choice.
+-- | Prologue: stp + mov, plus one str per argument.
+prologueBytes :: [ByteString] -> Int
+prologueBytes params = 8 + 4 * length params
+
+-- | Epilogue: ldp (deallocates the whole frame via post-index) + ret.
 epilogueBytes :: [ByteString] -> Int
-epilogueBytes [] = 8           -- ldp + ret
-epilogueBytes _  = 8           -- ldp + ret (ldp's post-index deallocates the whole 32)
+epilogueBytes _ = 8
 
 bindingBytes :: Binding -> Int
 bindingBytes b =

@@ -23,6 +23,11 @@ module IHC.Encode
     , popFpLr32
     , strX0ArgSlot
     , ldrX0ArgSlot
+      -- * Generic stack/frame memory ops for multi-arg functions
+    , strXnToSp
+    , ldrXnFromSp
+    , ldrXnFromFp
+    , addSpImm
       -- * Indirect call
     , blrX16
       -- * Comparison / conditional select
@@ -177,6 +182,40 @@ bOffset :: Int -> Word32
 bOffset offset =
     0x14000000
     .|. (fromIntegral offset .&. 0x3FFFFFF)
+
+-- | @STR Xn, [SP, #byteOff]@ (unsigned offset, @byteOff@ must be a
+-- multiple of 8 and fit in 12 scaled bits = 32760).
+strXnToSp :: Int -> Int -> Word32
+strXnToSp rt byteOff =
+    0xF9000000
+    .|. ((fromIntegral (byteOff `div` 8) .&. 0xFFF) `shiftL` 10)
+    .|. (31 `shiftL` 5)       -- Rn = SP
+    .|. (fromIntegral rt .&. 0x1F)
+
+-- | @LDR Xn, [SP, #byteOff]@ (unsigned offset).
+ldrXnFromSp :: Int -> Int -> Word32
+ldrXnFromSp rt byteOff =
+    0xF9400000
+    .|. ((fromIntegral (byteOff `div` 8) .&. 0xFFF) `shiftL` 10)
+    .|. (31 `shiftL` 5)
+    .|. (fromIntegral rt .&. 0x1F)
+
+-- | @LDR Xn, [X29, #byteOff]@ (FP-relative; useful once SP has moved
+-- during body evaluation).
+ldrXnFromFp :: Int -> Int -> Word32
+ldrXnFromFp rt byteOff =
+    0xF9400000
+    .|. ((fromIntegral (byteOff `div` 8) .&. 0xFFF) `shiftL` 10)
+    .|. (29 `shiftL` 5)       -- Rn = X29 (FP)
+    .|. (fromIntegral rt .&. 0x1F)
+
+-- | @ADD SP, SP, #imm@ (unsigned, 12-bit).
+addSpImm :: Int -> Word32
+addSpImm imm =
+    0x91000000
+    .|. ((fromIntegral imm .&. 0xFFF) `shiftL` 10)
+    .|. (31 `shiftL` 5)       -- Rn = SP
+    .|. 31                    -- Rd = SP
 
 -- | Materialize a 64-bit integer into register @Xrd@, using up to four
 -- MOVZ/MOVK instructions (covers the full 64-bit range). For small
