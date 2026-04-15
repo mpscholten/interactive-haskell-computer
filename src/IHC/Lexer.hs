@@ -111,6 +111,8 @@ data TokenKind
     | TkSpliceLParen          -- ^ @$(@ TH splice open (Phase 2.11)
     | TkPrimId !ByteString    -- ^ @name#@ / @name##@ MagicHash identifier
                               --   (e.g. @I#@, @runRW#@, @newByteArray#@)
+    | TkLabel  !ByteString    -- ^ @#name@ OverloadedLabels label
+                              --   (leading @#@ followed by a lowercase letter)
     | TkLUnbox                -- ^ @(#@ unboxed-tuple open
     | TkRUnbox                -- ^ @#)@ unboxed-tuple close
     | TkSymOp !ByteString     -- ^ generic user-defined symbolic operator
@@ -202,7 +204,19 @@ nextToken s c0 =
             | b == 0x27        -> lexChar   c                          -- '\''
             -- Structural punctuation (non-op chars): parens, brackets,
             -- braces, comma, semicolon, backtick, backslash.
-            | b == 0x28, Just 0x23 <- peekByte s (cPos c + 1)
+            -- OverloadedLabels: '#' followed immediately by a lowercase
+            -- letter is a label token. '#' that starts an operator run
+            -- (e.g. '#)' or is alone) falls through to lexSymOp as before.
+            | b == 0x23
+            , Just b2 <- peekByte s (cPos c + 1)
+            , isLowerStart b2 -> lexLabel c
+            -- '(#' unboxed-tuple open — but NOT '(#name' which is
+            -- '(' followed by an OverloadedLabels label.
+            -- '(#' is TkLUnbox only when the byte after '#' is NOT a
+            -- lowercase ident-start character.
+            | b == 0x28
+            , Just 0x23 <- peekByte s (cPos c + 1)
+            , not (maybe False isLowerStart (peekByte s (cPos c + 2)))
                                ->                                         -- '(#' unboxed-tuple open
                                   let c' = step (step c)
                                   in (mkTok TkLUnbox c c', c')
@@ -438,6 +452,20 @@ nextToken s c0 =
             end = Cursor endP' (cLine openCur)
                          (cCol openCur + (endP' - cPos openCur))
         in (mkTok (TkChar ch) openCur end, end)
+
+    -- | Lex an OverloadedLabels label: '#' followed by a run of
+    -- identifier-continuation chars. The '#' is consumed as part of the
+    -- token start; the result name is everything AFTER the '#'.
+    lexLabel start =
+        let nameStart = cPos start + 1 in   -- skip the leading '#'
+        let endP = go nameStart in
+        let name = sliceBytes s (nameStart, endP)
+            end  = Cursor endP (cLine start) (cCol start + (endP - cPos start))
+        in (mkTok (TkLabel name) start end, end)
+      where
+        go p = case peekByte s p of
+            Just b | isIdentCont b -> go (p + 1)
+            _      -> p
 
     keywordOr bs = case bs of
         "if"        -> TkIf

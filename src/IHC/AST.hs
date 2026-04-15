@@ -18,12 +18,14 @@ module IHC.AST
     , Alt(..)
     , Pat(..)
     , Lit(..)
+    , Label
     ) where
 
 import Data.ByteString (ByteString)
 import Data.Int (Int64)
 
-type Name = ByteString
+type Name  = ByteString
+type Label = ByteString
 
 -- | Source-level expressions. Lazy semantics are encoded in the
 -- evaluator, not the AST itself — every sub-Expr is a candidate for
@@ -44,6 +46,7 @@ data Expr
     | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
     | ERecordWild !Name                -- Con {..} — RecordWildCards construction
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
+    | ELabel !Label                     -- #name OverloadedLabels label (Phase 3.5)
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

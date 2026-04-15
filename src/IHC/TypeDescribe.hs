@@ -44,6 +44,7 @@ describeType = go
     go (VPrimObj (PrimPtr _))     = pure "Ptr Word8"
     go (VPrimObj (PrimByteArray _)) = pure "ByteArray"
     go (VPrimObj PrimRealWorld)   = pure "RealWorld#"
+    go (VLabel name)              = pure ("Label \"" <> name <> "\"")
 
     -- Booleans
     go (VCon "True"  []) = pure "Bool"

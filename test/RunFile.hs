@@ -592,7 +592,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         let isSubstring needle haystack =
                 any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
         result `shouldSatisfy` \case
-            Left e  -> "no_such_file.hs" `isSubstring` show e
+            Left e  -> isSubstring "no_such_file.hs" (show e)
             Right _ -> False
 
     --------------------------------------------------------------------
@@ -785,3 +785,26 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/ihp_integration.hs")
         n   `shouldBe` 0
         out `shouldBe` "IHP integration OK\n42\n"
+
+    --------------------------------------------------------------------
+    -- Phase 3.5: OverloadedLabels
+    --------------------------------------------------------------------
+    it "Phase35: #email label prints as #email" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase35/label_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "#email\n"
+
+    it "Phase35: label stored in let then printed" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase35/label_as_proxy.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "#email\n"
+
+    it "Phase35: label in tuple — IHP filterWhere pattern" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase35/label_in_tuple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "#email\nhi\n"
+
+    it "Phase35: multiple labels in one function" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase35/label_multiple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "#firstName\n#lastName\n#email\n"

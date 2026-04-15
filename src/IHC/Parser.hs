@@ -1271,6 +1271,7 @@ startsAtom TkInt{}         = True
 startsAtom TkFloat{}       = True
 startsAtom TkStr{}         = True
 startsAtom TkChar{}        = True
+startsAtom TkLabel{}       = True  -- Phase 3.5: #name is a valid argument
 startsAtom TkLParen        = True
 startsAtom TkLBracket      = True
 startsAtom TkIdent{}       = True
@@ -1293,6 +1294,7 @@ parseAtom ctx cur0 = do
         TkFloat d  -> pure (ELit (LFloat d), cur1)
         TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
+        TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference
         TkImplicitRef n -> pure (EImplicitRef n, cur1)
         TkIdent n

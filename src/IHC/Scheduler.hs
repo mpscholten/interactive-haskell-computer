@@ -455,6 +455,7 @@ rewriteExpr rw = go []
                 bs'    = [(n, go bound' b) | (n, b) <- bs]
             in EImplicitLet bs' (go bound' e)
         ESplice inner   -> ESplice (go bound inner)
+        e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -959,6 +960,7 @@ freeVars = goAll []
                 bound' = names ++ bound
             in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
         ESplice inner   -> goAll bound inner
+        ELabel _        -> []   -- Phase 3.5: labels have no free variables
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.

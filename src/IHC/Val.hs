@@ -72,6 +72,7 @@ data Val
     | VUnit                            -- () — IO result of putStrLn etc.
     | VIO   !(IO Val)                  -- suspended IO action (Phase 2.4)
     | VPrimObj !PrimObj                -- opaque host object (Phase 2.4)
+    | VLabel   !ByteString             -- #name OverloadedLabels value (Phase 3.5)
 
 -- | Opaque host-side objects surfaced to the interpreter. Not
 -- user-inspectable — programs pass them through primops only
@@ -108,6 +109,7 @@ showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
 showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
 showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
+showValForDebug (VLabel name)                = "#" <> BC.unpack name
 
 --------------------------------------------------------------------------------
 -- Thunks

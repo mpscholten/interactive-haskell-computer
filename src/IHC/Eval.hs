@@ -57,6 +57,7 @@ eval env ipm = go
     go (ELit (LFloat d)) = pure (VFloat d)
     go (ELit (LStr s))   = pure (VStr s)
     go (ELit (LChar c))  = pure (VChar c)
+    go (ELabel name)     = pure (VLabel name)  -- Phase 3.5: OverloadedLabels
 
     go (EVar name) = case lookupEnv name env of
         Just t  -> force t

@@ -154,6 +154,8 @@ builtinEnv reg = do
     rightT <- newWHNFThunk (VFun $ \x -> pure (VCon "Right" [x]))
     let eitherCtors = [("Left", leftT), ("Right", rightT)]
     -- Phase 2.9.5: Proxy and Dynamic constructors.
+    -- Phase 3.5 note: when a VLabel is used where a Proxy is expected,
+    -- fromLabel produces VCon "Proxy" [VLabel name].
     proxyT    <- newWHNFThunk (VCon "Proxy" [])
     dynCtorV  <- dynamicCtorB
     dynCtorT  <- newWHNFThunk dynCtorV
@@ -437,6 +439,8 @@ builtins reg =
     , ("tyConName",      tyConNameB)
     , ("typeRepTyCon",   typeRepTyConB)
     , ("typeRepArgs",    typeRepArgsB)
+    -- Phase 3.5: OverloadedLabels
+    , ("fromLabel",    fromLabelB reg)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
@@ -736,6 +740,7 @@ showDispatch reg = pure $ VFun $ \a -> do
 -- | Show a value, consulting the ClassRegistry for user-defined Show.
 showValWith :: ClassRegistry -> Val -> IO String
 showValWith reg av = case av of
+    VLabel name -> pure ("#" <> BC.unpack name)   -- Phase 3.5: #name
     VInt _    -> showVal av
     VFloat _  -> showVal av
     VChar _   -> showVal av
@@ -822,6 +827,7 @@ showDouble d
         in if '.' `elem` s || 'e' `elem` s then s else s <> ".0"
 
 showVal :: Val -> IO String
+showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
 showVal (VFloat d)  = pure (showDouble d)
 showVal (VChar c)   = pure (show c)
@@ -910,6 +916,26 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         pure (VCon ":" [h, restT])
     appendVal other _ =
         error ("(++): not a list: " <> showValForDebug other)
+
+-- Phase 3.5: OverloadedLabels ------------------------------------------------
+
+-- | @fromLabel :: VLabel name -> Val@
+--
+-- In GHC, @fromLabel \@"name"@ selects an @IsLabel@ instance via type
+-- inference. We have no type inference, so we dispatch at runtime:
+--
+-- * When the label is used in any context we don't yet recognise, we
+--   return a @VCon "Proxy" [VLabel name]@ — the Proxy IsLabel instance.
+--   Downstream code can pattern-match on this to recover the name.
+-- * Field-accessor dispatch is deferred until the OverloadedRecordDot
+--   agent lands its field-lookup primitive.
+fromLabelB :: ClassRegistry -> IO Val
+fromLabelB _reg = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VLabel name -> pure (VCon "Proxy" [])   -- Proxy IsLabel instance
+        other -> error ("fromLabel: expected a Label value, got: "
+                        <> showValForDebug other)
 
 -- showB replaced by showDispatch in Phase 2.3
 
