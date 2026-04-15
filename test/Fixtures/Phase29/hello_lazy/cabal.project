@@ -1,0 +1,7 @@
+packages: .
+
+-- Point directly at the vendored bytestring source so PackageStore
+-- does not need a network fetch (it is already on disk in the repo root).
+source-repository-package
+    type:     git
+    location: .
