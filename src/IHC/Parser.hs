@@ -71,8 +71,28 @@ parseExpr :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO (
 parseExpr src params resolve cur0 acc0 = do
     let (tok, cur1) = nextSig src cur0
     case tkKind tok of
-        TkIf -> parseIf src params resolve cur1 acc0
-        _    -> parseOr src params resolve cur0 acc0
+        TkIf -> parseIf     src params resolve cur1 acc0
+        TkDo -> parseDo     src params resolve cur1 acc0
+        _    -> parseOr     src params resolve cur0 acc0
+
+-- @do { stmt ; stmt ; ... ; stmt }@. Each stmt is a full expression;
+-- intermediate results overwrite x0 (the @>>@ semantics for actions
+-- whose result type is the unit-like 0). The block's value is the
+-- last stmt's value.
+parseDo :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseDo src params resolve cur0 acc0 = do
+    let (lb, curB) = nextSig src cur0
+    case tkKind lb of
+        TkLBrace -> stmts curB acc0
+        _        -> parseErr "expected `{` after `do`" lb
+  where
+    stmts cur acc = do
+        (acc', cur')  <- parseExpr src params resolve cur acc
+        let (sep, curN) = nextSig src cur'
+        case tkKind sep of
+            TkSemi   -> stmts curN acc'
+            TkRBrace -> pure (acc', curN)
+            _        -> parseErr "expected `;` or `}` in do-block" sep
 
 parseIf :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseIf src params resolve cur0 acc0 = do

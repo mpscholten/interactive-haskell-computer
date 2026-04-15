@@ -65,6 +65,10 @@ data TokenKind
     | TkIf                    -- ^ keyword @if@
     | TkThen                  -- ^ keyword @then@
     | TkElse                  -- ^ keyword @else@
+    | TkDo                    -- ^ keyword @do@
+    | TkLBrace                -- ^ @{@
+    | TkRBrace                -- ^ @}@
+    | TkSemi                  -- ^ @;@
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -131,6 +135,9 @@ nextToken s c0 =
             | b == 0x29        -> (mkTok TkRParen c (step c), step c)  -- ')'
             | b == 0x3C        -> (mkTok TkLt     c (step c), step c)  -- '<'
             | b == 0x3E        -> (mkTok TkGt     c (step c), step c)  -- '>'
+            | b == 0x7B        -> (mkTok TkLBrace c (step c), step c)  -- '{'
+            | b == 0x7D        -> (mkTok TkRBrace c (step c), step c)  -- '}'
+            | b == 0x3B        -> (mkTok TkSemi   c (step c), step c)  -- ';'
             | b == 0x22        -> lexString c                          -- '"'
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
@@ -198,6 +205,7 @@ nextToken s c0 =
         "if"   -> TkIf
         "then" -> TkThen
         "else" -> TkElse
+        "do"   -> TkDo
         _      -> TkIdent bs
 
 isDigit :: Word8 -> Bool

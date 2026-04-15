@@ -148,3 +148,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/negate_lit.hs")
         n   `shouldBe` 0
         out `shouldBe` "-2\n"
+
+    it "do-block sequences three IO actions" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/do_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "first\nsecond\n12\n"
+
+    it "do-block with computed values across recursion" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/do_with_recursion.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Computing fibonacci numbers:\n5\n55\n610\n"
