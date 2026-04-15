@@ -10,6 +10,7 @@ import IHC (version)
 import IHC.CabalProject (detectProjectRoot, resolve)
 import IHC.Driver (runFile)
 import IHC.Jit (codesignCheck)
+import IHC.Repl (runRepl)
 
 usage :: String
 usage = unlines
@@ -59,9 +60,7 @@ main = getArgs >>= \case
     ("run":_)        -> do
         hPutStrLn stderr "usage: ihc run FILE.hs"
         exitFailure
-    ("repl":_)       -> do
-        hPutStrLn stderr "ihc repl: not implemented yet."
-        exitFailure
+    ("repl":_)       -> runRepl
     args             -> do
         hPutStrLn stderr ("ihc: unknown arguments: " <> unwords args)
         hPutStrLn stderr usage

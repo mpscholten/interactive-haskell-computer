@@ -28,6 +28,7 @@
 module IHC.Parser
     ( parseBodyExpr
     , parseBodyExprWithFixity
+    , parseExprOnly
     , ParseError(..)
     , FixityTable
     , Assoc(..)
@@ -205,6 +206,17 @@ parseBodyExprWithFixity src fx clauses = do
                         "parseBodyExpr: clauses have differing arities"))
           parsed
     pure (desugarClauses parsed arity)
+
+-- | Parse a single expression from raw bytes — intended for REPL input.
+-- The entire source is treated as one expression (no binding LHS, no `=`).
+-- Throws 'ParseError' on failure.
+parseExprOnly :: Source -> FixityTable -> IO Expr
+parseExprOnly src fx = do
+    let end = BC.length (srcBytes src)
+        ctx = Ctx src end 0 fx
+        cur = startCursor
+    (e, _) <- parseExpr ctx cur
+    pure e
 
 --------------------------------------------------------------------------------
 -- Parsed clauses
@@ -819,6 +831,7 @@ parseSubPat ctx cur = do
                     (sub, curN) <- parseSubPat ctx curP
                     pure (PAs n sub, curN)
                 _    -> pure (PVar n, cur1)
+        TkPrimId n   -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
         TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
@@ -884,6 +897,7 @@ startsPat (TkInt _)    = True
 startsPat (TkChar _)   = True
 startsPat (TkStr _)    = True
 startsPat (TkIdent _)  = True
+startsPat (TkPrimId _) = True
 startsPat TkUnderscore = True
 startsPat (TkConId _)  = True
 startsPat TkLParen     = True
@@ -1049,6 +1063,7 @@ startsAtom TkLParen   = True
 startsAtom TkLBracket = True
 startsAtom TkIdent{}  = True
 startsAtom TkConId{}  = True
+startsAtom TkPrimId{} = True
 startsAtom TkLUnbox   = True
 startsAtom _          = False
 
@@ -1066,6 +1081,7 @@ parseAtom ctx cur0 = do
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
+        TkPrimId n -> pure (EVar n, cur1)
         TkConId n ->
             tryQualified ctx n tok cur1
         TkLParen   -> parseParenExpr ctx tok cur1
@@ -1187,14 +1203,14 @@ gatherTupleExpr ctx cur acc = do
 
 parseUnboxedTuple :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseUnboxedTuple ctx cur0 = do
-    -- Treat (# e1, e2 #) as a boxed tuple at the AST level for Phase 2.6.
     -- `#)` is NOT lexed as a single token (that would misread string-lit
     -- primops like @"x"#)@), so we accept either 'TkRUnbox' or the pair
     -- @TkSymOp "#" ; TkRParen@ as the closing delimiter.
+    --
+    -- (# #) → unit, (# e #) → e (single-element), (# e1, e2, ... #) →
+    -- EApp chain using a named unboxed-tuple constructor "(#,#)" / "(#,,#)" etc.
     if isUnboxClose ctx cur0
-        then do
-            let curP = skipUnboxClose ctx cur0
-            pure (EVar "()", curP)
+        then pure (EVar "()", skipUnboxClose ctx cur0)
         else do
             (e, cur1) <- parseExpr ctx cur0
             if isUnboxClose ctx cur1
@@ -1204,7 +1220,13 @@ parseUnboxedTuple ctx cur0 = do
                     case tkKind sep of
                         TkComma -> do
                             (rest, curEnd) <- gatherUnboxed ctx cur2 []
-                            pure (ETuple (e : rest), curEnd)
+                            let elems = e : rest
+                                arity = length elems
+                                conName = BC.pack ("(#" <> replicate (arity - 1) ',' <> "#)")
+                                -- Build EApp chain: (((EVar conName) e1) e2) ...
+                                con  = EVar conName
+                                expr = foldl EApp con elems
+                            pure (expr, curEnd)
                         _ -> parseErr "expected `,` or `#)` in unboxed tuple" sep
   where
     gatherUnboxed c cur acc = do

@@ -32,11 +32,12 @@ module IHC.Scheduler
     ( -- * Entry points
       loadProgram
     , loadProgramFromSource
+    , buildBaseEnv
       -- * Types exposed for testing
     , ModuleRegistry
     ) where
 
-import Control.Exception (throwIO, Exception)
+import Control.Exception (throwIO, Exception, catch)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -184,6 +185,17 @@ loadProgramFromSource searchPath src0 = do
         Just t  -> pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
                            <> BC.unpack entryName)
+
+-- | Build a fresh base environment with all builtins and an empty
+-- ClassRegistry. Used by the REPL to get a starting env without
+-- requiring a @main@ binding.
+buildBaseEnv :: IO (Env, ClassRegistry)
+buildBaseEnv = do
+    classReg <- newClassRegistry
+    builtins <- builtinEnv classReg
+    conEnv   <- buildConEnv Map.empty
+    let env = Map.union conEnv builtins
+    pure (env, classReg)
 
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
@@ -397,18 +409,67 @@ loadModule registry searchPath name = do
         Just (Loaded lm) -> pure lm
         Just Loading     -> throwIO (ImportCycle name)
         Nothing -> do
-            path <- locateModule searchPath name
-            src0 <- readSourceFile path
-            src  <- cppSource src0
-            (mHeader, _) <- parseModuleHeader src startCursor
-            let header = fromMaybe emptyHeader mHeader
-                declared = fromMaybe name (mhName header)
-            -- Register as Loading *before* we parse further — this
-            -- lets a cycle trip the detector on the second visit.
-            modifyIORef' registry (Map.insert name Loading)
-            lm <- buildLoadedModule declared False header src
-            modifyIORef' registry (Map.insert name (Loaded lm))
-            pure lm
+            -- GHC.*, System.IO.Unsafe, Foreign.*, Data.Bits, etc. are
+            -- intercepted as empty stubs because their names are provided
+            -- directly by the builtin environment. Trying to parse their
+            -- GHC-internal source would fail.
+            if isBuiltinBackedModule name
+                then do
+                    lm <- buildEmptyStubModule name
+                    modifyIORef' registry (Map.insert name (Loaded lm))
+                    pure lm
+                else do
+                    path <- locateModule searchPath name
+                    src0 <- readSourceFile path
+                    src  <- cppSource src0
+                    (mHeader, _) <- parseModuleHeader src startCursor
+                    let header = fromMaybe emptyHeader mHeader
+                        declared = fromMaybe name (mhName header)
+                    modifyIORef' registry (Map.insert name Loading)
+                    lm <- buildLoadedModule declared False header src
+                    modifyIORef' registry (Map.insert name (Loaded lm))
+                    pure lm
+
+-- | Modules whose names are backed entirely by the builtin environment.
+-- We return empty stub modules so import declarations don't fail at file lookup.
+isBuiltinBackedModule :: ModuleName -> Bool
+isBuiltinBackedModule n =
+       "GHC."         `BC.isPrefixOf` n
+    || n == "Prelude"
+    || n == "System.IO"
+    || n == "System.IO.Unsafe"
+    || n == "System.Exit"
+    || "Foreign."     `BC.isPrefixOf` n
+    || n == "Data.IORef"
+    || n == "Data.Int"
+    || n == "Data.Word"
+    || n == "Data.Bits"
+    || n == "Data.Char"
+    || n == "Data.List"
+    || n == "Data.Maybe"
+    || n == "Data.Ord"
+    || n == "Control.Monad"
+    || n == "Control.DeepSeq"
+    || "Data.Map"     `BC.isPrefixOf` n
+    || "Data.Set"     `BC.isPrefixOf` n
+    || "Data.IntMap"  `BC.isPrefixOf` n
+    || "Data.Sequence" `BC.isPrefixOf` n
+
+buildEmptyStubModule :: ModuleName -> IO LoadedModule
+buildEmptyStubModule name = do
+    known  <- emptyKnownSymbols
+    bodies <- newIORef Map.empty
+    let src = mkSource (BC.unpack name) ""
+    pure LoadedModule
+        { lmName    = name
+        , lmHeader  = ModuleHeader (Just name) ExportAll []
+        , lmSource  = src
+        , lmKnown   = known
+        , lmDataReg = Map.empty
+        , lmBodies  = bodies
+        , lmIsEntry = False
+        , lmFixity  = defaultFixityTable
+        }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
 buildLoadedModule name isEntry header src = do
