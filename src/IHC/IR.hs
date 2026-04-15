@@ -29,9 +29,14 @@ data Item
     | IAddX1X0                -- x0 = x1 + x0
     | ISubX1X0                -- x0 = x1 - x0
     | IMulX1X0                -- x0 = x1 * x0
+    | ICmpLe                  -- x0 = (x1 <= x0) ? 1 : 0 (cmp + cset)
     | IArg                    -- load the first argument from arg-slot into x0
     | ICall     !ByteString   -- call nullary binding, result in x0
     | ICall1    !ByteString   -- call 1-arg binding with arg in x0, result in x0
+    | IIfThenElse [Item] [Item] [Item]
+                              -- ^ cond; then-branch; else-branch. Emits
+                              --   cond items, CBZ over then, then items,
+                              --   B over else, else items.
     deriving (Eq, Show)
 
 -- | A discovered + parsed top-level binding.
@@ -48,9 +53,16 @@ sizeOfItem = \case
     IAddX1X0      -> 4
     ISubX1X0      -> 4
     IMulX1X0      -> 4
+    ICmpLe        -> 8                      -- cmp + cset
     IArg          -> 4
-    ICall _       -> 20           -- 4 movz/movk + 1 blr
-    ICall1 _      -> 20           -- same shape; arg already in x0 at the call site
+    ICall _       -> 20                     -- 4 movz/movk + 1 blr
+    ICall1 _      -> 20                     -- same shape
+    IIfThenElse c t e ->
+        sizeOfItems c
+        + 4                                  -- cbz over then
+        + sizeOfItems t
+        + 4                                  -- b over else
+        + sizeOfItems e
 
 sizeOfItems :: [Item] -> Int
 sizeOfItems = sum . map sizeOfItem

@@ -56,3 +56,23 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "passes a parameter as an argument to another function: `twice 10` → 22" do
         n <- runFile "test/Fixtures/fn_call_through_param.hs"
         n `shouldBe` 22
+
+    it "respects parens: `2 * (3 + 4)` → 14" do
+        n <- runFile "test/Fixtures/parens.hs"
+        n `shouldBe` 14
+
+    it "if-then-else: takes the then-branch when condition is true" do
+        n <- runFile "test/Fixtures/if_const.hs"
+        n `shouldBe` 100
+
+    it "if-then-else: takes the else-branch when condition is false" do
+        n <- runFile "test/Fixtures/if_const_else.hs"
+        n `shouldBe` 200
+
+    it "self-recursion: factorial 10 → 3628800" do
+        n <- runFile "test/Fixtures/fact.hs"
+        n `shouldBe` 3628800
+
+    it "self-recursion with two recursive calls: fib 10 → 55" do
+        n <- runFile "test/Fixtures/fib.hs"
+        n `shouldBe` 55

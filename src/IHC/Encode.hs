@@ -25,6 +25,12 @@ module IHC.Encode
     , ldrX0ArgSlot
       -- * Indirect call
     , blrX16
+      -- * Comparison / conditional select
+    , cmpX1X0
+    , csetLeX0
+      -- * Branches (PC-relative)
+    , cbzX0Offset
+    , bOffset
       -- * Composed: materialize a signed 64-bit into a register
     , loadInt64
     ) where
@@ -135,6 +141,42 @@ strX0ArgSlot = 0xF9000BE0
 -- (e.g. via pushX0 spills during expression evaluation).
 ldrX0ArgSlot :: Word32
 ldrX0ArgSlot = 0xF9400BA0
+
+-- | @CMP X1, X0@ — alias for @SUBS XZR, X1, X0@; sets NZCV.
+--
+-- SUBS (shifted register), 64-bit: 0xEB000000 base.
+-- For Rm=0, Rn=1, Rd=31 (XZR):
+--   0xEB000000 | (0 << 16) | (1 << 5) | 31 = 0xEB00003F.
+cmpX1X0 :: Word32
+cmpX1X0 = 0xEB00003F
+
+-- | @CSET X0, LE@ — set x0 to 1 if previous compare was less-or-equal,
+-- else 0. Alias for @CSINC X0, XZR, XZR, invert(LE)@ = @CSINC X0, XZR, XZR, GT@.
+--
+-- CSINC 64-bit encoding: 0x9A800400 base.
+-- For Rm=31, Rn=31, cond=GT(0xC), Rd=0:
+--   0x9A800400 | (31<<16) | (0xC<<12) | (31<<5) | 0
+--   = 0x9A800400 | 0x1F0000 | 0xC000 | 0x3E0
+--   = 0x9A9FC7E0.
+csetLeX0 :: Word32
+csetLeX0 = 0x9A9FC7E0
+
+-- | @CBZ X0, #(offset instructions)@ — branch to @PC + imm19*4@ if x0 == 0.
+--
+-- CBZ 64-bit encoding: 0xB4000000 base, imm19 at bits [23:5], Rt at [4:0].
+-- 'offset' is in /instructions/ (not bytes); range +-2^18.
+cbzX0Offset :: Int -> Word32
+cbzX0Offset offset =
+    0xB4000000
+    .|. ((fromIntegral offset .&. 0x7FFFF) `shiftL` 5)
+    .|. 0                                        -- Rt = x0
+
+-- | @B #(offset instructions)@ — unconditional branch to @PC + imm26*4@.
+-- 'offset' is in instructions; range +-2^25.
+bOffset :: Int -> Word32
+bOffset offset =
+    0x14000000
+    .|. (fromIntegral offset .&. 0x3FFFFFF)
 
 -- | Materialize a 64-bit integer into register @Xrd@, using up to four
 -- MOVZ/MOVK instructions (covers the full 64-bit range). For small

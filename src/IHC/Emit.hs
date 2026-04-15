@@ -51,9 +51,35 @@ emitItem cb addrs = \case
     IAddX1X0  -> emitInsn cb (addXXX 0 1 0)
     ISubX1X0  -> emitInsn cb (subXXX 0 1 0)
     IMulX1X0  -> emitInsn cb (mulXXX 0 1 0)
+    ICmpLe    -> do
+        emitInsn cb cmpX1X0
+        emitInsn cb csetLeX0
     IArg      -> emitInsn cb ldrX0ArgSlot
     ICall nm  -> callTo cb addrs nm
-    ICall1 nm -> callTo cb addrs nm   -- same shape; caller already put arg in x0
+    ICall1 nm -> callTo cb addrs nm
+    IIfThenElse cond thenB elseB -> do
+        -- Emit the condition, leaving 0 or 1 in x0.
+        mapM_ (emitItem cb addrs) cond
+        -- PC-relative distances in instructions.
+        --
+        -- Layout from the CBZ instruction:
+        --   +0:                  cbz x0, ...        (this insn)
+        --   +4:                  then-items         (thenSize bytes)
+        --   +4 + thenSize:       b ...              (jump past else)
+        --   +4 + thenSize + 4:   else-items         (elseSize bytes)
+        --   +8 + thenSize + elseSize: instruction after if
+        let thenSize = sizeOfItems thenB
+            elseSize = sizeOfItems elseB
+            -- CBZ target = first instruction of else. Distance from CBZ
+            -- in instructions = (4 + thenSize + 4) / 4 = thenSize/4 + 2.
+            cbzInsts = (thenSize + 8) `div` 4
+            -- B is at +4+thenSize. Target = +8+thenSize+elseSize.
+            -- Distance = (4 + elseSize) / 4 = elseSize/4 + 1.
+            bInsts   = (elseSize + 4) `div` 4
+        emitInsn cb (cbzX0Offset cbzInsts)
+        mapM_ (emitItem cb addrs) thenB
+        emitInsn cb (bOffset bInsts)
+        mapM_ (emitItem cb addrs) elseB
 
 callTo :: CodeBuffer -> Map ByteString (Ptr ()) -> ByteString -> IO ()
 callTo cb addrs nm = case Map.lookup nm addrs of

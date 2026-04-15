@@ -50,6 +50,12 @@ data TokenKind
     | TkPlus                  -- ^ @+@
     | TkMinus                 -- ^ @-@ (only when not followed by another '-')
     | TkStar                  -- ^ @*@
+    | TkLParen                -- ^ @(@
+    | TkRParen                -- ^ @)@
+    | TkLe                    -- ^ @<=@
+    | TkIf                    -- ^ keyword @if@
+    | TkThen                  -- ^ keyword @then@
+    | TkElse                  -- ^ keyword @else@
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -94,10 +100,14 @@ nextToken s c0 =
             | isDigit b        -> lexInt c
             | isLowerStart b   -> lexIdent False c
             | isUpperStart b   -> lexIdent True  c
-            | b == 0x3D        -> (mkTok TkEq    c (step c), step c)  -- '='
-            | b == 0x2B        -> (mkTok TkPlus  c (step c), step c)  -- '+'
-            | b == 0x2A        -> (mkTok TkStar  c (step c), step c)  -- '*'
-            | b == 0x2D        -> (mkTok TkMinus c (step c), step c)  -- '-' (not '--', already skipped)
+            | b == 0x3D        -> (mkTok TkEq     c (step c), step c)  -- '='
+            | b == 0x2B        -> (mkTok TkPlus   c (step c), step c)  -- '+'
+            | b == 0x2A        -> (mkTok TkStar   c (step c), step c)  -- '*'
+            | b == 0x2D        -> (mkTok TkMinus  c (step c), step c)  -- '-' (not '--', already skipped)
+            | b == 0x28        -> (mkTok TkLParen c (step c), step c)  -- '('
+            | b == 0x29        -> (mkTok TkRParen c (step c), step c)  -- ')'
+            | b == 0x3C, Just 0x3D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkLe c c', c')  -- '<='
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b
@@ -130,9 +140,16 @@ nextToken s c0 =
         go p = case peekByte s p of
             Just b | isIdentCont b -> go (p + 1)
             _ -> let bs  = sliceBytes s (cPos start, p)
-                     k   = if isCon then TkConId bs else TkIdent bs
+                     k   | isCon     = TkConId bs
+                         | otherwise = keywordOr bs
                      end = Cursor p (cLine start) (cCol start + (p - cPos start))
                  in (mkTok k start end, end)
+
+    keywordOr bs = case bs of
+        "if"   -> TkIf
+        "then" -> TkThen
+        "else" -> TkElse
+        _      -> TkIdent bs
 
 isDigit :: Word8 -> Bool
 isDigit b = b >= 0x30 && b <= 0x39
