@@ -42,14 +42,18 @@ import IHC.AST (Expr, Name)
 -- | Weak-head-normal-form values. Lazy data appears as 'Thunk's
 -- inside a 'VCon'.
 data Val
-    = VInt !Int64
-    | VStr !ByteString                 -- raw bytes; later replaced by [Char]
-    | VFun !(Thunk -> IO Val)          -- single-argument closure
-    | VCon !Name ![Thunk]              -- saturated constructor (Phase 2.1+)
+    = VInt  !Int64
+    | VChar !Char                      -- single character (Phase 2.2+)
+    | VStr  !ByteString                -- raw bytes — transitional, some
+                                       -- builtins still produce these;
+                                       -- user-visible strings are [Char]
+    | VFun  !(Thunk -> IO Val)         -- single-argument closure
+    | VCon  !Name ![Thunk]             -- saturated constructor (Phase 2.1+)
     | VUnit                            -- () — IO result of putStrLn etc.
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
+showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)    = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"

@@ -48,6 +48,7 @@ data TokenKind
     | TkInt   !Integer        -- ^ decimal integer literal
     | TkStr   !ByteString     -- ^ @\"...\"@ string literal (contents after
                               --   basic \\n \\t \\\\ \\\" escapes)
+    | TkChar  !Char           -- ^ @\'c\'@ character literal
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
     | TkPlusPlus              -- ^ @++@ (string / list concat)
@@ -77,6 +78,10 @@ data TokenKind
     | TkBar                   -- ^ @|@ (data-decl alternative separator)
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
+    | TkLBracket              -- ^ @[@
+    | TkRBracket              -- ^ @]@
+    | TkComma                 -- ^ @,@
+    | TkColon                 -- ^ @:@ (list cons; Phase 2.2)
     | TkSemi                  -- ^ @;@
     | TkDColon                -- ^ @::@ (type-signature separator)
     | TkArrow                 -- ^ @->@ (type-arrow; also lambda body)
@@ -154,9 +159,14 @@ nextToken s c0 =
             | b == 0x3E        -> (mkTok TkGt     c (step c), step c)  -- '>'
             | b == 0x7B        -> (mkTok TkLBrace c (step c), step c)  -- '{'
             | b == 0x7D        -> (mkTok TkRBrace c (step c), step c)  -- '}'
+            | b == 0x5B        -> (mkTok TkLBracket c (step c), step c)  -- '['
+            | b == 0x5D        -> (mkTok TkRBracket c (step c), step c)  -- ']'
+            | b == 0x2C        -> (mkTok TkComma  c (step c), step c)  -- ','
+            | b == 0x3A        -> (mkTok TkColon  c (step c), step c)  -- ':' (single; '::' handled above)
             | b == 0x3B        -> (mkTok TkSemi   c (step c), step c)  -- ';'
             | b == 0x7C        -> (mkTok TkBar    c (step c), step c)  -- '|'
             | b == 0x22        -> lexString c                          -- '"'
+            | b == 0x27        -> lexChar   c                          -- '\''
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b
@@ -218,6 +228,32 @@ nextToken s c0 =
                     Just c    -> scanStr (p + 2) (c    : acc)  -- unknown: pass through
                     Nothing   -> (BS.pack (reverse acc), p + 1)
             Just b    -> scanStr (p + 1) (b : acc)
+
+    -- Starts at the opening single-quote. One logical character, possibly
+    -- escaped, followed by a closing single-quote. Malformed input degrades
+    -- gracefully (we just emit whatever we scanned).
+    lexChar openCur =
+        let p0 = cPos openCur + 1 in
+        let (ch, endP) = case peekByte s p0 of
+                Just 0x5C -> case peekByte s (p0 + 1) of           -- backslash
+                    Just 0x6E -> ('\n', p0 + 2)
+                    Just 0x74 -> ('\t', p0 + 2)
+                    Just 0x5C -> ('\\', p0 + 2)
+                    Just 0x27 -> ('\'', p0 + 2)
+                    Just 0x22 -> ('"',  p0 + 2)
+                    Just 0x30 -> ('\0', p0 + 2)
+                    Just c    -> (chr (fromIntegral c), p0 + 2)
+                    Nothing   -> ('?',  p0 + 1)
+                Just b    -> (chr (fromIntegral b), p0 + 1)
+                Nothing   -> ('?', p0)
+        in
+        -- skip closing '\''
+        let endP' = case peekByte s endP of
+                Just 0x27 -> endP + 1
+                _         -> endP
+            end = Cursor endP' (cLine openCur)
+                         (cCol openCur + (endP' - cPos openCur))
+        in (mkTok (TkChar ch) openCur end, end)
 
     keywordOr bs = case bs of
         "if"    -> TkIf

@@ -274,11 +274,34 @@ parseCase ctx cur0 = do
     -- inside parens, as a sub-pattern) we use parseSubPat which does
     -- NOT greedily consume further atoms — a bare TkConId sub-pattern
     -- is always nullary unless parenthesised.
+    --
+    -- We also handle infix `:` (cons) at the top level, with `PCon ":"`.
     parseTopPat cur = do
+        (p, cur') <- parseTopPatNoCons cur
+        consTail p cur'
+
+    -- Handle `(x : xs)` style cons patterns by peeking for `:` after
+    -- each pattern and chaining right-associatively.
+    consTail p cur =
+        let (tok, cur1) = nextSig ctx cur in
+        case tkKind tok of
+            TkColon -> do
+                (rhs, cur2) <- parseTopPat cur1
+                pure (PCon ":" [p, rhs], cur2)
+            _ -> pure (p, cur)
+
+    parseTopPatNoCons cur = do
         let (tok, cur1) = nextSig ctx cur
         case tkKind tok of
-            TkConId n -> collectArgs n [] cur1
-            _         -> simplePat tok cur1
+            TkConId n  -> collectArgs n [] cur1
+            TkLParen   -> do
+                (inner, cur2) <- parseTopPat cur1
+                let (close, cur3) = nextSig ctx cur2
+                case tkKind close of
+                    TkRParen -> pure (inner, cur3)
+                    _        -> parseErr "expected `)` in pattern" close
+            TkLBracket -> parseListPat cur1
+            _          -> simplePat tok cur1
 
     -- Gather sub-patterns for an outer constructor pattern until we hit
     -- a non-pattern token (like `->`).
@@ -291,10 +314,13 @@ parseCase ctx cur0 = do
             else pure (PCon name (reverse acc), cur)
 
     startsPat (TkInt _)    = True
+    startsPat (TkChar _)   = True
+    startsPat (TkStr _)    = True
     startsPat (TkIdent _)  = True
     startsPat TkUnderscore = True
     startsPat (TkConId _)  = True
     startsPat TkLParen     = True
+    startsPat TkLBracket   = True
     startsPat _            = False
 
     -- A sub-pattern — recursive, but a bare TkConId is nullary here.
@@ -303,18 +329,42 @@ parseCase ctx cur0 = do
     parseSubPat cur = do
         let (tok, cur1) = nextSig ctx cur
         case tkKind tok of
-            TkConId n -> pure (PCon n [], cur1)
-            TkLParen  -> do
+            TkConId n  -> pure (PCon n [], cur1)
+            TkLParen   -> do
                 (inner, cur2) <- parseTopPat cur1
                 let (close, cur3) = nextSig ctx cur2
                 case tkKind close of
                     TkRParen -> pure (inner, cur3)
                     _        -> parseErr "expected `)` in pattern" close
+            TkLBracket -> parseListPat cur1
             _ -> simplePat tok cur1
+
+    -- Parse a list-literal pattern: `[]`, `[a]`, `[a, b, c]`. The opening
+    -- `[` has already been consumed.
+    parseListPat cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkRBracket -> pure (PCon "[]" [], cur1)
+            _ -> do
+                (first, cur2) <- parseSubPat cur
+                gatherListPat [first] cur2
+
+    gatherListPat acc cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkComma -> do
+                (p, cur2) <- parseSubPat cur1
+                gatherListPat (p : acc) cur2
+            TkRBracket ->
+                let build []     = PCon "[]" []
+                    build (p:ps) = PCon ":" [p, build ps]
+                in pure (build (reverse acc), cur1)
+            _ -> parseErr "expected `,` or `]` in list pattern" tok
 
     simplePat tok cur1 = case tkKind tok of
         TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
+        TkChar c     -> pure (PLit (LChar c), cur1)
         TkUnderscore -> pure (PWild, cur1)
         TkIdent n    -> pure (PVar n, cur1)
         _ -> parseErr "expected pattern (Int, String, _, ident, or constructor) in case alt" tok
@@ -342,7 +392,7 @@ parseCase ctx cur0 = do
 -- Operator precedence
 --------------------------------------------------------------------------------
 
-parseOr, parseAnd, parseRel, parseSum, parseTerm, parseApp, parseAtom
+parseOr, parseAnd, parseRel, parseCons, parseSum, parseTerm, parseApp, parseAtom
     :: Ctx -> Cursor -> IO (Expr, Cursor)
 
 parseOr  ctx c = chain1L ctx c parseAnd "||" matchesOr
@@ -351,7 +401,7 @@ parseAnd ctx c = chain1L ctx c parseRel "&&" matchesAnd
   where matchesAnd TkAnd = True; matchesAnd _ = False
 
 parseRel ctx cur0 = do
-    (l, cur1) <- parseSum ctx cur0
+    (l, cur1) <- parseCons ctx cur0
     let (tok, curN) = nextSig ctx cur1
     case tkKind tok of
         TkLe   -> binApp "<="  curN l
@@ -363,8 +413,20 @@ parseRel ctx cur0 = do
         _      -> pure (l, cur1)
   where
     binApp opName cur l = do
-        (r, cur') <- parseSum ctx cur
+        (r, cur') <- parseCons ctx cur
         pure (EApp (EApp (EVar opName) l) r, cur')
+
+-- Cons `:` is right-associative, Haskell precedence 5 (above +,- and ++).
+-- Parse sums, then if we see `:`, recursively parse the right-hand side
+-- at the same level to get right-associativity.
+parseCons ctx cur0 = do
+    (l, cur1) <- parseSum ctx cur0
+    let (tok, curN) = nextSig ctx cur1
+    case tkKind tok of
+        TkColon -> do
+            (r, cur') <- parseCons ctx curN
+            pure (EApp (EApp (EVar ":") l) r, cur')
+        _ -> pure (l, cur1)
 
 parseSum ctx cur0 = do
     (l, cur1) <- parseTerm ctx cur0
@@ -412,7 +474,9 @@ parseApp ctx cur0 = do
 
     startsAtom TkInt{}        = True
     startsAtom TkStr{}        = True
+    startsAtom TkChar{}       = True
     startsAtom TkLParen       = True
+    startsAtom TkLBracket     = True
     startsAtom TkIdent{}      = True
     startsAtom TkConId{}      = True
     startsAtom _              = False
@@ -421,22 +485,69 @@ parseAtom ctx cur0 = do
     let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
         TkInt n  -> pure (ELit (LInt (fromInteger n)), cur1)
-        TkStr s  -> pure (ELit (LStr s), cur1)
+        TkStr s  -> pure (stringToConsList (BC.unpack s), cur1)
+        TkChar c -> pure (ELit (LChar c), cur1)
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
         TkConId n -> pure (EVar n, cur1)
         TkLParen -> do
-            (e, cur2) <- parseExpr ctx cur1
-            let (close, cur3) = nextSig ctx cur2
-            case tkKind close of
-                TkRParen -> pure (e, cur3)
-                _        -> parseErr "expected `)`" close
+            -- Special case: "(:)" as a section for the cons operator.
+            let (peekTok, afterPeek) = nextSig ctx cur1
+            case tkKind peekTok of
+                TkColon ->
+                    let (close, cur3) = nextSig ctx afterPeek in
+                    case tkKind close of
+                        TkRParen -> pure (EVar ":", cur3)
+                        _        -> do
+                            (e, cur2) <- parseExpr ctx cur1
+                            let (close', cur3') = nextSig ctx cur2
+                            case tkKind close' of
+                                TkRParen -> pure (e, cur3')
+                                _        -> parseErr "expected `)`" close'
+                _ -> do
+                    (e, cur2) <- parseExpr ctx cur1
+                    let (close, cur3) = nextSig ctx cur2
+                    case tkKind close of
+                        TkRParen -> pure (e, cur3)
+                        _        -> parseErr "expected `)`" close
+        TkLBracket -> parseListLit ctx cur1
         TkMinus -> do
             (e, cur2) <- parseAtom ctx cur1
             pure (ENeg e, cur2)
         TkEof -> throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
         _ -> parseErr "unexpected token" tok
+
+-- | Desugar a string literal into a chain of cons/nil applications.
+-- "Hi" becomes @'H' : 'i' : []@ i.e. @EApp (EApp (EVar ":") (ELit (LChar 'H'))) (...)@.
+stringToConsList :: String -> Expr
+stringToConsList []     = EVar "[]"
+stringToConsList (c:cs) = EApp (EApp (EVar ":") (ELit (LChar c))) (stringToConsList cs)
+
+-- | Parse a list literal @[e1, e2, ..., en]@. The opening @[@ has
+-- already been consumed; we start at the first element (or @]@ for
+-- the empty list). Desugars to a chain of cons: @[a,b] ~~> a : b : []@.
+parseListLit :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseListLit ctx cur0 = do
+    let (tok, cur1) = nextSig ctx cur0
+    case tkKind tok of
+        TkRBracket -> pure (EVar "[]", cur1)
+        _ -> do
+            (first, cur2) <- parseExpr ctx cur0
+            gather [first] cur2
+  where
+    gather acc cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkComma -> do
+                (e, cur2) <- parseExpr ctx cur1
+                gather (e : acc) cur2
+            TkRBracket -> pure (buildCons (reverse acc), cur1)
+            _ -> parseErr "expected `,` or `]` in list literal" tok
+
+    buildCons :: [Expr] -> Expr
+    buildCons []     = EVar "[]"
+    buildCons (e:es) = EApp (EApp (EVar ":") e) (buildCons es)
 
 chain1L :: Ctx -> Cursor
         -> (Ctx -> Cursor -> IO (Expr, Cursor))

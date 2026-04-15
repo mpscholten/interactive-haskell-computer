@@ -53,6 +53,7 @@ data Pat
     deriving (Eq, Show)
 
 data Lit
-    = LInt !Int64
-    | LStr !ByteString
+    = LInt  !Int64
+    | LStr  !ByteString
+    | LChar !Char
     deriving (Eq, Show)

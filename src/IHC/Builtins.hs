@@ -16,6 +16,7 @@ module IHC.Builtins
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Int (Int64)
+import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import System.IO (hFlush, stdout)
 
@@ -25,11 +26,23 @@ import IHC.Scan (DataRegistry)
 import IHC.Val
 
 -- | Build the initial environment containing every well-known name.
+--
+-- This also registers the built-in list constructors @[]@ and @(:)@
+-- — lists are Phase 2.2's first taste of a built-in ADT. We treat
+-- them exactly like user-declared constructors from 'buildConEnv':
+-- arity-0 nil is a bare @VCon "[]" []@; arity-2 cons is a curried
+-- function that accumulates two thunks and returns @VCon ":" [h, t]@.
 builtinEnv :: IO Env
 builtinEnv = do
     pairs <- mapM (\(n, mkV) -> do { v <- mkV; t <- newWHNFThunk v; pure (n, t) })
                   builtins
-    pure (extendEnvMany pairs emptyEnv)
+    -- Built-in list constructors.
+    nilT  <- newWHNFThunk (VCon "[]" [])
+    consT <- newWHNFThunk consV
+    let listCtors = [("[]", nilT), (":", consT)]
+    pure (extendEnvMany (pairs ++ listCtors) emptyEnv)
+  where
+    consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
 
 builtins :: [(Name, IO Val)]
 builtins =
@@ -60,12 +73,13 @@ builtins =
     -- Boolean (bitwise on 0/1 values until real Bool)
     , ("&&",       binOpInt (\a b -> if a /= 0 && b /= 0 then 1 else 0))
     , ("||",       binOpInt (\a b -> if a /= 0 || b /= 0 then 1 else 0))
-    -- Strings
-    , ("++",       strConcat)
-    , ("show",     showInt)
-    , ("length",   lengthStr)
+    -- Strings / lists (strings are [Char] from Phase 2.2 onward)
+    , ("++",       listConcat)
+    , ("show",     showB)
+    , ("length",   lengthB)
     -- IO
     , ("putStrLn", putStrLnB)
+    , ("putStr",   putStrB)
     , ("print",    printB)
     , ("putChar",  putCharB)
     , ("getLine",  getLineB)
@@ -103,51 +117,163 @@ cmpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
                     <> showValForDebug av <> ", " <> showValForDebug bv)
 
 --------------------------------------------------------------------------------
--- Strings (raw ByteString for now; replaced by [Char] in Phase 2.2)
+-- Lists as user-facing strings / generic containers
+--
+-- In Phase 2.2 a string literal desugars to a cons-chain of VChar, so
+-- "Hi" is @VCon ":" [VChar 'H', VCon ":" [VChar 'i', VCon "[]" []]]@.
+-- The built-ins below walk such chains explicitly. We keep a VStr
+-- fallback so the transition is gradual — some legacy code paths may
+-- still produce VStr, and the list builtins accept it.
 --------------------------------------------------------------------------------
 
-strConcat :: IO Val
-strConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
-    case (av, bv) of
-        (VStr x, VStr y) -> pure (VStr (x <> y))
-        _ -> error ("(++): non-string args: "
-                    <> showValForDebug av <> ", " <> showValForDebug bv)
+-- | Force a cons-list all the way to @[]@ and collect its elements as
+-- WHNF 'Val's. Each element is forced before being returned.
+forceList :: Val -> IO [Val]
+forceList (VCon "[]" _) = pure []
+forceList (VCon ":"  [h, t]) = do
+    hv <- force h
+    tv <- force t
+    rest <- forceList tv
+    pure (hv : rest)
+forceList other =
+    error ("forceList: not a list: " <> showValForDebug other)
 
-showInt :: IO Val
-showInt = pure $ VFun $ \a -> do
+-- | Force a @[Char]@ value down to a host 'String'. Accepts either a
+-- cons-chain of VChar or a transitional VStr.
+valToString :: Val -> IO String
+valToString (VStr s) = pure (BC.unpack s)
+valToString v = do
+    xs <- forceList v
+    mapM extractChar xs
+  where
+    extractChar (VChar c) = pure c
+    extractChar (VInt  n) = pure (toEnum (fromIntegral n))  -- tolerate mixed use
+    extractChar other =
+        error ("expected Char in [Char]: " <> showValForDebug other)
+
+-- | Is this WHNF value a @[Char]@? Used to decide whether to render a
+-- list as a double-quoted string or with the @[a,b,c]@ syntax.
+isCharList :: Val -> IO Bool
+isCharList (VStr _) = pure True
+isCharList (VCon "[]" _) = pure True
+isCharList (VCon ":"  [h, _]) = do
+    hv <- force h
+    case hv of
+        VChar _ -> pure True
+        _       -> pure False
+isCharList _ = pure False
+
+-- | Render any supported WHNF value as the Haskell @show@ of it.
+showVal :: Val -> IO String
+showVal (VInt n)    = pure (show n)
+showVal (VChar c)   = pure (show c)
+showVal VUnit       = pure "()"
+showVal v@(VCon "[]" _) = pure "[]"
+showVal v@(VCon ":" _) = do
+    cl <- isCharList v
+    if cl
+        then do s <- valToString v; pure (show s)
+        else do
+            xs <- forceList v
+            parts <- mapM showVal xs
+            pure ("[" <> intercalate "," parts <> "]")
+showVal (VStr s)    = pure (show (BC.unpack s))
+showVal (VCon name thunks) = do
+    parts <- mapM (\t -> do v <- force t; showVal v) thunks
+    case parts of
+        [] -> pure (BC.unpack name)
+        _  -> pure (BC.unpack name <> " " <> unwords parts)
+showVal (VFun _)    = pure "<function>"
+
+-- | @xs ++ ys@ as a list concat. For VStr+VStr the fast path uses
+-- ByteString concat. For cons-lists we walk the spine of @xs@,
+-- forcing each cons (but NOT the head elements), and reuse the
+-- original @ys@ thunk as the final tail — so elements stay lazy.
+listConcat :: IO Val
+listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     case av of
-        VInt n -> pure (VStr (BC.pack (show n)))
-        VStr s -> pure (VStr (BC.pack (show (BC.unpack s))))
-        _ -> error ("show: unsupported value: " <> showValForDebug av)
+        VStr x -> do
+            bv <- force b
+            case bv of
+                VStr y -> pure (VStr (x <> y))
+                _ -> do
+                    -- VStr ++ [Char]: promote and chain.
+                    listV <- stringToListValIO (BC.unpack x)
+                    appendVal listV b
+        _ -> appendVal av b
+  where
+    appendVal :: Val -> Thunk -> IO Val
+    appendVal (VCon "[]" _)     bT = force bT
+    appendVal (VCon ":" [h, t]) bT = do
+        -- Force the tail's spine lazily on demand: we create a WHNF
+        -- thunk whose value is the recursive append on the next cons.
+        tv    <- force t
+        rv    <- appendVal tv bT
+        restT <- newWHNFThunk rv
+        pure (VCon ":" [h, restT])
+    appendVal other _ =
+        error ("(++): not a list: " <> showValForDebug other)
 
-lengthStr :: IO Val
-lengthStr = pure $ VFun $ \a -> do
+-- | Polymorphic-ish @show@: Int, Char, [Char], or generic list / constructor.
+showB :: IO Val
+showB = pure $ VFun $ \a -> do
     av <- force a
-    case av of
-        VStr s -> pure (VInt (fromIntegral (BC.length s)))
-        _ -> error ("length: not a string: " <> showValForDebug av)
+    s  <- showVal av
+    stringToListValIO s
+
+-- | Build a cons-chain of VChar from a host 'String' (in IO — needs
+-- to allocate thunks).
+stringToListValIO :: String -> IO Val
+stringToListValIO []     = pure (VCon "[]" [])
+stringToListValIO (c:cs) = do
+    hT   <- newWHNFThunk (VChar c)
+    restV <- stringToListValIO cs
+    tT   <- newWHNFThunk restV
+    pure (VCon ":" [hT, tT])
+
+-- | Generic @length@ — walks the spine of a list, forcing each cons
+-- but not the elements.
+lengthB :: IO Val
+lengthB = pure $ VFun $ \a -> do
+    av <- force a
+    n  <- go av 0
+    pure (VInt n)
+  where
+    go (VStr s) !acc = pure (acc + fromIntegral (BC.length s))
+    go (VCon "[]" _) !acc = pure acc
+    go (VCon ":" [_, t]) !acc = do
+        tv <- force t
+        go tv (acc + 1)
+    go other _ = error ("length: not a list: " <> showValForDebug other)
 
 --------------------------------------------------------------------------------
 -- IO
 --------------------------------------------------------------------------------
 
+-- | Write a @[Char]@ plus newline. Accepts either a cons-chain of
+-- VChar or a transitional VStr.
 putStrLnB :: IO Val
 putStrLnB = pure $ VFun $ \a -> do
     av <- force a
-    case av of
-        VStr s -> do
-            BC.putStrLn s
-            hFlush stdout
-            pure VUnit
-        _ -> error ("putStrLn: not a string: " <> showValForDebug av)
+    s  <- valToString av
+    putStrLn s
+    hFlush stdout
+    pure VUnit
+
+putStrB :: IO Val
+putStrB = pure $ VFun $ \a -> do
+    av <- force a
+    s  <- valToString av
+    putStr s
+    hFlush stdout
+    pure VUnit
 
 printB :: IO Val
 printB = pure $ VFun $ \a -> do
     av <- force a
-    putStrLn (case av of VInt n -> show n; v -> showValForDebug v)
+    s  <- showVal av
+    putStrLn s
     hFlush stdout
     pure VUnit
 
@@ -155,22 +281,22 @@ putCharB :: IO Val
 putCharB = pure $ VFun $ \a -> do
     av <- force a
     case av of
-        VInt c -> do { putChar (toEnum (fromIntegral c)); hFlush stdout; pure VUnit }
-        _ -> error ("putChar: not an Int: " <> showValForDebug av)
+        VChar c -> do { putChar c; hFlush stdout; pure VUnit }
+        VInt c  -> do { putChar (toEnum (fromIntegral c)); hFlush stdout; pure VUnit }
+        _ -> error ("putChar: not a Char: " <> showValForDebug av)
 
 getLineB :: IO Val
 getLineB = pure $ VFun $ \_ -> do
     -- Note: takes a dummy arg in Phase-1's convention. We'll fix when
     -- proper IO actions arrive in Phase 2.4.
     s <- getLine
-    pure (VStr (BC.pack s))
+    stringToListValIO s
 
 errorB :: IO Val
 errorB = pure $ VFun $ \a -> do
     av <- force a
-    case av of
-        VStr s -> error ("ihc: " <> BC.unpack s)
-        _      -> error ("ihc: error called with non-string")
+    s  <- valToString av
+    error ("ihc: " <> s)
 
 --------------------------------------------------------------------------------
 -- User-defined constructors

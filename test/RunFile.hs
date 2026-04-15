@@ -242,3 +242,44 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/adt_combined.hs")
         n   `shouldBe` 0
         out `shouldBe` "99\n42\n2\n"
+
+    -- Phase 2.2: lists, string literals as [Char], list patterns.
+    it "list via explicit cons: 1 : 2 : 3 : [] prints as [1,2,3]" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/list_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[1,2,3]\n"
+
+    it "list-literal sugar: [1,2,3,4,5] prints as [1,2,3,4,5]" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/list_sugar.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[1,2,3,4,5]\n"
+
+    it "list pattern match: sumList [1,2,3,4,5] = 15" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/list_pattern.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "15\n"
+
+    it "string is [Char]: putStrLn \"Hi\" prints Hi" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/string_as_chars.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hi\n"
+
+    it "take on a list: take 3 [10,20,30,40,50] = [10,20,30]" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/take_drop.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[10,20,30]\n"
+
+    it "string (++) on [Char] lists concatenates and prints" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/string_concat.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, world!\nanswer = 42\n"
+
+    it "length on lists and strings" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/list_length.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "5\n0\n5\n"
+
+    it "char literal + putChar + escape" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/char_literal.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hi\n"

@@ -49,8 +49,9 @@ force t = do
 eval :: Env -> Expr -> IO Val
 eval env = go
   where
-    go (ELit (LInt n)) = pure (VInt n)
-    go (ELit (LStr s)) = pure (VStr s)
+    go (ELit (LInt n))  = pure (VInt n)
+    go (ELit (LStr s))  = pure (VStr s)
+    go (ELit (LChar c)) = pure (VChar c)
 
     go (EVar name) = case lookupEnv name env of
         Just t  -> force t
@@ -145,6 +146,10 @@ matchPat (PLit (LStr s)) (VStr t)
     | s == t    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LStr _)) _       = pure Nothing
+matchPat (PLit (LChar c)) (VChar d)
+    | c == d    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LChar _)) _      = pure Nothing
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For
