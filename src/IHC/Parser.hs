@@ -695,17 +695,30 @@ wrapParams ps body = foldr wrap body ps
 
 parseLet :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseLet ctx cur0 = do
+    -- Phase 3.6: peek whether this is an implicit-param let (?x = ...).
     let (firstTok, curAfter) = nextSig ctx cur0
-    (binds, curEnd) <- case tkKind firstTok of
-        TkLBrace -> bracedBinds curAfter []
-        _        -> singleBind cur0
-    let (inTok, curIn) = nextSig ctx curEnd
-    case tkKind inTok of
-        TkIn -> pure ()
-        _    -> parseErr "expected `in` in let-binding" inTok
-    (body, curBody) <- parseExpr ctx curIn
-    pure (ELet binds body, curBody)
+    case tkKind firstTok of
+        TkImplicitRef _ -> parseImplicitLet ctx cur0
+        TkLBrace -> do
+            -- Could be braced implicit or regular. Peek inside.
+            let (peek, _) = nextSig ctx curAfter
+            case tkKind peek of
+                TkImplicitRef _ -> parseImplicitLet ctx cur0
+                _               -> do
+                    (binds, curEnd) <- bracedBinds curAfter []
+                    finishLet binds curEnd
+        _ -> do
+            (binds, curEnd) <- singleBind cur0
+            finishLet binds curEnd
   where
+    finishLet binds curEnd = do
+        let (inTok, curIn) = nextSig ctx curEnd
+        case tkKind inTok of
+            TkIn -> pure ()
+            _    -> parseErr "expected `in` in let-binding" inTok
+        (body, curBody) <- parseExpr ctx curIn
+        pure (ELet binds body, curBody)
+
     singleBind cur = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
@@ -736,6 +749,53 @@ parseLet ctx cur0 = do
             TkSemi   -> bracedBinds curN ((name, wrapParams params e) : acc)
             TkRBrace -> pure (reverse ((name, wrapParams params e) : acc), curN)
             _        -> parseErr "expected `;` or `}` in let-block" sep
+
+-- | Parse @let ?x = e; ?y = f in body@ — one or more implicit-param
+-- bindings followed by @in body@. Produces 'EImplicitLet'.
+--
+-- Grammar (layout or explicit braces both work):
+--   let { ?x = e ; ?y = f } in body
+--   let ?x = e in body
+parseImplicitLet :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseImplicitLet ctx cur0 = do
+    let (firstTok, curAfter) = nextSig ctx cur0
+    (iBinds, curEnd) <- case tkKind firstTok of
+        TkLBrace -> bracedIPBinds curAfter []
+        _        -> singleIPBind cur0
+    let (inTok, curIn) = nextSig ctx curEnd
+    case tkKind inTok of
+        TkIn -> pure ()
+        _    -> parseErr "expected `in` after implicit let" inTok
+    (body, curBody) <- parseExpr ctx curIn
+    pure (EImplicitLet iBinds body, curBody)
+  where
+    singleIPBind cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _               -> parseErr "expected `?name` in implicit let" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in implicit let" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        pure ([(name, e)], cur3)
+
+    bracedIPBinds cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _               -> parseErr "expected `?name` in implicit let" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in implicit let" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let (sep, curN) = nextSig ctx cur3
+        case tkKind sep of
+            TkSemi   -> bracedIPBinds curN ((name, e) : acc)
+            TkRBrace -> pure (reverse ((name, e) : acc), curN)
+            _        -> parseErr "expected `;` or `}` in implicit let" sep
 
 parseCase :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseCase ctx cur0 = do
@@ -1059,17 +1119,18 @@ parseApp ctx cur0 = do
             else pure (fn, cur)
 
 startsAtom :: TokenKind -> Bool
-startsAtom TkInt{}    = True
-startsAtom TkFloat{}  = True
-startsAtom TkStr{}    = True
-startsAtom TkChar{}   = True
-startsAtom TkLParen   = True
-startsAtom TkLBracket = True
-startsAtom TkIdent{}  = True
-startsAtom TkConId{}  = True
-startsAtom TkPrimId{} = True
-startsAtom TkLUnbox   = True
-startsAtom _          = False
+startsAtom TkInt{}         = True
+startsAtom TkFloat{}       = True
+startsAtom TkStr{}         = True
+startsAtom TkChar{}        = True
+startsAtom TkLParen        = True
+startsAtom TkLBracket      = True
+startsAtom TkIdent{}       = True
+startsAtom TkConId{}       = True
+startsAtom TkPrimId{}      = True
+startsAtom TkLUnbox        = True
+startsAtom TkImplicitRef{} = True  -- Phase 3.6: ?name can start an atom
+startsAtom _               = False
 
 --------------------------------------------------------------------------------
 -- Atoms
@@ -1083,12 +1144,22 @@ parseAtom ctx cur0 = do
         TkFloat d  -> pure (ELit (LFloat d), cur1)
         TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
+        -- Phase 3.6: ?name in expression position -> implicit parameter reference
+        TkImplicitRef n -> pure (EImplicitRef n, cur1)
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
         TkPrimId n -> pure (EVar n, cur1)
-        TkConId n ->
-            tryQualified ctx n tok cur1
+        TkConId n -> do
+            -- Check for record construction: Con { f1 = v1, f2 = v2 }
+            (qexpr, qcur) <- tryQualified ctx n tok cur1
+            case (qexpr, peekByte (ctxSrc ctx) (cPos qcur)) of
+                (EVar qname, Just 0x7B) -> do  -- '{'
+                    -- Record literal: parse { f1 = e1, f2 = e2, ... }
+                    let (_, curBrace) = nextToken (ctxSrc ctx) qcur
+                    (fields, curEnd) <- parseRecordFields ctx curBrace []
+                    pure (ERecordCon qname fields, curEnd)
+                _ -> pure (qexpr, qcur)
         TkLParen   -> parseParenExpr ctx tok cur1
         TkLUnbox   -> parseUnboxedTuple ctx cur1
         TkLBracket -> parseListLit ctx cur1
@@ -1205,6 +1276,24 @@ gatherTupleExpr ctx cur acc = do
         TkComma  -> gatherTupleExpr ctx cur2 (e : acc)
         TkRParen -> pure (reverse (e : acc), cur2)
         _        -> parseErr "expected `,` or `)` in tuple" sep
+
+-- | Parse a record-field list @{ f1 = e1, f2 = e2, ... }@. The opening
+-- @{@ has already been consumed. Returns the fields and cursor after @}@.
+parseRecordFields :: Ctx -> Cursor -> [(Name, Expr)] -> IO ([(Name, Expr)], Cursor)
+parseRecordFields ctx cur acc = do
+    let (tok, cur') = nextSig ctx cur
+    case tkKind tok of
+        TkRBrace -> pure (reverse acc, cur')
+        TkComma  -> parseRecordFields ctx cur' acc
+        TkIdent fname -> do
+            let (eqTok, cur2) = nextSig ctx cur'
+            case tkKind eqTok of
+                TkEq -> do
+                    (e, cur3) <- parseExpr ctx cur2
+                    parseRecordFields ctx cur3 ((fname, e) : acc)
+                _ -> parseErr "expected `=` in record field" eqTok
+        TkEof -> pure (reverse acc, cur')
+        _ -> parseErr "expected field name or `}` in record literal" tok
 
 parseUnboxedTuple :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseUnboxedTuple ctx cur0 = do

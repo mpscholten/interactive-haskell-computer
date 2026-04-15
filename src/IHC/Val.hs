@@ -32,6 +32,9 @@ module IHC.Val
     , PatternMatchFail(..)
     ) where
 
+import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar (MVar)
+import Control.Concurrent.STM (TVar)
 import Control.Exception (Exception)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
@@ -103,6 +106,20 @@ data ThunkState
     = Unevaluated !Closure
     | Evaluated   !Val
     | BlackHole                         -- entered, not yet returned
+
+-- | Map of implicit-parameter names (@?x@) to thunks, threaded through
+-- closures for lexical scoping. Empty for most code; non-empty only when
+-- an @ImplicitParams@ binding is in scope.
+type ImplicitParamMap = Map Name Thunk
+
+emptyIPMap :: ImplicitParamMap
+emptyIPMap = Map.empty
+
+extendIPMap :: Name -> Thunk -> ImplicitParamMap -> ImplicitParamMap
+extendIPMap = Map.insert
+
+lookupIPMap :: Name -> ImplicitParamMap -> Maybe Thunk
+lookupIPMap = Map.lookup
 
 -- | A closure captures both the regular environment and the implicit-param
 -- map at the point of its creation (lexical scoping for both).

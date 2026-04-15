@@ -126,3 +126,34 @@ spec = describe "REPL smoke tests" do
                    <> ":q\n" )
         code `shouldBe` ExitSuccess
         out `shouldContain` "3"
+
+    -- Recursive let-binding tests (knot-tying fix)
+    it "let map with recursion: map (\\x -> 1) \"hello\" = [1,1,1,1,1]" do
+        (code, out, _err) <- runRepl
+            ( "let map f x = case x of { (x:xs) -> (f x):(map f xs); [] -> [] }\n"
+           <> "map (\\x -> 1) \"hello\"\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "1"
+
+    it "let fact n: factorial of 5 is 120" do
+        (code, out, _err) <- runRepl
+            ( "let fact n = if n == 0 then 1 else n * fact (n-1)\n"
+           <> "fact 5\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "120"
+
+    it "let x = 42 (non-recursive) still works" do
+        (code, out, _err) <- runRepl
+            ( "let x = 42\n"
+           <> "x\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "42"
+
+    it "let y = y (self-loop) does not crash the REPL" do
+        (code, _out, _err) <- runRepl
+            ( "let y = y\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess

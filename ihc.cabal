@@ -65,6 +65,7 @@ library
       , filepath         >= 1.4
       , haskeline        >= 0.8
       , process          >= 1.6
+      , stm              >= 2.5
       , text             >= 2.0
 
     c-sources:

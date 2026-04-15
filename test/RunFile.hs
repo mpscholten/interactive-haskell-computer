@@ -569,3 +569,31 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
       where
         isSubstring needle haystack =
             any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
+
+    --------------------------------------------------------------------
+    -- OverloadedRecordDot
+    --------------------------------------------------------------------
+    it "record dot: p.name and p.age on a record-syntax ADT" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Alice\n30\n"
+
+    it "record dot: chained x.a.b.c two-level access" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/chained.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Berlin\n"
+
+    it "record dot: (.age) section used in map" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/section.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[30,25]\n"
+
+    it "record dot: f . g with spaces is still composition (regression)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/does_not_regress_compose.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "10\n"
+
+    it "record dot: p.name inside a larger expression (++ greet)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/in_expr.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, Alice!\n"

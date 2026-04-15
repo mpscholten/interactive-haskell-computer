@@ -41,6 +41,7 @@ data Expr
     | ETuple ![Expr]                    -- (a, b, ...) tuple (Phase 2.6)
     | EImplicitRef  !Name              -- ?name reference (Phase 3.6)
     | EImplicitLet  ![(Name, Expr)] !Expr -- let ?x = e in body (Phase 3.6)
+    | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

@@ -3,13 +3,17 @@
 -- Three primitive operations:
 --
 -- * @force :: Thunk -> IO Val@        — drive a thunk to WHNF.
--- * @eval  :: Env -> Expr -> IO Val@  — evaluate an expression to WHNF.
+-- * @eval  :: Env -> ImplicitParamMap -> Expr -> IO Val@  — evaluate an expression to WHNF.
 -- * @apply :: Val -> Thunk -> IO Val@ — apply a function-value to a thunk-arg.
 --
 -- Laziness is maintained because every place an Expr could be passed
 -- as an argument or stored in a binding, we wrap it in a fresh
 -- 'Thunk' instead. The thunk evaluates at most once, courtesy of the
 -- BlackHole protocol.
+--
+-- Phase 3.6: ImplicitParamMap is threaded alongside Env. Implicit params
+-- (?x) live in a separate namespace; closures capture the map at creation
+-- time (lexical scoping).
 module IHC.Eval
     ( eval
     , force
@@ -36,9 +40,9 @@ force t = do
     case st of
         Evaluated v -> pure v
         BlackHole   -> throwIO LoopException
-        Unevaluated (Closure env expr) -> do
+        Unevaluated (Closure env ipm expr) -> do
             writeIORef t BlackHole
-            v <- eval env expr
+            v <- eval env ipm expr
             writeIORef t (Evaluated v)
             pure v
 
@@ -46,8 +50,8 @@ force t = do
 -- eval
 --------------------------------------------------------------------------------
 
-eval :: Env -> Expr -> IO Val
-eval env = go
+eval :: Env -> ImplicitParamMap -> Expr -> IO Val
+eval env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
     go (ELit (LFloat d)) = pure (VFloat d)
@@ -59,13 +63,15 @@ eval env = go
         Nothing -> error ("IHC.Eval: unbound variable `" <> BC.unpack name <> "`")
 
     go (EApp f x) = do
-        fv  <- go f                       -- function to WHNF
-        xt  <- newThunk env x             -- argument stays a thunk (lazy)
+        fv  <- go f                            -- function to WHNF
+        xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
         apply fv xt
 
     go (ELam name body) =
+        -- Capture the current implicit-param map in the closure so that
+        -- ?x references inside the lambda see the lexical binding.
         pure $ VFun $ \argThunk ->
-            eval (extendEnv name argThunk env) body
+            eval (extendEnv name argThunk env) ipm body
 
     go (ELet binds body) = do
         -- Recursive group: pre-allocate a thunk per binding holding a
@@ -79,9 +85,9 @@ eval env = go
         let names  = map fst binds
             env'   = extendEnvMany (zip names slots) env
         mapM_ (\((_, rhs), slot) ->
-                   writeIORef slot (Unevaluated (Closure env' rhs)))
+                   writeIORef slot (Unevaluated (Closure env' ipm rhs)))
               (zip binds slots)
-        eval env' body
+        eval env' ipm body
 
     go (ECase scrut alts) = do
         v <- go scrut
@@ -109,10 +115,36 @@ eval env = go
         -- Build the right tuple constructor name for this arity.
         let arity = length es
             name  = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
-        thunks <- mapM (newThunk env) es
+        thunks <- mapM (newThunkIP env ipm) es
         pure (VCon name thunks)
 
-    go (EDo stmts) = evalDo env stmts
+    go (EDo stmts) = evalDo env ipm stmts
+
+    -- Phase 3.6: Implicit parameter reference.
+    -- Look up ?name in the current ImplicitParamMap. Miss -> runtime error.
+    go (EImplicitRef name) = case lookupIPMap name ipm of
+        Just t  -> force t
+        Nothing -> error ("IHC.Eval: implicit parameter `?"
+                          <> BC.unpack name <> "` is not in scope")
+
+    -- Phase 3.6: Implicit parameter let-binding.
+    -- Extend the implicit-param map for the duration of @body@.
+    -- Each binding thunk captures the CURRENT env+ipm (not the extended ipm').
+    go (EImplicitLet binds body) = do
+        slots <- mapM (\_ -> newIORef BlackHole) binds
+        let names = map fst binds
+            ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
+                          (zip names slots)
+        mapM_ (\((_, rhs), slot) ->
+                   writeIORef slot (Unevaluated (Closure env ipm rhs)))
+              (zip binds slots)
+        eval env ipm' body
+
+    -- Record construction: Con { f1 = e1, f2 = e2, ... }
+    -- We ignore field names and build a positional VCon.
+    go (ERecordCon name fields) = do
+        thunks <- mapM (\(_, e) -> newThunkIP env ipm e) fields
+        pure (VCon name thunks)
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
@@ -122,7 +154,7 @@ eval env = go
         m <- matchPat pat v
         case m of
             Just bindings ->
-                eval (extendEnvMany bindings env) body
+                eval (extendEnvMany bindings env) ipm body
             Nothing -> tryAlts v rest
 
 -- | Try to match a pattern against a (already-WHNF) value. Returns
@@ -134,7 +166,7 @@ eval env = go
 matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
 matchPat PWild        _          = pure (Just [])
 matchPat (PVar n)     v          = do
-    -- The value is already WHNF — bind it directly to a WHNF thunk.
+    -- The value is already WHNF -- bind it directly to a WHNF thunk.
     -- (This is the cheapest way; we don't have the original thunk
     -- here since the caller forced it before calling matchPat.)
     t <- newWHNFThunk v
@@ -178,7 +210,7 @@ matchPat (PCon name pats) (VCon vname vthunks)
         -- Zip sub-patterns with the constructor's field thunks. For
         -- each pair: if the sub-pattern is a 'PVar' we bind the name
         -- directly to the existing field thunk (preserving sharing
-        -- and laziness — we never force the field). For any other
+        -- and laziness -- we never force the field). For any other
         -- sub-pattern we MUST force the thunk to pattern-match its
         -- structure, then recurse.
         matchFields (zip pats vthunks) []
@@ -214,54 +246,54 @@ apply v        _   = error ("IHC.Eval.apply: not a function: "
 -- earlier 'SBind' / 'SLet' stmts.
 --
 -- Semantics:
---   []               — empty do is a no-op IO, per GHC, but we never
+--   []               -- empty do is a no-op IO, per GHC, but we never
 --                      parse one. Still handle defensively.
---   [SExpr e]        — evaluating @e@ must yield a 'VIO' (the action),
+--   [SExpr e]        -- evaluating @e@ must yield a 'VIO' (the action),
 --                      and that action is the whole do-block's value.
---   SExpr e : rest   — sequence: run the action from @e@, discard its
+--   SExpr e : rest   -- sequence: run the action from @e@, discard its
 --                      result, then run the rest.
---   SBind x e : rest — run the action from @e@, bind its result to @x@,
+--   SBind x e : rest -- run the action from @e@, bind its result to @x@,
 --                      then run the rest in the extended env.
---   SLet bs : rest   — semantically @let bs in <rest as EDo>@; just
+--   SLet bs : rest   -- semantically @let bs in <rest as EDo>@; just
 --                      extend the env (lazy recursive group) and
 --                      recurse.
 --------------------------------------------------------------------------------
 
-evalDo :: Env -> [Stmt] -> IO Val
-evalDo _   []              = pure (VIO (pure VUnit))
-evalDo env [SExpr e]       = eval env e
-evalDo env [SBind _ e]     =
+evalDo :: Env -> ImplicitParamMap -> [Stmt] -> IO Val
+evalDo _   _   []              = pure (VIO (pure VUnit))
+evalDo env ipm [SExpr e]       = eval env ipm e
+evalDo env ipm [SBind _ e]     =
     -- Haskell forbids a do-block to end in a bind statement, but be
     -- defensive: evaluate the action and return its value directly.
-    eval env e
-evalDo _   [SLet _]        = pure (VIO (pure VUnit))
-evalDo env (SExpr e : rest) =
+    eval env ipm e
+evalDo _   _   [SLet _]        = pure (VIO (pure VUnit))
+evalDo env ipm (SExpr e : rest) =
     pure $ VIO $ do
-        mv <- eval env e
+        mv <- eval env ipm e
         _  <- runIOVal mv                   -- run and discard
-        restV <- evalDo env rest
+        restV <- evalDo env ipm rest
         runIOVal restV
-evalDo env (SBind name e : rest) =
+evalDo env ipm (SBind name e : rest) =
     pure $ VIO $ do
-        mv <- eval env e
+        mv <- eval env ipm e
         v  <- runIOVal mv
         vT <- newWHNFThunk v
         let env' = extendEnv name vT env
-        restV <- evalDo env' rest
+        restV <- evalDo env' ipm rest
         runIOVal restV
-evalDo env (SLet bs : rest) = do
+evalDo env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
     slots <- mapM (\_ -> newIORef BlackHole) bs
     let names = map fst bs
         env'  = extendEnvMany (zip names slots) env
     mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure env' rhs)))
+               writeIORef slot (Unevaluated (Closure env' ipm rhs)))
           (zip bs slots)
-    evalDo env' rest
+    evalDo env' ipm rest
 
 -- | Force a 'VIO' to execute its suspended action. Any other value
--- is returned as-is (treated as a "pure" IO result — shouldn't happen
+-- is returned as-is (treated as a "pure" IO result -- shouldn't happen
 -- in well-typed code, but we're optimistic and permissive).
 runIOVal :: Val -> IO Val
 runIOVal (VIO io) = io >>= runIOVal

@@ -8,7 +8,7 @@
 -- persist in subsequent inputs.
 module IHC.Repl (runRepl) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, throwIO, try)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -34,7 +34,7 @@ import IHC.Eval (eval, force)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
-import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..))
+import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
 import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
 import IHC.Source (mkSource, readSourceFile, Source(..), srcBytes)
 import IHC.TypeDescribe (describeType)
@@ -135,7 +135,7 @@ doTypeOf envRef expr = do
 -- IO actions are NOT executed — we stop at the first 'VIO' and report "IO a".
 typeOfExpr :: Env -> Expr -> IO String
 typeOfExpr env ast = do
-    v  <- eval env ast
+    v  <- eval env emptyIPMap ast
     ty <- describeType v
     pure (BC.unpack ty)
 
@@ -371,9 +371,9 @@ evalInstanceMethods src env methods =
 evalLine :: IORef Env -> ClassRegistry -> String -> InputT IO ()
 evalLine envRef classReg input = do
     env <- liftIO (readIORef envRef)
-    case parseLet input of
-        Just (name, rhs) -> do
-            r <- liftIO (tryEvalLet env name rhs)
+    case letBindingName input of
+        Just name -> do
+            r <- liftIO (tryEvalLetDecl env name input)
             case r of
                 Left  err     -> outputStrLn ("Error: " <> err)
                 Right newEnv  -> liftIO (writeIORef envRef newEnv)
@@ -383,37 +383,82 @@ evalLine envRef classReg input = do
                 Left  err -> outputStrLn ("Error: " <> err)
                 Right ()  -> pure ()
 
--- | Detect `let name = expr` (a standalone let with no `in`).
-parseLet :: String -> Maybe (String, String)
-parseLet s =
+-- | Extract the binding name from a REPL-level @let@ declaration.
+-- Returns 'Just name' when the input looks like @let f ...@ with an @=@
+-- sign somewhere (i.e. it is a binding, not a @let … in …@ expression).
+-- The heuristic: the second word after @let@ must start with a lowercase
+-- letter or @_@, there must be an @=@ in the input, and the top-level
+-- structure must not include an @in@ keyword at the same nesting depth
+-- as the @let@ (that would make it a @let … in@ expression, not a
+-- standalone binding).
+letBindingName :: String -> Maybe String
+letBindingName s =
     case words s of
-        ("let" : _) ->
-            let body = dropPrefix "let" (dropWhile (== ' ') s)
-            in case break (== '=') body of
-                (lhs, '=' : rhs)
-                    | not (null (trim lhs))
-                    , '>' `notElem` take 1 (trim rhs)
-                    -> Just (trim lhs, trim rhs)
-                _ -> Nothing
+        ("let" : name@(c:_) : _)
+            | '=' `elem` s
+            , isLower c || c == '_'
+            , not (hasTopLevelIn s)
+            -> Just name
         _ -> Nothing
   where
-    trim       = reverse . dropWhile (== ' ') . reverse . dropWhile (== ' ')
-    dropPrefix pfx str =
-        let n = length pfx
-        in if take n str == pfx then drop n str else str
+    isLower c = c >= 'a' && c <= 'z'
+    -- Check whether the keyword "in" appears at the top level of the
+    -- string (depth 0 for parens/brackets/braces), which would mean
+    -- this is a "let … in …" expression rather than a standalone binding.
+    hasTopLevelIn str = go (0 :: Int) (words (stripLetPrefix str))
+    stripLetPrefix str = case words str of
+        ("let":rest) -> unwords rest
+        _            -> str
+    go _     []           = False
+    go depth (w : ws)
+        | w `elem` ["(","[","{"]  = go (depth + 1) ws
+        | w `elem` [")","]","}"]  = go (max 0 (depth - 1)) ws
+        | w == "in" && depth == 0 = True
+        | otherwise               = go depth ws
 
-tryEvalLet :: Env -> String -> String -> IO (Either String Env)
-tryEvalLet env name rhs = do
-    let src = mkSource "<repl>" (BC.pack rhs)
-    r <- try (parseExprOnly src defaultFixityTable)
+-- | Parse and bind a REPL @let@ declaration, using the full Scan +
+-- Parser pipeline so that function-style LHSs like @f x y = body@ are
+-- correctly desugared into lambdas, and the binding is knot-tied so
+-- recursive references inside the body (e.g. @map@ calling @map@) work.
+tryEvalLetDecl :: Env -> String -> String -> IO (Either String Env)
+tryEvalLetDecl env name input = do
+    -- Strip the leading "let " and wrap in a synthetic module so that
+    -- findBinding can locate the top-level declaration at column 1.
+    let decl = dropLetPrefix input
+        src  = mkSource "<repl>" (syntheticModule decl)
+        key  = BC.pack name
+    r <- try (parseLetBinding src key)
             :: IO (Either SomeException Expr)
     case r of
         Left  err  -> pure (Left (show err))
         Right expr -> do
+            -- Knot-tying: allocate a slot first, extend the env to
+            -- include the binding, then fill the slot with a closure
+            -- that captures the extended env.  This makes the binding
+            -- visible to itself (recursion) and to later REPL lines.
             slot <- newIORef BlackHole
-            let env' = Map.insert (BC.pack name) slot env
-            writeIORef slot (Unevaluated (Closure env' expr))
+            let env' = Map.insert key slot env
+            writeIORef slot (Unevaluated (Closure env' emptyIPMap expr))
             pure (Right env')
+
+dropLetPrefix :: String -> String
+dropLetPrefix s =
+    let s1 = dropWhile (== ' ') s
+    in if take 3 s1 == "let"
+       then dropWhile (== ' ') (drop 3 s1)
+       else s1
+
+-- | Use the Scan + Parser pipeline to parse a top-level binding from a
+-- synthetic module source.  Returns the desugared 'Expr' (parameters
+-- become nested lambdas via 'parseBodyExprWithFixity').
+parseLetBinding :: Source -> BC.ByteString -> IO Expr
+parseLetBinding src name = do
+    known <- emptyKnownSymbols
+    mLhs  <- findBinding src known name
+    case mLhs of
+        Nothing  -> throwIO (userError ("let: cannot parse binding for `"
+                                         <> BC.unpack name <> "`"))
+        Just lhs -> parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
 
 tryEvalExpr :: Env -> ClassRegistry -> String -> IO (Either String ())
 tryEvalExpr env classReg input = do
@@ -431,7 +476,7 @@ tryEvalExpr env classReg input = do
 
 evalAndPrint :: Env -> ClassRegistry -> Expr -> IO ()
 evalAndPrint env classReg expr = do
-    v <- eval env expr
+    v <- eval env emptyIPMap expr
     case v of
         VIO _ -> do
             v2 <- runIO v

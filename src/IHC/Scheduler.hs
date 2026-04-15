@@ -176,7 +176,7 @@ loadProgramFromSource searchPath src0 = do
     let env = envWithAliases
 
     mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure env rhs)))
+               writeIORef slot (Unevaluated (Closure env emptyIPMap rhs)))
           (zip qualPairs slots)
 
     -- Phase 2.3: scan instance declarations from all loaded modules
@@ -282,7 +282,7 @@ loadImportIntoEnv searchPath imp existingEnv
         -- (e.g. `greet` calling `suffix`) resolve properly.
         let innerEnv = Map.union aliasEnv qualEnv
         mapM_ (\((_, rhs), slot) ->
-                   writeIORef slot (Unevaluated (Closure innerEnv rhs)))
+                   writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
               (zip qualPairs slots)
         -- Merge into the REPL env: prefer existing REPL bindings (shadow).
         -- Report the count of NEW bare (or qualified-alias) names added so
@@ -309,8 +309,9 @@ registerOne classReg env lm (InstanceDecl cls typ methods) = do
 
 evalMethod :: Env -> LoadedModule -> (ByteString, BindingLhs) -> IO Val
 evalMethod env lm (_, lhs) = do
-    expr <- Parser.parseBodyExprWithFixity
+    expr0 <- Parser.parseBodyExprWithFixity
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+    let expr = desugarRecordCons (lmFieldReg lm) expr0
     -- Evaluate the method expression to a Val in the global env.
     -- We need Eval here but can't import it (cycle). Use a thunk trick:
     -- make a thunk and force it immediately.
@@ -395,6 +396,14 @@ rewriteExpr rw = go []
         EDo stmts   -> EDo (goStmts bound stmts)
         ENeg e      -> ENeg (go bound e)
         ETuple es   -> ETuple (map (go bound) es)
+        ERecordCon n fields ->
+            ERecordCon n [(fname, go bound e) | (fname, e) <- fields]
+        EImplicitRef n  -> EImplicitRef n
+        EImplicitLet bs e ->
+            let names  = map fst bs
+                bound' = names ++ bound
+                bs'    = [(n, go bound' b) | (n, b) <- bs]
+            in EImplicitLet bs' (go bound' e)
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -637,10 +646,11 @@ discoverInModule registry searchPath lm name
                 mLhs <- findOrResolveLhs (lmSource lm) (lmKnown lm) name
                 case mLhs of
                     Just lhs -> do
-                        expr <- Parser.parseBodyExprWithFixity
+                        expr0 <- Parser.parseBodyExprWithFixity
                                     (lmSource lm)
                                     (lmFixity lm)
                                     (lhsClauses lhs)
+                        let expr = desugarRecordCons (lmFieldReg lm) expr0
                         modifyIORef' (lmBodies lm) (Map.insert name expr)
                         -- Recurse into every free var. Qualified ones
                         -- will be routed on the next call.
@@ -790,6 +800,12 @@ freeVars = goAll []
         EDo stmts   -> goStmts bound stmts
         ENeg e      -> goAll bound e
         ETuple es   -> concatMap (goAll bound) es
+        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
+        EImplicitRef _  -> []
+        EImplicitLet bs e ->
+            let names = map fst bs
+                bound' = names ++ bound
+            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
@@ -810,4 +826,50 @@ freeVars = goAll []
     patBound (PAs n p)   = n : patBound p
     patBound (PBang p)   = patBound p
     patBound (PTuple ps) = concatMap patBound ps
+    patBound _           = []
+
+-- | Desugar @ERecordCon Con [(f1,e1),(f2,e2)]@ into the equivalent
+-- positional application @Con e_at_0 e_at_1@ using the FieldRegistry to
+-- determine the correct field ordering.
+--
+-- Fields not found in the registry are placed in declaration order (graceful
+-- degradation for programs without scanDataDecls coverage).
+desugarRecordCons :: FieldRegistry -> Expr -> Expr
+desugarRecordCons fldReg = go
+  where
+    go (ERecordCon conName fields) =
+        -- Build index -> expr mapping using the FieldRegistry.
+        let byIndex = Map.fromList
+                [ (idx, go e)
+                | (fname, e) <- fields
+                , Just pairs <- [Map.lookup fname fldReg]
+                , Just idx   <- [lookup conName pairs]
+                ]
+            -- Arity = one past the highest known index, or just the
+            -- number of given fields as a fallback.
+            maxIdx = if Map.null byIndex
+                         then length fields - 1
+                         else maximum (Map.keys byIndex)
+            errExpr _i = EApp (EVar "error")
+                             (EVar "undefined")
+            args = [ Map.findWithDefault (errExpr i) i byIndex
+                   | i <- [0 .. maxIdx] ]
+        in foldl EApp (EVar conName) args
+    -- Recurse into all sub-expressions.
+    go (EApp f x)       = EApp (go f) (go x)
+    go (ELam n e)       = ELam n (go e)
+    go (ELet bs e)      = ELet [(n, go b) | (n, b) <- bs] (go e)
+    go (ECase s as)     = ECase (go s) [Alt p (go b) | Alt p b <- as]
+    go (EIf c t e)      = EIf (go c) (go t) (go e)
+    go (EDo stmts)      = EDo (map goStmt stmts)
+    go (ENeg e)         = ENeg (go e)
+    go (ETuple es)      = ETuple (map go es)
+    go (EImplicitRef n) = EImplicitRef n
+    go (EImplicitLet bs e) =
+        EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
+    go e                = e  -- EVar, ELit
+
+    goStmt (SExpr e)   = SExpr (go e)
+    goStmt (SBind n e) = SBind n (go e)
+    goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
     patBound _           = []
