@@ -1157,7 +1157,7 @@ parseAtom ctx cur0 = do
         TkImplicitRef n -> pure (EImplicitRef n, cur1)
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
-            | otherwise -> pure (EVar n, cur1)
+            | otherwise -> applyRecordDots ctx tok (EVar n) cur1
         TkPrimId n -> pure (EVar n, cur1)
         TkConId n -> do
             -- Check for record construction: Con { f1 = v1, f2 = v2 }
@@ -1203,6 +1203,43 @@ parseParenExpr ctx _openTok cur0 = do
     let (peek, curP) = nextSig ctx cur0
     case tkKind peek of
         TkRParen -> pure (EVar "()", curP)
+        -- OverloadedRecordDot: (.field) section — \$s -> field $s
+        -- Must check adjacency: the '.' and 'field' have no whitespace between
+        -- them. 'peek' already points to the '.' (via nextSig); we use nextToken
+        -- (no trivia skip) to check whether the following ident abuts the dot.
+        TkDot ->
+            let src = ctxSrc ctx
+                (fieldTok, curAfterField) = nextToken src curP
+            in case tkKind fieldTok of
+                TkIdent fname | tkStart fieldTok == tkEnd peek -> do
+                    -- Adjacent: (.fname) is a record-dot section \$s -> fname $s
+                    let (closeTok, curClose) = nextSig ctx curAfterField
+                    case tkKind closeTok of
+                        TkRParen ->
+                            let n = "$s"
+                            in pure (ELam n (EApp (EVar fname) (EVar n)), curClose)
+                        _ -> do
+                            -- (.fname expr) is unusual but parse generically.
+                            (e, cur1) <- parseExpr ctx cur0
+                            let (sep, cur2) = nextSig ctx cur1
+                            case tkKind sep of
+                                TkRParen -> pure (e, cur2)
+                                _ -> parseErr "expected `)` after record-dot section" sep
+                _ -> do
+                    -- Dot is not adjacent to an ident: treat as composition
+                    -- operator `(.)` or a right section `(. f)`.
+                    let (afterOp, curAfterOp) = nextSig ctx curP
+                    case tkKind afterOp of
+                        TkRParen -> pure (EVar ".", curAfterOp)
+                        _ -> do
+                            (rhs, curR) <- parseExpr ctx curP
+                            let (closeTok, curC) = nextSig ctx curR
+                            case tkKind closeTok of
+                                TkRParen ->
+                                    let n = "$s"
+                                        body = EApp (EApp (EVar ".") (EVar n)) rhs
+                                    in pure (ELam n body, curC)
+                                _ -> parseErr "expected `)` in composition section" closeTok
         -- Operator-as-value, optionally followed by right-operand (section).
         _ | Just opName <- tokenOpName (tkKind peek)
           , tkKind peek /= TkMinus        -- `(-1)` is NEG 1, not a section
@@ -1413,6 +1450,29 @@ tryQualified ctx firstName firstTok cur0 =
                         go (acc <> BC.pack "." <> n) segTok curAfterSeg
                     _ -> pure (EVar acc, cur)
             _ -> pure (EVar acc, cur)
+
+-- | OverloadedRecordDot: after parsing a variable atom, check if it is
+-- immediately followed by @.field@ (no whitespace). If so, desugar:
+--
+-- > x.f        ->  f x
+-- > x.f.g      ->  g (f x)
+--
+-- Adjacency is required: @tkStart dotTok == tkEnd lastTok@ and
+-- @tkStart fieldTok == tkEnd dotTok@. This mirrors the same check used
+-- in 'tryQualified' for qualified names (e.g. @Foo.bar@).
+applyRecordDots :: Ctx -> Token -> Expr -> Cursor -> IO (Expr, Cursor)
+applyRecordDots ctx lastTok expr cur =
+    let src = ctxSrc ctx
+        (dotTok, curAfterDot) = nextToken src cur
+    in case tkKind dotTok of
+        TkDot | tkStart dotTok == tkEnd lastTok ->
+            let (fieldTok, curAfterField) = nextToken src curAfterDot in
+            case tkKind fieldTok of
+                TkIdent fname | tkStart fieldTok == tkEnd dotTok ->
+                    -- Desugar: expr.fname -> fname expr, then recurse for chaining.
+                    applyRecordDots ctx fieldTok (EApp (EVar fname) expr) curAfterField
+                _ -> pure (expr, cur)
+        _ -> pure (expr, cur)
 
 --------------------------------------------------------------------------------
 -- String literal desugar + list literals
