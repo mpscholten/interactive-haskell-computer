@@ -45,6 +45,7 @@ library
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.TH
       , IHC.TypeDescribe
       , IHC.Val
       -- Dormant Phase-1 JIT machinery, kept in tree but no longer

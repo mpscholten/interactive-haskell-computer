@@ -59,6 +59,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls)
 import IHC.Scan
 import IHC.Source
+import IHC.TH (expandSplicesInExpr)
 import IHC.Val
 
 -- | Run our hand-rolled CPP over the source bytes, returning a new
@@ -153,6 +154,12 @@ loadProgramFromSource searchPath src0 = do
     fieldEnv <- buildFieldEnv unionedFields
     builtins <- builtinEnv classReg
     let base = Map.union fieldEnv (Map.union conEnv builtins)
+
+    -- Phase 2.11: expand TH splices in every loaded module's bodies.
+    -- Run AFTER all modules are discovered (so imports are resolved) but
+    -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
+    -- contains all builtins including the 'lift' function.
+    mapM_ (expandSplicesInModule base) loadedModules
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry) loadedModules
@@ -294,6 +301,14 @@ loadImportIntoEnv searchPath imp existingEnv
                           `Map.difference` existingEnv
         pure (merged, Map.size newAliases)
 
+-- | Phase 2.11: expand TH splices in all bodies of a loaded module.
+-- Mutates the @lmBodies@ IORef in place.
+expandSplicesInModule :: Env -> LoadedModule -> IO ()
+expandSplicesInModule spliceEnv lm = do
+    bodies <- readIORef (lmBodies lm)
+    expanded <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) bodies
+    writeIORef (lmBodies lm) expanded
+
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
 -- resulting dict in the ClassRegistry.
@@ -404,6 +419,7 @@ rewriteExpr rw = go []
                 bound' = names ++ bound
                 bs'    = [(n, go bound' b) | (n, b) <- bs]
             in EImplicitLet bs' (go bound' e)
+        ESplice inner   -> ESplice (go bound inner)
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -560,6 +576,8 @@ isBuiltinBackedModule n =
     || "Data.Set"     `BC.isPrefixOf` n
     || "Data.IntMap"  `BC.isPrefixOf` n
     || "Data.Sequence" `BC.isPrefixOf` n
+    -- Phase 2.11: TH synthetic modules — names provided by IHC.TH builtins
+    || "Language.Haskell.TH" `BC.isPrefixOf` n
 
 buildEmptyStubModule :: ModuleName -> IO LoadedModule
 buildEmptyStubModule name = do

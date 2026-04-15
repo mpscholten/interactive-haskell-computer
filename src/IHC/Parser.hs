@@ -1161,13 +1161,17 @@ parseAtom ctx cur0 = do
         TkPrimId n -> pure (EVar n, cur1)
         TkConId n -> do
             -- Check for record construction: Con { f1 = v1, f2 = v2 }
+            -- We use nextSig to skip whitespace so "Con { }" and "Con{}" both work.
             (qexpr, qcur) <- tryQualified ctx n tok cur1
-            case (qexpr, peekByte (ctxSrc ctx) (cPos qcur)) of
-                (EVar qname, Just 0x7B) -> do  -- '{'
-                    -- Record literal: parse { f1 = e1, f2 = e2, ... }
-                    let (_, curBrace) = nextToken (ctxSrc ctx) qcur
-                    (fields, curEnd) <- parseRecordFields ctx curBrace []
-                    pure (ERecordCon qname fields, curEnd)
+            case qexpr of
+                EVar qname ->
+                    let (nextTk, curAfterBrace) = nextSig ctx qcur in
+                    case tkKind nextTk of
+                        TkLBrace -> do
+                            -- Record literal: parse field-list then closing '}'
+                            (fields, curEnd) <- parseRecordFields ctx curAfterBrace []
+                            pure (ERecordCon qname fields, curEnd)
+                        _ -> pure (qexpr, qcur)
                 _ -> pure (qexpr, qcur)
         TkLParen   -> parseParenExpr ctx tok cur1
         TkLUnbox   -> parseUnboxedTuple ctx cur1

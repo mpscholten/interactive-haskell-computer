@@ -42,6 +42,7 @@ data Expr
     | EImplicitRef  !Name              -- ?name reference (Phase 3.6)
     | EImplicitLet  ![(Name, Expr)] !Expr -- let ?x = e in body (Phase 3.6)
     | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
+    | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

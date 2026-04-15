@@ -106,7 +106,8 @@ data TokenKind
     | TkBang                  -- ^ @!@ (bang pattern, strict field)
     | TkBacktick              -- ^ @`@ (backtick infix)
     | TkBackslash             -- ^ @\\@ (lambda)
-    | TkDollar                -- ^ @$@
+    | TkDollar                -- ^ @$@ (standalone dollar, not followed by @(@)
+    | TkSpliceLParen          -- ^ @$(@ TH splice open (Phase 2.11)
     | TkPrimId !ByteString    -- ^ @name#@ / @name##@ MagicHash identifier
                               --   (e.g. @I#@, @runRW#@, @newByteArray#@)
     | TkLUnbox                -- ^ @(#@ unboxed-tuple open
@@ -225,6 +226,13 @@ nextToken s c0 =
                                -> let c' = step (step c) in (mkTok TkOr c c', c')
             | b == 0x7C, not (isOpChar (peekByte s (cPos c + 1)))
                                -> (mkTok TkBar c (step c), step c)       -- '|'
+            -- '$(' is the TH splice open token (Phase 2.11).
+            -- Must be checked before the generic op-char path so that '$('
+            -- becomes TkSpliceLParen rather than TkDollar followed by TkLParen.
+            | b == 0x24, Just 0x28 <- peekByte s (cPos c + 1)
+                               ->                                         -- '$(' splice
+                                  let c' = step (step c)
+                                  in (mkTok TkSpliceLParen c c', c')
             -- '?' followed by a lowercase letter or '_' is an implicit
             -- parameter reference: ?name -> TkImplicitRef name.
             | b == 0x3F

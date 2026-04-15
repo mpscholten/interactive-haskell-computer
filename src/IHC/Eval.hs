@@ -65,13 +65,15 @@ eval env ipm = go
     go (EApp f x) = do
         fv  <- go f                            -- function to WHNF
         xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
-        apply fv xt
+        applyIP ipm fv xt                      -- pass caller's ipm for ?-params
 
     go (ELam name body) =
-        -- Capture the current implicit-param map in the closure so that
-        -- ?x references inside the lambda see the lexical binding.
-        pure $ VFun $ \argThunk ->
-            eval (extendEnv name argThunk env) ipm body
+        -- Phase 3.6: User-defined lambdas use VFunIP so the caller can
+        -- pass its ImplicitParamMap at call time. The closed-over `ipm`
+        -- (lexical binding) takes priority over the caller's map.
+        pure $ VFunIP ipm $ \callerIPM argThunk ->
+            let mergedIPM = Map.union ipm callerIPM
+            in eval (extendEnv name argThunk env) mergedIPM body
 
     go (ELet binds body) = do
         -- Recursive group: pre-allocate a thunk per binding holding a
@@ -145,6 +147,12 @@ eval env ipm = go
     go (ERecordCon name fields) = do
         thunks <- mapM (\(_, e) -> newThunkIP env ipm e) fields
         pure (VCon name thunks)
+
+    -- Phase 2.11: TH splices should be expanded before eval by the
+    -- scheduler's expandSplicesInModule pass. If one reaches here it's
+    -- a bug — report it clearly rather than looping.
+    go (ESplice _) =
+        error "IHC.Eval: ESplice reached eval — splice expansion pass missed this node"
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
@@ -234,9 +242,18 @@ matchPat (PCon _ _) _ = pure Nothing
 --------------------------------------------------------------------------------
 
 apply :: Val -> Thunk -> IO Val
-apply (VFun f) arg = f arg
-apply v        _   = error ("IHC.Eval.apply: not a function: "
-                            <> showValForDebug v)
+apply (VFun f)        arg = f arg
+apply (VFunIP _ f)    arg = f Map.empty arg
+apply v               _   = error ("IHC.Eval.apply: not a function: "
+                                   <> showValForDebug v)
+
+-- | Apply with the caller's ImplicitParamMap — used by EApp so that
+-- implicit params flow from the call site into the callee.
+applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
+applyIP callerIPM (VFun f)     arg = f arg
+applyIP callerIPM (VFunIP _ f) arg = f callerIPM arg
+applyIP _         v            _   = error ("IHC.Eval.applyIP: not a function: "
+                                            <> showValForDebug v)
 
 --------------------------------------------------------------------------------
 -- Do-block desugaring

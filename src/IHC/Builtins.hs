@@ -817,6 +817,7 @@ showVal (VCon name thunks)
             [] -> pure (BC.unpack name)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
+showVal (VFunIP _ _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _))      = pure "<IORef>"
 showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"

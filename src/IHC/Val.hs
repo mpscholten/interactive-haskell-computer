@@ -30,6 +30,7 @@ module IHC.Val
       -- * Failures
     , LoopException(..)
     , PatternMatchFail(..)
+    , IhcException(..)
     ) where
 
 import Control.Concurrent (ThreadId)
@@ -62,7 +63,11 @@ data Val
     | VStr   !ByteString               -- raw bytes — transitional, some
                                        -- builtins still produce these;
                                        -- user-visible strings are [Char]
-    | VFun  !(Thunk -> IO Val)         -- single-argument closure
+    | VFun  !(Thunk -> IO Val)         -- single-argument closure (builtins)
+    -- Phase 3.6: user-defined lambda with implicit-param support.
+    -- The function receives the caller's ImplicitParamMap so it can
+    -- merge (lexically-bound ?params win over caller's).
+    | VFunIP !ImplicitParamMap !(ImplicitParamMap -> Thunk -> IO Val)
     | VCon  !Name ![Thunk]             -- saturated constructor (Phase 2.1+)
     | VUnit                            -- () — IO result of putStrLn etc.
     | VIO   !(IO Val)                  -- suspended IO action (Phase 2.4)
@@ -79,13 +84,18 @@ data PrimObj
     | PrimPtr        !(Ptr Word8)
     | PrimByteArray  !(IORef ByteString)   -- mutable byte array backed by ByteString
     | PrimRealWorld                        -- zero-size phantom token
+    -- Phase 2.10a: concurrency primitives backed by host GHC RTS.
+    | PrimMVar     !(MVar Val)
+    | PrimTVar     !(TVar Val)
+    | PrimThreadId !ThreadId
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
 showValForDebug (VFloat d)  = show d
 showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
-showValForDebug (VFun _)    = "<function>"
+showValForDebug (VFun _)      = "<function>"
+showValForDebug (VFunIP _ _)  = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
 showValForDebug (VIO _)     = "<IO>"
@@ -95,6 +105,9 @@ showValForDebug (VPrimObj (PrimForeignPtr _)) = "<ForeignPtr>"
 showValForDebug (VPrimObj (PrimPtr _))        = "<Ptr>"
 showValForDebug (VPrimObj (PrimByteArray _))  = "<MutableByteArray>"
 showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
+showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
+showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
+showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
 
 --------------------------------------------------------------------------------
 -- Thunks
@@ -162,3 +175,11 @@ instance Exception LoopException
 
 newtype PatternMatchFail = PatternMatchFail String deriving Show
 instance Exception PatternMatchFail
+
+-- | Phase 2.10a: wrapper for exceptions thrown by interpreter-level
+-- 'throwIO' / 'throw'. The 'Thunk' holds the Val-level exception value;
+-- 'ByteString' is a display string for 'show'.
+data IhcException = IhcException !ByteString !(IORef ThunkState)
+instance Show IhcException where
+    show (IhcException msg _) = "IhcException: " <> BC.unpack msg
+instance Exception IhcException

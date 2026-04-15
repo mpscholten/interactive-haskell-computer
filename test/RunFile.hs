@@ -563,12 +563,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "CPP #include: missing file throws an exception mentioning the path" do
         result <- try (runFile "test/Fixtures/CppInclude/missing/main.hs")
                       :: IO (Either SomeException Int)
+        let isSubstring needle haystack =
+                any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
         result `shouldSatisfy` \case
             Left e  -> "no_such_file.hs" `isSubstring` show e
             Right _ -> False
-      where
-        isSubstring needle haystack =
-            any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
 
     --------------------------------------------------------------------
     -- OverloadedRecordDot
@@ -597,3 +596,61 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/RecordDot/in_expr.hs")
         n   `shouldBe` 0
         out `shouldBe` "Hello, Alice!\n"
+
+    --------------------------------------------------------------------
+    -- Phase 3.6: ImplicitParams (?name + let ?x = …)
+    --------------------------------------------------------------------
+    it "implicit params: basic ?x usage via let ?x = 10 in foo 5" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase36/iparam_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "15\n"
+
+    it "implicit params: lexical capture — closure captures ?x at definition, not call site" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase36/iparam_capture.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    it "implicit params: nested let ?x shadows outer ?x" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase36/iparam_shadow.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "2\n"
+
+    it "implicit params: multiple implicit params ?x and ?y in same let" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase36/iparam_multiple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "30\n"
+
+    it "implicit params: unbound ?x raises a runtime error" do
+        result <- try (runFile "test/Fixtures/Phase36/iparam_unbound.hs")
+                      :: IO (Either SomeException Int)
+        result `shouldSatisfy` \case
+            Left _  -> True
+            Right _ -> False
+
+    --------------------------------------------------------------------
+    -- Phase 2.11: TH Lift-splice subset
+    --------------------------------------------------------------------
+    it "TH lift: $(lift (42 :: Int)) expands to literal 42" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_int.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "TH lift: $(lift \"hello\") expands to string \"hello\"" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_string.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\n"
+
+    it "TH lift: $(lift [1,2,3]) expands to list [1,2,3]" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_list.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[1,2,3]\n"
+
+    it "TH lift: $(lift (1 :: Int, \"a\")) expands to a tuple" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_tuple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "(1,\"a\")\n"
+
+    it "TH lift: user-defined ADT Color auto-lifted via generic VCon path" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_user_data.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Red\n"
