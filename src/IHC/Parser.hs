@@ -166,10 +166,92 @@ parseExpr :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseExpr ctx cur0 acc0 = do
     let (tok, cur1) = nextSig (ctxSrc ctx) cur0
     case tkKind tok of
-        TkIf  -> parseIf  ctx cur1 acc0
-        TkDo  -> parseDo  ctx cur1 acc0
-        TkLet -> parseLet ctx cur1 acc0
-        _     -> parseOr  ctx cur0 acc0
+        TkIf   -> parseIf   ctx cur1 acc0
+        TkDo   -> parseDo   ctx cur1 acc0
+        TkLet  -> parseLet  ctx cur1 acc0
+        TkCase -> parseCase ctx cur1 acc0
+        _      -> parseOr   ctx cur0 acc0
+
+-- @case scrutinee of { pat -> e ; ... ; _ -> e }@
+--
+-- Restrictions for now:
+--   * scrutinee is a single atom (literal, ident, or paren-expr); we
+--     re-evaluate it per branch (acceptable for pure expressions).
+--   * patterns are Int literals or @_@. The wildcard, if present,
+--     must be last.
+--
+-- Desugars to a chain of IIfThenElse comparing the scrutinee with
+-- each pattern.
+parseCase :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseCase ctx cur0 acc0 = do
+    -- scrutinee atom (its items will be re-emitted per comparison).
+    (scrutRev, curS) <- parseAtom ctx cur0 []
+    let scrutItems = reverse scrutRev
+    let (ofTok, curO) = nextSig (ctxSrc ctx) curS
+    case tkKind ofTok of
+        TkOf -> pure ()
+        _    -> parseErr "expected `of` in case-expression" ofTok
+    -- Either braced or layout alts.
+    let (firstTok, curBody) = nextSig (ctxSrc ctx) curO
+    (alts, curEnd) <- case tkKind firstTok of
+        TkLBrace -> bracedAlts curBody []
+        _        -> layoutAlts (tkCol firstTok) curO []
+    case buildCase scrutItems alts of
+        Nothing -> parseErr "case has no branches" firstTok
+        Just chain -> pure (reverse chain ++ acc0, curEnd)
+  where
+    parseAlt cur = do
+        let (patTok, cur1) = nextSig (ctxSrc ctx) cur
+        pat <- case tkKind patTok of
+            TkInt n      -> pure (Just (fromInteger n))
+            TkUnderscore -> pure Nothing
+            _            -> parseErr "expected Int literal or `_` as case pattern" patTok
+        let (arr, cur2) = nextSig (ctxSrc ctx) cur1
+        case tkKind arr of
+            TkArrow -> pure ()
+            _       -> parseErr "expected `->` in case alternative" arr
+        (eRev, cur3) <- parseExpr ctx cur2 []
+        pure ((pat, reverse eRev), cur3)
+
+    bracedAlts cur acc = do
+        (alt, cur') <- parseAlt cur
+        let (sep, curN) = nextSig (ctxSrc ctx) cur'
+        case tkKind sep of
+            TkSemi   -> bracedAlts curN (alt : acc)
+            TkRBrace -> pure (reverse (alt : acc), curN)
+            _        -> parseErr "expected `;` or `}` in case alts" sep
+
+    layoutAlts altCol cur acc = do
+        (alt, cur') <- parseAlt cur
+        let (nextTok, _) = nextSig (ctxSrc ctx) cur'
+        case tkKind nextTok of
+            TkEof -> pure (reverse (alt : acc), cur')
+            _ | tkCol nextTok == altCol ->
+                  layoutAlts altCol cur' (alt : acc)
+              | otherwise ->
+                  pure (reverse (alt : acc), cur')
+
+    -- Build a right-leaning chain of IIfThenElse from the alt list.
+    -- Wildcard alts (Nothing) become the else-branch; literal alts
+    -- become a comparison.
+    buildCase :: [Item] -> [(Maybe Int, [Item])] -> Maybe [Item]
+    buildCase _      []                       = Nothing
+    buildCase scrut alts =
+        let (lits, rest) = span (\(p, _) -> case p of Just _ -> True; _ -> False) alts
+            wildItems    = case rest of
+                ((Nothing, e) : _) -> e
+                _                  -> [ICall "error" 1, ILitStr "case: non-exhaustive"]
+        in Just (foldr (\(Just p, e) acc ->
+                            [IIfThenElse (cmpItems scrut p) e acc])
+                       wildItems
+                       lits)
+
+    cmpItems :: [Item] -> Int -> [Item]
+    cmpItems scrut p =
+        scrut
+        ++ [IPushX0]
+        ++ [ILitInt (fromIntegral p)]
+        ++ [IPopX1, ICmp CEq]
 
 -- @let ident = e1 in e2@
 --

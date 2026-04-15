@@ -80,6 +80,41 @@ ihcConcat a b = do
 ihcGetLine :: IO CString
 ihcGetLine = getLine >>= newCAString
 
+ihcEven :: Int -> Int
+ihcEven n = if even n then 1 else 0
+
+ihcOdd :: Int -> Int
+ihcOdd n = if odd n then 1 else 0
+
+ihcSucc :: Int -> Int
+ihcSucc = succ
+
+ihcPred :: Int -> Int
+ihcPred = pred
+
+ihcSignum :: Int -> Int
+ihcSignum = signum
+
+ihcNot :: Int -> Int
+ihcNot 0 = 1
+ihcNot _ = 0
+
+-- | @error :: String -> a@ — abort the JIT'd program with the message.
+ihcError :: CString -> IO Int
+ihcError cs = do
+    s <- peekCString cs
+    Prelude.error ("ihc: " <> s)
+
+-- | @gcd :: Int -> Int -> Int@.
+ihcGcd :: Int -> Int -> Int
+ihcGcd = gcd
+
+-- | @length :: String -> Int@ — bytes in the string (i.e. C strlen).
+ihcLength :: CString -> IO Int
+ihcLength cs = do
+    s <- peekCString cs
+    pure (length s)
+
 --------------------------------------------------------------------------------
 -- Foreign exports + re-imports (to take their address)
 --------------------------------------------------------------------------------
@@ -128,6 +163,25 @@ foreign export ccall "ihc_getLine" ihcGetLine :: IO CString
 foreign import ccall unsafe "&ihc_getLine"
     p_ihcGetLine :: FunPtr (IO CString)
 
+foreign export ccall "ihc_even"   ihcEven   :: Int -> Int
+foreign import ccall unsafe "&ihc_even"   p_ihcEven   :: FunPtr (Int -> Int)
+foreign export ccall "ihc_odd"    ihcOdd    :: Int -> Int
+foreign import ccall unsafe "&ihc_odd"    p_ihcOdd    :: FunPtr (Int -> Int)
+foreign export ccall "ihc_succ"   ihcSucc   :: Int -> Int
+foreign import ccall unsafe "&ihc_succ"   p_ihcSucc   :: FunPtr (Int -> Int)
+foreign export ccall "ihc_pred"   ihcPred   :: Int -> Int
+foreign import ccall unsafe "&ihc_pred"   p_ihcPred   :: FunPtr (Int -> Int)
+foreign export ccall "ihc_signum" ihcSignum :: Int -> Int
+foreign import ccall unsafe "&ihc_signum" p_ihcSignum :: FunPtr (Int -> Int)
+foreign export ccall "ihc_not"    ihcNot    :: Int -> Int
+foreign import ccall unsafe "&ihc_not"    p_ihcNot    :: FunPtr (Int -> Int)
+foreign export ccall "ihc_error"  ihcError  :: CString -> IO Int
+foreign import ccall unsafe "&ihc_error"  p_ihcError  :: FunPtr (CString -> IO Int)
+foreign export ccall "ihc_gcd"    ihcGcd    :: Int -> Int -> Int
+foreign import ccall unsafe "&ihc_gcd"    p_ihcGcd    :: FunPtr (Int -> Int -> Int)
+foreign export ccall "ihc_length" ihcLength :: CString -> IO Int
+foreign import ccall unsafe "&ihc_length" p_ihcLength :: FunPtr (CString -> IO Int)
+
 --------------------------------------------------------------------------------
 -- Registry: name -> (entry ptr, arity)
 --------------------------------------------------------------------------------
@@ -155,4 +209,13 @@ builtins =
       -- (++) is bound at the operator level via a synthetic ICall
       -- with this name; see IHC.Parser.parseSum.
     , ("##concat", Builtin (castFunPtrToPtr p_ihcConcat)   2)
+    , ("even",     Builtin (castFunPtrToPtr p_ihcEven)     1)
+    , ("odd",      Builtin (castFunPtrToPtr p_ihcOdd)      1)
+    , ("succ",     Builtin (castFunPtrToPtr p_ihcSucc)     1)
+    , ("pred",     Builtin (castFunPtrToPtr p_ihcPred)     1)
+    , ("signum",   Builtin (castFunPtrToPtr p_ihcSignum)   1)
+    , ("not",      Builtin (castFunPtrToPtr p_ihcNot)      1)
+    , ("error",    Builtin (castFunPtrToPtr p_ihcError)    1)
+    , ("gcd",      Builtin (castFunPtrToPtr p_ihcGcd)      2)
+    , ("length",   Builtin (castFunPtrToPtr p_ihcLength)   1)
     ]

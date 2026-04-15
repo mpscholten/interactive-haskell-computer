@@ -66,6 +66,9 @@ data TokenKind
     | TkIf                    -- ^ keyword @if@
     | TkThen                  -- ^ keyword @then@
     | TkElse                  -- ^ keyword @else@
+    | TkCase                  -- ^ keyword @case@
+    | TkOf                    -- ^ keyword @of@
+    | TkUnderscore            -- ^ wildcard pattern @_@
     | TkLet                   -- ^ keyword @let@
     | TkIn                    -- ^ keyword @in@
     | TkWhere                 -- ^ keyword @where@
@@ -221,6 +224,9 @@ nextToken s c0 =
         "let"   -> TkLet
         "in"    -> TkIn
         "where" -> TkWhere
+        "case"  -> TkCase
+        "of"    -> TkOf
+        "_"     -> TkUnderscore
         _       -> TkIdent bs
 
 isDigit :: Word8 -> Bool

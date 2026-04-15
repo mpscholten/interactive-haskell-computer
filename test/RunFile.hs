@@ -220,3 +220,8 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/where_chain.hs")
         n   `shouldBe` 0
         out `shouldBe` "12\n21\n"
+
+    it "case-of on Int: classify maps 0,1,2,_ to 0,1,1,99" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/case_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n1\n1\n99\n"
