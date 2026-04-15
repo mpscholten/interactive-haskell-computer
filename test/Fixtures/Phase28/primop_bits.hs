@@ -1,0 +1,10 @@
+-- Phase 2.8: bit operations (.&., .|., xor, shiftL, shiftR, popCount)
+main :: IO ()
+main = do
+    print (12 .&. 10)
+    print (12 .|. 10)
+    print (xor 12 10)
+    print (complement 0)
+    print (shiftL 1 4)
+    print (shiftR 16 2)
+    print (popCount 255)

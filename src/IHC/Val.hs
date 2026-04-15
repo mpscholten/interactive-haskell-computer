@@ -33,6 +33,9 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Int (Int64)
+import Data.Word (Word8)
+import Foreign.ForeignPtr (ForeignPtr)
+import Foreign.Ptr (Ptr)
 import System.IO (Handle)
 
 import IHC.AST (Expr, Name)
@@ -61,6 +64,11 @@ data Val
 data PrimObj
     = PrimIORef  !(IORef Val)
     | PrimHandle !Handle
+    -- Phase 2.8: low-level memory objects for ByteString / ForeignPtr support.
+    | PrimForeignPtr !(ForeignPtr Word8)
+    | PrimPtr        !(Ptr Word8)
+    | PrimByteArray  !(IORef ByteString)   -- mutable byte array backed by ByteString
+    | PrimRealWorld                        -- zero-size phantom token
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
@@ -70,8 +78,12 @@ showValForDebug (VFun _)    = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
 showValForDebug (VIO _)     = "<IO>"
-showValForDebug (VPrimObj (PrimIORef _))  = "<IORef>"
-showValForDebug (VPrimObj (PrimHandle _)) = "<Handle>"
+showValForDebug (VPrimObj (PrimIORef _))       = "<IORef>"
+showValForDebug (VPrimObj (PrimHandle _))     = "<Handle>"
+showValForDebug (VPrimObj (PrimForeignPtr _)) = "<ForeignPtr>"
+showValForDebug (VPrimObj (PrimPtr _))        = "<Ptr>"
+showValForDebug (VPrimObj (PrimByteArray _))  = "<MutableByteArray>"
+showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
 
 --------------------------------------------------------------------------------
 -- Thunks

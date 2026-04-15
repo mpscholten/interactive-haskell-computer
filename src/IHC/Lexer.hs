@@ -106,6 +106,8 @@ data TokenKind
     | TkBacktick              -- ^ @`@ (backtick infix)
     | TkBackslash             -- ^ @\\@ (lambda)
     | TkDollar                -- ^ @$@
+    | TkPrimId !ByteString    -- ^ @name#@ / @name##@ MagicHash identifier
+                              --   (e.g. @I#@, @runRW#@, @newByteArray#@)
     | TkLUnbox                -- ^ @(#@ unboxed-tuple open
     | TkRUnbox                -- ^ @#)@ unboxed-tuple close
     | TkSymOp !ByteString     -- ^ generic user-defined symbolic operator
@@ -262,8 +264,14 @@ nextToken s c0 =
         go p = case peekByte s p of
             Just b | isDigit b -> go (p + 1)
             _ -> let n   = read (BC.unpack (sliceBytes s (cPos start, p))) :: Integer
-                     end = Cursor p (cLine start) (cCol start + (p - cPos start))
+                     -- Consume trailing '#' or '##' for unboxed int literals
+                     -- (e.g. 0#, 1##). Treat them as plain integers.
+                     p'  = skipHashes p
+                     end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
                  in (mkTok (TkInt n) start end, end)
+        skipHashes p = case peekByte s p of
+            Just 0x23 -> skipHashes (p + 1)   -- '#'
+            _         -> p
 
     lexHex start = go (cPos start + 2) 0
       where
@@ -295,8 +303,11 @@ nextToken s c0 =
         go p = case peekByte s p of
             Just b | isIdentCont b -> go (p + 1)
             _ -> let bs  = sliceBytes s (cPos start, p)
-                     k   | isCon     = TkConId bs
-                         | otherwise = keywordOr bs
+                     -- If the identifier ends with '#' it's a MagicHash
+                     -- primop name regardless of case (I#, runRW#, etc.).
+                     k   | BC.isSuffixOf "#" bs = TkPrimId bs
+                         | isCon               = TkConId bs
+                         | otherwise           = keywordOr bs
                      end = Cursor p (cLine start) (cCol start + (p - cPos start))
                  in (mkTok k start end, end)
 

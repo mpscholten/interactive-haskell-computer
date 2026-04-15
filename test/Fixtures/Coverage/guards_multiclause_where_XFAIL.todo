@@ -1,0 +1,3 @@
+Float/Double literals not yet supported in the IHC interpreter (no VFloat in Val.hs).
+The fixture uses fractional division for BMI calculation.
+Remove _XFAIL suffix once floating-point literals land.
