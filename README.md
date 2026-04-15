@@ -34,7 +34,11 @@ Remaining slices (rough order):
 - 2.10a — STM + async exceptions (2.10b abandoned — containers interpreted from source)
 - 2.11 — `Lift`-splice TH (subset of full TH)
 - 2.12 — tasty-load pipeline integration
-- 2.13 — ⭐ bytestring test suite
+- 2.13 — ⭐ bytestring test suite (north-star)
+- 3.1 — **full Template Haskell**: `[|…|]` quotation, `$(…)` AST-returning splices, `Q` IO, `reify`. Required by `aeson-th`, `lens` `makeLenses`, `persistent` TH — anything IHP uses heavily.
+- 3.2 — **type families** (open, closed, associated). Required by `servant`, effect libs, `singletons`, some IHP generated code.
+- 3.3 — **`DerivingVia` / `GeneralizedNewtypeDeriving` beyond trivial**, `QuantifiedConstraints`. Required by `optics`, `generic-lens`, modern typeclass-heavy Haskell.
+- 3.4 — `DataKinds` + promoted types. Required by type-level routing (`servant`).
 
 ## Dev setup
 
