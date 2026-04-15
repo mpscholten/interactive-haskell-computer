@@ -36,7 +36,10 @@ main = getArgs >>= \case
                 exitFailure
     ["run", path]    -> do
         n <- runFile path
-        print n
+        -- Convention: an IO-action `main` returns 0 (unit). Suppress
+        -- the trailing print in that case so `putStrLn "..."` programs
+        -- look natural; pure-Int `main`s still print their value.
+        if n == 0 then pure () else print n
     ("run":_)        -> do
         hPutStrLn stderr "usage: ihc run FILE.hs"
         exitFailure

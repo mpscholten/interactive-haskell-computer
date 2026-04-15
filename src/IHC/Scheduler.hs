@@ -30,30 +30,65 @@ import IHC.Jit (jitWritable, jitExecutable, jitFlush)
 import qualified IHC.Parser as Parser
 import IHC.Scan
 import IHC.Source
+import IHC.Stdlib (Builtin(..), builtins)
 
+import Control.Monad (forM)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
+import Data.Word (Word8)
+import Foreign.C.String (CString, newCAString)
+import Foreign.Marshal.Alloc (free)
+import Foreign.Marshal.Array (peekArray)
+import Foreign.Ptr (castPtr)
+import Numeric (showHex)
 import System.Environment (lookupEnv)
 import System.IO (hPutStrLn, stderr)
-import qualified Data.ByteString.Char8 as BC
-import Foreign.Marshal.Array (peekArray)
-import Data.Word (Word8)
-import Numeric (showHex)
 
 data Scheduler = Scheduler
     { schedSrc     :: !Source
     , schedBuf     :: !CodeBuffer
     , schedKnown   :: !KnownSymbols
     , schedBodies  :: !(IORef (Map ByteString Binding))
+    , schedStrings :: !(IORef [CString])    -- ^ pool of allocated string literals
+    , schedStrMap  :: !(IORef (Map ByteString CString))
+                       -- ^ content -> pointer, so identical literals share one
+                       --   allocation
     }
+
+-- | Names from 'IHC.Stdlib' that the parser treats as already-compiled
+-- top-level bindings. Looking them up via 'arityResolver' returns the
+-- builtin's arity.
+builtinsMap :: Map ByteString Builtin
+builtinsMap = Map.fromList builtins
 
 newScheduler :: Source -> IO Scheduler
 newScheduler src = do
-    buf    <- newCodeBuffer (64 * 1024)
-    known  <- emptyKnownSymbols
-    bodies <- newIORef Map.empty
-    pure (Scheduler src buf known bodies)
+    buf     <- newCodeBuffer (64 * 1024)
+    known   <- emptyKnownSymbols
+    bodies  <- newIORef Map.empty
+    strs    <- newIORef []
+    strMap  <- newIORef Map.empty
+    pure (Scheduler src buf known bodies strs strMap)
 
 freeScheduler :: Scheduler -> IO ()
-freeScheduler s = freeCodeBuffer (schedBuf s)
+freeScheduler s = do
+    freeCodeBuffer (schedBuf s)
+    -- Free every string we allocated for literals.
+    cstrs <- readIORef (schedStrings s)
+    mapM_ free cstrs
+
+-- | Intern a string literal: if this content has been seen before,
+-- return the existing pointer; otherwise allocate a fresh CString.
+internString :: Scheduler -> ByteString -> IO CString
+internString s bs = do
+    m <- readIORef (schedStrMap s)
+    case Map.lookup bs m of
+        Just p  -> pure p
+        Nothing -> do
+            p <- newCAString (BC.unpack bs)
+            modifyIORef' (schedStrMap  s) (Map.insert bs p)
+            modifyIORef' (schedStrings s) (p :)
+            pure p
 
 -- | Compile the given root, returning its entry pointer. On return,
 -- the JIT buffer is executable and I-cache-flushed.
@@ -63,55 +98,80 @@ compileRoot s root = do
 
     bodies <- readIORef (schedBodies s)
     let sortedBodies       = Map.toAscList bodies
-        (addrs, totalSize) = layout (cbBase (schedBuf s)) sortedBodies
+        (userAddrs, total) = layout (cbBase (schedBuf s)) sortedBodies
+        -- Merge builtin addresses in with user-defined ones. Builtins
+        -- have fixed host-library addresses; user bindings live in the
+        -- JIT page. Parser/emit don't care which is which.
+        addrs              = Map.union userAddrs (fmap builtinAddr builtinsMap)
+
+    -- Intern every string literal referenced anywhere in the program
+    -- *before* emit, so the resolver in emitItem can just read pointers.
+    strMap <- internAllStrings s bodies
 
     jitWritable
-    mapM_ (\(_, b) -> emitBinding (schedBuf s) addrs b) sortedBodies
+    mapM_ (\(_, b) -> emitBinding (schedBuf s) addrs strMap b) sortedBodies
 
-    -- Optional dump of the emitted bytes for debugging.
     dumpEnv <- lookupEnv "IHC_DUMP_JIT"
     case dumpEnv of
-        Just _ -> dumpBuffer (cbBase (schedBuf s)) totalSize addrs
+        Just _ -> dumpBuffer (cbBase (schedBuf s)) total addrs
         Nothing -> pure ()
 
     jitExecutable
-    jitFlush (cbBase (schedBuf s)) totalSize
+    jitFlush (cbBase (schedBuf s)) total
 
     case Map.lookup root addrs of
         Just p  -> pure p
         Nothing -> error ("IHC.Scheduler.compileRoot: missing root `"
                           <> BC.unpack root <> "` after layout")
 
--- | Phase A — parse @name@ and every binding it calls.
-discover :: Scheduler -> ByteString -> IO ()
-discover s name = do
-    bodies <- readIORef (schedBodies s)
-    if Map.member name bodies
-        then pure ()
-        else do
-            mLhs <- findOrResolveLhs s name
-            case mLhs of
-                Nothing -> error ("IHC.Scheduler.discover: no binding `"
-                                  <> BC.unpack name <> "`")
-                Just lhs -> do
-                    items <- Parser.parseBodyItems
-                                (schedSrc s)
-                                (lhsParams lhs)
-                                (arityResolver s)
-                                (lhsBody lhs)
-                    let b = Binding (lhsParams lhs) items
-                    modifyIORef' (schedBodies s) (Map.insert name b)
-                    mapM_ (discover s) (callees items)
+-- | Walk all bodies, interning every ILitStr content in the scheduler's
+-- pool, returning the resulting content -> pointer map for emission.
+internAllStrings :: Scheduler -> Map ByteString Binding -> IO (Map ByteString CString)
+internAllStrings s bodies = do
+    let allStrs = concatMap (collectStrs . bindItems . snd) (Map.toList bodies)
+    _ <- forM allStrs (internString s)
+    readIORef (schedStrMap s)
+  where
+    collectStrs = concatMap go
+    go (ILitStr bs)         = [bs]
+    go (IIfThenElse c t e)  = collectStrs c ++ collectStrs t ++ collectStrs e
+    go _                    = []
 
--- | Arity resolver used by the parser: look up (or lazily discover)
--- a referenced binding's LHS and report its param count.
+-- | Phase A — parse @name@ and every binding it calls. Builtins
+-- short-circuit: they have addresses but no body to parse.
+discover :: Scheduler -> ByteString -> IO ()
+discover s name
+    | Map.member name builtinsMap = pure ()
+    | otherwise = do
+        bodies <- readIORef (schedBodies s)
+        if Map.member name bodies
+            then pure ()
+            else do
+                mLhs <- findOrResolveLhs s name
+                case mLhs of
+                    Nothing -> error ("IHC.Scheduler.discover: no binding `"
+                                      <> BC.unpack name <> "`")
+                    Just lhs -> do
+                        items <- Parser.parseBodyItems
+                                    (schedSrc s)
+                                    (lhsParams lhs)
+                                    (arityResolver s)
+                                    (lhsBody lhs)
+                        let b = Binding (lhsParams lhs) items
+                        modifyIORef' (schedBodies s) (Map.insert name b)
+                        mapM_ (discover s) (callees items)
+
+-- | Arity resolver used by the parser: builtins first, then lazily-
+-- discovered user bindings.
 arityResolver :: Scheduler -> ByteString -> IO Int
-arityResolver s name = do
-    mLhs <- findOrResolveLhs s name
-    case mLhs of
-        Just lhs -> pure (length (lhsParams lhs))
-        Nothing  -> error ("IHC.Scheduler.arityResolver: unknown binding `"
-                           <> BC.unpack name <> "`")
+arityResolver s name
+    | Just b <- Map.lookup name builtinsMap = pure (builtinArity b)
+    | otherwise = do
+        mLhs <- findOrResolveLhs s name
+        case mLhs of
+            Just lhs -> pure (length (lhsParams lhs))
+            Nothing  -> error ("IHC.Scheduler.arityResolver: unknown binding `"
+                               <> BC.unpack name <> "`")
 
 findOrResolveLhs :: Scheduler -> ByteString -> IO (Maybe BindingLhs)
 findOrResolveLhs s name = do

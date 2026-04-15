@@ -40,6 +40,7 @@ library
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.Stdlib
     build-depends:
         base             >= 4.19 && < 5
       , bytestring       >= 0.11
@@ -86,5 +87,6 @@ test-suite ihc-test
         base
       , ihc
       , bytestring
+      , directory
       , hspec            >= 2.10
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"

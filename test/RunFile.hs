@@ -1,8 +1,30 @@
 module RunFile (spec) where
 
+import Control.Exception (bracket_)
+import GHC.IO.Handle (hDuplicate, hDuplicateTo)
+import System.IO
+import System.Directory (removeFile, getTemporaryDirectory)
+
 import Test.Hspec
 
 import IHC.Driver
+
+-- | Run an IO action with stdout redirected to a temp file; return its
+-- result and the captured stdout. Lets us verify that JIT'd programs
+-- produce the expected output via host @base@'s 'putStrLn' / 'print'.
+captureStdout :: IO a -> IO (a, String)
+captureStdout action = do
+    tmp <- getTemporaryDirectory
+    (path, h) <- openTempFile tmp "ihc-test-stdout.txt"
+    saved <- hDuplicate stdout
+    hFlush stdout
+    r <- bracket_
+        (hDuplicateTo h stdout >> hClose h)
+        (hDuplicateTo saved stdout >> hClose saved >> hFlush stdout)
+        action
+    out <- readFile path
+    removeFile path
+    pure (r, out)
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
@@ -96,3 +118,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "2-arg with 1-arg args: `mul2 (inc 3) (inc 9)` → 40" do
         n <- runFile "test/Fixtures/fn_mixed.hs"
         n `shouldBe` 40
+
+    it "calls host base putStrLn: prints `Hello, world!`" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/hello.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, world!\n"
+
+    it "calls host base print on Int: prints fib 15 = 610" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/print_fib.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "610\n"

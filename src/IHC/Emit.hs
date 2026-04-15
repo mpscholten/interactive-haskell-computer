@@ -10,17 +10,23 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Word (Word32, Word64)
-import Foreign.Ptr (Ptr, ptrToWordPtr)
+import Foreign.C.String (CString)
+import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr)
 
 import IHC.CodeBuffer
 import IHC.Encode
 import IHC.IR
 
-emitBinding :: CodeBuffer -> Map ByteString (Ptr ()) -> Binding -> IO ()
-emitBinding cb addrs b = do
+emitBinding
+    :: CodeBuffer
+    -> Map ByteString (Ptr ())     -- name -> code address
+    -> Map ByteString CString      -- string-literal content -> pool ptr
+    -> Binding
+    -> IO ()
+emitBinding cb addrs strs b = do
     let arity = length (bindParams b)
     emitPrologue cb arity
-    mapM_ (emitItem cb addrs) (bindItems b)
+    mapM_ (emitItem cb addrs strs) (bindItems b)
     emitEpilogue cb arity
 
 emitPrologue :: CodeBuffer -> Int -> IO ()
@@ -43,11 +49,14 @@ emitEpilogue cb arity = do
         else emitInsn cb popFpLr32
     emitInsn cb retX30
 
-emitItem :: CodeBuffer -> Map ByteString (Ptr ()) -> Item -> IO ()
-emitItem cb addrs = \case
+emitItem :: CodeBuffer -> Map ByteString (Ptr ()) -> Map ByteString CString -> Item -> IO ()
+emitItem cb addrs strs = \case
     IPushX0   -> emitInsn cb pushX0
     IPopX1    -> emitInsn cb popX1
     ILitInt n -> emitInsns cb (loadInt64 0 n)
+    ILitStr s -> case Map.lookup s strs of
+        Just p  -> emitInsns cb (loadAddr64 0 (castPtr p))
+        Nothing -> error "IHC.Emit: ILitStr content missing from string pool"
     IAddX1X0  -> emitInsn cb (addXXX 0 1 0)
     ISubX1X0  -> emitInsn cb (subXXX 0 1 0)
     IMulX1X0  -> emitInsn cb (mulXXX 0 1 0)
@@ -56,9 +65,6 @@ emitItem cb addrs = \case
         emitInsn cb csetLeX0
     IArg i    -> emitInsn cb (ldrXnFromFp 0 (16 + 8 * i))
     ICall nm arity -> do
-        -- Pop @arity@ values from the spill stack into x0..x(arity-1).
-        -- After N pushes, the Nth push is on top at [sp, #0], the 1st
-        -- push (oldest) is at [sp, #(N-1)*16].
         case arity of
             0 -> pure ()
             _ -> do
@@ -67,15 +73,15 @@ emitItem cb addrs = \case
                 emitInsn cb (addSpImm (arity * 16))
         callTo cb addrs nm
     IIfThenElse cond thenB elseB -> do
-        mapM_ (emitItem cb addrs) cond
+        mapM_ (emitItem cb addrs strs) cond
         let thenSize = sizeOfItems thenB
             elseSize = sizeOfItems elseB
             cbzInsts = (thenSize + 8) `div` 4
             bInsts   = (elseSize + 4) `div` 4
         emitInsn cb (cbzX0Offset cbzInsts)
-        mapM_ (emitItem cb addrs) thenB
+        mapM_ (emitItem cb addrs strs) thenB
         emitInsn cb (bOffset bInsts)
-        mapM_ (emitItem cb addrs) elseB
+        mapM_ (emitItem cb addrs strs) elseB
 
 callTo :: CodeBuffer -> Map ByteString (Ptr ()) -> ByteString -> IO ()
 callTo cb addrs nm = case Map.lookup nm addrs of

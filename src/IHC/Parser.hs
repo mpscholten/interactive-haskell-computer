@@ -157,6 +157,8 @@ parseAtom src params resolve cur0 acc0 = do
     case tkKind tok of
         TkInt n ->
             pure (ILitInt (fromInteger n) : acc0, cur1)
+        TkStr s ->
+            pure (ILitStr s : acc0, cur1)
         TkLParen -> do
             (acc1, cur2) <- parseExpr src params resolve cur1 acc0
             let (close, cur3) = nextSig src cur2

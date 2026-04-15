@@ -46,6 +46,8 @@ data TokenKind
     = TkIdent !ByteString     -- ^ lowercase-start identifier
     | TkConId !ByteString     -- ^ uppercase-start identifier
     | TkInt   !Integer        -- ^ decimal integer literal
+    | TkStr   !ByteString     -- ^ @\"...\"@ string literal (contents after
+                              --   basic \\n \\t \\\\ \\\" escapes)
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
     | TkMinus                 -- ^ @-@ (only when not followed by another '-')
@@ -108,6 +110,7 @@ nextToken s c0 =
             | b == 0x29        -> (mkTok TkRParen c (step c), step c)  -- ')'
             | b == 0x3C, Just 0x3D <- peekByte s (cPos c + 1)
                                -> let c' = step (step c) in (mkTok TkLe c c', c')  -- '<='
+            | b == 0x22        -> lexString c                     -- '"'
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b
@@ -144,6 +147,31 @@ nextToken s c0 =
                          | otherwise = keywordOr bs
                      end = Cursor p (cLine start) (cCol start + (p - cPos start))
                  in (mkTok k start end, end)
+
+    -- Starts at the opening quote. Consume up to the matching @"@, handling
+    -- a handful of backslash escapes. On malformed input (unterminated
+    -- string, bad escape), we just stop at EOF / keep bytes as-is; the
+    -- parser will surface a clearer error if needed.
+    lexString openCur =
+        let openP = cPos openCur + 1 in      -- past the opening quote
+        let (bs, endP) = scanStr openP [] in
+        let end = Cursor (endP + 1) (cLine openCur)
+                         (cCol openCur + (endP + 1 - cPos openCur))
+        in (mkTok (TkStr bs) openCur end, end)
+      where
+        scanStr p acc = case peekByte s p of
+            Nothing   -> (BS.pack (reverse acc), p)          -- EOF; close loosely
+            Just 0x22 -> (BS.pack (reverse acc), p)          -- closing quote
+            Just 0x5C ->                                      -- backslash
+                case peekByte s (p + 1) of
+                    Just 0x6E -> scanStr (p + 2) (0x0A : acc)  -- \n
+                    Just 0x74 -> scanStr (p + 2) (0x09 : acc)  -- \t
+                    Just 0x22 -> scanStr (p + 2) (0x22 : acc)  -- \"
+                    Just 0x5C -> scanStr (p + 2) (0x5C : acc)  -- \\
+                    Just 0x30 -> scanStr (p + 2) (0x00 : acc)  -- \0
+                    Just c    -> scanStr (p + 2) (c    : acc)  -- unknown: pass through
+                    Nothing   -> (BS.pack (reverse acc), p + 1)
+            Just b    -> scanStr (p + 1) (b : acc)
 
     keywordOr bs = case bs of
         "if"   -> TkIf

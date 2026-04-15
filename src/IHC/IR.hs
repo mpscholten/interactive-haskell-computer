@@ -20,7 +20,9 @@ import IHC.Encode (loadInt64)
 data Item
     = IPushX0                       -- spill accumulator to stack
     | IPopX1                        -- pop previous accumulator into x1
-    | ILitInt   !Int64              -- materialize literal into x0
+    | ILitInt   !Int64              -- materialize Int literal into x0
+    | ILitStr   !ByteString         -- materialize (CString) pointer for a
+                                    --   string literal into x0
     | IAddX1X0                      -- x0 = x1 + x0
     | ISubX1X0                      -- x0 = x1 - x0
     | IMulX1X0                      -- x0 = x1 * x0
@@ -41,6 +43,7 @@ sizeOfItem = \case
     IPushX0       -> 4
     IPopX1        -> 4
     ILitInt n     -> 4 * length (loadInt64 0 n)
+    ILitStr _     -> 16                     -- always 4 movz/movk (full addr)
     IAddX1X0      -> 4
     ISubX1X0      -> 4
     IMulX1X0      -> 4
