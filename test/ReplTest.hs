@@ -63,3 +63,26 @@ spec = describe "REPL smoke tests" do
         (code, out, _err) <- runRepl "import\n1 + 1\n:q\n"
         code `shouldBe` ExitSuccess
         out `shouldContain` "2"
+
+    -- :t smoke tests
+    it ":t (1, 1) reports (Int, Int)" do
+        (code, out, _err) <- runRepl ":t (1, 1)\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "(Int, Int)"
+
+    it ":t [1, 2, 3] reports [Int]" do
+        (code, out, _err) <- runRepl ":t [1, 2, 3]\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "[Int]"
+
+    it ":t Just 42 reports Maybe Int" do
+        (code, out, _err) <- runRepl ":t Just 42\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Maybe Int"
+
+    it ":t putStrLn \"x\" reports IO a without printing" do
+        (code, out, _err) <- runRepl ":t putStrLn \"x\"\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "IO a"
+        -- Must NOT have actually executed the action
+        out `shouldNotContain` "x\n"

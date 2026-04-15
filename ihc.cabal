@@ -45,6 +45,7 @@ library
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.TypeDescribe
       , IHC.Val
       -- Dormant Phase-1 JIT machinery, kept in tree but no longer
       -- on the runtime path. May be re-activated as a tier-2 opt JIT

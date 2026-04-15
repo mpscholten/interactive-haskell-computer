@@ -35,6 +35,7 @@ import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly)
 import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
 import IHC.Source (mkSource, readSourceFile, Source(..), srcBytes)
+import IHC.TypeDescribe (describeType)
 import IHC.Val
 
 -- | Entry point. Boots the base environment, then runs the REPL.
@@ -88,9 +89,7 @@ metaCmd _      _        "?"    _    = printHelp >> pure True
 metaCmd _      _        "help" _    = printHelp >> pure True
 metaCmd envRef classReg "l"    args = doLoad envRef classReg (unwords args) >> pure True
 metaCmd envRef classReg "load" args = doLoad envRef classReg (unwords args) >> pure True
-metaCmd _      _        "t"    args = do
-    outputStrLn ("TYPE: unknown (no type checker) — " <> unwords args)
-    pure True
+metaCmd envRef _        "t"    args = doTypeOf envRef (unwords args) >> pure True
 metaCmd _      _        cmd    _    = do
     outputStrLn ("Unknown command :" <> cmd <> "  (try :?)")
     pure True
@@ -99,11 +98,39 @@ printHelp :: InputT IO ()
 printHelp = mapM_ outputStrLn
     [ "ihc REPL commands:"
     , "  :l FILE   (:load)   load a Haskell file into the session"
-    , "  :t EXPR   (:type)   stub — no type checker yet"
+    , "  :t EXPR   (:type)   show the runtime structural type of an expression"
     , "  :?        (:help)   show this message"
     , "  :q        (:quit)   exit"
     , "  Ctrl-D              exit"
     ]
+
+--------------------------------------------------------------------------------
+-- :t EXPR  —  runtime structural type
+--------------------------------------------------------------------------------
+
+doTypeOf :: IORef Env -> String -> InputT IO ()
+doTypeOf _      ""   = outputStrLn "Usage: :t EXPR"
+doTypeOf envRef expr = do
+    env <- liftIO (readIORef envRef)
+    let src = mkSource "<repl:t>" (BC.pack expr)
+    r <- liftIO (try (parseExprOnly src defaultFixityTable)
+                    :: IO (Either SomeException Expr))
+    case r of
+        Left err -> outputStrLn ("Parse error: " <> show err)
+        Right ast -> do
+            r2 <- liftIO (try (typeOfExpr env ast)
+                              :: IO (Either SomeException String))
+            case r2 of
+                Left  e   -> outputStrLn (expr <> " :: <error: " <> show e <> ">")
+                Right ty  -> outputStrLn (expr <> " :: " <> ty)
+
+-- | Evaluate an expression to WHNF and describe its runtime type.
+-- IO actions are NOT executed — we stop at the first 'VIO' and report "IO a".
+typeOfExpr :: Env -> Expr -> IO String
+typeOfExpr env ast = do
+    v  <- eval env ast
+    ty <- describeType v
+    pure (BC.unpack ty)
 
 --------------------------------------------------------------------------------
 -- :load FILE
