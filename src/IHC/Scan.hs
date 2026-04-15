@@ -1,23 +1,28 @@
 -- | On-demand symbol finder. The core of demand-driven laziness:
 -- given a target name, advance the lexer through top-level tokens
--- until we find @name [param] = ...@, returning the parameter list
--- plus body span. Bindings skimmed past are registered as 'SpanOnly'
--- so future lookups hit instantly.
+-- until we find @name [param*] = ...@, returning a list of clauses
+-- (each with a params-span and a body-span).
 --
 -- Never parses a body. Never materializes a token list. Stops as soon
--- as the requested name is found.
+-- as the requested name is fully collected (all consecutive clauses of
+-- that name at column 1 have been absorbed into a single 'BindingLhs').
 --
--- Phase 1.3 LHS grammar:
+-- Phase 2.2.5 LHS grammar:
 --
 -- @
--- top ::= ident ident? '=' rhs
--- rhs ::= <everything up to end-of-line>
+-- top      ::= clause ( clause* with same name)
+-- clause   ::= ident pattern* ('=' rhs | ('|' guard '=' rhs)+)
 -- @
+--
+-- 'findBinding' returns a 'BindingLhs' whose 'lhsClauses' has one
+-- entry per equation. Pattern-parsing and guard-parsing are deferred
+-- to 'IHC.Parser'; the scanner only records byte spans.
 module IHC.Scan
     ( KnownSymbols
     , emptyKnownSymbols
     , SymbolInfo(..)
     , BindingLhs(..)
+    , Clause(..)
     , findBinding
     , lookupSymbol
     , markCompiled
@@ -37,13 +42,26 @@ import IHC.Source
 
 -- | What we know about a top-level name.
 data SymbolInfo
-    = SpanOnly !BindingLhs      -- ^ skimmed past; body location known
+    = SpanOnly !BindingLhs      -- ^ skimmed past; clause locations known
     | Compiled !(Ptr ())        -- ^ already JITted; entry pointer
     deriving (Eq, Show)
 
+-- | One equation in a (possibly multi-clause) binding.
+--
+-- @clausePats@ is the byte span containing the parameter patterns
+-- between the binder-name and either the @=@ (plain body) or the first
+-- @|@ (guarded body). May be an empty span (no params).
+--
+-- @clauseRhs@ is the byte span containing the right-hand side:
+-- either @expr@ (for a plain body) or @| g1 = e1 | g2 = e2 ...@
+-- (for guards). The parser detects which by peeking the first token.
+data Clause = Clause
+    { clausePats :: !Span
+    , clauseRhs  :: !Span
+    } deriving (Eq, Show)
+
 data BindingLhs = BindingLhs
-    { lhsParams :: ![ByteString] -- ^ zero or one in Phase 1.3
-    , lhsBody   :: !Span
+    { lhsClauses :: ![Clause]
     } deriving (Eq, Show)
 
 type KnownSymbols = IORef (Map ByteString SymbolInfo, Cursor)
@@ -61,7 +79,8 @@ markCompiled ref name ptr =
     modifyIORef' ref (\(m, c) -> (Map.insert name (Compiled ptr) m, c))
 
 -- | Advance looking for a top-level binding named @target@. Returns
--- the binding's LHS (param list + body span) if found.
+-- the binding's LHS (list of clauses) if found. Consecutive equations
+-- at column 1 with the same name are grouped into a single 'BindingLhs'.
 findBinding :: Source -> KnownSymbols -> ByteString -> IO (Maybe BindingLhs)
 findBinding src ref target = do
     existing <- lookupSymbol ref target
@@ -84,37 +103,118 @@ findBinding src ref target = do
                 | otherwise      -> go acc cur'
             _ -> go acc cur'
 
+    -- We saw `name` at column 1. Scan through its params+rhs to find
+    -- the clause boundaries, then peek ahead: if the next column-1
+    -- significant token is the same name, accumulate another clause.
     handleTopIdent acc name startTok cur = do
-        -- Read zero or more parameter idents, then expect '='.
-        (params, curAfter) <- collectParams [] cur
-        let (t, curN) = nextToken src curAfter
-        case tkKind t of
-            TkEq -> finish acc name params curN startTok
-            _    -> skipBadBinding acc startTok cur
+        mClause <- scanOneClauseAfterName src cur
+        case mClause of
+            Nothing      -> skipBadBinding acc startTok cur
+            Just (clause, curAfter) -> do
+                (moreClauses, curFinal) <-
+                    collectMoreClauses name [clause] curAfter
+                let lhs  = BindingLhs (reverse moreClauses)
+                    acc' = Map.insert name (SpanOnly lhs) acc
+                if name == target
+                    then do
+                        writeIORef ref (acc', curFinal)
+                        pure (Just lhs)
+                    else go acc' curFinal
 
-    collectParams :: [ByteString] -> Cursor -> IO ([ByteString], Cursor)
-    collectParams acc cur = do
-        let (tok, cur') = nextToken src cur
+    -- After one clause body ends (at a column-1 boundary), peek to see
+    -- if the same binder-name repeats. If so, consume its params+rhs
+    -- and loop. Otherwise, return.
+    collectMoreClauses name acc cur = do
+        -- Skip newlines only; do NOT skip other content.
+        let (tok, curAfter) = peekSigTok cur
         case tkKind tok of
-            TkIdent p -> collectParams (p : acc) cur'
-            _         -> pure (reverse acc, cur)
+            TkIdent n | n == name && tkCol tok == 1 -> do
+                mClause <- scanOneClauseAfterName src curAfter
+                case mClause of
+                    Nothing -> pure (acc, cur)
+                    Just (cl, curNext) ->
+                        collectMoreClauses name (cl : acc) curNext
+            _ -> pure (acc, cur)
 
-    finish acc name params cur startTok = do
-        let bodyStart = cPos (skipTrivia src cur)
-            bodyEnd   = findBodyEnd src bodyStart
-            lhs       = BindingLhs params (bodyStart, bodyEnd)
-            acc'      = Map.insert name (SpanOnly lhs) acc
-            curAfter  = Cursor bodyEnd (tkLine startTok) 1
-        if name == target
-            then do
-                writeIORef ref (acc', curAfter)
-                pure (Just lhs)
-            else go acc' curAfter
+    -- Peek the next significant (non-newline) token without losing
+    -- the ability to restart from `cur` on backtrack. Returns (token,
+    -- cursor AFTER the token) — but only used for its kind/column;
+    -- the body-end cursor is what advances.
+    peekSigTok cur0 =
+        let (tok, curN) = nextToken src cur0 in
+        case tkKind tok of
+            TkNewline -> peekSigTok curN
+            _         -> (tok, curN)
 
     skipBadBinding acc startTok cur =
         let eolPos = findLineEnd src (cPos cur)
             cur'   = Cursor eolPos (tkLine startTok) 1
         in go acc cur'
+
+-- | Starting just after a binder-name identifier, scan the parameter
+-- patterns and the RHS until this clause ends (body extends through
+-- all indented continuation lines, up to the next column-1 token or
+-- EOF). Returns a 'Clause' (spans for patterns + rhs) and the cursor
+-- positioned at the end of the clause body.
+--
+-- The clause is delimited as:
+--   patsSpan = [afterName .. startOfFirstEqOrBar)
+--   rhsSpan  = [startOfFirstEqOrBar .. clauseEnd)
+--   clauseEnd is the body-end (last newline before the next col-1 start,
+--   or EOF, whichever comes first).
+--
+-- If we fail to find either @=@ or @|@ on this line, returns Nothing so
+-- the caller can recover.
+scanOneClauseAfterName :: Source -> Cursor -> IO (Maybe (Clause, Cursor))
+scanOneClauseAfterName src curAfterName = do
+    let patsStart = cPos (skipTrivia src curAfterName)
+    mEqOrBar <- findEqOrBarOnLine src curAfterName
+    case mEqOrBar of
+        Nothing -> pure Nothing
+        Just (sepTokStart, cur1) -> do
+            -- RHS starts at sepTokStart (the `=` or `|` character).
+            -- Body extends to the next column-1 significant position.
+            let bodyStart = sepTokStart
+                bodyEnd   = findBodyEnd src bodyStart
+                patsEnd   = sepTokStart
+                clause    = Clause (patsStart, patsEnd) (bodyStart, bodyEnd)
+                curAfter  = Cursor bodyEnd 0 1
+            pure (Just (clause, curAfter))
+
+-- | Scan forward from @cur@ collecting tokens until we encounter
+-- either a top-level @=@ or a top-level @|@ (not inside parens or
+-- brackets). Returns the byte offset of that token and the cursor
+-- just past it. Returns Nothing if the line ends or a newline-then-
+-- col-1 boundary appears first (malformed LHS — e.g. a bare binder
+-- with no RHS).
+--
+-- Nested parens/brackets/braces are tracked so an @=@ inside a record
+-- literal (not supported yet, but future-proof) or a @|@ inside a
+-- bracketed expression isn't mistaken for the RHS separator.
+findEqOrBarOnLine :: Source -> Cursor -> IO (Maybe (Pos, Cursor))
+findEqOrBarOnLine src cur0 = go cur0 (0 :: Int)
+  where
+    go cur depth = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure Nothing
+            TkEq      | depth == 0 -> pure (Just (tkStart tok, cur'))
+            TkBar     | depth == 0 -> pure (Just (tkStart tok, cur'))
+            TkLParen  -> go cur' (depth + 1)
+            TkLBracket-> go cur' (depth + 1)
+            TkLBrace  -> go cur' (depth + 1)
+            TkRParen  -> go cur' (max 0 (depth - 1))
+            TkRBracket-> go cur' (max 0 (depth - 1))
+            TkRBrace  -> go cur' (max 0 (depth - 1))
+            TkNewline ->
+                -- If the next significant token is at col 1, the LHS
+                -- never got its '=' — malformed. Stop.
+                let (nxt, _) = nextToken src cur' in
+                case tkKind nxt of
+                    TkEof -> pure Nothing
+                    _ | tkCol nxt == 1 -> pure Nothing
+                      | otherwise      -> go cur' depth
+            _ -> go cur' depth
 
 -- | Scan until the end of the current line (or EOF). Used only for
 -- recovering after a malformed LHS; the real body-extent logic is

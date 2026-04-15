@@ -283,3 +283,34 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/char_literal.hs")
         n   `shouldBe` 0
         out `shouldBe` "Hi\n"
+
+    -- Phase 2.2.5: multi-clause function definitions and pattern guards.
+    it "multi-clause on list patterns: isEmpty [] vs isEmpty (_:_)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/multi_clause.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n0\n"
+
+    it "multi-clause with multiple args: add 0 y = y; add x y = x + y" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/multi_clause_args.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "10\n12\n"
+
+    it "pattern guards: classify n by sign with `otherwise`" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/guards.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "-1\n0\n1\n"
+
+    it "pattern guards with `| True` fallback: sign 7 = 1" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/guards_with_patterns.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    it "multi-clause recursion: len on [] and on 5-element list" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/multi_clause_recursive.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n5\n"
+
+    it "multi-clause + guards combined: describe on several lists" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/multi_clause_guards.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n1\n-1\n2\n"

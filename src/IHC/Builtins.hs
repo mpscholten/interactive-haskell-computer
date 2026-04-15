@@ -40,7 +40,14 @@ builtinEnv = do
     nilT  <- newWHNFThunk (VCon "[]" [])
     consT <- newWHNFThunk consV
     let listCtors = [("[]", nilT), (":", consT)]
-    pure (extendEnvMany (pairs ++ listCtors) emptyEnv)
+    -- Guard sugar: `| otherwise = ...` desugars to an `if otherwise`.
+    -- The EIf evaluator treats any non-zero VInt as truthy, so VInt 1
+    -- is the right representation while we still carry 0/1 Bools.
+    otherT <- newWHNFThunk (VInt 1)
+    trueT  <- newWHNFThunk (VInt 1)
+    falseT <- newWHNFThunk (VInt 0)
+    let boolish = [("otherwise", otherT), ("True", trueT), ("False", falseT)]
+    pure (extendEnvMany (pairs ++ listCtors ++ boolish) emptyEnv)
   where
     consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
 

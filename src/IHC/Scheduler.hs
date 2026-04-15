@@ -47,7 +47,11 @@ loadProgram src = do
     dataReg <- scanDataDecls src
     conEnv  <- buildConEnv dataReg
     builtins <- builtinEnv
-    let base = Map.union builtins conEnv
+    -- User-declared constructors (from `conEnv`) take precedence over
+    -- the bool-ish fallbacks in `builtins` (True/False/otherwise).
+    -- Ordinary builtins (+, ++, show, print, …) still win over any
+    -- accidental clashes since conEnv only contains constructors.
+    let base = Map.union conEnv builtins
     let pairs = Map.toList bodies
     slots <- mapM (\_ -> newIORef BlackHole) pairs
     let env = extendEnvMany (zip (map fst pairs) slots) base
@@ -76,7 +80,7 @@ discover src bodiesRef known name = do
             case mLhs of
                 Nothing  -> pure ()    -- assume builtin or local — let evaluator complain
                 Just lhs -> do
-                    expr <- Parser.parseBodyExpr src (lhsParams lhs) (lhsBody lhs)
+                    expr <- Parser.parseBodyExpr src (lhsClauses lhs)
                     modifyIORef' bodiesRef (Map.insert name expr)
                     mapM_ (discover src bodiesRef known) (freeVars expr)
 
