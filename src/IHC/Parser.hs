@@ -261,19 +261,63 @@ parseCase ctx cur0 = do
     -- it respects the alt's column boundary (otherwise the RHS would
     -- gobble the next alt).
     parseAlt altCtx cur = do
-        let (patTok, cur1) = nextSig ctx cur
-        pat <- case tkKind patTok of
-            TkInt n      -> pure (PLit (LInt (fromInteger n)))
-            TkStr s      -> pure (PLit (LStr s))
-            TkUnderscore -> pure PWild
-            TkIdent n    -> pure (PVar n)
-            _            -> parseErr "expected pattern (Int, String, _, or ident) in case alt" patTok
+        (pat, cur1) <- parseTopPat cur
         let (arr, cur2) = nextSig ctx cur1
         case tkKind arr of
             TkArrow -> pure ()
             _       -> parseErr "expected `->` in case alternative" arr
         (e, cur3) <- parseExpr altCtx cur2
         pure (Alt pat e, cur3)
+
+    -- Top-level pattern in a case-alt: a TkConId may be followed by
+    -- zero or more sub-patterns (arguments). Everywhere else (nested
+    -- inside parens, as a sub-pattern) we use parseSubPat which does
+    -- NOT greedily consume further atoms — a bare TkConId sub-pattern
+    -- is always nullary unless parenthesised.
+    parseTopPat cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkConId n -> collectArgs n [] cur1
+            _         -> simplePat tok cur1
+
+    -- Gather sub-patterns for an outer constructor pattern until we hit
+    -- a non-pattern token (like `->`).
+    collectArgs name acc cur =
+        let (tok, _) = nextSig ctx cur in
+        if startsPat (tkKind tok)
+            then do
+                (sp, cur') <- parseSubPat cur
+                collectArgs name (sp : acc) cur'
+            else pure (PCon name (reverse acc), cur)
+
+    startsPat (TkInt _)    = True
+    startsPat (TkIdent _)  = True
+    startsPat TkUnderscore = True
+    startsPat (TkConId _)  = True
+    startsPat TkLParen     = True
+    startsPat _            = False
+
+    -- A sub-pattern — recursive, but a bare TkConId is nullary here.
+    -- To pass args to a nested constructor, wrap it in parens:
+    -- @Just (Just x)@.
+    parseSubPat cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkConId n -> pure (PCon n [], cur1)
+            TkLParen  -> do
+                (inner, cur2) <- parseTopPat cur1
+                let (close, cur3) = nextSig ctx cur2
+                case tkKind close of
+                    TkRParen -> pure (inner, cur3)
+                    _        -> parseErr "expected `)` in pattern" close
+            _ -> simplePat tok cur1
+
+    simplePat tok cur1 = case tkKind tok of
+        TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
+        TkStr s      -> pure (PLit (LStr s), cur1)
+        TkUnderscore -> pure (PWild, cur1)
+        TkIdent n    -> pure (PVar n, cur1)
+        _ -> parseErr "expected pattern (Int, String, _, ident, or constructor) in case alt" tok
 
     bracedAlts cur acc = do
         (alt, cur') <- parseAlt ctx cur
@@ -370,6 +414,7 @@ parseApp ctx cur0 = do
     startsAtom TkStr{}        = True
     startsAtom TkLParen       = True
     startsAtom TkIdent{}      = True
+    startsAtom TkConId{}      = True
     startsAtom _              = False
 
 parseAtom ctx cur0 = do
@@ -380,6 +425,7 @@ parseAtom ctx cur0 = do
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
+        TkConId n -> pure (EVar n, cur1)
         TkLParen -> do
             (e, cur2) <- parseExpr ctx cur1
             let (close, cur3) = nextSig ctx cur2

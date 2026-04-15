@@ -116,28 +116,58 @@ eval env = go
     -- raises PatternMatchFail.
     tryAlts :: Val -> [Alt] -> IO Val
     tryAlts _ [] = throwIO (PatternMatchFail "case: non-exhaustive patterns")
-    tryAlts v (Alt pat body : rest) =
-        case matchPat pat v of
-            Just bindings -> do
-                ts <- mapM (\(_, vv) -> newWHNFThunk vv) bindings
-                eval (extendEnvMany (zip (map fst bindings) ts) env) body
+    tryAlts v (Alt pat body : rest) = do
+        m <- matchPat pat v
+        case m of
+            Just bindings ->
+                eval (extendEnvMany bindings env) body
             Nothing -> tryAlts v rest
 
 -- | Try to match a pattern against a (already-WHNF) value. Returns
 -- the variable bindings introduced by the pattern, or 'Nothing'.
-matchPat :: Pat -> Val -> Maybe [(Name, Val)]
-matchPat PWild        _          = Just []
-matchPat (PVar n)     v          = Just [(n, v)]
-matchPat (PLit (LInt n)) (VInt m) | n == m = Just []
-matchPat (PLit (LInt _)) _       = Nothing
-matchPat (PLit (LStr s)) (VStr t) | s == t = Just []
-matchPat (PLit (LStr _)) _       = Nothing
+--
+-- Returns 'Thunk' rather than 'Val' because nested constructor
+-- patterns may force sub-fields and rebind them; for a 'PVar' we
+-- reuse the existing thunk so the match itself doesn't lose sharing.
+matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
+matchPat PWild        _          = pure (Just [])
+matchPat (PVar n)     v          = do
+    -- The value is already WHNF — bind it directly to a WHNF thunk.
+    -- (This is the cheapest way; we don't have the original thunk
+    -- here since the caller forced it before calling matchPat.)
+    t <- newWHNFThunk v
+    pure (Just [(n, t)])
+matchPat (PLit (LInt n)) (VInt m)
+    | n == m    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LInt _)) _       = pure Nothing
+matchPat (PLit (LStr s)) (VStr t)
+    | s == t    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LStr _)) _       = pure Nothing
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
-        -- For Phase 2.0 we only ever build PCon at parse time for
-        -- ADTs (Phase 2.1). For now this branch is unused.
-        error "IHC.Eval.matchPat: nested constructor matching not yet implemented"
-matchPat _ _ = Nothing
+        -- Zip sub-patterns with the constructor's field thunks. For
+        -- each pair: if the sub-pattern is a 'PVar' we bind the name
+        -- directly to the existing field thunk (preserving sharing
+        -- and laziness — we never force the field). For any other
+        -- sub-pattern we MUST force the thunk to pattern-match its
+        -- structure, then recurse.
+        matchFields (zip pats vthunks) []
+    | otherwise = pure Nothing
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar n, t) : rest) acc =
+        matchFields rest ((n, t) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((p, t) : rest) acc = do
+        fv <- force t
+        m  <- matchPat p fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon _ _) _ = pure Nothing
 
 --------------------------------------------------------------------------------
 -- apply

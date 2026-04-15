@@ -73,6 +73,8 @@ data TokenKind
     | TkIn                    -- ^ keyword @in@
     | TkWhere                 -- ^ keyword @where@
     | TkDo                    -- ^ keyword @do@
+    | TkData                  -- ^ keyword @data@
+    | TkBar                   -- ^ @|@ (data-decl alternative separator)
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
     | TkSemi                  -- ^ @;@
@@ -153,6 +155,7 @@ nextToken s c0 =
             | b == 0x7B        -> (mkTok TkLBrace c (step c), step c)  -- '{'
             | b == 0x7D        -> (mkTok TkRBrace c (step c), step c)  -- '}'
             | b == 0x3B        -> (mkTok TkSemi   c (step c), step c)  -- ';'
+            | b == 0x7C        -> (mkTok TkBar    c (step c), step c)  -- '|'
             | b == 0x22        -> lexString c                          -- '"'
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
@@ -226,6 +229,7 @@ nextToken s c0 =
         "where" -> TkWhere
         "case"  -> TkCase
         "of"    -> TkOf
+        "data"  -> TkData
         "_"     -> TkUnderscore
         _       -> TkIdent bs
 

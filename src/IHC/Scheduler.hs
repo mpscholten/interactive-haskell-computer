@@ -16,7 +16,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 
 import IHC.AST
-import IHC.Builtins (builtinEnv)
+import IHC.Builtins (builtinEnv, buildConEnv)
 import qualified IHC.Parser as Parser
 import IHC.Scan
 import IHC.Source
@@ -38,7 +38,16 @@ loadProgram src = do
     -- knot pattern as ELet in IHC.Eval: pre-allocate IORefs, build
     -- the env from those live pointers, back-patch each with its
     -- real closure.
-    base <- builtinEnv
+    --
+    -- User-declared constructors are registered first (they never
+    -- reference any user binding), then the regular builtins are
+    -- layered on top, then the recursive top-level bindings. The
+    -- second argument to 'Map.union' wins collisions, so user
+    -- bindings can shadow builtins and constructors if they choose.
+    dataReg <- scanDataDecls src
+    conEnv  <- buildConEnv dataReg
+    builtins <- builtinEnv
+    let base = Map.union builtins conEnv
     let pairs = Map.toList bodies
     slots <- mapM (\_ -> newIORef BlackHole) pairs
     let env = extendEnvMany (zip (map fst pairs) slots) base

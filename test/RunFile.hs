@@ -225,3 +225,20 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/case_basic.hs")
         n   `shouldBe` 0
         out `shouldBe` "0\n1\n1\n99\n"
+
+    it "user ADT: Maybe + fromMaybe + pattern match on Just x" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/adt_maybe.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n42\n"
+
+    it "user ADT: Tree + recursive size via Node _ l r" do
+        -- size counts only Node constructors (Leaf -> 0). Node 1 (Node 2 Leaf Leaf) Leaf
+        -- contains two Node constructors.
+        (n, out) <- captureStdout (runFile "test/Fixtures/adt_tree.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "2\n"
+
+    it "user ADT: combined Maybe + Tree fixture" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/adt_combined.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n42\n2\n"

@@ -10,15 +10,18 @@
 -- code in the same process, so calls are direct.
 module IHC.Builtins
     ( builtinEnv
+    , buildConEnv
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
 import System.IO (hFlush, stdout)
 
 import IHC.AST  (Name)
 import IHC.Eval (force)
+import IHC.Scan (DataRegistry)
 import IHC.Val
 
 -- | Build the initial environment containing every well-known name.
@@ -168,3 +171,36 @@ errorB = pure $ VFun $ \a -> do
     case av of
         VStr s -> error ("ihc: " <> BC.unpack s)
         _      -> error ("ihc: error called with non-string")
+
+--------------------------------------------------------------------------------
+-- User-defined constructors
+--------------------------------------------------------------------------------
+
+-- | Build an environment binding every user-declared constructor to a
+-- function (or value, for nullary) that produces a 'VCon'. Arity-0
+-- constructors become WHNF thunks holding @VCon name []@; arity-n
+-- constructors become a curried chain of @VFun@s that accumulate the
+-- argument thunks, then produce @VCon name args@ at saturation.
+--
+-- The argument thunks are stored unevaluated — a 'VCon' field is lazy.
+buildConEnv :: DataRegistry -> IO Env
+buildConEnv reg = do
+    pairs <- mapM mkBinding (Map.toList reg)
+    pure (extendEnvMany pairs emptyEnv)
+  where
+    mkBinding (name, arity) = do
+        v <- mkCon name arity
+        t <- newWHNFThunk v
+        pure (name, t)
+
+    -- arity 0: the VCon itself (wrapped later in a thunk).
+    -- arity n: a chain of n VFuns that accumulate thunks in reverse, then
+    --          return a saturated VCon.
+    mkCon :: Name -> Int -> IO Val
+    mkCon name 0 = pure (VCon name [])
+    mkCon name n = pure (buildLam name n [])
+
+    buildLam :: Name -> Int -> [Thunk] -> Val
+    buildLam name 0    acc = VCon name (reverse acc)
+    buildLam name left acc = VFun $ \t ->
+        pure (buildLam name (left - 1) (t : acc))
