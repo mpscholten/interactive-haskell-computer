@@ -49,9 +49,10 @@ force t = do
 eval :: Env -> Expr -> IO Val
 eval env = go
   where
-    go (ELit (LInt n))  = pure (VInt n)
-    go (ELit (LStr s))  = pure (VStr s)
-    go (ELit (LChar c)) = pure (VChar c)
+    go (ELit (LInt n))   = pure (VInt n)
+    go (ELit (LFloat d)) = pure (VFloat d)
+    go (ELit (LStr s))   = pure (VStr s)
+    go (ELit (LChar c))  = pure (VChar c)
 
     go (EVar name) = case lookupEnv name env of
         Just t  -> force t
@@ -99,9 +100,10 @@ eval env = go
     go (ENeg e) = do
         v <- go e
         case v of
-            VInt n -> pure (VInt (negate n))
-            other  -> error ("IHC.Eval: negate of non-Int: "
-                             <> showValForDebug other)
+            VInt n   -> pure (VInt (negate n))
+            VFloat d -> pure (VFloat (negate d))
+            other    -> error ("IHC.Eval: negate of non-numeric: "
+                               <> showValForDebug other)
 
     go (ETuple es) = do
         -- Build the right tuple constructor name for this arity.
@@ -157,6 +159,10 @@ matchPat (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LInt _)) _       = pure Nothing
+matchPat (PLit (LFloat x)) (VFloat y)
+    | x == y    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LFloat _)) _     = pure Nothing
 matchPat (PLit (LStr s)) (VStr t)
     | s == t    = pure (Just [])
     | otherwise = pure Nothing
@@ -165,6 +171,8 @@ matchPat (PLit (LChar c)) (VChar d)
     | c == d    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LChar _)) _      = pure Nothing
+-- Unit constructor pattern matches VUnit (the canonical runtime unit).
+matchPat (PCon "()" []) VUnit = pure (Just [])
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For

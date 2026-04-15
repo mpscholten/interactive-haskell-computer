@@ -11,6 +11,7 @@
 module IHC.Builtins
     ( builtinEnv
     , buildConEnv
+    , buildFieldEnv
     , showValWith
     ) where
 
@@ -59,7 +60,7 @@ import System.IO
 import IHC.AST  (Name)
 import IHC.Classes (ClassRegistry, lookupInstance, typeTagOf)
 import IHC.Eval (apply, force)
-import IHC.Scan (DataRegistry)
+import IHC.Scan (DataRegistry, FieldRegistry)
 import IHC.Val
 
 -- | Build the initial environment containing every well-known name.
@@ -107,6 +108,12 @@ builtinEnv reg = do
     eqT <- newWHNFThunk (VCon "EQ" [])
     gtT <- newWHNFThunk (VCon "GT" [])
     let orderingCtors = [("LT", ltT), ("EQ", eqT), ("GT", gtT)]
+    -- Unit constructor: () → VUnit.
+    -- The parser emits EVar "()" for the () expression; VUnit is the
+    -- canonical runtime representation so we register the name here
+    -- exactly as we do for True/False/[]/Nothing.
+    unitT <- newWHNFThunk VUnit
+    let unitCtor = [("()", unitT)]
     -- Phase 2.8: unboxed tuple constructors (# , #), (# ,, #) etc.
     -- The parser builds EApp chains using these names.
     unbox2T <- newWHNFThunk (VFun $ \a -> pure $ VFun $ \b -> pure (VCon "(#,#)" [a, b]))
@@ -117,7 +124,8 @@ builtinEnv reg = do
     exitFailT <- newWHNFThunk (VFun $ \n -> pure (VCon "ExitFailure" [n]))
     let exitCtors = [("ExitSuccess", exitSuccT), ("ExitFailure", exitFailT)]
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
-                         ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors)
+                         ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors
+                         ++ unitCtor)
                         emptyEnv)
   where
     consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
@@ -128,20 +136,28 @@ builtinEnv reg = do
 builtins :: ClassRegistry -> [(Name, IO Val)]
 builtins reg =
     -- Arithmetic (TODO 2.6: replace with Num class dispatch)
-    [ ("+",        binOpInt (+))
-    , ("-",        binOpInt (-))
-    , ("*",        binOpInt (*))
+    [ ("+",        binOpNum (+) (+))
+    , ("-",        binOpNum (-) (-))
+    , ("*",        binOpNum (*) (*))
+    , ("/",        binOpFloat (/))
     , ("mod",      binOpInt mod)
     , ("div",      binOpInt div)
-    , ("negate",   unaryOpInt negate)
-    , ("abs",      unaryOpInt abs)
-    , ("signum",   unaryOpInt signum)
-    , ("succ",     unaryOpInt (+1))
-    , ("pred",     unaryOpInt (subtract 1))
-    , ("min",      binOpInt min)
-    , ("max",      binOpInt max)
+    , ("negate",   unaryOpNum negate negate)
+    , ("abs",      unaryOpNum abs abs)
+    , ("signum",   unaryOpNum signum signum)
+    , ("succ",     unaryOpNum (+1) (+1))
+    , ("pred",     unaryOpNum (subtract 1) (subtract 1))
+    , ("min",      binOpNum min min)
+    , ("max",      binOpNum max max)
     , ("gcd",      binOpInt gcd)
-    , ("subtract", binOpInt (\a b -> b - a))
+    , ("subtract", binOpNum (\a b -> b - a) (\a b -> b - a))
+    , ("sqrt",     unaryOpFloat sqrt)
+    , ("floor",    floatToIntB floor)
+    , ("ceiling",  floatToIntB ceiling)
+    , ("round",    floatToIntB round)
+    , ("truncate", floatToIntB truncate)
+    , ("fromIntegral", fromIntegralB)
+    , ("fromInteger",  fromIntegralB)
     , (".",        compose)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
@@ -191,6 +207,9 @@ builtins reg =
     , ("hGetLine",    hGetLineB)
     , ("hFlush",      hFlushB)
     , ("hSetBuffering", hSetBufferingB)
+    , ("readFile",    readFileB)
+    , ("writeFile",   writeFileB)
+    , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
     , ("$!",          dollarBangB)
@@ -314,6 +333,12 @@ builtins reg =
     , ("testBit",      testBitB)
     , ("clearBit",     clearBitB)
     , ("setBit",       setBitB)
+    -- Power operator and range
+    , ("^",            powOpB)
+    , ("^^",           powFloatOpB)
+    , ("**",           powFloatOpB)
+    , ("enumFromTo",   enumFromToB)
+    , ("enumFromThenTo", enumFromThenToB)
     ]
 
 --------------------------------------------------------------------------------
@@ -329,12 +354,63 @@ binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error ("binOp: non-Int args: "
                     <> showValForDebug av <> ", " <> showValForDebug bv)
 
+-- | Polymorphic binary op for Int and Float.
+-- If either argument is a Float, both are promoted.
+binOpNum :: (Int64 -> Int64 -> Int64) -> (Double -> Double -> Double) -> IO Val
+binOpNum intOp floatOp = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    case (av, bv) of
+        (VInt x,   VInt y)   -> pure (VInt   (intOp   x y))
+        (VFloat x, VFloat y) -> pure (VFloat (floatOp x y))
+        (VInt x,   VFloat y) -> pure (VFloat (floatOp (fromIntegral x) y))
+        (VFloat x, VInt y)   -> pure (VFloat (floatOp x (fromIntegral y)))
+        _ -> error ("binOpNum: non-numeric args: "
+                    <> showValForDebug av <> ", " <> showValForDebug bv)
+
+-- | Float-only binary op (division etc.).
+binOpFloat :: (Double -> Double -> Double) -> IO Val
+binOpFloat op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    let toD (VFloat d) = d
+        toD (VInt n)   = fromIntegral n
+        toD v          = error ("binOpFloat: non-numeric: " <> showValForDebug v)
+    pure (VFloat (op (toD av) (toD bv)))
+
 unaryOpInt :: (Int64 -> Int64) -> IO Val
 unaryOpInt op = pure $ VFun $ \a -> do
     av <- force a
     case av of
         VInt x -> pure (VInt (op x))
         _ -> error ("unaryOp: non-Int arg: " <> showValForDebug av)
+
+-- | Polymorphic unary op for Int and Float.
+unaryOpNum :: (Int64 -> Int64) -> (Double -> Double) -> IO Val
+unaryOpNum intOp floatOp = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VInt n   -> pure (VInt   (intOp   n))
+        VFloat d -> pure (VFloat (floatOp d))
+        _ -> error ("unaryOpNum: non-numeric arg: " <> showValForDebug av)
+
+-- | Float-only unary op.
+unaryOpFloat :: (Double -> Double) -> IO Val
+unaryOpFloat op = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VFloat d -> pure (VFloat (op d))
+        VInt n   -> pure (VFloat (op (fromIntegral n)))
+        _ -> error ("unaryOpFloat: non-numeric arg: " <> showValForDebug av)
+
+-- | floor/ceiling/round/truncate — Float -> Int.
+floatToIntB :: (Double -> Int64) -> IO Val
+floatToIntB op = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VFloat d -> pure (VInt (op d))
+        VInt n   -> pure (VInt n)
+        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
 
 -- | @(.) :: (b -> c) -> (a -> b) -> a -> c@. Built as a three-arg
 -- curried 'VFun'. @f@ and @g@ are held as thunks; @x@ is passed to @g@,
@@ -425,11 +501,14 @@ neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | Core equality test on WHNF values.
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
 eqVals reg av bv = case (av, bv) of
-    (VInt x, VInt y)    -> pure (boolVal (x == y))
-    (VChar x, VChar y)  -> pure (boolVal (x == y))
-    (VInt x, VChar y)   -> pure (boolVal (toEnum (fromIntegral x) == y))
-    (VChar x, VInt y)   -> pure (boolVal (x == toEnum (fromIntegral y)))
-    (VStr x, VStr y)    -> pure (boolVal (x == y))
+    (VInt x, VInt y)     -> pure (boolVal (x == y))
+    (VFloat x, VFloat y) -> pure (boolVal (x == y))
+    (VInt x, VFloat y)   -> pure (boolVal (fromIntegral x == y))
+    (VFloat x, VInt y)   -> pure (boolVal (x == fromIntegral y))
+    (VChar x, VChar y)   -> pure (boolVal (x == y))
+    (VInt x, VChar y)    -> pure (boolVal (toEnum (fromIntegral x) == y))
+    (VChar x, VInt y)    -> pure (boolVal (x == toEnum (fromIntegral y)))
+    (VStr x, VStr y)     -> pure (boolVal (x == y))
     (VUnit, VUnit)      -> pure (boolVal True)
     (VCon "True" _, VCon "True" _)   -> pure (boolVal True)
     (VCon "False" _, VCon "False" _) -> pure (boolVal True)
@@ -471,11 +550,14 @@ ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
 ordCmp _reg slot av bv = case (av, bv) of
-    (VInt x, VInt y)   -> pure (boolVal (intOrdSlot slot x y))
-    (VChar x, VChar y) -> let xi = fromIntegral (fromEnum x) :: Int64
-                              yi = fromIntegral (fromEnum y) :: Int64
-                          in pure (boolVal (intOrdSlot slot xi yi))
-    (VStr x, VStr y)   -> pure (boolVal (strOrdSlot slot x y))
+    (VInt x, VInt y)     -> pure (boolVal (intOrdSlot slot x y))
+    (VFloat x, VFloat y) -> pure (boolVal (dblOrdSlot slot x y))
+    (VInt x, VFloat y)   -> pure (boolVal (dblOrdSlot slot (fromIntegral x) y))
+    (VFloat x, VInt y)   -> pure (boolVal (dblOrdSlot slot x (fromIntegral y)))
+    (VChar x, VChar y)   -> let xi = fromIntegral (fromEnum x) :: Int64
+                                yi = fromIntegral (fromEnum y) :: Int64
+                            in pure (boolVal (intOrdSlot slot xi yi))
+    (VStr x, VStr y)     -> pure (boolVal (strOrdSlot slot x y))
     _ -> do
         let tag = typeTagOf av
         mMethods <- lookupInstance _reg "Ord" tag
@@ -504,6 +586,12 @@ ordCmp _reg slot av bv = case (av, bv) of
     intOrdSlot 3 x y = x >= y
     intOrdSlot _ _ _ = False
 
+    dblOrdSlot 0 x y = x < y
+    dblOrdSlot 1 x y = x <= y
+    dblOrdSlot 2 x y = x > y
+    dblOrdSlot 3 x y = x >= y
+    dblOrdSlot _ _ _ = False
+
     strOrdSlot 0 x y = x < y
     strOrdSlot 1 x y = x <= y
     strOrdSlot 2 x y = x > y
@@ -518,6 +606,12 @@ compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VCon (orderingName (compare x y)) [])
+        (VFloat x, VFloat y) ->
+            pure (VCon (orderingName (compare x y)) [])
+        (VInt x, VFloat y) ->
+            pure (VCon (orderingName (compare (fromIntegral x :: Double) y)) [])
+        (VFloat x, VInt y) ->
+            pure (VCon (orderingName (compare x (fromIntegral y :: Double))) [])
         (VChar x, VChar y) ->
             pure (VCon (orderingName (compare x y)) [])
         _ -> do
@@ -544,6 +638,7 @@ showDispatch reg = pure $ VFun $ \a -> do
 showValWith :: ClassRegistry -> Val -> IO String
 showValWith reg av = case av of
     VInt _    -> showVal av
+    VFloat _  -> showVal av
     VChar _   -> showVal av
     VStr _    -> showVal av
     VUnit     -> showVal av
@@ -617,8 +712,19 @@ isCharList (VCon ":"  [h, _]) = do
 isCharList _ = pure False
 
 -- | Render any supported WHNF value as the Haskell @show@ of it.
+-- | Show a Double in Haskell-compatible format. Whole numbers are shown
+-- with a trailing ".0", e.g. @3.0@ not @3@.
+showDouble :: Double -> String
+showDouble d
+    | isNaN d      = "NaN"
+    | isInfinite d = if d > 0 then "Infinity" else "-Infinity"
+    | otherwise    =
+        let s = show d
+        in if '.' `elem` s || 'e' `elem` s then s else s <> ".0"
+
 showVal :: Val -> IO String
 showVal (VInt n)    = pure (show n)
+showVal (VFloat d)  = pure (showDouble d)
 showVal (VChar c)   = pure (show c)
 showVal VUnit       = pure "()"
 showVal v@(VCon "[]" _) = pure "[]"
@@ -1025,14 +1131,16 @@ chrB = pure $ VFun $ \a -> do
         VInt n -> pure (VChar (chr (fromIntegral n)))
         _ -> error ("chr: not an Int: " <> showValForDebug av)
 
--- | 'fromIntegral' as an Int identity in Phase 2.4 — we only have one
--- Int-like numeric type, so the coercion collapses.
+-- | 'fromIntegral' / 'fromInteger' coercion. Accepts Int or Float/Double;
+-- returns the value unchanged (we have one Int type and one Float type).
 fromIntegralB :: IO Val
 fromIntegralB = pure $ VFun $ \a -> do
     av <- force a
     case av of
-        VInt n -> pure (VInt n)
-        _ -> error ("fromIntegral: not an Int: " <> showValForDebug av)
+        VInt n   -> pure (VInt n)
+        VFloat d -> pure (VFloat d)
+        VChar c  -> pure (VInt (fromIntegral (ord c)))
+        _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
@@ -1827,6 +1935,132 @@ setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error "setBit: bad args"
 
 --------------------------------------------------------------------------------
+-- Power operator
+--------------------------------------------------------------------------------
+
+-- | @(^) :: Num a => a -> Int -> a@ — right-associative, precedence 8.
+-- Int ^ Int → Int via repeated multiplication (handles 0^0 = 1).
+-- Double ^ Int → Double via Haskell's (^^).
+powOpB :: IO Val
+powOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    case (av, bv) of
+        (VInt x, VInt n)
+            | n < 0    -> error ("(^): negative exponent: " <> show n)
+            | otherwise -> pure (VInt (intPow x n))
+        (VFloat x, VInt n) -> pure (VFloat (x ^^ n))
+        (VInt x, VFloat _) -> error "(^): exponent must be Int"
+        _ -> error ("(^): non-numeric args: "
+                    <> showValForDebug av <> " ^ " <> showValForDebug bv)
+  where
+    intPow :: Int64 -> Int64 -> Int64
+    intPow _ 0 = 1
+    intPow x n | odd n    = x * intPow x (n - 1)
+               | otherwise = let h = intPow x (n `div` 2) in h * h
+
+-- | @(^^) :: Fractional a => a -> Int -> a@  and  @(**) :: Floating a => a -> a -> a@.
+powFloatOpB :: IO Val
+powFloatOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    let toD (VFloat d) = d
+        toD (VInt n)   = fromIntegral n
+        toD v          = error ("(^^)/(** ): non-numeric: " <> showValForDebug v)
+    pure (VFloat (toD av ** toD bv))
+
+--------------------------------------------------------------------------------
+-- Arithmetic sequences: enumFromTo, enumFromThenTo
+--------------------------------------------------------------------------------
+
+-- | @enumFromTo lo hi@ builds @[lo..hi]@. Works for Int and Char.
+enumFromToB :: IO Val
+enumFromToB = pure $ VFun $ \loT -> pure $ VFun $ \hiT -> do
+    lov <- force loT
+    hiv <- force hiT
+    case (lov, hiv) of
+        (VInt lo, VInt hi) -> buildIntList lo hi
+        (VChar lo, VChar hi) ->
+            buildIntList (fromIntegral (fromEnum lo)) (fromIntegral (fromEnum hi))
+            >>= charifyList
+        _ -> error ("enumFromTo: non-Int/Char args: "
+                    <> showValForDebug lov <> " " <> showValForDebug hiv)
+  where
+    buildIntList :: Int64 -> Int64 -> IO Val
+    buildIntList lo hi
+        | lo > hi   = pure (VCon "[]" [])
+        | otherwise = do
+            hT   <- newWHNFThunk (VInt lo)
+            rest <- buildIntList (lo + 1) hi
+            tT   <- newWHNFThunk rest
+            pure (VCon ":" [hT, tT])
+    charifyList :: Val -> IO Val
+    charifyList (VCon "[]" _) = pure (VCon "[]" [])
+    charifyList (VCon ":" [hT, tT]) = do
+        hv <- force hT
+        case hv of
+            VInt n -> do
+                cT   <- newWHNFThunk (VChar (toEnum (fromIntegral n)))
+                rest <- force tT >>= charifyList
+                rT   <- newWHNFThunk rest
+                pure (VCon ":" [cT, rT])
+            _ -> error "charifyList: expected VInt"
+    charifyList v = error ("charifyList: bad list: " <> showValForDebug v)
+
+-- | @enumFromThenTo lo step hi@ builds @[lo, step..hi]@. Works for Int and Char.
+enumFromThenToB :: IO Val
+enumFromThenToB = pure $ VFun $ \loT -> pure $ VFun $ \stepT -> pure $ VFun $ \hiT -> do
+    lov  <- force loT
+    stepv <- force stepT
+    hiv  <- force hiT
+    case (lov, stepv, hiv) of
+        (VInt lo, VInt step, VInt hi) -> buildStepList lo step hi
+        _ -> error ("enumFromThenTo: non-Int args")
+  where
+    buildStepList :: Int64 -> Int64 -> Int64 -> IO Val
+    buildStepList lo step hi
+        | step > 0 && lo > hi = pure (VCon "[]" [])
+        | step < 0 && lo < hi = pure (VCon "[]" [])
+        | step == 0            = pure (VCon "[]" [])  -- avoid infinite loop
+        | otherwise = do
+            hT   <- newWHNFThunk (VInt lo)
+            rest <- buildStepList (lo + step) step hi
+            tT   <- newWHNFThunk rest
+            pure (VCon ":" [hT, tT])
+
+--------------------------------------------------------------------------------
+-- Simple file IO: readFile, writeFile, appendFile
+--------------------------------------------------------------------------------
+
+-- | @readFile path@ — read the entire file as a String ([Char]).
+readFileB :: IO Val
+readFileB = pure $ VFun $ \a -> pure $ VIO $ do
+    pv   <- force a
+    path <- valToString pv
+    contents <- readFile path
+    stringToListValIO contents
+
+-- | @writeFile path contents@ — write a String to the file (truncating).
+writeFileB :: IO Val
+writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
+    pv   <- force a
+    path <- valToString pv
+    cv   <- force b
+    s    <- valToString cv
+    writeFile path s
+    pure VUnit
+
+-- | @appendFile path contents@ — append a String to the file.
+appendFileB :: IO Val
+appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
+    pv   <- force a
+    path <- valToString pv
+    cv   <- force b
+    s    <- valToString cv
+    appendFile path s
+    pure VUnit
+
+--------------------------------------------------------------------------------
 -- User-defined constructors
 --------------------------------------------------------------------------------
 
@@ -1858,3 +2092,48 @@ buildConEnv reg = do
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
         pure (buildLam name (left - 1) (t : acc))
+
+-- | Build an environment binding each record-field name to an accessor
+-- function.  For a field @f@ that lives at index @i@ in constructor @Con@,
+-- the accessor is equivalent to:
+--
+-- > f (Con _ _ ... x _ ...) = x  -- where x is at position i
+--
+-- If a field name appears in multiple constructors (unusual but legal) we
+-- generate a single function that tries each one in order and falls back
+-- to an @error@ on mismatch.
+--
+-- The accessor is a plain @VFun@ so it participates in lazy evaluation.
+buildFieldEnv :: FieldRegistry -> IO Env
+buildFieldEnv reg = do
+    pairs <- mapM mkAccessor (Map.toList reg)
+    pure (Map.fromList pairs)
+  where
+    mkAccessor (fieldName, clauses) = do
+        t <- newWHNFThunk (VFun (access fieldName clauses))
+        pure (fieldName, t)
+
+    -- Build a function that, given a VCon, extracts the right field.
+    access fieldName clauses argThunk = do
+        v <- force argThunk
+        case v of
+            VCon conName args ->
+                case lookup conName clauses of
+                    Just idx | idx < length args ->
+                        force (args !! idx)
+                    Just idx ->
+                        throwIO (userError
+                            ("record accessor `" <> BC.unpack fieldName
+                             <> "`: constructor `" <> BC.unpack conName
+                             <> "` has only " <> show (length args)
+                             <> " fields, index " <> show idx
+                             <> " out of range"))
+                    Nothing ->
+                        throwIO (userError
+                            ("record accessor `" <> BC.unpack fieldName
+                             <> "`: constructor `" <> BC.unpack conName
+                             <> "` has no such field"))
+            _ ->
+                throwIO (userError
+                    ("record accessor `" <> BC.unpack fieldName
+                     <> "` applied to non-constructor value"))

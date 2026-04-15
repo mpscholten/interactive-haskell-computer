@@ -29,6 +29,7 @@ module IHC.Scan
     , scanAllTopLevelNames
       -- * Data declarations
     , DataRegistry
+    , FieldRegistry
     , scanDataDecls
       -- * Instance declarations
     , InstanceDecl(..)
@@ -307,6 +308,11 @@ findBodyEnd s = scanBody
 -- | Map from constructor name to arity. Populated once per program by
 -- 'scanDataDecls', consumed by 'IHC.Builtins.buildConEnv'.
 type DataRegistry = Map ByteString Int
+
+-- | Map from record-field name to a list of @(constructor name, field index)@
+-- pairs. Used by 'IHC.Builtins.buildFieldEnv' to generate field-accessor
+-- functions automatically.
+type FieldRegistry = Map ByteString [(ByteString, Int)]
 
 -- | Scan the whole source for top-level @data@ declarations and
 -- collect every (constructor, arity) pair. This is a lexer-only pass —
