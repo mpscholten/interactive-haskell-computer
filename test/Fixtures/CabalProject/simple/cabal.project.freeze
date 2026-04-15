@@ -1,0 +1,5 @@
+constraints: any.base ==4.19.0.0,
+             any.foo ==1.0.0,
+             any.bar ==2.3.4,
+             any.bytestring ==0.12.2.0,
+             foo +debug
