@@ -44,3 +44,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "ignores bindings not reachable from main (demand-driven)" do
         n <- runFile "test/Fixtures/cross_with_noise.hs"
         n `shouldBe` 99
+
+    it "calls a 1-arg function with a literal: `inc 10` → 11" do
+        n <- runFile "test/Fixtures/fn_inc.hs"
+        n `shouldBe` 11
+
+    it "mixes function calls with arithmetic: `double 5 + double 7 - 1` → 23" do
+        n <- runFile "test/Fixtures/fn_double_mix.hs"
+        n `shouldBe` 23
+
+    it "passes a parameter as an argument to another function: `twice 10` → 22" do
+        n <- runFile "test/Fixtures/fn_call_through_param.hs"
+        n `shouldBe` 22

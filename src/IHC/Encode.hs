@@ -14,10 +14,15 @@ module IHC.Encode
       -- * Stack push/pop (single 64-bit register)
     , pushX0
     , popX1
-      -- * Function prologue / epilogue
+      -- * Function prologue / epilogue (16-byte frame — no arg slot)
     , pushFpLr
     , popFpLr
     , movFpSp
+      -- * Function prologue / epilogue (32-byte frame — includes arg slot)
+    , pushFpLr32
+    , popFpLr32
+    , strX0ArgSlot
+    , ldrX0ArgSlot
       -- * Indirect call
     , blrX16
       -- * Composed: materialize a signed 64-bit into a register
@@ -101,6 +106,35 @@ movFpSp = 0x910003FD
 -- | @BLR X16@ — branch with link through register x16 (scratch).
 blrX16 :: Word32
 blrX16 = 0xD63F0200
+
+-- | @STP X29, X30, [SP, #-32]!@ — push FP+LR, allocate 32-byte frame.
+-- Layout after mov x29, sp:
+--   [fp + 0]  saved old fp
+--   [fp + 8]  saved old lr
+--   [fp + 16] arg-slot (written by 'strX0ArgSlot')
+--   [fp + 24] padding
+pushFpLr32 :: Word32
+pushFpLr32 = 0xA9BE7BFD
+
+-- | @LDP X29, X30, [SP], #32@ — pop FP+LR, deallocate 32-byte frame.
+popFpLr32 :: Word32
+popFpLr32 = 0xA8C27BFD
+
+-- | @STR X0, [SP, #16]@ — save the first argument to the arg slot.
+-- Only valid immediately after a 32-byte 'pushFpLr32' prologue, before
+-- any further SP changes.
+--
+-- Encoding: 0xF9000000 base, (imm12/8)=2 -> (2<<10)=0x800, Rn=SP=0x3E0.
+-- 0x800 | 0x3E0 = 0xBE0. Writing 0x7E0 here would target [sp,#8] and
+-- corrupt the saved LR.
+strX0ArgSlot :: Word32
+strX0ArgSlot = 0xF9000BE0
+
+-- | @LDR X0, [X29, #16]@ — load the first argument from the arg slot.
+-- Uses FP so it remains correct even if SP has moved inside the body
+-- (e.g. via pushX0 spills during expression evaluation).
+ldrX0ArgSlot :: Word32
+ldrX0ArgSlot = 0xF9400BA0
 
 -- | Materialize a 64-bit integer into register @Xrd@, using up to four
 -- MOVZ/MOVK instructions (covers the full 64-bit range). For small

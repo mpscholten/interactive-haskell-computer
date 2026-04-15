@@ -1,19 +1,13 @@
 -- | Two-phase demand-driven scheduler.
 --
 -- Phase A (discover): starting from a root name, recursively parse each
--- reachable binding to its 'Item' list, memoizing by name. Follows the
--- plan's demand-driven rule — bindings not transitively reachable from
--- the root are never parsed.
+-- reachable binding to a 'Binding' (params + items), memoizing by name.
+-- Bindings not transitively reachable from the root are never parsed.
 --
 -- Phase B (layout + emit): we know every reachable binding and its
--- byte size (from 'bindingBytes'). Assign each an offset in the code
--- buffer, then emit them one at a time with all cross-call addresses
--- already resolved. Self- and mutual-recursion fall out for free
--- because every address is known before we write the first byte.
---
--- W^X: 'compileRoot' brackets the whole emit phase in writable mode
--- and flips to executable at the end. Recursive compilation happens
--- entirely in Haskell land (parsing), so there's no nested toggle.
+-- byte size. Assign each an offset, then emit bindings one at a time
+-- with all cross-call addresses resolved. Self- and mutual-recursion
+-- fall out for free.
 module IHC.Scheduler
     ( Scheduler
     , newScheduler
@@ -27,6 +21,7 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Foreign.Ptr (Ptr, plusPtr)
+import qualified Foreign.Ptr
 
 import IHC.CodeBuffer
 import IHC.Emit (emitBinding)
@@ -36,11 +31,18 @@ import qualified IHC.Parser as Parser
 import IHC.Scan
 import IHC.Source
 
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
+import qualified Data.ByteString.Char8 as BC
+import Foreign.Marshal.Array (peekArray)
+import Data.Word (Word8)
+import Numeric (showHex)
+
 data Scheduler = Scheduler
     { schedSrc     :: !Source
     , schedBuf     :: !CodeBuffer
     , schedKnown   :: !KnownSymbols
-    , schedBodies  :: !(IORef (Map ByteString [Item]))
+    , schedBodies  :: !(IORef (Map ByteString Binding))
     }
 
 newScheduler :: Source -> IO Scheduler
@@ -53,26 +55,25 @@ newScheduler src = do
 freeScheduler :: Scheduler -> IO ()
 freeScheduler s = freeCodeBuffer (schedBuf s)
 
--- | Compile the given root (typically @"main"@), returning its entry
--- pointer. The JIT buffer is executable and I-cache-flushed on return;
--- the caller may call the entry directly.
+-- | Compile the given root, returning its entry pointer. On return,
+-- the JIT buffer is executable and I-cache-flushed.
 compileRoot :: Scheduler -> ByteString -> IO (Ptr ())
 compileRoot s root = do
-    -- Phase A: discover + parse every binding reachable from root.
     discover s root
 
-    -- Phase B.1: layout — assign each binding an entry offset.
-    -- We process bindings in ascending key order and emit them in the
-    -- *same* order so offsets match bump-pointer positions.
     bodies <- readIORef (schedBodies s)
     let sortedBodies       = Map.toAscList bodies
         (addrs, totalSize) = layout (cbBase (schedBuf s)) sortedBodies
 
-    -- Phase B.2: emit each binding at its assigned address.
     jitWritable
-    mapM_ (\(_, items) -> emitBinding (schedBuf s) addrs items) sortedBodies
+    mapM_ (\(_, b) -> emitBinding (schedBuf s) addrs b) sortedBodies
 
-    -- Flip to executable + flush I-cache over all emitted bytes.
+    -- Optional dump of the emitted bytes for debugging.
+    dumpEnv <- lookupEnv "IHC_DUMP_JIT"
+    case dumpEnv of
+        Just _ -> dumpBuffer (cbBase (schedBuf s)) totalSize addrs
+        Nothing -> pure ()
+
     jitExecutable
     jitFlush (cbBase (schedBuf s)) totalSize
 
@@ -81,44 +82,75 @@ compileRoot s root = do
         Nothing -> error ("IHC.Scheduler.compileRoot: missing root `"
                           <> BC.unpack root <> "` after layout")
 
--- | Phase A — parse @name@ and every binding it calls into an Item map.
+-- | Phase A — parse @name@ and every binding it calls.
 discover :: Scheduler -> ByteString -> IO ()
 discover s name = do
     bodies <- readIORef (schedBodies s)
     if Map.member name bodies
-        then pure ()     -- already discovered; break cycles
+        then pure ()
         else do
-            mspan <- findOrResolveSpan s name
-            case mspan of
+            mLhs <- findOrResolveLhs s name
+            case mLhs of
                 Nothing -> error ("IHC.Scheduler.discover: no binding `"
                                   <> BC.unpack name <> "`")
-                Just span_ -> do
-                    items <- Parser.parseBodyItems (schedSrc s) span_
-                    modifyIORef' (schedBodies s) (Map.insert name items)
+                Just lhs -> do
+                    items <- Parser.parseBodyItems (schedSrc s) (lhsParams lhs) (lhsBody lhs)
+                    let b = Binding (lhsParams lhs) items
+                    modifyIORef' (schedBodies s) (Map.insert name b)
                     mapM_ (discover s) (callees items)
 
-findOrResolveSpan :: Scheduler -> ByteString -> IO (Maybe Span)
-findOrResolveSpan s name = do
+findOrResolveLhs :: Scheduler -> ByteString -> IO (Maybe BindingLhs)
+findOrResolveLhs s name = do
     existing <- lookupSymbol (schedKnown s) name
     case existing of
-        Just (SpanOnly sp) -> pure (Just sp)
-        Just (Compiled _)  -> pure Nothing
-        Nothing            -> findBinding (schedSrc s) (schedKnown s) name
+        Just (SpanOnly lhs) -> pure (Just lhs)
+        Just (Compiled _)   -> pure Nothing
+        Nothing             -> findBinding (schedSrc s) (schedKnown s) name
 
 callees :: [Item] -> [ByteString]
 callees = concatMap toCall
   where
-    toCall (ICall n) = [n]
-    toCall _         = []
+    toCall (ICall  n) = [n]
+    toCall (ICall1 n) = [n]
+    toCall _          = []
 
--- | Phase B.1 — walk the sorted binding list left-to-right, assigning
--- each binding an entry address from a running offset. Returns the
--- address map plus the total bytes used.
-layout :: Ptr () -> [(ByteString, [Item])] -> (Map ByteString (Ptr ()), Int)
+-- | Dump the code buffer as hex groups of 4 bytes per line. Prints
+-- "name:" at entries that match an address.
+dumpBuffer :: Ptr () -> Int -> Map ByteString (Ptr ()) -> IO ()
+dumpBuffer base nBytes addrs = do
+    -- Build a reverse map from address to name for labelling.
+    let nameOf p = fst <$> Map.lookupMin (Map.filter (== p) addrs)
+    bs <- peekArray nBytes (castPtr' base)
+    hPutStrLn stderr ("=== JIT dump (" <> show nBytes <> " bytes) ===")
+    let groups = chunk4 bs
+    mapM_ (\(off, ws) -> do
+        case nameOf (base `plusPtr` off) of
+            Just nm -> hPutStrLn stderr ("\n" <> BC.unpack nm <> ":")
+            Nothing -> pure ()
+        hPutStrLn stderr (pad (showHex off "") <> ":  " <> fmtInsn ws))
+        (zip [0, 4 ..] groups)
+  where
+    chunk4 [] = []
+    chunk4 xs = let (a, b) = splitAt 4 xs in a : chunk4 b
+    fmtInsn [a,b,c,d] = pad (showHex (unpackLE a b c d) "")
+    fmtInsn xs = concatMap (\x -> pad2 (showHex x "") <> " ") xs
+    pad s  = replicate (8 - length s) '0' <> s
+    pad2 s = replicate (2 - length s) '0' <> s
+    unpackLE a b c d =
+        fromIntegral a
+        + fromIntegral b * 0x100
+        + fromIntegral c * 0x10000
+        + (fromIntegral d * 0x1000000 :: Word)
+    castPtr' :: Ptr () -> Ptr Word8
+    castPtr' = Foreign.Ptr.castPtr
+
+-- | Phase B.1 — walk the sorted binding list, assigning each an entry
+-- address from a running offset.
+layout :: Ptr () -> [(ByteString, Binding)] -> (Map ByteString (Ptr ()), Int)
 layout base = go Map.empty 0
   where
     go !acc !off []                = (acc, off)
-    go !acc !off ((name, items):xs) =
+    go !acc !off ((name, b):xs) =
         let entry = base `plusPtr` off
-            sz    = bindingBytes items
+            sz    = bindingBytes b
         in go (Map.insert name entry acc) (off + sz) xs

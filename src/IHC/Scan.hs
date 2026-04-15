@@ -1,21 +1,23 @@
--- | On-demand symbol finder. This is the core of the plan's
--- "demand-driven laziness": given a target binding name, advance the
--- lexer through top-level tokens until we find @name = …@, returning
--- the byte span of the body. Bindings we skim past are registered as
--- 'SpanOnly' so future lookups find them instantly.
+-- | On-demand symbol finder. The core of demand-driven laziness:
+-- given a target name, advance the lexer through top-level tokens
+-- until we find @name [param] = ...@, returning the parameter list
+-- plus body span. Bindings skimmed past are registered as 'SpanOnly'
+-- so future lookups hit instantly.
 --
--- Never parses a body. Never materializes a token list. Stops scanning
--- as soon as the requested name is found.
+-- Never parses a body. Never materializes a token list. Stops as soon
+-- as the requested name is found.
 --
--- Limitations for Phase 1.0 (adequate to run @main = 42@):
---   * assumes each binding occupies a single physical line
---     (no where-clauses, no multi-line RHS)
---   * recognises only @name = rhs@; no signatures, no patterns
---   * layout handling is trivially "top-level token at column 1"
+-- Phase 1.3 LHS grammar:
+--
+-- @
+-- top ::= ident ident? '=' rhs
+-- rhs ::= <everything up to end-of-line>
+-- @
 module IHC.Scan
     ( KnownSymbols
     , emptyKnownSymbols
     , SymbolInfo(..)
+    , BindingLhs(..)
     , findBinding
     , lookupSymbol
     , markCompiled
@@ -32,11 +34,15 @@ import IHC.Source
 
 -- | What we know about a top-level name.
 data SymbolInfo
-    = SpanOnly !Span           -- ^ we've skimmed past it; body lives in this span
-    | Compiled !(Ptr ())       -- ^ already JITted; this is the entry pointer
+    = SpanOnly !BindingLhs      -- ^ skimmed past; body location known
+    | Compiled !(Ptr ())        -- ^ already JITted; entry pointer
     deriving (Eq, Show)
 
--- | Shared mutable table. IORef for Phase 1.0; a concurrent map in Phase 6.
+data BindingLhs = BindingLhs
+    { lhsParams :: ![ByteString] -- ^ zero or one in Phase 1.3
+    , lhsBody   :: !Span
+    } deriving (Eq, Show)
+
 type KnownSymbols = IORef (Map ByteString SymbolInfo, Cursor)
 
 emptyKnownSymbols :: IO KnownSymbols
@@ -51,19 +57,14 @@ markCompiled :: KnownSymbols -> ByteString -> Ptr () -> IO ()
 markCompiled ref name ptr =
     modifyIORef' ref (\(m, c) -> (Map.insert name (Compiled ptr) m, c))
 
--- | Advance the lexer looking for a top-level binding named @target@.
--- Every other top-level binding we pass along the way is registered as
--- 'SpanOnly'. Returns 'Just' with the body span once found.
---
--- Resumes from the saved cursor in 'KnownSymbols' so repeated calls
--- don't re-scan the prefix of the file.
-findBinding :: Source -> KnownSymbols -> ByteString -> IO (Maybe Span)
+-- | Advance looking for a top-level binding named @target@. Returns
+-- the binding's LHS (param list + body span) if found.
+findBinding :: Source -> KnownSymbols -> ByteString -> IO (Maybe BindingLhs)
 findBinding src ref target = do
-    -- Fast path: already registered.
     existing <- lookupSymbol ref target
     case existing of
-        Just (SpanOnly s) -> pure (Just s)
-        Just (Compiled _) -> pure Nothing  -- caller should use requireCode instead
+        Just (SpanOnly lhs) -> pure (Just lhs)
+        Just (Compiled _)   -> pure Nothing
         Nothing -> do
             (m0, c0) <- readIORef ref
             go m0 c0
@@ -77,31 +78,37 @@ findBinding src ref target = do
             TkNewline -> go acc cur'
             TkIdent name
                 | tkCol tok == 1 -> handleTopIdent acc name tok cur'
-                | otherwise      -> go acc cur'  -- indented — not a binding start
+                | otherwise      -> go acc cur'
             _ -> go acc cur'
 
-    handleTopIdent acc name tok cur = do
-        -- Expect: `=` follows, then the RHS extends to end-of-line.
-        let (eqTok, cur1) = nextToken src cur
-        case tkKind eqTok of
-            TkEq -> do
-                -- Body starts after '=' (skipping whitespace) and ends at EOL.
-                let bodyStart = cPos (skipTrivia src cur1)
-                    bodyEnd   = findLineEnd src bodyStart
-                    bodySpan  = (bodyStart, bodyEnd)
-                    acc'      = Map.insert name (SpanOnly bodySpan) acc
-                    -- Move cursor to the newline after the body.
-                    cur2      = Cursor bodyEnd (tkLine tok) 1
-                if name == target
-                    then do
-                        writeIORef ref (acc', cur2)
-                        pure (Just bodySpan)
-                    else go acc' cur2
-            _ ->
-                -- Unexpected; skip this binding by eating to EOL and continuing.
-                let eolPos = findLineEnd src (tkEnd tok)
-                    cur2   = Cursor eolPos (tkLine tok) 1
-                in go acc cur2
+    handleTopIdent acc name startTok cur = do
+        -- Read up to one optional parameter ident, then expect '='.
+        let (t1, cur1) = nextToken src cur
+        case tkKind t1 of
+            TkIdent pname -> do
+                let (t2, cur2) = nextToken src cur1
+                case tkKind t2 of
+                    TkEq  -> finish acc name [pname] cur2 startTok
+                    _     -> skipBadBinding acc startTok cur
+            TkEq -> finish acc name [] cur1 startTok
+            _    -> skipBadBinding acc startTok cur
+
+    finish acc name params cur startTok = do
+        let bodyStart = cPos (skipTrivia src cur)
+            bodyEnd   = findLineEnd src bodyStart
+            lhs       = BindingLhs params (bodyStart, bodyEnd)
+            acc'      = Map.insert name (SpanOnly lhs) acc
+            curAfter  = Cursor bodyEnd (tkLine startTok) 1
+        if name == target
+            then do
+                writeIORef ref (acc', curAfter)
+                pure (Just lhs)
+            else go acc' curAfter
+
+    skipBadBinding acc startTok cur =
+        let eolPos = findLineEnd src (cPos cur)
+            cur'   = Cursor eolPos (tkLine startTok) 1
+        in go acc cur'
 
 findLineEnd :: Source -> Pos -> Pos
 findLineEnd s p = case peekByte s p of

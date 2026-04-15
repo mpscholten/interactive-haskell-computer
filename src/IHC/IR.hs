@@ -6,14 +6,10 @@
 -- is to let us (a) parse each binding in isolation, (b) discover
 -- dependencies transitively, (c) lay out all reachable bindings in the
 -- code buffer with known addresses, and then (d) emit each binding in
--- one contiguous shot. Without it, recursive dependency compilation
--- would interleave emissions and scramble the bump-pointer layout.
---
--- Each item corresponds to a handful of aarch64 instructions; 'sizeOf'
--- gives the emitted byte count so the scheduler can lay bindings out
--- in the buffer before it knows their contents.
+-- one contiguous shot.
 module IHC.IR
     ( Item(..)
+    , Binding(..)
     , sizeOfItem
     , sizeOfItems
     , prologueBytes
@@ -27,14 +23,22 @@ import Data.Int (Int64)
 import IHC.Encode (loadInt64)
 
 data Item
-    = IPushX0                    -- spill accumulator to stack
-    | IPopX1                     -- pop previous accumulator into x1
-    | ILitInt   !Int64           -- materialize literal into x0
-    | IAddX1X0                   -- x0 = x1 + x0
-    | ISubX1X0                   -- x0 = x1 - x0
-    | IMulX1X0                   -- x0 = x1 * x0
-    | ICall     !ByteString      -- call another top-level binding, result in x0
+    = IPushX0                 -- spill accumulator to stack
+    | IPopX1                  -- pop previous accumulator into x1
+    | ILitInt   !Int64        -- materialize literal into x0
+    | IAddX1X0                -- x0 = x1 + x0
+    | ISubX1X0                -- x0 = x1 - x0
+    | IMulX1X0                -- x0 = x1 * x0
+    | IArg                    -- load the first argument from arg-slot into x0
+    | ICall     !ByteString   -- call nullary binding, result in x0
+    | ICall1    !ByteString   -- call 1-arg binding with arg in x0, result in x0
     deriving (Eq, Show)
+
+-- | A discovered + parsed top-level binding.
+data Binding = Binding
+    { bindParams :: ![ByteString]  -- ^ zero or one in Phase 1.3
+    , bindItems  :: ![Item]
+    } deriving (Eq, Show)
 
 sizeOfItem :: Item -> Int
 sizeOfItem = \case
@@ -44,18 +48,26 @@ sizeOfItem = \case
     IAddX1X0      -> 4
     ISubX1X0      -> 4
     IMulX1X0      -> 4
-    ICall _       -> 20           -- always 4 movz/movk + 1 blr
+    IArg          -> 4
+    ICall _       -> 20           -- 4 movz/movk + 1 blr
+    ICall1 _      -> 20           -- same shape; arg already in x0 at the call site
 
 sizeOfItems :: [Item] -> Int
 sizeOfItems = sum . map sizeOfItem
 
--- | Prologue is @stp x29,x30,[sp,#-16]! ; mov x29,sp@ — 8 bytes.
-prologueBytes :: Int
-prologueBytes = 8
+-- | Prologue size depends on arity. Zero-arg uses the 16-byte frame
+-- (stp+mov); one-arg uses the 32-byte frame (stp+mov+str).
+prologueBytes :: [ByteString] -> Int
+prologueBytes [] = 8           -- stp + mov
+prologueBytes _  = 12          -- stp + mov + str
 
--- | Epilogue is @ldp x29,x30,[sp],#16 ; ret@ — 8 bytes.
-epilogueBytes :: Int
-epilogueBytes = 8
+-- | Epilogue size matches the prologue's frame choice.
+epilogueBytes :: [ByteString] -> Int
+epilogueBytes [] = 8           -- ldp + ret
+epilogueBytes _  = 8           -- ldp + ret (ldp's post-index deallocates the whole 32)
 
-bindingBytes :: [Item] -> Int
-bindingBytes items = prologueBytes + sizeOfItems items + epilogueBytes
+bindingBytes :: Binding -> Int
+bindingBytes b =
+    prologueBytes (bindParams b)
+    + sizeOfItems (bindItems b)
+    + epilogueBytes (bindParams b)
