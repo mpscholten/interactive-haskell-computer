@@ -2,12 +2,39 @@ module RunFile (spec) where
 
 import Control.Exception (bracket_)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
+import System.FilePath (takeDirectory)
 import System.IO
 import System.Directory (removeFile, getTemporaryDirectory)
 
 import Test.Hspec
 
 import IHC.Driver
+import IHC.Eval (force)
+import IHC.Scheduler (loadProgramFromSource)
+import IHC.Source (readSourceFile)
+import IHC.Val (Val(..))
+
+-- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
+-- an explicit search path so imports like @import Foo@ can resolve to
+-- sibling files on disk. The regular single-file 'runFile' will gain a
+-- search-path arg in a follow-up Driver patch; until then the tests
+-- use this helper directly.
+runFileWithSearch :: [FilePath] -> FilePath -> IO Int
+runFileWithSearch searchPath path = do
+    src <- readSourceFile path
+    (_env, mainT) <- loadProgramFromSource searchPath src
+    v             <- force mainT
+    final         <- runIO v
+    case final of
+        VInt n -> pure (fromIntegral n)
+        _      -> pure 0
+  where
+    runIO (VIO io) = io >>= runIO
+    runIO x        = pure x
+
+-- | Convenience: infer the search path from the Main.hs location.
+runMainWithSiblings :: FilePath -> IO Int
+runMainWithSiblings path = runFileWithSearch [takeDirectory path] path
 
 -- | Run an IO action with stdout redirected to a temp file; return its
 -- result and the captured stdout. Lets us verify that JIT'd programs
@@ -314,3 +341,61 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/multi_clause_guards.hs")
         n   `shouldBe` 0
         out `shouldBe` "0\n1\n-1\n2\n"
+
+    -- Phase 2.4: IO monad + primops.
+    it "io: do-block bind of `return 42` then print" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_return.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "io: `let x = 100` inside a do-block scopes to the rest of the block" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_let_in_do.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "100\n"
+
+    it "io: two binds in one do-block compose (a + b = 3)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_nested_bind.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    it "io: newIORef + readIORef round-trips a value" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_ioref_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n"
+
+    it "io: `seq (1 + 1) 42` forces LHS then returns RHS" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_seq.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "io: ord 'A' = 65; chr 65 = 'A'" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/io_ord_chr.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "65\n'A'\n"
+
+    --------------------------------------------------------------------
+    -- Phase 2.5: modules + imports.
+    --------------------------------------------------------------------
+    it "module: simple unqualified import (Bar.greet + Bar.suffix)" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings "test/Fixtures/Modules/simple/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, world!\nAside from Bar.\n"
+
+    it "module: `import qualified Bar as B` + `import Foo (greet)`" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings "test/Fixtures/Modules/qualified/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, world!\nAside from Bar.\n"
+
+    it "module: export list — only exported names are reachable" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings "test/Fixtures/Modules/export_list/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hello, friend!\n"
+
+    it "module: three-level import chain Main -> Foo -> Bar" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings "test/Fixtures/Modules/transitive/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Hi, world!\n"

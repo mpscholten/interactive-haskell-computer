@@ -103,15 +103,7 @@ eval env = go
             other  -> error ("IHC.Eval: negate of non-Int: "
                              <> showValForDebug other)
 
-    go (EDo stmts) =
-        -- Run each stmt in source order; result of the do-block is the
-        -- result of the last stmt. Intermediate results are discarded
-        -- (no >>= yet — bind-stmts arrive in Phase 2.4).
-        case reverse stmts of
-            []     -> pure VUnit
-            (l:rs) -> do
-                mapM_ go (reverse rs)
-                go l
+    go (EDo stmts) = evalDo env stmts
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
@@ -182,3 +174,64 @@ apply :: Val -> Thunk -> IO Val
 apply (VFun f) arg = f arg
 apply v        _   = error ("IHC.Eval.apply: not a function: "
                             <> showValForDebug v)
+
+--------------------------------------------------------------------------------
+-- Do-block desugaring
+--
+-- Desugars at eval time (not parse time) into a single 'VIO' value
+-- that the driver runs. Each statement sees the env augmented by any
+-- earlier 'SBind' / 'SLet' stmts.
+--
+-- Semantics:
+--   []               — empty do is a no-op IO, per GHC, but we never
+--                      parse one. Still handle defensively.
+--   [SExpr e]        — evaluating @e@ must yield a 'VIO' (the action),
+--                      and that action is the whole do-block's value.
+--   SExpr e : rest   — sequence: run the action from @e@, discard its
+--                      result, then run the rest.
+--   SBind x e : rest — run the action from @e@, bind its result to @x@,
+--                      then run the rest in the extended env.
+--   SLet bs : rest   — semantically @let bs in <rest as EDo>@; just
+--                      extend the env (lazy recursive group) and
+--                      recurse.
+--------------------------------------------------------------------------------
+
+evalDo :: Env -> [Stmt] -> IO Val
+evalDo _   []              = pure (VIO (pure VUnit))
+evalDo env [SExpr e]       = eval env e
+evalDo env [SBind _ e]     =
+    -- Haskell forbids a do-block to end in a bind statement, but be
+    -- defensive: evaluate the action and return its value directly.
+    eval env e
+evalDo _   [SLet _]        = pure (VIO (pure VUnit))
+evalDo env (SExpr e : rest) =
+    pure $ VIO $ do
+        mv <- eval env e
+        _  <- runIOVal mv                   -- run and discard
+        restV <- evalDo env rest
+        runIOVal restV
+evalDo env (SBind name e : rest) =
+    pure $ VIO $ do
+        mv <- eval env e
+        v  <- runIOVal mv
+        vT <- newWHNFThunk v
+        let env' = extendEnv name vT env
+        restV <- evalDo env' rest
+        runIOVal restV
+evalDo env (SLet bs : rest) = do
+    -- Same tying-the-knot pattern as 'ELet', but we're inside a
+    -- do-block so the scope is the rest of the stmts (not a body expr).
+    slots <- mapM (\_ -> newIORef BlackHole) bs
+    let names = map fst bs
+        env'  = extendEnvMany (zip names slots) env
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure env' rhs)))
+          (zip bs slots)
+    evalDo env' rest
+
+-- | Force a 'VIO' to execute its suspended action. Any other value
+-- is returned as-is (treated as a "pure" IO result — shouldn't happen
+-- in well-typed code, but we're optimistic and permissive).
+runIOVal :: Val -> IO Val
+runIOVal (VIO io) = io >>= runIOVal
+runIOVal v        = pure v

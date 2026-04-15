@@ -13,6 +13,7 @@
 module IHC.AST
     ( Name
     , Expr(..)
+    , Stmt(..)
     , Bind
     , Alt(..)
     , Pat(..)
@@ -35,9 +36,20 @@ data Expr
     | ELet  ![Bind] !Expr               -- (mutually) recursive let group
     | ECase !Expr ![Alt]                -- pattern match
     | EIf   !Expr !Expr !Expr           -- if-then-else (sugar for case)
-    | EDo   ![Expr]                     -- do-block: each Expr is a stmt;
-                                        --   later phases add bind-stmts
+    | EDo   ![Stmt]                     -- do-block statements (Phase 2.4)
     | ENeg  !Expr                       -- unary minus
+    deriving (Eq, Show)
+
+-- | A single statement inside a do-block.
+--
+--   * 'SExpr' — a bare expression, e.g. @putStrLn "hi"@
+--   * 'SBind' — a bind statement @x <- action@
+--   * 'SLet'  — @let x = e; y = e2@ inside do (no @in@ — the scope is
+--               the remainder of the do-block)
+data Stmt
+    = SExpr !Expr
+    | SBind !Name !Expr
+    | SLet  ![Bind]
     deriving (Eq, Show)
 
 type Bind = (Name, Expr)

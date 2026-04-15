@@ -7,6 +7,7 @@
 module IHC.Val
     ( -- * Values
       Val(..)
+    , PrimObj(..)
     , showValForDebug
       -- * Thunks
     , Thunk
@@ -32,6 +33,7 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Int (Int64)
+import System.IO (Handle)
 
 import IHC.AST (Expr, Name)
 
@@ -50,6 +52,15 @@ data Val
     | VFun  !(Thunk -> IO Val)         -- single-argument closure
     | VCon  !Name ![Thunk]             -- saturated constructor (Phase 2.1+)
     | VUnit                            -- () — IO result of putStrLn etc.
+    | VIO   !(IO Val)                  -- suspended IO action (Phase 2.4)
+    | VPrimObj !PrimObj                -- opaque host object (Phase 2.4)
+
+-- | Opaque host-side objects surfaced to the interpreter. Not
+-- user-inspectable — programs pass them through primops only
+-- ('readIORef', 'hClose', …).
+data PrimObj
+    = PrimIORef  !(IORef Val)
+    | PrimHandle !Handle
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
@@ -58,6 +69,9 @@ showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)    = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
+showValForDebug (VIO _)     = "<IO>"
+showValForDebug (VPrimObj (PrimIORef _))  = "<IORef>"
+showValForDebug (VPrimObj (PrimHandle _)) = "<Handle>"
 
 --------------------------------------------------------------------------------
 -- Thunks

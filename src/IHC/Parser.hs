@@ -378,23 +378,90 @@ parseDo ctx cur0 = do
         _        -> layoutStmts (tkCol firstTok) cur0 []
   where
     bracedStmts cur acc = do
-        (e, cur') <- parseExpr ctx cur
+        (s, cur') <- parseStmt ctx cur
         let (sep, curN) = nextSig ctx cur'
         case tkKind sep of
-            TkSemi   -> bracedStmts curN (e : acc)
-            TkRBrace -> pure (EDo (reverse (e : acc)), curN)
+            TkSemi   -> bracedStmts curN (s : acc)
+            TkRBrace -> pure (EDo (reverse (s : acc)), curN)
             _        -> parseErr "expected `;` or `}` in do-block" sep
 
     -- Each stmt's expression sees ctxMinCol = stmtCol so its parseApp
     -- / operator loops won't gobble the next stmt at the same column.
     layoutStmts stmtCol cur acc = do
         let stmtCtx = ctx { ctxMinCol = stmtCol }
-        (e, cur') <- parseExpr stmtCtx cur
+        (s, cur') <- parseStmt stmtCtx cur
         let (nextTok, _) = nextSig ctx cur'
         case tkKind nextTok of
-            TkEof -> pure (EDo (reverse (e : acc)), cur')
-            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' (e : acc)
-              | otherwise                -> pure (EDo (reverse (e : acc)), cur')
+            TkEof -> pure (EDo (reverse (s : acc)), cur')
+            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' (s : acc)
+              | otherwise                -> pure (EDo (reverse (s : acc)), cur')
+
+-- | Parse one do-block statement. Three shapes:
+--
+--   * @let { x = e ; y = e2 }@ (or layout) — no trailing @in@; the
+--     bindings scope over the remaining statements.
+--   * @ident <- action@       — bind statement
+--   * @expr@                  — plain statement
+--
+-- We look one token ahead after an identifier to detect @<-@.
+parseStmt :: Ctx -> Cursor -> IO (Stmt, Cursor)
+parseStmt ctx cur0 = do
+    let (tok, cur1) = nextSig ctx cur0
+    case tkKind tok of
+        TkLet -> parseDoLet ctx cur1
+        TkIdent name -> do
+            -- Peek one more token: if it's `<-`, it's a bind-stmt.
+            let (peek, cur2) = nextSig ctx cur1
+            case tkKind peek of
+                TkLArrow -> do
+                    (e, cur3) <- parseExpr ctx cur2
+                    pure (SBind name e, cur3)
+                _ -> do
+                    (e, cur') <- parseExpr ctx cur0
+                    pure (SExpr e, cur')
+        _ -> do
+            (e, cur') <- parseExpr ctx cur0
+            pure (SExpr e, cur')
+
+-- | Parse a @let@ block inside a do-block. Shape:
+--   @let { n1 = e1 ; n2 = e2 }@   (braced)
+--   @let n = e@                    (single binding, layout)
+-- The opening @let@ has already been consumed. No trailing @in@.
+parseDoLet :: Ctx -> Cursor -> IO (Stmt, Cursor)
+parseDoLet ctx cur0 = do
+    let (firstTok, curAfter) = nextSig ctx cur0
+    (binds, curEnd) <- case tkKind firstTok of
+        TkLBrace -> bracedBinds curAfter []
+        _        -> singleBind cur0
+    pure (SLet binds, curEnd)
+  where
+    singleBind cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkIdent n -> pure n
+            _         -> parseErr "expected identifier after `let`" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        pure ([(name, e)], cur3)
+
+    bracedBinds cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkIdent n -> pure n
+            _         -> parseErr "expected identifier in let-binding" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let (sep, curN) = nextSig ctx cur3
+        case tkKind sep of
+            TkSemi   -> bracedBinds curN ((name, e) : acc)
+            TkRBrace -> pure (reverse ((name, e) : acc), curN)
+            _        -> parseErr "expected `;` or `}` in let-block" sep
 
 parseLet :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseLet ctx cur0 = do
@@ -699,7 +766,13 @@ parseAtom ctx cur0 = do
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
-        TkConId n -> pure (EVar n, cur1)
+        TkConId n ->
+            -- Phase 2.5: accept qualified names like @B.suffix@ or
+            -- @Data.Map.empty@. We require the dot to TOUCH both the
+            -- preceding ConId and the following ident/ConId (no
+            -- whitespace) so ordinary function-composition @f . g@
+            -- still parses as three atoms + a TkDot operator.
+            tryQualified ctx n tok cur1
         TkLParen -> do
             -- Special case: "(:)" as a section for the cons operator.
             let (peekTok, afterPeek) = nextSig ctx cur1
@@ -726,6 +799,32 @@ parseAtom ctx cur0 = do
             pure (ENeg e, cur2)
         TkEof -> throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
         _ -> parseErr "unexpected token" tok
+
+-- | After a 'TkConId', attempt to fuse @.ident@ / @.Conid@ chains into
+-- a single qualified 'EVar'. Works on the raw token stream (no
+-- whitespace skipping) so a genuine composition operator — which
+-- always has whitespace around the dot — is left untouched.
+--
+-- Grammar: @ConId (\.(ConId|ident))+@ with every adjacency
+-- satisfying @tkEnd a == tkStart b@. The accumulated string is joined
+-- with dots, e.g. @B.suffix@ or @Data.Map.empty@.
+tryQualified :: Ctx -> Name -> Token -> Cursor -> IO (Expr, Cursor)
+tryQualified ctx firstName firstTok cur0 =
+    go firstName firstTok cur0
+  where
+    src = ctxSrc ctx
+    go acc lastTok cur =
+        let (dotTok, curAfterDot) = nextToken src cur in
+        case tkKind dotTok of
+            TkDot | tkStart dotTok == tkEnd lastTok ->
+                let (segTok, curAfterSeg) = nextToken src curAfterDot in
+                case tkKind segTok of
+                    TkIdent n | tkStart segTok == tkEnd dotTok ->
+                        pure (EVar (acc <> BC.pack "." <> n), curAfterSeg)
+                    TkConId n | tkStart segTok == tkEnd dotTok ->
+                        go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    _ -> pure (EVar acc, cur)
+            _ -> pure (EVar acc, cur)
 
 -- | Desugar a string literal into a chain of cons/nil applications.
 -- "Hi" becomes @'H' : 'i' : []@ i.e. @EApp (EApp (EVar ":") (ELit (LChar 'H'))) (...)@.
