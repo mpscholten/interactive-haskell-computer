@@ -1,44 +1,64 @@
 # Interactive Haskell Computer (`ihc`)
 
-A demand-driven, single-pass, copy-and-patch JIT interpreter for Haskell targeting **macOS / Apple Silicon only**.
+A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goal: interpret real Hackage source — eventually the bytestring test suite, then Warp/IHP.
 
-Goals (see `CLAUDE.md`):
+## Status (Phase 2.6 — 2026-04-15)
 
-- Fast, multi-core interpreter capable of running real Hackage applications — ultimately **IHP** and **Warp** servers.
-- **Demand-driven**: only parse/rename/run bindings transitively reachable from `main`. Unused top-level bindings are never parsed.
-- **Minimal layers**: Pascal-style — source streams straight into emitted aarch64 machine code with no AST or Core IR in between.
-- **Hot loop in aarch64**: stencils compiled by GHC/Clang, patched and stitched at runtime.
-- **Optimistic typing**: the background type checker runs *while* `main` is already executing; most programs never wait on it.
+- **84/84 fixtures pass** end-to-end through a tree-walking lazy evaluator.
+- **`Data/ByteString/Lazy.hs` + the rest of bytestring (55/55 files = 100%) parse cleanly.**
+- Lazy evaluation with `IORef`-backed thunks (black-hole protocol).
+- ADTs + pattern matching + lists + `[Char]` strings + tuples + as/bang patterns.
+- Multi-clause functions + guards.
+- Pratt operator parser with module-level fixity tables.
+- Hand-rolled CPP (no `cpphs` dep) handling `#if`/`#ifdef`/`MIN_VERSION_*`/etc.
+- IO monad with `do`/`<-`/`>>=`/`return`/IORef/file IO/exit.
+- Multi-module loading with qualified imports + per-module `KnownSymbols`.
+- Lambdas (multi-arg + `\case`), sections, backtick infix, `$`, `.`, `MultiWayIf`.
 
-## Status
+Everything via interpretation — **no JIT path on the runtime today**. The aarch64 JIT from Phase 1 is dormant in `src/IHC/{Jit,Encode,Emit,IR,CodeBuffer,Stdlib}.hs` and `rts/`.
 
-**Phase 0** — scaffolding. The JIT smoke test emits and executes aarch64 in a `MAP_JIT` page. Phase 1 (the demand-driven single-pass JIT for pure Int programs) is next.
+## Roadmap
+
+The north-star: **run bytestring's `tests/Main.hs` from source under `ihc`** with the same pass/fail count as `cabal test`. Phase plan in `/Users/marc/.claude/plans/temporal-mixing-raccoon.md`.
+
+Remaining slices (rough order):
+- 2.3 — type classes (dictionary passing) — designed
+- 2.7 — Cabal-aware source loader — in progress
+- 2.8 — `ByteArray#`/`ForeignPtr`/`Word8`/`Storable` primops — designed
+- 2.9 — mid-milestone: `L.putStr (L.pack [72,105,10])` runs from source
+- 2.9.5 — GADTs + `Typeable`/`cast`/`Dynamic` — surfaced by tasty survey
+- 2.10a — STM + async exceptions, 2.10b — trusted host modules (containers shimmed)
+- 2.11 — `Lift`-splice TH (subset of full TH)
+- 2.12 — tasty-load pipeline integration
+- 2.13 — ⭐ bytestring test suite
 
 ## Dev setup
 
-Requires macOS on Apple Silicon and Nix with flakes enabled.
-
 ```sh
-direnv allow            # or: nix develop
-make test               # build + codesign + run the JIT smoke tests
-make check              # build + codesign + run `ihc --check-jit`
+direnv allow                # or: nix develop
+nix develop -c cabal build all
+nix develop -c cabal test ihc-test --test-show-details=streaming
+nix develop -c cabal run ihc -- run path/to/program.hs
 ```
-
-## Why codesigning is necessary
-
-Apple Silicon's hardened runtime forbids `PROT_EXEC` on writable pages unless the binary carries `com.apple.security.cs.allow-jit`. `scripts/codesign-jit.sh` ad-hoc-signs the binary with the required entitlements. The `Makefile` runs it automatically. On CI (`macos-14` runner) the same script is invoked.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `rts/jit.c`, `rts/jit.h` | `MAP_JIT` allocator + `pthread_jit_write_protect_np` W↔X toggle + `sys_icache_invalidate` |
-| `rts/bridge.c` | (Phase 1+) glue for GHC RTS allocation and `dlopen`/`dlsym` |
-| `rts/enter.S` | (Phase 1+) STG-style enter/apply in aarch64 asm |
-| `src/IHC/Jit.hs` | thin FFI binding around the C jit API |
-| `app/Main.hs` | CLI |
-| `test/JitSmoke.hs` | end-to-end JIT page proof |
-| `jit.entitlements` | `allow-jit`, `allow-unsigned-executable-memory`, `disable-library-validation` |
-| `scripts/codesign-jit.sh` | ad-hoc codesigner |
+| `src/IHC/Source.hs` | immutable source buffer + cursors |
+| `src/IHC/Lexer.hs` | streaming layout-aware lexer; pragmas, blocks, MagicHash |
+| `src/IHC/Cpp.hs` | hand-rolled CPP preprocessor |
+| `src/IHC/Scan.hs` | demand-driven binding finder + `data` / fixity / type-sig scanners |
+| `src/IHC/ModuleHeader.hs` | `module Foo where`, `import qualified … as …` parsing |
+| `src/IHC/AST.hs` | `Expr`, `Pat`, `Lit`, `Stmt` |
+| `src/IHC/Parser.hs` | recursive-descent → AST, Pratt operator layer |
+| `src/IHC/Val.hs` | `Val`, `Thunk`, `Env`, `PrimObj` |
+| `src/IHC/Eval.hs` | force / eval / apply / matchPat |
+| `src/IHC/Builtins.hs` | host-Haskell primitives (no FFI shims) |
+| `src/IHC/Scheduler.hs` | discovery + multi-module loading + tying-the-knot |
+| `src/IHC/Driver.hs` | CLI entry point: file → search-path → eval → exit code |
+| `src/IHC/Jit.hs` + `src/IHC/{Encode,Emit,IR,CodeBuffer,Stdlib}.hs` + `rts/*` | dormant Phase-1 aarch64 JIT (no longer on runtime path) |
+| `test/RunFile.hs` | golden-output fixture tests |
+| `test/Fixtures/` | `.hs` programs the suite runs |
 
-See `/Users/marc/.claude/plans/temporal-mixing-raccoon.md` for the full bootstrap plan.
+See `CLAUDE.md` and `/Users/marc/.claude/plans/` for the full design history (one plan per phase).
