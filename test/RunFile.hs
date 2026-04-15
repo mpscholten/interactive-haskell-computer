@@ -399,3 +399,71 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runMainWithSiblings "test/Fixtures/Modules/transitive/Main.hs")
         n   `shouldBe` 0
         out `shouldBe` "Hi, world!\n"
+
+    --------------------------------------------------------------------
+    -- Phase 2.6: language extensions + hand-rolled CPP.
+    --------------------------------------------------------------------
+    it "multi-arg lambda: (\\x y z -> x * y + z) 2 3 4 = 10" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/lambda_multiarg.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "10\n"
+
+    it "sections: (+ 1) 41 = 42, subtract 1 applied yields 42" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/sections.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n42\n"
+
+    it "backtick infix: 10 `div` 3 = 3" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/backtick.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    it "`$` as infix application: print $ 1 + 2 * 3 = 7" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/dollar.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "7\n"
+
+    it "2-tuple literal + tuple pattern: swap (1,2) = (2,1)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/tuple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "(2,1)\n"
+
+    it "3-tuple literal + tuple pattern: rotate (1,2,3) = (2,3,1)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/tuple3.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "(2,3,1)\n"
+
+    it "as-pattern: firstAndAll [1,2,3] = (1,[1,2,3])" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/as_pattern.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "(1,[1,2,3])\n"
+
+    it "LambdaCase: classifies 0 as \"zero\" and 5 as \"other\"" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/lambda_case.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "zero\nother\n"
+
+    it "multi-way if: sgn (-3) = -1" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/multiway_if.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "-1\n"
+
+    it "fixity decl: infixl `myop` drives left-associative chain" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/fixity_decl.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "123\n"
+
+    it "CPP: #ifdef __GLASGOW_HASKELL__ selects the ghc branch" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/cpp_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "ghc-flavoured\n"
+
+    it "bang pattern: !x !y parses and runs" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/bang_pattern.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "composition `.` via Pratt parser: ((*2) . (+3)) 4 = 14" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/compose.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "14\n"

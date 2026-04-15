@@ -6,3 +6,8 @@ dist/
 *.o
 result
 result-*
+
+# Stray cabal-get extractions (from agents that ran `cabal get` here)
+/bytestring-*/
+/tasty-*/
+/QuickCheck-*/

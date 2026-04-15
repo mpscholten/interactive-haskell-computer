@@ -100,6 +100,8 @@ builtins =
     , ("min",      binOpInt min)
     , ("max",      binOpInt max)
     , ("gcd",      binOpInt gcd)
+    , ("subtract", binOpInt (\a b -> b - a))
+    , (".",        compose)
     -- Comparisons (return 0/1 for now; real Bool arrives in Phase 2.1)
     , ("==",       cmpInt (==))
     , ("/=",       cmpInt (/=))
@@ -178,6 +180,17 @@ unaryOpInt op = pure $ VFun $ \a -> do
         VInt x -> pure (VInt (op x))
         _ -> error ("unaryOp: non-Int arg: " <> showValForDebug av)
 
+-- | @(.) :: (b -> c) -> (a -> b) -> a -> c@. Built as a three-arg
+-- curried 'VFun'. @f@ and @g@ are held as thunks; @x@ is passed to @g@,
+-- whose result is forced and handed to @f@.
+compose :: IO Val
+compose = pure $ VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
+    fv <- force fT
+    gv <- force gT
+    gx <- apply gv xT
+    gxT <- newWHNFThunk gx
+    apply fv gxT
+
 cmpInt :: (Int64 -> Int64 -> Bool) -> IO Val
 cmpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
@@ -249,15 +262,28 @@ showVal v@(VCon ":" _) = do
             parts <- mapM showVal xs
             pure ("[" <> intercalate "," parts <> "]")
 showVal (VStr s)    = pure (show (BC.unpack s))
-showVal (VCon name thunks) = do
-    parts <- mapM (\t -> do v <- force t; showVal v) thunks
-    case parts of
-        [] -> pure (BC.unpack name)
-        _  -> pure (BC.unpack name <> " " <> unwords parts)
+showVal (VCon name thunks)
+    | isTupleConName name = do
+        parts <- mapM (\t -> do v <- force t; showVal v) thunks
+        pure ("(" <> intercalate "," parts <> ")")
+    | otherwise = do
+        parts <- mapM (\t -> do v <- force t; showVal v) thunks
+        case parts of
+            [] -> pure (BC.unpack name)
+            _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _)) = pure "<IORef>"
 showVal (VPrimObj (PrimHandle _)) = pure "<Handle>"
+
+-- | Tuple constructors are named @(,)@, @(,,)@, @(,,,)@, etc. — any
+-- @(@ followed by @n@ commas and @)@.
+isTupleConName :: ByteString -> Bool
+isTupleConName bs = case BC.unpack bs of
+    '(':rest | not (null rest), last rest == ')' ->
+        let middle = init rest
+        in not (null middle) && all (== ',') middle
+    _ -> False
 
 -- | @xs ++ ys@ as a list concat. For VStr+VStr the fast path uses
 -- ByteString concat. For cons-lists we walk the spine of @xs@,

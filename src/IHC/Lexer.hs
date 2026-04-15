@@ -106,6 +106,8 @@ data TokenKind
     | TkBacktick              -- ^ @`@ (backtick infix)
     | TkBackslash             -- ^ @\\@ (lambda)
     | TkDollar                -- ^ @$@
+    | TkLUnbox                -- ^ @(#@ unboxed-tuple open
+    | TkRUnbox                -- ^ @#)@ unboxed-tuple close
     | TkSymOp !ByteString     -- ^ generic user-defined symbolic operator
                               --   (e.g. @<>@, @>>=@, @<$>@, @.&.@, @:|@)
     | TkNewline               -- ^ one or more newlines; bumps layout
@@ -194,6 +196,10 @@ nextToken s c0 =
             | b == 0x27        -> lexChar   c                          -- '\''
             -- Structural punctuation (non-op chars): parens, brackets,
             -- braces, comma, semicolon, backtick, backslash.
+            | b == 0x28, Just 0x23 <- peekByte s (cPos c + 1)
+                               ->                                         -- '(#' unboxed-tuple open
+                                  let c' = step (step c)
+                                  in (mkTok TkLUnbox c c', c')
             | b == 0x28        -> (mkTok TkLParen   c (step c), step c)  -- '('
             | b == 0x29        -> (mkTok TkRParen   c (step c), step c)  -- ')'
             | b == 0x7B        -> (mkTok TkLBrace   c (step c), step c)  -- '{'
@@ -466,6 +472,7 @@ isIdentCont b =
     || isUpperStart b
     || isDigit b
     || b == 0x27                                           -- '\''
+    || b == 0x23                                           -- '#' (MagicHash: I#, runRW#, ByteArray#)
 
 showHex :: Word8 -> String
 showHex b = [hex (fromIntegral b `div` 16), hex (fromIntegral b `mod` 16)]

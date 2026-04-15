@@ -103,6 +103,13 @@ eval env = go
             other  -> error ("IHC.Eval: negate of non-Int: "
                              <> showValForDebug other)
 
+    go (ETuple es) = do
+        -- Build the right tuple constructor name for this arity.
+        let arity = length es
+            name  = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
+        thunks <- mapM (newThunk env) es
+        pure (VCon name thunks)
+
     go (EDo stmts) = evalDo env stmts
 
     -- Pattern match alternatives. Returns the matched alt's body or
@@ -130,6 +137,22 @@ matchPat (PVar n)     v          = do
     -- here since the caller forced it before calling matchPat.)
     t <- newWHNFThunk v
     pure (Just [(n, t)])
+matchPat (PBang p)    v          = matchPat p v
+matchPat (PAs n p)    v          = do
+    m <- matchPat p v
+    case m of
+        Nothing  -> pure Nothing
+        Just bs  -> do
+            t <- newWHNFThunk v
+            pure (Just ((n, t) : bs))
+matchPat (PTuple ps) v = do
+    let arity = length ps
+        tupleName = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
+    case v of
+        VCon cn vthunks
+            | cn == tupleName && length vthunks == arity ->
+                matchPat (PCon tupleName ps) v
+        _ -> pure Nothing
 matchPat (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing

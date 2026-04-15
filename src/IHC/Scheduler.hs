@@ -48,12 +48,21 @@ import System.FilePath ((</>))
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv)
+import IHC.Cpp (cppPreprocess, defaultCppContext)
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
 import qualified IHC.Parser as Parser
+import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls)
 import IHC.Scan
 import IHC.Source
 import IHC.Val
+
+-- | Run our hand-rolled CPP over the source bytes, returning a new
+-- 'Source' with the same filename and the preprocessed contents.
+cppSource :: Source -> IO Source
+cppSource src = do
+    bs' <- cppPreprocess defaultCppContext (srcName src) (srcBytes src)
+    pure (src { srcBytes = bs' })
 
 --------------------------------------------------------------------------------
 -- Module registry types
@@ -70,6 +79,9 @@ data LoadedModule = LoadedModule
       -- | Whether this is the entry module (its bindings stay unqualified
       -- in the final env; foreign-module bindings are namespaced).
     , lmIsEntry :: !Bool
+      -- | Per-module fixity table: defaults + any @infixl/infixr/infix@
+      -- declarations found at column 1 in this source.
+    , lmFixity  :: !FixityTable
     }
 
 data ModuleState
@@ -105,8 +117,13 @@ loadProgram = loadProgramFromSource []
 -- | Multi-module entry point: @searchPath@ is the list of directories
 -- to look in when resolving @import Foo@ statements.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
-loadProgramFromSource searchPath src = do
+loadProgramFromSource searchPath src0 = do
     registry <- newIORef Map.empty
+
+    -- Phase 2.6: run CPP on the entry module's bytes before anything
+    -- else touches them. Directive-free files short-circuit and are
+    -- returned unchanged.
+    src <- cppSource src0
 
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
@@ -234,6 +251,7 @@ rewriteExpr rw = go []
         EIf c t e   -> EIf (go bound c) (go bound t) (go bound e)
         EDo stmts   -> EDo (goStmts bound stmts)
         ENeg e      -> ENeg (go bound e)
+        ETuple es   -> ETuple (map (go bound) es)
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -250,6 +268,9 @@ rewriteExpr rw = go []
 
     patBound (PVar n)    = [n]
     patBound (PCon _ ps) = concatMap patBound ps
+    patBound (PAs n p)   = n : patBound p
+    patBound (PBang p)   = patBound p
+    patBound (PTuple ps) = concatMap patBound ps
     patBound _           = []
 
 -- | Build the alias environment for the entry module: every unqualified
@@ -343,7 +364,8 @@ loadModule registry searchPath name = do
         Just Loading     -> throwIO (ImportCycle name)
         Nothing -> do
             path <- locateModule searchPath name
-            src  <- readSourceFile path
+            src0 <- readSourceFile path
+            src  <- cppSource src0
             (mHeader, _) <- parseModuleHeader src startCursor
             let header = fromMaybe emptyHeader mHeader
                 declared = fromMaybe name (mhName header)
@@ -359,6 +381,7 @@ buildLoadedModule name isEntry header src = do
     known  <- emptyKnownSymbols
     dataR  <- scanDataDecls src
     bodies <- newIORef Map.empty
+    fixity <- scanFixityDecls src defaultFixityTable
     pure LoadedModule
         { lmName    = name
         , lmHeader  = header
@@ -367,6 +390,7 @@ buildLoadedModule name isEntry header src = do
         , lmDataReg = dataR
         , lmBodies  = bodies
         , lmIsEntry = isEntry
+        , lmFixity  = fixity
         }
 
 emptyHeader :: ModuleHeader
@@ -419,7 +443,10 @@ discoverInModule registry searchPath lm name
                 mLhs <- findOrResolveLhs (lmSource lm) (lmKnown lm) name
                 case mLhs of
                     Just lhs -> do
-                        expr <- Parser.parseBodyExpr (lmSource lm) (lhsClauses lhs)
+                        expr <- Parser.parseBodyExprWithFixity
+                                    (lmSource lm)
+                                    (lmFixity lm)
+                                    (lhsClauses lhs)
                         modifyIORef' (lmBodies lm) (Map.insert name expr)
                         -- Recurse into every free var. Qualified ones
                         -- will be routed on the next call.
@@ -568,6 +595,7 @@ freeVars = goAll []
         EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
         EDo stmts   -> goStmts bound stmts
         ENeg e      -> goAll bound e
+        ETuple es   -> concatMap (goAll bound) es
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
@@ -585,4 +613,7 @@ freeVars = goAll []
     patBound :: Pat -> [ByteString]
     patBound (PVar n)    = [n]
     patBound (PCon _ ps) = concatMap patBound ps
+    patBound (PAs n p)   = n : patBound p
+    patBound (PBang p)   = patBound p
+    patBound (PTuple ps) = concatMap patBound ps
     patBound _           = []

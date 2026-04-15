@@ -38,6 +38,7 @@ data Expr
     | EIf   !Expr !Expr !Expr           -- if-then-else (sugar for case)
     | EDo   ![Stmt]                     -- do-block statements (Phase 2.4)
     | ENeg  !Expr                       -- unary minus
+    | ETuple ![Expr]                    -- (a, b, ...) tuple (Phase 2.6)
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.
@@ -62,6 +63,9 @@ data Pat
     | PLit  !Lit                        -- match literal exactly
     | PWild                             -- _, matches anything, no binding
     | PCon  !Name ![Pat]                -- constructor pattern (Phase 2.1+)
+    | PAs   !Name !Pat                  -- xs\@(x:_) as-pattern (Phase 2.6)
+    | PBang !Pat                        -- !x bang-pattern — we ignore strictness (Phase 2.6)
+    | PTuple ![Pat]                     -- (a, b, ...) tuple pattern (Phase 2.6)
     deriving (Eq, Show)
 
 data Lit
