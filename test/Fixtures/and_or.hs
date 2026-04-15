@@ -1,6 +1,9 @@
 -- Combine relops with && and ||.
 inRange x = (1 <= x) && (x <= 10)
-either x  = (x == 0) || (x == 100)
+either' x = (x == 0) || (x == 100)
 
-main = print (inRange 5 + inRange 11 + either 0 + either 50)
--- 1 + 0 + 1 + 0 = 2
+main = do
+    print (inRange 5)
+    print (inRange 11)
+    print (either' 0)
+    print (either' 50)

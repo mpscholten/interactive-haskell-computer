@@ -39,6 +39,7 @@ import System.IO
     )
 
 import IHC.AST  (Name)
+import IHC.Classes (ClassRegistry, lookupInstance, typeTagOf)
 import IHC.Eval (apply, force)
 import IHC.Scan (DataRegistry)
 import IHC.Val
@@ -50,20 +51,23 @@ import IHC.Val
 -- them exactly like user-declared constructors from 'buildConEnv':
 -- arity-0 nil is a bare @VCon "[]" []@; arity-2 cons is a curried
 -- function that accumulates two thunks and returns @VCon ":" [h, t]@.
-builtinEnv :: IO Env
-builtinEnv = do
+--
+-- The 'ClassRegistry' is threaded in so dispatch operations like @==@
+-- and @show@ can look up user-defined instances at runtime.
+builtinEnv :: ClassRegistry -> IO Env
+builtinEnv reg = do
     pairs <- mapM (\(n, mkV) -> do { v <- mkV; t <- newWHNFThunk v; pure (n, t) })
-                  builtins
+                  (builtins reg)
     -- Built-in list constructors.
     nilT  <- newWHNFThunk (VCon "[]" [])
     consT <- newWHNFThunk consV
     let listCtors = [("[]", nilT), (":", consT)]
-    -- Guard sugar: `| otherwise = ...` desugars to an `if otherwise`.
-    -- The EIf evaluator treats any non-zero VInt as truthy, so VInt 1
-    -- is the right representation while we still carry 0/1 Bools.
+    -- Phase 2.3: True/False are now proper VCon constructors.
+    -- The EIf evaluator already handles both VInt and VCon "True"/"False".
+    -- `otherwise` remains VInt 1 for back-compat with guard patterns.
     otherT <- newWHNFThunk (VInt 1)
-    trueT  <- newWHNFThunk (VInt 1)
-    falseT <- newWHNFThunk (VInt 0)
+    trueT  <- newWHNFThunk (VCon "True"  [])
+    falseT <- newWHNFThunk (VCon "False" [])
     let boolish = [("otherwise", otherT), ("True", trueT), ("False", falseT)]
     -- IOMode/BufferMode ctors: arity-0 data constructors surfaced so
     -- that primops like `openFile path ReadMode` can pattern match.
@@ -76,7 +80,21 @@ builtinEnv = do
     stdoutT <- newWHNFThunk (VPrimObj (PrimHandle stdout))
     stderrT <- newWHNFThunk (VPrimObj (PrimHandle stderr))
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
-    pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles)
+    -- Builtin Maybe constructors (commonly needed without an explicit data decl).
+    nothingT <- newWHNFThunk (VCon "Nothing" [])
+    justT    <- newWHNFThunk (VFun $ \x -> pure (VCon "Just" [x]))
+    let maybeCtors = [("Nothing", nothingT), ("Just", justT)]
+    -- Ordering constructors.
+    ltT <- newWHNFThunk (VCon "LT" [])
+    eqT <- newWHNFThunk (VCon "EQ" [])
+    gtT <- newWHNFThunk (VCon "GT" [])
+    let orderingCtors = [("LT", ltT), ("EQ", eqT), ("GT", gtT)]
+    -- ExitCode constructors.
+    exitSuccT <- newWHNFThunk (VCon "ExitSuccess" [])
+    exitFailT <- newWHNFThunk (VFun $ \n -> pure (VCon "ExitFailure" [n]))
+    let exitCtors = [("ExitSuccess", exitSuccT), ("ExitFailure", exitFailT)]
+    pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
+                         ++ maybeCtors ++ orderingCtors ++ exitCtors)
                         emptyEnv)
   where
     consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
@@ -84,9 +102,9 @@ builtinEnv = do
         t <- newWHNFThunk (VCon name [])
         pure (name, t)
 
-builtins :: [(Name, IO Val)]
-builtins =
-    -- Arithmetic
+builtins :: ClassRegistry -> [(Name, IO Val)]
+builtins reg =
+    -- Arithmetic (TODO 2.6: replace with Num class dispatch)
     [ ("+",        binOpInt (+))
     , ("-",        binOpInt (-))
     , ("*",        binOpInt (*))
@@ -102,27 +120,30 @@ builtins =
     , ("gcd",      binOpInt gcd)
     , ("subtract", binOpInt (\a b -> b - a))
     , (".",        compose)
-    -- Comparisons (return 0/1 for now; real Bool arrives in Phase 2.1)
-    , ("==",       cmpInt (==))
-    , ("/=",       cmpInt (/=))
-    , ("<",        cmpInt (<))
-    , ("<=",       cmpInt (<=))
-    , (">",        cmpInt (>))
-    , (">=",       cmpInt (>=))
-    , ("even",     unaryOpInt (\n -> if even n then 1 else 0))
-    , ("odd",      unaryOpInt (\n -> if odd  n then 1 else 0))
-    , ("not",      unaryOpInt (\n -> if n == 0 then 1 else 0))
-    -- Boolean (bitwise on 0/1 values until real Bool)
-    , ("&&",       binOpInt (\a b -> if a /= 0 && b /= 0 then 1 else 0))
-    , ("||",       binOpInt (\a b -> if a /= 0 || b /= 0 then 1 else 0))
+    -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
+    -- Builtin instances for Int, Char, Bool, [] are handled inline;
+    -- user-defined instances are looked up from the registry.
+    , ("==",       eqDispatch reg)
+    , ("/=",       neqDispatch reg)
+    , ("<",        ordDispatch reg 0)
+    , ("<=",       ordDispatch reg 1)
+    , (">",        ordDispatch reg 2)
+    , (">=",       ordDispatch reg 3)
+    , ("compare",  compareDispatch reg)
+    , ("even",     evenB)
+    , ("odd",      oddB)
+    , ("not",      notB)
+    -- Boolean
+    , ("&&",       andB)
+    , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("++",       listConcat)
-    , ("show",     showB)
+    , ("show",     showDispatch reg)
     , ("length",   lengthB)
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
-    , ("print",    printB)
+    , ("print",    printDispatch reg)
     , ("putChar",  putCharB)
     , ("getLine",  getLineB)
     -- Monad core (plain names so Phase 2.3 class dispatch can overlay)
@@ -191,14 +212,227 @@ compose = pure $ VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
     gxT <- newWHNFThunk gx
     apply fv gxT
 
-cmpInt :: (Int64 -> Int64 -> Bool) -> IO Val
-cmpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+-- cmpInt removed in Phase 2.3 — replaced by eqDispatch/ordDispatch
+
+-- | Boolean-returning version of a comparison: returns VCon "True" or "False".
+boolVal :: Bool -> Val
+boolVal True  = VCon "True"  []
+boolVal False = VCon "False" []
+
+-- | Test for truthy value: VCon "True"/VInt non-zero is True.
+isTruthy :: Val -> Bool
+isTruthy (VCon "True" _)  = True
+isTruthy (VCon "False" _) = False
+isTruthy (VInt 0)         = False
+isTruthy (VInt _)         = True
+isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
+
+notB :: IO Val
+notB = pure $ VFun $ \a -> do
+    av <- force a
+    pure (boolVal (not (isTruthy av)))
+
+evenB :: IO Val
+evenB = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VInt n -> pure (boolVal (even n))
+        _ -> error ("even: not an Int: " <> showValForDebug av)
+
+oddB :: IO Val
+oddB = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VInt n -> pure (boolVal (odd n))
+        _ -> error ("odd: not an Int: " <> showValForDebug av)
+
+andB :: IO Val
+andB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    if isTruthy av
+        then do
+            bv <- force b
+            pure (boolVal (isTruthy bv))
+        else pure (boolVal False)
+
+orB :: IO Val
+orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    if isTruthy av
+        then pure (boolVal True)
+        else do
+            bv <- force b
+            pure (boolVal (isTruthy bv))
+
+--------------------------------------------------------------------------------
+-- Phase 2.3: type-class dispatch for Eq, Ord, Show
+--
+-- For Int, Char, Bool, List: handled inline.
+-- For user-defined types: look up the ClassRegistry.
+--------------------------------------------------------------------------------
+
+-- | Eq dispatch: look up "==" method from the class registry.
+-- Method slot 0 = (==), slot 1 = (/=).
+eqDispatch :: ClassRegistry -> IO Val
+eqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    eqVals reg av bv
+
+-- | /= dispatch.
+neqDispatch :: ClassRegistry -> IO Val
+neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    r <- eqVals reg av bv
+    pure (boolVal (not (isTruthy r)))
+
+-- | Core equality test on WHNF values.
+eqVals :: ClassRegistry -> Val -> Val -> IO Val
+eqVals reg av bv = case (av, bv) of
+    (VInt x, VInt y)    -> pure (boolVal (x == y))
+    (VChar x, VChar y)  -> pure (boolVal (x == y))
+    (VInt x, VChar y)   -> pure (boolVal (toEnum (fromIntegral x) == y))
+    (VChar x, VInt y)   -> pure (boolVal (x == toEnum (fromIntegral y)))
+    (VStr x, VStr y)    -> pure (boolVal (x == y))
+    (VUnit, VUnit)      -> pure (boolVal True)
+    (VCon "True" _, VCon "True" _)   -> pure (boolVal True)
+    (VCon "False" _, VCon "False" _) -> pure (boolVal True)
+    (VCon "True" _, VCon "False" _)  -> pure (boolVal False)
+    (VCon "False" _, VCon "True" _)  -> pure (boolVal False)
+    (VCon n1 ts1, VCon n2 ts2)
+        | n1 /= n2  -> pure (boolVal False)
+        | otherwise -> do
+            -- Check field-by-field.
+            results <- mapM (\(t1, t2) -> do
+                v1 <- force t1
+                v2 <- force t2
+                eqVals reg v1 v2)
+                (zip ts1 ts2)
+            pure (boolVal (all isTruthy results))
+    _ -> do
+        -- Try user-defined instance.
+        let tag = typeTagOf av
+        mMethods <- lookupInstance reg "Eq" tag
+        case mMethods of
+            Just (eqMethod : _) -> do
+                aT <- newWHNFThunk av
+                bT <- newWHNFThunk bv
+                r1 <- apply eqMethod aT
+                apply r1 bT
+            _ -> error ("(==): no Eq instance for type tag `"
+                        <> BC.unpack tag <> "`: "
+                        <> showValForDebug av)
+
+-- | Ord dispatch. Slot in the method list:
+--   0 = (<), 1 = (<=), 2 = (>), 3 = (>=), 4 = compare
+-- We implement all four directly for builtin types and use
+-- registry lookup for user-defined types.
+ordDispatch :: ClassRegistry -> Int -> IO Val
+ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    ordCmp reg slot av bv
+
+ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
+ordCmp _reg slot av bv = case (av, bv) of
+    (VInt x, VInt y)   -> pure (boolVal (intOrdSlot slot x y))
+    (VChar x, VChar y) -> let xi = fromIntegral (fromEnum x) :: Int64
+                              yi = fromIntegral (fromEnum y) :: Int64
+                          in pure (boolVal (intOrdSlot slot xi yi))
+    (VStr x, VStr y)   -> pure (boolVal (strOrdSlot slot x y))
+    _ -> do
+        let tag = typeTagOf av
+        mMethods <- lookupInstance _reg "Ord" tag
+        case mMethods of
+            Just methods | length methods > slot -> do
+                let method = methods !! slot
+                aT <- newWHNFThunk av
+                bT <- newWHNFThunk bv
+                r1 <- apply method aT
+                apply r1 bT
+            _ ->
+                -- Fall back to Eq for <= and >=
+                case slot of
+                    1 -> do r <- eqVals _reg av bv
+                            if isTruthy r then pure (boolVal True)
+                            else ordCmp _reg 0 av bv
+                    3 -> do r <- eqVals _reg av bv
+                            if isTruthy r then pure (boolVal True)
+                            else ordCmp _reg 2 av bv
+                    _ -> error ("Ord: no instance for type tag `"
+                                <> BC.unpack (typeTagOf av) <> "`")
+  where
+    intOrdSlot 0 x y = x < y
+    intOrdSlot 1 x y = x <= y
+    intOrdSlot 2 x y = x > y
+    intOrdSlot 3 x y = x >= y
+    intOrdSlot _ _ _ = False
+
+    strOrdSlot 0 x y = x < y
+    strOrdSlot 1 x y = x <= y
+    strOrdSlot 2 x y = x > y
+    strOrdSlot 3 x y = x >= y
+    strOrdSlot _ _ _ = False
+
+-- | @compare@ returns an Ordering constructor: LT, EQ, or GT.
+compareDispatch :: ClassRegistry -> IO Val
+compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (VInt (if op x y then 1 else 0))
-        _ -> error ("cmp: non-Int args: "
-                    <> showValForDebug av <> ", " <> showValForDebug bv)
+        (VInt x, VInt y) ->
+            pure (VCon (orderingName (compare x y)) [])
+        (VChar x, VChar y) ->
+            pure (VCon (orderingName (compare x y)) [])
+        _ -> do
+            lt <- ordCmp reg 0 av bv
+            if isTruthy lt then pure (VCon "LT" [])
+            else do
+                eq <- eqVals reg av bv
+                if isTruthy eq then pure (VCon "EQ" [])
+                else pure (VCon "GT" [])
+  where
+    orderingName LT = "LT"
+    orderingName EQ = "EQ"
+    orderingName GT = "GT"
+
+-- | Show dispatch: look up "show" in the Show class registry.
+-- Slot 0 = show. Falls back to built-in showVal for base types.
+showDispatch :: ClassRegistry -> IO Val
+showDispatch reg = pure $ VFun $ \a -> do
+    av <- force a
+    s  <- showValWith reg av
+    stringToListValIO s
+
+-- | Show a value, consulting the ClassRegistry for user-defined Show.
+showValWith :: ClassRegistry -> Val -> IO String
+showValWith reg av = case av of
+    VInt _    -> showVal av
+    VChar _   -> showVal av
+    VStr _    -> showVal av
+    VUnit     -> showVal av
+    VCon "[]" _ -> showVal av
+    VCon ":" _  -> do
+        cl <- isCharList av
+        if cl then showVal av
+        else do
+            xs <- forceList av
+            parts <- mapM (showValWith reg) xs
+            pure ("[" <> intercalate "," parts <> "]")
+    VCon "True" _  -> pure "True"
+    VCon "False" _ -> pure "False"
+    VCon n _ | isTupleConName n -> showVal av
+    VCon n _ -> do
+        let tag = n
+        mMethods <- lookupInstance reg "Show" tag
+        case mMethods of
+            Just (showMethod : _) -> do
+                aT <- newWHNFThunk av
+                rv <- apply showMethod aT
+                valToString rv
+            _ -> showVal av
+    _ -> showVal av
 
 --------------------------------------------------------------------------------
 -- Lists as user-facing strings / generic containers
@@ -315,12 +549,7 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     appendVal other _ =
         error ("(++): not a list: " <> showValForDebug other)
 
--- | Polymorphic-ish @show@: Int, Char, [Char], or generic list / constructor.
-showB :: IO Val
-showB = pure $ VFun $ \a -> do
-    av <- force a
-    s  <- showVal av
-    stringToListValIO s
+-- showB replaced by showDispatch in Phase 2.3
 
 -- | Build a cons-chain of VChar from a host 'String' (in IO — needs
 -- to allocate thunks).
@@ -372,10 +601,12 @@ putStrB = pure $ VFun $ \a -> pure $ VIO $ do
     hFlush stdout
     pure VUnit
 
-printB :: IO Val
-printB = pure $ VFun $ \a -> pure $ VIO $ do
+-- printB replaced by printDispatch in Phase 2.3
+
+printDispatch :: ClassRegistry -> IO Val
+printDispatch reg = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
-    s  <- showVal av
+    s  <- showValWith reg av
     putStrLn s
     hFlush stdout
     pure VUnit

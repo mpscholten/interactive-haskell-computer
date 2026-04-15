@@ -29,9 +29,13 @@ module IHC.Scan
       -- * Data declarations
     , DataRegistry
     , scanDataDecls
+      -- * Instance declarations
+    , InstanceDecl(..)
+    , scanInstanceDecls
     ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
@@ -348,3 +352,162 @@ scanDataDecls src = go Map.empty startCursor
                 TkRParen -> skipToMatchingRParen (depth - 1) cur'
                 TkEof    -> pure cur'
                 _        -> skipToMatchingRParen depth cur'
+
+--------------------------------------------------------------------------------
+-- Instance declarations
+--------------------------------------------------------------------------------
+
+-- | One top-level @instance C T where method = body@ declaration.
+-- 'instClassName' is the class name, 'instTypeName' is the head type
+-- (first uppercase identifier after the class name, before @where@).
+-- 'instMethods' is a list of (method-name, Clause-list) pairs exactly
+-- like the output of 'findBinding'.
+data InstanceDecl = InstanceDecl
+    { instClassName :: !ByteString
+    , instTypeName  :: !ByteString
+    , instMethods   :: ![(ByteString, BindingLhs)]
+    } deriving (Eq, Show)
+
+-- | Scan the whole source for top-level @instance@ declarations and
+-- return each one as an 'InstanceDecl'. The method bodies are recorded
+-- as 'Clause' byte-spans (same format as 'findBinding') so the caller
+-- can hand them to the parser.
+--
+-- Grammar handled (permissive):
+-- @
+-- instance [ctx =>] ClassName TypeHead where
+--   method [params] = body
+--   ...
+-- @
+-- The instance head (everything between @instance@ and @where@) is
+-- partially parsed: we grab the first uppercase identifier as the class
+-- name and walk for the first upper-or-lower identifier that follows a
+-- constraint arrow or is the head type.
+scanInstanceDecls :: Source -> IO [InstanceDecl]
+scanInstanceDecls src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkInstance | tkCol tok == 1 -> do
+                mDecl <- scanOneInstance cur'
+                case mDecl of
+                    Nothing   -> go acc cur'
+                    Just decl -> go (decl : acc) cur'
+            _ -> go acc cur'
+
+    -- After `instance`, scan the head to find class name + type name,
+    -- then scan the `where` body for method bindings.
+    scanOneInstance cur0 = do
+        -- Collect tokens up to `where`.
+        (mClassName, mTypeName, curWhere) <- parseInstanceHead cur0
+        case (mClassName, mTypeName) of
+            (Just cls, Just typ) -> do
+                methods <- parseInstanceBody curWhere
+                pure (Just (InstanceDecl cls typ methods))
+            _ -> pure Nothing
+
+    -- Parse: [context =>] ClassName TypeHead where
+    -- We grab the first TkConId as class name, then look for the type.
+    -- Simplified: first ConId = class, next ConId/Ident after `=>` or
+    -- directly = type. Stop at `where`.
+    parseInstanceHead cur0 = scanHead cur0 Nothing Nothing False
+      where
+        scanHead cur mCls mTyp seenArrow = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof    -> pure (mCls, mTyp, cur)
+                TkWhere  -> pure (mCls, mTyp, cur')
+                TkNewline -> scanHead cur' mCls mTyp seenArrow
+                TkDArrow -> scanHead cur' mCls Nothing True
+                TkConId n ->
+                    case mCls of
+                        Nothing -> scanHead cur' (Just n) mTyp seenArrow
+                        Just _  ->
+                            case mTyp of
+                                Nothing -> scanHead cur' mCls (Just n) seenArrow
+                                Just _  -> scanHead cur' mCls mTyp seenArrow
+                TkIdent _ ->
+                    -- Lower-case type variable or instance argument like
+                    -- `instance Eq a => Eq [a]` — skip for now, the
+                    -- bracket-balanced scan below handles more complex heads.
+                    scanHead cur' mCls mTyp seenArrow
+                TkLParen -> do
+                    -- Skip parenthesised types like `(,)` or `(a, b)`.
+                    curAfter <- skipParens 1 cur'
+                    -- The head type might BE a tuple or list; extract its name.
+                    let headTyp = case mTyp of
+                            Nothing -> Just (BC.pack "(,)")
+                            Just _  -> mTyp
+                    scanHead curAfter mCls headTyp seenArrow
+                TkLBracket -> do
+                    curAfter <- skipBrackets 1 cur'
+                    let headTyp = case mTyp of
+                            Nothing -> Just (BC.pack "[]")
+                            Just _  -> mTyp
+                    scanHead curAfter mCls headTyp seenArrow
+                _ -> scanHead cur' mCls mTyp seenArrow
+
+    skipParens :: Int -> Cursor -> IO Cursor
+    skipParens !d cur
+        | d <= 0    = pure cur
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLParen -> skipParens (d + 1) cur'
+                TkRParen -> skipParens (d - 1) cur'
+                TkEof    -> pure cur'
+                _        -> skipParens d cur'
+
+    skipBrackets :: Int -> Cursor -> IO Cursor
+    skipBrackets !d cur
+        | d <= 0    = pure cur
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLBracket -> skipBrackets (d + 1) cur'
+                TkRBracket -> skipBrackets (d - 1) cur'
+                TkEof      -> pure cur'
+                _          -> skipBrackets d cur'
+
+    -- Parse the `where` body: a layout block of method bindings.
+    -- Each binding is `methodName [pats] = body` (possibly multi-clause).
+    -- We reuse the same clause-scanning logic as findBinding.
+    parseInstanceBody cur0 = scanMethods Map.empty cur0
+
+    scanMethods !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (Map.toList acc)
+            TkNewline -> scanMethods acc cur'
+            TkIdent name | tkCol tok > 1 -> do
+                mClause <- scanOneClauseAfterName src cur'
+                case mClause of
+                    Nothing -> scanMethods acc cur'
+                    Just (clause, curNext) -> do
+                        (moreClauses, curFinal) <-
+                            collectInstanceClauses name [clause] curNext
+                        let lhs  = BindingLhs (reverse moreClauses)
+                            acc' = Map.insert name lhs acc
+                        scanMethods acc' curFinal
+            -- Stop when we hit a new column-1 token (next top-level decl).
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (Map.toList acc)
+              | otherwise -> scanMethods acc cur'
+
+    collectInstanceClauses name acc cur = do
+        let (tok, curAfter) = peekSig cur
+        case tkKind tok of
+            TkIdent n | n == name && tkCol tok > 1 -> do
+                mClause <- scanOneClauseAfterName src curAfter
+                case mClause of
+                    Nothing -> pure (acc, cur)
+                    Just (cl, curNext) ->
+                        collectInstanceClauses name (cl : acc) curNext
+            _ -> pure (acc, cur)
+
+    peekSig cur0 =
+        let (tok, curN) = nextToken src cur0 in
+        case tkKind tok of
+            TkNewline -> peekSig curN
+            _         -> (tok, curN)

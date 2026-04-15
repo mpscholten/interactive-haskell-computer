@@ -156,20 +156,20 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "610\n"
 
-    it "all six relational operators yield 1 when their condition holds" do
+    it "all six relational operators return True for their conditions" do
         (n, out) <- captureStdout (runFile "test/Fixtures/cmp_ops.hs")
         n   `shouldBe` 0
-        out `shouldBe` "1\n"
+        out `shouldBe` "True\nTrue\nTrue\nTrue\nTrue\nTrue\n"
 
     it "&& and || combine relops correctly" do
         (n, out) <- captureStdout (runFile "test/Fixtures/and_or.hs")
         n   `shouldBe` 0
-        out `shouldBe` "2\n"
+        out `shouldBe` "True\nFalse\nTrue\nFalse\n"
 
     it "primality test (trial division) reports 97 as prime" do
         (n, out) <- captureStdout (runFile "test/Fixtures/primality.hs")
         n   `shouldBe` 0
-        out `shouldBe` "1\n"
+        out `shouldBe` "True\nFalse\n"
 
     it "unary minus on literal + abs builtin: -5 + abs (-3) = -2" do
         (n, out) <- captureStdout (runFile "test/Fixtures/negate_lit.hs")
@@ -467,3 +467,46 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/compose.hs")
         n   `shouldBe` 0
         out `shouldBe` "14\n"
+
+    --------------------------------------------------------------------
+    -- Phase 2.3: type classes (dictionary passing).
+    --------------------------------------------------------------------
+    it "class: Eq Int — == and /= return proper Bool" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_eq_int.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nFalse\n"
+
+    it "class: Ord Int — <, <=, >, >= return proper Bool" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_ord_int.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nTrue\nTrue\nFalse\n"
+
+    it "class: Show dispatch — show Int, Bool, Char" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_show_int.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\nTrue\nFalse\n'x'\n"
+
+    it "class: Eq list — structural equality on [Int] and String" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_eq_list.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nTrue\nFalse\n"
+
+    it "class: Eq Maybe — structural equality on Maybe Int" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_eq_maybe.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nFalse\n"
+
+    it "class: Bool operations return proper Bool constructors" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_bool_ops.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nFalse\nFalse\nTrue\n"
+
+    it "class: user-defined Eq instance on ADT Color" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_user_defined.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\nTrue\nFalse\n"
+
+    it "class: user-defined Show instance on ADT Shape" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_show_custom.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Circle\nSquare\nTriangle\n"

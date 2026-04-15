@@ -48,7 +48,9 @@ import System.FilePath ((</>))
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv)
+import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance)
 import IHC.Cpp (cppPreprocess, defaultCppContext)
+import IHC.Eval (force)
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
 import qualified IHC.Parser as Parser
@@ -125,6 +127,9 @@ loadProgramFromSource searchPath src0 = do
     -- returned unchanged.
     src <- cppSource src0
 
+    -- Phase 2.3: class registry for type-class dispatch.
+    classReg <- newClassRegistry
+
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
     -- as the entry module so its bindings stay unqualified.
@@ -141,7 +146,7 @@ loadProgramFromSource searchPath src0 = do
     -- Union data registries across all modules.
     let unionedData = foldr Map.union Map.empty (map lmDataReg loadedModules)
     conEnv <- buildConEnv unionedData
-    builtins <- builtinEnv
+    builtins <- builtinEnv classReg
     let base = Map.union conEnv builtins
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
@@ -169,10 +174,39 @@ loadProgramFromSource searchPath src0 = do
                writeIORef slot (Unevaluated (Closure env rhs)))
           (zip qualPairs slots)
 
+    -- Phase 2.3: scan instance declarations from all loaded modules
+    -- and register their method vals into the ClassRegistry. This must
+    -- happen AFTER the env is fully tied so instance bodies can see all
+    -- bindings (including recursive ones).
+    mapM_ (registerInstancesFrom classReg env) loadedModules
+
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
                            <> BC.unpack entryName)
+
+-- | Scan @instance C T where ...@ declarations in a module's source,
+-- parse each method body, evaluate it to a Val, and register the
+-- resulting dict in the ClassRegistry.
+registerInstancesFrom :: ClassRegistry -> Env -> LoadedModule -> IO ()
+registerInstancesFrom classReg env lm = do
+    decls <- scanInstanceDecls (lmSource lm)
+    mapM_ (registerOne classReg env lm) decls
+
+registerOne :: ClassRegistry -> Env -> LoadedModule -> InstanceDecl -> IO ()
+registerOne classReg env lm (InstanceDecl cls typ methods) = do
+    methodVals <- mapM (evalMethod env lm) methods
+    registerInstance classReg cls typ methodVals
+
+evalMethod :: Env -> LoadedModule -> (ByteString, BindingLhs) -> IO Val
+evalMethod env lm (_, lhs) = do
+    expr <- Parser.parseBodyExprWithFixity
+                (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+    -- Evaluate the method expression to a Val in the global env.
+    -- We need Eval here but can't import it (cycle). Use a thunk trick:
+    -- make a thunk and force it immediately.
+    t <- newThunk env expr
+    force t
 
 -- | For each loaded module, read its collected bodies out of the
 -- IORef and key them by either the unqualified local name (entry

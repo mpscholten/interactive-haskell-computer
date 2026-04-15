@@ -33,6 +33,7 @@ library
       , IHC.AST
       , IHC.Builtins
       , IHC.CabalProject
+      , IHC.Classes
       , IHC.Cpp
       , IHC.Driver
       , IHC.Eval
