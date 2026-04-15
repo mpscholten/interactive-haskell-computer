@@ -26,10 +26,10 @@ Remaining slices (rough order):
 - 2.3 — type classes (dictionary passing) — designed, in progress
 - 2.7 — Cabal-aware source loader — ✅ shipped
 - 2.12 — tasty/QuickCheck end-to-end pipeline — designed
-- 2.8 — `ByteArray#`/`ForeignPtr`/`Word8`/`Storable` primops — designed
+- 2.8 — `ByteArray#`/`ForeignPtr`/`Word8`/`Storable` primops + `GHC.Exts` surface containers needs — designed
 - 2.9 — mid-milestone: `L.putStr (L.pack [72,105,10])` runs from source
 - 2.9.5 — GADTs + `Typeable`/`cast`/`Dynamic` — surfaced by tasty survey
-- 2.10a — STM + async exceptions, 2.10b — trusted host modules (containers shimmed)
+- 2.10a — STM + async exceptions (2.10b abandoned — containers interpreted from source)
 - 2.11 — `Lift`-splice TH (subset of full TH)
 - 2.12 — tasty-load pipeline integration
 - 2.13 — ⭐ bytestring test suite
