@@ -31,9 +31,10 @@ import IHC.Builtins (showValWith)
 import IHC.Classes (ClassRegistry)
 import IHC.Driver (resolveSearchPathFor)
 import IHC.Eval (eval)
+import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly)
-import IHC.Scheduler (buildBaseEnv, loadProgramFromSource)
-import IHC.Source (mkSource, readSourceFile, Source(..))
+import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
+import IHC.Source (mkSource, readSourceFile, Source(..), srcBytes)
 import IHC.Val
 
 -- | Entry point. Boots the base environment, then runs the REPL.
@@ -73,6 +74,7 @@ dispatch :: IORef Env -> ClassRegistry -> String -> InputT IO Bool
 dispatch envRef classReg line =
     case words line of
         ((':':cmd):rest) -> metaCmd envRef classReg cmd rest
+        ("import":_)     -> doImport envRef line >> pure True
         _                -> evalLine envRef classReg line >> pure True
 
 --------------------------------------------------------------------------------
@@ -140,6 +142,49 @@ loadFile path = do
                                            <> BC.pack "\nmain = ()\n" }
             (env, _) <- loadProgramFromSource searchPath patched
             pure env
+
+--------------------------------------------------------------------------------
+-- import MODULE
+--------------------------------------------------------------------------------
+
+-- | Handle a line that starts with @import@ typed at the REPL prompt.
+-- Parses the import declaration, loads the named module (discovering all
+-- its exported bindings), and merges the result into the session env.
+doImport :: IORef Env -> String -> InputT IO ()
+doImport envRef line = do
+    let src = mkSource "<repl>" (BC.pack line)
+    mDecl <- liftIO (parseSingleImport src)
+    case mDecl of
+        Nothing -> outputStrLn ("Import parse error: " <> show line)
+        Just imp -> do
+            env <- liftIO (readIORef envRef)
+            -- Use the current directory as the default search path for
+            -- REPL-level imports. The user can :load a file first to
+            -- widen the search to that file's directory.
+            let searchPath = ["."]
+            r <- liftIO (tryImportModule searchPath imp env)
+            case r of
+                Left err           ->
+                    outputStrLn ("Import error: " <> err)
+                Right (newEnv, n)  -> do
+                    liftIO (writeIORef envRef newEnv)
+                    outputStrLn ( "imported "
+                                <> BC.unpack (impModule imp)
+                                <> " ("
+                                <> show n
+                                <> " names)" )
+
+tryImportModule
+    :: [FilePath]
+    -> ImportDecl
+    -> Env
+    -> IO (Either String (Env, Int))
+tryImportModule searchPath imp env = do
+    r <- try (loadImportIntoEnv searchPath imp env)
+            :: IO (Either SomeException (Env, Int))
+    case r of
+        Right pair -> pure (Right pair)
+        Left  e    -> pure (Left (show e))
 
 --------------------------------------------------------------------------------
 -- Expression evaluation

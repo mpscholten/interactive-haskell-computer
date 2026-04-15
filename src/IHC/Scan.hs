@@ -26,6 +26,7 @@ module IHC.Scan
     , findBinding
     , lookupSymbol
     , markCompiled
+    , scanAllTopLevelNames
       -- * Data declarations
     , DataRegistry
     , scanDataDecls
@@ -81,6 +82,53 @@ lookupSymbol ref name = do
 markCompiled :: KnownSymbols -> ByteString -> Ptr () -> IO ()
 markCompiled ref name ptr =
     modifyIORef' ref (\(m, c) -> (Map.insert name (Compiled ptr) m, c))
+
+-- | Scan the entire source file and return the names of all top-level
+-- value bindings (column-1 lowercase identifiers with an @=@ or guards).
+-- Type signatures, data declarations, and class/instance declarations are
+-- skipped.  This is used by the REPL import machinery to enumerate every
+-- exported name before demand-driving their bodies.
+scanAllTopLevelNames :: Source -> IO [ByteString]
+scanAllTopLevelNames src = go [] startCursor
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkNewline -> go acc cur'
+            TkIdent name
+                | tkCol tok == 1 -> do
+                    -- Quick-scan past this binding's clauses so we don't
+                    -- re-report the same name from a continuation clause.
+                    curSkipped <- skipThroughBinding src name cur'
+                    let acc' = if name `elem` acc then acc else name : acc
+                    go acc' curSkipped
+            _ -> go acc cur'
+
+-- | Skip through all consecutive clauses of the given binding name so
+-- that the scanner doesn't report it multiple times.
+skipThroughBinding :: Source -> ByteString -> Cursor -> IO Cursor
+skipThroughBinding src name cur0 = do
+    mClause <- scanOneClauseAfterName src cur0
+    case mClause of
+        Nothing          -> pure cur0
+        Just (_, curAfter) -> do
+            -- Check whether the next column-1 significant token is the
+            -- same name (another clause). If so, consume that too.
+            let (peek, peekAfter) = peekSigTokFrom src curAfter
+            case tkKind peek of
+                TkIdent n | n == name && tkCol peek == 1 ->
+                    skipThroughBinding src name peekAfter
+                _ -> pure curAfter
+
+-- | 'peekSigTokFrom' — skip newlines and return the next non-newline token
+-- at the given cursor without actually advancing the returned cursor past it.
+peekSigTokFrom :: Source -> Cursor -> (Token, Cursor)
+peekSigTokFrom src cur =
+    let (tok, cur') = nextToken src cur
+    in case tkKind tok of
+        TkNewline -> peekSigTokFrom src cur'
+        _         -> (tok, cur')
 
 -- | Advance looking for a top-level binding named @target@. Returns
 -- the binding's LHS (list of clauses) if found. Consecutive equations

@@ -48,3 +48,18 @@ spec = describe "REPL smoke tests" do
         (code, out, _err) <- runRepl ":l test/Fixtures/hello.hs\nmain\n:q\n"
         code `shouldBe` ExitSuccess
         out `shouldContain` "Hello, world!"
+
+    it "import Data.List succeeds and length still works" do
+        -- Data.List is builtin-backed: the dispatch parses the import
+        -- correctly, prints a confirmation, and the REPL keeps running.
+        -- length is provided by the builtin env.
+        (code, out, _err) <- runRepl "import Data.List\nlength [1,2,3]\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Data.List"
+        out `shouldContain` "3"
+
+    it "import parse error is reported gracefully, REPL continues" do
+        -- A malformed import should print an error but not crash.
+        (code, out, _err) <- runRepl "import\n1 + 1\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "2"

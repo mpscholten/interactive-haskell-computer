@@ -27,6 +27,7 @@ module IHC.ModuleHeader
     , ExportSpec(..)
     , ExportItem(..)
     , parseModuleHeader
+    , parseSingleImport
     , modulePathCandidates
     ) where
 
@@ -322,3 +323,27 @@ skipNewlines src cur =
             let (_, c') = nextToken src cur in
             skipNewlines src c'
         _ -> (t, cur)
+
+--------------------------------------------------------------------------------
+-- Single-import entry point (used by the REPL)
+--------------------------------------------------------------------------------
+
+-- | Parse a single @import@ declaration from a 'Source' that contains
+-- exactly one import line (e.g. @\"import qualified Foo as F\"@). The
+-- leading @import@ keyword may be present or absent — the parser
+-- handles both forms so the caller doesn't have to strip it.
+--
+-- Returns 'Nothing' if no valid 'ImportDecl' can be parsed from the
+-- input (malformed or empty). Never throws.
+parseSingleImport :: Source -> IO (Maybe ImportDecl)
+parseSingleImport src = do
+    let cur0 = startCursor
+        (tok, _) = skipNewlines src cur0
+    -- Skip an optional leading `import` keyword.
+    let curBody = case tkKind tok of
+            TkImport ->
+                let (_, afterImp) = nextSigTok src cur0
+                in afterImp
+            _ -> cur0
+    mResult <- parseOneImport src curBody
+    pure (fmap fst mResult)

@@ -33,6 +33,7 @@ module IHC.Scheduler
       loadProgram
     , loadProgramFromSource
     , buildBaseEnv
+    , loadImportIntoEnv
       -- * Types exposed for testing
     , ModuleRegistry
     ) where
@@ -196,6 +197,97 @@ buildBaseEnv = do
     conEnv   <- buildConEnv Map.empty
     let env = Map.union conEnv builtins
     pure (env, classReg)
+
+-- | Load a single import declaration into an existing 'Env', as if the
+-- REPL user typed @import Foo@ at the prompt.
+--
+-- For builtin-backed modules (Prelude, Data.List, etc.) the names are
+-- already present in the base env — we return the env unchanged with
+-- count 0.
+--
+-- For source-backed modules we load the target module, discover ALL its
+-- top-level names (not just those reachable from some entry point), build
+-- thunks for each exported name, and merge them into @existingEnv@.
+-- Qualified imports (@import qualified Foo as F@) expose names under the
+-- alias prefix (@F.name@) only; unqualified imports also add bare names.
+--
+-- The @searchPath@ should contain every directory that may hold the
+-- target module's @.hs@ file.
+--
+-- On success returns the updated env and the number of NEW names added.
+-- On failure raises an exception; the caller should catch it.
+loadImportIntoEnv
+    :: [FilePath]   -- ^ directories to search for module source files
+    -> ImportDecl   -- ^ the parsed import declaration
+    -> Env          -- ^ current REPL env
+    -> IO (Env, Int)
+loadImportIntoEnv searchPath imp existingEnv
+    | isBuiltinBackedModule (impModule imp) = pure (existingEnv, 0)
+    | otherwise = do
+        registry <- newIORef Map.empty
+        -- Load the target module (and its transitive imports).
+        targetLm <- loadModule registry searchPath (impModule imp)
+        -- Discover ALL exported top-level names in the target module.
+        allNames <- scanAllTopLevelNames (lmSource targetLm)
+        let exported = filter (exportsName (lmHeader targetLm))
+                     $ filter (specAllows (impSpec imp)) allNames
+        mapM_ (discoverInModule registry searchPath targetLm) exported
+        -- Collect every loaded module and build a combined env.
+        reg <- readIORef registry
+        let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
+        let unionedData = foldr Map.union Map.empty (map lmDataReg loadedModules)
+        conEnv   <- buildConEnv unionedData
+        builtins <- builtinEnv =<< newClassRegistry
+        let baseForImport = Map.union conEnv builtins
+        -- Build (qualified-key, Expr) pairs for each loaded module.
+        -- All modules here are non-entry (lmIsEntry = False), so bodies
+        -- are keyed as Module.name.
+        qualPairs <- concat <$> mapM (exportBodies registry) loadedModules
+        -- Tie the knot.
+        slots <- mapM (\_ -> newIORef BlackHole) qualPairs
+        let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
+        -- Build aliases according to the import declaration.
+        -- For unqualified: bare name -> thunk.
+        -- For qualified with alias A: A.name -> thunk.
+        -- For qualified without alias: Module.name -> thunk (already in qualEnv).
+        let thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+            modPrefix  = lmName targetLm <> BC.pack "."
+            qualPrefix = case impAlias imp of
+                Just a  -> a <> BC.pack "."
+                Nothing
+                    | impQualified imp -> lmName targetLm <> BC.pack "."
+                    | otherwise        -> BC.empty
+            bareAliases
+                | impQualified imp = []
+                | otherwise =
+                    [ (n, t)
+                    | n <- exported
+                    , Just t <- [Map.lookup (modPrefix <> n) thunkByKey]
+                    ]
+            qualAliases
+                | BC.null qualPrefix = []
+                | otherwise =
+                    [ (qualPrefix <> n, t)
+                    | n <- exported
+                    , Just t <- [Map.lookup (modPrefix <> n) thunkByKey]
+                    ]
+        let aliasEnv = Map.fromList (bareAliases ++ qualAliases)
+        -- The final env visible to imported bindings: qualEnv + aliases.
+        -- We also include the aliases so that intra-module cross-references
+        -- (e.g. `greet` calling `suffix`) resolve properly.
+        let innerEnv = Map.union aliasEnv qualEnv
+        mapM_ (\((_, rhs), slot) ->
+                   writeIORef slot (Unevaluated (Closure innerEnv rhs)))
+              (zip qualPairs slots)
+        -- Merge into the REPL env: prefer existing REPL bindings (shadow).
+        -- Report the count of NEW bare (or qualified-alias) names added so
+        -- the REPL can print "imported Foo (N names)".
+        let newBindings = Map.union qualEnv aliasEnv
+            additions   = Map.difference newBindings existingEnv
+            merged      = Map.union existingEnv additions
+            newAliases  = Map.fromList (bareAliases ++ qualAliases)
+                          `Map.difference` existingEnv
+        pure (merged, Map.size newAliases)
 
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
