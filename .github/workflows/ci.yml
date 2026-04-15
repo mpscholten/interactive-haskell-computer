@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    # Apple Silicon is MANDATORY — the runtime emits aarch64 and MAP_JIT pages
+    # require Apple Silicon semantics. x86_64 runners cannot execute our output.
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cache nix store
+        uses: actions/cache@v4
+        with:
+          path: |
+            /nix
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-${{ runner.arch }}-nix-${{ hashFiles('flake.nix', 'flake.lock', 'ihc.cabal') }}
+
+      - name: Build
+        run: nix develop --command cabal build all
+
+      - name: Sign the test binary
+        run: nix develop --command make sign-test
+
+      - name: Test
+        run: nix develop --command cabal test ihc-test --test-show-details=streaming
+
+      - name: Sign + smoke test the ihc binary
+        run: |
+          nix develop --command make sign-ihc
+          BIN=$(nix develop --command cabal list-bin exe:ihc)
+          "$BIN" --version
+          "$BIN" --check-jit

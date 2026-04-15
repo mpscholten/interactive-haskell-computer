@@ -1,0 +1,78 @@
+cabal-version:      3.0
+name:               ihc
+version:            0.1.0.0
+synopsis:           Interactive Haskell Computer — demand-driven copy-and-patch JIT interpreter
+description:        Single-pass, Pascal-style, demand-driven Haskell interpreter targeting macOS/aarch64.
+author:             digitally induced
+maintainer:         marc@digitallyinduced.com
+license:            BSD-3-Clause
+build-type:         Simple
+tested-with:        GHC == 9.10.*
+
+common warnings
+    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing
+
+common lang
+    default-language: GHC2024
+    default-extensions:
+        OverloadedStrings
+      , LambdaCase
+      , BangPatterns
+      , ScopedTypeVariables
+      , RecordWildCards
+      , BlockArguments
+      , DerivingStrategies
+      , StrictData
+
+library
+    import:           warnings, lang
+    hs-source-dirs:   src
+    exposed-modules:
+        IHC
+      , IHC.Jit
+    build-depends:
+        base             >= 4.19 && < 5
+      , bytestring       >= 0.11
+      , text             >= 2.0
+
+    c-sources:
+        rts/jit.c
+      , rts/bridge.c
+    -- rts/enter.S will be added once it has real content.
+    include-dirs:
+        rts
+    install-includes:
+        jit.h
+
+    cc-options:
+        -Wall
+        -Wextra
+        -fno-stack-protector
+        -mmacosx-version-min=14.0
+
+executable ihc
+    import:           warnings, lang
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:
+        base
+      , ihc
+      , text
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+
+    -- Post-build codesigning must be handled outside cabal (see Makefile /
+    -- scripts/codesign-jit.sh). cabal does not have a portable post-build hook.
+
+test-suite ihc-test
+    import:           warnings, lang
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Spec.hs
+    other-modules:
+        JitSmoke
+    build-depends:
+        base
+      , ihc
+      , bytestring
+      , hspec            >= 2.10
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
