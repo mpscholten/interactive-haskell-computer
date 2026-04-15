@@ -103,6 +103,7 @@ test-suite ihc-test
     main-is:          Spec.hs
     other-modules:
         CabalLoader
+      , Coverage
       , JitSmoke
       , ReplTest
       , RunFile

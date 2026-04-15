@@ -1,0 +1,2 @@
+Uses writeFile and readFile which are not yet in IHC.Builtins (only openFile, hClose, hPutStr, hPutStrLn are available).
+Remove _XFAIL suffix once writeFile/readFile wrappers land in Builtins.hs.
