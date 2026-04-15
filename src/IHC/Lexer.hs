@@ -45,6 +45,7 @@ data TokenKind
     = TkIdent !ByteString     -- ^ lowercase-start identifier
     | TkConId !ByteString     -- ^ uppercase-start identifier
     | TkInt   !Integer        -- ^ integer literal (decimal, @0x...@ hex, @0o...@ octal)
+    | TkFloat !Double         -- ^ floating-point literal (e.g. @1.5@, @1e9@, @1.5e-3@)
     | TkStr   !ByteString     -- ^ @\"...\"@ string literal (contents after
                               --   basic \\n \\t \\\\ \\\" escapes)
     | TkChar  !Char           -- ^ @\'c\'@ character literal
@@ -112,6 +113,7 @@ data TokenKind
     | TkRUnbox                -- ^ @#)@ unboxed-tuple close
     | TkSymOp !ByteString     -- ^ generic user-defined symbolic operator
                               --   (e.g. @<>@, @>>=@, @<$>@, @.&.@, @:|@)
+    | TkImplicitRef !ByteString -- ^ @?name@ implicit parameter reference
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -223,6 +225,12 @@ nextToken s c0 =
                                -> let c' = step (step c) in (mkTok TkOr c c', c')
             | b == 0x7C, not (isOpChar (peekByte s (cPos c + 1)))
                                -> (mkTok TkBar c (step c), step c)       -- '|'
+            -- '?' followed by a lowercase letter or '_' is an implicit
+            -- parameter reference: ?name -> TkImplicitRef name.
+            | b == 0x3F
+            , Just b2 <- peekByte s (cPos c + 1)
+            , isLowerStart b2
+                -> lexImplicitRef c
             -- Everything else that starts with an operator char goes through
             -- the longest-match symbolic operator lexer. It returns known
             -- tokens for recognised shapes (=, ==, ->, :, ::, +, ++, ...)
@@ -263,15 +271,49 @@ nextToken s c0 =
       where
         go p = case peekByte s p of
             Just b | isDigit b -> go (p + 1)
-            _ -> let n   = read (BC.unpack (sliceBytes s (cPos start, p))) :: Integer
-                     -- Consume trailing '#' or '##' for unboxed int literals
-                     -- (e.g. 0#, 1##). Treat them as plain integers.
-                     p'  = skipHashes p
-                     end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
-                 in (mkTok (TkInt n) start end, end)
+            _ ->
+                -- Check for float: '.' followed by digit, or 'e'/'E'.
+                case peekByte s p of
+                    Just 0x2E                                -- '.'
+                        | Just b2 <- peekByte s (p + 1)
+                        , isDigit b2                        -- not '..' or '.x'
+                        -> lexFloat start (p + 1)
+                    Just e | e == 0x65 || e == 0x45         -- 'e' or 'E'
+                        -> lexFloat start p
+                    _ ->
+                        let n   = read (BC.unpack (sliceBytes s (cPos start, p))) :: Integer
+                            -- Consume trailing '#' or '##' for unboxed int literals
+                            -- (e.g. 0#, 1##). Treat them as plain integers.
+                            p'  = skipHashes p
+                            end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
+                        in (mkTok (TkInt n) start end, end)
         skipHashes p = case peekByte s p of
             Just 0x23 -> skipHashes (p + 1)   -- '#'
             _         -> p
+
+    -- | Lex the fractional+exponent part of a float literal.
+    -- @start@ is the start of the whole literal; @p@ is positioned
+    -- just after the integer digits (either at '.' or at 'e'/'E').
+    lexFloat start p0 =
+        let p1 = case peekByte s p0 of
+                    Just 0x2E -> goDec (p0 + 1)     -- consume '.' then fraction digits
+                    _         -> p0                  -- no '.' — start of exponent
+            p2 = case peekByte s p1 of
+                    Just e | e == 0x65 || e == 0x45  -- 'e' or 'E'
+                        -> let p3 = case peekByte s (p1 + 1) of
+                                        Just 0x2B -> p1 + 2   -- '+'
+                                        Just 0x2D -> p1 + 2   -- '-'
+                                        _         -> p1 + 1
+                           in goDec p3
+                    _ -> p1
+            bs  = sliceBytes s (cPos start, p2)
+            d   = read (BC.unpack bs) :: Double
+            end = Cursor p2 (cLine start) (cCol start + (p2 - cPos start))
+        in (mkTok (TkFloat d) start end, end)
+      where
+        goDec p = case peekByte s p of
+            Just b | isDigit b -> goDec (p + 1)
+            _                  -> p
 
     lexHex start = go (cPos start + 2) 0
       where
@@ -310,6 +352,20 @@ nextToken s c0 =
                          | otherwise           = keywordOr bs
                      end = Cursor p (cLine start) (cCol start + (p - cPos start))
                  in (mkTok k start end, end)
+
+    -- | Implicit parameter reference: @?name@ → 'TkImplicitRef' name.
+    -- The leading @?@ is consumed; the identifier part is lexed the same
+    -- way as a normal lowercase identifier (letters, digits, @'@, @#@).
+    lexImplicitRef start =
+        let nameStart = cPos start + 1   -- skip the '?'
+            nameEnd   = go nameStart
+            bs        = sliceBytes s (nameStart, nameEnd)
+            end       = Cursor nameEnd (cLine start) (cCol start + (nameEnd - cPos start))
+        in (mkTok (TkImplicitRef bs) start end, end)
+      where
+        go p = case peekByte s p of
+            Just b | isIdentCont b -> go (p + 1)
+            _                      -> p
 
     -- | Longest-match symbolic operator. Scans the contiguous run of operator
     -- characters, then decides which token kind to emit. Known shapes map to

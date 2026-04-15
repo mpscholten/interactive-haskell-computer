@@ -49,7 +49,7 @@ import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import IHC.AST
-import IHC.Builtins (builtinEnv, buildConEnv)
+import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance)
 import IHC.Cpp (cppPreprocess, defaultCppContext)
 import IHC.Eval (force)
@@ -73,19 +73,20 @@ cppSource src = do
 --------------------------------------------------------------------------------
 
 data LoadedModule = LoadedModule
-    { lmName    :: !ModuleName
-    , lmHeader  :: !ModuleHeader
-    , lmSource  :: !Source
-    , lmKnown   :: !KnownSymbols
-    , lmDataReg :: !DataRegistry
+    { lmName     :: !ModuleName
+    , lmHeader   :: !ModuleHeader
+    , lmSource   :: !Source
+    , lmKnown    :: !KnownSymbols
+    , lmDataReg  :: !DataRegistry
+    , lmFieldReg :: !FieldRegistry
       -- | Accumulated (local-name, parsed body) pairs for this module.
-    , lmBodies  :: !(IORef (Map ByteString Expr))
+    , lmBodies   :: !(IORef (Map ByteString Expr))
       -- | Whether this is the entry module (its bindings stay unqualified
       -- in the final env; foreign-module bindings are namespaced).
-    , lmIsEntry :: !Bool
+    , lmIsEntry  :: !Bool
       -- | Per-module fixity table: defaults + any @infixl/infixr/infix@
       -- declarations found at column 1 in this source.
-    , lmFixity  :: !FixityTable
+    , lmFixity   :: !FixityTable
     }
 
 data ModuleState
@@ -145,11 +146,13 @@ loadProgramFromSource searchPath src0 = do
     reg <- readIORef registry
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
 
-    -- Union data registries across all modules.
-    let unionedData = foldr Map.union Map.empty (map lmDataReg loadedModules)
-    conEnv <- buildConEnv unionedData
+    -- Union data registries and field registries across all modules.
+    let unionedData  = foldr Map.union Map.empty (map lmDataReg  loadedModules)
+        unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+    conEnv   <- buildConEnv  unionedData
+    fieldEnv <- buildFieldEnv unionedFields
     builtins <- builtinEnv classReg
-    let base = Map.union conEnv builtins
+    let base = Map.union fieldEnv (Map.union conEnv builtins)
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry) loadedModules
@@ -235,10 +238,12 @@ loadImportIntoEnv searchPath imp existingEnv
         -- Collect every loaded module and build a combined env.
         reg <- readIORef registry
         let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
-        let unionedData = foldr Map.union Map.empty (map lmDataReg loadedModules)
-        conEnv   <- buildConEnv unionedData
+        let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules)
+            unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+        conEnv    <- buildConEnv  unionedData
+        fieldEnv' <- buildFieldEnv unionedFields
         builtins <- builtinEnv =<< newClassRegistry
-        let baseForImport = Map.union conEnv builtins
+        let baseForImport = Map.union fieldEnv' (Map.union conEnv builtins)
         -- Build (qualified-key, Expr) pairs for each loaded module.
         -- All modules here are non-entry (lmIsEntry = False), so bodies
         -- are keyed as Module.name.
@@ -553,31 +558,33 @@ buildEmptyStubModule name = do
     bodies <- newIORef Map.empty
     let src = mkSource (BC.unpack name) ""
     pure LoadedModule
-        { lmName    = name
-        , lmHeader  = ModuleHeader (Just name) ExportAll []
-        , lmSource  = src
-        , lmKnown   = known
-        , lmDataReg = Map.empty
-        , lmBodies  = bodies
-        , lmIsEntry = False
-        , lmFixity  = defaultFixityTable
+        { lmName     = name
+        , lmHeader   = ModuleHeader (Just name) ExportAll []
+        , lmSource   = src
+        , lmKnown    = known
+        , lmDataReg  = Map.empty
+        , lmFieldReg = Map.empty
+        , lmBodies   = bodies
+        , lmIsEntry  = False
+        , lmFixity   = defaultFixityTable
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
 buildLoadedModule name isEntry header src = do
-    known  <- emptyKnownSymbols
-    dataR  <- scanDataDecls src
-    bodies <- newIORef Map.empty
-    fixity <- scanFixityDecls src defaultFixityTable
+    known         <- emptyKnownSymbols
+    (dataR, fldR) <- scanDataDecls src
+    bodies        <- newIORef Map.empty
+    fixity        <- scanFixityDecls src defaultFixityTable
     pure LoadedModule
-        { lmName    = name
-        , lmHeader  = header
-        , lmSource  = src
-        , lmKnown   = known
-        , lmDataReg = dataR
-        , lmBodies  = bodies
-        , lmIsEntry = isEntry
-        , lmFixity  = fixity
+        { lmName     = name
+        , lmHeader   = header
+        , lmSource   = src
+        , lmKnown    = known
+        , lmDataReg  = dataR
+        , lmFieldReg = fldR
+        , lmBodies   = bodies
+        , lmIsEntry  = isEntry
+        , lmFixity   = fixity
         }
 
 emptyHeader :: ModuleHeader

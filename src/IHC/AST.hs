@@ -39,6 +39,8 @@ data Expr
     | EDo   ![Stmt]                     -- do-block statements (Phase 2.4)
     | ENeg  !Expr                       -- unary minus
     | ETuple ![Expr]                    -- (a, b, ...) tuple (Phase 2.6)
+    | EImplicitRef  !Name              -- ?name reference (Phase 3.6)
+    | EImplicitLet  ![(Name, Expr)] !Expr -- let ?x = e in body (Phase 3.6)
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.
@@ -69,7 +71,8 @@ data Pat
     deriving (Eq, Show)
 
 data Lit
-    = LInt  !Int64
-    | LStr  !ByteString
-    | LChar !Char
+    = LInt    !Int64
+    | LFloat  !Double
+    | LStr    !ByteString
+    | LChar   !Char
     deriving (Eq, Show)

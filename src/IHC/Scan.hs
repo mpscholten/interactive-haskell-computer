@@ -314,40 +314,37 @@ type DataRegistry = Map ByteString Int
 -- functions automatically.
 type FieldRegistry = Map ByteString [(ByteString, Int)]
 
--- | Scan the whole source for top-level @data@ declarations and
--- collect every (constructor, arity) pair. This is a lexer-only pass —
--- we do NOT build any AST, don't track type parameters, and don't care
--- about the LHS (@data Maybe a@ vs @data Tree@). We just walk
--- constructor alternatives separated by @|@.
+-- | Scan the whole source for top-level @data@ declarations and collect
+-- every (constructor, arity) pair plus record-field metadata.
+-- This is a lexer-only pass — we do NOT build any AST, don't track type
+-- parameters, and don't care about the LHS type name.
 --
 -- Grammar handled:
 --
 -- @
--- data TyCon tyvar* = Con0 field* ( | ConN field* )*
+-- data TyCon tyvar* = Con0 field*              -- positional ctor
+--                   | ConR { f1 :: T1, ... }    -- record-syntax ctor
 -- @
---
--- where each @field@ is either an atom (TkConId / TkIdent) or a
--- parenthesised group counted as a single field.
-scanDataDecls :: Source -> IO DataRegistry
-scanDataDecls src = go Map.empty startCursor
+scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry)
+scanDataDecls src = go Map.empty Map.empty startCursor
   where
-    go !acc cur = do
+    go !dReg !fReg cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkEof -> pure acc
+            TkEof -> pure (dReg, fReg)
             TkData | tkCol tok == 1 -> do
-                (acc', curAfter) <- scanOneDataDecl acc cur'
-                go acc' curAfter
-            _ -> go acc cur'
+                ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
+                go dReg' fReg' curAfter
+            _ -> go dReg fReg cur'
 
     -- Parse: (TkConId tyvar*) '=' ctor ('|' ctor)*  until the decl ends.
     -- Decl ends at a column-1 token (next top-level binding / data) or
     -- at EOF. TkNewline is trivia.
-    scanOneDataDecl !acc cur0 = do
+    scanOneDataDecl !regs cur0 = do
         -- Skip tyname + tyvars.
         curHeader <- skipUntilEq cur0
         -- Now collect ctors separated by '|'.
-        collectCtors acc curHeader
+        collectCtors regs curHeader
 
     skipUntilEq cur = do
         let (tok, cur') = nextToken src cur
@@ -358,28 +355,95 @@ scanDataDecls src = go Map.empty startCursor
 
     -- At start of each ctor: expect TkConId, then consume field atoms
     -- until TkBar / decl-end.
-    collectCtors !acc cur = do
+    collectCtors (!dReg, !fReg) cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkNewline -> collectCtors acc cur'
+            TkNewline -> collectCtors (dReg, fReg) cur'
             TkConId name -> do
-                (arity, curN) <- countCtorFields 0 cur'
-                let acc' = Map.insert name arity acc
+                -- Peek ahead: if '{' follows immediately, it is record syntax.
+                let (peek, _) = nextToken src cur'
+                (arity, fields, curN) <- case tkKind peek of
+                    TkLBrace -> do
+                        let (_, curBrace) = nextToken src cur'
+                        collectRecordFields 0 [] curBrace
+                    _ -> do
+                        (n, curN') <- countCtorFields 0 cur'
+                        pure (n, [], curN')
+                let dReg' = Map.insert name arity dReg
+                    fReg' = foldr
+                        (\(fieldName, idx) acc ->
+                            Map.insertWith (++) fieldName [(name, idx)] acc)
+                        fReg
+                        fields
                 -- After fields, check for '|' (more ctors) or decl end.
                 let (sep, curSep) = nextToken src curN
                 case tkKind sep of
-                    TkBar    -> collectCtors acc' curSep
-                    TkNewline -> collectCtors acc' curSep
-                    _        -> pure (acc', curN)
+                    TkBar     -> collectCtors (dReg', fReg') curSep
+                    TkNewline -> collectCtors (dReg', fReg') curSep
+                    _         -> pure ((dReg', fReg'), curN)
             -- Missing constructor (malformed) or decl ended.
-            _ -> pure (acc, cur)
+            _ -> pure ((dReg, fReg), cur)
 
-    -- Count atoms up to '|', column-1 token, or EOF.
+    -- Parse a record-syntax field list after the opening '{'.
+    -- Returns (arity, [(fieldName, index)], cursorAfterClosingBrace).
+    collectRecordFields !idx !fields cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (idx, reverse fields, cur)
+            TkRBrace  -> pure (idx, reverse fields, cur')
+            TkNewline -> collectRecordFields idx fields cur'
+            TkComma   -> collectRecordFields idx fields cur'
+            TkIdent fname -> do
+                -- Skip '::' and the type expression up to next ',' or '}'.
+                curAfterType <- skipFieldType cur'
+                collectRecordFields (idx + 1) ((fname, idx) : fields) curAfterType
+            TkBang -> do
+                -- Strict field: '!' followed by identifier.
+                let (fTok, cur'') = nextToken src cur'
+                case tkKind fTok of
+                    TkIdent fname -> do
+                        curAfterType <- skipFieldType cur''
+                        collectRecordFields (idx + 1) ((fname, idx) : fields) curAfterType
+                    _ -> collectRecordFields idx fields cur''
+            _ -> collectRecordFields idx fields cur'
+
+    -- After a field name, skip '::' and the type annotation up to (but not
+    -- consuming) the next ',' or '}'.
+    skipFieldType cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkDColon -> skipType 0 cur'
+            _        -> pure cur  -- no '::'; stop here
+
+    -- Skip a type expression at the given depth.
+    -- Stops (without consuming) at depth-0 ',' or '}'.
+    skipType !depth cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof      -> pure cur
+            TkComma    | depth == 0 -> pure cur   -- don't consume
+            TkRBrace   | depth == 0 -> pure cur   -- don't consume
+            TkLParen   -> skipType (depth + 1) cur'
+            TkRParen   -> skipType (max 0 (depth - 1)) cur'
+            TkLBracket -> skipType (depth + 1) cur'
+            TkRBracket -> skipType (max 0 (depth - 1)) cur'
+            TkLBrace   -> skipType (depth + 1) cur'
+            TkRBrace   -> skipType (max 0 (depth - 1)) cur'
+            TkNewline  -> do
+                let (peek, _) = nextToken src cur'
+                case tkKind peek of
+                    TkEof -> pure cur'
+                    _ | tkCol peek == 1 -> pure cur'
+                      | otherwise       -> skipType depth cur'
+            _          -> skipType depth cur'
+
+    -- Count positional atoms up to '|', '{', column-1 token, or EOF.
     countCtorFields !n cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkBar            -> pure (n, cur)             -- don't consume
             TkEof            -> pure (n, cur)
+            TkLBrace         -> pure (n, cur)             -- record block; stop
             TkNewline        ->
                 -- If the next significant token is at col 1, decl ends;
                 -- otherwise it's whitespace between fields.

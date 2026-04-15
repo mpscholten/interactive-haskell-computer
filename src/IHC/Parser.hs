@@ -834,6 +834,7 @@ parseSubPat ctx cur = do
         TkPrimId n   -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
         TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
+        TkFloat d    -> pure (PLit (LFloat d), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
         TkChar c     -> pure (PLit (LChar c), cur1)
         TkConId n    -> pure (PCon n [], cur1)
@@ -842,8 +843,9 @@ parseSubPat ctx cur = do
         TkMinus -> do
             let (n, cur2) = nextSig ctx cur1
             case tkKind n of
-                TkInt i -> pure (PLit (LInt (fromInteger (negate i))), cur2)
-                _       -> parseErr "expected integer after `-` in pattern" n
+                TkInt i   -> pure (PLit (LInt (fromInteger (negate i))), cur2)
+                TkFloat d -> pure (PLit (LFloat (negate d)), cur2)
+                _         -> parseErr "expected number after `-` in pattern" n
         _ -> parseErr "expected pattern (Int, String, _, ident, or constructor)" tok
 
 -- | Parenthesised pattern: could be a single pattern @(p)@, a tuple
@@ -894,6 +896,7 @@ gatherListPat ctx acc cur = do
 
 startsPat :: TokenKind -> Bool
 startsPat (TkInt _)    = True
+startsPat (TkFloat _)  = True
 startsPat (TkChar _)   = True
 startsPat (TkStr _)    = True
 startsPat (TkIdent _)  = True
@@ -1057,6 +1060,7 @@ parseApp ctx cur0 = do
 
 startsAtom :: TokenKind -> Bool
 startsAtom TkInt{}    = True
+startsAtom TkFloat{}  = True
 startsAtom TkStr{}    = True
 startsAtom TkChar{}   = True
 startsAtom TkLParen   = True
@@ -1075,9 +1079,10 @@ parseAtom :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseAtom ctx cur0 = do
     let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
-        TkInt n  -> pure (ELit (LInt (fromInteger n)), cur1)
-        TkStr s  -> pure (stringToConsList (BC.unpack s), cur1)
-        TkChar c -> pure (ELit (LChar c), cur1)
+        TkInt n    -> pure (ELit (LInt (fromInteger n)), cur1)
+        TkFloat d  -> pure (ELit (LFloat d), cur1)
+        TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
+        TkChar c   -> pure (ELit (LChar c), cur1)
         TkIdent n
             | n == "_" -> parseErr "wildcard `_` in expression position" tok
             | otherwise -> pure (EVar n, cur1)
@@ -1315,26 +1320,62 @@ parseListLit ctx cur0 = do
         TkRBracket -> pure (EVar "[]", cur1)
         _ -> do
             (first, cur2) <- parseExpr ctx cur0
-            gather [first] cur2
+            gather first cur2
   where
-    gather acc cur = do
+    gather first cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            -- Range: [first .. hi]  or  [first .. ]  (infinite — not yet supported)
+            TkDotDot -> do
+                let (peek, _) = nextSig ctx cur1
+                case tkKind peek of
+                    TkRBracket ->
+                        -- [first ..] — infinite range, not yet supported; skip
+                        pure (buildCons [first], snd (nextSig ctx cur1))
+                    _ -> do
+                        (hi, cur3) <- parseExpr ctx cur1
+                        let (close, cur4) = nextSig ctx cur3
+                        case tkKind close of
+                            TkRBracket ->
+                                pure (EApp (EApp (EVar "enumFromTo") first) hi, cur4)
+                            _ -> parseErr "expected `]` after range upper bound" close
+            -- Step range: after gathering [first, second, we see '..'
+            TkComma -> do
+                (second, cur2) <- parseExpr ctx cur1
+                let (peek2, cur3) = nextSig ctx cur2
+                case tkKind peek2 of
+                    TkDotDot -> do
+                        let (peek3, _) = nextSig ctx cur3
+                        case tkKind peek3 of
+                            TkRBracket ->
+                                -- [first, second ..] — infinite stepped range, skip
+                                pure (buildCons [first, second], snd (nextSig ctx cur3))
+                            _ -> do
+                                (hi, cur4) <- parseExpr ctx cur3
+                                let (close, cur5) = nextSig ctx cur4
+                                case tkKind close of
+                                    TkRBracket ->
+                                        pure ( EApp (EApp (EApp (EVar "enumFromThenTo")
+                                                               first) second) hi
+                                             , cur5 )
+                                    _ -> parseErr "expected `]` after range upper bound" close
+                    -- Plain list: continue gathering
+                    _ -> gatherMore [second, first] cur2
+            TkRBracket -> pure (buildCons [first], cur1)
+            -- List comprehension @[ e | q1, q2, ... ]@ — swallow to ']'.
+            TkBar -> do
+                curEnd <- skipToCloseBracket ctx cur1
+                pure (buildCons [first], curEnd)
+            _ -> parseErr "expected `,`, `..`, or `]` in list literal" tok
+
+    gatherMore acc cur = do
         let (tok, cur1) = nextSig ctx cur
         case tkKind tok of
             TkComma -> do
                 (e, cur2) <- parseExpr ctx cur1
-                gather (e : acc) cur2
+                gatherMore (e : acc) cur2
             TkRBracket -> pure (buildCons (reverse acc), cur1)
-            -- List comprehension @[ e | q1, q2, ... ]@ — Phase 2.6 parses
-            -- the shape but doesn't evaluate it; we swallow through the
-            -- closing @]@ and hand back a singleton list @[e]@ so
-            -- higher-level code continues to parse.
             TkBar -> do
-                curEnd <- skipToCloseBracket ctx cur1
-                pure (buildCons (reverse acc), curEnd)
-            -- Range expression @[a..b]@ or @[a,b..c]@ — approximate by
-            -- returning a singleton of the first element so downstream
-            -- code still parses. Full range evaluation is deferred.
-            TkDotDot -> do
                 curEnd <- skipToCloseBracket ctx cur1
                 pure (buildCons (reverse acc), curEnd)
             _ -> parseErr "expected `,` or `]` in list literal" tok

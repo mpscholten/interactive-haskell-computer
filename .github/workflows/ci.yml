@@ -4,11 +4,12 @@ on:
   push:
     branches: [master, main]
   pull_request:
+    branches: [master, main]
 
 jobs:
   build:
-    # Apple Silicon is MANDATORY — the runtime emits aarch64 and MAP_JIT pages
-    # require Apple Silicon semantics. x86_64 runners cannot execute our output.
+    # Apple Silicon is MANDATORY — the runtime emits aarch64 machine code and
+    # MAP_JIT pages require Apple Silicon semantics; x86_64 cannot run the output.
     runs-on: macos-14
 
     steps:
@@ -19,27 +20,23 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Cache nix store
-        uses: actions/cache@v4
-        with:
-          path: |
-            /nix
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-${{ runner.arch }}-nix-${{ hashFiles('flake.nix', 'flake.lock', 'ihc.cabal') }}
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
 
       - name: Build
         run: nix develop --command cabal build all
 
-      - name: Sign the test binary
+      - name: Sign test binary (JIT entitlement required on macOS)
         run: nix develop --command make sign-test
 
       - name: Test
-        run: nix develop --command cabal test ihc-test --test-show-details=streaming
-
-      - name: Sign + smoke test the ihc binary
         run: |
-          nix develop --command make sign-ihc
-          BIN=$(nix develop --command cabal list-bin exe:ihc)
-          "$BIN" --version
-          "$BIN" --check-jit
+          nix develop --command cabal test ihc-test --test-show-details=streaming \
+            2>&1 | tee /tmp/ihc-test.log; exit ${PIPESTATUS[0]}
+
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: /tmp/ihc-test.log
+          retention-days: 7

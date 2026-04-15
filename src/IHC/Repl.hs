@@ -27,7 +27,7 @@ import System.Console.Haskeline
     )
 
 import IHC.AST (Expr)
-import IHC.Builtins (showValWith, buildConEnv)
+import IHC.Builtins (showValWith, buildConEnv, buildFieldEnv)
 import IHC.Classes (ClassRegistry, registerInstance)
 import IHC.Driver (resolveSearchPathFor)
 import IHC.Eval (eval, force)
@@ -243,21 +243,18 @@ doDataDecl envRef line = do
 
 tryDataDecl :: IORef Env -> Source -> String -> IO (Either String String)
 tryDataDecl envRef src _line = do
-    r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString Int)))
+    r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString Int, Map.Map BC.ByteString [(BC.ByteString, Int)])))
     case r of
         Left err  -> pure (Left (show err))
-        Right reg ->
+        Right (reg, fldReg) ->
             if Map.null reg
             then pure (Left "no constructors found (parse error?)")
             else do
-                conEnv <- buildConEnv reg
-                modifyIORef' envRef (Map.union conEnv)
+                conEnv   <- buildConEnv  reg
+                fieldEnv <- buildFieldEnv fldReg
+                modifyIORef' envRef (Map.union fieldEnv . Map.union conEnv)
                 let ctorCount = Map.size reg
                     ctors     = Map.keys reg
-                    -- Guess the type name: the common prefix or just list ctors.
-                    -- We report the first word after 'data'/'newtype' as the
-                    -- type name for the confirmation message, extracted by the
-                    -- caller if needed. We just report the ctor count.
                     msg = "data decl: " <> show ctorCount <>
                           " constructor(s): " <>
                           unwords (map BC.unpack ctors)

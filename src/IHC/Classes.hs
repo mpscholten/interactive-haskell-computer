@@ -45,6 +45,7 @@ lookupInstance reg className typeTag = do
 -- Used by dispatch builtins to find the right class instance.
 typeTagOf :: Val -> ByteString
 typeTagOf (VInt _)    = BC.pack "Int"
+typeTagOf (VFloat _)  = BC.pack "Double"
 typeTagOf (VChar _)   = BC.pack "Char"
 typeTagOf (VStr _)    = BC.pack "String"   -- transitional VStr
 typeTagOf VUnit       = BC.pack "()"

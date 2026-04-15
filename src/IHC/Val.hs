@@ -14,6 +14,7 @@ module IHC.Val
     , ThunkState(..)
     , Closure(..)
     , newThunk
+    , newThunkIP
     , newWHNFThunk
       -- * Environments
     , Env
@@ -21,6 +22,11 @@ module IHC.Val
     , extendEnv
     , extendEnvMany
     , lookupEnv
+      -- * Implicit-parameter map (Phase 3.6)
+    , ImplicitParamMap
+    , emptyIPMap
+    , extendIPMap
+    , lookupIPMap
       -- * Failures
     , LoopException(..)
     , PatternMatchFail(..)
@@ -47,9 +53,10 @@ import IHC.AST (Expr, Name)
 -- | Weak-head-normal-form values. Lazy data appears as 'Thunk's
 -- inside a 'VCon'.
 data Val
-    = VInt  !Int64
-    | VChar !Char                      -- single character (Phase 2.2+)
-    | VStr  !ByteString                -- raw bytes — transitional, some
+    = VInt   !Int64
+    | VFloat !Double                   -- Float/Double (Phase 2.9+)
+    | VChar  !Char                     -- single character (Phase 2.2+)
+    | VStr   !ByteString               -- raw bytes — transitional, some
                                        -- builtins still produce these;
                                        -- user-visible strings are [Char]
     | VFun  !(Thunk -> IO Val)         -- single-argument closure
@@ -72,6 +79,7 @@ data PrimObj
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
+showValForDebug (VFloat d)  = show d
 showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)    = "<function>"
@@ -96,10 +104,16 @@ data ThunkState
     | Evaluated   !Val
     | BlackHole                         -- entered, not yet returned
 
-data Closure = Closure !Env !Expr
+-- | A closure captures both the regular environment and the implicit-param
+-- map at the point of its creation (lexical scoping for both).
+data Closure = Closure !Env !ImplicitParamMap !Expr
 
 newThunk :: Env -> Expr -> IO Thunk
-newThunk env expr = newIORef (Unevaluated (Closure env expr))
+newThunk env expr = newIORef (Unevaluated (Closure env emptyIPMap expr))
+
+-- | Like 'newThunk' but also captures the current implicit-param map.
+newThunkIP :: Env -> ImplicitParamMap -> Expr -> IO Thunk
+newThunkIP env ipm expr = newIORef (Unevaluated (Closure env ipm expr))
 
 newWHNFThunk :: Val -> IO Thunk
 newWHNFThunk v = newIORef (Evaluated v)
