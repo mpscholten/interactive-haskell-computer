@@ -39,7 +39,9 @@ Remaining slices (rough order):
 - 3.1 — **full Template Haskell**: `[|…|]` quotation, `$(…)` AST-returning splices, `Q` IO, `reify`. Required by `aeson-th`, `lens` `makeLenses`, `persistent` TH — anything IHP uses heavily.
 - 3.2 — **type families** (open, closed, associated). Required by `servant`, effect libs, `singletons`, some IHP generated code.
 - 3.3 — **`DerivingVia` / `GeneralizedNewtypeDeriving` beyond trivial**, `QuantifiedConstraints`. Required by `optics`, `generic-lens`, modern typeclass-heavy Haskell.
-- 3.4 — `DataKinds` + promoted types. Required by type-level routing (`servant`).
+- 3.4 — `DataKinds` + promoted types. Required by type-level routing (`servant`) and pervasive in IHP.
+- 3.5 — `OverloadedLabels` (`#fieldName`). Pervasive in IHP queries — every `filterWhere` call uses it.
+- 3.6 — `ImplicitParams` (`?context`, `?schema`). Every IHP controller relies on implicit context.
 
 ## Dev setup
 
