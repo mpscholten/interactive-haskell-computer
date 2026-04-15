@@ -20,3 +20,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         -- on the garbage on the next line. Success means it stopped.
         n <- runFile "test/Fixtures/with_noise.hs"
         n `shouldBe` 7
+
+    it "evaluates `1 + 2 + 3` → 6 (left-associative addition)" do
+        n <- runFile "test/Fixtures/arith.hs"
+        n `shouldBe` 6
+
+    it "evaluates `2 + 3 * 4 - 1` → 13 (* binds tighter than + and -)" do
+        n <- runFile "test/Fixtures/arith_precedence.hs"
+        n `shouldBe` 13
+
+    it "evaluates `100 - 10 - 5` → 85 (- is left-associative)" do
+        n <- runFile "test/Fixtures/arith_assoc.hs"
+        n `shouldBe` 85

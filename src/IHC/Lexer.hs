@@ -47,6 +47,9 @@ data TokenKind
     | TkConId !ByteString     -- ^ uppercase-start identifier
     | TkInt   !Integer        -- ^ decimal integer literal
     | TkEq                    -- ^ @=@
+    | TkPlus                  -- ^ @+@
+    | TkMinus                 -- ^ @-@ (only when not followed by another '-')
+    | TkStar                  -- ^ @*@
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -91,7 +94,10 @@ nextToken s c0 =
             | isDigit b        -> lexInt c
             | isLowerStart b   -> lexIdent False c
             | isUpperStart b   -> lexIdent True  c
-            | b == 0x3D        -> (mkTok TkEq c (step c), step c)  -- '='
+            | b == 0x3D        -> (mkTok TkEq    c (step c), step c)  -- '='
+            | b == 0x2B        -> (mkTok TkPlus  c (step c), step c)  -- '+'
+            | b == 0x2A        -> (mkTok TkStar  c (step c), step c)  -- '*'
+            | b == 0x2D        -> (mkTok TkMinus c (step c), step c)  -- '-' (not '--', already skipped)
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b

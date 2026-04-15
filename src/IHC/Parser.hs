@@ -1,18 +1,24 @@
+{-# LANGUAGE DeriveAnyClass #-}
+
 -- | Single-pass recursive-descent parser for binding bodies.
 --
 -- Does not build an AST. As it parses tokens, it calls into the
--- 'CodeBuffer' to emit aarch64 instructions directly. The buffer must
--- already be writable when 'parseBody' is called.
+-- 'CodeBuffer' to emit aarch64 instructions directly. Each subexpression
+-- leaves its value in @x0@; binary operators push the left operand to
+-- the stack, evaluate the right, then pop and combine.
 --
--- Phase 1.0 grammar:
+-- Grammar (Phase 1.1):
 --
---   body ::= int-literal          -- emits: movz/movk chain into x0 ; ret
+-- @
+-- body  ::= expr
+-- expr  ::= term (('+' | '-') term)*      -- left-associative
+-- term  ::= atom ('*' atom)*              -- left-associative, tighter
+-- atom  ::= INT
+-- @
 --
--- Later slices add binary ops, function application, class methods,
--- and TH quotation. Adding each is a matter of extending 'parseExpr'
--- with a new branch that emits more instructions.
-{-# LANGUAGE DeriveAnyClass #-}
-
+-- Adding new forms (function application, class methods, TH, \...) is a
+-- matter of extending 'parseAtom' with new branches that emit more
+-- instructions.
 module IHC.Parser
     ( parseBody
     , ParseError(..)
@@ -36,29 +42,61 @@ newtype ParseError = ParseError String
 -- entry point should land and for being inside a 'withWritable'
 -- bracket.
 parseBody :: Source -> Span -> CodeBuffer -> IO ()
-parseBody src (start, end) cb = do
+parseBody src (start, _end) cb = do
     let cur0 = Cursor start 1 1
-    (_tok, cur1) <- parseExpr src (end, cur0) cb
-    -- Terminate with RET. We don't care whether cur1 reached `end` exactly —
-    -- trailing whitespace / comments are benign.
-    _ <- pure cur1
+    _ <- parseExpr src cur0 cb
     emitInsn cb retX30
 
--- | Parse a single expression, emitting code that leaves its value in @x0@.
--- Returns the token cursor past the expression.
-parseExpr :: Source -> (Pos, Cursor) -> CodeBuffer -> IO (Token, Cursor)
-parseExpr src (endPos, cur0) cb = do
+-- | Parse and emit code for an expression; returns the cursor positioned
+-- at (or past) the first token that wasn't part of the expression.
+parseExpr :: Source -> Cursor -> CodeBuffer -> IO Cursor
+parseExpr src cur0 cb = do
+    cur1 <- parseTerm src cur0 cb
+    loop cur1
+  where
+    loop cur =
+        let (tok, curN) = nextToken src cur in
+        case tkKind tok of
+            TkPlus -> do
+                emitInsn cb pushX0                -- save left
+                cur2 <- parseTerm src curN cb     -- right → x0
+                emitInsn cb popX1                 -- left → x1
+                emitInsn cb (addXXX 0 1 0)        -- x0 = x1 + x0
+                loop cur2
+            TkMinus -> do
+                emitInsn cb pushX0
+                cur2 <- parseTerm src curN cb
+                emitInsn cb popX1
+                emitInsn cb (subXXX 0 1 0)        -- x0 = x1 - x0
+                loop cur2
+            _ -> pure cur                          -- leave tok unconsumed
+
+parseTerm :: Source -> Cursor -> CodeBuffer -> IO Cursor
+parseTerm src cur0 cb = do
+    cur1 <- parseAtom src cur0 cb
+    loop cur1
+  where
+    loop cur =
+        let (tok, curN) = nextToken src cur in
+        case tkKind tok of
+            TkStar -> do
+                emitInsn cb pushX0
+                cur2 <- parseAtom src curN cb
+                emitInsn cb popX1
+                emitInsn cb (mulXXX 0 1 0)        -- x0 = x1 * x0
+                loop cur2
+            _ -> pure cur
+
+parseAtom :: Source -> Cursor -> CodeBuffer -> IO Cursor
+parseAtom src cur0 cb = do
     let (tok, cur1) = nextToken src cur0
     case tkKind tok of
         TkInt n -> do
-            -- Emit `mov x0, #n` (or the movz/movk chain for larger values).
             emitInsns cb (loadInt64 0 (fromInteger n))
-            pure (tok, cur1)
+            pure cur1
         TkEof ->
-            throwIO (ParseError ("empty body at offset " <> show (tkStart tok)))
-        _ ->
+            throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
+        other ->
             throwIO (ParseError ("expected Int literal at offset "
                                  <> show (tkStart tok)
-                                 <> " but saw " <> show (tkKind tok)))
-  -- Suppress unused-var warning.
-  where _ = endPos
+                                 <> " but saw " <> show other))

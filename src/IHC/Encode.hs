@@ -7,6 +7,13 @@ module IHC.Encode
     , movkImm
       -- * Return / branch
     , retX30
+      -- * Arithmetic (register-register)
+    , addXXX
+    , subXXX
+    , mulXXX
+      -- * Stack push/pop (single 64-bit register)
+    , pushX0
+    , popX1
       -- * Composed: materialize a signed 64-bit into a register
     , loadInt64
     ) where
@@ -36,6 +43,42 @@ movkImm rd hw imm16 =
 -- | @RET x30@.
 retX30 :: Word32
 retX30 = 0xD65F03C0
+
+-- | @ADD Xd, Xn, Xm@ (64-bit, shift=0).
+-- Encoding: 1 | 00 | 01011 | 00 | 0 | Rm(5) | 000000 | Rn(5) | Rd(5).
+addXXX :: Int -> Int -> Int -> Word32
+addXXX rd rn rm =
+    0x8B000000
+    .|. (fromIntegral rm .&. 0x1F) `shiftL` 16
+    .|. (fromIntegral rn .&. 0x1F) `shiftL` 5
+    .|.  fromIntegral rd .&. 0x1F
+
+-- | @SUB Xd, Xn, Xm@ (64-bit, shift=0).
+-- Encoding: 1 | 10 | 01011 | 00 | 0 | Rm(5) | 000000 | Rn(5) | Rd(5).
+subXXX :: Int -> Int -> Int -> Word32
+subXXX rd rn rm =
+    0xCB000000
+    .|. (fromIntegral rm .&. 0x1F) `shiftL` 16
+    .|. (fromIntegral rn .&. 0x1F) `shiftL` 5
+    .|.  fromIntegral rd .&. 0x1F
+
+-- | @MUL Xd, Xn, Xm@ (64-bit) — alias for MADD Xd,Xn,Xm,XZR.
+-- Encoding: 1 | 00 | 11011 | 000 | Rm(5) | 0 | 11111 | Rn(5) | Rd(5).
+mulXXX :: Int -> Int -> Int -> Word32
+mulXXX rd rn rm =
+    0x9B007C00
+    .|. (fromIntegral rm .&. 0x1F) `shiftL` 16
+    .|. (fromIntegral rn .&. 0x1F) `shiftL` 5
+    .|.  fromIntegral rd .&. 0x1F
+
+-- | @STR X0, [SP, #-16]!@ — pre-index store, decrements SP by 16.
+-- Keeps SP 16-byte aligned (Apple ABI).
+pushX0 :: Word32
+pushX0 = 0xF81F0FE0
+
+-- | @LDR X1, [SP], #16@ — post-index load, increments SP by 16.
+popX1 :: Word32
+popX1 = 0xF84107E1
 
 -- | Materialize a 64-bit integer into register @Xrd@, using up to four
 -- MOVZ/MOVK instructions (covers the full 64-bit range). For small
