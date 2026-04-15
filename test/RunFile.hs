@@ -128,3 +128,23 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/print_fib.hs")
         n   `shouldBe` 0
         out `shouldBe` "610\n"
+
+    it "all six relational operators yield 1 when their condition holds" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/cmp_ops.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    it "&& and || combine relops correctly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/and_or.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "2\n"
+
+    it "primality test (trial division) reports 97 as prime" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/primality.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    it "unary minus on literal + abs builtin: -5 + abs (-3) = -2" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/negate_lit.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "-2\n"

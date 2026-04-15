@@ -15,7 +15,7 @@ module IHC.IR
 import Data.ByteString (ByteString)
 import Data.Int (Int64)
 
-import IHC.Encode (loadInt64)
+import IHC.Encode (loadInt64, Cond)
 
 data Item
     = IPushX0                       -- spill accumulator to stack
@@ -26,7 +26,10 @@ data Item
     | IAddX1X0                      -- x0 = x1 + x0
     | ISubX1X0                      -- x0 = x1 - x0
     | IMulX1X0                      -- x0 = x1 * x0
-    | ICmpLe                        -- x0 = (x1 <= x0) ? 1 : 0 (cmp + cset)
+    | ICmp      !Cond               -- x0 = (x1 `cond` x0) ? 1 : 0 (cmp + cset)
+    | IAndX1X0                      -- bitwise AND (boolean && for 0/1 values)
+    | IOrX1X0                       -- bitwise OR  (boolean || for 0/1 values)
+    | INegX0                        -- x0 = -x0 (unary minus)
     | IArg      !Int                -- load nth parameter (0-indexed) into x0
     | ICall     !ByteString !Int    -- call; arity=N means pop N values from
                                     --   stack into x0..x(N-1), then blr
@@ -47,7 +50,10 @@ sizeOfItem = \case
     IAddX1X0      -> 4
     ISubX1X0      -> 4
     IMulX1X0      -> 4
-    ICmpLe        -> 8                      -- cmp + cset
+    ICmp _        -> 8                      -- cmp + cset
+    IAndX1X0      -> 4
+    IOrX1X0       -> 4
+    INegX0        -> 4
     IArg _        -> 4
     ICall _ 0     -> 20                     -- 4 movz/movk + 1 blr
     ICall _ n     -> 4 * n                  --   n ldrs (one per arg)

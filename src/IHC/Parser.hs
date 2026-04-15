@@ -39,6 +39,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.List (elemIndex)
 import Data.Maybe (fromJust)
 
+import IHC.Encode (Cond(..))
 import IHC.IR
 import IHC.Lexer
 import IHC.Source
@@ -71,7 +72,7 @@ parseExpr src params resolve cur0 acc0 = do
     let (tok, cur1) = nextSig src cur0
     case tkKind tok of
         TkIf -> parseIf src params resolve cur1 acc0
-        _    -> parseRel src params resolve cur0 acc0
+        _    -> parseOr src params resolve cur0 acc0
 
 parseIf :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseIf src params resolve cur0 acc0 = do
@@ -89,15 +90,52 @@ parseIf src params resolve cur0 acc0 = do
                 _ -> parseErr "expected `else`" tElse
         _ -> parseErr "expected `then`" tThen
 
+-- || (lowest precedence binary)
+parseOr :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseOr src params resolve cur0 acc0 = do
+    (acc1, cur1) <- parseAnd src params resolve cur0 acc0
+    loop acc1 cur1
+  where
+    loop acc cur =
+        let (tok, curN) = nextSig src cur in
+        case tkKind tok of
+            TkOr -> do
+                (acc', cur') <- parseAnd src params resolve curN (IPushX0 : acc)
+                loop (IOrX1X0 : IPopX1 : acc') cur'
+            _ -> pure (acc, cur)
+
+-- &&
+parseAnd :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseAnd src params resolve cur0 acc0 = do
+    (acc1, cur1) <- parseRel src params resolve cur0 acc0
+    loop acc1 cur1
+  where
+    loop acc cur =
+        let (tok, curN) = nextSig src cur in
+        case tkKind tok of
+            TkAnd -> do
+                (acc', cur') <- parseRel src params resolve curN (IPushX0 : acc)
+                loop (IAndX1X0 : IPopX1 : acc') cur'
+            _ -> pure (acc, cur)
+
+-- relational layer: at most one comparison (Haskell convention).
 parseRel :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseRel src params resolve cur0 acc0 = do
     (acc1, cur1) <- parseSum src params resolve cur0 acc0
     let (tok, curN) = nextSig src cur1
-    case tkKind tok of
-        TkLe -> do
+    case tokToCond (tkKind tok) of
+        Just c -> do
             (acc2, cur2) <- parseSum src params resolve curN (IPushX0 : acc1)
-            pure (ICmpLe : IPopX1 : acc2, cur2)
-        _ -> pure (acc1, cur1)
+            pure (ICmp c : IPopX1 : acc2, cur2)
+        Nothing -> pure (acc1, cur1)
+  where
+    tokToCond TkLe   = Just CLe
+    tokToCond TkLt   = Just CLt
+    tokToCond TkGe   = Just CGe
+    tokToCond TkGt   = Just CGt
+    tokToCond TkEqEq = Just CEq
+    tokToCond TkNeq  = Just CNe
+    tokToCond _      = Nothing
 
 parseSum :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
 parseSum src params resolve cur0 acc0 = do
@@ -159,6 +197,10 @@ parseAtom src params resolve cur0 acc0 = do
             pure (ILitInt (fromInteger n) : acc0, cur1)
         TkStr s ->
             pure (ILitStr s : acc0, cur1)
+        TkMinus -> do
+            -- Unary minus: parse the next atom then negate.
+            (acc1, cur2) <- parseAtom src params resolve cur1 acc0
+            pure (INegX0 : acc1, cur2)
         TkLParen -> do
             (acc1, cur2) <- parseExpr src params resolve cur1 acc0
             let (close, cur3) = nextSig src cur2

@@ -33,6 +33,13 @@ module IHC.Encode
       -- * Comparison / conditional select
     , cmpX1X0
     , csetLeX0
+    , csetX0Cond
+    , Cond(..)
+      -- * Bitwise / logical (used as boolean and/or on 0/1 values)
+    , andXXX
+    , orrXXX
+      -- * Negation (alias of @SUB Xd, XZR, Xm@)
+    , negX0X0
       -- * Branches (PC-relative)
     , cbzX0Offset
     , bOffset
@@ -155,16 +162,64 @@ ldrX0ArgSlot = 0xF9400BA0
 cmpX1X0 :: Word32
 cmpX1X0 = 0xEB00003F
 
--- | @CSET X0, LE@ — set x0 to 1 if previous compare was less-or-equal,
--- else 0. Alias for @CSINC X0, XZR, XZR, invert(LE)@ = @CSINC X0, XZR, XZR, GT@.
+-- | aarch64 condition codes used by 'CSET' (and similar).
+data Cond = CEq | CNe | CLt | CLe | CGt | CGe
+    deriving (Eq, Show)
+
+-- | aarch64 4-bit cond field for 'Cond'.
+condCode :: Cond -> Int
+condCode CEq = 0x0
+condCode CNe = 0x1
+condCode CLt = 0xB
+condCode CLe = 0xD
+condCode CGt = 0xC
+condCode CGe = 0xA
+
+-- | Inverted code, used by the 'CSET' alias mapping.
+invertedCond :: Cond -> Int
+invertedCond CEq = condCode CNe
+invertedCond CNe = condCode CEq
+invertedCond CLt = condCode CGe
+invertedCond CLe = condCode CGt
+invertedCond CGt = condCode CLe
+invertedCond CGe = condCode CLt
+
+-- | @CSET X0, cond@ — set x0 to 1 if @cond@ holds (per the previous
+-- compare), else 0. Alias for @CSINC X0, XZR, XZR, invert(cond)@.
 --
 -- CSINC 64-bit encoding: 0x9A800400 base.
--- For Rm=31, Rn=31, cond=GT(0xC), Rd=0:
---   0x9A800400 | (31<<16) | (0xC<<12) | (31<<5) | 0
---   = 0x9A800400 | 0x1F0000 | 0xC000 | 0x3E0
---   = 0x9A9FC7E0.
+-- For Rm=31, Rn=31, Rd=0:
+--   0x9A800400 | (31<<16) | (icond<<12) | (31<<5) | 0
+--   = 0x9A9F07E0 | (icond << 12)
+csetX0Cond :: Cond -> Word32
+csetX0Cond cond =
+    0x9A9F07E0
+    .|. ((fromIntegral (invertedCond cond) .&. 0xF) `shiftL` 12)
+
+-- | Backwards-compat: @CSET X0, LE@.
 csetLeX0 :: Word32
-csetLeX0 = 0x9A9FC7E0
+csetLeX0 = csetX0Cond CLe
+
+-- | @AND Xd, Xn, Xm@ (64-bit, no shift). Bitwise — for 0/1 values
+-- this is the boolean AND we want.
+andXXX :: Int -> Int -> Int -> Word32
+andXXX rd rn rm =
+    0x8A000000
+    .|. (fromIntegral rm .&. 0x1F) `shiftL` 16
+    .|. (fromIntegral rn .&. 0x1F) `shiftL` 5
+    .|.  fromIntegral rd .&. 0x1F
+
+-- | @ORR Xd, Xn, Xm@ (64-bit, no shift). Bitwise — boolean OR for 0/1.
+orrXXX :: Int -> Int -> Int -> Word32
+orrXXX rd rn rm =
+    0xAA000000
+    .|. (fromIntegral rm .&. 0x1F) `shiftL` 16
+    .|. (fromIntegral rn .&. 0x1F) `shiftL` 5
+    .|.  fromIntegral rd .&. 0x1F
+
+-- | @NEG X0, X0@ — alias for @SUB X0, XZR, X0@.
+negX0X0 :: Word32
+negX0X0 = subXXX 0 31 0
 
 -- | @CBZ X0, #(offset instructions)@ — branch to @PC + imm19*4@ if x0 == 0.
 --

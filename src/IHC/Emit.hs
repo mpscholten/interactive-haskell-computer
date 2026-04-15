@@ -60,9 +60,12 @@ emitItem cb addrs strs = \case
     IAddX1X0  -> emitInsn cb (addXXX 0 1 0)
     ISubX1X0  -> emitInsn cb (subXXX 0 1 0)
     IMulX1X0  -> emitInsn cb (mulXXX 0 1 0)
-    ICmpLe    -> do
+    ICmp cond -> do
         emitInsn cb cmpX1X0
-        emitInsn cb csetLeX0
+        emitInsn cb (csetX0Cond cond)
+    IAndX1X0  -> emitInsn cb (andXXX 0 1 0)
+    IOrX1X0   -> emitInsn cb (orrXXX 0 1 0)
+    INegX0    -> emitInsn cb negX0X0
     IArg i    -> emitInsn cb (ldrXnFromFp 0 (16 + 8 * i))
     ICall nm arity -> do
         case arity of

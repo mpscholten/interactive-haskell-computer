@@ -46,6 +46,21 @@ ihcPutChar c = do
     putChar (toEnum (fromIntegral c))
     hFlush stdout
 
+ihcMod :: Int -> Int -> Int
+ihcMod a b = a `mod` b
+
+ihcDiv :: Int -> Int -> Int
+ihcDiv a b = a `div` b
+
+ihcAbs :: Int -> Int
+ihcAbs = abs
+
+ihcMin :: Int -> Int -> Int
+ihcMin = min
+
+ihcMax :: Int -> Int -> Int
+ihcMax = max
+
 --------------------------------------------------------------------------------
 -- Foreign exports + re-imports (to take their address)
 --------------------------------------------------------------------------------
@@ -62,6 +77,26 @@ foreign export ccall "ihc_putChar" ihcPutChar :: Int -> IO ()
 foreign import ccall unsafe "&ihc_putChar"
     p_ihcPutChar :: FunPtr (Int -> IO ())
 
+foreign export ccall "ihc_mod" ihcMod :: Int -> Int -> Int
+foreign import ccall unsafe "&ihc_mod"
+    p_ihcMod :: FunPtr (Int -> Int -> Int)
+
+foreign export ccall "ihc_div" ihcDiv :: Int -> Int -> Int
+foreign import ccall unsafe "&ihc_div"
+    p_ihcDiv :: FunPtr (Int -> Int -> Int)
+
+foreign export ccall "ihc_abs" ihcAbs :: Int -> Int
+foreign import ccall unsafe "&ihc_abs"
+    p_ihcAbs :: FunPtr (Int -> Int)
+
+foreign export ccall "ihc_min" ihcMin :: Int -> Int -> Int
+foreign import ccall unsafe "&ihc_min"
+    p_ihcMin :: FunPtr (Int -> Int -> Int)
+
+foreign export ccall "ihc_max" ihcMax :: Int -> Int -> Int
+foreign import ccall unsafe "&ihc_max"
+    p_ihcMax :: FunPtr (Int -> Int -> Int)
+
 --------------------------------------------------------------------------------
 -- Registry: name -> (entry ptr, arity)
 --------------------------------------------------------------------------------
@@ -76,7 +111,12 @@ data Builtin = Builtin
 -- body can call them without a parsed definition.
 builtins :: [(ByteString, Builtin)]
 builtins =
-    [ ("putStrLn", Builtin (castFunPtrToPtr p_ihcPutStrLn)  1)
+    [ ("putStrLn", Builtin (castFunPtrToPtr p_ihcPutStrLn) 1)
     , ("print",    Builtin (castFunPtrToPtr p_ihcPrintInt) 1)
     , ("putChar",  Builtin (castFunPtrToPtr p_ihcPutChar)  1)
+    , ("mod",      Builtin (castFunPtrToPtr p_ihcMod)      2)
+    , ("div",      Builtin (castFunPtrToPtr p_ihcDiv)      2)
+    , ("abs",      Builtin (castFunPtrToPtr p_ihcAbs)      1)
+    , ("min",      Builtin (castFunPtrToPtr p_ihcMin)      2)
+    , ("max",      Builtin (castFunPtrToPtr p_ihcMax)      2)
     ]

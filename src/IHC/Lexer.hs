@@ -55,6 +55,13 @@ data TokenKind
     | TkLParen                -- ^ @(@
     | TkRParen                -- ^ @)@
     | TkLe                    -- ^ @<=@
+    | TkLt                    -- ^ @<@
+    | TkGe                    -- ^ @>=@
+    | TkGt                    -- ^ @>@
+    | TkEqEq                  -- ^ @==@
+    | TkNeq                   -- ^ @/=@
+    | TkAnd                   -- ^ @&&@
+    | TkOr                    -- ^ @||@
     | TkIf                    -- ^ keyword @if@
     | TkThen                  -- ^ keyword @then@
     | TkElse                  -- ^ keyword @else@
@@ -102,15 +109,29 @@ nextToken s c0 =
             | isDigit b        -> lexInt c
             | isLowerStart b   -> lexIdent False c
             | isUpperStart b   -> lexIdent True  c
+            -- Two-char operators MUST be tested before their single-char
+            -- subset (e.g. '==' before '=', '<=' before '<').
+            | b == 0x3D, Just 0x3D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkEqEq c c', c')  -- '=='
+            | b == 0x3C, Just 0x3D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkLe   c c', c')  -- '<='
+            | b == 0x3E, Just 0x3D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkGe   c c', c')  -- '>='
+            | b == 0x2F, Just 0x3D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkNeq  c c', c')  -- '/='
+            | b == 0x26, Just 0x26 <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkAnd  c c', c')  -- '&&'
+            | b == 0x7C, Just 0x7C <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkOr   c c', c')  -- '||'
             | b == 0x3D        -> (mkTok TkEq     c (step c), step c)  -- '='
             | b == 0x2B        -> (mkTok TkPlus   c (step c), step c)  -- '+'
             | b == 0x2A        -> (mkTok TkStar   c (step c), step c)  -- '*'
-            | b == 0x2D        -> (mkTok TkMinus  c (step c), step c)  -- '-' (not '--', already skipped)
+            | b == 0x2D        -> (mkTok TkMinus  c (step c), step c)  -- '-'
             | b == 0x28        -> (mkTok TkLParen c (step c), step c)  -- '('
             | b == 0x29        -> (mkTok TkRParen c (step c), step c)  -- ')'
-            | b == 0x3C, Just 0x3D <- peekByte s (cPos c + 1)
-                               -> let c' = step (step c) in (mkTok TkLe c c', c')  -- '<='
-            | b == 0x22        -> lexString c                     -- '"'
+            | b == 0x3C        -> (mkTok TkLt     c (step c), step c)  -- '<'
+            | b == 0x3E        -> (mkTok TkGt     c (step c), step c)  -- '>'
+            | b == 0x22        -> lexString c                          -- '"'
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b
