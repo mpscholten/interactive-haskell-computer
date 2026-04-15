@@ -15,7 +15,27 @@ module IHC.Builtins
     , showValWith
     ) where
 
-import Control.Exception (throwIO)
+import Control.Concurrent
+    ( forkIO, killThread, myThreadId, threadDelay
+    )
+import Control.Concurrent.MVar
+    ( MVar, newMVar, newEmptyMVar, takeMVar, putMVar, readMVar
+    , modifyMVar_, modifyMVar, tryTakeMVar, tryPutMVar, isEmptyMVar
+    , withMVar, swapMVar
+    )
+import Control.Concurrent.STM
+    ( TVar, atomically, retry, orElse, check
+    , newTVar, newTVarIO, readTVar, writeTVar, modifyTVar, modifyTVar', readTVarIO
+    , STM
+    )
+import GHC.Conc.Sync (unsafeIOToSTM)
+import qualified Control.Exception as CE
+import Control.Exception
+    ( throwIO, catch, try, evaluate, mask, mask_
+    , bracket, bracket_, finally, onException, throwTo
+    , SomeException, IOException
+    , Exception(..)
+    )
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
@@ -339,6 +359,53 @@ builtins reg =
     , ("**",           powFloatOpB)
     , ("enumFromTo",   enumFromToB)
     , ("enumFromThenTo", enumFromThenToB)
+    -- Phase 2.10a: concurrency primitives
+    , ("forkIO",          forkIOB)
+    , ("killThread",      killThreadB)
+    , ("myThreadId",      myThreadIdB)
+    , ("threadDelay",     threadDelayB)
+    , ("getNumCapabilities", getNumCapabilitiesB)
+    -- Phase 2.10a: MVar
+    , ("newMVar",         newMVarB)
+    , ("newEmptyMVar",    newEmptyMVarB)
+    , ("takeMVar",        takeMVarB)
+    , ("putMVar",         putMVarB)
+    , ("readMVar",        readMVarB)
+    , ("modifyMVar_",     modifyMVar_B)
+    , ("modifyMVar",      modifyMVarB)
+    , ("tryTakeMVar",     tryTakeMVarB)
+    , ("tryPutMVar",      tryPutMVarB)
+    , ("isEmptyMVar",     isEmptyMVarB)
+    , ("withMVar",        withMVarB)
+    , ("swapMVar",        swapMVarB)
+    -- Phase 2.10a: STM
+    , ("atomically",      atomicallyB)
+    , ("retry",           retryB)
+    , ("orElse",          orElseB)
+    , ("check",           checkB)
+    , ("newTVar",         newTVarB)
+    , ("newTVarIO",       newTVarIOB)
+    , ("readTVar",        readTVarB)
+    , ("writeTVar",       writeTVarB)
+    , ("modifyTVar'",     modifyTVar'B)
+    , ("modifyTVar",      modifyTVar'B)
+    , ("readTVarIO",      readTVarIOB)
+    -- Phase 2.10a: exceptions
+    , ("throwIO",         throwIOB)
+    , ("throw",           throwIOB)
+    , ("catch",           catchB)
+    , ("handle",          handleB)
+    , ("try",             tryB)
+    , ("evaluate",        evaluateB)
+    , ("mask_",           mask_B)
+    , ("mask",            maskB)
+    , ("uninterruptibleMask_", mask_B)
+    , ("bracket",         bracketB)
+    , ("bracket_",        bracket_B)
+    , ("finally",         finallyB)
+    , ("onException",     onExceptionB)
+    , ("throwTo",         throwToB)
+    , ("displayException", displayExceptionB)
     ]
 
 --------------------------------------------------------------------------------
@@ -757,6 +824,9 @@ showVal (VPrimObj (PrimForeignPtr _))  = pure "<ForeignPtr>"
 showVal (VPrimObj (PrimPtr _))         = pure "<Ptr>"
 showVal (VPrimObj (PrimByteArray _))   = pure "<MutableByteArray>"
 showVal (VPrimObj PrimRealWorld)       = pure "<RealWorld#>"
+showVal (VPrimObj (PrimMVar _))        = pure "<MVar>"
+showVal (VPrimObj (PrimTVar _))        = pure "<TVar>"
+showVal (VPrimObj (PrimThreadId tid))  = pure ("ThreadId " <> show tid)
 
 -- | Tuple constructors are named @(,)@, @(,,)@, @(,,,)@, etc. — any
 -- @(@ followed by @n@ commas and @)@.
@@ -2137,3 +2207,385 @@ buildFieldEnv reg = do
                 throwIO (userError
                     ("record accessor `" <> BC.unpack fieldName
                      <> "` applied to non-constructor value"))
+
+--------------------------------------------------------------------------------
+-- Phase 2.10a: concurrency - thread primitives
+--------------------------------------------------------------------------------
+
+-- | @forkIO action@ - fork a new thread running the IO action.
+forkIOB :: IO Val
+forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    tid <- forkIO $ do
+        _ <- runIOVal av
+        pure ()
+    pure (VPrimObj (PrimThreadId tid))
+
+-- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
+killThreadB :: IO Val
+killThreadB = pure $ VFun $ \tidT -> pure $ VIO $ do
+    tidV <- force tidT
+    case tidV of
+        VPrimObj (PrimThreadId tid) -> do
+            killThread tid
+            pure VUnit
+        _ -> error ("killThread: not a ThreadId: " <> showValForDebug tidV)
+
+-- | @myThreadId@ - return the current thread's id.
+myThreadIdB :: IO Val
+myThreadIdB = pure $ VIO $ do
+    tid <- myThreadId
+    pure (VPrimObj (PrimThreadId tid))
+
+-- | @threadDelay microseconds@ - sleep.
+threadDelayB :: IO Val
+threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
+    nv <- force nT
+    case nv of
+        VInt n -> do { threadDelay (fromIntegral n); pure VUnit }
+        _ -> error ("threadDelay: not an Int: " <> showValForDebug nv)
+
+-- | @getNumCapabilities@ - return 1 (simplified).
+getNumCapabilitiesB :: IO Val
+getNumCapabilitiesB = pure $ VIO $ pure (VInt 1)
+
+--------------------------------------------------------------------------------
+-- Phase 2.10a: MVar primitives
+--------------------------------------------------------------------------------
+
+requireMVar :: String -> Val -> IO (MVar Val)
+requireMVar fn v = case v of
+    VPrimObj (PrimMVar mv) -> pure mv
+    _ -> error (fn <> ": not an MVar: " <> showValForDebug v)
+
+newMVarB :: IO Val
+newMVarB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    mv <- newMVar av
+    pure (VPrimObj (PrimMVar mv))
+
+newEmptyMVarB :: IO Val
+newEmptyMVarB = pure $ VIO $ do
+    mv <- newEmptyMVar
+    pure (VPrimObj (PrimMVar mv))
+
+takeMVarB :: IO Val
+takeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "takeMVar" mvv
+    takeMVar mv
+
+putMVarB :: IO Val
+putMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "putMVar" mvv
+    av  <- force aT
+    putMVar mv av
+    pure VUnit
+
+readMVarB :: IO Val
+readMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "readMVar" mvv
+    readMVar mv
+
+modifyMVar_B :: IO Val
+modifyMVar_B = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "modifyMVar_" mvv
+    fv  <- force fT
+    modifyMVar_ mv $ \cur -> do
+        curT <- newWHNFThunk cur
+        rv   <- apply fv curT
+        runIOVal rv
+    pure VUnit
+
+modifyMVarB :: IO Val
+modifyMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "modifyMVar" mvv
+    fv  <- force fT
+    modifyMVar mv $ \cur -> do
+        curT  <- newWHNFThunk cur
+        rv    <- apply fv curT
+        pairV <- runIOVal rv
+        case pairV of
+            VCon _ [newT, extraT] -> do
+                newV   <- force newT
+                extraV <- force extraT
+                pure (newV, extraV)
+            _ -> error ("modifyMVar: f did not return a pair: "
+                        <> showValForDebug pairV)
+
+tryTakeMVarB :: IO Val
+tryTakeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "tryTakeMVar" mvv
+    r   <- tryTakeMVar mv
+    case r of
+        Nothing -> pure (VCon "Nothing" [])
+        Just v  -> do { t <- newWHNFThunk v; pure (VCon "Just" [t]) }
+
+tryPutMVarB :: IO Val
+tryPutMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "tryPutMVar" mvv
+    av  <- force aT
+    ok  <- tryPutMVar mv av
+    pure (boolVal ok)
+
+isEmptyMVarB :: IO Val
+isEmptyMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "isEmptyMVar" mvv
+    b   <- isEmptyMVar mv
+    pure (boolVal b)
+
+withMVarB :: IO Val
+withMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "withMVar" mvv
+    fv  <- force fT
+    withMVar mv $ \cur -> do
+        curT <- newWHNFThunk cur
+        rv   <- apply fv curT
+        runIOVal rv
+
+swapMVarB :: IO Val
+swapMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
+    mvv <- force mvT
+    mv  <- requireMVar "swapMVar" mvv
+    av  <- force aT
+    swapMVar mv av
+
+--------------------------------------------------------------------------------
+-- Phase 2.10a: STM primitives
+--------------------------------------------------------------------------------
+
+atomicallyB :: IO Val
+atomicallyB = pure $ VFun $ \stmT -> pure $ VIO $ do
+    stmV <- force stmT
+    runIOVal stmV
+
+retryB :: IO Val
+retryB = pure $ VIO $ atomically retry
+
+orElseB :: IO Val
+orElseB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VIO $ do
+    av <- force aT
+    bv <- force bT
+    -- Approximate: try av first, fall back to bv on exception
+    CE.catch (runIOVal av) (\(_ :: CE.SomeException) -> runIOVal bv)
+
+checkB :: IO Val
+checkB = pure $ VFun $ \bT -> pure $ VIO $ do
+    bv <- force bT
+    atomically (check (isTruthy bv))
+    pure VUnit
+
+newTVarB :: IO Val
+newTVarB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    tv <- newTVarIO av
+    pure (VPrimObj (PrimTVar tv))
+
+newTVarIOB :: IO Val
+newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    tv <- newTVarIO av
+    pure (VPrimObj (PrimTVar tv))
+
+readTVarB :: IO Val
+readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
+    tvv <- force tvT
+    case tvv of
+        VPrimObj (PrimTVar tv) -> atomically (readTVar tv)
+        _ -> error ("readTVar: not a TVar: " <> showValForDebug tvv)
+
+writeTVarB :: IO Val
+writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
+    tvv <- force tvT
+    av  <- force aT
+    case tvv of
+        VPrimObj (PrimTVar tv) -> do
+            atomically (writeTVar tv av)
+            pure VUnit
+        _ -> error ("writeTVar: not a TVar: " <> showValForDebug tvv)
+
+modifyTVar'B :: IO Val
+modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
+    tvv <- force tvT
+    fv  <- force fT
+    case tvv of
+        VPrimObj (PrimTVar tv) -> do
+            cur  <- atomically (readTVar tv)
+            curT <- newWHNFThunk cur
+            new  <- apply fv curT
+            atomically (writeTVar tv new)
+            pure VUnit
+        _ -> error ("modifyTVar': not a TVar: " <> showValForDebug tvv)
+
+readTVarIOB :: IO Val
+readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
+    tvv <- force tvT
+    case tvv of
+        VPrimObj (PrimTVar tv) -> readTVarIO tv
+        _ -> error ("readTVarIO: not a TVar: " <> showValForDebug tvv)
+
+--------------------------------------------------------------------------------
+-- Phase 2.10a: exception primitives
+--------------------------------------------------------------------------------
+
+-- | Wrap a 'Val' in an 'IhcException' for host-level throwing.
+valToIhcException :: Val -> IO IhcException
+valToIhcException v = do
+    let msg = case v of
+                VStr s   -> s
+                VCon n _ -> n
+                _        -> BC.pack (showValForDebug v)
+    t <- newWHNFThunk v
+    pure (IhcException msg t)
+
+-- | Extract the 'Val' from an 'IhcException'.
+ihcExceptionToVal :: IhcException -> IO Val
+ihcExceptionToVal (IhcException _ t) = force t
+
+throwIOB :: IO Val
+throwIOB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av  <- force aT
+    exc <- valToIhcException av
+    throwIO exc
+
+catchB :: IO Val
+catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
+    av <- force aT
+    hv <- force hT
+    catch
+        (catch
+            (runIOVal av)
+            (\(exc :: IhcException) -> do
+                excVal <- ihcExceptionToVal exc
+                excT   <- newWHNFThunk excVal
+                rv     <- apply hv excT
+                runIOVal rv))
+        (\(exc :: SomeException) -> do
+            let msg = BC.pack (show exc)
+            excT <- newWHNFThunk (VStr msg)
+            rv   <- apply hv excT
+            runIOVal rv)
+
+handleB :: IO Val
+handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
+    hv <- force hT
+    av <- force aT
+    catch
+        (catch
+            (runIOVal av)
+            (\(exc :: IhcException) -> do
+                excVal <- ihcExceptionToVal exc
+                excT   <- newWHNFThunk excVal
+                rv     <- apply hv excT
+                runIOVal rv))
+        (\(exc :: SomeException) -> do
+            let msg = BC.pack (show exc)
+            excT <- newWHNFThunk (VStr msg)
+            rv   <- apply hv excT
+            runIOVal rv)
+
+tryB :: IO Val
+tryB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    r  <- CE.try @IhcException (runIOVal av)
+    case r of
+        Right v -> do
+            vT <- newWHNFThunk v
+            pure (VCon "Right" [vT])
+        Left exc -> do
+            excVal <- ihcExceptionToVal exc
+            excT   <- newWHNFThunk excVal
+            pure (VCon "Left" [excT])
+
+evaluateB :: IO Val
+evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    _  <- evaluate av
+    pure av
+
+mask_B :: IO Val
+mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    mask_ (runIOVal av)
+
+maskB :: IO Val
+maskB = pure $ VFun $ \fT -> pure $ VIO $ do
+    fv <- force fT
+    mask $ \restore -> do
+        let restoreVal = VFun $ \aT -> pure $ VIO $ do
+                av <- force aT
+                restore (runIOVal av)
+        restoreT <- newWHNFThunk restoreVal
+        rv <- apply fv restoreT
+        runIOVal rv
+
+bracketB :: IO Val
+bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
+    acqV <- force acqT
+    relV <- force relT
+    useV <- force useT
+    bracket
+        (runIOVal acqV)
+        (\res -> do
+            resT <- newWHNFThunk res
+            rv   <- apply relV resT
+            _    <- runIOVal rv
+            pure ())
+        (\res -> do
+            resT <- newWHNFThunk res
+            rv   <- apply useV resT
+            runIOVal rv)
+
+bracket_B :: IO Val
+bracket_B = pure $ VFun $ \befT -> pure $ VFun $ \aftT -> pure $ VFun $ \thingT -> pure $ VIO $ do
+    befV   <- force befT
+    aftV   <- force aftT
+    thingV <- force thingT
+    bracket_
+        (runIOVal befV >> pure ())
+        (runIOVal aftV >> pure ())
+        (runIOVal thingV)
+
+finallyB :: IO Val
+finallyB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
+    av     <- force aT
+    cleanV <- force cleanT
+    finally
+        (runIOVal av)
+        (runIOVal cleanV >> pure ())
+
+onExceptionB :: IO Val
+onExceptionB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
+    av     <- force aT
+    cleanV <- force cleanT
+    onException
+        (runIOVal av)
+        (runIOVal cleanV >> pure ())
+
+throwToB :: IO Val
+throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
+    tidV <- force tidT
+    excV <- force excT
+    case tidV of
+        VPrimObj (PrimThreadId tid) -> do
+            exc <- valToIhcException excV
+            throwTo tid exc
+            pure VUnit
+        _ -> error ("throwTo: not a ThreadId: " <> showValForDebug tidV)
+
+displayExceptionB :: IO Val
+displayExceptionB = pure $ VFun $ \eT -> do
+    ev <- force eT
+    let s = case ev of
+                VStr msg  -> BC.unpack msg
+                VCon n _  -> BC.unpack n
+                _         -> showValForDebug ev
+    stringToListValIO s

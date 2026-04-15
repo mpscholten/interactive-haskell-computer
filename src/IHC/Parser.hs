@@ -583,6 +583,14 @@ parseLambdaCase ctx cur0 = do
 -- do / let / case (kept close to the Phase 2.5 code)
 --------------------------------------------------------------------------------
 
+-- Note: {-# LANGUAGE ApplicativeDo #-} is accepted (the lexer silently skips
+-- all pragmas) but does NOT trigger a different desugaring path here.
+-- We always desugar do-blocks monadically (>>=).  For the use-cases that
+-- matter to us (IHP generated decoders, IHP.FetchPipelined), Applicative is
+-- a superclass of Monad, so monadic desugaring produces the same observable
+-- result.  If true parallel applicative semantics are ever needed, this
+-- function is the place to add an independence analysis pass.
+
 parseDo :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseDo ctx cur0 = do
     let (firstTok, curAfter) = nextSig ctx cur0
@@ -1130,6 +1138,7 @@ startsAtom TkConId{}       = True
 startsAtom TkPrimId{}      = True
 startsAtom TkLUnbox        = True
 startsAtom TkImplicitRef{} = True  -- Phase 3.6: ?name can start an atom
+startsAtom TkSpliceLParen  = True  -- Phase 2.11: $( starts a TH splice
 startsAtom _               = False
 
 --------------------------------------------------------------------------------
@@ -1163,6 +1172,13 @@ parseAtom ctx cur0 = do
         TkLParen   -> parseParenExpr ctx tok cur1
         TkLUnbox   -> parseUnboxedTuple ctx cur1
         TkLBracket -> parseListLit ctx cur1
+        -- Phase 2.11: TH splice $( expr )
+        TkSpliceLParen -> do
+            (inner, cur2) <- parseExpr ctx cur1
+            let (closeTok, cur3) = nextSig ctx cur2
+            case tkKind closeTok of
+                TkRParen -> pure (ESplice inner, cur3)
+                _        -> parseErr "expected `)` to close splice $(...)" closeTok
         TkEof -> throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
         _ -> parseErr "unexpected token" tok
 
