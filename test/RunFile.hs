@@ -195,3 +195,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/three_args.hs")
         n   `shouldBe` 0
         out `shouldBe` "17\n10\n300\n"
+
+    it "let-in (single binding, used twice): `x*x + x` -> 110" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/let_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "110\n"
+
+    it "nested let, inner references outer: `a*b` -> 30" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/let_nested.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "30\n"
+
+    it "let-in inside a function with params: `hyp 3 4` -> 25" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/let_with_param.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "25\n"

@@ -4,29 +4,26 @@
 --
 -- Parses the body once, producing a small 'Item' list. No AST.
 --
--- Grammar (Phase 1.5):
+-- Grammar (Phase 1.11):
 --
 -- @
 -- body    ::= expr
 -- expr    ::= 'if' expr 'then' expr 'else' expr
---           | rel
--- rel     ::= sum  ('<=' sum)?
--- sum     ::= term (('+' | '-') term)*
+--           | 'do' do-block
+--           | 'let' ident '=' expr 'in' expr
+--           | or
+-- or      ::= and  ('||' and)*
+-- and     ::= rel  ('&&' rel)*
+-- rel     ::= sum  (relop sum)?           -- at most one comparison
+-- sum     ::= term (('+' | '-' | '++') term)*
 -- term    ::= app  ('*' app)*
--- app     ::= atom atom*                   -- function application (exactly
---                                          -- @arity@ atoms consumed per the
---                                          -- callee's LHS)
--- atom    ::= INT
+-- app     ::= ident atom*                 -- function application
+--           | atom
+-- atom    ::= INT | STRING
 --           | '(' expr ')'
---           | ident
+--           | '-' atom                    -- unary minus
+--           | ident                       -- param, local-let, or nullary call
 -- @
---
--- The parser receives two callbacks:
---   * the enclosing binding's parameter list (so an ident matching a
---     param becomes 'IArg'),
---   * an 'ArityResolver' returning the arity of any referenced
---     top-level binding (so we know how many atoms to eat after the
---     call's ident).
 module IHC.Parser
     ( parseBodyItems
     , ParseError(..)
@@ -37,7 +34,8 @@ import Control.Exception (Exception, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.List (elemIndex)
-import Data.Maybe (fromJust)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
 
 import IHC.Encode (Cond(..))
 import IHC.IR
@@ -50,12 +48,22 @@ newtype ParseError = ParseError String
 
 type ArityResolver = ByteString -> IO Int
 
+-- | Parser context — bundled to avoid threading three or four args
+-- through every recursive call.
+data Ctx = Ctx
+    { ctxSrc     :: !Source
+    , ctxParams  :: ![ByteString]              -- enclosing function's params
+    , ctxLocals  :: !(Map ByteString [Item])   -- let-bound names -> items
+    , ctxResolve :: !ArityResolver
+    }
+
 -- | Parse a binding body's span given its param list and a resolver
 -- that knows every referenced top-level binding's arity.
 parseBodyItems :: Source -> [ByteString] -> ArityResolver -> Span -> IO [Item]
 parseBodyItems src params resolve (start, _end) = do
     let cur0 = Cursor start 1 1
-    (items, _cur1) <- parseExpr src params resolve cur0 []
+        ctx  = Ctx src params Map.empty resolve
+    (items, _cur1) <- parseExpr ctx cur0 []
     pure (reverse items)
 
 -- | 'nextToken' variant that skips 'TkNewline', letting an expression
@@ -67,107 +75,120 @@ nextSig src cur =
         TkNewline -> nextSig src c
         _         -> (t, c)
 
-parseExpr :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseExpr src params resolve cur0 acc0 = do
-    let (tok, cur1) = nextSig src cur0
+parseExpr :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseExpr ctx cur0 acc0 = do
+    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
     case tkKind tok of
-        TkIf -> parseIf     src params resolve cur1 acc0
-        TkDo -> parseDo     src params resolve cur1 acc0
-        _    -> parseOr     src params resolve cur0 acc0
+        TkIf  -> parseIf  ctx cur1 acc0
+        TkDo  -> parseDo  ctx cur1 acc0
+        TkLet -> parseLet ctx cur1 acc0
+        _     -> parseOr  ctx cur0 acc0
 
--- @do { stmt ; ... ; stmt }@ (explicit braces) or layout form
+-- @let ident = e1 in e2@
 --
--- @
--- do
---     stmt1
---     stmt2
---     stmt3
--- @
+-- Captures e1's items in the locals map; e2 is parsed with that
+-- extension. Each occurrence of the let-bound name in e2 splices a
+-- fresh copy of e1's items at the call site.
 --
--- Each stmt's items emit in source order; intermediate results
--- overwrite x0 (the @>>@ semantics for IO () actions). The block's
--- value is the last stmt's value.
-parseDo :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseDo src params resolve cur0 acc0 = do
-    let (firstTok, curAfter) = nextSig src cur0
+-- Caveat: this is splice/inline semantics. For pure expressions it
+-- matches Haskell's call-by-name; for IO actions with shared effects
+-- it would re-evaluate, which we don't try to support here.
+parseLet :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseLet ctx cur0 acc0 = do
+    let (nameTok, cur1) = nextSig (ctxSrc ctx) cur0
+    name <- case tkKind nameTok of
+        TkIdent n -> pure n
+        _         -> parseErr "expected identifier after `let`" nameTok
+    let (eqTok, cur2) = nextSig (ctxSrc ctx) cur1
+    case tkKind eqTok of
+        TkEq -> pure ()
+        _    -> parseErr "expected `=` in let-binding" eqTok
+    -- Parse e1 into its own item list (reversed during build).
+    (e1Rev, cur3) <- parseExpr ctx cur2 []
+    let e1Items = reverse e1Rev
+    -- Expect `in`.
+    let (inTok, cur4) = nextSig (ctxSrc ctx) cur3
+    case tkKind inTok of
+        TkIn -> pure ()
+        _    -> parseErr "expected `in` in let-binding" inTok
+    -- Parse e2 with the local binding in scope.
+    let ctx' = ctx { ctxLocals = Map.insert name e1Items (ctxLocals ctx) }
+    parseExpr ctx' cur4 acc0
+
+-- @do { stmt ; ... ; stmt }@ (explicit braces) or layout form.
+parseDo :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseDo ctx cur0 acc0 = do
+    let (firstTok, curAfter) = nextSig (ctxSrc ctx) cur0
     case tkKind firstTok of
         TkLBrace -> bracedStmts curAfter acc0
         TkEof    -> pure (acc0, cur0)
         _        -> layoutStmts (tkCol firstTok) cur0 acc0
   where
-    -- Explicit braces: stmts separated by `;`, terminated by `}`.
     bracedStmts cur acc = do
-        (acc', cur')  <- parseExpr src params resolve cur acc
-        let (sep, curN) = nextSig src cur'
+        (acc', cur')  <- parseExpr ctx cur acc
+        let (sep, curN) = nextSig (ctxSrc ctx) cur'
         case tkKind sep of
             TkSemi   -> bracedStmts curN acc'
             TkRBrace -> pure (acc', curN)
             _        -> parseErr "expected `;` or `}` in do-block" sep
 
-    -- Layout form: each stmt begins at exactly @stmtCol@; a token at
-    -- a lower column ends the block. The expression parser already
-    -- returns its cursor before unrecognised tokens, so we just
-    -- check the next sig token's column to decide whether to loop.
     layoutStmts stmtCol cur acc = do
-        (acc', cur') <- parseExpr src params resolve cur acc
-        let (nextTok, _) = nextSig src cur'
+        (acc', cur') <- parseExpr ctx cur acc
+        let (nextTok, _) = nextSig (ctxSrc ctx) cur'
         case tkKind nextTok of
             TkEof -> pure (acc', cur')
             _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' acc'
               | otherwise                -> pure (acc', cur')
 
-parseIf :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseIf src params resolve cur0 acc0 = do
-    (condRev, curC) <- parseExpr src params resolve cur0 []
-    let (tThen, curT0) = nextSig src curC
+parseIf :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseIf ctx cur0 acc0 = do
+    (condRev, curC) <- parseExpr ctx cur0 []
+    let (tThen, curT0) = nextSig (ctxSrc ctx) curC
     case tkKind tThen of
         TkThen -> do
-            (thenRev, curT) <- parseExpr src params resolve curT0 []
-            let (tElse, curE0) = nextSig src curT
+            (thenRev, curT) <- parseExpr ctx curT0 []
+            let (tElse, curE0) = nextSig (ctxSrc ctx) curT
             case tkKind tElse of
                 TkElse -> do
-                    (elseRev, curE) <- parseExpr src params resolve curE0 []
+                    (elseRev, curE) <- parseExpr ctx curE0 []
                     let item = IIfThenElse (reverse condRev) (reverse thenRev) (reverse elseRev)
                     pure (item : acc0, curE)
                 _ -> parseErr "expected `else`" tElse
         _ -> parseErr "expected `then`" tThen
 
--- || (lowest precedence binary)
-parseOr :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseOr src params resolve cur0 acc0 = do
-    (acc1, cur1) <- parseAnd src params resolve cur0 acc0
+parseOr :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseOr ctx cur0 acc0 = do
+    (acc1, cur1) <- parseAnd ctx cur0 acc0
     loop acc1 cur1
   where
     loop acc cur =
-        let (tok, curN) = nextSig src cur in
+        let (tok, curN) = nextSig (ctxSrc ctx) cur in
         case tkKind tok of
             TkOr -> do
-                (acc', cur') <- parseAnd src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseAnd ctx curN (IPushX0 : acc)
                 loop (IOrX1X0 : IPopX1 : acc') cur'
             _ -> pure (acc, cur)
 
--- &&
-parseAnd :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseAnd src params resolve cur0 acc0 = do
-    (acc1, cur1) <- parseRel src params resolve cur0 acc0
+parseAnd :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseAnd ctx cur0 acc0 = do
+    (acc1, cur1) <- parseRel ctx cur0 acc0
     loop acc1 cur1
   where
     loop acc cur =
-        let (tok, curN) = nextSig src cur in
+        let (tok, curN) = nextSig (ctxSrc ctx) cur in
         case tkKind tok of
             TkAnd -> do
-                (acc', cur') <- parseRel src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseRel ctx curN (IPushX0 : acc)
                 loop (IAndX1X0 : IPopX1 : acc') cur'
             _ -> pure (acc, cur)
 
--- relational layer: at most one comparison (Haskell convention).
-parseRel :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseRel src params resolve cur0 acc0 = do
-    (acc1, cur1) <- parseSum src params resolve cur0 acc0
-    let (tok, curN) = nextSig src cur1
+parseRel :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseRel ctx cur0 acc0 = do
+    (acc1, cur1) <- parseSum ctx cur0 acc0
+    let (tok, curN) = nextSig (ctxSrc ctx) cur1
     case tokToCond (tkKind tok) of
         Just c -> do
-            (acc2, cur2) <- parseSum src params resolve curN (IPushX0 : acc1)
+            (acc2, cur2) <- parseSum ctx curN (IPushX0 : acc1)
             pure (ICmp c : IPopX1 : acc2, cur2)
         Nothing -> pure (acc1, cur1)
   where
@@ -179,93 +200,84 @@ parseRel src params resolve cur0 acc0 = do
     tokToCond TkNeq  = Just CNe
     tokToCond _      = Nothing
 
-parseSum :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseSum src params resolve cur0 acc0 = do
-    (acc1, cur1) <- parseTerm src params resolve cur0 acc0
+parseSum :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseSum ctx cur0 acc0 = do
+    (acc1, cur1) <- parseTerm ctx cur0 acc0
     loop acc1 cur1
   where
     loop acc cur =
-        let (tok, curN) = nextSig src cur in
+        let (tok, curN) = nextSig (ctxSrc ctx) cur in
         case tkKind tok of
             TkPlus -> do
-                (acc', cur') <- parseTerm src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
                 loop (IAddX1X0 : IPopX1 : acc') cur'
             TkMinus -> do
-                (acc', cur') <- parseTerm src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
                 loop (ISubX1X0 : IPopX1 : acc') cur'
             TkPlusPlus -> do
-                -- `a ++ b` desugars into ICall "##concat" 2 with both
-                -- operands pushed left-to-right (matches our normal
-                -- 2-arg call convention so the same pop+blr emit path
-                -- runs).
-                (acc', cur') <- parseTerm src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
                 loop (ICall "##concat" 2 : IPushX0 : acc') cur'
             _ -> pure (acc, cur)
 
-parseTerm :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseTerm src params resolve cur0 acc0 = do
-    (acc1, cur1) <- parseApp src params resolve cur0 acc0
+parseTerm :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseTerm ctx cur0 acc0 = do
+    (acc1, cur1) <- parseApp ctx cur0 acc0
     loop acc1 cur1
   where
     loop acc cur =
-        let (tok, curN) = nextSig src cur in
+        let (tok, curN) = nextSig (ctxSrc ctx) cur in
         case tkKind tok of
             TkStar -> do
-                (acc', cur') <- parseApp src params resolve curN (IPushX0 : acc)
+                (acc', cur') <- parseApp ctx curN (IPushX0 : acc)
                 loop (IMulX1X0 : IPopX1 : acc') cur'
             _ -> pure (acc, cur)
 
--- | Function application. An identifier (that isn't a parameter) is
--- followed by exactly @arity@ atoms; each is parsed and pushed, then
--- ICall pops them into x0..x(arity-1) before branching.
-parseApp :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseApp src params resolve cur0 acc0 = do
-    let (tok, cur1) = nextSig src cur0
+parseApp :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseApp ctx cur0 acc0 = do
+    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
     case tkKind tok of
         TkIdent name
-            | Just idx <- elemIndex name params ->
+            -- Local let-binding: splice its items.
+            | Just localItems <- Map.lookup name (ctxLocals ctx) ->
+                pure (reverse localItems ++ acc0, cur1)
+            | Just idx <- elemIndex name (ctxParams ctx) ->
                 pure (IArg idx : acc0, cur1)
             | otherwise -> do
-                arity <- resolve name
-                (accAfterArgs, curAfterArgs) <- parseNArgs arity src params resolve cur1 acc0
+                arity <- ctxResolve ctx name
+                (accAfterArgs, curAfterArgs) <- parseNArgs arity ctx cur1 acc0
                 pure (ICall name arity : accAfterArgs, curAfterArgs)
-        _ -> parseAtom src params resolve cur0 acc0
+        _ -> parseAtom ctx cur0 acc0
 
-parseNArgs :: Int -> Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseNArgs 0 _ _ _ cur acc = pure (acc, cur)
-parseNArgs n src params resolve cur acc = do
-    (acc', cur') <- parseAtom src params resolve cur acc
-    -- The arg's value is in x0; push it before moving to the next arg.
-    parseNArgs (n - 1) src params resolve cur' (IPushX0 : acc')
+parseNArgs :: Int -> Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseNArgs 0 _ cur acc = pure (acc, cur)
+parseNArgs n ctx cur acc = do
+    (acc', cur') <- parseAtom ctx cur acc
+    parseNArgs (n - 1) ctx cur' (IPushX0 : acc')
 
-parseAtom :: Source -> [ByteString] -> ArityResolver -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseAtom src params resolve cur0 acc0 = do
-    let (tok, cur1) = nextSig src cur0
+parseAtom :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
+parseAtom ctx cur0 acc0 = do
+    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
     case tkKind tok of
         TkInt n ->
             pure (ILitInt (fromInteger n) : acc0, cur1)
         TkStr s ->
             pure (ILitStr s : acc0, cur1)
         TkMinus -> do
-            -- Unary minus: parse the next atom then negate.
-            (acc1, cur2) <- parseAtom src params resolve cur1 acc0
+            (acc1, cur2) <- parseAtom ctx cur1 acc0
             pure (INegX0 : acc1, cur2)
         TkLParen -> do
-            (acc1, cur2) <- parseExpr src params resolve cur1 acc0
-            let (close, cur3) = nextSig src cur2
+            (acc1, cur2) <- parseExpr ctx cur1 acc0
+            let (close, cur3) = nextSig (ctxSrc ctx) cur2
             case tkKind close of
                 TkRParen -> pure (acc1, cur3)
                 _        -> parseErr "expected ')'" close
         TkIdent name
-            | Just idx <- elemIndex name params ->
+            | Just localItems <- Map.lookup name (ctxLocals ctx) ->
+                pure (reverse localItems ++ acc0, cur1)
+            | Just idx <- elemIndex name (ctxParams ctx) ->
                 pure (IArg idx : acc0, cur1)
             | otherwise -> do
-                -- As an atom (i.e. in an argument position), a bare
-                -- ident is always a *nullary* call — if it had args,
-                -- the outer `parseApp` would have grabbed it. Ask the
-                -- resolver to confirm arity 0; any positive arity here
-                -- means a call site wasn't wrapped in parens.
-                arity <- resolve name
+                arity <- ctxResolve ctx name
                 if arity == 0
                     then pure (ICall name 0 : acc0, cur1)
                     else throwIO (ParseError

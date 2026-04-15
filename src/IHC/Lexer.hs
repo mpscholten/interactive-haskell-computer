@@ -66,6 +66,8 @@ data TokenKind
     | TkIf                    -- ^ keyword @if@
     | TkThen                  -- ^ keyword @then@
     | TkElse                  -- ^ keyword @else@
+    | TkLet                   -- ^ keyword @let@
+    | TkIn                    -- ^ keyword @in@
     | TkDo                    -- ^ keyword @do@
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
@@ -215,6 +217,8 @@ nextToken s c0 =
         "then" -> TkThen
         "else" -> TkElse
         "do"   -> TkDo
+        "let"  -> TkLet
+        "in"   -> TkIn
         _      -> TkIdent bs
 
 isDigit :: Word8 -> Bool
