@@ -1,6 +1,6 @@
 module RunFile (spec) where
 
-import Control.Exception (bracket_)
+import Control.Exception (bracket_, try, SomeException)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory)
 import System.IO
@@ -510,3 +510,62 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase23/class_show_custom.hs")
         n   `shouldBe` 0
         out `shouldBe` "Circle\nSquare\nTriangle\n"
+
+    --------------------------------------------------------------------
+    -- Phase 2.8: ByteArray#/ForeignPtr/Word8/Storable + GHC.Exts primops
+    --------------------------------------------------------------------
+    it "phase 2.8: bit ops (.&., .|., xor, shiftL, shiftR)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase28/primop_bits.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "8\n14\n6\n-1\n16\n4\n8\n"
+
+    it "phase 2.8: quot, rem, div, divMod, quotRem" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase28/primop_quot_rem.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n2\n3\n3\n2\n3\n2\n"
+
+    it "phase 2.8: unsafePerformIO runs IO synchronously" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase28/primop_unsafe_perform_io.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.8: runRW# applies function to RealWorld and extracts result" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase28/primop_run_rw.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.8: mallocForeignPtrBytes + poke + peek round-trip" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase28/primop_malloc_foreignptr.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "65\n"
+
+    --------------------------------------------------------------------
+    -- CPP #include directive
+    --------------------------------------------------------------------
+    it "CPP #include: simple include splices helper bindings inline" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/CppInclude/simple/main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello from helper\n"
+
+    it "CPP #include: #define from outer file propagates into included file" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/CppInclude/shared_define/main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "greetings enabled\n"
+
+    it "CPP #include: nested includes (main -> a.hs -> b.hs) work correctly" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/CppInclude/nested/main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "100\n"
+
+    it "CPP #include: missing file throws an exception mentioning the path" do
+        result <- try (runFile "test/Fixtures/CppInclude/missing/main.hs")
+                      :: IO (Either SomeException Int)
+        result `shouldSatisfy` \case
+            Left e  -> "no_such_file.hs" `isSubstring` show e
+            Right _ -> False
+      where
+        isSubstring needle haystack =
+            any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]

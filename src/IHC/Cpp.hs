@@ -8,11 +8,16 @@
 --   * @#define NAME value@ (object-like) and @#define NAME(a,b) value@
 --     (function-like, the bare minimum for @MIN_VERSION_X(a,b,c)@).
 --   * @#undef NAME@.
+--   * @#include "path"@ — double-quoted form, resolved relative to the
+--     directory of the including file.  The current macro table is
+--     inherited by the included file (C semantics).  Include depth is
+--     capped at 16 to prevent infinite recursion.
 --   * Condition expressions with: integer literals, @defined(NAME)@,
 --     @!@, @&&@, @||@, parens, comparison operators (@==@, @!=@, @<@,
 --     @<=@, @>@, @>=@), and macro expansion (so
 --     @MIN_VERSION_base(4,19,0)@ works).
---   * @#line@ and @#include@ are accepted and skipped.
+--   * @#line@ and @<angle-bracket> #include@ forms are accepted and
+--     skipped (no @<>@ lookup path).
 --
 -- What we deliberately don't support (Hackage doesn't lean on them):
 -- token pasting @##@, stringification @#@, variadic macros.
@@ -37,12 +42,14 @@ module IHC.Cpp
     , defineObject
     ) where
 
+import Control.Exception (throwIO, Exception, catch, IOException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import System.FilePath (takeDirectory, (</>))
 
 -- | A macro body: either a simple replacement text, or a function-like
 -- macro with parameter names and a replacement template containing
@@ -80,19 +87,33 @@ defaultCppContext = Map.fromList
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
     ]
 
+-- | Hard cap on include nesting depth to prevent infinite recursion.
+maxIncludeDepth :: Int
+maxIncludeDepth = 16
+
+-- | Raised when @#include@ depth exceeds 'maxIncludeDepth'.
+newtype IncludeDepthExceeded = IncludeDepthExceeded FilePath deriving Show
+instance Exception IncludeDepthExceeded
+
+-- | Raised when a @#include@ target file cannot be found.
+data IncludeMissing = IncludeMissing
+    { imIncluded :: FilePath   -- ^ the path as written in the directive
+    , imResolved :: FilePath   -- ^ the absolute path we searched for
+    } deriving Show
+instance Exception IncludeMissing
+
 --------------------------------------------------------------------------------
 -- Preprocessor driver
 --------------------------------------------------------------------------------
 
 -- | Entry point. No-op if the source has no CPP directives.
 cppPreprocess :: CppContext -> FilePath -> ByteString -> IO ByteString
-cppPreprocess ctx0 _path src
+cppPreprocess ctx0 path src
     | not (hasCppDirective src) = pure src
     | otherwise = do
-        let ls          = splitLines src
-            (outLs, _)  = process ctx0 True ls []
-            joined      = joinLines outLs
-        pure joined
+        let ls = splitLines src
+        (outLs, _) <- processIO ctx0 True ls [] path 0
+        pure (joinLines outLs)
 
 -- | Quick scan: any `#` appearing at start of line? (Tolerates leading
 -- whitespace in the scan.) If not, we skip the whole rewriting pass.
@@ -124,95 +145,146 @@ data BranchFrame = BranchFrame
     , bfParent   :: !Bool        -- was the enclosing scope active?
     }
 
--- | Drive line-by-line processing.
+-- | Drive line-by-line processing in IO (needed for #include).
 --
--- Returns reversed-accumulated output lines and the final context.
+-- Returns accumulated output lines (in order) and the final context.
 -- For each input line, emit either the processed line (if active) or a
 -- blank line (if skipped / directive) so line numbers match.
-process
+processIO
     :: CppContext
     -> Bool              -- ^ current scope is active
     -> [ByteString]      -- ^ remaining input lines
     -> [BranchFrame]     -- ^ branch stack
-    -> ([ByteString], CppContext)
-process ctx _active [] _ = ([], ctx)
-process ctx active (ln : rest) stack =
+    -> FilePath          -- ^ path of the file being processed (for #include resolution)
+    -> Int               -- ^ current include nesting depth
+    -> IO ([ByteString], CppContext)
+processIO ctx _active [] _ _ _ = pure ([], ctx)
+processIO ctx active (ln : rest) stack filePath depth =
     case parseDirective ln of
-        Just (DirIf expr) ->
-            let taken   = active && evalCondExpr ctx expr
-                frame   = BranchFrame taken taken active
-                (xs, c) = process ctx taken rest (frame : stack)
-            in (BS.empty : xs, c)
+        Just (DirIf expr) -> do
+            let taken = active && evalCondExpr ctx expr
+                frame = BranchFrame taken taken active
+            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
+            pure (BS.empty : xs, c)
 
-        Just (DirIfdef name) ->
+        Just (DirIfdef name) -> do
             let defined = Map.member name ctx
                 taken   = active && defined
                 frame   = BranchFrame taken taken active
-                (xs, c) = process ctx taken rest (frame : stack)
-            in (BS.empty : xs, c)
+            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
+            pure (BS.empty : xs, c)
 
-        Just (DirIfndef name) ->
+        Just (DirIfndef name) -> do
             let defined = Map.member name ctx
                 taken   = active && not defined
                 frame   = BranchFrame taken taken active
-                (xs, c) = process ctx taken rest (frame : stack)
-            in (BS.empty : xs, c)
+            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
+            pure (BS.empty : xs, c)
 
         Just (DirElif expr) -> case stack of
-            (f : fs) ->
-                let cond    = evalCondExpr ctx expr
-                    newAct  = bfParent f && not (bfAnyTaken f) && cond
-                    f'      = f { bfAnyTaken = bfAnyTaken f || newAct
-                                , bfActive   = newAct }
-                    (xs, c) = process ctx newAct rest (f' : fs)
-                in (BS.empty : xs, c)
-            [] ->  -- stray #elif — pretend blank
-                let (xs, c) = process ctx active rest stack
-                in (BS.empty : xs, c)
+            (f : fs) -> do
+                let cond   = evalCondExpr ctx expr
+                    newAct = bfParent f && not (bfAnyTaken f) && cond
+                    f'     = f { bfAnyTaken = bfAnyTaken f || newAct
+                               , bfActive   = newAct }
+                (xs, c) <- processIO ctx newAct rest (f' : fs) filePath depth
+                pure (BS.empty : xs, c)
+            [] -> do  -- stray #elif — pretend blank
+                (xs, c) <- processIO ctx active rest stack filePath depth
+                pure (BS.empty : xs, c)
 
         Just DirElse -> case stack of
-            (f : fs) ->
+            (f : fs) -> do
                 let newAct = bfParent f && not (bfAnyTaken f)
                     f'     = f { bfAnyTaken = bfAnyTaken f || newAct
                                , bfActive   = newAct }
-                    (xs, c) = process ctx newAct rest (f' : fs)
-                in (BS.empty : xs, c)
-            [] ->
-                let (xs, c) = process ctx active rest stack
-                in (BS.empty : xs, c)
+                (xs, c) <- processIO ctx newAct rest (f' : fs) filePath depth
+                pure (BS.empty : xs, c)
+            [] -> do
+                (xs, c) <- processIO ctx active rest stack filePath depth
+                pure (BS.empty : xs, c)
 
         Just DirEndif -> case stack of
-            (_ : fs) ->
+            (_ : fs) -> do
                 let parent = case fs of
                         (f:_) -> bfActive f
                         []    -> True
-                    (xs, c) = process ctx parent rest fs
-                in (BS.empty : xs, c)
-            [] ->
-                let (xs, c) = process ctx active rest stack
-                in (BS.empty : xs, c)
+                (xs, c) <- processIO ctx parent rest fs filePath depth
+                pure (BS.empty : xs, c)
+            [] -> do
+                (xs, c) <- processIO ctx active rest stack filePath depth
+                pure (BS.empty : xs, c)
 
-        Just (DirDefine name body) ->
+        Just (DirDefine name body) -> do
             let ctx' | active    = Map.insert name body ctx
                      | otherwise = ctx
-                (xs, c) = process ctx' active rest stack
-            in (BS.empty : xs, c)
+            (xs, c) <- processIO ctx' active rest stack filePath depth
+            pure (BS.empty : xs, c)
 
-        Just (DirUndef name) ->
+        Just (DirUndef name) -> do
             let ctx' | active    = Map.delete name ctx
                      | otherwise = ctx
-                (xs, c) = process ctx' active rest stack
-            in (BS.empty : xs, c)
+            (xs, c) <- processIO ctx' active rest stack filePath depth
+            pure (BS.empty : xs, c)
 
-        Just DirIgnore ->
-            let (xs, c) = process ctx active rest stack
-            in (BS.empty : xs, c)
+        Just (DirInclude incPath) | active -> do
+            -- Resolve relative to the directory of the including file.
+            let dir      = takeDirectory filePath
+                resolved = dir </> incPath
+            -- Depth check.
+            if depth >= maxIncludeDepth
+                then throwIO (IncludeDepthExceeded resolved)
+                else do
+                    -- Read and preprocess the included file with the
+                    -- current macro table (C semantics: #define from
+                    -- the outer file is visible in the included file).
+                    incBytes <- readFileOrThrow resolved incPath
+                    let incLines = splitLines incBytes
+                    (incOut, ctx') <- processIO ctx True incLines [] resolved (depth + 1)
+                    -- The included lines replace the single #include
+                    -- directive line; then continue with the rest of
+                    -- the current file using the updated ctx'.
+                    (xs, c) <- processIO ctx' active rest stack filePath depth
+                    pure (incOut ++ xs, c)
 
-        Nothing ->
+        Just (DirInclude _) -> do
+            -- #include in a disabled block: skip it.
+            (xs, c) <- processIO ctx active rest stack filePath depth
+            pure (BS.empty : xs, c)
+
+        Just DirIgnore -> do
+            (xs, c) <- processIO ctx active rest stack filePath depth
+            pure (BS.empty : xs, c)
+
+        Nothing -> do
             -- Regular line. Emit iff active; otherwise blank.
             let emit = if active then ln else BS.empty
-                (xs, c) = process ctx active rest stack
-            in (emit : xs, c)
+            (xs, c) <- processIO ctx active rest stack filePath depth
+            pure (emit : xs, c)
+
+-- | Read a file, throwing 'IncludeMissing' if it doesn't exist.
+readFileOrThrow :: FilePath -> FilePath -> IO ByteString
+readFileOrThrow resolved original = do
+    result <- tryReadFile resolved
+    case result of
+        Just bs -> pure bs
+        Nothing -> throwIO (IncludeMissing original resolved)
+
+-- | Try reading a file; return Nothing on any IO error.
+tryReadFile :: FilePath -> IO (Maybe ByteString)
+tryReadFile path = do
+    exists <- fileExists path
+    if exists
+        then Just <$> BS.readFile path
+        else pure Nothing
+
+fileExists :: FilePath -> IO Bool
+fileExists path = do
+    result <- (BS.readFile path >> pure True) `catchIO` \_ -> pure False
+    pure result
+
+catchIO :: IO a -> (IOException -> IO a) -> IO a
+catchIO = catch
 
 --------------------------------------------------------------------------------
 -- Directive recognition
@@ -227,7 +299,8 @@ data Directive
     | DirEndif
     | DirDefine  !ByteString !MacroBody
     | DirUndef   !ByteString
-    | DirIgnore                           -- #line, #include, #pragma, #error
+    | DirInclude !FilePath                 -- ^ double-quoted include path
+    | DirIgnore                            -- #line, #pragma, #error, <> includes
     deriving Show
 
 -- | If the line begins with @#@ (after optional whitespace), parse the
@@ -250,7 +323,7 @@ parseDirective ln =
                 "endif"    -> Just DirEndif
                 "define"   -> Just (parseDefine arg)
                 "undef"    -> Just (DirUndef (identOf arg))
-                "include"  -> Just DirIgnore
+                "include"  -> Just (parseInclude arg)
                 "line"     -> Just DirIgnore
                 "pragma"   -> Just DirIgnore
                 "error"    -> Just DirIgnore
@@ -258,6 +331,17 @@ parseDirective ln =
                 ""         -> Just DirIgnore         -- blank directive
                 _          -> Just DirIgnore         -- unknown — be forgiving
         _ -> Nothing
+
+-- | Parse the argument of @#include@. We support double-quoted
+-- @\"path\"@ (relative include) and silently ignore angle-bracket
+-- @\<path\>@ forms (system includes not needed for Haskell sources).
+parseInclude :: ByteString -> Directive
+parseInclude arg =
+    case BC.uncons arg of
+        Just ('"', rest) ->
+            let (path, _) = BC.break (== '"') rest
+            in DirInclude (BC.unpack path)
+        _ -> DirIgnore   -- <angle> form or empty — skip
 
 identOf :: ByteString -> ByteString
 identOf bs =
