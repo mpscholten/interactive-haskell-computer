@@ -5,6 +5,7 @@ import System.Exit (exitFailure, exitSuccess)
 import System.IO (hPutStrLn, stderr)
 
 import IHC (version)
+import IHC.Driver (runFile)
 import IHC.Jit (codesignCheck)
 
 usage :: String
@@ -33,8 +34,11 @@ main = getArgs >>= \case
                 hPutStrLn stderr ("JIT check failed, errno=" <> show rc)
                 hPutStrLn stderr "Did you forget to ad-hoc codesign with com.apple.security.cs.allow-jit?"
                 exitFailure
+    ["run", path]    -> do
+        n <- runFile path
+        print n
     ("run":_)        -> do
-        hPutStrLn stderr "ihc run: not implemented yet (Phase 1)."
+        hPutStrLn stderr "usage: ihc run FILE.hs"
         exitFailure
     ("repl":_)       -> do
         hPutStrLn stderr "ihc repl: not implemented yet."

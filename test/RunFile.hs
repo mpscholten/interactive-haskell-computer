@@ -1,0 +1,22 @@
+module RunFile (spec) where
+
+import Test.Hspec
+
+import IHC.Driver
+
+spec :: Spec
+spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    it "runs `main = 42`" do
+        n <- runFile "test/Fixtures/lit42.hs"
+        n `shouldBe` 42
+
+    it "emits movz+movk chain for a large 64-bit literal" do
+        n <- runFile "test/Fixtures/lit_large.hs"
+        -- 0x0123_4567_89AB_CDEF = 81985529216486895
+        n `shouldBe` 81985529216486895
+
+    it "never visits bindings after main (unused = garbage is ignored)" do
+        -- If the scanner kept reading past `main`, the lexer would crash
+        -- on the garbage on the next line. Success means it stopped.
+        n <- runFile "test/Fixtures/with_noise.hs"
+        n `shouldBe` 7

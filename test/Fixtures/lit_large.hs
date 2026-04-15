@@ -1,0 +1,2 @@
+-- Exercises movz+movk chaining: 0x123456789ABCDEF = 81985529216486895.
+main = 81985529216486895

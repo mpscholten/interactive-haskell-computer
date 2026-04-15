@@ -29,10 +29,18 @@ library
     hs-source-dirs:   src
     exposed-modules:
         IHC
+      , IHC.CodeBuffer
+      , IHC.Driver
+      , IHC.Encode
       , IHC.Jit
+      , IHC.Lexer
+      , IHC.Parser
+      , IHC.Scan
+      , IHC.Source
     build-depends:
         base             >= 4.19 && < 5
       , bytestring       >= 0.11
+      , containers       >= 0.6
       , text             >= 2.0
 
     c-sources:
@@ -70,6 +78,7 @@ test-suite ihc-test
     main-is:          Spec.hs
     other-modules:
         JitSmoke
+      , RunFile
     build-depends:
         base
       , ihc
