@@ -59,12 +59,99 @@ data Ctx = Ctx
 
 -- | Parse a binding body's span given its param list and a resolver
 -- that knows every referenced top-level binding's arity.
+--
+-- If the body contains a top-level @where@ clause, the where-bindings
+-- are parsed first into a locals map, then the body proper is parsed
+-- with those locals in scope. Where-bindings are processed in order;
+-- each may reference earlier where-bindings (sequential, not mutually
+-- recursive).
 parseBodyItems :: Source -> [ByteString] -> ArityResolver -> Span -> IO [Item]
-parseBodyItems src params resolve (start, _end) = do
-    let cur0 = Cursor start 1 1
-        ctx  = Ctx src params Map.empty resolve
+parseBodyItems src params resolve span_ = do
+    let (bodySpan, mWhere) = splitOnWhere src span_
+    whereLocals <- case mWhere of
+        Nothing       -> pure Map.empty
+        Just whereSpn -> parseWhereBindings src params resolve whereSpn
+    let cur0 = Cursor (fst bodySpan) 1 1
+        ctx  = Ctx src params whereLocals resolve
     (items, _cur1) <- parseExpr ctx cur0 []
     pure (reverse items)
+
+-- | Look for a top-level @where@ inside @span_@. If found, returns
+-- (body-without-where, Just where-region); otherwise (span_, Nothing).
+-- Walks tokens but tracks paren-depth so a `where` inside an
+-- expression (rare) wouldn't fool us.
+splitOnWhere :: Source -> Span -> (Span, Maybe Span)
+splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int)
+  where
+    go cur depth
+        | cPos cur >= end = ((start, end), Nothing)
+        | otherwise =
+            let (tok, cur') = nextToken src cur in
+            case tkKind tok of
+                TkEof    -> ((start, end), Nothing)
+                TkWhere | depth == 0 ->
+                    -- Body ends right before this `where`; where-region
+                    -- starts right after it.
+                    ((start, tkStart tok), Just (tkEnd tok, end))
+                TkLParen -> go cur' (depth + 1)
+                TkRParen -> go cur' (max 0 (depth - 1))
+                _        -> go cur' depth
+
+-- | Parse the contents of a where region — a (possibly braced /
+-- layout-listed) sequence of @name = expr@ value bindings — into a
+-- locals map. Each binding can reference earlier ones in the same
+-- region.
+parseWhereBindings
+    :: Source -> [ByteString] -> ArityResolver -> Span
+    -> IO (Map ByteString [Item])
+parseWhereBindings src params resolve (start, end) = do
+    let cur0 = Cursor start 1 1
+        (firstTok, curAfter) = nextSig src cur0
+    case tkKind firstTok of
+        TkLBrace -> braced curAfter Map.empty
+        TkEof    -> pure Map.empty
+        _        -> layout (tkCol firstTok) cur0 Map.empty
+  where
+    -- Parse a single `name = expr`. Stops at end-of-where-span.
+    parseOne acc cur = do
+        let (nameTok, cur1) = nextSig src cur
+        case tkKind nameTok of
+            TkIdent name -> do
+                let (eq, cur2) = nextSig src cur1
+                case tkKind eq of
+                    TkEq -> do
+                        -- Subexpression; parse with current locals so each
+                        -- binding can see earlier ones.
+                        let ctx = Ctx src params acc resolve
+                        (eRev, cur3) <- parseExpr ctx cur2 []
+                        pure (Map.insert name (reverse eRev) acc, cur3)
+                    _ -> parseErr "expected `=` in where-binding" eq
+            _ -> parseErr "expected identifier in where-binding" nameTok
+
+    braced cur acc
+        | cPos cur >= end = pure acc
+        | otherwise = do
+            (acc', cur') <- parseOne acc cur
+            let (sep, curN) = nextSig src cur'
+            case tkKind sep of
+                TkSemi   -> braced curN acc'
+                TkRBrace -> pure acc'
+                TkEof    -> pure acc'
+                _        -> parseErr "expected `;` or `}` in where-block" sep
+
+    layout bindCol cur acc
+        | cPos cur >= end = pure acc
+        | otherwise = do
+            (acc', cur') <- parseOne acc cur
+            -- Look for next binding at exactly bindCol; lower column
+            -- (or EOF) ends the block.
+            let (nextTok, _) = nextSig src cur'
+            case tkKind nextTok of
+                TkEof -> pure acc'
+                _ | tkCol nextTok == bindCol && cPos cur' < end ->
+                       layout bindCol cur' acc'
+                  | otherwise ->
+                       pure acc'
 
 -- | 'nextToken' variant that skips 'TkNewline', letting an expression
 -- flow across indented continuation lines.

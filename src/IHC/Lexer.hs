@@ -68,6 +68,7 @@ data TokenKind
     | TkElse                  -- ^ keyword @else@
     | TkLet                   -- ^ keyword @let@
     | TkIn                    -- ^ keyword @in@
+    | TkWhere                 -- ^ keyword @where@
     | TkDo                    -- ^ keyword @do@
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
@@ -213,13 +214,14 @@ nextToken s c0 =
             Just b    -> scanStr (p + 1) (b : acc)
 
     keywordOr bs = case bs of
-        "if"   -> TkIf
-        "then" -> TkThen
-        "else" -> TkElse
-        "do"   -> TkDo
-        "let"  -> TkLet
-        "in"   -> TkIn
-        _      -> TkIdent bs
+        "if"    -> TkIf
+        "then"  -> TkThen
+        "else"  -> TkElse
+        "do"    -> TkDo
+        "let"   -> TkLet
+        "in"    -> TkIn
+        "where" -> TkWhere
+        _       -> TkIdent bs
 
 isDigit :: Word8 -> Bool
 isDigit b = b >= 0x30 && b <= 0x39

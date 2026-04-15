@@ -210,3 +210,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/let_with_param.hs")
         n   `shouldBe` 0
         out `shouldBe` "25\n"
+
+    it "where clause with two value bindings: `hyp 3 4` -> 25" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/where_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "25\n"
+
+    it "where with sequential dependencies: `quadratic 1 (-3) 2 5` -> 12" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/where_chain.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "12\n21\n"
