@@ -1,44 +1,25 @@
 {-# LANGUAGE DeriveAnyClass #-}
 
--- | Single-pass recursive-descent parser for binding bodies.
+-- | Single-pass recursive-descent parser producing AST.
 --
--- Parses the body once, producing a small 'Item' list. No AST.
+-- Same surface grammar as Phase-1.13. Output is now @Expr@ from
+-- 'IHC.AST' instead of an Item list. Multi-arg functions desugar to
+-- nested lambdas: @f x y = e@ becomes @"f" -> ELam "x" (ELam "y" e)@.
 --
--- Grammar (Phase 1.11):
---
--- @
--- body    ::= expr
--- expr    ::= 'if' expr 'then' expr 'else' expr
---           | 'do' do-block
---           | 'let' ident '=' expr 'in' expr
---           | or
--- or      ::= and  ('||' and)*
--- and     ::= rel  ('&&' rel)*
--- rel     ::= sum  (relop sum)?           -- at most one comparison
--- sum     ::= term (('+' | '-' | '++') term)*
--- term    ::= app  ('*' app)*
--- app     ::= ident atom*                 -- function application
---           | atom
--- atom    ::= INT | STRING
---           | '(' expr ')'
---           | '-' atom                    -- unary minus
---           | ident                       -- param, local-let, or nullary call
--- @
+-- All parsers respect a body-end @Pos@ (carried in 'Ctx') so the
+-- expression grammar — which freely spans newlines — does NOT
+-- swallow the next top-level binding's tokens. nextSig synthesises
+-- a virtual @TkEof@ when the cursor reaches that bound.
 module IHC.Parser
-    ( parseBodyItems
+    ( parseBodyExpr
     , ParseError(..)
-    , ArityResolver
     ) where
 
 import Control.Exception (Exception, throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
-import Data.List (elemIndex)
-import qualified Data.Map.Strict as Map
-import Data.Map.Strict (Map)
 
-import IHC.Encode (Cond(..))
-import IHC.IR
+import IHC.AST
 import IHC.Lexer
 import IHC.Source
 
@@ -46,40 +27,41 @@ newtype ParseError = ParseError String
     deriving stock (Show)
     deriving anyclass (Exception)
 
-type ArityResolver = ByteString -> IO Int
-
--- | Parser context — bundled to avoid threading three or four args
--- through every recursive call.
+-- | Parser context bundle.
 data Ctx = Ctx
-    { ctxSrc     :: !Source
-    , ctxParams  :: ![ByteString]              -- enclosing function's params
-    , ctxLocals  :: !(Map ByteString [Item])   -- let-bound names -> items
-    , ctxResolve :: !ArityResolver
+    { ctxSrc    :: !Source
+    , ctxEnd    :: !Pos      -- byte-end of the region we're parsing
+    , ctxMinCol :: !Int      -- the layout column: an inner expression may
+                             --   freely consume tokens at column > ctxMinCol
+                             --   (continuation), but a token at column
+                             --   <= ctxMinCol is the start of a new layout
+                             --   item (or end of block) and must NOT be
+                             --   absorbed by the inner parsers.
     }
 
--- | Parse a binding body's span given its param list and a resolver
--- that knows every referenced top-level binding's arity.
---
--- If the body contains a top-level @where@ clause, the where-bindings
--- are parsed first into a locals map, then the body proper is parsed
--- with those locals in scope. Where-bindings are processed in order;
--- each may reference earlier where-bindings (sequential, not mutually
--- recursive).
-parseBodyItems :: Source -> [ByteString] -> ArityResolver -> Span -> IO [Item]
-parseBodyItems src params resolve span_ = do
+-- | Parse the body of a top-level binding. The @params@ list comes
+-- from the LHS scan and becomes a chain of lambdas around the body.
+parseBodyExpr :: Source -> [Name] -> Span -> IO Expr
+parseBodyExpr src params span_ = do
     let (bodySpan, mWhere) = splitOnWhere src span_
-    whereLocals <- case mWhere of
-        Nothing       -> pure Map.empty
-        Just whereSpn -> parseWhereBindings src params resolve whereSpn
+    whereBinds <- case mWhere of
+        Nothing -> pure []
+        Just ws -> parseBindingsIn src ws
     let cur0 = Cursor (fst bodySpan) 1 1
-        ctx  = Ctx src params whereLocals resolve
-    (items, _cur1) <- parseExpr ctx cur0 []
-    pure (reverse items)
+        -- Top-level bindings start at column 1; the body's expression
+        -- can therefore freely span any column > 1 but must NOT
+        -- absorb a column-1 token (that would be the next binding).
+        ctx  = Ctx src (snd bodySpan) 1
+    (bodyExpr, _) <- parseExpr ctx cur0
+    let core = case whereBinds of
+            [] -> bodyExpr
+            bs -> ELet bs bodyExpr
+    pure (foldr ELam core params)
 
--- | Look for a top-level @where@ inside @span_@. If found, returns
--- (body-without-where, Just where-region); otherwise (span_, Nothing).
--- Walks tokens but tracks paren-depth so a `where` inside an
--- expression (rare) wouldn't fool us.
+--------------------------------------------------------------------------------
+-- Where-clause split (token-walk, paren-aware, ignores body-bounds)
+--------------------------------------------------------------------------------
+
 splitOnWhere :: Source -> Span -> (Span, Maybe Span)
 splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int)
   where
@@ -90,140 +72,221 @@ splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int)
             case tkKind tok of
                 TkEof    -> ((start, end), Nothing)
                 TkWhere | depth == 0 ->
-                    -- Body ends right before this `where`; where-region
-                    -- starts right after it.
                     ((start, tkStart tok), Just (tkEnd tok, end))
                 TkLParen -> go cur' (depth + 1)
                 TkRParen -> go cur' (max 0 (depth - 1))
                 _        -> go cur' depth
 
--- | Parse the contents of a where region — a (possibly braced /
--- layout-listed) sequence of @name = expr@ value bindings — into a
--- locals map. Each binding can reference earlier ones in the same
--- region.
-parseWhereBindings
-    :: Source -> [ByteString] -> ArityResolver -> Span
-    -> IO (Map ByteString [Item])
-parseWhereBindings src params resolve (start, end) = do
+-- | Parse a sequence of `name = expr` value bindings (braced or layout).
+parseBindingsIn :: Source -> Span -> IO [Bind]
+parseBindingsIn src (start, end) = do
     let cur0 = Cursor start 1 1
-        (firstTok, curAfter) = nextSig src cur0
+        -- Provisional ctx: refined once we know the binding column.
+        provCtx = Ctx src end 0
+        (firstTok, curAfter) = nextSig provCtx cur0
     case tkKind firstTok of
-        TkLBrace -> braced curAfter Map.empty
-        TkEof    -> pure Map.empty
-        _        -> layout (tkCol firstTok) cur0 Map.empty
+        TkLBrace -> braced (Ctx src end 0) curAfter []
+        TkEof    -> pure []
+        _        ->
+            -- Each where/let binding's RHS is bounded by the binding
+            -- column: any token at <= bindCol starts a new binding (or
+            -- ends the block).
+            let ctx = Ctx src end (tkCol firstTok)
+            in layout ctx (tkCol firstTok) cur0 []
   where
-    -- Parse a single `name = expr`. Stops at end-of-where-span.
-    parseOne acc cur = do
-        let (nameTok, cur1) = nextSig src cur
-        case tkKind nameTok of
-            TkIdent name -> do
-                let (eq, cur2) = nextSig src cur1
-                case tkKind eq of
-                    TkEq -> do
-                        -- Subexpression; parse with current locals so each
-                        -- binding can see earlier ones.
-                        let ctx = Ctx src params acc resolve
-                        (eRev, cur3) <- parseExpr ctx cur2 []
-                        pure (Map.insert name (reverse eRev) acc, cur3)
-                    _ -> parseErr "expected `=` in where-binding" eq
-            _ -> parseErr "expected identifier in where-binding" nameTok
+    parseOne ctx cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkIdent n -> pure n
+            _         -> parseErr "expected identifier in binding" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in binding" eqTok
+        (expr, cur3) <- parseExpr ctx cur2
+        pure ((name, expr), cur3)
 
-    braced cur acc
-        | cPos cur >= end = pure acc
+    braced ctx cur acc
+        | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            (acc', cur') <- parseOne acc cur
-            let (sep, curN) = nextSig src cur'
+            (b, cur') <- parseOne ctx cur
+            let (sep, curN) = nextSig ctx cur'
             case tkKind sep of
-                TkSemi   -> braced curN acc'
-                TkRBrace -> pure acc'
-                TkEof    -> pure acc'
-                _        -> parseErr "expected `;` or `}` in where-block" sep
+                TkSemi   -> braced ctx curN (b : acc)
+                TkRBrace -> pure (reverse (b : acc))
+                TkEof    -> pure (reverse (b : acc))
+                _        -> parseErr "expected `;` or `}` in let/where" sep
 
-    layout bindCol cur acc
-        | cPos cur >= end = pure acc
+    layout ctx bindCol cur acc
+        | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            (acc', cur') <- parseOne acc cur
-            -- Look for next binding at exactly bindCol; lower column
-            -- (or EOF) ends the block.
-            let (nextTok, _) = nextSig src cur'
+            (b, cur') <- parseOne ctx cur
+            let (nextTok, _) = nextSig ctx cur'
             case tkKind nextTok of
-                TkEof -> pure acc'
-                _ | tkCol nextTok == bindCol && cPos cur' < end ->
-                       layout bindCol cur' acc'
+                TkEof -> pure (reverse (b : acc))
+                _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
+                       layout ctx bindCol cur' (b : acc)
                   | otherwise ->
-                       pure acc'
+                       pure (reverse (b : acc))
 
--- | 'nextToken' variant that skips 'TkNewline', letting an expression
--- flow across indented continuation lines.
-nextSig :: Source -> Cursor -> (Token, Cursor)
-nextSig src cur =
-    let (t, c) = nextToken src cur in
-    case tkKind t of
-        TkNewline -> nextSig src c
-        _         -> (t, c)
+--------------------------------------------------------------------------------
+-- nextSig with body-end bound
+--------------------------------------------------------------------------------
 
-parseExpr :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseExpr ctx cur0 acc0 = do
-    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
+-- | Get the next significant (non-newline) token, but synthesise a
+-- virtual 'TkEof' if the cursor is at or past the body span's end.
+-- Without this bound, an expression body would devour the next
+-- top-level binding's tokens.
+nextSig :: Ctx -> Cursor -> (Token, Cursor)
+nextSig ctx cur
+    | cPos cur >= ctxEnd ctx =
+        (Token TkEof (ctxEnd ctx) (ctxEnd ctx) 0 0, cur)
+    | otherwise =
+        let (t, c) = nextToken (ctxSrc ctx) cur in
+        case tkKind t of
+            TkNewline -> nextSig ctx c
+            _         -> (t, c)
+
+--------------------------------------------------------------------------------
+-- Expression parser
+--------------------------------------------------------------------------------
+
+parseExpr :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseExpr ctx cur0 = do
+    let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
-        TkIf   -> parseIf   ctx cur1 acc0
-        TkDo   -> parseDo   ctx cur1 acc0
-        TkLet  -> parseLet  ctx cur1 acc0
-        TkCase -> parseCase ctx cur1 acc0
-        _      -> parseOr   ctx cur0 acc0
+        TkIf   -> parseIf   ctx cur1
+        TkDo   -> parseDo   ctx cur1
+        TkLet  -> parseLet  ctx cur1
+        TkCase -> parseCase ctx cur1
+        _      -> parseOr   ctx cur0
 
--- @case scrutinee of { pat -> e ; ... ; _ -> e }@
---
--- Restrictions for now:
---   * scrutinee is a single atom (literal, ident, or paren-expr); we
---     re-evaluate it per branch (acceptable for pure expressions).
---   * patterns are Int literals or @_@. The wildcard, if present,
---     must be last.
---
--- Desugars to a chain of IIfThenElse comparing the scrutinee with
--- each pattern.
-parseCase :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseCase ctx cur0 acc0 = do
-    -- scrutinee atom (its items will be re-emitted per comparison).
-    (scrutRev, curS) <- parseAtom ctx cur0 []
-    let scrutItems = reverse scrutRev
-    let (ofTok, curO) = nextSig (ctxSrc ctx) curS
+parseIf :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseIf ctx cur0 = do
+    (c, cur1)  <- parseExpr ctx cur0
+    let (t1, cur2) = nextSig ctx cur1
+    case tkKind t1 of
+        TkThen -> pure ()
+        _      -> parseErr "expected `then`" t1
+    (t, cur3)  <- parseExpr ctx cur2
+    let (t2, cur4) = nextSig ctx cur3
+    case tkKind t2 of
+        TkElse -> pure ()
+        _      -> parseErr "expected `else`" t2
+    (e, cur5)  <- parseExpr ctx cur4
+    pure (EIf c t e, cur5)
+
+parseDo :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseDo ctx cur0 = do
+    let (firstTok, curAfter) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkLBrace -> bracedStmts curAfter []
+        TkEof    -> pure (EDo [], cur0)
+        _        -> layoutStmts (tkCol firstTok) cur0 []
+  where
+    bracedStmts cur acc = do
+        (e, cur') <- parseExpr ctx cur
+        let (sep, curN) = nextSig ctx cur'
+        case tkKind sep of
+            TkSemi   -> bracedStmts curN (e : acc)
+            TkRBrace -> pure (EDo (reverse (e : acc)), curN)
+            _        -> parseErr "expected `;` or `}` in do-block" sep
+
+    -- Each stmt's expression sees ctxMinCol = stmtCol so its parseApp
+    -- / operator loops won't gobble the next stmt at the same column.
+    layoutStmts stmtCol cur acc = do
+        let stmtCtx = ctx { ctxMinCol = stmtCol }
+        (e, cur') <- parseExpr stmtCtx cur
+        let (nextTok, _) = nextSig ctx cur'
+        case tkKind nextTok of
+            TkEof -> pure (EDo (reverse (e : acc)), cur')
+            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' (e : acc)
+              | otherwise                -> pure (EDo (reverse (e : acc)), cur')
+
+parseLet :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseLet ctx cur0 = do
+    let (firstTok, curAfter) = nextSig ctx cur0
+    (binds, curEnd) <- case tkKind firstTok of
+        TkLBrace -> bracedBinds curAfter []
+        _        -> singleBind cur0
+    let (inTok, curIn) = nextSig ctx curEnd
+    case tkKind inTok of
+        TkIn -> pure ()
+        _    -> parseErr "expected `in` in let-binding" inTok
+    (body, curBody) <- parseExpr ctx curIn
+    pure (ELet binds body, curBody)
+  where
+    singleBind cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkIdent n -> pure n
+            _         -> parseErr "expected identifier after `let`" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        pure ([(name, e)], cur3)
+
+    bracedBinds cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkIdent n -> pure n
+            _         -> parseErr "expected identifier in let-binding" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr "expected `=` in let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let (sep, curN) = nextSig ctx cur3
+        case tkKind sep of
+            TkSemi   -> bracedBinds curN ((name, e) : acc)
+            TkRBrace -> pure (reverse ((name, e) : acc), curN)
+            _        -> parseErr "expected `;` or `}` in let-block" sep
+
+parseCase :: Ctx -> Cursor -> IO (Expr, Cursor)
+parseCase ctx cur0 = do
+    (scrut, curS) <- parseAtom ctx cur0
+    let (ofTok, curO) = nextSig ctx curS
     case tkKind ofTok of
         TkOf -> pure ()
         _    -> parseErr "expected `of` in case-expression" ofTok
-    -- Either braced or layout alts.
-    let (firstTok, curBody) = nextSig (ctxSrc ctx) curO
+    let (firstTok, curBody) = nextSig ctx curO
     (alts, curEnd) <- case tkKind firstTok of
         TkLBrace -> bracedAlts curBody []
         _        -> layoutAlts (tkCol firstTok) curO []
-    case buildCase scrutItems alts of
-        Nothing -> parseErr "case has no branches" firstTok
-        Just chain -> pure (reverse chain ++ acc0, curEnd)
+    pure (ECase scrut alts, curEnd)
   where
-    parseAlt cur = do
-        let (patTok, cur1) = nextSig (ctxSrc ctx) cur
+    -- The caller-supplied @altCtx@ is used for the RHS expression so
+    -- it respects the alt's column boundary (otherwise the RHS would
+    -- gobble the next alt).
+    parseAlt altCtx cur = do
+        let (patTok, cur1) = nextSig ctx cur
         pat <- case tkKind patTok of
-            TkInt n      -> pure (Just (fromInteger n))
-            TkUnderscore -> pure Nothing
-            _            -> parseErr "expected Int literal or `_` as case pattern" patTok
-        let (arr, cur2) = nextSig (ctxSrc ctx) cur1
+            TkInt n      -> pure (PLit (LInt (fromInteger n)))
+            TkStr s      -> pure (PLit (LStr s))
+            TkUnderscore -> pure PWild
+            TkIdent n    -> pure (PVar n)
+            _            -> parseErr "expected pattern (Int, String, _, or ident) in case alt" patTok
+        let (arr, cur2) = nextSig ctx cur1
         case tkKind arr of
             TkArrow -> pure ()
             _       -> parseErr "expected `->` in case alternative" arr
-        (eRev, cur3) <- parseExpr ctx cur2 []
-        pure ((pat, reverse eRev), cur3)
+        (e, cur3) <- parseExpr altCtx cur2
+        pure (Alt pat e, cur3)
 
     bracedAlts cur acc = do
-        (alt, cur') <- parseAlt cur
-        let (sep, curN) = nextSig (ctxSrc ctx) cur'
+        (alt, cur') <- parseAlt ctx cur
+        let (sep, curN) = nextSig ctx cur'
         case tkKind sep of
             TkSemi   -> bracedAlts curN (alt : acc)
             TkRBrace -> pure (reverse (alt : acc), curN)
             _        -> parseErr "expected `;` or `}` in case alts" sep
 
     layoutAlts altCol cur acc = do
-        (alt, cur') <- parseAlt cur
-        let (nextTok, _) = nextSig (ctxSrc ctx) cur'
+        let altCtx = ctx { ctxMinCol = altCol }
+        (alt, cur') <- parseAlt altCtx cur
+        let (nextTok, _) = nextSig ctx cur'
         case tkKind nextTok of
             TkEof -> pure (reverse (alt : acc), cur')
             _ | tkCol nextTok == altCol ->
@@ -231,234 +294,120 @@ parseCase ctx cur0 acc0 = do
               | otherwise ->
                   pure (reverse (alt : acc), cur')
 
-    -- Build a right-leaning chain of IIfThenElse from the alt list.
-    -- Wildcard alts (Nothing) become the else-branch; literal alts
-    -- become a comparison.
-    buildCase :: [Item] -> [(Maybe Int, [Item])] -> Maybe [Item]
-    buildCase _      []                       = Nothing
-    buildCase scrut alts =
-        let (lits, rest) = span (\(p, _) -> case p of Just _ -> True; _ -> False) alts
-            wildItems    = case rest of
-                ((Nothing, e) : _) -> e
-                _                  -> [ICall "error" 1, ILitStr "case: non-exhaustive"]
-        in Just (foldr (\(Just p, e) acc ->
-                            [IIfThenElse (cmpItems scrut p) e acc])
-                       wildItems
-                       lits)
+--------------------------------------------------------------------------------
+-- Operator precedence
+--------------------------------------------------------------------------------
 
-    cmpItems :: [Item] -> Int -> [Item]
-    cmpItems scrut p =
-        scrut
-        ++ [IPushX0]
-        ++ [ILitInt (fromIntegral p)]
-        ++ [IPopX1, ICmp CEq]
+parseOr, parseAnd, parseRel, parseSum, parseTerm, parseApp, parseAtom
+    :: Ctx -> Cursor -> IO (Expr, Cursor)
 
--- @let ident = e1 in e2@
---
--- Captures e1's items in the locals map; e2 is parsed with that
--- extension. Each occurrence of the let-bound name in e2 splices a
--- fresh copy of e1's items at the call site.
---
--- Caveat: this is splice/inline semantics. For pure expressions it
--- matches Haskell's call-by-name; for IO actions with shared effects
--- it would re-evaluate, which we don't try to support here.
-parseLet :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseLet ctx cur0 acc0 = do
-    let (nameTok, cur1) = nextSig (ctxSrc ctx) cur0
-    name <- case tkKind nameTok of
-        TkIdent n -> pure n
-        _         -> parseErr "expected identifier after `let`" nameTok
-    let (eqTok, cur2) = nextSig (ctxSrc ctx) cur1
-    case tkKind eqTok of
-        TkEq -> pure ()
-        _    -> parseErr "expected `=` in let-binding" eqTok
-    -- Parse e1 into its own item list (reversed during build).
-    (e1Rev, cur3) <- parseExpr ctx cur2 []
-    let e1Items = reverse e1Rev
-    -- Expect `in`.
-    let (inTok, cur4) = nextSig (ctxSrc ctx) cur3
-    case tkKind inTok of
-        TkIn -> pure ()
-        _    -> parseErr "expected `in` in let-binding" inTok
-    -- Parse e2 with the local binding in scope.
-    let ctx' = ctx { ctxLocals = Map.insert name e1Items (ctxLocals ctx) }
-    parseExpr ctx' cur4 acc0
+parseOr  ctx c = chain1L ctx c parseAnd "||" matchesOr
+  where matchesOr TkOr = True; matchesOr _ = False
+parseAnd ctx c = chain1L ctx c parseRel "&&" matchesAnd
+  where matchesAnd TkAnd = True; matchesAnd _ = False
 
--- @do { stmt ; ... ; stmt }@ (explicit braces) or layout form.
-parseDo :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseDo ctx cur0 acc0 = do
-    let (firstTok, curAfter) = nextSig (ctxSrc ctx) cur0
-    case tkKind firstTok of
-        TkLBrace -> bracedStmts curAfter acc0
-        TkEof    -> pure (acc0, cur0)
-        _        -> layoutStmts (tkCol firstTok) cur0 acc0
+parseRel ctx cur0 = do
+    (l, cur1) <- parseSum ctx cur0
+    let (tok, curN) = nextSig ctx cur1
+    case tkKind tok of
+        TkLe   -> binApp "<="  curN l
+        TkLt   -> binApp "<"   curN l
+        TkGe   -> binApp ">="  curN l
+        TkGt   -> binApp ">"   curN l
+        TkEqEq -> binApp "=="  curN l
+        TkNeq  -> binApp "/="  curN l
+        _      -> pure (l, cur1)
   where
-    bracedStmts cur acc = do
-        (acc', cur')  <- parseExpr ctx cur acc
-        let (sep, curN) = nextSig (ctxSrc ctx) cur'
-        case tkKind sep of
-            TkSemi   -> bracedStmts curN acc'
-            TkRBrace -> pure (acc', curN)
-            _        -> parseErr "expected `;` or `}` in do-block" sep
+    binApp opName cur l = do
+        (r, cur') <- parseSum ctx cur
+        pure (EApp (EApp (EVar opName) l) r, cur')
 
-    layoutStmts stmtCol cur acc = do
-        (acc', cur') <- parseExpr ctx cur acc
-        let (nextTok, _) = nextSig (ctxSrc ctx) cur'
-        case tkKind nextTok of
-            TkEof -> pure (acc', cur')
-            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' acc'
-              | otherwise                -> pure (acc', cur')
-
-parseIf :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseIf ctx cur0 acc0 = do
-    (condRev, curC) <- parseExpr ctx cur0 []
-    let (tThen, curT0) = nextSig (ctxSrc ctx) curC
-    case tkKind tThen of
-        TkThen -> do
-            (thenRev, curT) <- parseExpr ctx curT0 []
-            let (tElse, curE0) = nextSig (ctxSrc ctx) curT
-            case tkKind tElse of
-                TkElse -> do
-                    (elseRev, curE) <- parseExpr ctx curE0 []
-                    let item = IIfThenElse (reverse condRev) (reverse thenRev) (reverse elseRev)
-                    pure (item : acc0, curE)
-                _ -> parseErr "expected `else`" tElse
-        _ -> parseErr "expected `then`" tThen
-
-parseOr :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseOr ctx cur0 acc0 = do
-    (acc1, cur1) <- parseAnd ctx cur0 acc0
-    loop acc1 cur1
+parseSum ctx cur0 = do
+    (l, cur1) <- parseTerm ctx cur0
+    loop l cur1
   where
-    loop acc cur =
-        let (tok, curN) = nextSig (ctxSrc ctx) cur in
+    loop l cur =
+        let (tok, curN) = nextSig ctx cur in
         case tkKind tok of
-            TkOr -> do
-                (acc', cur') <- parseAnd ctx curN (IPushX0 : acc)
-                loop (IOrX1X0 : IPopX1 : acc') cur'
-            _ -> pure (acc, cur)
+            TkPlus     -> step "+"  curN l
+            TkMinus    -> step "-"  curN l
+            TkPlusPlus -> step "++" curN l
+            _          -> pure (l, cur)
+    step op cur l = do
+        (r, cur') <- parseTerm ctx cur
+        loop (EApp (EApp (EVar op) l) r) cur'
 
-parseAnd :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseAnd ctx cur0 acc0 = do
-    (acc1, cur1) <- parseRel ctx cur0 acc0
-    loop acc1 cur1
+parseTerm ctx cur0 = do
+    (l, cur1) <- parseApp ctx cur0
+    loop l cur1
   where
-    loop acc cur =
-        let (tok, curN) = nextSig (ctxSrc ctx) cur in
-        case tkKind tok of
-            TkAnd -> do
-                (acc', cur') <- parseRel ctx curN (IPushX0 : acc)
-                loop (IAndX1X0 : IPopX1 : acc') cur'
-            _ -> pure (acc, cur)
-
-parseRel :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseRel ctx cur0 acc0 = do
-    (acc1, cur1) <- parseSum ctx cur0 acc0
-    let (tok, curN) = nextSig (ctxSrc ctx) cur1
-    case tokToCond (tkKind tok) of
-        Just c -> do
-            (acc2, cur2) <- parseSum ctx curN (IPushX0 : acc1)
-            pure (ICmp c : IPopX1 : acc2, cur2)
-        Nothing -> pure (acc1, cur1)
-  where
-    tokToCond TkLe   = Just CLe
-    tokToCond TkLt   = Just CLt
-    tokToCond TkGe   = Just CGe
-    tokToCond TkGt   = Just CGt
-    tokToCond TkEqEq = Just CEq
-    tokToCond TkNeq  = Just CNe
-    tokToCond _      = Nothing
-
-parseSum :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseSum ctx cur0 acc0 = do
-    (acc1, cur1) <- parseTerm ctx cur0 acc0
-    loop acc1 cur1
-  where
-    loop acc cur =
-        let (tok, curN) = nextSig (ctxSrc ctx) cur in
-        case tkKind tok of
-            TkPlus -> do
-                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
-                loop (IAddX1X0 : IPopX1 : acc') cur'
-            TkMinus -> do
-                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
-                loop (ISubX1X0 : IPopX1 : acc') cur'
-            TkPlusPlus -> do
-                (acc', cur') <- parseTerm ctx curN (IPushX0 : acc)
-                loop (ICall "##concat" 2 : IPushX0 : acc') cur'
-            _ -> pure (acc, cur)
-
-parseTerm :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseTerm ctx cur0 acc0 = do
-    (acc1, cur1) <- parseApp ctx cur0 acc0
-    loop acc1 cur1
-  where
-    loop acc cur =
-        let (tok, curN) = nextSig (ctxSrc ctx) cur in
+    loop l cur =
+        let (tok, curN) = nextSig ctx cur in
         case tkKind tok of
             TkStar -> do
-                (acc', cur') <- parseApp ctx curN (IPushX0 : acc)
-                loop (IMulX1X0 : IPopX1 : acc') cur'
-            _ -> pure (acc, cur)
+                (r, cur') <- parseApp ctx curN
+                loop (EApp (EApp (EVar "*") l) r) cur'
+            _ -> pure (l, cur)
 
-parseApp :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseApp ctx cur0 acc0 = do
-    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
+parseApp ctx cur0 = do
+    (head_, cur1) <- parseAtom ctx cur0
+    loop head_ cur1
+  where
+    loop fn cur =
+        let (tok, _) = nextSig ctx cur in
+        if startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx
+            then do
+                (arg, cur') <- parseAtom ctx cur
+                loop (EApp fn arg) cur'
+            else pure (fn, cur)
+
+    -- A column at or before ctxMinCol marks the start of a new
+    -- layout item (next stmt in a do-block, next binding in a
+    -- where-clause, next top-level binding for body parsing). It must
+    -- NOT be greedily consumed as an additional argument.
+
+    startsAtom TkInt{}        = True
+    startsAtom TkStr{}        = True
+    startsAtom TkLParen       = True
+    startsAtom TkIdent{}      = True
+    startsAtom _              = False
+
+parseAtom ctx cur0 = do
+    let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
-        TkIdent name
-            -- Local let-binding: splice its items.
-            | Just localItems <- Map.lookup name (ctxLocals ctx) ->
-                pure (reverse localItems ++ acc0, cur1)
-            | Just idx <- elemIndex name (ctxParams ctx) ->
-                pure (IArg idx : acc0, cur1)
-            | otherwise -> do
-                arity <- ctxResolve ctx name
-                (accAfterArgs, curAfterArgs) <- parseNArgs arity ctx cur1 acc0
-                pure (ICall name arity : accAfterArgs, curAfterArgs)
-        _ -> parseAtom ctx cur0 acc0
-
-parseNArgs :: Int -> Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseNArgs 0 _ cur acc = pure (acc, cur)
-parseNArgs n ctx cur acc = do
-    (acc', cur') <- parseAtom ctx cur acc
-    parseNArgs (n - 1) ctx cur' (IPushX0 : acc')
-
-parseAtom :: Ctx -> Cursor -> [Item] -> IO ([Item], Cursor)
-parseAtom ctx cur0 acc0 = do
-    let (tok, cur1) = nextSig (ctxSrc ctx) cur0
-    case tkKind tok of
-        TkInt n ->
-            pure (ILitInt (fromInteger n) : acc0, cur1)
-        TkStr s ->
-            pure (ILitStr s : acc0, cur1)
-        TkMinus -> do
-            (acc1, cur2) <- parseAtom ctx cur1 acc0
-            pure (INegX0 : acc1, cur2)
+        TkInt n  -> pure (ELit (LInt (fromInteger n)), cur1)
+        TkStr s  -> pure (ELit (LStr s), cur1)
+        TkIdent n
+            | n == "_" -> parseErr "wildcard `_` in expression position" tok
+            | otherwise -> pure (EVar n, cur1)
         TkLParen -> do
-            (acc1, cur2) <- parseExpr ctx cur1 acc0
-            let (close, cur3) = nextSig (ctxSrc ctx) cur2
+            (e, cur2) <- parseExpr ctx cur1
+            let (close, cur3) = nextSig ctx cur2
             case tkKind close of
-                TkRParen -> pure (acc1, cur3)
-                _        -> parseErr "expected ')'" close
-        TkIdent name
-            | Just localItems <- Map.lookup name (ctxLocals ctx) ->
-                pure (reverse localItems ++ acc0, cur1)
-            | Just idx <- elemIndex name (ctxParams ctx) ->
-                pure (IArg idx : acc0, cur1)
-            | otherwise -> do
-                arity <- ctxResolve ctx name
-                if arity == 0
-                    then pure (ICall name 0 : acc0, cur1)
-                    else throwIO (ParseError
-                        ("`" <> BC.unpack name <> "` expects "
-                         <> show arity
-                         <> " argument(s) but appears as a bare atom at offset "
-                         <> show (tkStart tok)
-                         <> " — wrap the call in parentheses"))
-        TkEof ->
-            throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
-        _ ->
-            parseErr "unexpected token" tok
+                TkRParen -> pure (e, cur3)
+                _        -> parseErr "expected `)`" close
+        TkMinus -> do
+            (e, cur2) <- parseAtom ctx cur1
+            pure (ENeg e, cur2)
+        TkEof -> throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
+        _ -> parseErr "unexpected token" tok
+
+chain1L :: Ctx -> Cursor
+        -> (Ctx -> Cursor -> IO (Expr, Cursor))
+        -> Name
+        -> (TokenKind -> Bool)
+        -> IO (Expr, Cursor)
+chain1L ctx cur0 sub opName matches = do
+    (l, cur1) <- sub ctx cur0
+    loop l cur1
+  where
+    loop l cur =
+        let (tok, curN) = nextSig ctx cur in
+        if matches (tkKind tok)
+            then do
+                (r, cur') <- sub ctx curN
+                loop (EApp (EApp (EVar opName) l) r) cur'
+            else pure (l, cur)
 
 parseErr :: String -> Token -> IO a
 parseErr msg tok =

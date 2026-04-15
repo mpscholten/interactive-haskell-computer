@@ -23,23 +23,31 @@ common lang
       , BlockArguments
       , DerivingStrategies
       , StrictData
+      , RecursiveDo
 
 library
     import:           warnings, lang
     hs-source-dirs:   src
     exposed-modules:
         IHC
-      , IHC.CodeBuffer
+      , IHC.AST
+      , IHC.Builtins
       , IHC.Driver
-      , IHC.Emit
-      , IHC.Encode
-      , IHC.IR
-      , IHC.Jit
+      , IHC.Eval
       , IHC.Lexer
       , IHC.Parser
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.Val
+      -- Dormant Phase-1 JIT machinery, kept in tree but no longer
+      -- on the runtime path. May be re-activated as a tier-2 opt JIT
+      -- once the interpreter supports the full language.
+      , IHC.CodeBuffer
+      , IHC.Emit
+      , IHC.Encode
+      , IHC.IR
+      , IHC.Jit
       , IHC.Stdlib
     build-depends:
         base             >= 4.19 && < 5
