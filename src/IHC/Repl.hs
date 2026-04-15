@@ -27,12 +27,14 @@ import System.Console.Haskeline
     )
 
 import IHC.AST (Expr)
-import IHC.Builtins (showValWith)
-import IHC.Classes (ClassRegistry)
+import IHC.Builtins (showValWith, buildConEnv)
+import IHC.Classes (ClassRegistry, registerInstance)
 import IHC.Driver (resolveSearchPathFor)
-import IHC.Eval (eval)
+import IHC.Eval (eval, force)
+import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
-import IHC.Parser (defaultFixityTable, parseExprOnly)
+import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
+import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..))
 import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
 import IHC.Source (mkSource, readSourceFile, Source(..), srcBytes)
 import IHC.TypeDescribe (describeType)
@@ -76,6 +78,11 @@ dispatch envRef classReg line =
     case words line of
         ((':':cmd):rest) -> metaCmd envRef classReg cmd rest
         ("import":_)     -> doImport envRef line >> pure True
+        ("data":_)       -> doDataDecl envRef line >> pure True
+        ("newtype":_)    -> doDataDecl envRef line >> pure True
+        ("type":_)       -> doTypeDecl line >> pure True
+        ("class":_)      -> doClassDecl line >> pure True
+        ("instance":_)   -> doInstanceDecl envRef classReg line >> pure True
         _                -> evalLine envRef classReg line >> pure True
 
 --------------------------------------------------------------------------------
@@ -212,6 +219,153 @@ tryImportModule searchPath imp env = do
     case r of
         Right pair -> pure (Right pair)
         Left  e    -> pure (Left (show e))
+
+--------------------------------------------------------------------------------
+-- Top-level declaration handlers
+--------------------------------------------------------------------------------
+
+-- | Synthetic-module wrapper used to reuse existing scan machinery on a
+-- single declaration line typed at the REPL prompt.
+syntheticModule :: String -> BC.ByteString
+syntheticModule decl = BC.pack ("module IhcRepl where\n" <> decl <> "\n")
+
+-- | Handle @data T = A | B Int@ and @newtype T = T Int@ at the REPL.
+-- We wrap the declaration in a synthetic module, run 'scanDataDecls' to
+-- extract (constructor, arity) pairs, build VFun/VCon thunks via
+-- 'buildConEnv', and merge the result into the REPL env.
+doDataDecl :: IORef Env -> String -> InputT IO ()
+doDataDecl envRef line = do
+    let src = mkSource "<repl>" (syntheticModule line)
+    r <- liftIO (tryDataDecl envRef src line)
+    case r of
+        Left err -> outputStrLn ("Error: " <> err)
+        Right msg -> outputStrLn msg
+
+tryDataDecl :: IORef Env -> Source -> String -> IO (Either String String)
+tryDataDecl envRef src _line = do
+    r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString Int)))
+    case r of
+        Left err  -> pure (Left (show err))
+        Right reg ->
+            if Map.null reg
+            then pure (Left "no constructors found (parse error?)")
+            else do
+                conEnv <- buildConEnv reg
+                modifyIORef' envRef (Map.union conEnv)
+                let ctorCount = Map.size reg
+                    ctors     = Map.keys reg
+                    -- Guess the type name: the common prefix or just list ctors.
+                    -- We report the first word after 'data'/'newtype' as the
+                    -- type name for the confirmation message, extracted by the
+                    -- caller if needed. We just report the ctor count.
+                    msg = "data decl: " <> show ctorCount <>
+                          " constructor(s): " <>
+                          unwords (map BC.unpack ctors)
+                pure (Right msg)
+
+-- | Handle @type Foo = Int@ at the REPL.  ihc has no type checker so we
+-- parse-and-discard type synonyms, printing a short note.
+doTypeDecl :: String -> InputT IO ()
+doTypeDecl line =
+    -- Extract the type name (second word after "type")
+    case words line of
+        ("type" : name : _) ->
+            outputStrLn ("type " <> name <> " (type synonyms are not checked in ihc)")
+        _ ->
+            outputStrLn "type synonym (not checked in ihc)"
+
+-- | Handle @class C a where foo :: a -> a@ at the REPL.
+-- We do a lightweight scan to count the method signatures/defaults declared
+-- in the @where@ block, then register the class name in the output.
+-- No ClassRegistry entry is created — dispatch is resolved at instance time.
+doClassDecl :: String -> InputT IO ()
+doClassDecl line = do
+    let src     = mkSource "<repl>" (syntheticModule line)
+        methods = countClassMethods src
+        name    = extractClassName line
+        msg     = "class " <> name <> " with " <> show methods <> " method(s)"
+    outputStrLn msg
+
+-- | Count method declarations in a @class … where@ block by scanning
+-- for indented (col > 1) identifier tokens that are followed eventually
+-- by @::@ or @=@ on the same or continuation line.
+-- Simplified heuristic: count distinct indented idents before @::@.
+countClassMethods :: Source -> Int
+countClassMethods src = go 0 False startCursor
+  where
+    go !n inWhere cur =
+        let (tok, cur') = nextToken src cur
+        in case tkKind tok of
+            TkEof    -> n
+            TkWhere  -> go n True cur'
+            TkNewline -> go n inWhere cur'
+            TkIdent _
+                | inWhere && tkCol tok > 1 ->
+                    -- Count this as a method name; skip to end of this line.
+                    go (n + 1) inWhere (skipToLineEnd src cur')
+            _ -> go n inWhere cur'
+
+    skipToLineEnd s c =
+        let (tok, c') = nextToken s c
+        in case tkKind tok of
+            TkEof     -> c
+            TkNewline -> c'
+            _         -> skipToLineEnd s c'
+
+-- | Extract the class name (first uppercase identifier after @class@).
+extractClassName :: String -> String
+extractClassName line =
+    case dropWhile (/= ' ') line of
+        []   -> "?"
+        rest -> case dropWhile (== ' ') rest of
+            []   -> "?"
+            rest2 -> takeWhile (\c -> c /= ' ' && c /= '\n') rest2
+
+-- | Handle @instance C Int where foo x = x + 1@ at the REPL.
+-- Wraps the declaration in a synthetic module, scans with
+-- 'scanInstanceDecls', evaluates each method body in the current env,
+-- and registers the dictionary in the ClassRegistry.
+doInstanceDecl :: IORef Env -> ClassRegistry -> String -> InputT IO ()
+doInstanceDecl envRef classReg line = do
+    r <- liftIO (tryInstanceDecl envRef classReg line)
+    case r of
+        Left err -> outputStrLn ("Error: " <> err)
+        Right msg -> outputStrLn msg
+
+tryInstanceDecl :: IORef Env -> ClassRegistry -> String -> IO (Either String String)
+tryInstanceDecl envRef classReg line = do
+    let src = mkSource "<repl>" (syntheticModule line)
+    r <- (try (scanInstanceDecls src) :: IO (Either SomeException [InstanceDecl]))
+    case r of
+        Left err -> pure (Left (show err))
+        Right [] -> pure (Left "no instance declaration found (parse error?)")
+        Right (InstanceDecl cls typ methods : _) -> do
+            env <- readIORef envRef
+            r2 <- (try (evalInstanceMethods src env methods)
+                    :: IO (Either SomeException [Val]))
+            case r2 of
+                Left err     -> pure (Left (show err))
+                Right vals   -> do
+                    registerInstance classReg cls typ vals
+                    let n   = length methods
+                        msg = "instance " <> BC.unpack cls <>
+                              " " <> BC.unpack typ <>
+                              " with " <> show n <> " method(s)"
+                    pure (Right msg)
+
+-- | Parse and evaluate each method body in the given env.
+evalInstanceMethods
+    :: Source
+    -> Env
+    -> [(BC.ByteString, BindingLhs)]
+    -> IO [Val]
+evalInstanceMethods src env methods =
+    mapM evalOne methods
+  where
+    evalOne (_, lhs) = do
+        expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        t    <- newThunk env expr
+        force t
 
 --------------------------------------------------------------------------------
 -- Expression evaluation

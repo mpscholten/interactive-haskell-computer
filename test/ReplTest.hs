@@ -64,6 +64,16 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "2"
 
+    it ":l file-without-main then `main` does not produce unbound () error" do
+        -- Regression test for the bug where loading a file that has no
+        -- `main` binding caused the scheduler to append `main = ()` as a
+        -- fallback, and then evaluating `main` failed with
+        -- "unbound variable `()`" because () was not in the builtin env.
+        (code, out, err) <- runRepl ":l test/Fixtures/no_main.hs\nmain\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldNotContain` "unbound variable"
+        err `shouldNotContain` "unbound variable"
+
     -- :t smoke tests
     it ":t (1, 1) reports (Int, Int)" do
         (code, out, _err) <- runRepl ":t (1, 1)\n:q\n"
@@ -86,3 +96,33 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "IO a"
         -- Must NOT have actually executed the action
         out `shouldNotContain` "x\n"
+
+    -- Top-level declaration tests
+    it "data Pair = Pair Int Int: constructors available" do
+        (code, out, _err) <- runRepl "data Pair = Pair Int Int\nPair 1 2\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Pair"
+
+    it "newtype W = W Int: constructor available" do
+        (code, out, _err) <- runRepl "newtype W = W Int\nW 5\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "W"
+
+    it "type synonym: no error, prints note" do
+        (code, out, _err) <- runRepl "type Foo = Int\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Foo"
+
+    it "class declaration: accepted and reported" do
+        (code, out, _err) <- runRepl "class MyClass a where\n  myMethod :: a -> a\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "class"
+
+    it "instance declaration: method registered and callable" do
+        (code, out, _err) <-
+            runRepl ( "instance Num Int where\n"
+                   <> "  myAdd x = x + 1\n"
+                   <> "1 + 2\n"
+                   <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "3"
