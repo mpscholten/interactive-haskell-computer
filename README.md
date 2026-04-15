@@ -2,10 +2,11 @@
 
 A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goal: interpret real Hackage source — eventually the bytestring test suite, then Warp/IHP.
 
-## Status (Phase 2.6 — 2026-04-15)
+## Status (Phase 2.7 — 2026-04-15)
 
-- **84/84 fixtures pass** end-to-end through a tree-walking lazy evaluator.
+- **94/94 tests pass** (84 fixtures + 10 Cabal-loader tests) through a tree-walking lazy evaluator.
 - **`Data/ByteString/Lazy.hs` + the rest of bytestring (55/55 files = 100%) parse cleanly.**
+- **Cabal-aware source loader**: detects project root, reads `cabal.project.freeze`, parallel `cabal get` into `~/.cache/ihc/sources/`, per-package extensions/cpp-options.
 - Lazy evaluation with `IORef`-backed thunks (black-hole protocol).
 - ADTs + pattern matching + lists + `[Char]` strings + tuples + as/bang patterns.
 - Multi-clause functions + guards.
@@ -22,8 +23,9 @@ Everything via interpretation — **no JIT path on the runtime today**. The aarc
 The north-star: **run bytestring's `tests/Main.hs` from source under `ihc`** with the same pass/fail count as `cabal test`. Phase plan in `/Users/marc/.claude/plans/temporal-mixing-raccoon.md`.
 
 Remaining slices (rough order):
-- 2.3 — type classes (dictionary passing) — designed
-- 2.7 — Cabal-aware source loader — in progress
+- 2.3 — type classes (dictionary passing) — designed, in progress
+- 2.7 — Cabal-aware source loader — ✅ shipped
+- 2.12 — tasty/QuickCheck end-to-end pipeline — designed
 - 2.8 — `ByteArray#`/`ForeignPtr`/`Word8`/`Storable` primops — designed
 - 2.9 — mid-milestone: `L.putStr (L.pack [72,105,10])` runs from source
 - 2.9.5 — GADTs + `Typeable`/`cast`/`Dynamic` — surfaced by tasty survey
