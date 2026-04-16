@@ -591,12 +591,20 @@ loadModule registry searchPath name = do
 -- We return empty stub modules so import declarations don't fail at file lookup.
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
+    -- GHC internals (GHC.Exts, GHC.Ptr, GHC.ForeignPtr, GHC.IO, GHC.Base, etc.)
        "GHC."         `BC.isPrefixOf` n
     || n == "Prelude"
+    -- System modules
     || n == "System.IO"
     || n == "System.IO.Unsafe"
     || n == "System.Exit"
+    || n == "System.Environment"
+    || n == "System.Posix.Types"
+    -- Foreign umbrella + subsystems (Foreign.* prefix covers subsystems;
+    -- bare "Foreign" needs an explicit check)
+    || n == "Foreign"
     || "Foreign."     `BC.isPrefixOf` n
+    -- Data modules
     || n == "Data.IORef"
     || n == "Data.Int"
     || n == "Data.Word"
@@ -604,13 +612,28 @@ isBuiltinBackedModule n =
     || n == "Data.Char"
     || n == "Data.List"
     || n == "Data.Maybe"
+    || n == "Data.Either"
     || n == "Data.Ord"
-    || n == "Control.Monad"
-    || n == "Control.DeepSeq"
+    || n == "Data.Function"
+    || n == "Data.Tuple"
+    || n == "Data.Coerce"
+    || n == "Data.Typeable"
+    || n == "Data.Kind"
+    || n == "Data.Proxy"
     || "Data.Map"     `BC.isPrefixOf` n
     || "Data.Set"     `BC.isPrefixOf` n
     || "Data.IntMap"  `BC.isPrefixOf` n
     || "Data.Sequence" `BC.isPrefixOf` n
+    -- Control modules
+    || n == "Control.Monad"
+    || n == "Control.Applicative"
+    || n == "Control.Arrow"
+    || n == "Control.Category"
+    || n == "Control.DeepSeq"
+    -- Text / numeric modules
+    || n == "Numeric"
+    || n == "Text.Read"
+    || n == "Text.Show"
     -- Phase 2.11: TH synthetic modules — names provided by IHC.TH builtins
     || "Language.Haskell.TH" `BC.isPrefixOf` n
 
