@@ -1,5 +1,0 @@
-Promoted constructor tick 'Foo in @'Foo type apps is mis-lexed: the lexer
-reads 'T as TkChar 'T' and leaves the rest of the identifier (rue) as a
-separate TkIdent, breaking the type argument skip.  Fix requires a lexer
-change to distinguish promoted-tick from char-literal context.
-Remove _XFAIL once the lexer handles @'Con correctly.

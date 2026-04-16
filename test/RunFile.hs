@@ -815,3 +815,26 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase35/label_multiple.hs")
         n   `shouldBe` 0
         out `shouldBe` "#firstName\n#lastName\n#email\n"
+
+    --------------------------------------------------------------------
+    -- Graduated XFAILs (fixtures that now pass)
+    --------------------------------------------------------------------
+    it "bang pattern strict: sumStrict with [1..10] = 55" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/bang_pattern_strict.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "55\n"
+
+    it "ops fixity prec: ^ operator and mixed arith" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/ops_fixity_prec.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "7\n26\n5\n512\n"
+
+    it "io file roundtrip: writeFile then readFile" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/io_file_roundtrip.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello from ihc\n"
+
+    it "typeapp promoted: @'True type application is parsed and ignored" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/typeapp_promoted.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\n"

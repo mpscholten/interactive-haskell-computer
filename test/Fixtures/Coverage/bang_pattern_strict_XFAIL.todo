@@ -1,2 +1,0 @@
-Uses [1..10] arithmetic sequence range syntax which is not yet implemented in the IHC parser.
-Remove _XFAIL suffix once ArithSeq / enumFromTo parsing lands.

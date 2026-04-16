@@ -1,2 +1,0 @@
-Uses ^ (power) operator which is not yet built into the IHC builtins.
-Remove _XFAIL suffix once ^ is added to Builtins.hs.
