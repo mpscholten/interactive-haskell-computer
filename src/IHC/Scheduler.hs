@@ -880,14 +880,7 @@ resolveQualified
     -> IO (Maybe LoadedModule)
 resolveQualified registry searchPath lm qual = do
     let imports = mhImports (lmHeader lm)
-    let matched = filter (importMatchesQual qual) imports
-    System.IO.hPutStrLn System.IO.stderr $
-        "[resolveQualified] mod=" <> BC.unpack (lmName lm)
-        <> " qual=" <> BC.unpack qual
-        <> " imports=" <> show (length imports)
-        <> " matched=" <> show (length matched)
-        <> " allAliases=" <> show [(BC.unpack (impModule i), fmap BC.unpack (impAlias i)) | i <- imports]
-    case matched of
+    case filter (importMatchesQual qual) imports of
         (imp:_) -> Just <$> loadModule registry searchPath (impModule imp)
         []      -> pure Nothing
 
