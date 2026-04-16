@@ -175,6 +175,47 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "Loaded test/Fixtures/hello.hs"
         out `shouldContain` "Reloading test/Fixtures/hello.hs"
 
+    -- ghci-compatible :l and import tests
+    it ":l simple_exports.hs exports foo unqualified" do
+        -- Bug 1 regression test: after :l, exported names must be reachable
+        -- unqualified even if not reachable from `main`.
+        (code, out, _err) <- runRepl
+            ( ":l test/Fixtures/Repl/simple_exports.hs\n"
+           <> "foo\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "42"
+        -- `bar` is not exported, so it should NOT be bound.
+        (code2, out2, _err2) <- runRepl
+            ( ":l test/Fixtures/Repl/simple_exports.hs\n"
+           <> "bar\n"
+           <> ":q\n" )
+        code2 `shouldBe` ExitSuccess
+        out2 `shouldContain` "unbound"
+
+    it "import Data.Maybe: fromMaybe 0 (Just 5) = 5" do
+        -- import re-export following: Data.Maybe is source-loadable and
+        -- fromMaybe should be available after import.
+        (code, out, _err) <- runRepl
+            ( "import Data.Maybe\n"
+           <> "fromMaybe 0 (Just 5)\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "5"
+
+    it "import qualified Data.List as L: L.isSubsequenceOf works, unqualified does not" do
+        -- Qualified import: L.isSubsequenceOf should work; bare name should fail.
+        -- isSubsequenceOf is locally defined in Data.List (not a re-export),
+        -- so it is discoverable without loading GHC.Base.
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.List as L\n"
+           <> "L.isSubsequenceOf [1,2] [1,2,3]\n"
+           <> "isSubsequenceOf [1,2] [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "True"
+        out `shouldContain` "unbound"
+
     it ":r after modify-on-disk reflects new binding" do
         tmpDir <- getTemporaryDirectory
         (tmpPath, h) <- openTempFile tmpDir "ihc_reload_test.hs"

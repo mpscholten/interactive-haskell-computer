@@ -189,6 +189,11 @@ parseExportList src cur0 = go [] cur0
                         go (ExportType n (Just subs) : acc) cur2
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
+            -- Operator export: `(++)`, `(<>)`, etc. — skip the whole
+            -- `(op)` group and continue rather than aborting the list.
+            TkLParen -> do
+                curSkip <- skipToCloseParen src cur1 1
+                go acc curSkip
             _        -> pure (ExportList (reverse acc), cur)
 
     parseExportSubs s c0 = loop [] c0

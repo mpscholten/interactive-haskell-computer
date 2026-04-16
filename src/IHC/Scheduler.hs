@@ -40,16 +40,18 @@ module IHC.Scheduler
     ) where
 
 import Control.Exception (throwIO, Exception, catch)
+import Control.Monad (when)
 import qualified System.IO
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sort)
 import Data.Maybe (fromMaybe)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.FilePath ((</>), takeDirectory)
+import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
@@ -464,10 +466,24 @@ loadImportIntoEnv searchPath imp existingEnv
         let aliasEnv = Map.fromList
                 ( bareAliases ++ qualAliases
                ++ reexportBareAliases ++ reexportQualAliases )
+        -- For intra-module self-references (recursive calls, mutual recursion),
+        -- locally-defined names in the target module must be reachable by their
+        -- bare name inside the closure env.  The rewriteExpr transform uses the
+        -- import-rewrite table for cross-module references but does NOT rewrite
+        -- self-references (they stay as bare names).  Supply bare-name → slot
+        -- mappings from the target module's own bodies so that, e.g.,
+        -- `isSubsequenceOf` calling itself works inside the Data.List closure.
+        let selfAliases =
+                [ (n, slot)
+                | (qualKey, slot) <- Map.toList thunkByKey
+                , BC.isPrefixOf modPrefix qualKey
+                , let n = BC.drop (BC.length modPrefix) qualKey
+                ]
         -- The final env visible to imported bindings: qualEnv + aliases.
         -- We also include the aliases so that intra-module cross-references
         -- (e.g. `greet` calling `suffix`) resolve properly.
-        let innerEnv = Map.union aliasEnv qualEnv
+        let innerEnv = Map.union (Map.fromList selfAliases)
+                     $ Map.union aliasEnv qualEnv
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
               (zip qualPairs slots)
@@ -533,8 +549,14 @@ exportBodies registry lm = do
             | lmIsEntry lm = e     -- entry keeps bare names; env has aliases
             | otherwise    = rewriteExpr rewrites e
     pure
+        -- Filter out foreign-alias sentinels inserted by discoverInModule.
+        -- A sentinel is an entry (n, EVar n) meaning "n resolved via import;
+        -- no local body to export".  Exporting them would create either
+        -- self-referential thunks (entry module) or dangling bare-name
+        -- references in non-entry module bodies.
         [ (keyPrefix <> n, transform e)
         | (n, e) <- Map.toList bs
+        , e /= EVar n   -- skip foreign-alias sentinels
         ]
 
 -- | Build a map from each locally-visible imported name to its
@@ -1007,6 +1029,16 @@ isLocalModule searchPath name = do
 -- Demand-driven discovery
 --------------------------------------------------------------------------------
 
+-- | Global counter for discoverInModule invocations (instrumentation).
+{-# NOINLINE discoverCounter #-}
+discoverCounter :: IORef Int
+discoverCounter = unsafePerformIO (newIORef 0)
+
+-- | Global map counting (module, name) invocations (instrumentation).
+{-# NOINLINE discoverCounts #-}
+discoverCounts :: IORef (Map (ByteString, ByteString) Int)
+discoverCounts = unsafePerformIO (newIORef Map.empty)
+
 -- | Recursively discover bindings reachable from @name@ inside the
 -- given module, following imports whenever the name isn't local.
 discoverInModule
@@ -1030,6 +1062,12 @@ discoverInModule registry searchPath includeMap lm name
                      <> " — no matching import in module "
                      <> BC.unpack (lmName lm)))
     | otherwise = do
+        n0 <- atomicModifyIORef' discoverCounter (\c -> (c+1, c+1))
+        modifyIORef' discoverCounts (Map.insertWith (+) (lmName lm, name) 1)
+        when (n0 `mod` 5000 == 0) $ do
+            counts <- readIORef discoverCounts
+            let hot = take 10 $ reverse $ sort [ (v, k) | (k, v) <- Map.toList counts, v > 1 ]
+            System.IO.hPutStrLn System.IO.stderr ("[DISC] total=" <> show n0 <> " hot=" <> show hot)
         bodies <- readIORef (lmBodies lm)
         if Map.member name bodies
             then pure ()
@@ -1046,13 +1084,22 @@ discoverInModule registry searchPath includeMap lm name
                         modifyIORef' (lmBodies lm) (Map.insert name expr)
                         -- Recurse into every free var. Qualified ones
                         -- will be routed on the next call.
+                        -- Deduplicate to avoid O(n^2) re-traversal when a
+                        -- name appears many times in one binding.
                         mapM_ (discoverInModule registry searchPath includeMap lm)
-                              (freeVars expr)
+                              (nubBS (freeVars expr))
                     Nothing -> do
                         -- Not local. Try imports.
                         mForeign <- resolveImport registry searchPath includeMap lm name
                         case mForeign of
-                            Just () -> pure ()
+                            Just () ->
+                                -- Memoize: mark this name as handled in the
+                                -- current module's bodies so that repeated
+                                -- calls to discoverInModule for the same
+                                -- (module, name) pair short-circuit
+                                -- immediately without re-traversing imports.
+                                -- EVar name acts as a "foreign alias" sentinel.
+                                modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
                             Nothing ->
                                 -- Assume a builtin; let the evaluator
                                 -- complain if truly missing.
@@ -1103,31 +1150,44 @@ resolveImport registry searchPath includeMap lm name = do
         | impModule imp == BC.pack "Prelude" = tryImports rest
         | not (specAllows (impSpec imp) name) = tryImports rest
         | otherwise = do
-            targetLm <- loadModule registry searchPath includeMap (impModule imp)
-            mLhs <- findOrResolveLhs (lmSource targetLm)
-                                     (lmKnown targetLm) name
-            case mLhs of
-                Just _ ->
-                    -- Export-list check: the target module must
-                    -- actually export @name@.
-                    if exportsName (lmHeader targetLm) name
-                        then do
-                            discoverInModule registry searchPath includeMap targetLm name
-                            pure (Just ())
-                        else tryImports rest
-                Nothing ->
-                    -- The name isn't defined locally in targetLm.
-                    -- Two ways it might still be exported:
-                    --
-                    -- 1. `module Foo` re-export entry — follow those.
-                    -- 2. `ExportName n` re-export via unqualified import:
-                    --    e.g. `Data.Map.Strict` lists `fromList` in its
-                    --    export list but the definition lives in
-                    --    `Data.Map.Internal`.  Follow all unqualified
-                    --    imports of @targetLm@ to find the definition.
-                    if exportsName (lmHeader targetLm) name
-                        then followNamedReexport targetLm rest
-                        else followModuleReexports targetLm rest
+            -- Don't eagerly load library modules that aren't already in
+            -- the registry.  Loading them to satisfy a single unbound free
+            -- variable would pull in the entire base transitive-closure
+            -- (GHC.Base and friends) and cause OOM.  Only load a module
+            -- when it is already in the registry (loaded by an earlier
+            -- discoverInModule call) or when it is a local (non-cache) file.
+            reg <- readIORef registry
+            shouldLoad <- case Map.lookup (impModule imp) reg of
+                Just _  -> pure True   -- already loaded, safe to query
+                Nothing -> isLocalModule searchPath (impModule imp)
+            if not shouldLoad
+                then tryImports rest
+                else do
+                    targetLm <- loadModule registry searchPath includeMap (impModule imp)
+                    mLhs <- findOrResolveLhs (lmSource targetLm)
+                                             (lmKnown targetLm) name
+                    case mLhs of
+                        Just _ ->
+                            -- Export-list check: the target module must
+                            -- actually export @name@.
+                            if exportsName (lmHeader targetLm) name
+                                then do
+                                    discoverInModule registry searchPath includeMap targetLm name
+                                    pure (Just ())
+                                else tryImports rest
+                        Nothing ->
+                            -- The name isn't defined locally in targetLm.
+                            -- Two ways it might still be exported:
+                            --
+                            -- 1. `module Foo` re-export entry — follow those.
+                            -- 2. `ExportName n` re-export via unqualified import:
+                            --    e.g. `Data.Map.Strict` lists `fromList` in its
+                            --    export list but the definition lives in
+                            --    `Data.Map.Internal`.  Follow all unqualified
+                            --    imports of @targetLm@ to find the definition.
+                            if exportsName (lmHeader targetLm) name
+                                then followNamedReexport targetLm rest
+                                else followModuleReexports targetLm rest
 
     -- | @targetLm@ exports @name@ by name (ExportName entry) but doesn't
     -- define it locally.  Walk @targetLm@'s own unqualified imports and

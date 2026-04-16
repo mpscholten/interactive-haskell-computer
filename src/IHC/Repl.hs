@@ -35,8 +35,8 @@ import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
 import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
-import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
-import IHC.Source (mkSource, readSourceFile, withBytes, Source(..), srcBytes)
+import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadFileIntoEnv)
+import IHC.Source (mkSource, Source(..))
 import IHC.TypeDescribe (describeType)
 import IHC.Val
 
@@ -150,13 +150,14 @@ typeOfExpr env ast = do
 doLoad :: IORef Env -> ClassRegistry -> IORef [FilePath] -> FilePath -> InputT IO ()
 doLoad _      _        _         ""   = outputStrLn "Usage: :load FILE"
 doLoad envRef _classReg loadedRef path = do
-    r <- liftIO (tryLoad path)
+    env <- liftIO (readIORef envRef)
+    r <- liftIO (tryLoadFile path env)
     case r of
-        Left err      -> outputStrLn ("Load error: " <> err)
-        Right newEnv  -> do
-            liftIO $ modifyIORef' envRef (\e -> Map.union newEnv e)
+        Left err              -> outputStrLn ("Load error: " <> err)
+        Right (newEnv, count) -> do
+            liftIO $ writeIORef envRef newEnv
             liftIO $ modifyIORef' loadedRef (addUnique path)
-            outputStrLn ("Loaded " <> path)
+            outputStrLn ("Loaded " <> path <> " (" <> show count <> " names)")
 
 -- | Add a path to the list only if it isn't already present.
 addUnique :: FilePath -> [FilePath] -> [FilePath]
@@ -178,33 +179,29 @@ doReload envRef _classReg loadedRef = do
   where
     reloadOne path = do
         outputStrLn ("Reloading " <> path)
-        r <- liftIO (tryLoad path)
+        env <- liftIO (readIORef envRef)
+        r <- liftIO (tryLoadFile path env)
         case r of
-            Left err     -> outputStrLn ("Load error: " <> err)
-            Right newEnv -> liftIO $ modifyIORef' envRef (\e -> Map.union newEnv e)
+            Left err              -> outputStrLn ("Load error: " <> err)
+            Right (newEnv, count) -> do
+                liftIO $ writeIORef envRef newEnv
+                outputStrLn ("Loaded " <> path <> " (" <> show count <> " names)")
 
--- | Attempt to load @path@, returning the resulting environment.
--- We append a trivial @main = ()@ if the file has no @main@, so
--- the scheduler doesn't throw.
-tryLoad :: FilePath -> IO (Either String Env)
-tryLoad path = do
-    r <- try (loadFile path) :: IO (Either SomeException Env)
+-- | Attempt to load @path@ into the existing env, returning the updated
+-- env and the count of newly-exported names.
+tryLoadFile :: FilePath -> Env -> IO (Either String (Env, Int))
+tryLoadFile path existingEnv = do
+    r <- try (doLoadFile path existingEnv) :: IO (Either SomeException (Env, Int))
     case r of
-        Right env -> pure (Right env)
-        Left  e   -> pure (Left (show e))
+        Right pair -> pure (Right pair)
+        Left  e    -> pure (Left (show e))
 
-loadFile :: FilePath -> IO Env
-loadFile path = do
-    src        <- readSourceFile path
+-- | Load a .hs file using the REPL-oriented loader that exposes ALL
+-- exported names unqualified.  This matches ghci's @:l@ semantics.
+doLoadFile :: FilePath -> Env -> IO (Env, Int)
+doLoadFile path existingEnv = do
     searchPath <- resolveSearchPathFor path
-    r <- try (loadProgramFromSource searchPath src)
-            :: IO (Either SomeException (Env, Thunk))
-    case r of
-        Right (env, _) -> pure env
-        Left  _        -> do
-            let patched = withBytes src (srcBytes src <> BC.pack "\nmain = ()\n")
-            (env, _) <- loadProgramFromSource searchPath patched
-            pure env
+    loadFileIntoEnv searchPath path existingEnv
 
 --------------------------------------------------------------------------------
 -- import MODULE
