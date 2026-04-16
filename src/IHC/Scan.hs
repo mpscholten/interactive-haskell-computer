@@ -853,15 +853,22 @@ scanInstanceDecls src = go [] startCursor
             TkEof     -> pure (Map.toList acc)
             TkNewline -> scanMethods acc cur'
             TkIdent name | tkCol tok > 1 -> do
-                mClause <- scanOneClauseAfterName src cur'
-                case mClause of
-                    Nothing -> scanMethods acc cur'
-                    Just (clause, curNext) -> do
-                        (moreClauses, curFinal) <-
-                            collectInstanceClauses name [clause] curNext
-                        let lhs  = BindingLhs (reverse moreClauses)
-                            acc' = Map.insert name lhs acc
-                        scanMethods acc' curFinal
+                -- InstanceSigs: if this line is a type sig
+                -- (@name[, name]* :: type@), skip it silently. Otherwise
+                -- fall through to the normal clause-scanning path.
+                mSkip <- trySkipInstanceSig (tkCol tok) cur'
+                case mSkip of
+                    Just curAfter -> scanMethods acc curAfter
+                    Nothing -> do
+                        mClause <- scanOneClauseAfterName src cur'
+                        case mClause of
+                            Nothing -> scanMethods acc cur'
+                            Just (clause, curNext) -> do
+                                (moreClauses, curFinal) <-
+                                    collectInstanceClauses name [clause] curNext
+                                let lhs  = BindingLhs (reverse moreClauses)
+                                    acc' = Map.insert name lhs acc
+                                scanMethods acc' curFinal
             -- Phase 3.6: operator methods like @(>>=)@, @(>>)@, @(<>)@, @(+)@.
             -- Pattern: @TkLParen TkSymOp name TkRParen ...@
             TkLParen | tkCol tok > 1 -> do
@@ -871,13 +878,22 @@ scanInstanceDecls src = go [] startCursor
                         let (closeTok, cur''') = nextToken src cur''
                         case tkKind closeTok of
                             TkRParen -> do
-                                mClause <- scanOneClauseAfterName src cur'''
-                                case mClause of
-                                    Nothing -> scanMethods acc cur'
-                                    Just (clause, curNext) -> do
-                                        let lhs  = BindingLhs [clause]
-                                            acc' = Map.insert opName lhs acc
-                                        scanMethods acc' curNext
+                                -- InstanceSigs: @(<>) :: ...@ inside an
+                                -- instance body is a type sig, not a
+                                -- binding. Detect and skip.
+                                let (peek, _) = peekSig cur'''
+                                case tkKind peek of
+                                    TkDColon -> do
+                                        curAfter <- skipInstanceSigType (tkCol tok) cur'''
+                                        scanMethods acc curAfter
+                                    _ -> do
+                                        mClause <- scanOneClauseAfterName src cur'''
+                                        case mClause of
+                                            Nothing -> scanMethods acc cur'
+                                            Just (clause, curNext) -> do
+                                                let lhs  = BindingLhs [clause]
+                                                    acc' = Map.insert opName lhs acc
+                                                scanMethods acc' curNext
                             _ -> scanMethods acc cur'
                     _ -> scanMethods acc cur'
             -- Phase 3.2: skip associated-type declarations inside instance bodies.
@@ -908,3 +924,51 @@ scanInstanceDecls src = go [] startCursor
         case tkKind tok of
             TkNewline -> peekSig curN
             _         -> (tok, curN)
+
+    -- | InstanceSigs: try to detect and skip a type signature line of the
+    -- form @name[, name]* :: type@ at the start of an instance-body
+    -- clause. The caller has already consumed the first @name@ at
+    -- column @bindCol@; @cur@ is positioned just after that identifier.
+    --
+    -- Returns @Just curAfter@ if a sig was skipped (the cursor is at
+    -- the next token with column @<= bindCol@, i.e. the next method or
+    -- the end of the instance body). Returns @Nothing@ if this looks
+    -- like a normal value binding and the caller should handle it.
+    trySkipInstanceSig bindCol cur = do
+        let (t, c) = peekSig cur
+        case tkKind t of
+            TkDColon -> do
+                curAfter <- skipInstanceSigType bindCol c
+                pure (Just curAfter)
+            TkComma -> do
+                -- Multi-name sig: consume comma, expect another ident, recurse.
+                let (t2, c2) = peekSig c
+                case tkKind t2 of
+                    TkIdent _ -> trySkipInstanceSig bindCol c2
+                    -- Qualified/operator variants unlikely inside an
+                    -- instance sig — if we can't continue, fall through.
+                    _ -> pure Nothing
+            _ -> pure Nothing
+
+    -- | Skip the type body of a @name :: <type>@ signature inside an
+    -- instance (or class) body. Stops as soon as a significant token
+    -- appears at column @<= bindCol@ at bracket depth 0, which marks
+    -- the next method binding or the end of the block.
+    skipInstanceSigType bindCol cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+      where
+        go cur b p c = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof     -> pure cur
+                TkNewline -> go cur' b p c
+                _ | tkCol tok <= bindCol && b == 0 && p == 0 && c == 0 -> pure cur
+                TkLParen   -> go cur' b (p + 1) c
+                TkLBracket -> go cur' (b + 1) p c
+                TkLBrace   -> go cur' b p (c + 1)
+                TkRParen   | p > 0 -> go cur' b (p - 1) c
+                TkRParen           -> pure cur
+                TkRBracket | b > 0 -> go cur' (b - 1) p c
+                TkRBracket         -> pure cur
+                TkRBrace   | c > 0 -> go cur' b p (c - 1)
+                TkRBrace           -> pure cur
+                _          -> go cur' b p c
