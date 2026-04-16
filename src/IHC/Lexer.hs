@@ -300,7 +300,7 @@ nextToken s c0 =
                     Just 0x2E                                -- '.'
                         | Just b2 <- peekByte s (p + 1)
                         , isDigit b2                        -- not '..' or '.x'
-                        -> lexFloat start (p + 1)
+                        -> lexFloat start p
                     Just e | e == 0x65 || e == 0x45         -- 'e' or 'E'
                         -> lexFloat start p
                     _ ->
