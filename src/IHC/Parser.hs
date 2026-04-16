@@ -405,22 +405,54 @@ parseBindingsIn src fx (start, end) = do
             let ctx = Ctx src end (tkCol firstTok) fx
             in layout ctx (tkCol firstTok) cur0 []
   where
-    parseOne ctx cur = do
+    -- Parse one clause of a named binding (name + params + = + body).
+    -- Returns (name, params, body-expr, cursor-after).
+    parseClauseRaw ctx cur = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
             _         -> parseErr ctx "expected identifier in binding" nameTok
-        let (eqTok, cur2) = nextSig ctx cur1
+        -- Allow LHS parameters before `=`, e.g. `f x y = body` in where-clauses.
+        (params, cur2) <- collectLetParams ctx cur1 []
+        let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> pure ()
             _    -> parseErr ctx "expected `=` in binding" eqTok
-        (expr, cur3) <- parseExpr ctx cur2
-        pure ((name, expr), cur3)
+        (expr, cur4) <- parseExpr ctx cur3
+        pure (name, params, expr, cur4)
+
+    -- Parse a single binding at the current column, collecting all
+    -- consecutive same-name clauses so multi-clause where-bindings
+    -- (e.g. `f _ [] = ...; f x (y:_) = ...`) are properly desugared.
+    parseOne ctx bindCol cur = do
+        (name, params0, body0, cur1) <- parseClauseRaw ctx cur
+        let clause0 = (params0, RhsPlain body0)
+        -- Peek: if the next binding-column token has the same name,
+        -- it is another clause of the same definition. Collect all of them.
+        (moreClauses, curFinal) <- collectMoreWhereClauses ctx bindCol name cur1 []
+        let allClauses = clause0 : moreClauses
+            arity      = length params0
+        -- Desugar multi-clause or single-clause into a single Expr.
+        let expr = desugarClauses allClauses arity
+        pure ((name, expr), curFinal)
+
+    -- Collect additional same-name clauses (for multi-clause where-bindings).
+    collectMoreWhereClauses ctx bindCol name cur acc = do
+        let (peekTok, _) = nextSig ctx cur
+        case tkKind peekTok of
+            TkIdent n | n == name && tkCol peekTok == bindCol -> do
+                (_, params, body, cur') <- parseClauseRaw ctx cur
+                collectMoreWhereClauses ctx bindCol name cur'
+                    ((params, RhsPlain body) : acc)
+            _ -> pure (reverse acc, cur)
 
     braced ctx cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            (b, cur') <- parseOne ctx cur
+            let (nameTok, _) = nextSig ctx cur
+            -- Peek the bind column from the current position.
+            let bindCol = tkCol nameTok
+            (b, cur') <- parseOne ctx bindCol cur
             let (sep, curN) = nextSig ctx cur'
             case tkKind sep of
                 TkSemi   -> braced ctx curN (b : acc)
@@ -431,7 +463,7 @@ parseBindingsIn src fx (start, end) = do
     layout ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            (b, cur') <- parseOne ctx cur
+            (b, cur') <- parseOne ctx bindCol cur
             let (nextTok, _) = nextSig ctx cur'
             case tkKind nextTok of
                 TkEof -> pure (reverse (b : acc))
