@@ -622,6 +622,9 @@ scanDataDecls src = go Map.empty Map.empty startCursor
                 countCtorFields (n + 1) curAfter
             TkConId _ -> countCtorFields (n + 1) cur'
             TkIdent _ -> countCtorFields (n + 1) cur'
+            -- TkBang is a strictness annotation on the *next* field, not a
+            -- field itself and not a terminator. Skip it and continue.
+            TkBang    -> countCtorFields n cur'
             -- Unrecognized token stops the field scan gracefully.
             _ -> pure (n, cur)
 
