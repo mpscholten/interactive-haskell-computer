@@ -850,3 +850,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/typeapp_promoted.hs")
         n   `shouldBe` 0
         out `shouldBe` "True\n"
+
+    --------------------------------------------------------------------
+    -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
+    --------------------------------------------------------------------
+    it "NamedFieldPuns: Foo { x, y } in construction and pattern" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/named_field_puns.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    it "NamedFieldPuns: postfix record-update r { x } uses in-scope x" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/named_field_puns_update.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "101\n"
+
+    it "NamedFieldPuns: mixing pun + explicit field = value in one record" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/named_field_puns_mixed.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "60\n"
