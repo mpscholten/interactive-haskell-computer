@@ -30,21 +30,26 @@ describeType :: Val -> IO ByteString
 describeType = go
   where
     go :: Val -> IO ByteString
-    go (VInt  _)   = pure "Int"
-    go (VChar _)   = pure "Char"
-    go (VStr  _)   = pure "[Char]"
-    go VUnit       = pure "()"
-    go (VFun  _)   = pure "a -> b"
-    go (VIO   _)   = pure "IO a"
+    go (VInt   _)   = pure "Int"
+    go (VFloat _)   = pure "Double"
+    go (VChar  _)   = pure "Char"
+    go (VStr   _)   = pure "[Char]"
+    go VUnit        = pure "()"
+    go (VFun   _)   = pure "a -> b"
+    go (VFunIP _ _) = pure "a -> b"
+    go (VIO    _)   = pure "IO a"
 
     -- PrimObj variants
-    go (VPrimObj (PrimIORef  _))  = pure "IORef a"
-    go (VPrimObj (PrimHandle _))  = pure "Handle"
+    go (VPrimObj (PrimIORef  _))     = pure "IORef a"
+    go (VPrimObj (PrimHandle _))     = pure "Handle"
     go (VPrimObj (PrimForeignPtr _)) = pure "ForeignPtr Word8"
-    go (VPrimObj (PrimPtr _))     = pure "Ptr Word8"
-    go (VPrimObj (PrimByteArray _)) = pure "ByteArray"
-    go (VPrimObj PrimRealWorld)   = pure "RealWorld#"
-    go (VLabel name)              = pure ("Label \"" <> name <> "\"")
+    go (VPrimObj (PrimPtr _))        = pure "Ptr Word8"
+    go (VPrimObj (PrimByteArray _))  = pure "ByteArray"
+    go (VPrimObj PrimRealWorld)      = pure "RealWorld#"
+    go (VPrimObj (PrimMVar _))       = pure "MVar a"
+    go (VPrimObj (PrimTVar _))       = pure "TVar a"
+    go (VPrimObj (PrimThreadId _))   = pure "ThreadId"
+    go (VLabel name)                 = pure ("Label \"" <> name <> "\"")
 
     -- Booleans
     go (VCon "True"  []) = pure "Bool"

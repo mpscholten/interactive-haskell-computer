@@ -116,6 +116,22 @@ spec = describe "REPL smoke tests" do
         -- Must NOT have actually executed the action
         out `shouldNotContain` "x\n"
 
+    it ":t 1.1 reports Double (regression: non-exhaustive patterns in go)" do
+        (code, out, _err) <- runRepl ":t 1.1\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Double"
+        out `shouldNotContain` "Non-exhaustive"
+
+    it ":t 1 reports Int" do
+        (code, out, _err) <- runRepl ":t 1\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Int"
+
+    it ":t 'a' reports Char" do
+        (code, out, _err) <- runRepl ":t 'a'\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Char"
+
     -- Top-level declaration tests
     it "data Pair = Pair Int Int: constructors available" do
         (code, out, _err) <- runRepl "data Pair = Pair Int Int\nPair 1 2\n:q\n"

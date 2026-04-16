@@ -10,7 +10,7 @@ build-type:         Simple
 tested-with:        GHC == 9.10.*
 
 common warnings
-    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing
+    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing -Werror=incomplete-patterns
 
 common lang
     default-language: GHC2024
