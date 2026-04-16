@@ -48,6 +48,7 @@ import System.Directory
     , getHomeDirectory
     , listDirectory
     )
+import System.Environment (lookupEnv)
 import System.FilePath
     ( (</>)
     , takeDirectory
@@ -321,8 +322,9 @@ emptyBuildInfoStub = libBuildInfo emptyLib
 --------------------------------------------------------------------------------
 
 -- | Enumerate every package cached under @~\/.cache\/ihc\/sources\/@
--- and return the actual source roots (respecting @hs-source-dirs@ from
--- each package's @.cabal@ file).
+-- and (if the @IHC_NIX_SOURCE_DIR@ environment variable is set) under
+-- the nix-provided source tree, returning the actual source roots
+-- (respecting @hs-source-dirs@ from each package's @.cabal@ file).
 --
 -- Algorithm for each subdirectory @\<pkg\>-\<ver\>@:
 --
@@ -334,18 +336,39 @@ emptyBuildInfoStub = libBuildInfo emptyLib
 -- checking whether a @src\/@ subdirectory exists (common convention);
 -- otherwise use the package root itself.
 --
--- Returns an empty list if the cache directory does not exist.
+-- The user-managed @~\/.cache\/ihc\/sources\/@ entries come first so
+-- that locally checked-out overrides shadow the nix bundle.
+--
+-- Returns an empty list if neither directory exists.
 cachedPackageSearchPath :: IO [FilePath]
 cachedPackageSearchPath = do
-    home <- getHomeDirectory
-    let sourcesDir = home </> ".cache" </> "ihc" </> "sources"
-    exists <- doesDirectoryExist sourcesDir
-    if not exists
-        then pure []
-        else do
-            entries <- listDirectory sourcesDir
-            concat <$> mapM (dirsForEntry sourcesDir) entries
+    userDirs <- enumerateSourceDir =<< userCacheDir
+    nixDirs  <- nixSourceDirs
+    pure (userDirs ++ nixDirs)
   where
+    userCacheDir :: IO FilePath
+    userCacheDir = do
+        home <- getHomeDirectory
+        pure (home </> ".cache" </> "ihc" </> "sources")
+
+    -- Enumerate the nix-pinned source tree exported by the devShell.
+    -- If the variable is unset or the path does not exist, returns [].
+    nixSourceDirs :: IO [FilePath]
+    nixSourceDirs = do
+        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
+        case mDir of
+            Nothing  -> pure []
+            Just dir -> enumerateSourceDir dir
+
+    enumerateSourceDir :: FilePath -> IO [FilePath]
+    enumerateSourceDir sourcesDir = do
+        exists <- doesDirectoryExist sourcesDir
+        if not exists
+            then pure []
+            else do
+                entries <- listDirectory sourcesDir
+                concat <$> mapM (dirsForEntry sourcesDir) entries
+
     dirsForEntry sourcesDir entry = do
         let pkgDir = sourcesDir </> entry
         isDir <- doesDirectoryExist pkgDir

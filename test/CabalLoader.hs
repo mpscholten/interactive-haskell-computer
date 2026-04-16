@@ -4,12 +4,17 @@
 -- hit the network; they use a pre-seeded fake cache instead of
 -- calling @cabal get@. The one path that does call out to a real
 -- @cabal@ binary is gated behind @IHC_INTEGRATION_TESTS=1@.
+--
+-- The nix-source-dir smoke test (gated on @IHC_NIX_SOURCE_DIR@ being
+-- set) verifies that the flake-provided Hackage source bundle is
+-- enumerated by 'cachedPackageSearchPath' without any @cabal get@.
 module CabalLoader (spec) where
 
 import qualified Data.ByteString.Char8 as BC
+import Data.List (isPrefixOf, isInfixOf)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
-import System.Directory (canonicalizePath, getCurrentDirectory, makeAbsolute)
+import System.Directory (canonicalizePath, doesDirectoryExist, getCurrentDirectory, listDirectory, makeAbsolute)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import Test.Hspec
@@ -22,6 +27,7 @@ import IHC.CabalProject
     , parseCabalFile
     , parseFreezeFile
     , resolve
+    , cachedPackageSearchPath
     )
 import IHC.PackageStore (buildSearchEnvWithRoot)
 
@@ -140,3 +146,31 @@ spec = describe "Phase 2.7 — Cabal project loader" do
                     pure ()
                 _ ->
                     pendingWith "set IHC_INTEGRATION_TESTS=1 to enable"
+
+    describe "nix source dir (gated on IHC_NIX_SOURCE_DIR being set)" do
+        it "IHC_NIX_SOURCE_DIR contains hspec-* and QuickCheck-* source trees" $ do
+            mNixDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
+            case mNixDir of
+                Nothing ->
+                    pendingWith "IHC_NIX_SOURCE_DIR not set — run inside nix develop"
+                Just nixDir -> do
+                    exists <- doesDirectoryExist nixDir
+                    exists `shouldBe` True
+                    entries <- listDirectory nixDir
+                    let hasHspec      = any ("hspec-"      `isPrefixOf`) entries
+                    let hasQuickCheck = any ("QuickCheck-" `isPrefixOf`) entries
+                    hasHspec      `shouldBe` True
+                    hasQuickCheck `shouldBe` True
+
+        it "cachedPackageSearchPath includes a path inside the nix hspec source tree" $ do
+            mNixDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
+            case mNixDir of
+                Nothing ->
+                    pendingWith "IHC_NIX_SOURCE_DIR not set — run inside nix develop"
+                Just nixDir -> do
+                    paths <- cachedPackageSearchPath
+                    -- At least one path should be rooted inside the nix
+                    -- source dir and belong to hspec.
+                    let nixHspecPaths = filter (\p -> nixDir `isPrefixOf` p
+                                                      && "hspec" `isInfixOf` p) paths
+                    nixHspecPaths `shouldNotBe` []
