@@ -1,0 +1,19 @@
+cabal-version: 2.4
+name:          aeson-probe
+version:       0.1.0.0
+build-type:    Simple
+
+executable probe1
+  main-is:       probe1_import_only.hs
+  build-depends: base, aeson, bytestring
+  default-language: Haskell2010
+
+executable probe2
+  main-is:       probe2_encode_int.hs
+  build-depends: base, aeson, bytestring
+  default-language: Haskell2010
+
+executable probe2b
+  main-is:       probe2b_encode_maybe.hs
+  build-depends: base, aeson, bytestring
+  default-language: Haskell2010
