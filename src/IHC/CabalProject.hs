@@ -202,8 +202,13 @@ extractPinnedVersions bs =
     in mapMaybe extract fragments
   where
     stripComments = BC.unlines
-        . map (BC.takeWhile (/= '-') . killConstraintsPrefix)
+        . map (stripLineComment . killConstraintsPrefix)
         . BC.lines
+    -- Strip a Haskell-style line comment ("--" onwards), being careful
+    -- NOT to strip on a lone '-' — package names may contain hyphens.
+    stripLineComment bs =
+        case BC.breakSubstring (BC.pack "--") bs of
+            (before, _) -> before
     -- Drop a leading @constraints:@ token so the first entry is as
     -- uniform as the others.
     killConstraintsPrefix line =

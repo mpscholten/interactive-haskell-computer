@@ -1,0 +1,5 @@
+constraints: any.optparse-applicative ==0.19.0.0,
+             any.base ==4.19.0.0,
+             any.two-part ==1.2.3,
+             any.a-b-c-d ==0.0.1,
+             optparse-applicative +deprecations-as-errors

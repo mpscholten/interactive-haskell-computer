@@ -71,6 +71,19 @@ spec = describe "Phase 2.7 — Cabal project loader" do
                 , (BC.pack "bytestring", BC.pack "0.12.2.0")
                 ]
 
+        it "correctly parses hyphenated package names (optparse-applicative bug)" do
+            -- The freeze-file parser must split on `==`, not on hyphens.
+            -- A prior bug turned `optparse-applicative ==0.19.0.0` into
+            -- package `optparse`, version `4.19.0.0`.
+            pairs <- parseFreezeFile
+                         (fixtureRoot </> "hyphenated" </> "cabal.project.freeze")
+            pairs `shouldMatchList`
+                [ (BC.pack "optparse-applicative", BC.pack "0.19.0.0")
+                , (BC.pack "base",                 BC.pack "4.19.0.0")
+                , (BC.pack "two-part",             BC.pack "1.2.3")
+                , (BC.pack "a-b-c-d",              BC.pack "0.0.1")
+                ]
+
     describe "parseCabalFile" do
         it "reads hs-source-dirs, default-extensions, cpp-options" do
             let cabalPath = simpleRoot </> "simple.cabal"
