@@ -1,6 +1,7 @@
 module RunFile (spec) where
 
-import Control.Exception (bracket_, try, SomeException)
+import Control.Exception (bracket_, displayException, try, SomeException)
+import Data.List (isInfixOf)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory)
 import System.IO
@@ -10,6 +11,7 @@ import Test.Hspec
 
 import IHC.Driver
 import IHC.Eval (force)
+import IHC.Parser (ParseError(..))
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (readSourceFile)
 import IHC.Val (Val(..))
@@ -661,3 +663,70 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase211/lift_user_data.hs")
         n   `shouldBe` 0
         out `shouldBe` "Red\n"
+
+    --------------------------------------------------------------------
+    -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
+    --------------------------------------------------------------------
+    it "phase 2.9.5: GADT simple — MkInt constructor arity 1, getInt returns field" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/gadt_simple.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.9.5: GADT arity — Pair2 :: Int -> Int -> Pair; pairSum works" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/gadt_arity.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.9.5: GADT constrained — Show constraint adds dict arg, construction works" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/gadt_constrained.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "constructed\n"
+
+    it "phase 2.9.5: existential basic — forall a. Wrap a; arity 1, unwrap returns True" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/existential_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\n"
+
+    it "phase 2.9.5: existential with constraint — forall a. Show a => MkShow a; arity 2" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/existential_with_constraint.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\n"
+
+    it "phase 2.9.5: typeable_prim — toDyn/fromDynamic round-trip for Int" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/typeable_prim.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.9.5: typeable_user — Dynamic works with user-defined data decl present" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/typeable_user.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.9.5: cast_success — cast with same TypeRep returns Just" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/cast_success.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
+    it "phase 2.9.5: cast_fail — cast with different TypeRep returns Nothing" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/cast_fail.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Nothing\n"
+
+    it "phase 2.9.5: dynamic_roundtrip — toDyn/fromDynamic with Int" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase295/dynamic_roundtrip.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n"
+
+    --------------------------------------------------------------------
+    -- Error message quality: parse errors carry file:line:col
+    --------------------------------------------------------------------
+    it "parse error shows file:line:col instead of raw byte offset" do
+        result <- try (runFile "test/Fixtures/Coverage/parse_error_position.hs")
+                      :: IO (Either ParseError Int)
+        case result of
+            Right _ -> expectationFailure "expected a ParseError but the file succeeded"
+            Left err -> do
+                -- displayException must format as  path:LINE:COL
+                let msg = displayException err
+                msg `shouldSatisfy` (":2:" `isInfixOf`)
+                msg `shouldSatisfy` ("parse error at" `isInfixOf`)

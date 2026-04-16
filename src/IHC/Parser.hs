@@ -36,7 +36,7 @@ module IHC.Parser
     , scanFixityDecls
     ) where
 
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception(..), throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
@@ -47,9 +47,19 @@ import IHC.Lexer
 import IHC.Scan (Clause(..))
 import IHC.Source
 
-newtype ParseError = ParseError String
-    deriving stock (Show)
-    deriving anyclass (Exception)
+-- | A parse error carrying the source location so the error handler can
+-- print @file:line:col@ instead of a raw byte offset.
+data ParseError = ParseError
+    { peFile :: !FilePath
+    , peLine :: !Int
+    , peCol  :: !Int
+    , peMsg  :: !String
+    } deriving (Show)
+
+instance Exception ParseError where
+    displayException (ParseError file line col msg) =
+        "parse error at " <> file <> ":" <> show line <> ":" <> show col
+        <> "\n  " <> msg
 
 --------------------------------------------------------------------------------
 -- Fixity table
@@ -193,7 +203,9 @@ parseBodyExpr :: Source -> [Clause] -> IO Expr
 parseBodyExpr src = parseBodyExprWithFixity src defaultFixityTable
 
 parseBodyExprWithFixity :: Source -> FixityTable -> [Clause] -> IO Expr
-parseBodyExprWithFixity _   _ [] = throwIO (ParseError "parseBodyExpr: empty clause list")
+parseBodyExprWithFixity src _ [] = throwIO (ParseError
+    { peFile = srcName src, peLine = 0, peCol = 0
+    , peMsg  = "empty clause list" })
 parseBodyExprWithFixity src fx clauses = do
     parsed <- mapM (parseClause src fx) clauses
     let arity = case parsed of
@@ -203,7 +215,8 @@ parseBodyExprWithFixity src fx clauses = do
                 if length ps == arity
                     then pure ()
                     else throwIO (ParseError
-                        "parseBodyExpr: clauses have differing arities"))
+                        { peFile = srcName src, peLine = 0, peCol = 0
+                        , peMsg  = "clauses have differing arities" }))
           parsed
     pure (desugarClauses parsed arity)
 
@@ -275,14 +288,14 @@ parseRhsIn src fx (start, end) = do
         TkBar -> do
             branches <- parseGuards ctx cur1 []
             pure (RhsGuards branches)
-        _ -> parseErr "expected `=` or `|` at start of RHS" firstTok
+        _ -> parseErr ctx "expected `=` or `|` at start of RHS" firstTok
   where
     parseGuards ctx cur acc = do
         (g, cur1) <- parseExpr ctx cur
         let (eqTok, cur2) = nextSig ctx cur1
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` after guard" eqTok
+            _    -> parseErr ctx "expected `=` after guard" eqTok
         (b, cur3) <- parseExpr ctx cur2
         let (sep, cur4) = nextSig ctx cur3
         case tkKind sep of
@@ -396,11 +409,11 @@ parseBindingsIn src fx (start, end) = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
-            _         -> parseErr "expected identifier in binding" nameTok
+            _         -> parseErr ctx "expected identifier in binding" nameTok
         let (eqTok, cur2) = nextSig ctx cur1
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in binding" eqTok
+            _    -> parseErr ctx "expected `=` in binding" eqTok
         (expr, cur3) <- parseExpr ctx cur2
         pure ((name, expr), cur3)
 
@@ -413,7 +426,7 @@ parseBindingsIn src fx (start, end) = do
                 TkSemi   -> braced ctx curN (b : acc)
                 TkRBrace -> pure (reverse (b : acc))
                 TkEof    -> pure (reverse (b : acc))
-                _        -> parseErr "expected `;` or `}` in let/where" sep
+                _        -> parseErr ctx "expected `;` or `}` in let/where" sep
 
     layout ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
@@ -508,12 +521,12 @@ parseIf ctx cur0 = do
         let (t1, cur2) = nextSig c2 cur1
         case tkKind t1 of
             TkThen -> pure ()
-            _      -> parseErr "expected `then`" t1
+            _      -> parseErr ctx "expected `then`" t1
         (th, cur3) <- parseExpr c2 cur2
         let (t2, cur4) = nextSig c2 cur3
         case tkKind t2 of
             TkElse -> pure ()
-            _      -> parseErr "expected `else`" t2
+            _      -> parseErr ctx "expected `else`" t2
         (el, cur5) <- parseExpr c2 cur4
         pure (EIf cond th el, cur5)
 
@@ -522,7 +535,7 @@ parseIf ctx cur0 = do
         let (arr, cur2) = nextSig c2 cur1
         case tkKind arr of
             TkArrow -> pure ()
-            _       -> parseErr "expected `->` in multi-way if" arr
+            _       -> parseErr ctx "expected `->` in multi-way if" arr
         (b, cur3) <- parseExpr c2 cur2
         let (sep, cur4) = nextSig c2 cur3
         case tkKind sep of
@@ -568,7 +581,7 @@ collectLamPats ctx cur acc = do
     case tkKind tok of
         TkArrow ->
             if null acc
-                then parseErr "expected at least one pattern in lambda" tok
+                then parseErr ctx "expected at least one pattern in lambda" tok
                 else do
                     let (_, curAfter) = nextSig ctx cur
                     pure (reverse acc, curAfter)
@@ -576,7 +589,7 @@ collectLamPats ctx cur acc = do
             (p, cur') <- parseSubPat ctx cur
             collectLamPats ctx cur' (p : acc)
           | otherwise ->
-            parseErr "expected pattern or `->` in lambda" tok
+            parseErr ctx "expected pattern or `->` in lambda" tok
 
 -- | \case { alts }  or  \case <layout alts>.  Desugars to
 -- @\\$lc -> case $lc of { alts }@.
@@ -615,7 +628,7 @@ parseDo ctx cur0 = do
         case tkKind sep of
             TkSemi   -> bracedStmts curN (s : acc)
             TkRBrace -> pure (EDo (reverse (s : acc)), curN)
-            _        -> parseErr "expected `;` or `}` in do-block" sep
+            _        -> parseErr ctx "expected `;` or `}` in do-block" sep
 
     layoutStmts stmtCol cur acc = do
         let stmtCtx = ctx { ctxMinCol = stmtCol }
@@ -666,13 +679,13 @@ parseDoLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
-            _         -> parseErr "expected identifier after `let`" nameTok
+            _         -> parseErr ctx "expected identifier after `let`" nameTok
         -- Allow curried params before `=`, e.g. `let f x y = ...`.
         (params, cur2) <- collectLetParams ctx cur1 []
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in let-binding" eqTok
+            _    -> parseErr ctx "expected `=` in let-binding" eqTok
         (e, cur4) <- parseExpr ctx cur3
         pure ([(name, wrapParams params e)], cur4)
 
@@ -680,18 +693,18 @@ parseDoLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
-            _         -> parseErr "expected identifier in let-binding" nameTok
+            _         -> parseErr ctx "expected identifier in let-binding" nameTok
         (params, cur2) <- collectLetParams ctx cur1 []
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in let-binding" eqTok
+            _    -> parseErr ctx "expected `=` in let-binding" eqTok
         (e, cur4) <- parseExpr ctx cur3
         let (sep, curN) = nextSig ctx cur4
         case tkKind sep of
             TkSemi   -> bracedBinds curN ((name, wrapParams params e) : acc)
             TkRBrace -> pure (reverse ((name, wrapParams params e) : acc), curN)
-            _        -> parseErr "expected `;` or `}` in let-block" sep
+            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
 
 -- | Walk forward collecting parameter patterns between a binder name
 -- and the @=@ in a let-binding. Empty is legal — a plain @let x = e@.
@@ -743,7 +756,7 @@ parseLet ctx cur0 = do
         let (inTok, curIn) = nextSig ctx curEnd
         case tkKind inTok of
             TkIn -> pure ()
-            _    -> parseErr "expected `in` in let-binding" inTok
+            _    -> parseErr ctx "expected `in` in let-binding" inTok
         (body, curBody) <- parseExpr ctx curIn
         pure (ELet binds body, curBody)
 
@@ -751,13 +764,13 @@ parseLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
-            _         -> parseErr "expected identifier after `let`" nameTok
+            _         -> parseErr ctx "expected identifier after `let`" nameTok
         -- Allow curried params before `=`, e.g. `let f x y = ...`.
         (params, cur2) <- collectLetParams ctx cur1 []
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in let-binding" eqTok
+            _    -> parseErr ctx "expected `=` in let-binding" eqTok
         (e, cur4) <- parseExpr ctx cur3
         pure ([(name, wrapParams params e)], cur4)
 
@@ -765,18 +778,18 @@ parseLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
-            _         -> parseErr "expected identifier in let-binding" nameTok
+            _         -> parseErr ctx "expected identifier in let-binding" nameTok
         (params, cur2) <- collectLetParams ctx cur1 []
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in let-binding" eqTok
+            _    -> parseErr ctx "expected `=` in let-binding" eqTok
         (e, cur4) <- parseExpr ctx cur3
         let (sep, curN) = nextSig ctx cur4
         case tkKind sep of
             TkSemi   -> bracedBinds curN ((name, wrapParams params e) : acc)
             TkRBrace -> pure (reverse ((name, wrapParams params e) : acc), curN)
-            _        -> parseErr "expected `;` or `}` in let-block" sep
+            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
 
 -- | Parse @let ?x = e; ?y = f in body@ — one or more implicit-param
 -- bindings followed by @in body@. Produces 'EImplicitLet'.
@@ -793,7 +806,7 @@ parseImplicitLet ctx cur0 = do
     let (inTok, curIn) = nextSig ctx curEnd
     case tkKind inTok of
         TkIn -> pure ()
-        _    -> parseErr "expected `in` after implicit let" inTok
+        _    -> parseErr ctx "expected `in` after implicit let" inTok
     (body, curBody) <- parseExpr ctx curIn
     pure (EImplicitLet iBinds body, curBody)
   where
@@ -801,11 +814,11 @@ parseImplicitLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkImplicitRef n -> pure n
-            _               -> parseErr "expected `?name` in implicit let" nameTok
+            _               -> parseErr ctx "expected `?name` in implicit let" nameTok
         let (eqTok, cur2) = nextSig ctx cur1
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in implicit let" eqTok
+            _    -> parseErr ctx "expected `=` in implicit let" eqTok
         (e, cur3) <- parseExpr ctx cur2
         pure ([(name, e)], cur3)
 
@@ -813,25 +826,25 @@ parseImplicitLet ctx cur0 = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkImplicitRef n -> pure n
-            _               -> parseErr "expected `?name` in implicit let" nameTok
+            _               -> parseErr ctx "expected `?name` in implicit let" nameTok
         let (eqTok, cur2) = nextSig ctx cur1
         case tkKind eqTok of
             TkEq -> pure ()
-            _    -> parseErr "expected `=` in implicit let" eqTok
+            _    -> parseErr ctx "expected `=` in implicit let" eqTok
         (e, cur3) <- parseExpr ctx cur2
         let (sep, curN) = nextSig ctx cur3
         case tkKind sep of
             TkSemi   -> bracedIPBinds curN ((name, e) : acc)
             TkRBrace -> pure (reverse ((name, e) : acc), curN)
-            _        -> parseErr "expected `;` or `}` in implicit let" sep
+            _        -> parseErr ctx "expected `;` or `}` in implicit let" sep
 
 parseCase :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseCase ctx cur0 = do
-    (scrut, curS) <- parseAtom ctx cur0
+    (scrut, curS) <- parseApp ctx cur0
     let (ofTok, curO) = nextSig ctx curS
     case tkKind ofTok of
         TkOf -> pure ()
-        _    -> parseErr "expected `of` in case-expression" ofTok
+        _    -> parseErr ctx "expected `of` in case-expression" ofTok
     let (firstTok, curBody) = nextSig ctx curO
     (alts, curEnd) <- case tkKind firstTok of
         TkLBrace -> bracedAlts ctx curBody []
@@ -845,7 +858,7 @@ bracedAlts ctx cur acc = do
     case tkKind sep of
         TkSemi   -> bracedAlts ctx curN (alt : acc)
         TkRBrace -> pure (reverse (alt : acc), curN)
-        _        -> parseErr "expected `;` or `}` in case alts" sep
+        _        -> parseErr ctx "expected `;` or `}` in case alts" sep
 
 layoutAlts :: Ctx -> Int -> Cursor -> [Alt] -> IO ([Alt], Cursor)
 layoutAlts ctx altCol cur acc = do
@@ -865,7 +878,7 @@ parseAlt ctx altCtx cur = do
     let (arr, cur2) = nextSig ctx cur1
     case tkKind arr of
         TkArrow -> pure ()
-        _       -> parseErr "expected `->` in case alternative" arr
+        _       -> parseErr ctx "expected `->` in case alternative" arr
     (e, cur3) <- parseExpr altCtx cur2
     pure (Alt pat e, cur3)
 
@@ -939,8 +952,8 @@ parseSubPat ctx cur = do
             case tkKind n of
                 TkInt i   -> pure (PLit (LInt (fromInteger (negate i))), cur2)
                 TkFloat d -> pure (PLit (LFloat (negate d)), cur2)
-                _         -> parseErr "expected number after `-` in pattern" n
-        _ -> parseErr "expected pattern (Int, String, _, ident, or constructor)" tok
+                _         -> parseErr ctx "expected number after `-` in pattern" n
+        _ -> parseErr ctx "expected pattern (Int, String, _, ident, or constructor)" tok
 
 -- | Parenthesised pattern: could be a single pattern @(p)@, a tuple
 -- @(p,q,r)@, unit @()@, or a view pattern @(expr -> p)@.
@@ -957,19 +970,19 @@ parseParenPat ctx cur0 = do
             let (arrTok, cur2) = nextSig ctx cur1
             case tkKind arrTok of
                 TkArrow -> pure ()
-                _       -> parseErr "expected `->` in view pattern" arrTok
+                _       -> parseErr ctx "expected `->` in view pattern" arrTok
             (viewPat, cur3) <- parseTopPat ctx cur2
             let (closeTok, cur4) = nextSig ctx cur3
             case tkKind closeTok of
                 TkRParen -> pure (PView viewFn viewPat, cur4)
-                _        -> parseErr "expected `)` after view pattern" closeTok
+                _        -> parseErr ctx "expected `)` after view pattern" closeTok
           | otherwise -> do
             (first, cur1) <- parseTopPat ctx cur0
             let (sep, cur2) = nextSig ctx cur1
             case tkKind sep of
                 TkRParen -> pure (first, cur2)
                 TkComma  -> gatherTuple ctx [first] cur2
-                _        -> parseErr "expected `)` or `,` in pattern" sep
+                _        -> parseErr ctx "expected `)` or `,` in pattern" sep
 
 -- | Check whether there is a @->@ token at paren-depth 0 before the
 -- matching @)@. Used to distinguish view patterns from regular paren patterns.
@@ -998,7 +1011,7 @@ gatherTuple ctx acc cur = do
     case tkKind sep of
         TkComma  -> gatherTuple ctx (p : acc) cur2
         TkRParen -> pure (PTuple (reverse (p : acc)), cur2)
-        _        -> parseErr "expected `,` or `)` in tuple pattern" sep
+        _        -> parseErr ctx "expected `,` or `)` in tuple pattern" sep
 
 parseListPat :: Ctx -> Cursor -> IO (Pat, Cursor)
 parseListPat ctx cur = do
@@ -1020,7 +1033,7 @@ gatherListPat ctx acc cur = do
             let build []     = PCon "[]" []
                 build (p:ps) = PCon ":" [p, build ps]
             in pure (build (reverse acc), cur1)
-        _ -> parseErr "expected `,` or `]` in list pattern" tok
+        _ -> parseErr ctx "expected `,` or `]` in list pattern" tok
 
 -- | Parse record-pattern field list @{ f1 = p1, f2, .. }@. The opening
 -- @{@ has already been consumed. Returns @(fields, cursorAfterClose, isWild)@.
@@ -1036,7 +1049,7 @@ parseRecordPatFields ctx _conName cur acc = do
             let (closeTok, curClose) = nextSig ctx cur'
             case tkKind closeTok of
                 TkRBrace -> pure (reverse acc, curClose, True)
-                _        -> parseErr "expected `}` after `..` in record pattern" closeTok
+                _        -> parseErr ctx "expected `}` after `..` in record pattern" closeTok
         TkIdent fname -> do
             let (eqTok, cur2) = nextSig ctx cur'
             case tkKind eqTok of
@@ -1047,7 +1060,7 @@ parseRecordPatFields ctx _conName cur acc = do
                 -- Note: use cur' (not cur2) so we don't consume the non-`=` token.
                 _ -> parseRecordPatFields ctx _conName cur' ((fname, PVar fname) : acc)
         TkEof -> pure (reverse acc, cur', False)
-        _ -> parseErr "expected field name, `..`, or `}` in record pattern" tok
+        _ -> parseErr ctx "expected field name, `..`, or `}` in record pattern" tok
 
 startsPat :: TokenKind -> Bool
 startsPat (TkInt _)    = True
@@ -1283,7 +1296,7 @@ parseAtom ctx cur0 = do
         -- Phase 3.6: ?name in expression position -> implicit parameter reference
         TkImplicitRef n -> pure (EImplicitRef n, cur1)
         TkIdent n
-            | n == "_" -> parseErr "wildcard `_` in expression position" tok
+            | n == "_" -> parseErr ctx "wildcard `_` in expression position" tok
             | otherwise -> applyRecordDots ctx tok (EVar n) cur1
         TkPrimId n -> pure (EVar n, cur1)
         TkConId n -> do
@@ -1311,9 +1324,9 @@ parseAtom ctx cur0 = do
             let (closeTok, cur3) = nextSig ctx cur2
             case tkKind closeTok of
                 TkRParen -> pure (ESplice inner, cur3)
-                _        -> parseErr "expected `)` to close splice $(...)" closeTok
-        TkEof -> throwIO (ParseError ("empty expression at offset " <> show (tkStart tok)))
-        _ -> parseErr "unexpected token" tok
+                _        -> parseErr ctx "expected `)` to close splice $(...)" closeTok
+        TkEof -> parseErr ctx "unexpected end of input" tok
+        _ -> parseErr ctx "unexpected token" tok
 
 -- | Dispatcher for everything that lives inside @( ... )@. Covers:
 --
@@ -1353,7 +1366,7 @@ parseParenExpr ctx _openTok cur0 = do
                             let (sep, cur2) = nextSig ctx cur1
                             case tkKind sep of
                                 TkRParen -> pure (e, cur2)
-                                _ -> parseErr "expected `)` after record-dot section" sep
+                                _ -> parseErr ctx "expected `)` after record-dot section" sep
                 _ -> do
                     -- Dot is not adjacent to an ident: treat as composition
                     -- operator `(.)` or a right section `(. f)`.
@@ -1368,7 +1381,7 @@ parseParenExpr ctx _openTok cur0 = do
                                     let n = "$s"
                                         body = EApp (EApp (EVar ".") (EVar n)) rhs
                                     in pure (ELam n body, curC)
-                                _ -> parseErr "expected `)` in composition section" closeTok
+                                _ -> parseErr ctx "expected `)` in composition section" closeTok
         -- Operator-as-value, optionally followed by right-operand (section).
         _ | Just opName <- tokenOpName (tkKind peek)
           , tkKind peek /= TkMinus        -- `(-1)` is NEG 1, not a section
@@ -1385,7 +1398,7 @@ parseParenExpr ctx _openTok cur0 = do
                             let n = "$s"
                                 body = EApp (EApp (EVar opName) (EVar n)) rhs
                             in pure (ELam n body, curC)
-                        _ -> parseErr "expected `)` in section" closeTok
+                        _ -> parseErr ctx "expected `)` in section" closeTok
           | tkKind peek == TkBacktick -> do
             -- Backtick section: (`f` e) = \$x -> f $x e
             let (idTok, curId) = nextSig ctx curP
@@ -1405,9 +1418,9 @@ parseParenExpr ctx _openTok cur0 = do
                                             let n = "$s"
                                                 body = EApp (EApp (EVar fn) (EVar n)) rhs
                                             in pure (ELam n body, curC)
-                                        _ -> parseErr "expected `)` in backtick section" closeTok
-                        _ -> parseErr "expected closing backtick in section" bt2
-                _ -> parseErr "expected identifier in backtick section" idTok
+                                        _ -> parseErr ctx "expected `)` in backtick section" closeTok
+                        _ -> parseErr ctx "expected closing backtick in section" bt2
+                _ -> parseErr ctx "expected identifier in backtick section" idTok
         -- TupleSections: leading hole — @(, e, f)@ has no first expression.
         -- Collect all elements (some may be holes), then desugar with lambdas.
         TkComma -> do
@@ -1441,7 +1454,7 @@ parseParenExpr ctx _openTok cur0 = do
                             let n = "$s"
                                 body = EApp (EApp (EVar opName) e) (EVar n)
                             in pure (ELam n body, curAfterOp)
-                        _ -> parseErr "expected `)` after operator in section" afterOp
+                        _ -> parseErr ctx "expected `)` after operator in section" afterOp
                   | tkKind sep == TkBacktick -> do
                     -- Left backtick section: (e `f`)
                     let (idTok, curId) = nextSig ctx cur2
@@ -1456,10 +1469,10 @@ parseParenExpr ctx _openTok cur0 = do
                                             let n = "$s"
                                                 body = EApp (EApp (EVar fn) e) (EVar n)
                                             in pure (ELam n body, curAfterOp)
-                                        _ -> parseErr "expected `)` after left backtick section" afterOp
-                                _ -> parseErr "expected closing backtick in left section" bt2
-                        _ -> parseErr "expected identifier in backtick section" idTok
-                _ -> parseErr "expected `)` or `,` in parenthesised expression" sep
+                                        _ -> parseErr ctx "expected `)` after left backtick section" afterOp
+                                _ -> parseErr ctx "expected closing backtick in left section" bt2
+                        _ -> parseErr ctx "expected identifier in backtick section" idTok
+                _ -> parseErr ctx "expected `)` or `,` in parenthesised expression" sep
 
 -- | Collect elements of a tuple section. Each element is either a
 -- 'Just expr' (present) or 'Nothing' (hole — a lambda-bound argument).
@@ -1481,7 +1494,7 @@ gatherTupleSectionElems ctx cur acc = do
             case tkKind sep of
                 TkComma  -> gatherTupleSectionElems ctx cur2 (Just e : acc)
                 TkRParen -> pure (reverse (Just e : acc), cur2)
-                _        -> parseErr "expected `,` or `)` in tuple section" sep
+                _        -> parseErr ctx "expected `,` or `)` in tuple section" sep
 
 isTsHole :: Maybe a -> Bool
 isTsHole Nothing  = True
@@ -1522,7 +1535,7 @@ parseRecordFields ctx conName cur acc = do
             let (closeTok, curClose) = nextSig ctx cur'
             case tkKind closeTok of
                 TkRBrace -> pure (reverse acc, curClose, True)
-                _        -> parseErr "expected `}` after `..` in record construction" closeTok
+                _        -> parseErr ctx "expected `}` after `..` in record construction" closeTok
         TkIdent fname -> do
             let (eqTok, cur2) = nextSig ctx cur'
             case tkKind eqTok of
@@ -1533,7 +1546,7 @@ parseRecordFields ctx conName cur acc = do
                 -- Note: use cur' (not cur2) so we don't consume the non-`=` token.
                 _ -> parseRecordFields ctx conName cur' ((fname, EVar fname) : acc)
         TkEof -> pure (reverse acc, cur', False)
-        _ -> parseErr "expected field name or `}` in record literal" tok
+        _ -> parseErr ctx "expected field name or `}` in record literal" tok
 
 parseUnboxedTuple :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseUnboxedTuple ctx cur0 = do
@@ -1561,7 +1574,7 @@ parseUnboxedTuple ctx cur0 = do
                                 con  = EVar conName
                                 expr = foldl EApp con elems
                             pure (expr, curEnd)
-                        _ -> parseErr "expected `,` or `#)` in unboxed tuple" sep
+                        _ -> parseErr ctx "expected `,` or `#)` in unboxed tuple" sep
   where
     gatherUnboxed c cur acc = do
         (e, cur1) <- parseExpr c cur
@@ -1571,7 +1584,7 @@ parseUnboxedTuple ctx cur0 = do
                 let (sep, cur2) = nextSig c cur1
                 case tkKind sep of
                     TkComma -> gatherUnboxed c cur2 (e : acc)
-                    _       -> parseErr "expected `,` or `#)` in unboxed tuple" sep
+                    _       -> parseErr ctx "expected `,` or `#)` in unboxed tuple" sep
 
 -- | Is the next token sequence an unboxed-tuple close: @#)@?
 isUnboxClose :: Ctx -> Cursor -> Bool
@@ -1690,7 +1703,7 @@ parseListLit ctx cur0 = do
                         case tkKind close of
                             TkRBracket ->
                                 pure (EApp (EApp (EVar "enumFromTo") first) hi, cur4)
-                            _ -> parseErr "expected `]` after range upper bound" close
+                            _ -> parseErr ctx "expected `]` after range upper bound" close
             -- Step range: after gathering [first, second, we see '..'
             TkComma -> do
                 (second, cur2) <- parseExpr ctx cur1
@@ -1710,7 +1723,7 @@ parseListLit ctx cur0 = do
                                         pure ( EApp (EApp (EApp (EVar "enumFromThenTo")
                                                                first) second) hi
                                              , cur5 )
-                                    _ -> parseErr "expected `]` after range upper bound" close
+                                    _ -> parseErr ctx "expected `]` after range upper bound" close
                     -- Plain list: continue gathering
                     _ -> gatherMore [second, first] cur2
             TkRBracket -> pure (buildCons [first], cur1)
@@ -1718,7 +1731,7 @@ parseListLit ctx cur0 = do
             TkBar -> do
                 curEnd <- skipToCloseBracket ctx cur1
                 pure (buildCons [first], curEnd)
-            _ -> parseErr "expected `,`, `..`, or `]` in list literal" tok
+            _ -> parseErr ctx "expected `,`, `..`, or `]` in list literal" tok
 
     gatherMore acc cur = do
         let (tok, cur1) = nextSig ctx cur
@@ -1730,7 +1743,7 @@ parseListLit ctx cur0 = do
             TkBar -> do
                 curEnd <- skipToCloseBracket ctx cur1
                 pure (buildCons (reverse acc), curEnd)
-            _ -> parseErr "expected `,` or `]` in list literal" tok
+            _ -> parseErr ctx "expected `,` or `]` in list literal" tok
 
     buildCons :: [Expr] -> Expr
     buildCons []     = EVar "[]"
@@ -1761,7 +1774,11 @@ skipToCloseBracket ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
 -- Errors
 --------------------------------------------------------------------------------
 
-parseErr :: String -> Token -> IO a
-parseErr msg tok =
-    throwIO (ParseError (msg <> " at offset " <> show (tkStart tok)
-                         <> " but saw " <> show (tkKind tok)))
+parseErr :: Ctx -> String -> Token -> IO a
+parseErr ctx msg tok =
+    throwIO (ParseError
+        { peFile = srcName (ctxSrc ctx)
+        , peLine = tkLine tok
+        , peCol  = tkCol  tok
+        , peMsg  = msg <> "; saw " <> show (tkKind tok)
+        })
