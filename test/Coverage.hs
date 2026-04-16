@@ -16,7 +16,7 @@ fixtureDir = "test/Fixtures/Coverage"
 
 -- | Quick-wins fixtures: one-off language-extension fixtures tracked by
 -- the IHP roadmap (Tier 3 in what-is-still-needed-groovy-lobster.md).
--- Separate directory so InstanceSigs / NamedFieldPuns / etc.
+-- Separate directory so InstanceSigs / NamedFieldPuns / StandaloneDeriving
 -- regressions are easy to locate.
 quickWinsDir :: FilePath
 quickWinsDir = "test/Fixtures/QuickWins"
