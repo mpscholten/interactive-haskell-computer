@@ -148,6 +148,12 @@ eval env ipm = go
         thunks <- mapM (\(_, e) -> newThunkIP env ipm e) fields
         pure (VCon name thunks)
 
+    -- RecordWildCards construction: ERecordWild should be desugared by the
+    -- scheduler's desugarRecordCons pass before reaching eval.
+    go (ERecordWild n) =
+        error ("IHC.Eval: ERecordWild reached eval — desugarRecordCons missed: "
+               <> BC.unpack n)
+
     -- Phase 2.11: TH splices should be expanded before eval by the
     -- scheduler's expandSplicesInModule pass. If one reaches here it's
     -- a bug — report it clearly rather than looping.
@@ -236,6 +242,19 @@ matchPat (PCon name pats) (VCon vname vthunks)
             Nothing   -> pure Nothing
             Just subs -> matchFields rest (reverse subs ++ acc)
 matchPat (PCon _ _) _ = pure Nothing
+-- Record patterns: should have been desugared to PCon by the scheduler.
+-- If they reach here (e.g. in a standalone test), fall back to failure.
+matchPat (PRecord _ _) _ = pure Nothing
+matchPat (PRecordWild _) _ = pure Nothing
+-- ViewPatterns: (f -> p) matches v when f v matches p.
+-- We evaluate f v and then match the result against p.
+matchPat (PView fn p) v = do
+    -- f is an Expr; we need an Env to evaluate it. We don't have the
+    -- env here, so ViewPatterns MUST be desugared before reaching Eval.
+    -- This case is a safeguard — in practice desugarRecordPats converts
+    -- PView into a case expression via desugarViewPat in the scheduler.
+    error ("IHC.Eval: PView reached matchPat — view pattern not desugared: "
+            <> show fn <> " -> " <> show p)
 
 --------------------------------------------------------------------------------
 -- apply

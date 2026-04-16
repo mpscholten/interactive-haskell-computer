@@ -401,6 +401,7 @@ expandSplicesInExpr env ipm depth expr
     go (ERecordCon n fields) = do
         fields' <- mapM (\(fn, fe) -> (fn,) <$> go fe) fields
         pure (ERecordCon n fields')
+    go (ERecordWild n) = pure (ERecordWild n)
 
     goAlt (Alt p e) = Alt p <$> go e
 

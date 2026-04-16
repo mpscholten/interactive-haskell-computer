@@ -42,6 +42,7 @@ data Expr
     | EImplicitRef  !Name              -- ?name reference (Phase 3.6)
     | EImplicitLet  ![(Name, Expr)] !Expr -- let ?x = e in body (Phase 3.6)
     | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
+    | ERecordWild !Name                -- Con {..} — RecordWildCards construction
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
     deriving (Eq, Show)
 
@@ -70,6 +71,9 @@ data Pat
     | PAs   !Name !Pat                  -- xs\@(x:_) as-pattern (Phase 2.6)
     | PBang !Pat                        -- !x bang-pattern — we ignore strictness (Phase 2.6)
     | PTuple ![Pat]                     -- (a, b, ...) tuple pattern (Phase 2.6)
+    | PRecord !Name ![(Name, Pat)]      -- Con { f1 = p1, f2 = p2, ... } record pattern (NamedFieldPuns)
+    | PRecordWild !Name                 -- Con {..} — RecordWildCards pattern
+    | PView !Expr !Pat                  -- (f -> p) view pattern (ViewPatterns)
     deriving (Eq, Show)
 
 data Lit

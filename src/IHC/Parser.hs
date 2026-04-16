@@ -339,6 +339,16 @@ matchPatterns ((p, argName) : rest) body fallback =
         PWild ->
             matchPatterns rest body fallback
         PBang inner -> matchPatterns ((inner, argName) : rest) body fallback
+        -- ViewPatterns: (f -> p) desugars to
+        --   let $vpN = f argName in case $vpN of { p -> restBody; _ -> fallback }
+        PView fn vp ->
+            let n = BC.pack ("$vp" <> BC.unpack argName)
+                vpBody = matchPatterns rest body fallback
+            in ELet [(n, EApp fn (EVar argName))]
+                   (ECase (EVar n)
+                       [ Alt vp vpBody
+                       , Alt PWild fallback
+                       ])
         _ ->
             ECase (EVar argName)
                 [ Alt p (matchPatterns rest body fallback)
@@ -875,12 +885,18 @@ parseTopPatNoCons ctx cur = do
 
 collectArgs :: Ctx -> Name -> [Pat] -> Cursor -> IO (Pat, Cursor)
 collectArgs ctx name acc cur =
-    let (tok, _) = nextSig ctx cur in
-    if startsPat (tkKind tok)
-        then do
-            (sp, cur') <- parseSubPat ctx cur
-            collectArgs ctx name (sp : acc) cur'
-        else pure (PCon name (reverse acc), cur)
+    let (tok, cur') = nextSig ctx cur in
+    case tkKind tok of
+        -- Record-syntax pattern: Con { f1 = p1, f2 = p2 } or Con {..}
+        TkLBrace -> do
+            (fieldPats, curEnd, isWild) <- parseRecordPatFields ctx name cur' []
+            if isWild
+                then pure (PRecordWild name, curEnd)
+                else pure (PRecord name fieldPats, curEnd)
+        _ | startsPat (tkKind tok) -> do
+            (sp, cur'') <- parseSubPat ctx cur
+            collectArgs ctx name (sp : acc) cur''
+          | otherwise -> pure (PCon name (reverse acc), cur)
 
 -- | A sub-pattern. Handles as-patterns @name\@sub@, bang patterns,
 -- tuples, negative-literal patterns, etc.
@@ -917,19 +933,53 @@ parseSubPat ctx cur = do
         _ -> parseErr "expected pattern (Int, String, _, ident, or constructor)" tok
 
 -- | Parenthesised pattern: could be a single pattern @(p)@, a tuple
--- @(p,q,r)@, or unit @()@. The opening @(@ has been consumed.
+-- @(p,q,r)@, unit @()@, or a view pattern @(expr -> p)@.
+-- The opening @(@ has been consumed.
 parseParenPat :: Ctx -> Cursor -> IO (Pat, Cursor)
 parseParenPat ctx cur0 = do
     let (peek, curP) = nextSig ctx cur0
     case tkKind peek of
         TkRParen -> pure (PCon "()" [], curP)
-        _ -> do
+        -- ViewPatterns: peek ahead for `->` at paren-depth 0.
+        -- If found, parse the LHS as an expression and RHS as a pattern.
+        _ | peekViewArrow ctx cur0 -> do
+            (viewFn, cur1) <- parseExpr ctx cur0
+            let (arrTok, cur2) = nextSig ctx cur1
+            case tkKind arrTok of
+                TkArrow -> pure ()
+                _       -> parseErr "expected `->` in view pattern" arrTok
+            (viewPat, cur3) <- parseTopPat ctx cur2
+            let (closeTok, cur4) = nextSig ctx cur3
+            case tkKind closeTok of
+                TkRParen -> pure (PView viewFn viewPat, cur4)
+                _        -> parseErr "expected `)` after view pattern" closeTok
+          | otherwise -> do
             (first, cur1) <- parseTopPat ctx cur0
             let (sep, cur2) = nextSig ctx cur1
             case tkKind sep of
                 TkRParen -> pure (first, cur2)
                 TkComma  -> gatherTuple ctx [first] cur2
                 _        -> parseErr "expected `)` or `,` in pattern" sep
+
+-- | Check whether there is a @->@ token at paren-depth 0 before the
+-- matching @)@. Used to distinguish view patterns from regular paren patterns.
+peekViewArrow :: Ctx -> Cursor -> Bool
+peekViewArrow ctx cur0 = go cur0 (0 :: Int)
+  where
+    go cur !depth =
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            TkEof    -> False
+            TkRParen | depth == 0 -> False
+            TkRParen              -> go cur' (depth - 1)
+            TkLParen              -> go cur' (depth + 1)
+            TkLBracket            -> go cur' (depth + 1)
+            TkRBracket            -> go cur' (depth - 1)
+            TkLBrace              -> go cur' (depth + 1)
+            TkRBrace              -> go cur' (depth - 1)
+            TkComma  | depth == 0 -> False   -- tuple pattern, not view
+            TkArrow  | depth == 0 -> True
+            _                     -> go cur' depth
 
 gatherTuple :: Ctx -> [Pat] -> Cursor -> IO (Pat, Cursor)
 gatherTuple ctx acc cur = do
@@ -961,6 +1011,33 @@ gatherListPat ctx acc cur = do
                 build (p:ps) = PCon ":" [p, build ps]
             in pure (build (reverse acc), cur1)
         _ -> parseErr "expected `,` or `]` in list pattern" tok
+
+-- | Parse record-pattern field list @{ f1 = p1, f2, .. }@. The opening
+-- @{@ has already been consumed. Returns @(fields, cursorAfterClose, isWild)@.
+-- Supports NamedFieldPuns: @{ x }@ → @[("x", PVar "x")]@.
+-- Supports RecordWildCards: @{..}@ sets @isWild = True@.
+parseRecordPatFields :: Ctx -> Name -> Cursor -> [(Name, Pat)] -> IO ([(Name, Pat)], Cursor, Bool)
+parseRecordPatFields ctx _conName cur acc = do
+    let (tok, cur') = nextSig ctx cur
+    case tkKind tok of
+        TkRBrace -> pure (reverse acc, cur', False)
+        TkComma  -> parseRecordPatFields ctx _conName cur' acc
+        TkDotDot -> do
+            let (closeTok, curClose) = nextSig ctx cur'
+            case tkKind closeTok of
+                TkRBrace -> pure (reverse acc, curClose, True)
+                _        -> parseErr "expected `}` after `..` in record pattern" closeTok
+        TkIdent fname -> do
+            let (eqTok, cur2) = nextSig ctx cur'
+            case tkKind eqTok of
+                TkEq -> do
+                    (p, cur3) <- parseTopPat ctx cur2
+                    parseRecordPatFields ctx _conName cur3 ((fname, p) : acc)
+                -- NamedFieldPuns: { x } → { x = x }
+                -- Note: use cur' (not cur2) so we don't consume the non-`=` token.
+                _ -> parseRecordPatFields ctx _conName cur' ((fname, PVar fname) : acc)
+        TkEof -> pure (reverse acc, cur', False)
+        _ -> parseErr "expected field name, `..`, or `}` in record pattern" tok
 
 startsPat :: TokenKind -> Bool
 startsPat (TkInt _)    = True
@@ -1209,8 +1286,10 @@ parseAtom ctx cur0 = do
                     case tkKind nextTk of
                         TkLBrace -> do
                             -- Record literal: parse field-list then closing '}'
-                            (fields, curEnd) <- parseRecordFields ctx curAfterBrace []
-                            pure (ERecordCon qname fields, curEnd)
+                            (fields, curEnd, isWild) <- parseRecordFields ctx qname curAfterBrace []
+                            if isWild
+                                then pure (ERecordWild qname, curEnd)
+                                else pure (ERecordCon qname fields, curEnd)
                         _ -> pure (qexpr, qcur)
                 _ -> pure (qexpr, qcur)
         TkLParen   -> parseParenExpr ctx tok cur1
@@ -1319,10 +1398,15 @@ parseParenExpr ctx _openTok cur0 = do
                                         _ -> parseErr "expected `)` in backtick section" closeTok
                         _ -> parseErr "expected closing backtick in section" bt2
                 _ -> parseErr "expected identifier in backtick section" idTok
+        -- TupleSections: leading hole — @(, e, f)@ has no first expression.
+        -- Collect all elements (some may be holes), then desugar with lambdas.
+        TkComma -> do
+            (rest, curEnd) <- gatherTupleSectionElems ctx curP []
+            pure (desugarTupleSection (Nothing : rest), curEnd)
         _ -> do
             -- Fully general expression, possibly followed by:
             --   - `)`  → single expression, or unit.
-            --   - `,`  → tuple, collect more.
+            --   - `,`  → tuple or tuple section, collect more.
             --   - `::` → type annotation, swallow to matching `)`.
             --   - an operator + `)` → left section.
             (e, cur1) <- parseExpr ctx cur0
@@ -1330,8 +1414,12 @@ parseParenExpr ctx _openTok cur0 = do
             case tkKind sep of
                 TkRParen -> pure (e, cur2)
                 TkComma  -> do
-                    (rest, curEnd) <- gatherTupleExpr ctx cur2 []
-                    pure (ETuple (e : rest), curEnd)
+                    -- Check for tuple section: next token is `,` or `)` → hole.
+                    (rest, curEnd) <- gatherTupleSectionElems ctx cur2 []
+                    let elems = Just e : rest
+                    if any isTsHole elems
+                        then pure (desugarTupleSection elems, curEnd)
+                        else pure (ETuple (map fromJustTs elems), curEnd)
                 TkDColon -> do
                     curEnd <- skipTypeToClose ctx cur2
                     pure (e, curEnd)
@@ -1363,33 +1451,78 @@ parseParenExpr ctx _openTok cur0 = do
                         _ -> parseErr "expected identifier in backtick section" idTok
                 _ -> parseErr "expected `)` or `,` in parenthesised expression" sep
 
--- | Collect more tuple components after the first @,@. Starts just after
--- a comma.
-gatherTupleExpr :: Ctx -> Cursor -> [Expr] -> IO ([Expr], Cursor)
-gatherTupleExpr ctx cur acc = do
-    (e, cur1) <- parseExpr ctx cur
-    let (sep, cur2) = nextSig ctx cur1
-    case tkKind sep of
-        TkComma  -> gatherTupleExpr ctx cur2 (e : acc)
-        TkRParen -> pure (reverse (e : acc), cur2)
-        _        -> parseErr "expected `,` or `)` in tuple" sep
+-- | Collect elements of a tuple section. Each element is either a
+-- 'Just expr' (present) or 'Nothing' (hole — a lambda-bound argument).
+-- The cursor is positioned just after a @,@ when called.
+-- Collects elements and terminating @)@.
+gatherTupleSectionElems :: Ctx -> Cursor -> [Maybe Expr] -> IO ([Maybe Expr], Cursor)
+gatherTupleSectionElems ctx cur acc = do
+    let (peek, curP) = nextSig ctx cur
+    case tkKind peek of
+        TkRParen ->
+            -- Trailing comma before `)`: last element is a hole.
+            pure (reverse (Nothing : acc), curP)
+        TkComma ->
+            -- Two commas in a row: current slot is a hole.
+            gatherTupleSectionElems ctx curP (Nothing : acc)
+        _ -> do
+            (e, cur1) <- parseExpr ctx cur
+            let (sep, cur2) = nextSig ctx cur1
+            case tkKind sep of
+                TkComma  -> gatherTupleSectionElems ctx cur2 (Just e : acc)
+                TkRParen -> pure (reverse (Just e : acc), cur2)
+                _        -> parseErr "expected `,` or `)` in tuple section" sep
+
+isTsHole :: Maybe a -> Bool
+isTsHole Nothing  = True
+isTsHole (Just _) = False
+
+fromJustTs :: Maybe Expr -> Expr
+fromJustTs (Just e) = e
+fromJustTs Nothing  = error "IHC.Parser: impossible hole in non-section tuple"
+
+-- | Desugar a tuple section into a lambda. Each 'Nothing' slot becomes
+-- a fresh lambda parameter @$tsN@. The body is an 'ETuple'.
+desugarTupleSection :: [Maybe Expr] -> Expr
+desugarTupleSection elems =
+    let holes = [i | (i, Nothing) <- zip [0 :: Int ..] elems]
+        names = [BC.pack ("$ts" ++ show i) | i <- holes]
+        nameMap = Map.fromList (zip holes names)
+        body  = ETuple [ case me of
+                            Just e  -> e
+                            Nothing -> EVar (nameMap Map.! i)
+                       | (i, me) <- zip [0 :: Int ..] elems
+                       ]
+    in foldr ELam body names
+
 
 -- | Parse a record-field list @{ f1 = e1, f2 = e2, ... }@. The opening
 -- @{@ has already been consumed. Returns the fields and cursor after @}@.
-parseRecordFields :: Ctx -> Cursor -> [(Name, Expr)] -> IO ([(Name, Expr)], Cursor)
-parseRecordFields ctx cur acc = do
+-- Supports NamedFieldPuns (@{ x }@ → @{ x = x }@) and RecordWildCards
+-- (@{..}@ → an 'ERecordWild' placeholder resolved by the scheduler).
+parseRecordFields :: Ctx -> Name -> Cursor -> [(Name, Expr)] -> IO ([(Name, Expr)], Cursor, Bool)
+parseRecordFields ctx conName cur acc = do
     let (tok, cur') = nextSig ctx cur
     case tkKind tok of
-        TkRBrace -> pure (reverse acc, cur')
-        TkComma  -> parseRecordFields ctx cur' acc
+        TkRBrace -> pure (reverse acc, cur', False)
+        TkComma  -> parseRecordFields ctx conName cur' acc
+        -- RecordWildCards: {..} — return a sentinel flag; the caller wraps
+        -- the whole ERecordCon into an ERecordWild.
+        TkDotDot -> do
+            let (closeTok, curClose) = nextSig ctx cur'
+            case tkKind closeTok of
+                TkRBrace -> pure (reverse acc, curClose, True)
+                _        -> parseErr "expected `}` after `..` in record construction" closeTok
         TkIdent fname -> do
             let (eqTok, cur2) = nextSig ctx cur'
             case tkKind eqTok of
                 TkEq -> do
                     (e, cur3) <- parseExpr ctx cur2
-                    parseRecordFields ctx cur3 ((fname, e) : acc)
-                _ -> parseErr "expected `=` in record field" eqTok
-        TkEof -> pure (reverse acc, cur')
+                    parseRecordFields ctx conName cur3 ((fname, e) : acc)
+                -- NamedFieldPuns: { x } or { x, y } — no `=`, bind to same name.
+                -- Note: use cur' (not cur2) so we don't consume the non-`=` token.
+                _ -> parseRecordFields ctx conName cur' ((fname, EVar fname) : acc)
+        TkEof -> pure (reverse acc, cur', False)
         _ -> parseErr "expected field name or `}` in record literal" tok
 
 parseUnboxedTuple :: Ctx -> Cursor -> IO (Expr, Cursor)

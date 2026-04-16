@@ -326,7 +326,8 @@ evalMethod :: Env -> LoadedModule -> (ByteString, BindingLhs) -> IO Val
 evalMethod env lm (_, lhs) = do
     expr0 <- Parser.parseBodyExprWithFixity
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
-    let expr = desugarRecordCons (lmFieldReg lm) expr0
+    let expr = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0)
     -- Evaluate the method expression to a Val in the global env.
     -- We need Eval here but can't import it (cycle). Use a thunk trick:
     -- make a thunk and force it immediately.
@@ -413,6 +414,7 @@ rewriteExpr rw = go []
         ETuple es   -> ETuple (map (go bound) es)
         ERecordCon n fields ->
             ERecordCon n [(fname, go bound e) | (fname, e) <- fields]
+        ERecordWild n   -> ERecordWild n
         EImplicitRef n  -> EImplicitRef n
         EImplicitLet bs e ->
             let names  = map fst bs
@@ -434,12 +436,15 @@ rewriteExpr rw = go []
             bs'   = [(n, go bound' b) | (n, b) <- bs]
         in SLet bs' : goStmts bound' rest
 
-    patBound (PVar n)    = [n]
-    patBound (PCon _ ps) = concatMap patBound ps
-    patBound (PAs n p)   = n : patBound p
-    patBound (PBang p)   = patBound p
-    patBound (PTuple ps) = concatMap patBound ps
-    patBound _           = []
+    patBound (PVar n)        = [n]
+    patBound (PCon _ ps)     = concatMap patBound ps
+    patBound (PAs n p)       = n : patBound p
+    patBound (PBang p)       = patBound p
+    patBound (PTuple ps)     = concatMap patBound ps
+    patBound (PRecord _ fps) = concatMap (patBound . snd) fps
+    patBound (PRecordWild _) = []
+    patBound (PView _ p)     = patBound p
+    patBound _               = []
 
 -- | Build the alias environment for the entry module: every unqualified
 -- import makes its bindings available under the local (bare) name in
@@ -668,7 +673,8 @@ discoverInModule registry searchPath lm name
                                     (lmSource lm)
                                     (lmFixity lm)
                                     (lhsClauses lhs)
-                        let expr = desugarRecordCons (lmFieldReg lm) expr0
+                        let expr = desugarRecordPats (lmFieldReg lm)
+                                     (desugarRecordCons (lmFieldReg lm) expr0)
                         modifyIORef' (lmBodies lm) (Map.insert name expr)
                         -- Recurse into every free var. Qualified ones
                         -- will be routed on the next call.
@@ -819,11 +825,13 @@ freeVars = goAll []
         ENeg e      -> goAll bound e
         ETuple es   -> concatMap (goAll bound) es
         ERecordCon _ fields -> concatMap (goAll bound . snd) fields
+        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
         EImplicitRef _  -> []
         EImplicitLet bs e ->
             let names = map fst bs
                 bound' = names ++ bound
             in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
+        ESplice inner   -> goAll bound inner
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
@@ -839,16 +847,23 @@ freeVars = goAll []
     goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
 
     patBound :: Pat -> [ByteString]
-    patBound (PVar n)    = [n]
-    patBound (PCon _ ps) = concatMap patBound ps
-    patBound (PAs n p)   = n : patBound p
-    patBound (PBang p)   = patBound p
-    patBound (PTuple ps) = concatMap patBound ps
-    patBound _           = []
+    patBound (PVar n)            = [n]
+    patBound (PCon _ ps)         = concatMap patBound ps
+    patBound (PAs n p)           = n : patBound p
+    patBound (PBang p)           = patBound p
+    patBound (PTuple ps)         = concatMap patBound ps
+    patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
+    patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
+    patBound (PView _ p)         = patBound p
+    patBound _                   = []
 
 -- | Desugar @ERecordCon Con [(f1,e1),(f2,e2)]@ into the equivalent
 -- positional application @Con e_at_0 e_at_1@ using the FieldRegistry to
 -- determine the correct field ordering.
+--
+-- Also desugars 'ERecordWild' (RecordWildCards construction):
+--   @Con {..}@ → @Con f0 f1 ...@ where each @fi@ is @EVar fi@
+--   (i.e., all fields must be in scope with the same name).
 --
 -- Fields not found in the registry are placed in declaration order (graceful
 -- degradation for programs without scanDataDecls coverage).
@@ -873,6 +888,13 @@ desugarRecordCons fldReg = go
             args = [ Map.findWithDefault (errExpr i) i byIndex
                    | i <- [0 .. maxIdx] ]
         in foldl EApp (EVar conName) args
+    -- RecordWildCards construction: Con {..}
+    -- Expand to Con f0 f1 ... using field order from FieldRegistry.
+    go (ERecordWild conName) =
+        let fieldPairs = conFields fldReg conName
+            -- Build positional list sorted by field index.
+            args = map (\(fname, _) -> EVar fname) fieldPairs
+        in foldl EApp (EVar conName) args
     -- Recurse into all sub-expressions.
     go (EApp f x)       = EApp (go f) (go x)
     go (ELam n e)       = ELam n (go e)
@@ -890,4 +912,111 @@ desugarRecordCons fldReg = go
     goStmt (SExpr e)   = SExpr (go e)
     goStmt (SBind n e) = SBind n (go e)
     goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
-    patBound _           = []
+
+-- | Look up all fields for a constructor from the FieldRegistry,
+-- sorted by their positional index.
+conFields :: FieldRegistry -> ByteString -> [(ByteString, Int)]
+conFields fldReg conName =
+    -- The FieldRegistry maps field names -> [(conName, idx)] pairs.
+    -- Invert: collect all (fieldName, idx) for this constructor, sort by idx.
+    let pairs = [ (fname, idx)
+                | (fname, entries) <- Map.toList fldReg
+                , Just idx <- [lookup conName entries]
+                ]
+    in sortByIdx pairs
+  where
+    sortByIdx ps = map snd $ Map.toAscList $ Map.fromList [(idx, (fname, idx)) | (fname, idx) <- ps]
+
+-- | Desugar record patterns and view patterns in an expression tree.
+-- Handles:
+--   * 'PRecord' (NamedFieldPuns) → positional 'PCon' via FieldRegistry
+--   * 'PRecordWild' (RecordWildCards) → positional 'PCon' binding all fields
+--   * 'PView' (ViewPatterns) — desugared in case-alt context into a let+case
+desugarRecordPats :: FieldRegistry -> Expr -> Expr
+desugarRecordPats fldReg = goExpr
+  where
+    goExpr (EApp f x)       = EApp (goExpr f) (goExpr x)
+    goExpr (ELam n e)       = ELam n (goExpr e)
+    goExpr (ELet bs e)      = ELet [(n, goExpr b) | (n, b) <- bs] (goExpr e)
+    goExpr (ECase s as)     = goCase (goExpr s) as
+    goExpr (EIf c t e)      = EIf (goExpr c) (goExpr t) (goExpr e)
+    goExpr (EDo stmts)      = EDo (map goStmt stmts)
+    goExpr (ENeg e)         = ENeg (goExpr e)
+    goExpr (ETuple es)      = ETuple (map goExpr es)
+    goExpr (ERecordCon n fs) = ERecordCon n [(fn, goExpr fe) | (fn, fe) <- fs]
+    goExpr (ERecordWild n)  = ERecordWild n
+    goExpr (EImplicitRef n) = EImplicitRef n
+    goExpr (EImplicitLet bs e) =
+        EImplicitLet [(n, goExpr b) | (n, b) <- bs] (goExpr e)
+    goExpr (ESplice inner)  = ESplice (goExpr inner)
+    goExpr e                = e  -- EVar, ELit
+
+    goStmt (SExpr e)   = SExpr (goExpr e)
+    goStmt (SBind n e) = SBind n (goExpr e)
+    goStmt (SLet bs)   = SLet [(n, goExpr b) | (n, b) <- bs]
+
+    -- Handle a case expression, desugaring view-pattern alts into a chain.
+    -- View pattern alt: (f -> p) → fresh var, let vp = f scrut, case vp of p
+    -- The tricky bit is that when the view match fails, we need to try the
+    -- NEXT alt in the OUTER case. We do this by building a fallback chain:
+    -- each view-pattern alt is wrapped in a let+case whose wildcard branch
+    -- falls through to the remaining alts (also wrapped, recursively).
+    goCase scrut alts =
+        -- Ensure the scrutinee is bound to a variable to avoid duplication.
+        case scrut of
+            EVar _ -> buildAltChain scrut alts
+            _      -> let sn = "$cs"
+                      in ELet [(sn, scrut)] (buildAltChain (EVar sn) alts)
+
+    buildAltChain _ [] = EApp (EVar "error") (EVar "\"case: non-exhaustive patterns\"")
+    buildAltChain scrut (Alt pat body : rest) =
+        case pat of
+            PView fn vp ->
+                -- Desugar: let $vp = fn scrut in case $vp of { vp -> body; _ -> rest }
+                let vpn      = "$vp"
+                    restExpr = buildAltChain scrut rest
+                    innerCase = ECase (EVar vpn)
+                        [ Alt (goPat vp) (goExpr body)
+                        , Alt PWild restExpr
+                        ]
+                in ELet [(vpn, EApp (goExpr fn) scrut)] innerCase
+            _ ->
+                -- No view pattern: emit as a regular case, but fold remaining
+                -- alts into the same case expression to avoid redundant fallback.
+                -- Collect contiguous non-view alts together.
+                let (nonView, viewRest) = span (not . isViewAlt) (Alt pat body : rest)
+                    regularAlts = [Alt (goPat p) (goExpr b) | Alt p b <- nonView]
+                    -- If there are more view-pattern alts after, add a wildcard
+                    -- fallthrough alt that continues the chain.
+                    allAlts = case viewRest of
+                        [] -> regularAlts
+                        _  -> regularAlts ++
+                              [Alt PWild (buildAltChain scrut viewRest)]
+                in ECase scrut allAlts
+
+    isViewAlt (Alt (PView _ _) _) = True
+    isViewAlt _                   = False
+
+    -- Desugar record patterns recursively (no PView handling here — that
+    -- is handled above in goCase / buildAltChain).
+    goPat (PRecord conName fieldPats) =
+        -- Build positional sub-pattern list using FieldRegistry order.
+        let allFields = conFields fldReg conName
+            fieldMap  = Map.fromList fieldPats
+            subPats   = [ case Map.lookup fname fieldMap of
+                            Just p  -> goPat p
+                            Nothing -> PWild   -- omitted field → wildcard
+                        | (fname, _) <- allFields
+                        ]
+        in PCon conName subPats
+    goPat (PRecordWild conName) =
+        -- Con {..} binds each field to a variable with the same name.
+        let allFields = conFields fldReg conName
+            subPats   = [PVar fname | (fname, _) <- allFields]
+        in PCon conName subPats
+    goPat (PView fn p)     = PView (goExpr fn) (goPat p)  -- nested view (unusual)
+    goPat (PCon n ps)      = PCon n (map goPat ps)
+    goPat (PAs n p)        = PAs n (goPat p)
+    goPat (PBang p)        = PBang (goPat p)
+    goPat (PTuple ps)      = PTuple (map goPat ps)
+    goPat p                = p  -- PVar, PWild, PLit
