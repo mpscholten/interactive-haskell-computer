@@ -81,6 +81,7 @@ import IHC.AST  (Name)
 import IHC.Classes (ClassRegistry, lookupInstance, typeTagOf)
 import IHC.Eval (apply, force)
 import IHC.Scan (DataRegistry, FieldRegistry)
+import IHC.TH (thBuiltinPairs)
 import IHC.Val
 
 -- | Build the initial environment containing every well-known name.
@@ -406,7 +407,10 @@ builtins reg =
     , ("onException",     onExceptionB)
     , ("throwTo",         throwToB)
     , ("displayException", displayExceptionB)
-    ]
+    -- Phase 2.11: TH Lift builtins. Registered under short and
+    -- fully-qualified names so $(TH.lift x), $(lift x), and
+    -- $(Language.Haskell.TH.lift x) all resolve.
+    ] ++ thBuiltinPairs
 
 --------------------------------------------------------------------------------
 -- Builders

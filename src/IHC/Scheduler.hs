@@ -45,7 +45,7 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, doesDirectoryExist, getHomeDirectory)
 import System.FilePath ((</>))
 
 import IHC.AST
@@ -587,53 +587,39 @@ loadModule registry searchPath name = do
                     modifyIORef' registry (Map.insert name (Loaded lm))
                     pure lm
 
--- | Modules whose names are backed entirely by the builtin environment.
--- We return empty stub modules so import declarations don't fail at file lookup.
+-- | Modules whose names are backed entirely by the builtin environment
+-- (host RTS, primops, FFI, threading).  These cannot be source-loaded
+-- because they depend on GHC primops, C FFI, or RTS internals that our
+-- interpreter does not implement.
+--
+-- All other base modules (Control.Applicative, Data.Maybe, Data.List,
+-- Numeric, Text.Show, etc.) are plain Haskell and should be loaded
+-- from the base source cache via 'locateModule'.
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
-    -- GHC internals (GHC.Exts, GHC.Ptr, GHC.ForeignPtr, GHC.IO, GHC.Base, etc.)
+    -- GHC internals (GHC.Exts, GHC.Ptr, GHC.ForeignPtr, GHC.IO, GHC.Base,
+    -- GHC.Prim, etc.) — all primop-backed.
        "GHC."         `BC.isPrefixOf` n
     || n == "Prelude"
-    -- System modules
+    -- System surface — threads to host RTS.
     || n == "System.IO"
     || n == "System.IO.Unsafe"
     || n == "System.Exit"
     || n == "System.Environment"
     || n == "System.Posix.Types"
-    -- Foreign umbrella + subsystems (Foreign.* prefix covers subsystems;
-    -- bare "Foreign" needs an explicit check)
+    || "System.Posix." `BC.isPrefixOf` n
+    -- Foreign umbrella — C FFI bindings.
     || n == "Foreign"
     || "Foreign."     `BC.isPrefixOf` n
-    -- Data modules
+    -- Host mutable refs (backed by host IORef/STRef machinery).
     || n == "Data.IORef"
-    || n == "Data.Int"
-    || n == "Data.Word"
-    || n == "Data.Bits"
-    || n == "Data.Char"
-    || n == "Data.List"
-    || n == "Data.Maybe"
-    || n == "Data.Either"
-    || n == "Data.Ord"
-    || n == "Data.Function"
-    || n == "Data.Tuple"
-    || n == "Data.Coerce"
-    || n == "Data.Typeable"
-    || n == "Data.Kind"
-    || n == "Data.Proxy"
-    || "Data.Map"     `BC.isPrefixOf` n
-    || "Data.Set"     `BC.isPrefixOf` n
-    || "Data.IntMap"  `BC.isPrefixOf` n
-    || "Data.Sequence" `BC.isPrefixOf` n
-    -- Control modules
-    || n == "Control.Monad"
-    || n == "Control.Applicative"
-    || n == "Control.Arrow"
-    || n == "Control.Category"
-    || n == "Control.DeepSeq"
-    -- Text / numeric modules
-    || n == "Numeric"
-    || n == "Text.Read"
-    || n == "Text.Show"
+    || n == "Data.STRef"
+    -- Host threading + exception machinery.
+    || n == "Control.Concurrent"
+    || "Control.Concurrent." `BC.isPrefixOf` n
+    || n == "Control.Exception"
+    -- Pragmatic: Unsafe.Coerce is a trivial primop shim.
+    || n == "Unsafe.Coerce"
     -- Phase 2.11: TH synthetic modules — names provided by IHC.TH builtins
     || "Language.Haskell.TH" `BC.isPrefixOf` n
 
@@ -675,10 +661,26 @@ buildLoadedModule name isEntry header src = do
 emptyHeader :: ModuleHeader
 emptyHeader = ModuleHeader Nothing ExportAll []
 
+-- | Return the source root(s) of the cached @base@ package, if present.
+-- base's @.cabal@ file omits @hs-source-dirs@, so the package root is
+-- itself the source root.  Returns an empty list if the cache directory
+-- does not exist (caller falls through to the normal "module not found"
+-- error path).
+baseCacheSearchPath :: IO [FilePath]
+baseCacheSearchPath = do
+    home <- getHomeDirectory
+    let dir = home </> ".cache" </> "ihc" </> "sources" </> "base-4.19.0.0"
+    exists <- doesDirectoryExist dir
+    pure (if exists then [dir] else [])
+
 -- | Given a dotted module name, search each entry in @searchPath@ for
--- a matching file. Raises 'ModuleNotFound' on miss.
+-- a matching file.  On miss, falls back to the base source cache at
+-- @~\/.cache\/ihc\/sources\/base-4.19.0.0\/@.  Raises 'ModuleNotFound'
+-- only when both the user search path AND the base cache miss.
 locateModule :: [FilePath] -> ModuleName -> IO FilePath
-locateModule searchPath name = go searchPath
+locateModule searchPath name = do
+    baseDirs <- baseCacheSearchPath
+    go (searchPath ++ baseDirs)
   where
     candidates = modulePathCandidates name
     go []     = throwIO (ModuleNotFound name)
