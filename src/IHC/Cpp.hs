@@ -54,7 +54,6 @@ import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.List (isSuffixOf)
 import System.Environment (lookupEnv)
 import System.FilePath (takeDirectory, splitDrive, (</>))
-import System.IO (hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
 
 -- | A macro body: either a simple replacement text, or a function-like
@@ -378,12 +377,17 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
                         Nothing
                             | isSystemHeader incPath -> do
                                 -- Unresolvable system header (.h/.hpp/.hsc config
-                                -- headers): emit a warning and produce zero lines.
-                                -- This is safe for generated headers like
-                                -- HsBaseConfig.h that live only in the build tree.
-                                hPutStrLn stderr ("IHC.Cpp: skipping unresolvable system include: " ++ incPath)
+                                -- headers): silently drop the directive and emit
+                                -- an empty replacement. Needed for generated
+                                -- headers like @HsBaseConfig.h@ that only live
+                                -- in the GHC build tree — this unblocks all of
+                                -- @System.IO@, @GHC.IO.*@, @Foreign.C.*@.
+                                -- A Haskell line-comment is emitted in place of
+                                -- the directive for debug visibility (and to
+                                -- preserve the source line number).
+                                let debugComment = BC.pack ("-- IHC.Cpp: dropped unresolvable system include: " ++ incPath)
                                 (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
-                                pure (emit1 xs, c)
+                                pure (debugComment : contBlanks ++ xs, c)
                             | otherwise ->
                                 throwIO (IncludeMissing incPath resolved)
 
