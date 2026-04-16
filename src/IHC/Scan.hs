@@ -30,6 +30,7 @@ module IHC.Scan
       -- * Data declarations
     , DataRegistry
     , FieldRegistry
+    , TypeCtorRegistry
     , scanDataDecls
       -- * Instance declarations
     , InstanceDecl(..)
@@ -577,6 +578,12 @@ type DataRegistry = Map ByteString Int
 -- functions automatically.
 type FieldRegistry = Map ByteString [(ByteString, Int)]
 
+-- | Map from type-constructor name to the list of data-constructor names
+-- that type declares. Built by 'scanDataDecls' alongside 'DataRegistry'.
+-- Consumed by the scheduler's @exportsName@ to resolve the @T(..)@ and
+-- @T(Ctor1, Ctor2)@ forms of export lists.
+type TypeCtorRegistry = Map ByteString [ByteString]
+
 -- | Scan the whole source for top-level @data@ declarations and collect
 -- every (constructor, arity) pair plus record-field metadata.
 -- This is a lexer-only pass — we do NOT build any AST, don't track type
@@ -591,28 +598,78 @@ type FieldRegistry = Map ByteString [(ByteString, Int)]
 --   Ctor :: ctx => T1 -> T2 -> TyCon
 -- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
-scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry)
-scanDataDecls src = go Map.empty Map.empty startCursor
+scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
+scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
   where
-    go !dReg !fReg cur = do
+    go !dReg !fReg !tReg cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkEof -> pure (dReg, fReg)
+            TkEof -> pure (dReg, fReg, tReg)
             TkData | tkCol tok == 1 -> do
+                let mTyName = peekTypeName cur'
                 ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
-                go dReg' fReg' curAfter
+                let tReg' = recordTypeCtors mTyName dReg dReg' tReg
+                go dReg' fReg' tReg' curAfter
             -- Phase 3.6: newtype declarations behave like single-constructor
             -- data declarations for our purposes (constructor name → arity 1).
             TkNewtype | tkCol tok == 1 -> do
+                let mTyName = peekTypeName cur'
                 ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
-                go dReg' fReg' curAfter
+                let tReg' = recordTypeCtors mTyName dReg dReg' tReg
+                go dReg' fReg' tReg' curAfter
             -- Phase 3.2 + 3.4: skip top-level type / type family / type instance
             -- declarations. These are discarded (no reduction needed for our
             -- interpreter). The skipTypeDecl helper advances past the entire
             -- declaration body including any 'where' equations.
             TkTypeKw | tkCol tok == 1 ->
-                go dReg fReg (skipTypeDecl src cur')
-            _ -> go dReg fReg cur'
+                go dReg fReg tReg (skipTypeDecl src cur')
+            _ -> go dReg fReg tReg cur'
+
+    -- Peek the type-constructor name from the start of a data/newtype decl.
+    -- The type name is the first TkConId after the keyword (skipping any
+    -- optional parenthesised context and operator tokens). Returns Nothing
+    -- if we can't identify it.
+    peekTypeName :: Cursor -> Maybe ByteString
+    peekTypeName cur0 =
+        let loop c =
+                let (tk, c') = nextToken src c
+                in case tkKind tk of
+                    TkEof     -> Nothing
+                    TkConId n -> Just n
+                    TkNewline -> loop c'
+                    -- Skip a parenthesised context like @data (Eq a) => T ...@
+                    -- by scanning until the matching ')'.
+                    TkLParen  -> loop (skipParensPure 1 c')
+                    _         -> loop c'
+        in loop cur0
+
+    -- Skip a parenthesised region starting at depth @d@, returning the
+    -- cursor just past the matching ')'. Pure; uses 'nextToken'.
+    skipParensPure :: Int -> Cursor -> Cursor
+    skipParensPure d c
+        | d <= 0    = c
+        | otherwise =
+            let (tk, c') = nextToken src c
+            in case tkKind tk of
+                TkEof    -> c
+                TkLParen -> skipParensPure (d + 1) c'
+                TkRParen -> skipParensPure (d - 1) c'
+                _        -> skipParensPure d c'
+
+    -- Given the DataRegistry before and after scanning one data decl,
+    -- record the set of constructor names that got added under the type
+    -- name @mTyName@.
+    recordTypeCtors :: Maybe ByteString
+                    -> DataRegistry
+                    -> DataRegistry
+                    -> TypeCtorRegistry
+                    -> TypeCtorRegistry
+    recordTypeCtors Nothing       _    _     tReg = tReg
+    recordTypeCtors (Just tyName) before after tReg =
+        let newCtors = Map.keys (Map.difference after before)
+        in if null newCtors
+             then tReg
+             else Map.insertWith (\new old -> old ++ new) tyName newCtors tReg
 
     -- Parse: (TkConId tyvar*) '=' ctor ('|' ctor)*  until the decl ends.
     -- Decl ends at a column-1 token (next top-level binding / data) or

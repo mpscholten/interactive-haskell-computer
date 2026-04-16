@@ -89,20 +89,25 @@ cppSourceWithIncludes includeDirs src = do
 --------------------------------------------------------------------------------
 
 data LoadedModule = LoadedModule
-    { lmName     :: !ModuleName
-    , lmHeader   :: !ModuleHeader
-    , lmSource   :: !Source
-    , lmKnown    :: !KnownSymbols
-    , lmDataReg  :: !DataRegistry
-    , lmFieldReg :: !FieldRegistry
+    { lmName        :: !ModuleName
+    , lmHeader      :: !ModuleHeader
+    , lmSource      :: !Source
+    , lmKnown       :: !KnownSymbols
+    , lmDataReg     :: !DataRegistry
+    , lmFieldReg    :: !FieldRegistry
+      -- | Map from type-constructor name to the data constructors it
+      -- declares. Built by 'scanDataDecls' alongside 'lmDataReg'. Used by
+      -- 'exportsName' so that @T(..)@ and @T(Ctor1, Ctor2)@ exports match
+      -- the named constructors, not just the type head.
+    , lmTypeCtorReg :: !TypeCtorRegistry
       -- | Accumulated (local-name, parsed body) pairs for this module.
-    , lmBodies   :: !(IORef (Map ByteString Expr))
+    , lmBodies      :: !(IORef (Map ByteString Expr))
       -- | Whether this is the entry module (its bindings stay unqualified
       -- in the final env; foreign-module bindings are namespaced).
-    , lmIsEntry  :: !Bool
+    , lmIsEntry     :: !Bool
       -- | Per-module fixity table: defaults + any @infixl/infixr/infix@
       -- declarations found at column 1 in this source.
-    , lmFixity   :: !FixityTable
+    , lmFixity      :: !FixityTable
     }
 
 data ModuleState
@@ -296,7 +301,7 @@ loadFileIntoEnv searchPath path existingEnv = do
         -- Names the module declares it exports (or all names if ExportAll).
         exported = case mhExports header of
             ExportAll    -> allNames
-            ExportList _ -> filter (exportsNameDirect header) allNames
+            ExportList _ -> filter (exportsNameDirect entry) allNames
     -- Demand-discover every exported name.
     mapM_ (discoverInModule registry fullSearchPath includeMap entry) exported
     -- Collect all loaded modules.
@@ -954,7 +959,7 @@ buildImportRewrites registry lm _builtinNames = do
                 | n <- requestedNames
                 , Just expr <- [Map.lookup n bodiesMap]
                 , expr /= EVar n
-                , exportsNameDirect (lmHeader tm) n
+                , exportsNameDirect tm n
                 ]
             localPairs = [(n, prefix <> n) | n <- localExported]
         -- For ExportName entries not covered by local bodies, follow
@@ -1165,7 +1170,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                 | n <- allN
                 , Just expr <- [Map.lookup n bodiesMap]
                 , expr /= EVar n
-                , exportsNameDirect (lmHeader tm) n
+                , exportsNameDirect tm n
                 ]
             localPairs = [ (n, t)
                          | n <- localExported
@@ -1358,33 +1363,35 @@ buildEmptyStubModule name = do
     bodies <- newIORef Map.empty
     let src = mkSource (BC.unpack name) ""
     pure LoadedModule
-        { lmName     = name
-        , lmHeader   = ModuleHeader (Just name) ExportAll []
-        , lmSource   = src
-        , lmKnown    = known
-        , lmDataReg  = Map.empty
-        , lmFieldReg = Map.empty
-        , lmBodies   = bodies
-        , lmIsEntry  = False
-        , lmFixity   = defaultFixityTable
+        { lmName        = name
+        , lmHeader      = ModuleHeader (Just name) ExportAll []
+        , lmSource      = src
+        , lmKnown       = known
+        , lmDataReg     = Map.empty
+        , lmFieldReg    = Map.empty
+        , lmTypeCtorReg = Map.empty
+        , lmBodies      = bodies
+        , lmIsEntry     = False
+        , lmFixity      = defaultFixityTable
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
 buildLoadedModule name isEntry header src = do
-    known         <- emptyKnownSymbols
-    (dataR, fldR) <- scanDataDecls src
-    bodies        <- newIORef Map.empty
-    fixity        <- scanFixityDecls src defaultFixityTable
+    known               <- emptyKnownSymbols
+    (dataR, fldR, tCtR) <- scanDataDecls src
+    bodies              <- newIORef Map.empty
+    fixity              <- scanFixityDecls src defaultFixityTable
     pure LoadedModule
-        { lmName     = name
-        , lmHeader   = header
-        , lmSource   = src
-        , lmKnown    = known
-        , lmDataReg  = dataR
-        , lmFieldReg = fldR
-        , lmBodies   = bodies
-        , lmIsEntry  = isEntry
-        , lmFixity   = fixity
+        { lmName        = name
+        , lmHeader      = header
+        , lmSource      = src
+        , lmKnown       = known
+        , lmDataReg     = dataR
+        , lmFieldReg    = fldR
+        , lmTypeCtorReg = tCtR
+        , lmBodies      = bodies
+        , lmIsEntry     = isEntry
+        , lmFixity      = fixity
         }
 
 emptyHeader :: ModuleHeader
@@ -1611,7 +1618,7 @@ resolveImport registry searchPath includeMap lm name = do
                                 Just _ ->
                                     -- Export-list check: the target module must
                                     -- actually export @name@.
-                                    if exportsName (lmHeader targetLm) name
+                                    if exportsName targetLm name
                                         then do
                                             discoverInModule registry searchPath includeMap targetLm name
                                             pure (Just ())
@@ -1626,7 +1633,7 @@ resolveImport registry searchPath includeMap lm name = do
                                     --    export list but the definition lives in
                                     --    `Data.Map.Internal`.  Follow all unqualified
                                     --    imports of @targetLm@ to find the definition.
-                                    if exportsName (lmHeader targetLm) name
+                                    if exportsName targetLm name
                                         then followNamedReexport targetLm rest
                                         else followModuleReexports targetLm rest
 
@@ -1680,7 +1687,7 @@ resolveImport registry searchPath includeMap lm name = do
                 mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
                 case mLhs of
                     Just _ ->
-                        if exportsName (lmHeader srcLm) name
+                        if exportsName srcLm name
                             then do
                                 discoverInModule registry searchPath includeMap srcLm name
                                 pure (Just ())
@@ -1688,7 +1695,7 @@ resolveImport registry searchPath includeMap lm name = do
                     Nothing ->
                         -- srcLm might itself re-export via unqualified imports
                         -- (go one level deeper, decrementing the depth cap).
-                        if exportsName (lmHeader srcLm) name
+                        if exportsName srcLm name
                             then followNamedReexportD (depth - 1) srcLm rest >>= \case
                                     Just () -> pure (Just ())
                                     Nothing -> tryViaImports moreImps depth rest
@@ -1712,7 +1719,7 @@ resolveImport registry searchPath includeMap lm name = do
                             mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
                             case mLhs of
                                 Just _ ->
-                                    if exportsName (lmHeader srcLm) name
+                                    if exportsName srcLm name
                                         then do
                                             discoverInModule registry searchPath includeMap srcLm name
                                             pure (Just ())
@@ -1721,7 +1728,7 @@ resolveImport registry searchPath includeMap lm name = do
                                     -- Not defined directly in srcLm; recurse one
                                     -- level deeper if srcLm exports the name via
                                     -- its own imports (limited by depth).
-                                    if exportsName (lmHeader srcLm) name && depth > 1
+                                    if exportsName srcLm name && depth > 1
                                         then followNamedReexportD (depth - 1) srcLm rest >>= \case
                                                 Just () -> pure (Just ())
                                                 Nothing -> tryViaImports moreImps depth rest
@@ -1763,7 +1770,7 @@ resolveImport registry searchPath includeMap lm name = do
                         mLhs <- findOrResolveLhs (lmSource reLm) (lmKnown reLm) name
                         case mLhs of
                             Just _ ->
-                                if exportsName (lmHeader reLm) name
+                                if exportsName reLm name
                                     then do
                                         r <- try (discoverInModule registry searchPath includeMap reLm name) :: IO (Either SomeException ())
                                         case r of
@@ -1802,26 +1809,55 @@ moduleReexports h = case mhExports h of
 -- or if the module re-exports everything ('ExportAll').  Does NOT
 -- return True for @ExportModule@ items — use 'moduleReexports' to
 -- follow those chains separately.
-exportsNameDirect :: ModuleHeader -> ByteString -> Bool
-exportsNameDirect h n = case mhExports h of
+--
+-- Like 'exportsName', this understands @T(..)@ and @T(Ctor1, Ctor2)@:
+-- the former expands to the type head plus every constructor from the
+-- module's 'lmTypeCtorReg', the latter to the type head plus the
+-- listed sub-names.
+exportsNameDirect :: LoadedModule -> ByteString -> Bool
+exportsNameDirect lm n = case mhExports (lmHeader lm) of
     ExportAll     -> True
     ExportList xs -> any matchDirect xs
   where
-    matchDirect (ExportName m)   = n == m
-    matchDirect (ExportType m _) = n == m
+    tCtors = lmTypeCtorReg lm
+
+    matchDirect (ExportName m)            = n == m
+    matchDirect (ExportType m Nothing)    = n == m
+    matchDirect (ExportType m (Just [])) =
+        n == m || n `elem` Map.findWithDefault [] m tCtors
+    matchDirect (ExportType m (Just subs)) =
+        n == m || n `elem` subs
     matchDirect (ExportModule _) = False
 
 -- | Like 'exportsNameDirect' but also returns True when the export
 -- list contains a @module Foo@ entry (because the name may come from
 -- that re-exported module).  Used by 'resolveImport' so that the
 -- name-not-found case can fall through to 'followModuleReexports'.
-exportsName :: ModuleHeader -> ByteString -> Bool
-exportsName h n = case mhExports h of
+--
+-- Unlike 'exportsNameDirect', this version also looks inside
+-- @ExportType T (Just subs)@ items:
+--
+--   * @T(Ctor1, Ctor2)@ matches @T@ itself plus any name in the sub-list.
+--   * @T(..)@ (represented as @Just []@) matches @T@ plus every
+--     constructor of @T@ known from the module's 'lmTypeCtorReg'.
+--   * @T@ (represented as @Nothing@) only matches the type head @T@.
+exportsName :: LoadedModule -> ByteString -> Bool
+exportsName lm n = case mhExports (lmHeader lm) of
     ExportAll     -> True
     ExportList xs -> any matchExport xs
   where
-    matchExport (ExportName m)    = n == m
-    matchExport (ExportType m _)  = n == m
+    tCtors = lmTypeCtorReg lm
+
+    matchExport (ExportName m)            = n == m
+    matchExport (ExportType m Nothing)    = n == m
+    matchExport (ExportType m (Just [])) =
+        -- The `T(..)` form: the type head plus every constructor of T
+        -- that the scanner saw in this module's source.
+        n == m || n `elem` Map.findWithDefault [] m tCtors
+    matchExport (ExportType m (Just subs)) =
+        -- The `T(Ctor1, Ctor2, field1, ...)` form: the type head plus
+        -- every explicitly-listed sub-name.
+        n == m || n `elem` subs
     -- `module Foo` re-export: the scheduler follows this dynamically;
     -- here we conservatively return True so the name is not filtered
     -- out before the dynamic check in resolveImport.

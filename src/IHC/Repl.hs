@@ -281,10 +281,10 @@ doDataDecl envRef line = do
 
 tryDataDecl :: IORef Env -> Source -> String -> IO (Either String String)
 tryDataDecl envRef src _line = do
-    r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString Int, Map.Map BC.ByteString [(BC.ByteString, Int)])))
+    r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString Int, Map.Map BC.ByteString [(BC.ByteString, Int)], Map.Map BC.ByteString [BC.ByteString])))
     case r of
         Left err  -> pure (Left (show err))
-        Right (reg, fldReg) ->
+        Right (reg, fldReg, _tReg) ->
             if Map.null reg
             then pure (Left "no constructors found (parse error?)")
             else do
