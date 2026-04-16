@@ -868,3 +868,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/named_field_puns_mixed.hs")
         n   `shouldBe` 0
         out `shouldBe` "60\n"
+
+    it "Lazy pattern: let ~(x, y) = ... binds through the tuple" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/lazy_pat.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    it "Lazy pattern: \\ ~(a, b) -> ... in a lambda argument" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/lazy_pat_lambda.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "30\n"

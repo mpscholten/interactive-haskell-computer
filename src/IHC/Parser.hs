@@ -1331,6 +1331,11 @@ parseSubPat ctx cur = do
         TkBang -> do
             (p, curN) <- parseSubPat ctx cur1
             pure (PBang p, curN)
+        -- Lazy/irrefutable pattern: ~pat.  Under ihc's already-lazy
+        -- evaluator ~pat has the same runtime semantics as pat (we don't
+        -- enforce strictness without an explicit bang), so strip the
+        -- tilde at parse time and return the inner pattern unchanged.
+        TkSymOp op | op == BC.pack "~" -> parseSubPat ctx cur1
         TkIdent n -> do
             -- Potential as-pattern: ident '@' sub
             -- But '@' followed by TkSymOp is an infix operator (@?=, @=?, etc.),
@@ -1558,6 +1563,7 @@ startsPat TkLBracket   = True
 startsPat TkMinus      = True
 startsPat TkBang       = True
 startsPat TkLUnbox     = True   -- (# a, b #) unboxed tuple patterns
+startsPat (TkSymOp op) = op == BC.pack "~"   -- lazy/irrefutable ~pat
 startsPat _            = False
 
 --------------------------------------------------------------------------------
