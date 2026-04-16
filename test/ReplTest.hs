@@ -7,6 +7,8 @@
 module ReplTest (spec) where
 
 import System.Environment (lookupEnv)
+import System.IO (hPutStr, hFlush, hClose, openTempFile)
+import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
 import Test.Hspec
@@ -157,3 +159,39 @@ spec = describe "REPL smoke tests" do
             ( "let y = y\n"
            <> ":q\n" )
         code `shouldBe` ExitSuccess
+
+    -- :reload tests
+    it ":r with no prior :l prints 'nothing to reload'" do
+        (code, out, _err) <- runRepl ":r\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "nothing to reload"
+
+    it ":l FILE then :r reloads the file" do
+        (code, out, _err) <- runRepl
+            ( ":l test/Fixtures/hello.hs\n"
+           <> ":r\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Loaded test/Fixtures/hello.hs"
+        out `shouldContain` "Reloading test/Fixtures/hello.hs"
+
+    it ":r after modify-on-disk reflects new binding" do
+        tmpDir <- getTemporaryDirectory
+        (tmpPath, h) <- openTempFile tmpDir "ihc_reload_test.hs"
+        -- Write a file with main that calls a top-level binding.
+        -- The scheduler is demand-driven from main, so main must reference
+        -- the binding we want to test.
+        hPutStr h "main = putStrLn \"hello-v1\"\n"
+        hFlush h
+        hClose h
+        -- First load: main prints hello-v1
+        (_, out1, _) <- runRepl (":l " <> tmpPath <> "\nmain\n:q\n")
+        out1 `shouldContain` "hello-v1"
+        -- Overwrite the file with a new version: main prints hello-v2
+        writeFile tmpPath "main = putStrLn \"hello-v2\"\n"
+        -- In a fresh session: load + reload, then call main
+        (code2, out2, _) <- runRepl (":l " <> tmpPath <> "\n:r\nmain\n:q\n")
+        code2 `shouldBe` ExitSuccess
+        out2 `shouldContain` "Reloading"
+        out2 `shouldContain` "hello-v2"
+        removeFile tmpPath

@@ -44,11 +44,12 @@ import IHC.Val
 runRepl :: IO ()
 runRepl = do
     (baseEnv, classReg) <- buildBaseEnv
-    envRef  <- newIORef baseEnv
-    histDir <- historyDir
+    envRef      <- newIORef baseEnv
+    loadedRef   <- newIORef ([] :: [FilePath])
+    histDir     <- historyDir
     let settings = defaultSettings
             { historyFile = Just (histDir </> "repl_history") }
-    runInputT settings (loop envRef classReg)
+    runInputT settings (loop envRef classReg loadedRef)
 
 historyDir :: IO FilePath
 historyDir = do
@@ -61,8 +62,8 @@ historyDir = do
 -- Main REPL loop
 --------------------------------------------------------------------------------
 
-loop :: IORef Env -> ClassRegistry -> InputT IO ()
-loop envRef classReg = go
+loop :: IORef Env -> ClassRegistry -> IORef [FilePath] -> InputT IO ()
+loop envRef classReg loadedRef = go
   where
     go = do
         mLine <- getInputLine "ihc> "
@@ -70,13 +71,13 @@ loop envRef classReg = go
             Nothing   -> pure ()
             Just ""   -> go
             Just line -> do
-                continue <- dispatch envRef classReg line
+                continue <- dispatch envRef classReg loadedRef line
                 if continue then go else pure ()
 
-dispatch :: IORef Env -> ClassRegistry -> String -> InputT IO Bool
-dispatch envRef classReg line =
+dispatch :: IORef Env -> ClassRegistry -> IORef [FilePath] -> String -> InputT IO Bool
+dispatch envRef classReg loadedRef line =
     case words line of
-        ((':':cmd):rest) -> metaCmd envRef classReg cmd rest
+        ((':':cmd):rest) -> metaCmd envRef classReg loadedRef cmd rest
         ("import":_)     -> doImport envRef line >> pure True
         ("data":_)       -> doDataDecl envRef line >> pure True
         ("newtype":_)    -> doDataDecl envRef line >> pure True
@@ -89,15 +90,17 @@ dispatch envRef classReg line =
 -- Meta-commands
 --------------------------------------------------------------------------------
 
-metaCmd :: IORef Env -> ClassRegistry -> String -> [String] -> InputT IO Bool
-metaCmd _      _        "q"    _    = pure False
-metaCmd _      _        "quit" _    = pure False
-metaCmd _      _        "?"    _    = printHelp >> pure True
-metaCmd _      _        "help" _    = printHelp >> pure True
-metaCmd envRef classReg "l"    args = doLoad envRef classReg (unwords args) >> pure True
-metaCmd envRef classReg "load" args = doLoad envRef classReg (unwords args) >> pure True
-metaCmd envRef _        "t"    args = doTypeOf envRef (unwords args) >> pure True
-metaCmd _      _        cmd    _    = do
+metaCmd :: IORef Env -> ClassRegistry -> IORef [FilePath] -> String -> [String] -> InputT IO Bool
+metaCmd _      _        _         "q"      _    = pure False
+metaCmd _      _        _         "quit"   _    = pure False
+metaCmd _      _        _         "?"      _    = printHelp >> pure True
+metaCmd _      _        _         "help"   _    = printHelp >> pure True
+metaCmd envRef classReg loadedRef "l"      args = doLoad envRef classReg loadedRef (unwords args) >> pure True
+metaCmd envRef classReg loadedRef "load"   args = doLoad envRef classReg loadedRef (unwords args) >> pure True
+metaCmd envRef classReg loadedRef "r"      _    = doReload envRef classReg loadedRef >> pure True
+metaCmd envRef classReg loadedRef "reload" _    = doReload envRef classReg loadedRef >> pure True
+metaCmd envRef _        _         "t"      args = doTypeOf envRef (unwords args) >> pure True
+metaCmd _      _        _         cmd      _    = do
     outputStrLn ("Unknown command :" <> cmd <> "  (try :?)")
     pure True
 
@@ -105,6 +108,7 @@ printHelp :: InputT IO ()
 printHelp = mapM_ outputStrLn
     [ "ihc REPL commands:"
     , "  :l FILE   (:load)   load a Haskell file into the session"
+    , "  :r        (:reload) re-load all previously loaded files"
     , "  :t EXPR   (:type)   show the runtime structural type of an expression"
     , "  :?        (:help)   show this message"
     , "  :q        (:quit)   exit"
@@ -143,15 +147,41 @@ typeOfExpr env ast = do
 -- :load FILE
 --------------------------------------------------------------------------------
 
-doLoad :: IORef Env -> ClassRegistry -> FilePath -> InputT IO ()
-doLoad _      _        ""   = outputStrLn "Usage: :load FILE"
-doLoad envRef _classReg path = do
+doLoad :: IORef Env -> ClassRegistry -> IORef [FilePath] -> FilePath -> InputT IO ()
+doLoad _      _        _         ""   = outputStrLn "Usage: :load FILE"
+doLoad envRef _classReg loadedRef path = do
     r <- liftIO (tryLoad path)
     case r of
         Left err      -> outputStrLn ("Load error: " <> err)
         Right newEnv  -> do
             liftIO $ modifyIORef' envRef (\e -> Map.union newEnv e)
+            liftIO $ modifyIORef' loadedRef (addUnique path)
             outputStrLn ("Loaded " <> path)
+
+-- | Add a path to the list only if it isn't already present.
+addUnique :: FilePath -> [FilePath] -> [FilePath]
+addUnique p ps
+    | p `elem` ps = ps
+    | otherwise   = ps <> [p]
+
+-- | `:r` / `:reload` — re-run every previously loaded file in order.
+-- Bindings from a fresh load shadow any stale definitions in the env
+-- (same behaviour as `:l`).  Prints one "Reloading FILE" line per file.
+-- If a file has a parse or load error, the error is reported but the
+-- REPL stays alive and the remaining files are still processed.
+doReload :: IORef Env -> ClassRegistry -> IORef [FilePath] -> InputT IO ()
+doReload envRef _classReg loadedRef = do
+    paths <- liftIO (readIORef loadedRef)
+    case paths of
+        [] -> outputStrLn "No files loaded; nothing to reload."
+        _  -> mapM_ reloadOne paths
+  where
+    reloadOne path = do
+        outputStrLn ("Reloading " <> path)
+        r <- liftIO (tryLoad path)
+        case r of
+            Left err     -> outputStrLn ("Load error: " <> err)
+            Right newEnv -> liftIO $ modifyIORef' envRef (\e -> Map.union newEnv e)
 
 -- | Attempt to load @path@, returning the resulting environment.
 -- We append a trivial @main = ()@ if the file has no @main@, so
