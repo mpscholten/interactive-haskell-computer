@@ -403,6 +403,10 @@ expandSplicesInExpr env ipm depth expr
         fields' <- mapM (\(fn, fe) -> (fn,) <$> go fe) fields
         pure (ERecordCon n fields')
     go (ERecordWild n) = pure (ERecordWild n)
+    go (ERecordUpdate e fields) = do
+        e'      <- go e
+        fields' <- mapM (\(fn, fe) -> (fn,) <$> go fe) fields
+        pure (ERecordUpdate e' fields')
     go (ELabel n) = pure (ELabel n)   -- Phase 3.5: labels are self-contained
     -- Phase 2.12: EQuote is a leaf in the splice-expansion pass.
     -- Its body is NOT expanded (it's a quotation, not a splice).

@@ -155,6 +155,11 @@ eval env ipm = go
         error ("IHC.Eval: ERecordWild reached eval — desugarRecordCons missed: "
                <> BC.unpack n)
 
+    -- Record update: ERecordUpdate should be desugared by desugarRecordCons
+    -- into an ECase. If it reaches eval, it means the registry didn't know the
+    -- constructor (graceful degradation: evaluate the base expression unchanged).
+    go (ERecordUpdate baseExpr _) = go baseExpr
+
     -- Phase 2.11: TH splices should be expanded before eval by the
     -- scheduler's expandSplicesInModule pass. If one reaches here it's
     -- a bug — report it clearly rather than looping.

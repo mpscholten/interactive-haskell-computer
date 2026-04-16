@@ -806,6 +806,8 @@ rewriteExpr rw = go []
         ERecordCon n fields ->
             ERecordCon n [(fname, go bound e) | (fname, e) <- fields]
         ERecordWild n   -> ERecordWild n
+        ERecordUpdate e fields ->
+            ERecordUpdate (go bound e) [(fname, go bound fe) | (fname, fe) <- fields]
         EImplicitRef n  -> EImplicitRef n
         EImplicitLet bs e ->
             let names  = map fst bs
@@ -1522,6 +1524,7 @@ freeVars = goAll []
         ETuple es   -> concatMap (goAll bound) es
         ERecordCon _ fields -> concatMap (goAll bound . snd) fields
         ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
+        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
         EImplicitRef _  -> []
         EImplicitLet bs e ->
             let names = map fst bs
@@ -1593,6 +1596,50 @@ desugarRecordCons fldReg = go
             -- Build positional list sorted by field index.
             args = map (\(fname, _) -> EVar fname) fieldPairs
         in foldl EApp (EVar conName) args
+    -- Record update: e { f1 = e1, f2 = e2, ... }
+    -- Desugar to a case expression that reconstructs the record with updated fields.
+    -- We look up all constructors that contain the updated field names in fldReg,
+    -- then generate one case alt per such constructor.
+    go (ERecordUpdate baseExpr updates) =
+        let scrut = go baseExpr
+            updatesG = [(fn, go fe) | (fn, fe) <- updates]
+            -- Find all constructors that own any of the updated field names.
+            -- A constructor is included if it appears in the FieldRegistry for
+            -- at least one of the updated fields.
+            relevantCons :: [ByteString]
+            relevantCons =
+                nubBS
+                [ conName
+                | (fname, _) <- updatesG
+                , Just pairs <- [Map.lookup fname fldReg]
+                , (conName, _) <- pairs
+                ]
+            buildAlt conName =
+                let allFields = conFields fldReg conName   -- [(fname, idx)]
+                    arity     = length allFields
+                    -- Fresh variable names for the pattern: $ru0, $ru1, ...
+                    varNames  = [ BC.pack ("$ru" <> show i) | i <- [0 .. arity - 1] ]
+                    -- For each positional slot, use the updated expr if present,
+                    -- otherwise use the original field variable.
+                    updateMap  = Map.fromList updatesG
+                    args = [ case Map.lookup fname updateMap of
+                                 Just e' -> e'
+                                 Nothing -> EVar (varNames !! idx)
+                           | (fname, idx) <- allFields
+                           ]
+                    pat = PCon conName (map PVar varNames)
+                    body = foldl EApp (EVar conName) args
+                in Alt pat body
+            alts = map buildAlt relevantCons
+            -- If no relevant constructors found (e.g. unknown ADT), fall back to
+            -- a runtime error so we don't silently discard the update.
+            fallback = Alt PWild
+                         (EApp (EVar "error")
+                               (ELit (LStr "record update: unknown constructor")))
+        in if null alts
+               then go baseExpr   -- no registry info; best effort: return original
+               else ECase scrut (alts ++ [fallback])
+
     -- Recurse into all sub-expressions.
     go (EApp f x)       = EApp (go f) (go x)
     go (ELam n e)       = ELam n (go e)
@@ -1644,6 +1691,7 @@ desugarRecordPats fldReg = goExpr
     goExpr (ETuple es)      = ETuple (map goExpr es)
     goExpr (ERecordCon n fs) = ERecordCon n [(fn, goExpr fe) | (fn, fe) <- fs]
     goExpr (ERecordWild n)  = ERecordWild n
+    goExpr (ERecordUpdate e fs) = ERecordUpdate (goExpr e) [(fn, goExpr fe) | (fn, fe) <- fs]
     goExpr (EImplicitRef n) = EImplicitRef n
     goExpr (EImplicitLet bs e) =
         EImplicitLet [(n, goExpr b) | (n, b) <- bs] (goExpr e)
