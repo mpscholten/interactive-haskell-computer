@@ -328,6 +328,21 @@ matchPat (PCon "IO" [p]) (VIO action) = do
             resT <- newWHNFThunk result
             pure (VCon "(#,#)" [stT, resT])
     matchPat p stFn
+-- ST bridge: VIO-valued ST computations (e.g. `return 42 :: ST s Int`
+-- produces `VIO (pure 42)` via the builtin `returnB`). When source code
+-- pattern-matches `ST f` on such a value -- e.g. `runST (ST m)` in
+-- GHC.ST -- expose the same State#-passing function the ST constructor
+-- expects, so the pure ST = IO bridge is transparent at the match layer.
+-- Rationale: `ST s a` is semantically identical to `IO a` in our
+-- single-threaded interpreter (see CLAUDE.md: runRW# is compiler-intrinsic,
+-- no userland Haskell can implement it).
+matchPat (PCon "ST" [p]) (VIO action) = do
+    let stFn = VFun $ \_stateThunk -> do
+            result <- action
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            resT <- newWHNFThunk result
+            pure (VCon "(#,#)" [stT, resT])
+    matchPat p stFn
 matchPat (PCon pname ppats) v = do
     pure Nothing
 -- Record patterns: should have been desugared to PCon by the scheduler.

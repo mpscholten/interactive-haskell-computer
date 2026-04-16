@@ -1167,6 +1167,9 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         -- ST monad bind:
         -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
+        -- If k r returns VIO (from `return`/`pure` via the IO-backed builtin),
+        -- we run it eagerly and wrap the result in a new (# s', a #) tuple --
+        -- the ST ≈ IO bridge (CLAUDE.md: ST is compiler-intrinsic, IO machinery reused).
         VCon "ST" [mFuncT] -> do
             mFuncV <- force mFuncT
             ktV    <- force kt
@@ -1175,14 +1178,33 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                 resV   <- runIOVal resRaw    -- run VIO if needed (primop results)
                 case resV of
                     VCon "(#,#)" [newST, rT] -> do
-                        stkRaw <- apply ktV rT   -- k applied to r; result is an ST
-                        stkV   <- runIOVal stkRaw
-                        case stkV of
+                        stkRaw <- apply ktV rT   -- k applied to r; may be ST or VIO
+                        -- DO NOT runIOVal here unconditionally: that would strip a
+                        -- `VIO (pure x)` (from `return`/`pure`) down to a bare x and
+                        -- lose the state-threading shape. Branch on stkRaw first.
+                        case stkRaw of
                             VCon "ST" [k2FuncT] -> do
                                 k2FuncV  <- force k2FuncT
                                 resRaw2  <- apply k2FuncV newST
                                 runIOVal resRaw2
-                            other -> pure other  -- k returned a non-ST (shouldn't happen)
+                            -- VIO from `return`/`pure` in ST: run it, wrap as (# s, a #)
+                            VIO io -> do
+                                r  <- io
+                                rT <- newWHNFThunk r
+                                pure (VCon "(#,#)" [newST, rT])
+                            other -> do
+                                -- Run any outstanding VIO layers; wrap as (# s, a #).
+                                -- This keeps `stkRaw = VIO (VIO ...)` and other
+                                -- deeply-wrapped results compatible with the ST shape.
+                                v  <- runIOVal other
+                                case v of
+                                    VCon "ST" [k2FuncT] -> do
+                                        k2FuncV <- force k2FuncT
+                                        resRaw2 <- apply k2FuncV newST
+                                        runIOVal resRaw2
+                                    _ -> do
+                                        vT <- newWHNFThunk v
+                                        pure (VCon "(#,#)" [newST, vT])
                     other -> pure other  -- m didn't return an unboxed tuple
             pure (VCon "ST" [stFunc])
         _ -> do
@@ -1219,6 +1241,7 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
         -- ST monad seq:
         -- m >> n = m >>= \_ -> n  for ST
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
+        -- If n is VIO (from `return`/`pure`), we run it and wrap as (# s', a #).
         VCon "ST" [mFuncT] -> do
             mFuncV <- force mFuncT
             stFunc <- newWHNFThunk $ VFun $ \sT -> do
@@ -1232,7 +1255,21 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
                                 k2FuncV  <- force k2FuncT
                                 resRaw2  <- apply k2FuncV newST
                                 runIOVal resRaw2
-                            other -> pure other
+                            -- VIO from `return`/`pure`: run and wrap as (# s, a #)
+                            VIO io -> do
+                                r  <- io
+                                rT <- newWHNFThunk r
+                                pure (VCon "(#,#)" [newST, rT])
+                            other -> do
+                                v <- runIOVal other
+                                case v of
+                                    VCon "ST" [k2FuncT] -> do
+                                        k2FuncV <- force k2FuncT
+                                        resRaw2 <- apply k2FuncV newST
+                                        runIOVal resRaw2
+                                    _ -> do
+                                        vT <- newWHNFThunk v
+                                        pure (VCon "(#,#)" [newST, vT])
                     other -> pure other
             pure (VCon "ST" [stFunc])
         _ -> do
