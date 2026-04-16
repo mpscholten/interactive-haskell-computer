@@ -183,6 +183,9 @@ parseExportList src cur0 = go [] cur0
             TkRParen -> pure (ExportList (reverse acc), cur1)
             TkComma  -> go acc cur1
             TkIdent n   -> go (ExportName n : acc) cur1
+            -- MagicHash primop identifiers like `unpackCString#` are
+            -- valid export names in modules that enable MagicHash.
+            TkPrimId n  -> go (ExportName n : acc) cur1
             -- `module Foo.Bar` re-export form.
             TkModule -> do
                 (mMod, cur2) <- parseDottedName src cur1

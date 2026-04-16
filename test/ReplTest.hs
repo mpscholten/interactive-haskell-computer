@@ -341,6 +341,52 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "Error"
         out `shouldContain` "unbound variable"
 
+    -- Regression: unaliased `import qualified M` should register `M`
+    -- itself as the qualifier, so `M.name` resolves the deferred import.
+    it "import qualified Data.List (no alias): Data.List.intercalate works" do
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.List\n"
+           <> "Data.List.intercalate \", \" [\"a\",\"b\",\"c\"]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Data.List (deferred)"
+        out `shouldContain` "\"a, b, c\""
+
+    -- Transitive qualified-name resolution: when a loaded module's body
+    -- contains `H.foo`, the scheduler must consult the *loaded module's*
+    -- imports (not the REPL's) to find `H`.  Greet.hs does
+    -- `import qualified Helper as H` and calls `H.join`/`H.surround`
+    -- inside its own bindings.  Both unaliased and aliased REPL imports
+    -- must follow this chain successfully.
+    it "import qualified Greet (unaliased): transitive H.join inside Greet's body" do
+        (code, out, _err) <- runRepl
+            ( ":l test/Fixtures/Repl/qual_transitive/Greet.hs\n"
+           <> "import qualified Greet\n"
+           <> "Greet.greet \"world\"\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Greet (deferred)"
+        out `shouldContain` "\"(hi - world)\""
+
+    it "import qualified Greet as G: transitive H.join inside Greet's body" do
+        (code, out, _err) <- runRepl
+            ( ":l test/Fixtures/Repl/qual_transitive/Greet.hs\n"
+           <> "import qualified Greet as G\n"
+           <> "G.greet \"world\"\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Greet (deferred)"
+        out `shouldContain` "\"(hi - world)\""
+
+    it "import qualified Greet as G: G.parts exercises H.join directly" do
+        (code, out, _err) <- runRepl
+            ( ":l test/Fixtures/Repl/qual_transitive/Greet.hs\n"
+           <> "import qualified Greet as G\n"
+           <> "G.parts \"x\" \"y\"\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "\"x - y\""
+
     it ":r after modify-on-disk reflects new binding" do
         tmpDir <- getTemporaryDirectory
         (tmpPath, h) <- openTempFile tmpDir "ihc_reload_test.hs"
