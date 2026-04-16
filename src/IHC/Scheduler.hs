@@ -40,18 +40,16 @@ module IHC.Scheduler
     ) where
 
 import Control.Exception (throwIO, Exception, catch)
-import Control.Monad (when)
 import qualified System.IO
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.List (isPrefixOf, sort)
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.FilePath ((</>), takeDirectory)
-import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
@@ -1029,16 +1027,6 @@ isLocalModule searchPath name = do
 -- Demand-driven discovery
 --------------------------------------------------------------------------------
 
--- | Global counter for discoverInModule invocations (instrumentation).
-{-# NOINLINE discoverCounter #-}
-discoverCounter :: IORef Int
-discoverCounter = unsafePerformIO (newIORef 0)
-
--- | Global map counting (module, name) invocations (instrumentation).
-{-# NOINLINE discoverCounts #-}
-discoverCounts :: IORef (Map (ByteString, ByteString) Int)
-discoverCounts = unsafePerformIO (newIORef Map.empty)
-
 -- | Recursively discover bindings reachable from @name@ inside the
 -- given module, following imports whenever the name isn't local.
 discoverInModule
@@ -1062,12 +1050,6 @@ discoverInModule registry searchPath includeMap lm name
                      <> " — no matching import in module "
                      <> BC.unpack (lmName lm)))
     | otherwise = do
-        n0 <- atomicModifyIORef' discoverCounter (\c -> (c+1, c+1))
-        modifyIORef' discoverCounts (Map.insertWith (+) (lmName lm, name) 1)
-        when (n0 `mod` 5000 == 0) $ do
-            counts <- readIORef discoverCounts
-            let hot = take 10 $ reverse $ sort [ (v, k) | (k, v) <- Map.toList counts, v > 1 ]
-            System.IO.hPutStrLn System.IO.stderr ("[DISC] total=" <> show n0 <> " hot=" <> show hot)
         bodies <- readIORef (lmBodies lm)
         if Map.member name bodies
             then pure ()
@@ -1203,8 +1185,9 @@ resolveImport registry searchPath includeMap lm name = do
         | depth <= 0 = tryImports rest
         | otherwise = do
             -- First try module-form re-exports (they may also apply).
-            let reexportedMods = moduleReexports (lmHeader via)
-            r <- tryReexports reexportedMods rest
+            let reexportedMods = filter (/= lmName via)
+                               $ moduleReexports (lmHeader via)
+            r <- tryReexports [lmName via] reexportedMods rest
             case r of
                 Just () -> pure (Just ())
                 Nothing -> do
@@ -1270,13 +1253,18 @@ resolveImport registry searchPath includeMap lm name = do
     -- | Chase every `module Foo` entry in the export list of @via@ to
     -- see whether any of them provides @name@.  We recurse through
     -- 'discoverInModule' so the transitive load chain is followed
-    -- automatically.
-    followModuleReexports via rest = do
-        let reexportedMods = moduleReexports (lmHeader via)
-        tryReexports reexportedMods rest
+    -- automatically.  @visited@ prevents infinite loops when modules
+    -- have circular re-export chains (e.g. A re-exports B, B re-exports A).
+    followModuleReexports via rest =
+        followModuleReexportsV [lmName via] via rest
 
-    tryReexports [] rest = tryImports rest
-    tryReexports (modName:mods) rest = do
+    followModuleReexportsV visited via rest = do
+        let reexportedMods = filter (`notElem` visited)
+                           $ moduleReexports (lmHeader via)
+        tryReexports visited reexportedMods rest
+
+    tryReexports _       [] rest = tryImports rest
+    tryReexports visited (modName:mods) rest = do
         reLm <- loadModule registry searchPath includeMap modName
         mLhs <- findOrResolveLhs (lmSource reLm) (lmKnown reLm) name
         case mLhs of
@@ -1285,12 +1273,13 @@ resolveImport registry searchPath includeMap lm name = do
                     then do
                         discoverInModule registry searchPath includeMap reLm name
                         pure (Just ())
-                    else tryReexports mods rest
+                    else tryReexports visited mods rest
             Nothing ->
                 -- Go one level deeper if reLm itself has module re-exports.
-                followModuleReexports reLm [] >>= \case
+                -- Mark modName as visited to prevent cycles.
+                followModuleReexportsV (modName : visited) reLm [] >>= \case
                     Just ()  -> pure (Just ())
-                    Nothing  -> tryReexports mods rest
+                    Nothing  -> tryReexports visited mods rest
 
 specAllows :: ImportSpec -> ByteString -> Bool
 specAllows ImportAll         _ = True
