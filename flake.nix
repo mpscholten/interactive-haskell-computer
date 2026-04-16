@@ -80,6 +80,30 @@
           "bytestring"
         ];
 
+        # A single flat directory containing every .h file shipped with the
+        # installed GHC (rts, ghc-internal, bytestring, unix, time, process,
+        # ghc-bignum, …).  This lets IHC's CPP preprocessor resolve system
+        # headers like MachDeps.h, HsFFI.h, HsBaseConfig.h that live in the
+        # GHC installation but not in Hackage source tarballs.
+        #
+        # We collect headers from all per-package include/ subdirs under
+        #   <ghc>/lib/ghc-<ver>/lib/<platform>-ghc-<ver>/<pkg>-<ver>/include/
+        # as well as the top-level rts include tree (which contains MachDeps.h,
+        # DerivedConstants.h, ghcplatform.h, HsFFI.h, Rts.h, etc.).
+        # Sub-directories (rts/, stg/) are preserved by using cp -r so that
+        # includes like #include "rts/Types.h" also resolve.
+        ghcIncludeDirs = pkgs.runCommand "ihc-ghc-includes" { } ''
+          mkdir -p $out
+          # Walk every include/ subdir under the installed GHC package tree
+          # and copy its contents into the flat output dir.  cp -rn (no-clobber)
+          # means earlier (more important) headers win when names collide.
+          for inc_dir in ${ghc}/lib/ghc-*/lib/*-ghc-*/*/include; do
+            if [ -d "$inc_dir" ]; then
+              cp -rn "$inc_dir"/. $out/ 2>/dev/null || true
+            fi
+          done
+        '';
+
         # Derivation that copies each boot-lib source tree from GHC's source
         # into $out/<pkg>-<version>/.  Version is read from the .cabal file
         # using a case-insensitive grep so it handles both "version:" and
@@ -140,6 +164,12 @@
             # required.  IHC.CabalProject.cachedPackageSearchPath enumerates
             # this directory alongside ~/.cache/ihc/sources/.
             export IHC_NIX_SOURCE_DIR="${ihcSourceRoot}"
+
+            # GHC's own header files (MachDeps.h, HsFFI.h, HsBaseConfig.h, …)
+            # live in the installed GHC package tree, not in Hackage tarballs.
+            # IHC.Cpp reads this colon-separated list as a last-resort include
+            # search path so that #include "MachDeps.h" resolves correctly.
+            export IHC_GHC_INCLUDE_DIRS="${ghcIncludeDirs}"
 
             # ~/.cache/ihc/sources/ remains available for packages NOT in the
             # nix bundle above; users can still `cabal get <pkg>` there as

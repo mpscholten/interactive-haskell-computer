@@ -50,9 +50,12 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.List (isSuffixOf)
+import System.Environment (lookupEnv)
 import System.FilePath (takeDirectory, splitDrive, (</>))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | A macro body: either a simple replacement text, or a function-like
 -- macro with parameter names and a replacement template containing
@@ -93,6 +96,38 @@ defaultCppContext = Map.fromList
 -- | Hard cap on include nesting depth to prevent infinite recursion.
 maxIncludeDepth :: Int
 maxIncludeDepth = 16
+
+-- | GHC's global include directories, read once from the
+-- @IHC_GHC_INCLUDE_DIRS@ environment variable (colon-separated).  These
+-- contain headers like @MachDeps.h@, @HsFFI.h@, @HsBaseConfig.h@ that are
+-- part of the installed GHC but are not shipped in Hackage source tarballs.
+-- Populated lazily on first use via 'unsafePerformIO'; safe because the
+-- environment variable is read-only after process start.
+{-# NOINLINE ghcGlobalIncludeDirsRef #-}
+ghcGlobalIncludeDirsRef :: IORef (Maybe [FilePath])
+ghcGlobalIncludeDirsRef = unsafePerformIO (newIORef Nothing)
+
+-- | Return the list of GHC global include directories, reading the env var
+-- the first time this function is called.
+getGhcGlobalIncludeDirs :: IO [FilePath]
+getGhcGlobalIncludeDirs = do
+    cached <- readIORef ghcGlobalIncludeDirsRef
+    case cached of
+        Just dirs -> pure dirs
+        Nothing   -> do
+            mEnv <- lookupEnv "IHC_GHC_INCLUDE_DIRS"
+            let dirs = case mEnv of
+                    Nothing  -> []
+                    Just ""  -> []
+                    Just val -> splitOnColon val
+            atomicWriteIORef ghcGlobalIncludeDirsRef (Just dirs)
+            pure dirs
+  where
+    splitOnColon :: String -> [FilePath]
+    splitOnColon ""  = []
+    splitOnColon str = case break (== ':') str of
+        (d, [])     -> [d]
+        (d, _:rest) -> d : splitOnColon rest
 
 -- | Raised when @#include@ depth exceeds 'maxIncludeDepth'.
 newtype IncludeDepthExceeded = IncludeDepthExceeded FilePath deriving Show
@@ -298,10 +333,19 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
                     maybeBytes1 <- case maybeBytes of
                         Just _  -> pure maybeBytes
                         Nothing -> searchIncludeDirs includeDirs incPath
-                    -- Fallback 2: walk ancestor include/ directories heuristically.
-                    -- Handles packages where the cabal include-dirs weren't parsed.
-                    maybeBytes' <- case maybeBytes1 of
+                    -- Fallback 2: GHC's own installed include directories
+                    -- (MachDeps.h, HsFFI.h, HsBaseConfig.h, DerivedConstants.h,
+                    -- etc.).  Populated from IHC_GHC_INCLUDE_DIRS env var which
+                    -- the nix shell sets to the ghcIncludeDirs derivation output.
+                    maybeBytes2 <- case maybeBytes1 of
                         Just _  -> pure maybeBytes1
+                        Nothing -> do
+                            ghcDirs <- getGhcGlobalIncludeDirs
+                            searchIncludeDirs ghcDirs incPath
+                    -- Fallback 3: walk ancestor include/ directories heuristically.
+                    -- Handles packages where the cabal include-dirs weren't parsed.
+                    maybeBytes' <- case maybeBytes2 of
+                        Just _  -> pure maybeBytes2
                         Nothing -> do
                             mAncestor <- findInAncestorIncludes dir incPath
                             case mAncestor of
@@ -315,7 +359,8 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
                             -- The resolved path for the included file should be
                             -- the path we actually found it at, so relative
                             -- includes inside it also resolve correctly.
-                            resolvedPath <- findIncludePath dir includeDirs incPath
+                            ghcDirs <- getGhcGlobalIncludeDirs
+                            resolvedPath <- findIncludePath dir (includeDirs ++ ghcDirs) incPath
                             let incLines = splitLines incBytes
                             (incOut, ctx') <- processIO includeDirs ctx True incLines [] resolvedPath (depth + 1)
                             -- The included lines replace the single #include
