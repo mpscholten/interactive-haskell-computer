@@ -640,6 +640,16 @@ parseStmt ctx cur0 = do
                 _ -> do
                     (e, cur') <- parseExpr ctx cur0
                     pure (SExpr e, cur')
+        -- `_ <- expr` — wildcard bind; discard the result.
+        TkUnderscore -> do
+            let (peek, cur2) = nextSig ctx cur1
+            case tkKind peek of
+                TkLArrow -> do
+                    (e, cur3) <- parseExpr ctx cur2
+                    pure (SBind (BC.pack "_") e, cur3)
+                _ -> do
+                    (e, cur') <- parseExpr ctx cur0
+                    pure (SExpr e, cur')
         _ -> do
             (e, cur') <- parseExpr ctx cur0
             pure (SExpr e, cur')
