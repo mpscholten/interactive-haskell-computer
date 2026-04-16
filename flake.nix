@@ -33,6 +33,20 @@
           call-stack
           HUnit
           aeson
+          directory
+          filepath
+          process
+          unix
+          time
+          deepseq
+          exceptions
+          stm
+          async
+          hashable
+          unordered-containers
+          vector
+          scientific
+          attoparsec
         ];
 
         # Keep only packages that actually have a derivation and are not
