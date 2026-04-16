@@ -319,6 +319,13 @@ nextToken s c0 =
       where
         go p = case peekByte s p of
             Just b | isDigit b -> go (p + 1)
+            -- NumericUnderscores: `_` between digits is a separator, stripped
+            -- before the `read` call below. Only accept if next byte is a digit,
+            -- otherwise the underscore belongs to a trailing identifier / op.
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , isDigit b2
+                -> go (p + 1)
             _ ->
                 -- Check for float: '.' followed by digit, or 'e'/'E'.
                 case peekByte s p of
@@ -329,7 +336,8 @@ nextToken s c0 =
                     Just e | e == 0x65 || e == 0x45         -- 'e' or 'E'
                         -> lexFloat start p
                     _ ->
-                        let n   = read (BC.unpack (sliceBytes s (cPos start, p))) :: Integer
+                        let raw = sliceBytes s (cPos start, p)
+                            n   = read (BC.unpack (stripUnderscores raw)) :: Integer
                             -- Consume trailing '#' or '##' for unboxed int literals
                             -- (e.g. 0#, 1##). Treat them as plain integers.
                             p'  = skipHashes p
@@ -354,19 +362,32 @@ nextToken s c0 =
                                         _         -> p1 + 1
                            in goDec p3
                     _ -> p1
-            bs  = sliceBytes s (cPos start, p2)
+            bs  = stripUnderscores (sliceBytes s (cPos start, p2))
             d   = read (BC.unpack bs) :: Double
             end = Cursor p2 (cLine start) (cCol start + (p2 - cPos start))
         in (mkTok (TkFloat d) start end, end)
       where
+        -- NumericUnderscores inside fractional / exponent digits.
         goDec p = case peekByte s p of
             Just b | isDigit b -> goDec (p + 1)
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , isDigit b2
+                -> goDec (p + 1)
             _                  -> p
 
+    -- NumericUnderscores: `0x_` just after the '0x' prefix is allowed, and
+    -- '_' between digits is a separator. @skipUnder@ consumes at most one
+    -- underscore followed by a hex digit; we re-enter the digit loop
+    -- whenever we see one.
     lexHex start = go (cPos start + 2) 0
       where
         go p !acc = case peekByte s p of
             Just b | isHexDigit b -> go (p + 1) (acc * 16 + fromIntegral (hexVal b))
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , isHexDigit b2
+                -> go (p + 1) acc
             _ | p == cPos start + 2 ->
                     -- '0x' with no digits: fall back to decimal 0, leave 'x...'
                     -- to the next call. Should not happen in practice.
@@ -381,6 +402,10 @@ nextToken s c0 =
         go p !acc = case peekByte s p of
             Just b | b >= 0x30 && b <= 0x37 ->
                 go (p + 1) (acc * 8 + fromIntegral (b - 0x30))
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , b2 >= 0x30 && b2 <= 0x37
+                -> go (p + 1) acc
             _ | p == cPos start + 2 ->
                     let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
                     in (mkTok (TkInt 0) start end, end)
@@ -674,3 +699,9 @@ utf8CharLen b
     | b < 0xF0  = 3
     | b < 0xF8  = 4
     | otherwise = 1
+
+-- | Drop NumericUnderscores separators from a raw numeric literal slice
+-- before handing it to 'read'. The lexer only admits @_@ between digits,
+-- so a simple filter is always safe.
+stripUnderscores :: ByteString -> ByteString
+stripUnderscores = BS.filter (/= 0x5F)
