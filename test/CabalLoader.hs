@@ -323,3 +323,67 @@ spec = describe "Phase 2.7 — Cabal project loader" do
             tarballPaths <- cabalTarballSearchPath
             allPaths     <- cachedPackageSearchPath
             mapM_ (\p -> allPaths `shouldContain` [p]) tarballPaths
+
+    --------------------------------------------------------------------
+    -- Multi-package search path + hs-source-dirs: src support
+    --
+    -- Regression tests for the three dryrun findings that flagged
+    -- "multi-package search path not implemented" as a fatal blocker
+    -- (mtl/transformers, random/splitmix, classy-prelude). These pin
+    -- down that:
+    --
+    --   1. cachedPackageSearchPath enumerates EVERY
+    --      ~/.cache/ihc/sources/*/ subdir, not just base-*.
+    --   2. For packages with hs-source-dirs: src, the src/ subdir is
+    --      the entry that appears (not the package root).
+    --
+    -- Each test is gated on the package actually being cached so they
+    -- are safe to run in a cold-cache CI environment.
+    --------------------------------------------------------------------
+    describe "multi-package cache enumeration" do
+        it "includes the mtl package root (module files at pkg/Control/Monad/State.hs)" $ do
+            home <- lookupEnv "HOME"
+            case home of
+                Nothing -> pendingWith "HOME not set"
+                Just h  -> do
+                    let mtlRoot = h </> ".cache" </> "ihc" </> "sources" </> "mtl-2.3.2"
+                    hasMtl <- doesDirectoryExist mtlRoot
+                    if not hasMtl
+                        then pendingWith "mtl-2.3.2 not in ~/.cache/ihc/sources"
+                        else do
+                            -- mtl's cabal has no hs-source-dirs, so the entry
+                            -- should be the package root itself.
+                            paths <- cachedPackageSearchPath
+                            paths `shouldContain` [mtlRoot]
+
+        it "includes random-1.3.1/src when hs-source-dirs: src is declared" $ do
+            home <- lookupEnv "HOME"
+            case home of
+                Nothing -> pendingWith "HOME not set"
+                Just h  -> do
+                    let randomRoot = h </> ".cache" </> "ihc" </> "sources" </> "random-1.3.1"
+                        randomSrc  = randomRoot </> "src"
+                    hasRandom <- doesDirectoryExist randomRoot
+                    if not hasRandom
+                        then pendingWith "random-1.3.1 not in ~/.cache/ihc/sources"
+                        else do
+                            paths <- cachedPackageSearchPath
+                            -- random declares hs-source-dirs: src, so we
+                            -- MUST see the src/ subdir in the path, not
+                            -- the bare package root.
+                            paths `shouldContain` [randomSrc]
+                            paths `shouldSatisfy` (\ps -> randomRoot `notElem` ps)
+
+        it "includes splitmix-0.1.3.2/src when hs-source-dirs: src is declared" $ do
+            home <- lookupEnv "HOME"
+            case home of
+                Nothing -> pendingWith "HOME not set"
+                Just h  -> do
+                    let splitRoot = h </> ".cache" </> "ihc" </> "sources" </> "splitmix-0.1.3.2"
+                        splitSrc  = splitRoot </> "src"
+                    hasSplit <- doesDirectoryExist splitRoot
+                    if not hasSplit
+                        then pendingWith "splitmix-0.1.3.2 not in ~/.cache/ihc/sources"
+                        else do
+                            paths <- cachedPackageSearchPath
+                            paths `shouldContain` [splitSrc]
