@@ -403,7 +403,20 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
             -- in the context so that e.g. IS_WINDOWS, CHAR, FILEPATH, MODULE_NAME
             -- (defined via #define in a template-include wrapper like Posix.hs)
             -- are substituted into the body of the included file.
-            let emit = if active then expandMacrosInLine ctx ln else BS.empty
+            --
+            -- Exception: C header files (.h, .hpp, .H) may contain C-style
+            -- comments (/* ... */) and other non-Haskell content.  Emitting
+            -- these verbatim into the output would confuse the Haskell lexer
+            -- (e.g. bytestring-cpp-macros.h has /* ... */ comments between
+            -- #define directives that appear before the module declaration
+            -- of the including .hs file).  We blank those regular lines out
+            -- so only CPP-directive-driven content affects the output.
+            let isCHeader = ".h"   `isSuffixOf` filePath
+                         || ".hpp" `isSuffixOf` filePath
+                         || ".H"   `isSuffixOf` filePath
+            let emit | not active  = BS.empty
+                     | isCHeader   = BS.empty   -- C comments / non-Haskell content
+                     | otherwise   = expandMacrosInLine ctx ln
             (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
             pure (emit : xs, c)
 
@@ -542,7 +555,16 @@ parseDirective ln =
                 "pragma"   -> Just DirIgnore
                 "error"    -> Just DirIgnore
                 "warning"  -> Just DirIgnore
-                ""         -> Just DirIgnore         -- blank directive
+                ""         ->
+                    -- Empty word: the '#' is not followed by an identifier.
+                    -- If the next char is '-', this is '#-}' (Haskell
+                    -- block-comment/pragma close) or '#-' — treat as a
+                    -- regular line, NOT a CPP directive.  This preserves the
+                    -- closing '#-}' of '{-# RULES ... #-}' pragmas that span
+                    -- multiple lines when '#-}' appears at column 1.
+                    case BC.uncons content of
+                        Just ('-', _) -> Nothing   -- '#-}' or '#-...' → not CPP
+                        _             -> Just DirIgnore  -- truly blank directive
                 _          -> Just DirIgnore         -- unknown — be forgiving
         _ -> Nothing
 

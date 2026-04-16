@@ -276,6 +276,11 @@ nextToken s c0 =
             -- tokens for recognised shapes (=, ==, ->, :, ::, +, ++, ...)
             -- and TkSymOp for user-defined operators.
             | isOpChar (Just b) -> lexSymOp c
+            -- Real-world source files occasionally contain UTF-8 in comments,
+            -- Haddock, or string-like examples. The lexer is otherwise
+            -- ASCII-centric, so treat an unexpected non-ASCII codepoint as
+            -- ignorable trivia rather than aborting the whole load.
+            | b >= 0x80         -> nextToken s (stepN (utf8CharLen b) c)
             | otherwise        ->
                 error ("IHC.Lexer: unexpected byte 0x"
                        <> showHex b
@@ -287,6 +292,9 @@ nextToken s c0 =
     step (Cursor p l col) = case peekByte s p of
         Just 0x0A -> Cursor (p + 1) (l + 1) 1
         _         -> Cursor (p + 1) l (col + 1)
+
+    stepN 0 cur = cur
+    stepN n cur = stepN (n - 1) (step cur)
 
     eatNewlines start = go start
       where
@@ -658,3 +666,11 @@ showHex b = [hex (fromIntegral b `div` 16), hex (fromIntegral b `mod` 16)]
   where
     hex n | n < 10    = chr (0x30 + n)
           | otherwise = chr (0x61 + n - 10)
+
+utf8CharLen :: Word8 -> Int
+utf8CharLen b
+    | b < 0x80  = 1
+    | b < 0xE0  = 2
+    | b < 0xF0  = 3
+    | b < 0xF8  = 4
+    | otherwise = 1

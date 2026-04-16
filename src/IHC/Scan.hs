@@ -43,6 +43,8 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
+import Control.Monad (when)
+import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
 import IHC.Lexer
@@ -101,10 +103,16 @@ scanAllTopLevelNames src = go [] startCursor
             TkNewline -> go acc cur'
             TkIdent name
                 | tkCol tok == 1 -> do
+                    -- Check if this is an infix binding: `arg \`op\` arg = ...`
+                    -- or `arg @op arg = ...`.  If so, report the operator name,
+                    -- not the first-argument name.
+                    let bindName = case peekInfixOp src cur' of
+                                       Just op -> op
+                                       Nothing -> name
                     -- Quick-scan past this binding's clauses so we don't
                     -- re-report the same name from a continuation clause.
                     curSkipped <- skipThroughBinding src name cur'
-                    let acc' = if name `elem` acc then acc else name : acc
+                    let acc' = if bindName `elem` acc then acc else bindName : acc
                     go acc' curSkipped
             -- Phase 3.2 + 3.4: explicitly skip top-level type / type family /
             -- type instance declarations (DataKinds + TypeFamilies). These are
@@ -136,6 +144,60 @@ peekSigTokFrom src cur =
     in case tkKind tok of
         TkNewline -> peekSigTokFrom src cur'
         _         -> (tok, cur')
+
+-- | Given a cursor positioned just after a column-1 identifier, check
+-- whether this is an infix binding of the form:
+--
+--   @arg1 \`op\` arg2 = ...@     — backtick operator
+--   @arg1 @?= arg2 = ...@       — @\@@-prefixed symbolic operator
+--
+-- Returns @Just operatorName@ if the pattern matches, @Nothing@ if
+-- this is a plain binding (@f x y = ...@).
+--
+-- We only detect the simple case where the operator immediately follows
+-- the first argument (i.e. @arg1@ is the token right after the col-1
+-- ident).  Multi-pattern LHS like @f x \`op\` y = ...@ is not handled
+-- here but those are rare in practice.
+peekInfixOp :: Source -> Cursor -> Maybe ByteString
+peekInfixOp src cur =
+    let (t1, c1) = peekSigTokFrom src cur
+    in case tkKind t1 of
+        -- Immediately followed by backtick: `arg \`op\` ...`
+        TkBacktick ->
+            let (t2, c2) = peekSigTokFrom src c1
+            in case tkKind t2 of
+                TkIdent op ->
+                    let (t3, _) = peekSigTokFrom src c2
+                    in case tkKind t3 of
+                        TkBacktick -> Just op
+                        _          -> Nothing
+                _ -> Nothing
+        -- Immediately followed by '@'-prefixed op: `arg @?= ...`
+        TkAt ->
+            let (t2, _) = peekSigTokFrom src c1
+            in case tkKind t2 of
+                TkSymOp suf -> Just (BC.pack "@" <> suf)
+                _           -> Nothing
+        -- First token is a single-ident argument; check the token after it.
+        TkIdent _ ->
+            let (t2, c2) = peekSigTokFrom src c1
+            in case tkKind t2 of
+                TkBacktick ->
+                    let (t3, c3) = peekSigTokFrom src c2
+                    in case tkKind t3 of
+                        TkIdent op ->
+                            let (t4, _) = peekSigTokFrom src c3
+                            in case tkKind t4 of
+                                TkBacktick -> Just op
+                                _          -> Nothing
+                        _ -> Nothing
+                TkAt ->
+                    let (t3, _) = peekSigTokFrom src c2
+                    in case tkKind t3 of
+                        TkSymOp suf -> Just (BC.pack "@" <> suf)
+                        _           -> Nothing
+                _ -> Nothing
+        _ -> Nothing
 
 -- | Advance looking for a top-level binding named @target@. Returns
 -- the binding's LHS (list of clauses) if found. Consecutive equations
@@ -169,15 +231,32 @@ findBinding src ref target = do
     -- the clause boundaries, then peek ahead: if the next column-1
     -- significant token is the same name, accumulate another clause.
     handleTopIdent acc name startTok cur = do
+        -- If this col-1 identifier is actually the LHS argument of an infix
+        -- binding (e.g. `actual \`shouldBe\` expected = ...`), use the
+        -- operator as the real binding name.
+        let mInfixOp = peekInfixOp src cur
+            realName = case mInfixOp of
+                           Just op -> op
+                           Nothing -> name
         mClause <- scanOneClauseAfterName src cur
         case mClause of
             Nothing      -> skipBadBinding acc startTok cur
             Just (clause, curAfter) -> do
+                -- For infix bindings, extend the pats span leftward to include
+                -- the first argument (the col-1 identifier).
+                -- E.g. for `actual \`shouldBe\` expected = rhs`, the scanner
+                -- starts from after `actual`, so patsStart points at the
+                -- backtick.  We need it at `actual` so parsePatsIn collects
+                -- both arguments as patterns.
+                let clause' = case mInfixOp of
+                        Just _ -> clause { clausePats =
+                                    (tkStart startTok, snd (clausePats clause)) }
+                        Nothing -> clause
                 (moreClauses, curFinal) <-
-                    collectMoreClauses name [clause] curAfter
+                    collectMoreClauses name [clause'] curAfter
                 let lhs  = BindingLhs (reverse moreClauses)
-                    acc' = Map.insert name (SpanOnly lhs) acc
-                if name == target
+                    acc' = Map.insert realName (SpanOnly lhs) acc
+                if realName == target
                     then do
                         writeIORef ref (acc', curFinal)
                         pure (Just lhs)
@@ -374,6 +453,11 @@ scanDataDecls src = go Map.empty Map.empty startCursor
         case tkKind tok of
             TkEof -> pure (dReg, fReg)
             TkData | tkCol tok == 1 -> do
+                ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
+                go dReg' fReg' curAfter
+            -- Phase 3.6: newtype declarations behave like single-constructor
+            -- data declarations for our purposes (constructor name → arity 1).
+            TkNewtype | tkCol tok == 1 -> do
                 ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
                 go dReg' fReg' curAfter
             -- Phase 3.2 + 3.4: skip top-level type / type family / type instance
@@ -622,6 +706,7 @@ scanDataDecls src = go Map.empty Map.empty startCursor
                 countCtorFields (n + 1) curAfter
             TkConId _ -> countCtorFields (n + 1) cur'
             TkIdent _ -> countCtorFields (n + 1) cur'
+            TkPrimId _ -> countCtorFields (n + 1) cur'
             -- TkBang is a strictness annotation on the *next* field, not a
             -- field itself and not a terminator. Skip it and continue.
             TkBang    -> countCtorFields n cur'
@@ -777,6 +862,24 @@ scanInstanceDecls src = go [] startCursor
                         let lhs  = BindingLhs (reverse moreClauses)
                             acc' = Map.insert name lhs acc
                         scanMethods acc' curFinal
+            -- Phase 3.6: operator methods like @(>>=)@, @(>>)@, @(<>)@, @(+)@.
+            -- Pattern: @TkLParen TkSymOp name TkRParen ...@
+            TkLParen | tkCol tok > 1 -> do
+                let (opTok, cur'') = nextToken src cur'
+                case tkKind opTok of
+                    TkSymOp opName -> do
+                        let (closeTok, cur''') = nextToken src cur''
+                        case tkKind closeTok of
+                            TkRParen -> do
+                                mClause <- scanOneClauseAfterName src cur'''
+                                case mClause of
+                                    Nothing -> scanMethods acc cur'
+                                    Just (clause, curNext) -> do
+                                        let lhs  = BindingLhs [clause]
+                                            acc' = Map.insert opName lhs acc
+                                        scanMethods acc' curNext
+                            _ -> scanMethods acc cur'
+                    _ -> scanMethods acc cur'
             -- Phase 3.2: skip associated-type declarations inside instance bodies.
             -- 'type Elem [] = ()' appears inside 'instance C T where' blocks.
             -- We use findLineEnd to skip only the current line so we don't

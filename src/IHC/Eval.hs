@@ -25,6 +25,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Int (Int64)
+import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
+import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 
 import IHC.AST
@@ -55,7 +57,11 @@ eval env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
     go (ELit (LFloat d)) = pure (VFloat d)
-    go (ELit (LStr s))   = pure (VStr s)
+    -- Source-level Haskell strings are [Char]. Keeping literals as real cons
+    -- lists lets source-loaded libraries like bytestring pattern-match and
+    -- recurse over them normally instead of tripping over the transitional
+    -- VStr representation.
+    go (ELit (LStr s))   = stringLiteralToListVal s
     go (ELit (LChar c))  = pure (VChar c)
     go (ELabel name)     = pure (VLabel name)  -- Phase 3.5: OverloadedLabels
 
@@ -66,7 +72,12 @@ eval env ipm = go
     go (EApp f x) = do
         fv  <- go f                            -- function to WHNF
         xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
-        applyIP ipm fv xt                      -- pass caller's ipm for ?-params
+        case fv of
+            VPrimObj _ -> do
+                a <- force xt
+                error ("IHC.Eval.go(EApp): VPrimObj in function position: "
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
+            _ -> applyIP ipm fv xt
 
     go (ELam name body) =
         -- Phase 3.6: User-defined lambdas use VFunIP so the caller can
@@ -182,6 +193,16 @@ eval env ipm = go
                 eval (extendEnvMany bindings env) ipm body
             Nothing -> tryAlts v rest
 
+    stringLiteralToListVal :: ByteString -> IO Val
+    stringLiteralToListVal bs = goChars (BC.unpack bs)
+      where
+        goChars [] = pure (VCon "[]" [])
+        goChars (ch:chs) = do
+            chT <- newWHNFThunk (VChar ch)
+            restV <- goChars chs
+            restT <- newWHNFThunk restV
+            pure (VCon ":" [chT, restT])
+
 -- | Try to match a pattern against a (already-WHNF) value. Returns
 -- the variable bindings introduced by the pattern, or 'Nothing'.
 --
@@ -252,7 +273,62 @@ matchPat (PCon name pats) (VCon vname vthunks)
         case m of
             Nothing   -> pure Nothing
             Just subs -> matchFields rest (reverse subs ++ acc)
-matchPat (PCon _ _) _ = pure Nothing
+-- IO constructor: VIO wraps a suspended (IO Val). When source code
+-- pattern-matches on IO (e.g. `IO act`), expose the underlying
+-- State# RealWorld -> (# State# RealWorld, a #) function so that
+-- source-loaded unsafeDupablePerformIO & friends can deconstruct it.
+
+-- ForeignPtr deconstruction: source code pattern-matches
+-- `ForeignPtr addr# contents` on our opaque VPrimObj (PrimForeignPtr fp).
+-- Expose Addr# as VPrimObj PrimPtr (the raw pointer) and
+-- ForeignPtrContents as an opaque placeholder.
+matchPat (PCon "ForeignPtr" [pAddr, pContents]) (VPrimObj (PrimForeignPtr fp)) = do
+    let rawPtr = unsafeForeignPtrToPtr fp
+    addrThunk <- newWHNFThunk (VPrimObj (PrimPtr (castPtr rawPtr)))
+    -- ForeignPtrContents is opaque; use the ForeignPtr itself as a stand-in
+    -- so touchForeignPtr can still work if needed.
+    contentsThunk <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
+    matchFields [(pAddr, addrThunk), (pContents, contentsThunk)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar n, t) : rest) acc =
+        matchFields rest ((n, t) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((p, t) : rest) acc = do
+        fv <- force t
+        m  <- matchPat p fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+
+-- Ptr deconstruction: source code pattern-matches `Ptr addr#`.
+matchPat (PCon "Ptr" [pAddr]) (VPrimObj (PrimPtr ptr)) = do
+    addrThunk <- newWHNFThunk (VPrimObj (PrimPtr ptr))
+    matchFields [(pAddr, addrThunk)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar n, t) : rest) acc =
+        matchFields rest ((n, t) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((p, t) : rest) acc = do
+        fv <- force t
+        m  <- matchPat p fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+
+matchPat (PCon "IO" [p]) (VIO action) = do
+    let stFn = VFun $ \_stateThunk -> do
+            -- Run the IO action, return an unboxed tuple (# state, result #)
+            result <- action
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            resT <- newWHNFThunk result
+            pure (VCon "(#,#)" [stT, resT])
+    matchPat p stFn
+matchPat (PCon pname ppats) v = do
+    pure Nothing
 -- Record patterns: should have been desugared to PCon by the scheduler.
 -- If they reach here (e.g. in a standalone test), fall back to failure.
 matchPat (PRecord _ _) _ = pure Nothing
@@ -282,8 +358,10 @@ apply v               _   = error ("IHC.Eval.apply: not a function: "
 applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP callerIPM (VFun f)     arg = f arg
 applyIP callerIPM (VFunIP _ f) arg = f callerIPM arg
-applyIP _         v            _   = error ("IHC.Eval.applyIP: not a function: "
-                                            <> showValForDebug v)
+applyIP _         v            arg  = do
+    a <- force arg
+    error ("IHC.Eval.applyIP: not a function: "
+           <> showValForDebug v <> " applied to " <> showValForDebug a)
 
 --------------------------------------------------------------------------------
 -- Do-block desugaring
@@ -344,6 +422,16 @@ evalDo env ipm (SLet bs : rest) = do
 -- in well-typed code, but we're optimistic and permissive).
 runIOVal :: Val -> IO Val
 runIOVal (VIO io) = io >>= runIOVal
+-- Source-constructed IO actions: `IO $ \s -> (# s', a #)`
+-- The thunk wraps a function from State# to unboxed tuple.
+runIOVal (VCon "IO" [ft]) = do
+    fv <- force ft
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- apply fv rwT
+    -- result should be (# State#, a #) unboxed tuple
+    case result of
+        VCon _ [_stT, resT] -> force resT >>= runIOVal
+        other               -> runIOVal other
 runIOVal v        = pure v
 
 --------------------------------------------------------------------------------

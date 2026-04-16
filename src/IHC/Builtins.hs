@@ -53,7 +53,9 @@ import Foreign.C.String (peekCAString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
     , newForeignPtr_
+    , plusForeignPtr
     )
+import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr, nullPtr, minusPtr)
@@ -86,6 +88,26 @@ import IHC.Eval (apply, force)
 import IHC.Scan (DataRegistry, FieldRegistry)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
+
+mkForeignPtrVal :: ForeignPtr Word8 -> IO Val
+mkForeignPtrVal fp = do
+    addrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr (unsafeForeignPtrToPtr fp))))
+    gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
+    pure (VCon "ForeignPtr" [addrT, gutsT])
+
+ptrValToPtr :: Val -> IO (Ptr Word8)
+ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
+ptrValToPtr (VCon "Ptr" [pT]) = force pT >>= ptrValToPtr
+ptrValToPtr other = error ("expected Ptr: " <> showValForDebug other)
+
+foreignPtrValToForeignPtr :: Val -> IO (ForeignPtr Word8)
+foreignPtrValToForeignPtr (VPrimObj (PrimForeignPtr fp)) = pure fp
+foreignPtrValToForeignPtr (VCon "ForeignPtr" [_addrT, gutsT]) = do
+    gv <- force gutsT
+    case gv of
+        VPrimObj (PrimForeignPtr fp) -> pure fp
+        _ -> error ("ForeignPtr guts missing host pointer: " <> showValForDebug gv)
+foreignPtrValToForeignPtr other = error ("expected ForeignPtr: " <> showValForDebug other)
 
 -- | Build the initial environment containing every well-known name.
 --
@@ -153,6 +175,22 @@ builtinEnv reg = do
     leftT  <- newWHNFThunk (VFun $ \x -> pure (VCon "Left"  [x]))
     rightT <- newWHNFThunk (VFun $ \x -> pure (VCon "Right" [x]))
     let eitherCtors = [("Left", leftT), ("Right", rightT)]
+    -- IO constructor: IO wraps a (State# RealWorld -> (# State# RealWorld, a #))
+    -- function into a VIO action.  GHC.Types defines `newtype IO a = IO (State# ...)`
+    -- but since GHC.Types is builtin-backed (no .hs source), we register it here.
+    ioCtorT <- newWHNFThunk (VFun $ \fThunk -> do
+        f <- force fThunk
+        pure (VIO (do
+            let stok = VPrimObj PrimRealWorld
+            stokT <- newWHNFThunk stok
+            r <- apply f stokT
+            case r of
+                VCon "(#,#)" [_stT, aT] -> do
+                    v <- force aT
+                    pure v
+                other                    -> pure other)))
+    -- Ptr smart constructor: `Ptr addr#` wraps an Addr# (PrimPtr) back into PrimPtr.
+    ptrCtorT <- newWHNFThunk ptrCtorV
     -- Phase 2.9.5: Proxy and Dynamic constructors.
     -- Phase 3.5 note: when a VLabel is used where a Proxy is expected,
     -- fromLabel produces VCon "Proxy" [VLabel name].
@@ -164,13 +202,22 @@ builtinEnv reg = do
     typeableInsts <- buildBuiltinTypeableInsts
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors
-                         ++ unitCtor ++ eitherCtors ++ phase295Ctors ++ typeableInsts)
+                         ++ unitCtor ++ eitherCtors ++ [("IO", ioCtorT)]
+                         ++ [("Ptr", ptrCtorT)]
+                         ++ phase295Ctors ++ typeableInsts)
                         emptyEnv)
   where
     consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
     mkCon0 name = do
         t <- newWHNFThunk (VCon name [])
         pure (name, t)
+    -- Ptr constructor: `Ptr addr#` => VPrimObj (PrimPtr p).
+    -- The Addr# is already a VPrimObj PrimPtr internally.
+    ptrCtorV = VFun $ \addrT -> do
+        v <- force addrT
+        case v of
+            VPrimObj (PrimPtr p) -> pure (VPrimObj (PrimPtr p))
+            _                   -> pure (VCon "Ptr" [addrT])  -- fallback
 
 builtins :: ClassRegistry -> [(Name, IO Val)]
 builtins reg =
@@ -224,9 +271,11 @@ builtins reg =
     , ("print",    printDispatch reg)
     , ("putChar",  putCharB)
     , ("getLine",  getLineB)
-    -- Monad core (plain names so Phase 2.3 class dispatch can overlay)
-    , (">>=",      bindB)
-    , (">>",       seqIOB)
+    -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
+    -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
+    -- implementation for VIO values.
+    , (">>=",      bindDispatch reg)
+    , (">>",       seqDispatch reg)
     , ("return",   returnB)
     , ("pure",     returnB)
     , ("fmap",     fmapB)
@@ -252,6 +301,7 @@ builtins reg =
     -- Control flow
     , ("seq",         seqB)
     , ("$!",          dollarBangB)
+    , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
     , ("exitWith",    exitWithB)
@@ -262,6 +312,7 @@ builtins reg =
     , ("fromIntegral", fromIntegralB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
+    , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("runRW#",                   runRWB)
     , ("lazy",                     lazyB)
     -- Phase 2.8: unsafePerformIO family
@@ -309,6 +360,7 @@ builtins reg =
     -- Phase 2.8: C memory ops
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
+    , ("copyBytes",  copyBytesB)  -- Foreign.Marshal.Utils.copyBytes: wraps memcpy (primop-backed, no Haskell source)
     , ("memset",     memsetB)
     , ("memchr",     memchrB)
     , ("memcmp",     memcmpB)
@@ -441,6 +493,15 @@ builtins reg =
     , ("typeRepArgs",    typeRepArgsB)
     -- Phase 3.5: OverloadedLabels
     , ("fromLabel",    fromLabelB reg)
+    -- Phase 3.6: MutVar# primops (backing ST monad source).
+    -- GHC.Prim has no .hs source; these are wired-in by the GHC build system.
+    , ("newMutVar#",            newMutVarB)
+    , ("readMutVar#",           readMutVarB)
+    , ("writeMutVar#",          writeMutVarB)
+    , ("atomicModifyMutVar#",   atomicModifyMutVarB)
+    , ("atomicModifyMutVar2#",  atomicModifyMutVar2B)
+    , ("atomicModifyMutVar_#",  atomicModifyMutVarUB)
+    , ("casMutVar#",            casMutVarB)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
@@ -612,6 +673,10 @@ eqVals reg av bv = case (av, bv) of
     (VInt x, VChar y)    -> pure (boolVal (toEnum (fromIntegral x) == y))
     (VChar x, VInt y)    -> pure (boolVal (x == toEnum (fromIntegral y)))
     (VStr x, VStr y)     -> pure (boolVal (x == y))
+    (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
+        pure (boolVal (p1 == p2))
+    (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
+        pure (boolVal (fp1 == fp2))
     (VUnit, VUnit)      -> pure (boolVal True)
     (VCon "True" _, VCon "True" _)   -> pure (boolVal True)
     (VCon "False" _, VCon "False" _) -> pure (boolVal True)
@@ -661,6 +726,10 @@ ordCmp _reg slot av bv = case (av, bv) of
                                 yi = fromIntegral (fromEnum y) :: Int64
                             in pure (boolVal (intOrdSlot slot xi yi))
     (VStr x, VStr y)     -> pure (boolVal (strOrdSlot slot x y))
+    (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
+        pure (boolVal (ptrOrdSlot slot p1 p2))
+    (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
+        pure (boolVal (foreignPtrOrdSlot slot fp1 fp2))
     _ -> do
         let tag = typeTagOf av
         mMethods <- lookupInstance _reg "Ord" tag
@@ -701,6 +770,18 @@ ordCmp _reg slot av bv = case (av, bv) of
     strOrdSlot 3 x y = x >= y
     strOrdSlot _ _ _ = False
 
+    ptrOrdSlot 0 x y = x < y
+    ptrOrdSlot 1 x y = x <= y
+    ptrOrdSlot 2 x y = x > y
+    ptrOrdSlot 3 x y = x >= y
+    ptrOrdSlot _ _ _ = False
+
+    foreignPtrOrdSlot 0 x y = x < y
+    foreignPtrOrdSlot 1 x y = x <= y
+    foreignPtrOrdSlot 2 x y = x > y
+    foreignPtrOrdSlot 3 x y = x >= y
+    foreignPtrOrdSlot _ _ _ = False
+
 -- | @compare@ returns an Ordering constructor: LT, EQ, or GT.
 compareDispatch :: ClassRegistry -> IO Val
 compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
@@ -717,6 +798,10 @@ compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VCon (orderingName (compare x (fromIntegral y :: Double))) [])
         (VChar x, VChar y) ->
             pure (VCon (orderingName (compare x y)) [])
+        (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
+            pure (VCon (orderingName (compare p1 p2)) [])
+        (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
+            pure (VCon (orderingName (compare fp1 fp2)) [])
         _ -> do
             lt <- ordCmp reg 0 av bv
             if isTruthy lt then pure (VCon "LT" [])
@@ -1019,6 +1104,8 @@ errorB :: IO Val
 errorB = pure $ VFun $ \a -> do
     av <- force a
     s  <- valToString av
+    hPutStrLn stderr ("ihc error called: " <> s)
+    hFlush stderr
     error ("ihc: " <> s)
 
 undefinedB :: IO Val
@@ -1035,9 +1122,108 @@ undefinedB = pure (VIO (error "Prelude.undefined"))
 returnB :: IO Val
 returnB = pure $ VFun $ \a -> pure (VIO (force a))
 
--- | @m >>= k@. Left side must evaluate to 'VIO'; run it, force the
--- right side to 'VFun', apply to the result (via a WHNF thunk), then
--- force the outer 'VIO' and run it.
+-- | Class-dispatched @>>=@.  For 'VIO' values (the common IO case) this
+-- is the same as the old 'bindB'.  For ST computations (VCon "ST" _), the
+-- ST monad bind is implemented directly: build a new ST computation that
+-- sequences the two.  For other values the 'Monad' instance in the class
+-- registry is consulted.
+bindDispatch :: ClassRegistry -> IO Val
+bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
+    mv <- force ma
+    case mv of
+        VIO _ -> pure $ VIO $ do
+            v  <- runIOVal mv
+            kv <- force kt
+            vT <- newWHNFThunk v
+            r  <- apply kv vT
+            runIOVal r
+        -- ST monad bind:
+        -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
+        -- Note: primop state functions may return VIO actions; run them with runIOVal.
+        VCon "ST" [mFuncT] -> do
+            mFuncV <- force mFuncT
+            ktV    <- force kt
+            stFunc <- newWHNFThunk $ VFun $ \sT -> do
+                resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
+                resV   <- runIOVal resRaw    -- run VIO if needed (primop results)
+                case resV of
+                    VCon "(#,#)" [newST, rT] -> do
+                        stkRaw <- apply ktV rT   -- k applied to r; result is an ST
+                        stkV   <- runIOVal stkRaw
+                        case stkV of
+                            VCon "ST" [k2FuncT] -> do
+                                k2FuncV  <- force k2FuncT
+                                resRaw2  <- apply k2FuncV newST
+                                runIOVal resRaw2
+                            other -> pure other  -- k returned a non-ST (shouldn't happen)
+                    other -> pure other  -- m didn't return an unboxed tuple
+            pure (VCon "ST" [stFunc])
+        _ -> do
+            -- Look up Monad instance for this value's type tag.
+            let tag = typeTagOf mv
+            mMethods <- lookupInstance reg "Monad" tag
+            case mMethods of
+                Just methods | not (null methods) -> do
+                    -- Monad methods are stored in the order they appear in the
+                    -- instance declaration.  We search by name.
+                    let bindMethod = last methods   -- >>=  is typically the key method
+                    maT <- newWHNFThunk mv
+                    r1  <- apply bindMethod maT
+                    apply r1 kt
+                _ ->
+                    -- No instance found; fall back to IO bind (will error at
+                    -- runtime if mv is not VIO, but gives a sensible message).
+                    pure $ VIO $ do
+                        v  <- runIOVal mv
+                        kv <- force kt
+                        vT <- newWHNFThunk v
+                        r  <- apply kv vT
+                        runIOVal r
+
+-- | @m >> n@ = run m (discarding result), then run n.
+seqDispatch :: ClassRegistry -> IO Val
+seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
+    mv <- force ma
+    case mv of
+        VIO _ -> pure $ VIO $ do
+            _ <- runIOVal mv
+            nv <- force mb
+            runIOVal nv
+        -- ST monad seq:
+        -- m >> n = m >>= \_ -> n  for ST
+        -- Note: primop state functions may return VIO actions; run them with runIOVal.
+        VCon "ST" [mFuncT] -> do
+            mFuncV <- force mFuncT
+            stFunc <- newWHNFThunk $ VFun $ \sT -> do
+                resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
+                resV   <- runIOVal resRaw    -- run VIO if needed
+                case resV of
+                    VCon "(#,#)" [newST, _] -> do
+                        nbV <- force mb
+                        case nbV of
+                            VCon "ST" [k2FuncT] -> do
+                                k2FuncV  <- force k2FuncT
+                                resRaw2  <- apply k2FuncV newST
+                                runIOVal resRaw2
+                            other -> pure other
+                    other -> pure other
+            pure (VCon "ST" [stFunc])
+        _ -> do
+            let tag = typeTagOf mv
+            mMethods <- lookupInstance reg "Monad" tag
+            case mMethods of
+                Just methods | length methods >= 2 -> do
+                    let seqMethod = head methods   -- >>  is typically stored first
+                    maT <- newWHNFThunk mv
+                    r1  <- apply seqMethod maT
+                    apply r1 mb
+                _ ->
+                    pure $ VIO $ do
+                        _ <- runIOVal mv
+                        nv <- force mb
+                        runIOVal nv
+
+-- | @m >>= k@. Low-level IO-only variant (kept for internal use).
 bindB :: IO Val
 bindB = pure $ VFun $ \ma -> pure $ VFun $ \kt -> pure $ VIO $ do
     mv <- force ma
@@ -1132,6 +1318,146 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
         _ -> error ("modifyIORef: not an IORef: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
+-- MutVar# primops (Phase 3.6).
+--
+-- GHC.Prim has no .hs source; MutVar# is wired-in by the GHC build system.
+-- GHC.ST and Data.STRef are source-loaded from base — they use these primops.
+-- We back MutVar# with the existing PrimIORef (IORef Thunk) representation.
+--
+-- The GHC State# threading convention:
+--   newMutVar# init s  = (# s', MutVar# ref #)
+--   readMutVar# mv s   = (# s', val #)
+--   writeMutVar# mv v s = (# s' #)
+-- We erase the State# token and return/accept it as VUnit (or the interpreter's
+-- unboxed-tuple convention).  The 'ST s' newtype wrapper in GHC.ST rewraps these.
+--------------------------------------------------------------------------------
+
+-- | @newMutVar# :: a -> State# s -> (# State# s, MutVar# s a #)@
+-- Returns @(# s, MutVar# ref #)@ directly (no VIO wrapper) so that
+-- source-loaded callers (GHC.STRef.newSTRef) can case-match on the result.
+newMutVarB :: IO Val
+newMutVarB = pure $ VFun $ \initThunk -> pure $ VFun $ \_st -> do
+    v  <- force initThunk
+    rf <- newIORef v
+    stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    refT <- newWHNFThunk (VPrimObj (PrimIORef rf))
+    pure (VCon "(#,#)" [stT, refT])
+
+-- | @readMutVar# :: MutVar# s a -> State# s -> (# State# s, a #)@
+-- Returns the unboxed tuple directly (no VIO wrapper).
+readMutVarB :: IO Val
+readMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_st -> do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            v   <- readIORef rf
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            vT  <- newWHNFThunk v
+            pure (VCon "(#,#)" [stT, vT])
+        _ -> error ("readMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @writeMutVar# :: MutVar# s a -> a -> State# s -> State# s@
+-- Returns the new state token directly (no VIO wrapper).
+writeMutVarB :: IO Val
+writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
+               pure $ VFun $ \_st -> do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            v <- force valThunk
+            writeIORef rf v
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @atomicModifyMutVar# :: MutVar# s a -> (a -> (a, b)) -> State# s -> (# State# s, b #)@
+atomicModifyMutVarB :: IO Val
+atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
+                      pure $ VFun $ \_st -> pure $ VIO $ do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            fv   <- force fThunk
+            cur  <- readIORef rf
+            curT <- newWHNFThunk cur
+            -- f cur returns a (a, b) pair
+            res  <- apply fv curT
+            resV <- runIOVal res
+            case resV of
+                VCon _ [newT, bT] -> do
+                    new <- force newT
+                    b   <- force bT
+                    writeIORef rf new
+                    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+                    bT' <- newWHNFThunk b
+                    pure (VCon "(#,#)" [stT, bT'])
+                _ -> error ("atomicModifyMutVar#: f did not return a pair: "
+                            <> showValForDebug resV)
+        _ -> error ("atomicModifyMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @atomicModifyMutVar2# :: MutVar# s a -> (a -> (a, b)) -> State# s -> (# State# s, a, (a, b) #)@
+atomicModifyMutVar2B :: IO Val
+atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
+                       pure $ VFun $ \_st -> pure $ VIO $ do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            fv   <- force fThunk
+            cur  <- readIORef rf
+            curT <- newWHNFThunk cur
+            res  <- apply fv curT
+            resV <- runIOVal res
+            case resV of
+                VCon _ [newT, bT] -> do
+                    new  <- force newT
+                    b    <- force bT
+                    writeIORef rf new
+                    stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+                    curT' <- newWHNFThunk cur
+                    newT' <- newWHNFThunk new
+                    bT'   <- newWHNFThunk b
+                    pairT <- newWHNFThunk (VCon "(,)" [newT', bT'])
+                    pure (VCon "(#,,#)" [stT, curT', pairT])
+                _ -> error ("atomicModifyMutVar2#: f did not return a pair: "
+                            <> showValForDebug resV)
+        _ -> error ("atomicModifyMutVar2#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @atomicModifyMutVar_# :: MutVar# s a -> (a -> a) -> State# s -> (# State# s, a, a #)@
+-- Returns @(# s, old, new #)@.
+atomicModifyMutVarUB :: IO Val
+atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
+                       pure $ VFun $ \_st -> pure $ VIO $ do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            fv   <- force fThunk
+            old  <- readIORef rf
+            oldT <- newWHNFThunk old
+            new  <- apply fv oldT
+            writeIORef rf new
+            stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+            oldT' <- newWHNFThunk old
+            newT  <- newWHNFThunk new
+            pure (VCon "(#,,#)" [stT, oldT', newT])
+        _ -> error ("atomicModifyMutVar_#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @casMutVar# :: MutVar# s a -> a -> a -> State# s -> (# State# s, Int#, a #)@
+-- Non-atomic CAS — always succeeds (returns 0# = success).
+casMutVarB :: IO Val
+casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
+             pure $ VFun $ \newThunk -> pure $ VFun $ \_st -> pure $ VIO $ do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            new <- force newThunk
+            writeIORef rf new
+            -- Return (# s, 0#, new #) — 0# means success
+            stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+            zT   <- newWHNFThunk (VInt 0)
+            newT <- newWHNFThunk new
+            pure (VCon "(#,,#)" [stT, zT, newT])
+        _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+--------------------------------------------------------------------------------
 -- File IO primops.
 --------------------------------------------------------------------------------
 
@@ -1214,6 +1540,10 @@ seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     _ <- force a
     force b
 
+-- | @assert cond x = x@.  Like GHC's default (assertions ignored) behaviour.
+assertB :: IO Val
+assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force x
+
 -- | @f $! x@: force @x@, then apply @f@ to the (now-evaluated) thunk.
 -- Returns a 1-arg remainder (curried).
 dollarBangB :: IO Val
@@ -1278,17 +1608,25 @@ fromIntegralB = pure $ VFun $ \a -> do
 realWorldB :: IO Val
 realWorldB = pure (VPrimObj PrimRealWorld)
 
--- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> a
--- In our interpreter: just apply the function to the RealWorld token,
--- then unwrap the result (an unboxed tuple = VCon "(#,#)" [_, result]).
+-- | noDuplicate# :: State# s -> State# s
+-- No-op in the interpreter; in GHC RTS this prevents thunk duplication.
+noDuplicateB :: IO Val
+noDuplicateB = pure $ VFun $ \_ -> pure (VPrimObj PrimRealWorld)
+
+-- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> (# State# RealWorld, a #)
+-- In our interpreter: apply the function to the RealWorld token, run any
+-- resulting VIO action, and return the (# State# RealWorld, a #) unboxed tuple.
+-- Callers (like runST, unsafePerformIO) are expected to extract the second
+-- element themselves via case pattern matching.
+-- NOTE: previous versions extracted the result here, but that broke source-loaded
+-- callers like GHC.ST.runST that pattern-match on the returned tuple themselves.
 runRWB :: IO Val
 runRWB = pure $ VFun $ \ft -> do
     fv <- force ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
-    case result of
-        VCon "(#,#)" [_, rT] -> force rT
-        other                -> pure other
+    resRaw <- apply fv rwT
+    result <- runIOVal resRaw
+    pure result
 
 lazyB :: IO Val
 lazyB = pure $ VFun $ \a -> force a
@@ -1390,41 +1728,42 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
     case av of
         VInt n -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
-            pure (VPrimObj (PrimForeignPtr fp))
+            mkForeignPtrVal fp
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
     fpv <- force fpT; fv <- force fT
-    case fpv of
-        VPrimObj (PrimForeignPtr fp) ->
-            withForeignPtr fp $ \ptr -> do
-                pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply fv pT
-                runIOVal rv
-        _ -> error ("withForeignPtr: not a ForeignPtr: " <> showValForDebug fpv)
+    fp <- foreignPtrValToForeignPtr fpv
+    withForeignPtr fp $ \ptr -> do
+        pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
+        rv <- apply fv pT
+        runIOVal rv
 
 plusForeignPtrB :: IO Val
 plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
-    fpv <- force fpT; _nv <- force nT
-    -- Approximate: return the same ForeignPtr (offset tracked elsewhere)
-    pure fpv
+    fpv <- force fpT; nv <- force nT
+    case (fpv, nv) of
+        -- ForeignPtr is RTS-backed and has no pure-Haskell storage model in IHC,
+        -- so this builtin must preserve the host pointer offset exactly.
+        (_, VInt n) -> do
+            fp <- foreignPtrValToForeignPtr fpv
+            mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
+        _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
     fpv <- force fpT
-    case fpv of
-        VPrimObj (PrimForeignPtr fp) -> do { touchForeignPtr fp; pure VUnit }
-        _                            -> pure VUnit
+    fp <- foreignPtrValToForeignPtr fpv
+    touchForeignPtr fp
+    pure VUnit
 
 newForeignPtr_B :: IO Val
 newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
     pv <- force pT
-    case pv of
-        VPrimObj (PrimPtr p) -> do
-            fp <- newForeignPtr_ (castPtr p)
-            pure (VPrimObj (PrimForeignPtr fp))
-        _ -> error ("newForeignPtr_: not a Ptr: " <> showValForDebug pv)
+    p <- ptrValToPtr pv
+    fp <- newForeignPtr_ (castPtr p)
+    mkForeignPtrVal fp
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: Storable ops on Ptr
@@ -1433,27 +1772,24 @@ newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
 peekB :: IO Val
 peekB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            w <- peek (p :: Ptr Word8)
-            pure (VInt (fromIntegral w))
-        _ -> error ("peek: not a Ptr: " <> showValForDebug av)
+    p <- ptrValToPtr av
+    w <- peek (p :: Ptr Word8)
+    pure (VInt (fromIntegral w))
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a; bv <- force b
-    case av of
-        VPrimObj (PrimPtr p) ->
-            case bv of
-                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-                _ -> error ("poke: value not an Int: " <> showValForDebug bv)
-        _ -> error ("poke: not a Ptr: " <> showValForDebug av)
+    p <- ptrValToPtr av
+    case bv of
+        VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        _ -> error ("poke: value not an Int: " <> showValForDebug bv)
 
 peekByteOffB :: IO Val
 peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a; bv <- force b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VInt off) -> do
+    p <- ptrValToPtr av
+    case bv of
+        VInt off -> do
             w <- peekByteOff (p :: Ptr Word8) (fromIntegral off)
             pure (VInt (fromIntegral (w :: Word8)))
         _ -> error ("peekByteOff: bad args: " <> showValForDebug av)
@@ -1461,8 +1797,9 @@ peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 pokeByteOffB :: IO Val
 pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
     av <- force a; bv <- force b; cv <- force c
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VInt off) ->
+    p <- ptrValToPtr av
+    case bv of
+        VInt off ->
             case cv of
                 VInt n -> do
                     pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
@@ -1616,6 +1953,17 @@ memcpyFpB = pure $ VFun $ \fpT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure
                 pure VUnit
         _ -> error "memcpyFp: bad args"
 
+-- | copyBytes :: Ptr a -> Ptr a -> Int -> IO ()
+-- Foreign.Marshal.Utils.copyBytes — wraps copyAddrToAddrNonOverlapping# primop.
+copyBytesB :: IO Val
+copyBytesB = pure $ VFun $ \destT -> pure $ VFun $ \srcT -> pure $ VFun $ \nT -> pure $ VIO $ do
+    dv <- force destT; sv <- force srcT; nv <- force nT
+    case (dv, sv, nv) of
+        (VPrimObj (PrimPtr dest), VPrimObj (PrimPtr src), VInt n) -> do
+            copyBytes dest src (fromIntegral n)
+            pure VUnit
+        _ -> error $ "copyBytes: bad args"
+
 memsetB :: IO Val
 memsetB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
     pv <- force a; vv <- force b; nv <- force c
@@ -1676,8 +2024,9 @@ hPutBufB :: IO Val
 hPutBufB = pure $ VFun $ \hT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure $ VIO $ do
     hv <- force hT; pv <- force pT; nv <- force nT
     h  <- requireHandle "hPutBuf" hv
-    case (pv, nv) of
-        (VPrimObj (PrimPtr p), VInt n) -> do
+    p <- ptrValToPtr pv
+    case nv of
+        VInt n -> do
             hPutBuf h (castPtr p) (fromIntegral n)
             pure VUnit
         _ -> error "hPutBuf: bad args"
@@ -2808,4 +3157,3 @@ buildBuiltinTypeableInsts = mapM mkDict prims
         trT   <- newWHNFThunk tr
         dictT <- newWHNFThunk (VCon "Dict_Typeable" [trT])
         pure ("typeableDict_" <> tag, dictT)
-

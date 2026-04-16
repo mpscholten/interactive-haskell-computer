@@ -184,12 +184,43 @@ parseExportList src cur0 = go [] cur0
                     Just modN -> go (ExportModule modN : acc) cur2
                     Nothing   -> pure (ExportList (reverse acc), cur1)
             TkConId n -> do
-                -- Check for Tree(..) or Tree(a,b).
+                -- Check for Tree(..) or Tree(a,b), but also handle
+                -- qualified export names like B.fromStrict or B.ByteString.
+                -- A ConId immediately followed by '.' (no space) means this
+                -- is a qualified export — advance past 'ConId.bare' and
+                -- record the bare name.
                 let (peek, curP) = nextSigTok src cur1
                 case tkKind peek of
                     TkLParen -> do
                         (subs, cur2) <- parseExportSubs src curP
                         go (ExportType n (Just subs) : acc) cur2
+                    TkDot -> do
+                        -- Qualified export: <ConId>.<bare> or <ConId>.<ConId>
+                        -- The dot is only a qualifier separator if it abuts
+                        -- (no whitespace): peek without skipSig first.
+                        let (dotTok, curAfterDot) = nextToken src cur1
+                        case tkKind dotTok of
+                            TkDot
+                                | tkStart dotTok == tkEnd (fst (nextSigTok src cur))
+                                  || True  ->  -- always treat ConId.ident as qualified
+                                    do
+                                    let (bareTok, curAfterBare) = nextToken src curAfterDot
+                                    case tkKind bareTok of
+                                        TkIdent bare -> do
+                                            -- qualified lower-case export (e.g. B.fromStrict)
+                                            go (ExportName bare : acc) curAfterBare
+                                        TkConId bare -> do
+                                            -- qualified upper-case export (e.g. B.ByteString)
+                                            let (peek2, curP2) = nextSigTok src curAfterBare
+                                            case tkKind peek2 of
+                                                TkLParen -> do
+                                                    (subs, cur3) <- parseExportSubs src curP2
+                                                    go (ExportType bare (Just subs) : acc) cur3
+                                                _ -> go (ExportType bare Nothing : acc) curAfterBare
+                                        _ ->
+                                            -- Unrecognized qualified form: emit bare ConId
+                                            go (ExportType n Nothing : acc) cur1
+                            _ -> go (ExportType n Nothing : acc) cur1
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
             -- Parenthesised operator export: @(++)@, @(@?=@)@, etc.
@@ -247,6 +278,18 @@ parseExportList src cur0 = go [] cur0
                 TkComma   -> loop subs c1
                 TkIdent n -> loop (n : subs) c1
                 TkConId n -> loop (n : subs) c1
+                -- Operator in parens inside subs: Class((>>=), (>>), return).
+                -- Skip the parenthesised operator and continue.
+                TkLParen  -> do
+                    cAfterOp <- skipToCloseParen s c1 1
+                    loop subs cAfterOp
+                -- Bare operator (symbolic or backtick-wrapped): skip it.
+                TkSymOp _ -> loop subs c1
+                TkBacktick -> do
+                    -- Skip `op`
+                    let (_op, c2) = nextSigTok s c1
+                    let (_bt, c3) = nextSigTok s c2
+                    loop subs c3
                 _         -> pure (reverse subs, c)
 
 --------------------------------------------------------------------------------

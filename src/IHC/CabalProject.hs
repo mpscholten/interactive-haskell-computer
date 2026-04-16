@@ -39,7 +39,8 @@ import Control.Exception (Exception, throwIO, try, SomeException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.List (isSuffixOf)
+import Data.List (isSuffixOf, sortBy)
+import Data.Ord (Down(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, mapMaybe)
@@ -380,7 +381,13 @@ cachedPackageSearchPath = do
             then pure []
             else do
                 entries <- listDirectory sourcesDir
-                concat <$> mapM (dirsForEntry sourcesDir) entries
+                -- Sort in descending order so that the highest version of each
+                -- package is found first in the search path.  For package
+                -- directories named like "base-4.20.2.0" and "base-4.19.0.0",
+                -- reverse-alphabetical order puts the higher version first
+                -- because the version string compares lexicographically.
+                let sortedEntries = sortBy (\a b -> compare (Down a) (Down b)) entries
+                concat <$> mapM (dirsForEntry sourcesDir) sortedEntries
 
     dirsForEntry sourcesDir entry = do
         let pkgDir = sourcesDir </> entry
@@ -437,7 +444,10 @@ cachedPackageSearchPathWithIncludes = do
             then pure []
             else do
                 entries <- listDirectory sourcesDir
-                concat <$> mapM (pairsForEntry sourcesDir) entries
+                -- Sort descending so the highest version of each package is
+                -- found first (matches the ordering in cachedPackageSearchPath).
+                let sortedEntries = sortBy (\a b -> compare (Down a) (Down b)) entries
+                concat <$> mapM (pairsForEntry sourcesDir) sortedEntries
 
     pairsForEntry sourcesDir entry = do
         let pkgDir = sourcesDir </> entry
