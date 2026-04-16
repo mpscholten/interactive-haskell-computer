@@ -480,6 +480,17 @@ builtins reg =
     , ("raiseDivZero#",   raiseDivZeroB)
     , ("raiseOverflow#",  raiseOverflowB)
     , ("raiseUnderflow#", raiseUnderflowB)
+    -- unsafeCoerce / unsafeCoerce#: compiler-intrinsic. The Unsafe.Coerce
+    -- source defines these in terms of `unsafeEqualityProof`, whose
+    -- recursive body is rewritten by GHC's CoreToStg.Prep pass to
+    -- `UnsafeRefl` — without that rewrite the source loops. See Note
+    -- [Implementing unsafeCoerce] (U5) in base's Unsafe/Coerce.hs.
+    -- At the Val level there is no static type to violate, so the primop
+    -- is the identity on Val (same pattern as lazy, I#, W#, C#).
+    , ("unsafeCoerce",    unsafeCoerceB)
+    , ("unsafeCoerce#",   unsafeCoerceB)
+    , ("unsafeCoerceUnlifted", unsafeCoerceB)
+    , ("unsafeCoerceAddr", unsafeCoerceB)
     , ("catch",           catchB)
     , ("handle",          handleB)
     , ("try",             tryB)
@@ -2916,6 +2927,26 @@ raiseHashB :: IO Val
 raiseHashB = pure $ VFun $ \eT -> do
     exc <- forceToException eT
     throwIO exc
+
+-- | @unsafeCoerce :: a -> b@ / @unsafeCoerce# :: a -> b@ — compiler-intrinsic.
+--
+-- GHC implements @unsafeCoerce@ in @Unsafe.Coerce@ via the magical
+-- @unsafeEqualityProof@, whose recursive source body
+-- @case unsafeEqualityProof of UnsafeRefl -> UnsafeRefl@ is rewritten
+-- at CoreToStg.Prep time to the identity @UnsafeRefl@ (see Note
+-- [Implementing unsafeCoerce], point U5, in base's @Unsafe/Coerce.hs@).
+-- Without that rewrite the source definition diverges, so the module
+-- cannot be source-interpreted faithfully — it is therefore a
+-- legitimate whitelist entry under the project no-shim rule:
+-- compiler-intrinsic, not a shim around an ordinary Haskell library.
+--
+-- At the 'Val' level there is no static type to violate — the value
+-- representation is already dynamically tagged — so @unsafeCoerce@ is
+-- simply the identity. This is the same pattern as @lazy@, @I#@, @W#@.
+-- Used pervasively by @typerep-map@, @Data.Vault@, @bytestring@/@text@
+-- internals, and many other libraries.
+unsafeCoerceB :: IO Val
+unsafeCoerceB = pure $ VFun $ \t -> force t
 
 -- | @raiseIO# :: a -> State# RealWorld -> (# State# RealWorld, b #)@.
 -- Backs source-loaded @throwIO e = IO (raiseIO# (toException e))@. We
