@@ -32,6 +32,27 @@
                 echo "WARNING: not on Darwin arm64 — builds will fail (MAP_JIT + Apple-ABI stencils)." >&2
               fi
             fi
+
+            # Auto-populate the ihc interpreter source cache with common
+            # Haskell libraries so `:l` / `run` can source-load them
+            # without the user having to cabal-get manually each time.
+            # Best-effort: silent, parallel, skipped per-package if cached.
+            export IHC_CACHE="$HOME/.cache/ihc/sources"
+            mkdir -p "$IHC_CACHE"
+            _ihc_prefetch () {
+              local pkg="$1"
+              if ! ls -d "$IHC_CACHE/$pkg"-* >/dev/null 2>&1; then
+                (cd "$IHC_CACHE" && cabal get "$pkg" >/dev/null 2>&1) || true
+              fi
+            }
+            if [ -t 1 ]; then
+              for p in hspec hspec-core hspec-discover call-stack HUnit \
+                       QuickCheck splitmix random tf-random \
+                       mtl transformers containers text bytestring; do
+                _ihc_prefetch "$p" &
+              done
+              wait
+            fi
           '';
         };
 
