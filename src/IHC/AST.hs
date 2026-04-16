@@ -19,9 +19,11 @@ module IHC.AST
     , Pat(..)
     , Lit(..)
     , Label
+    , stripQualifier
     ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BC
 import Data.Int (Int64)
 
 type Name  = ByteString
@@ -45,6 +47,7 @@ data Expr
     | EImplicitLet  ![(Name, Expr)] !Expr -- let ?x = e in body (Phase 3.6)
     | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
     | ERecordWild !Name                -- Con {..} — RecordWildCards construction
+    | ERecordUpdate !Expr ![(Name, Expr)] -- expr { f1 = e1, ... } record update
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
     | EQuote   !Expr                   -- [| expr |] TH expression bracket (Phase 2.12)
     | ELabel !Label                     -- #name OverloadedLabels label (Phase 3.5)
@@ -86,3 +89,10 @@ data Lit
     | LStr    !ByteString
     | LChar   !Char
     deriving (Eq, Show)
+
+-- | Strip a module qualifier from a name, returning only the final segment.
+-- E.g. \"M.Just\" → \"Just\", \"Data.Maybe.Nothing\" → \"Nothing\", \"Just\" → \"Just\".
+stripQualifier :: Name -> Name
+stripQualifier n = case BC.elemIndexEnd '.' n of
+    Nothing -> n
+    Just i  -> BC.drop (i + 1) n

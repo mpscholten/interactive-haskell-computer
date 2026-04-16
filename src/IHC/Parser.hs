@@ -1222,7 +1222,9 @@ parseTopPatNoCons :: Ctx -> Cursor -> IO (Pat, Cursor)
 parseTopPatNoCons ctx cur = do
     let (tok, cur1) = nextSig ctx cur
     case tkKind tok of
-        TkConId n  -> collectArgs ctx n [] cur1
+        TkConId n  -> do
+            (qname, cur2) <- readQualConId ctx n tok cur1
+            collectArgs ctx (stripQualifier qname) [] cur2
         _          -> parseSubPat ctx cur
 
 collectArgs :: Ctx -> Name -> [Pat] -> Cursor -> IO (Pat, Cursor)
@@ -1263,7 +1265,11 @@ parseSubPat ctx cur = do
         TkFloat d    -> pure (PLit (LFloat d), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
         TkChar c     -> pure (PLit (LChar c), cur1)
-        TkConId n    -> pure (PCon n [], cur1)
+        TkConId n    -> do
+            -- Handle qualified constructor: M.Ctor or M.N.Ctor
+            -- Read adjacent dots/segments; strip the qualifier for pattern matching.
+            (qname, cur2) <- readQualConId ctx n tok cur1
+            pure (PCon (stripQualifier qname) [], cur2)
         TkLParen     -> parseParenPat ctx cur1
         TkLBracket   -> parseListPat ctx cur1
         TkMinus -> do
@@ -1301,7 +1307,49 @@ parseParenPat ctx cur0 = do
             case tkKind sep of
                 TkRParen -> pure (first, cur2)
                 TkComma  -> gatherTuple ctx [first] cur2
+                -- (pat :: Type) — type annotation in pattern; discard the type.
+                TkDColon -> do
+                    cur3 <- skipToCloseParen ctx cur2
+                    pure (first, cur3)
                 _        -> parseErr ctx "expected `)` or `,` in pattern" sep
+
+-- | Read a (possibly qualified) constructor name starting from the first
+-- segment @n@ (already consumed, token @tok@). Returns the full qualified
+-- name and the cursor positioned after the last segment consumed.
+-- E.g. reading \"M.Just\" returns (\"M.Just\", curAfter) where curAfter is
+-- positioned after \"Just\". The caller may then call 'stripQualifier' to
+-- obtain the unqualified name for pattern matching.
+readQualConId :: Ctx -> Name -> Token -> Cursor -> IO (Name, Cursor)
+readQualConId ctx = go
+  where
+    src = ctxSrc ctx
+    go acc lastTok cur =
+        let (dotTok, curAfterDot) = nextToken src cur in
+        case tkKind dotTok of
+            TkDot | tkStart dotTok == tkEnd lastTok ->
+                let (segTok, curAfterSeg) = nextToken src curAfterDot in
+                case tkKind segTok of
+                    TkConId n | tkStart segTok == tkEnd dotTok ->
+                        go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    _ -> pure (acc, cur)   -- dot not followed by ConId; stop
+            _ -> pure (acc, cur)
+
+-- | Skip tokens up to and including the next unmatched @)@ at depth 0.
+-- Used to skip type annotations in patterns after @::@.
+skipToCloseParen :: Ctx -> Cursor -> IO Cursor
+skipToCloseParen ctx = go (0 :: Int)
+  where
+    go !depth cur =
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            TkEof    -> pure cur   -- shouldn't happen; stop anyway
+            TkLParen -> go (depth + 1) cur'
+            TkLBracket -> go (depth + 1) cur'
+            TkRBracket -> go (depth - 1) cur'
+            TkRParen
+                | depth == 0 -> pure cur'   -- consumed the closing ')'
+                | otherwise  -> go (depth - 1) cur'
+            _ -> go depth cur'
 
 -- | Check whether there is a @->@ token at paren-depth 0 before the
 -- matching @)@. Used to distinguish view patterns from regular paren patterns.
@@ -1562,10 +1610,56 @@ parseApp ctx cur0 = do
                     _ -> do
                         cur'' <- skipTypeArg ctx cur'
                         loop fn cur''
+            -- Record-update: expr { field = val, ... }
+            -- Disambiguate from block syntax: only treat as record-update when
+            -- we see '{' immediately followed by 'ident =' or '}'.
+            TkLBrace | isRecordUpdateBrace ctx cur' -> do
+                    (fields, curEnd) <- parseRecordUpdateFields ctx cur' []
+                    loop (ERecordUpdate fn fields) curEnd
             _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseAtom ctx cur
                     loop (EApp fn arg) curA
               | otherwise -> pure (fn, cur)
+
+-- | Peek ahead after @{@ to decide whether this is a record-update
+-- expression @expr { f = e, ... }@. Returns 'True' when the tokens
+-- immediately after @{@ are @ident =@, @ident }@, @ident ,@ (field-update
+-- or NamedFieldPun syntax), or @}@ (empty update).
+-- Returns 'False' otherwise (e.g. a do-block @{ stmt; }@).
+isRecordUpdateBrace :: Ctx -> Cursor -> Bool
+isRecordUpdateBrace ctx cur =
+    let (t1, cur1) = nextSig ctx cur in
+    case tkKind t1 of
+        TkRBrace    -> True          -- empty update { }
+        TkIdent _   ->
+            let (t2, _) = nextSig ctx cur1 in
+            case tkKind t2 of
+                TkEq     -> True   -- { field = ...
+                TkRBrace -> True   -- { field }  (NamedFieldPun)
+                TkComma  -> True   -- { field, ... } (NamedFieldPun list)
+                _        -> False
+        _           -> False
+
+-- | Parse a record-update field list @{ f1 = e1, f2 = e2, ... }@.
+-- The opening @{@ has NOT been consumed; @cur@ is positioned just after @{@.
+-- Supports NamedFieldPuns: @{ x }@ → @{ x = x }@.
+parseRecordUpdateFields :: Ctx -> Cursor -> [(Name, Expr)] -> IO ([(Name, Expr)], Cursor)
+parseRecordUpdateFields ctx cur acc = do
+    let (tok, cur') = nextSig ctx cur
+    case tkKind tok of
+        TkRBrace -> pure (reverse acc, cur')
+        TkComma  -> parseRecordUpdateFields ctx cur' acc
+        TkIdent fname -> do
+            let (eqTok, cur2) = nextSig ctx cur'
+            case tkKind eqTok of
+                TkEq -> do
+                    (e, cur3) <- parseExpr ctx cur2
+                    parseRecordUpdateFields ctx cur3 ((fname, e) : acc)
+                -- NamedFieldPun: { x } → { x = x }
+                -- Don't consume the non-`=` token (use cur', not cur2).
+                _ -> parseRecordUpdateFields ctx cur' ((fname, EVar fname) : acc)
+        TkEof -> pure (reverse acc, cur')
+        _ -> parseErr ctx "expected field name or `}` in record update" tok
 
 -- | Skip one type-argument after @\@@ in a type application.
 -- Handles: plain ident/conid (@\@Int@, @\@a@), promoted (@\@\'Foo@),
