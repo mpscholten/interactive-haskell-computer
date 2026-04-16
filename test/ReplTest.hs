@@ -257,6 +257,25 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "10"
         out `shouldContain` "[3,4]"
 
+    it "head \"\" raises an exception but REPL continues (raise# primop)" do
+        -- Regression: source-loaded head [] bottoms out into raise#
+        -- (via error -> errorCallWithCallStackException -> raise#). The
+        -- raise# primop must throw an IhcException that the REPL's
+        -- top-level handler catches and reports. Subsequent lines must
+        -- still evaluate.
+        (code, out, _err) <- runRepl
+            ( "import Data.List\n"
+           <> "head \"\"\n"
+           <> "1 + 2\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        -- Either we get a proper IhcException message, or at minimum the
+        -- REPL must NOT report `raise#` as unbound.
+        out `shouldNotContain` "unbound variable `raise#`"
+        out `shouldContain` "Error:"
+        -- REPL must keep running after the error: the 1 + 2 must print.
+        out `shouldContain` "3"
+
     it "import qualified Data.List as L: L.head [1,2,3] = 1" do
         -- Qualified import: transitive re-exports should be reachable via
         -- the L. prefix.  head is in GHC.List (two hops via Data.OldList).

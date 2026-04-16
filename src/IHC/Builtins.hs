@@ -471,6 +471,15 @@ builtins reg =
     -- Phase 2.10a: exceptions
     , ("throwIO",         throwIOB)
     , ("throw",           throwIOB)
+    -- GHC primops from GHC.Prim: compiler-intrinsic, no Haskell source.
+    -- Source-loaded `error`, `throw`, `undefined`, `head []`, numeric
+    -- overflow paths etc. all bottom out into these. See commit message
+    -- / CLAUDE.md builtin rule: compiler-built + RTS-exclusive.
+    , ("raise#",          raiseHashB)
+    , ("raiseIO#",        raiseIOHashB)
+    , ("raiseDivZero#",   raiseDivZeroB)
+    , ("raiseOverflow#",  raiseOverflowB)
+    , ("raiseUnderflow#", raiseUnderflowB)
     , ("catch",           catchB)
     , ("handle",          handleB)
     , ("try",             tryB)
@@ -2854,12 +2863,33 @@ readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
 -- | Wrap a 'Val' in an 'IhcException' for host-level throwing.
 valToIhcException :: Val -> IO IhcException
 valToIhcException v = do
-    let msg = case v of
-                VStr s   -> s
-                VCon n _ -> n
-                _        -> BC.pack (showValForDebug v)
-    t <- newWHNFThunk v
+    msg <- extractExceptionMessage v
+    t   <- newWHNFThunk v
     pure (IhcException msg t)
+
+-- | Extract a user-readable message from an exception value.
+-- Unwraps 'SomeException' and pulls the payload out of 'ErrorCall' /
+-- 'ErrorCallWithLocation' so e.g. @head []@ reports
+-- @Prelude.head: empty list@ instead of just @ErrorCallWithLocation@.
+extractExceptionMessage :: Val -> IO ByteString
+extractExceptionMessage val = case val of
+    VStr s -> pure s
+    VCon "SomeException" [innerT] -> do
+        inner <- force innerT
+        extractExceptionMessage inner
+    VCon "ErrorCall" [msgT] ->
+        tryValToString msgT (BC.pack "ErrorCall")
+    VCon "ErrorCallWithLocation" (msgT : _) ->
+        tryValToString msgT (BC.pack "ErrorCallWithLocation")
+    VCon n _ -> pure n
+    _        -> pure (BC.pack (showValForDebug val))
+  where
+    tryValToString :: Thunk -> ByteString -> IO ByteString
+    tryValToString t fallback = do
+        r <- CE.try @SomeException (force t >>= valToString)
+        pure $ case r of
+            Right s -> BC.pack s
+            Left  _ -> fallback
 
 -- | Extract the 'Val' from an 'IhcException'.
 ihcExceptionToVal :: IhcException -> IO Val
@@ -2870,6 +2900,67 @@ throwIOB = pure $ VFun $ \aT -> pure $ VIO $ do
     av  <- force aT
     exc <- valToIhcException av
     throwIO exc
+
+-- | @raise# :: a -> b@ — GHC primop. Compiler-intrinsic; no Haskell
+-- source. Source-loaded @error@ / @throw@ / @undefined@ and the
+-- partial functions in @GHC.List@ (e.g. @head []@, @tail []@) bottom
+-- out into @raise#@. We wrap the exception 'Val' as an 'IhcException'
+-- and throw it on the host, so the interpreter's existing exception
+-- path catches it and surfaces a readable message.
+--
+-- We force the exception argument through 'forceToException' so that
+-- if evaluating the exception value itself throws (e.g. a thunk
+-- referencing an unbound helper), we still raise an informative
+-- 'IhcException' instead of propagating the inner crash.
+raiseHashB :: IO Val
+raiseHashB = pure $ VFun $ \eT -> do
+    exc <- forceToException eT
+    throwIO exc
+
+-- | @raiseIO# :: a -> State# RealWorld -> (# State# RealWorld, b #)@.
+-- Backs source-loaded @throwIO e = IO (raiseIO# (toException e))@. We
+-- take the exception eagerly but only raise when the world token is
+-- threaded through, matching IO semantics.
+raiseIOHashB :: IO Val
+raiseIOHashB = pure $ VFun $ \eT -> pure $ VFun $ \_rwT -> do
+    exc <- forceToException eT
+    throwIO exc
+
+-- | Force an exception-argument thunk into an 'IhcException', tolerating
+-- failures during the force itself. Source-loaded exception constructors
+-- (e.g. @errorCallWithCallStackException@) may reference bindings that
+-- aren't yet in scope; without this guard, forcing the exception value
+-- would itself crash the interpreter with an @unbound variable@ error
+-- instead of raising a proper Haskell exception.
+forceToException :: Thunk -> IO IhcException
+forceToException t = do
+    r <- CE.try @SomeException (force t)
+    case r of
+        Right v  -> valToIhcException v
+        Left  se -> do
+            let msg = BC.pack (show se)
+            t' <- newWHNFThunk (VStr msg)
+            pure (IhcException msg t')
+
+-- | @raiseDivZero# :: (# #) -> b@. GHC primop invoked by source-loaded
+-- numeric dispatch (e.g. @divZeroError = raise# divZeroException@ lives
+-- in the wrapper). Compiler-intrinsic; no Haskell source.
+raiseDivZeroB :: IO Val
+raiseDivZeroB = pure $ VFun $ \_ -> do
+    t <- newWHNFThunk (VStr (BC.pack "divide by zero"))
+    throwIO (IhcException (BC.pack "divide by zero") t)
+
+-- | @raiseOverflow# :: (# #) -> b@. GHC primop.
+raiseOverflowB :: IO Val
+raiseOverflowB = pure $ VFun $ \_ -> do
+    t <- newWHNFThunk (VStr (BC.pack "arithmetic overflow"))
+    throwIO (IhcException (BC.pack "arithmetic overflow") t)
+
+-- | @raiseUnderflow# :: (# #) -> b@. GHC primop.
+raiseUnderflowB :: IO Val
+raiseUnderflowB = pure $ VFun $ \_ -> do
+    t <- newWHNFThunk (VStr (BC.pack "arithmetic underflow"))
+    throwIO (IhcException (BC.pack "arithmetic underflow") t)
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
