@@ -56,8 +56,53 @@
           (p: p != null && !(p.meta.broken or false))
           ihcHackageSourceCandidates;
 
+        # GHC ships the source of every boot library under libraries/<pkg>/.
+        # Some libs have a nested layout: libraries/containers/containers/containers.cabal.
+        # We extract each one and place it under $out/<pkg>-<version>/ so the
+        # IHC loader finds it alongside the Hackage tarballs.
+        # "base" is intentionally excluded — it requires special treatment and
+        # is already handled via ~/.cache/ihc/sources/base-*/.
+        ghcSrc = pkgs.haskell.compiler.ghc910.src;
+
+        ghcBootLibs = [
+          "directory"
+          "filepath"
+          "process"
+          "time"
+          "deepseq"
+          "stm"
+          "unix"
+          "exceptions"
+          "containers"
+          "mtl"
+          "transformers"
+          "text"
+          "bytestring"
+        ];
+
+        # Derivation that copies each boot-lib source tree from GHC's source
+        # into $out/<pkg>-<version>/.  Version is read from the .cabal file
+        # using a case-insensitive grep so it handles both "version:" and
+        # "Version:" spellings.
+        ghcBootSourceRoot = pkgs.runCommand "ihc-ghc-boot-libs" { } ''
+          mkdir -p $out
+          ${pkgs.lib.concatMapStringsSep "\n" (pkg: ''
+            if [ -d "${ghcSrc}/libraries/${pkg}" ]; then
+              cabal_file=$(find "${ghcSrc}/libraries/${pkg}" -maxdepth 3 -name "${pkg}.cabal" -type f | head -1)
+              if [ -n "$cabal_file" ]; then
+                version=$(grep -im1 '^version:' "$cabal_file" | awk '{print $2}' | tr -d '\r')
+                src_dir=$(dirname "$cabal_file")
+                target="$out/${pkg}-$version"
+                cp -r "$src_dir" "$target"
+                chmod -R u+w "$target"
+              fi
+            fi
+          '') ghcBootLibs}
+        '';
+
         # A single derivation that unpacks every source tarball into $out.
         # Result layout: $out/hspec-2.11.16/, $out/QuickCheck-2.15.0.1/, …
+        # GHC boot-lib sources are merged in from ghcBootSourceRoot.
         # The loader (IHC.CabalProject.cachedPackageSearchPath) can then
         # enumerate $out the same way it enumerates ~/.cache/ihc/sources/.
         ihcSourceRoot = pkgs.runCommand "ihc-hackage-sources" { } ''
@@ -65,6 +110,9 @@
           ${pkgs.lib.concatMapStringsSep "\n" (p:
             "${pkgs.gnutar}/bin/tar -xf ${p.src} -C $out"
           ) ihcHackageSources}
+          # GHC boot libs — plain directories, not tarballs
+          cp -r ${ghcBootSourceRoot}/* $out/ 2>/dev/null || true
+          chmod -R u+w $out
         '';
       in {
         devShells.default = pkgs.mkShell {
