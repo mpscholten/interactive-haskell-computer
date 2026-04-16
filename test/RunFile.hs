@@ -400,6 +400,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Hi, world!\n"
 
+    it "module: `module Foo` re-export form — fn re-exported via Alias" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/reexport_module_form/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hi\n"
+
     --------------------------------------------------------------------
     -- Phase 2.6: language extensions + hand-rolled CPP.
     --------------------------------------------------------------------

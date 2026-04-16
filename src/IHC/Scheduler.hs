@@ -368,24 +368,42 @@ buildImportRewrites registry lm = do
         | impModule imp == BC.pack "Prelude" = pure []
         | otherwise = case Map.lookup (impModule imp) reg of
             Just (Loaded tm) -> do
-                bodiesMap <- readIORef (lmBodies tm)
-                let allNames = Map.keys bodiesMap
-                    visible  = filter (specAllows (impSpec imp)) allNames
-                    exported = filter (exportsName (lmHeader tm)) visible
-                    targetPrefix = lmName tm <> BC.pack "."
+                -- Gather (name, qualifiedKey) pairs from the module's own
+                -- bodies plus any `module Foo` re-exports.
+                directPairs <- directRewritePairs tm
+                reexportPairs <- concat <$>
+                    mapM (rewritePairsFromReexport reg)
+                         (moduleReexports (lmHeader tm))
+                let allPairs = directPairs ++ reexportPairs
+                    visible  = filter (specAllows (impSpec imp) . fst) allPairs
                     bare | impQualified imp = []
-                         | otherwise =
-                             [(n, targetPrefix <> n) | n <- exported]
+                         | otherwise = visible
                     qualRef = case impAlias imp of
                         Just a  -> Just (a <> BC.pack ".")
                         Nothing
                             | impQualified imp -> Just (lmName tm <> BC.pack ".")
                             | otherwise        -> Nothing
                     qual = case qualRef of
-                        Just p  -> [(p <> n, targetPrefix <> n) | n <- exported]
+                        Just p  -> [(p <> n, q) | (n, q) <- visible]
                         Nothing -> []
                 pure (bare ++ qual)
             _ -> pure []
+
+    -- | @(bare-name, fully-qualified-key)@ pairs for names defined
+    -- directly in a module.
+    directRewritePairs tm = do
+        bodiesMap <- readIORef (lmBodies tm)
+        let prefix  = lmName tm <> BC.pack "."
+            allNames = Map.keys bodiesMap
+            exported = filter (exportsNameDirect (lmHeader tm)) allNames
+        pure [(n, prefix <> n) | n <- exported]
+
+    -- | @(bare-name, fully-qualified-key)@ pairs from a re-exported
+    -- module (@module Foo@ in the export list).
+    rewritePairsFromReexport reg modName =
+        case Map.lookup modName reg of
+            Just (Loaded reLm) -> directRewritePairs reLm
+            _                  -> pure []
 
 -- | Rewrite every free 'EVar' in @expr@ whose name appears in the
 -- rewrite table (and isn't shadowed by an inner binder) to its
@@ -477,36 +495,48 @@ buildAliases registry _searchPath entry slots qualPairs = do
             reg <- readIORef registry
             case Map.lookup (impModule imp) reg of
                 Just (Loaded tm) -> do
-                    bodiesMap <- readIORef (lmBodies tm)
-                    let allNames = Map.keys bodiesMap
-                        visible  = filter (specAllows (impSpec imp)) allNames
-                        exported = filter (exportsName (lmHeader tm)) visible
-                        prefix   = lmName tm <> BC.pack "."
-                        -- The name the user writes to reach this import:
-                        -- @B.@ if qualified with alias B, @Bar.@ if
-                        -- qualified with no alias, empty if unqualified.
+                    -- Collect (owning-module-prefix, name) pairs from both
+                    -- the target module's own bodies and any `module Foo`
+                    -- re-exports in its export list.
+                    directPairs <- namesFromModule thunkByKey tm
+                    reexportPairs <- concat <$>
+                        mapM (namesFromReexport reg thunkByKey)
+                             (moduleReexports (lmHeader tm))
+                    let allPairs = directPairs ++ reexportPairs
                         qualPrefix = case impAlias imp of
                             Just a  -> a <> BC.pack "."
                             Nothing
                                 | impQualified imp -> lmName tm <> BC.pack "."
                                 | otherwise        -> BC.empty
-                        -- Qualified imports don't contribute bare aliases.
                         bareAliases
                             | impQualified imp = []
                             | otherwise =
-                                [ (n, t)
-                                | n <- exported
-                                , Just t <- [Map.lookup (prefix <> n) thunkByKey]
-                                ]
+                                [ (n, t) | (n, t) <- allPairs ]
                         qualAliases
                             | BC.null qualPrefix = []
                             | otherwise =
-                                [ (qualPrefix <> n, t)
-                                | n <- exported
-                                , Just t <- [Map.lookup (prefix <> n) thunkByKey]
-                                ]
+                                [ (qualPrefix <> n, t) | (n, t) <- allPairs ]
                     pure (bareAliases ++ qualAliases)
                 _ -> pure []
+
+    -- | Return @(bare-name, Thunk)@ pairs for names defined and exported
+    -- directly by a loaded module (not via re-exports).
+    namesFromModule thunkByKey tm = do
+        bodiesMap <- readIORef (lmBodies tm)
+        let prefix  = lmName tm <> BC.pack "."
+            allN    = Map.keys bodiesMap
+            exported = filter (exportsNameDirect (lmHeader tm)) allN
+        pure [ (n, t)
+             | n <- exported
+             , Just t <- [Map.lookup (prefix <> n) thunkByKey]
+             ]
+
+    -- | Collect exported name-thunk pairs from a re-exported module
+    -- (a @module Foo@ entry in an export list).
+    namesFromReexport reg thunkByKey modName =
+        case Map.lookup modName reg of
+            Just (Loaded reLm) -> namesFromModule thunkByKey reLm
+            _                  -> pure []
 
 --------------------------------------------------------------------------------
 -- Loading modules
@@ -745,20 +775,77 @@ resolveImport registry searchPath lm name = do
                             discoverInModule registry searchPath targetLm name
                             pure (Just ())
                         else tryImports rest
-                Nothing -> tryImports rest
+                Nothing ->
+                    -- The name isn't defined locally in targetLm.
+                    -- Check whether targetLm re-exports it via
+                    -- `module Foo` entries in its export list.
+                    followModuleReexports targetLm rest
+
+    -- | Chase every `module Foo` entry in the export list of @via@ to
+    -- see whether any of them provides @name@.  We recurse through
+    -- 'discoverInModule' so the transitive load chain is followed
+    -- automatically.
+    followModuleReexports via rest = do
+        let reexportedMods = moduleReexports (lmHeader via)
+        tryReexports reexportedMods rest
+
+    tryReexports [] rest = tryImports rest
+    tryReexports (modName:mods) rest = do
+        reLm <- loadModule registry searchPath modName
+        mLhs <- findOrResolveLhs (lmSource reLm) (lmKnown reLm) name
+        case mLhs of
+            Just _ ->
+                if exportsName (lmHeader reLm) name
+                    then do
+                        discoverInModule registry searchPath reLm name
+                        pure (Just ())
+                    else tryReexports mods rest
+            Nothing ->
+                -- Go one level deeper if reLm itself has module re-exports.
+                followModuleReexports reLm [] >>= \case
+                    Just ()  -> pure (Just ())
+                    Nothing  -> tryReexports mods rest
 
 specAllows :: ImportSpec -> ByteString -> Bool
 specAllows ImportAll         _ = True
 specAllows (ImportOnly ns)   n = n `elem` ns
 specAllows (ImportHiding ns) n = n `notElem` ns
 
+-- | Extract any @module Foo@ re-export module names from a module's
+-- export list.  Used by 'resolveImport' to follow re-export chains.
+moduleReexports :: ModuleHeader -> [ModuleName]
+moduleReexports h = case mhExports h of
+    ExportAll     -> []
+    ExportList xs -> [ m | ExportModule m <- xs ]
+
+-- | Returns True if @n@ is directly exported (by name or type entry)
+-- or if the module re-exports everything ('ExportAll').  Does NOT
+-- return True for @ExportModule@ items — use 'moduleReexports' to
+-- follow those chains separately.
+exportsNameDirect :: ModuleHeader -> ByteString -> Bool
+exportsNameDirect h n = case mhExports h of
+    ExportAll     -> True
+    ExportList xs -> any matchDirect xs
+  where
+    matchDirect (ExportName m)   = n == m
+    matchDirect (ExportType m _) = n == m
+    matchDirect (ExportModule _) = False
+
+-- | Like 'exportsNameDirect' but also returns True when the export
+-- list contains a @module Foo@ entry (because the name may come from
+-- that re-exported module).  Used by 'resolveImport' so that the
+-- name-not-found case can fall through to 'followModuleReexports'.
 exportsName :: ModuleHeader -> ByteString -> Bool
 exportsName h n = case mhExports h of
     ExportAll     -> True
     ExportList xs -> any matchExport xs
   where
-    matchExport (ExportName m)   = n == m
-    matchExport (ExportType m _) = n == m
+    matchExport (ExportName m)    = n == m
+    matchExport (ExportType m _)  = n == m
+    -- `module Foo` re-export: the scheduler follows this dynamically;
+    -- here we conservatively return True so the name is not filtered
+    -- out before the dynamic check in resolveImport.
+    matchExport (ExportModule _)  = True
 
 --------------------------------------------------------------------------------
 -- Qualified-name splitting

@@ -71,6 +71,8 @@ data ExportItem
     = ExportName !ByteString
     | ExportType !ByteString !(Maybe [ByteString])
       -- ^ @Tree@ (Nothing), @Tree(..)@ (Just []), @Tree(Leaf,Node)@ (Just [...])
+    | ExportModule !ByteString
+      -- ^ @module Foo.Bar@ re-export form
     deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -172,6 +174,12 @@ parseExportList src cur0 = go [] cur0
             TkRParen -> pure (ExportList (reverse acc), cur1)
             TkComma  -> go acc cur1
             TkIdent n   -> go (ExportName n : acc) cur1
+            -- `module Foo.Bar` re-export form.
+            TkModule -> do
+                (mMod, cur2) <- parseDottedName src cur1
+                case mMod of
+                    Just modN -> go (ExportModule modN : acc) cur2
+                    Nothing   -> pure (ExportList (reverse acc), cur1)
             TkConId n -> do
                 -- Check for Tree(..) or Tree(a,b).
                 let (peek, curP) = nextSigTok src cur1
