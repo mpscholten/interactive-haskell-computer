@@ -11,7 +11,7 @@
 module CabalLoader (spec) where
 
 import qualified Data.ByteString.Char8 as BC
-import Data.List (isPrefixOf, isInfixOf, isSuffixOf)
+import Data.List (isPrefixOf, isInfixOf, isSuffixOf, nub)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import System.Directory (canonicalizePath, doesDirectoryExist, getCurrentDirectory, listDirectory, makeAbsolute)
@@ -103,9 +103,51 @@ spec = describe "Phase 2.7 — Cabal project loader" do
             pkgName info    `shouldBe` BC.pack "simple"
             pkgVersion info `shouldBe` BC.pack "0.1.0.0"
             pkgSourceDirs info `shouldBe` [rootAbs </> "lib"]
-            pkgExtensions info `shouldMatchList`
+            -- pkgExtensions merges the Haskell2010 implied set with the
+            -- explicitly-declared extensions (default-language: Haskell2010
+            -- on the library stanza of simple.cabal).
+            let simpleExts = pkgExtensions info
+            mapM_ (\e -> simpleExts `shouldSatisfy` elem e)
                 [BC.pack "OverloadedStrings", BC.pack "LambdaCase"]
+            mapM_ (\e -> simpleExts `shouldSatisfy` elem e)
+                [ BC.pack "DatatypeContexts"
+                , BC.pack "DoAndIfThenElse"
+                , BC.pack "ImplicitPrelude"
+                , BC.pack "PatternGuards"
+                , BC.pack "TraditionalRecordSyntax"
+                ]
             pkgCppOptions info `shouldMatchList` [BC.pack "-DFIXTURE_FLAG=1"]
+
+        it "expands default-language: GHC2021 into its implied extension set" do
+            let ghc2021Root  = fixtureRoot </> "ghc2021"
+                cabalPath    = ghc2021Root </> "ghc2021.cabal"
+            rootAbs <- makeAbsolute ghc2021Root
+            mInfo   <- parseCabalFile rootAbs cabalPath
+            mInfo `shouldSatisfy` isJust
+            let Just info = mInfo
+                exts      = pkgExtensions info
+            -- Every GHC2021 staple must be on — this is the whole point
+            -- of expanding default-language.
+            mapM_ (\e -> exts `shouldSatisfy` elem e)
+                [ BC.pack "ScopedTypeVariables"
+                , BC.pack "MultiParamTypeClasses"
+                , BC.pack "TupleSections"
+                , BC.pack "NamedFieldPuns"
+                , BC.pack "ExistentialQuantification"
+                , BC.pack "InstanceSigs"
+                , BC.pack "BangPatterns"
+                , BC.pack "FlexibleContexts"
+                , BC.pack "FlexibleInstances"
+                , BC.pack "TypeApplications"
+                , BC.pack "ImportQualifiedPost"
+                , BC.pack "StandaloneKindSignatures"
+                ]
+            -- And the explicitly-declared extension still appears.
+            exts `shouldSatisfy` elem (BC.pack "OverloadedStrings")
+            -- No duplicate entries: if we ever list an extension under
+            -- both the GHC2021 implied set and the default-extensions
+            -- stanza, we still only emit it once.
+            length exts `shouldBe` length (nub exts)
 
         it "defaults hs-source-dirs to the package root when omitted" do
             -- foo-1.0.0 declares hs-source-dirs: src, so it has one.

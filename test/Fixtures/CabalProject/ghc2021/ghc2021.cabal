@@ -1,0 +1,14 @@
+cabal-version:      3.0
+name:               ghc2021
+version:            0.1.0.0
+synopsis:           Phase 2.7 loader test fixture - GHC2021 default-language
+license:            BSD-3-Clause
+build-type:         Simple
+
+library
+    exposed-modules:  Local
+    hs-source-dirs:   lib
+    default-extensions:
+        OverloadedStrings
+    default-language: GHC2021
+    build-depends:    base

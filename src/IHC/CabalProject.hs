@@ -75,6 +75,7 @@ import qualified Distribution.Types.Version as CabalVer
 import qualified Distribution.ModuleName as ModuleName
 import qualified Distribution.Pretty as CabalPretty
 import qualified Distribution.Utils.Path as CabalPath
+import qualified Language.Haskell.Extension as CabalLang
 
 --------------------------------------------------------------------------------
 -- Public types
@@ -303,9 +304,17 @@ gpdToPackageInfo packageRoot gpd =
                        else [ packageRoot </> CabalPath.getSymbolicPath sd
                             | sd <- srcDirs0
                             ]
-        exts      = [ BC.pack (CabalPretty.prettyShow e)
+        -- Expand @default-language: GHC2021@ (etc.) into the implied
+        -- extension set.  Cabal itself does not do this expansion — it
+        -- stores the language separately and leaves it to the compiler
+        -- to interpret.  Downstream consumers of 'pkgExtensions' only
+        -- ask "is extension X enabled for this package?", so we bake
+        -- the implied set in here.
+        langExts  = languageImpliedExtensions (defaultLanguage bi)
+        declared  = [ BC.pack (CabalPretty.prettyShow e)
                     | e <- defaultExtensions bi
                     ]
+        exts      = dedupPreserveOrder (langExts ++ declared)
         cppOpts   = [ BC.pack s | s <- cppOptions bi ]
         incDirs   = [ packageRoot </> d | d <- includeDirs bi ]
     in PackageInfo
@@ -325,6 +334,155 @@ emptyBuildInfoStub = libBuildInfo emptyLib
     -- Using mempty works for all Cabal versions from 3.0+.
     emptyLib :: Library
     emptyLib = mempty
+
+-- | Expand a @default-language:@ setting into the extensions it
+-- implicitly enables.  Cabal itself stores the language as a separate
+-- field (see 'Distribution.PackageDescription.defaultLanguage') and
+-- does *not* fold its implied set into 'defaultExtensions' — that
+-- expansion is normally done by GHC at compile time.  Since ihc
+-- consumes 'pkgExtensions' directly to answer "is this extension on?"
+-- queries, we have to do the expansion here.
+--
+-- The implied sets are intentionally hard-coded against the
+-- documented GHC user's guide (ghc/docs/users_guide/exts/
+-- control.rst).  Keeping them here rather than deriving them from the
+-- @Cabal@ library insulates us from future Cabal releases adding or
+-- removing entries under our feet.
+--
+-- Missing / @UnknownLanguage@ is treated as the empty set.  The
+-- caller (Scheduler / parser-driver) falls back to the usual
+-- interpreter defaults in that case.
+languageImpliedExtensions :: Maybe CabalLang.Language -> [ByteString]
+languageImpliedExtensions Nothing                = []
+languageImpliedExtensions (Just CabalLang.Haskell98) =
+    -- Haskell98 implies nothing that's relevant to our parser; leave
+    -- empty.  Old-but-explicit packages rely on GHC's built-in
+    -- defaults, which ihc matches.
+    []
+languageImpliedExtensions (Just CabalLang.Haskell2010) = haskell2010ImpliedExtensions
+languageImpliedExtensions (Just CabalLang.GHC2021)     = ghc2021ImpliedExtensions
+languageImpliedExtensions (Just lang)
+    -- GHC2024 and any future-named language land here; unknown
+    -- languages fall through to the empty list.  We match the
+    -- pretty-printed name so we don't break if a newer Cabal is
+    -- linked against us without the constructor yet.
+    | name == "GHC2024" = ghc2024ImpliedExtensions
+    | otherwise         = []
+  where
+    name = CabalPretty.prettyShow lang
+
+-- | Extensions implicitly enabled by @default-language: Haskell2010@.
+-- Taken verbatim from the GHC user's guide; Cabal's equivalent
+-- constant lives in 'Distribution.Compat.Prelude' but is not exposed.
+haskell2010ImpliedExtensions :: [ByteString]
+haskell2010ImpliedExtensions =
+    [ BC.pack e
+    | e <-
+        [ "DatatypeContexts"
+        , "DoAndIfThenElse"
+        , "EmptyDataDecls"
+        , "ForeignFunctionInterface"
+        , "ImplicitPrelude"
+        , "MonomorphismRestriction"
+        , "PatternGuards"
+        , "RelaxedPolyRec"
+        , "TraditionalRecordSyntax"
+        ]
+    ]
+
+-- | Extensions implicitly enabled by @default-language: GHC2021@.
+-- Pinned against the ~45 entries listed in the GHC 9.2+ user's guide
+-- (chapter "control", section "GHC2021").  Packages that use
+-- @GHC2021@ rely on *all* of these being on.
+ghc2021ImpliedExtensions :: [ByteString]
+ghc2021ImpliedExtensions =
+    [ BC.pack e
+    | e <-
+        [ "BangPatterns"
+        , "BinaryLiterals"
+        , "ConstrainedClassMethods"
+        , "ConstraintKinds"
+        , "DeriveDataTypeable"
+        , "DeriveFoldable"
+        , "DeriveFunctor"
+        , "DeriveGeneric"
+        , "DeriveLift"
+        , "DeriveTraversable"
+        , "DoAndIfThenElse"
+        , "EmptyCase"
+        , "EmptyDataDecls"
+        , "EmptyDataDeriving"
+        , "ExistentialQuantification"
+        , "ExplicitForAll"
+        , "FieldSelectors"
+        , "FlexibleContexts"
+        , "FlexibleInstances"
+        , "ForeignFunctionInterface"
+        , "GADTSyntax"
+        , "GeneralisedNewtypeDeriving"
+        , "HexFloatLiterals"
+        , "ImplicitPrelude"
+        , "ImportQualifiedPost"
+        , "InstanceSigs"
+        , "KindSignatures"
+        , "MonomorphismRestriction"
+        , "MultiParamTypeClasses"
+        , "NamedFieldPuns"
+        , "NamedWildCards"
+        , "NumericUnderscores"
+        , "PatternGuards"
+        , "PolyKinds"
+        , "PostfixOperators"
+        , "RankNTypes"
+        , "RelaxedPolyRec"
+        , "ScopedTypeVariables"
+        , "StandaloneDeriving"
+        , "StandaloneKindSignatures"
+        , "StarIsType"
+        , "TraditionalRecordSyntax"
+        , "TupleSections"
+        , "TypeApplications"
+        , "TypeOperators"
+        , "TypeSynonymInstances"
+        ]
+    ]
+
+-- | Extensions implicitly enabled by @default-language: GHC2024@.
+-- GHC2024 is a superset of GHC2021 plus the extensions listed in the
+-- GHC 9.10+ user's guide (chapter "control", section "GHC2024").
+-- We expand the full closure here (GHC2021 ∪ GHC2024-new) so
+-- callers only need to look at one list.
+ghc2024ImpliedExtensions :: [ByteString]
+ghc2024ImpliedExtensions =
+    dedupPreserveOrder (ghc2021ImpliedExtensions ++ newInGhc2024)
+  where
+    newInGhc2024 =
+        [ BC.pack e
+        | e <-
+            [ "DataKinds"
+            , "DerivingStrategies"
+            , "DisambiguateRecordFields"
+            , "ExplicitNamespaces"
+            , "GADTs"
+            , "LambdaCase"
+            , "MonoLocalBinds"
+            , "RoleAnnotations"
+            ]
+        ]
+
+-- | De-duplicate a list while preserving first-occurrence order.  The
+-- user-declared 'default-extensions' take precedence over the
+-- language-implied set only in the sense that they're evaluated in
+-- order; the actual semantic precedence (an explicit @No...@ disabling
+-- an implied extension) is deferred to whatever downstream consumer
+-- interprets the resulting ByteString list.
+dedupPreserveOrder :: [ByteString] -> [ByteString]
+dedupPreserveOrder = go []
+  where
+    go _    []     = []
+    go seen (x:xs)
+        | x `elem` seen = go seen xs
+        | otherwise     = x : go (x:seen) xs
 
 --------------------------------------------------------------------------------
 -- Cache-wide search path
