@@ -11,6 +11,7 @@ import System.IO (hPutStr, hFlush, hClose, openTempFile)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
 import System.Exit (ExitCode(..))
+import System.Timeout (timeout)
 import Test.Hspec
 
 -- | Locate the ihc binary built by cabal.
@@ -18,7 +19,13 @@ ihcBin :: FilePath
 ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
 
 runRepl :: String -> IO (ExitCode, String, String)
-runRepl input = readProcessWithExitCode ihcBin ["repl"] input
+runRepl input = do
+    result <- timeout (20 * 1000000) (readProcessWithExitCode ihcBin ["repl"] input)
+    case result of
+        Just triple -> pure triple
+        Nothing -> do
+            expectationFailure "REPL timed out"
+            pure (ExitFailure 124, "", "")
 
 spec :: Spec
 spec = describe "REPL smoke tests" do
@@ -52,12 +59,22 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "Hello, world!"
 
     it "import Data.List succeeds and length still works" do
-        -- Data.List is builtin-backed: the dispatch parses the import
-        -- correctly, prints a confirmation, and the REPL keeps running.
-        -- length is provided by the builtin env.
         (code, out, _err) <- runRepl "import Data.List\nlength [1,2,3]\n:q\n"
         code `shouldBe` ExitSuccess
         out `shouldContain` "imported Data.List"
+        out `shouldContain` "3"
+
+    it "import qualified Data.ByteString as BS succeeds" do
+        (code, out, _err) <- runRepl "import qualified Data.ByteString as BS\n:q\n"
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Data.ByteString (deferred)"
+
+    it "import qualified Data.ByteString as BS: BS.length (BS.pack [97,98,99]) = 3" do
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length (BS.pack [97,98,99])\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
         out `shouldContain` "3"
 
     it "import parse error is reported gracefully, REPL continues" do

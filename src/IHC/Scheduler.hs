@@ -37,6 +37,8 @@ module IHC.Scheduler
     , loadFileIntoEnv
       -- * Types exposed for testing
     , ModuleRegistry
+    , freeVars
+    , splitQualified
     ) where
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try)
@@ -48,13 +50,10 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Data.Maybe (fromMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
-import System.IO (hPutStrLn, stderr)
-
-
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
@@ -419,9 +418,9 @@ effectiveExports registry thunkByKey lm visited = do
 --
 -- Steps:
 --   1. Discover all locally-defined top-level names in @lm@.
---   2. For each @ExportName n@ not locally defined in @lm@, walk @lm@'s
---      unqualified imports to find and force-load the defining module and
---      discover @n@ there.
+--   2. For each missing @ExportName@ in @lm@, preload candidate unqualified
+--      import modules once so their local bodies and transitive re-exports
+--      are available to 'effectiveExports'.
 --   3. For each @ExportModule m@ in @lm@'s export list, recursively call
 --      'preloadForEffectiveExports' on @m@ (cycle-guarded by @visited@).
 preloadForEffectiveExports
@@ -432,19 +431,32 @@ preloadForEffectiveExports
     -> [ModuleName]             -- ^ visited: cycle guard
     -> IO ()
 preloadForEffectiveExports registry searchPath includeMap lm visited = do
-    -- 1. Discover all locally-defined names.  Wrap each in a try so a parse
-    --    error on one binding doesn't abort discovery of the rest.
+    -- 1. Discover only the locally-defined names that can actually contribute
+    --    to this module's export surface. Private helpers do not need to be
+    --    preloaded just to answer a REPL import.
     allLocalNames <- scanAllTopLevelNames (lmSource lm)
-    mapM_ (discoverSafe lm) allLocalNames
+    let localSet = Set.fromList allLocalNames
+        exportedLocalNames = case mhExports (lmHeader lm) of
+            ExportAll    -> allLocalNames
+            ExportList xs ->
+                [ n
+                | item <- xs
+                , n <- case item of
+                    ExportName n'   -> [n']
+                    ExportType n' _ -> [n']
+                    ExportModule _  -> []
+                , n `Set.member` localSet
+                ]
+    mapM_ (discoverSafe lm) exportedLocalNames
     -- 2. Named re-exports not locally defined.
     let namedRe = case mhExports (lmHeader lm) of
             ExportAll    -> []
             ExportList xs ->
                 [ n | ExportName n <- xs
-                    , n `notElem` allLocalNames
+                    , n `Set.notMember` localSet
                     , not (BC.null n) && BC.head n >= 'a' && BC.head n <= 'z'
                 ]
-    mapM_ (forceLoadForReexport registry searchPath includeMap lm) namedRe
+    preloadImportsForNamedReexports registry searchPath includeMap lm visited namedRe
     -- 3. ExportModule re-exports — recurse.
     let reexportMods = filter (`notElem` visited) (moduleReexports (lmHeader lm))
     mapM_ loadReexportMod reexportMods
@@ -469,45 +481,39 @@ preloadForEffectiveExports registry searchPath includeMap lm visited = do
             Right () -> pure ()
             Left  _  -> pure ()
 
--- | Force-load the unqualified import modules of @lm@ that could provide
--- the named re-export @n@, ensuring it is discovered (i.e. its body is
--- parsed into @lmBodies@).  Unlike 'resolveImport', this loads cache
--- modules unconditionally because the user explicitly asked for them.
+-- | Preload the unqualified import modules of @lm@ that could provide any of
+-- the named re-exports in @missingNames@. Each candidate import module is
+-- visited at most once per call, which avoids repeated graph walks for
+-- export-heavy modules like Data.List.
 --
 -- Parse errors and other exceptions from individual module loads or
--- binding discoveries are silently swallowed: if a module can't be
--- parsed (e.g. GHC.Base, GHC.List), we skip it and try the next
--- unqualified import.  The caller (@preloadForEffectiveExports@) will
--- discover whatever was successfully loaded; names that couldn't be
--- found due to parse failures simply won't appear in the effective-
--- export set, which is better than aborting the entire import.
-forceLoadForReexport
+-- recursive preloads are silently swallowed: if a candidate module can't be
+-- parsed, we skip it and continue. The caller (@preloadForEffectiveExports@)
+-- will discover whatever was successfully loaded.
+preloadImportsForNamedReexports
     :: ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> LoadedModule
-    -> ByteString
+    -> [ModuleName]             -- ^ visited import chain
+    -> [ByteString]
     -> IO ()
-forceLoadForReexport registry searchPath includeMap lm n = do
+preloadImportsForNamedReexports registry searchPath includeMap lm visited missingNames = do
     let unqualImports = filter (not . impQualified) (mhImports (lmHeader lm))
         viable = filter (\i ->
             impModule i /= BC.pack "Prelude" &&
-            specAllows (impSpec i) n) unqualImports
+            impModule i `notElem` visited &&
+            any (specAllows (impSpec i)) missingNames) unqualImports
     mapM_ tryLoad viable
   where
     tryLoad imp = do
-        -- Wrap the entire load+discover in a try; if parsing fails for this
+        -- Wrap the entire load+preload in a try; if parsing fails for this
         -- module we silently skip it (best-effort).
         result <- try $ do
             srcLm <- loadModule registry searchPath includeMap (impModule imp)
                        `catch` (\(_ :: ModuleNotFound) -> buildEmptyStubModule (impModule imp))
-            discoverInModule registry searchPath includeMap srcLm n
-            bodies <- readIORef (lmBodies srcLm)
-            if Map.member n bodies
-                then pure ()
-                -- Not found yet — recurse one level deeper (e.g. Data.OldList
-                -- might itself re-export from GHC.List).
-                else forceLoadForReexport registry searchPath includeMap srcLm n
+            preloadForEffectiveExports registry searchPath includeMap srcLm
+                (impModule imp : visited)
         case (result :: Either SomeException ()) of
             Right () -> pure ()
             Left  _  -> pure ()   -- parse error or other failure: skip silently
@@ -538,6 +544,7 @@ loadImportIntoEnv
     -> IO (Env, Int)
 loadImportIntoEnv searchPath imp existingEnv
     | isBuiltinBackedModule (impModule imp) = pure (existingEnv, 0)
+    | ImportOnly names <- impSpec imp = loadImportOnlyIntoEnv searchPath imp names existingEnv
     | otherwise = do
         -- Append cached package search dirs so mtl, transformers, etc. resolve.
         cacheWithIncludes <- cachedPackageSearchPathWithIncludes
@@ -559,13 +566,18 @@ loadImportIntoEnv searchPath imp existingEnv
         -- they end up in thunkByKey.  Repeat until the registry stabilises.
         preloadForEffectiveExports registry fullSearchPath includeMap targetLm
             [lmName targetLm]
-        let runUntilStable = do
+        let runUntilStable processed = do
                 regBefore <- readIORef registry
                 let knownNames = Map.keysSet regBefore
-                -- For every loaded module not yet fully preloaded, run
-                -- preloadForEffectiveExports so its local bodies are discovered.
-                let newlyLoaded = [ lm | (_, Loaded lm) <- Map.toList regBefore
-                                       , lmName lm /= lmName targetLm ]
+                -- Only preload modules that were added since the previous pass.
+                -- Re-running every loaded module on every iteration causes
+                -- quadratic work on import-heavy modules and can make REPL
+                -- imports appear hung.
+                let newlyLoaded =
+                        [ lm
+                        | (m, Loaded lm) <- Map.toList regBefore
+                        , m `Set.notMember` processed
+                        ]
                 mapM_ (\lm -> do
                     r <- try (preloadForEffectiveExports registry fullSearchPath
                                   includeMap lm [lmName lm])
@@ -576,8 +588,8 @@ loadImportIntoEnv searchPath imp existingEnv
                 let newNames = Map.keysSet regAfter
                 if newNames == knownNames
                     then pure ()   -- stable: no new modules loaded
-                    else runUntilStable   -- new modules appeared; go again
-        runUntilStable
+                    else runUntilStable (Set.union processed newNames)
+        runUntilStable (Set.singleton (lmName targetLm))
         -- Step 3: collect all loaded modules and build the combined env.
         reg0 <- readIORef registry
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
@@ -647,6 +659,107 @@ loadImportIntoEnv searchPath imp existingEnv
             merged      = Map.union existingEnv additions
             newAliases  = aliasEnv `Map.difference` existingEnv
         pure (merged, Map.size newAliases)
+
+loadImportOnlyIntoEnv
+    :: [FilePath]
+    -> ImportDecl
+    -> [ByteString]
+    -> Env
+    -> IO (Env, Int)
+loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs      = map fst cacheWithIncludes
+        includeMap     = Map.fromList cacheWithIncludes
+        fullSearchPath = searchPath ++ cacheDirs
+        requested      = nubBS requested0
+    registry <- newIORef Map.empty
+    classReg <- newClassRegistry
+    targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
+    mapM_ (discoverInModule registry fullSearchPath includeMap targetLm) requested
+    regAfterDiscover <- readIORef registry
+    let discoveredDeps =
+            [ lm
+            | (m, Loaded lm) <- Map.toList regAfterDiscover
+            , m /= lmName targetLm
+            ]
+    mapM_ (\lm -> do
+        r <- try (preloadForEffectiveExports registry fullSearchPath includeMap lm [lmName lm])
+                 :: IO (Either SomeException ())
+        case r of
+            Right () -> pure ()
+            Left _   -> pure ()
+        ) discoveredDeps
+    reg0 <- readIORef registry
+    let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
+        unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
+        unionedFields  = foldr Map.union Map.empty (map lmFieldReg loadedModules0)
+    conEnv    <- buildConEnv unionedData
+    fieldEnv' <- buildFieldEnv unionedFields
+    builtins  <- builtinEnv classReg
+    let baseForImport = Map.union builtins (Map.union fieldEnv' conEnv)
+    mapM_ (expandSplicesInModule baseForImport) loadedModules0
+    qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
+    slots <- mapM (\_ -> newIORef BlackHole) qualPairs
+    let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
+        thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+        modPrefix  = lmName targetLm <> BC.pack "."
+        qualPrefix = case impAlias imp of
+            Just a  -> a <> BC.pack "."
+            Nothing
+                | impQualified imp -> lmName targetLm <> BC.pack "."
+                | otherwise        -> BC.empty
+        requestedPairs =
+            [ (n, t)
+            | n <- requested
+            , Just t <- [lookupRequestedThunk targetLm thunkByKey n]
+            ]
+        bareAliases
+            | impQualified imp = []
+            | otherwise        = requestedPairs
+        qualAliases
+            | BC.null qualPrefix = []
+            | otherwise =
+                [ (qualPrefix <> n, t) | (n, t) <- requestedPairs ]
+        aliasEnv = Map.fromList (bareAliases ++ qualAliases)
+    aliases <- buildAliases registry fullSearchPath includeMap targetLm slots qualPairs
+    rewriteAliasPairs <- concat <$> mapM (rewriteAliases registry thunkByKey (Map.keysSet builtins)) loadedModules0
+    let selfAliases =
+            [ (n, slot)
+            | (qualKey, slot) <- Map.toList thunkByKey
+            , BC.isPrefixOf modPrefix qualKey
+            , let n = BC.drop (BC.length modPrefix) qualKey
+            ]
+        innerEnv = Map.union (Map.fromList selfAliases)
+                 $ Map.union (Map.fromList requestedPairs)
+                 $ Map.union (Map.fromList rewriteAliasPairs)
+                 $ Map.union aliases qualEnv
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
+          (zip qualPairs slots)
+    mapM_ (registerInstancesFrom classReg innerEnv) loadedModules0
+    let additions  = Map.difference aliasEnv existingEnv
+        merged     = Map.union existingEnv additions
+    pure (merged, Map.size additions)
+  where
+    lookupRequestedThunk lm thunkByKey n =
+        let prefix = lmName lm <> BC.pack "."
+            suffix = BC.pack "." <> n
+        in case Map.lookup (prefix <> n) thunkByKey of
+            Just t  -> Just t
+            Nothing ->
+                case [ t | (k, t) <- Map.toList thunkByKey
+                         , suffix `isSuffixOf` k ] of
+                    (t:_) -> Just t
+                    []    -> Nothing
+
+    rewriteAliases registry thunkByKey builtinNames lm = do
+        rw <- buildImportRewrites registry lm builtinNames
+        pure
+            [ (alias, slot)
+            | (alias, targetKey) <- Map.toList rw
+            , BC.elem '.' alias
+            , Just slot <- [Map.lookup targetKey thunkByKey]
+            ]
 
 -- | Phase 2.11: expand TH splices in all bodies of a loaded module.
 -- Mutates the @lmBodies@ IORef in place.
@@ -762,6 +875,7 @@ buildImportRewrites registry lm _builtinNames = do
             -- module's prefix in the flat env, not under this module's prefix.
             pure [ (n, prefix <> n)
                  | (n, expr) <- Map.toList bodiesNow
+                 , BC.elem '.' n == False
                  , expr /= EVar n   -- skip foreign-alias sentinels
                  ]
     importPairs <- concat <$> mapM (rewritesForImport reg neededNames) imports
@@ -770,9 +884,9 @@ buildImportRewrites registry lm _builtinNames = do
     let filteredImportPairs = filter (\(n, _) -> not (Set.member n ffiBuiltinNames)) importPairs
     -- Self-rewrites take lower priority than import-rewrites (an import
     -- that brings in the same name shadows the local self-rewrite).
-    -- Map.fromList is left-biased (first occurrence wins); put
-    -- importPairs first so they take priority.
-    pure (Map.fromList (filteredImportPairs ++ selfPairs))
+    -- Data.Map.fromList keeps the LAST occurrence for duplicate keys, so
+    -- selfPairs must come first and importPairs second for imports to win.
+    pure (Map.fromList (selfPairs ++ filteredImportPairs))
   where
     rewritesForImport reg needed imp
         | impModule imp == BC.pack "Prelude" = pure []
@@ -863,15 +977,16 @@ buildImportRewrites registry lm _builtinNames = do
                             Just expr -> expr == EVar n
                             Nothing   -> True
                         ) exportedNames
-                concat <$> mapM (findNameInImports reg tm) missingNames
+                concat <$> mapM (findNameInImports reg tm [lmName tm]) missingNames
 
     -- | Find which of @tm@'s unqualified imports provides @n@, returning
     -- a @(n, qualified-key)@ pair if found.
-    findNameInImports reg tm n = do
+    findNameInImports reg tm visited n = do
         let viaImports = filter (not . impQualified)
                            (mhImports (lmHeader tm))
             viable = filter (\i ->
                 impModule i /= BC.pack "Prelude" &&
+                impModule i `notElem` visited &&
                 specAllows (impSpec i) n) viaImports
         go viable
       where
@@ -886,7 +1001,7 @@ buildImportRewrites registry lm _builtinNames = do
                             pure [(n, srcPrefix <> n)]
                         else do
                             -- Try one level deeper (srcLm might also re-export).
-                            deeper <- findNameInImports reg srcLm n
+                            deeper <- findNameInImports reg srcLm (impModule imp : visited) n
                             case deeper of
                                 [] -> go rest
                                 ps -> pure ps
@@ -1072,15 +1187,16 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                             Just expr -> expr == EVar n
                             Nothing   -> True
                         ) exportedNames
-                pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm) missingNames
+                pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm [lmName tm]) missingNames
                 pure pairs
 
     -- | Find the Thunk for @n@ by walking @tm@'s unqualified imports.
-    findThunkInImports reg thunkByKey tm n = do
+    findThunkInImports reg thunkByKey tm visited n = do
         let viaImports = filter (not . impQualified)
                            (mhImports (lmHeader tm))
             viable = filter (\i ->
                 impModule i /= BC.pack "Prelude" &&
+                impModule i `notElem` visited &&
                 specAllows (impSpec i) n) viaImports
         go viable
       where
@@ -1096,7 +1212,8 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                                 Just t  -> pure [(n, t)]
                                 Nothing -> go rest
                         else do
-                            deeper <- findThunkInImports reg thunkByKey srcLm n
+                            deeper <- findThunkInImports reg thunkByKey srcLm
+                                (impModule imp : visited) n
                             case deeper of
                                 [] -> go rest
                                 ps -> pure ps

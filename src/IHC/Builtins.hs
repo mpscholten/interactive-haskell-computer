@@ -102,11 +102,18 @@ ptrValToPtr other = error ("expected Ptr: " <> showValForDebug other)
 
 foreignPtrValToForeignPtr :: Val -> IO (ForeignPtr Word8)
 foreignPtrValToForeignPtr (VPrimObj (PrimForeignPtr fp)) = pure fp
-foreignPtrValToForeignPtr (VCon "ForeignPtr" [_addrT, gutsT]) = do
+foreignPtrValToForeignPtr (VCon "ForeignPtr" [addrT, gutsT]) = do
     gv <- force gutsT
     case gv of
         VPrimObj (PrimForeignPtr fp) -> pure fp
-        _ -> error ("ForeignPtr guts missing host pointer: " <> showValForDebug gv)
+        -- Source-loaded code can construct ForeignPtr values whose guts are
+        -- constructors like FinalPtr rather than our host PrimForeignPtr.
+        -- Rebuild an equivalent host ForeignPtr from the raw address so the
+        -- RTS-backed pointer builtins can still operate on it.
+        _ -> do
+            addrV <- force addrT
+            p <- ptrValToPtr addrV
+            newForeignPtr_ (castPtr p)
 foreignPtrValToForeignPtr other = error ("expected ForeignPtr: " <> showValForDebug other)
 
 -- | Build the initial environment containing every well-known name.

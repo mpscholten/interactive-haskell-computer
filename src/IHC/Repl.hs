@@ -9,12 +9,14 @@
 module IHC.Repl (runRepl) where
 
 import Control.Exception (SomeException, throwIO, try)
+import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
+import Data.List (nub)
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO (hFlush, stdout)
 
 import System.Console.Haskeline
@@ -32,10 +34,16 @@ import IHC.Classes (ClassRegistry, registerInstance)
 import IHC.Driver (resolveSearchPathFor)
 import IHC.Eval (eval, force)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
-import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
+import IHC.ModuleHeader (ImportDecl(..), ImportSpec(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
 import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
-import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadFileIntoEnv)
+import IHC.Scheduler
+    ( buildBaseEnv
+    , freeVars
+    , loadImportIntoEnv
+    , loadFileIntoEnv
+    , splitQualified
+    )
 import IHC.Source (mkSource, Source(..))
 import IHC.TypeDescribe (describeType)
 import IHC.Val
@@ -46,10 +54,11 @@ runRepl = do
     (baseEnv, classReg) <- buildBaseEnv
     envRef      <- newIORef baseEnv
     loadedRef   <- newIORef ([] :: [FilePath])
+    importsRef  <- newIORef ([] :: [ImportDecl])
     histDir     <- historyDir
     let settings = defaultSettings
             { historyFile = Just (histDir </> "repl_history") }
-    runInputT settings (loop envRef classReg loadedRef)
+    runInputT settings (loop envRef classReg loadedRef importsRef)
 
 historyDir :: IO FilePath
 historyDir = do
@@ -62,8 +71,8 @@ historyDir = do
 -- Main REPL loop
 --------------------------------------------------------------------------------
 
-loop :: IORef Env -> ClassRegistry -> IORef [FilePath] -> InputT IO ()
-loop envRef classReg loadedRef = go
+loop :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> InputT IO ()
+loop envRef classReg loadedRef importsRef = go
   where
     go = do
         mLine <- getInputLine "ihc> "
@@ -71,36 +80,36 @@ loop envRef classReg loadedRef = go
             Nothing   -> pure ()
             Just ""   -> go
             Just line -> do
-                continue <- dispatch envRef classReg loadedRef line
+                continue <- dispatch envRef classReg loadedRef importsRef line
                 if continue then go else pure ()
 
-dispatch :: IORef Env -> ClassRegistry -> IORef [FilePath] -> String -> InputT IO Bool
-dispatch envRef classReg loadedRef line =
+dispatch :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO Bool
+dispatch envRef classReg loadedRef importsRef line =
     case words line of
-        ((':':cmd):rest) -> metaCmd envRef classReg loadedRef cmd rest
-        ("import":_)     -> doImport envRef line >> pure True
+        ((':':cmd):rest) -> metaCmd envRef classReg loadedRef importsRef cmd rest
+        ("import":_)     -> doImport envRef loadedRef importsRef line >> pure True
         ("data":_)       -> doDataDecl envRef line >> pure True
         ("newtype":_)    -> doDataDecl envRef line >> pure True
         ("type":_)       -> doTypeDecl line >> pure True
         ("class":_)      -> doClassDecl line >> pure True
         ("instance":_)   -> doInstanceDecl envRef classReg line >> pure True
-        _                -> evalLine envRef classReg line >> pure True
+        _                -> evalLine envRef classReg loadedRef importsRef line >> pure True
 
 --------------------------------------------------------------------------------
 -- Meta-commands
 --------------------------------------------------------------------------------
 
-metaCmd :: IORef Env -> ClassRegistry -> IORef [FilePath] -> String -> [String] -> InputT IO Bool
-metaCmd _      _        _         "q"      _    = pure False
-metaCmd _      _        _         "quit"   _    = pure False
-metaCmd _      _        _         "?"      _    = printHelp >> pure True
-metaCmd _      _        _         "help"   _    = printHelp >> pure True
-metaCmd envRef classReg loadedRef "l"      args = doLoad envRef classReg loadedRef (unwords args) >> pure True
-metaCmd envRef classReg loadedRef "load"   args = doLoad envRef classReg loadedRef (unwords args) >> pure True
-metaCmd envRef classReg loadedRef "r"      _    = doReload envRef classReg loadedRef >> pure True
-metaCmd envRef classReg loadedRef "reload" _    = doReload envRef classReg loadedRef >> pure True
-metaCmd envRef _        _         "t"      args = doTypeOf envRef (unwords args) >> pure True
-metaCmd _      _        _         cmd      _    = do
+metaCmd :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> [String] -> InputT IO Bool
+metaCmd _      _        _         _          "q"      _    = pure False
+metaCmd _      _        _         _          "quit"   _    = pure False
+metaCmd _      _        _         _          "?"      _    = printHelp >> pure True
+metaCmd _      _        _         _          "help"   _    = printHelp >> pure True
+metaCmd envRef classReg loadedRef _          "l"      args = doLoad envRef classReg loadedRef (unwords args) >> pure True
+metaCmd envRef classReg loadedRef _          "load"   args = doLoad envRef classReg loadedRef (unwords args) >> pure True
+metaCmd envRef classReg loadedRef _          "r"      _    = doReload envRef classReg loadedRef >> pure True
+metaCmd envRef classReg loadedRef _          "reload" _    = doReload envRef classReg loadedRef >> pure True
+metaCmd envRef _        loadedRef importsRef "t"      args = doTypeOf envRef loadedRef importsRef (unwords args) >> pure True
+metaCmd _      _        _         _          cmd      _    = do
     outputStrLn ("Unknown command :" <> cmd <> "  (try :?)")
     pure True
 
@@ -119,9 +128,9 @@ printHelp = mapM_ outputStrLn
 -- :t EXPR  —  runtime structural type
 --------------------------------------------------------------------------------
 
-doTypeOf :: IORef Env -> String -> InputT IO ()
-doTypeOf _      ""   = outputStrLn "Usage: :t EXPR"
-doTypeOf envRef expr = do
+doTypeOf :: IORef Env -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
+doTypeOf _      _         _          ""   = outputStrLn "Usage: :t EXPR"
+doTypeOf envRef loadedRef importsRef expr = do
     env <- liftIO (readIORef envRef)
     let src = mkSource "<repl:t>" (BC.pack expr)
     r <- liftIO (try (parseExprOnly src defaultFixityTable)
@@ -129,7 +138,8 @@ doTypeOf envRef expr = do
     case r of
         Left err -> outputStrLn ("Parse error: " <> show err)
         Right ast -> do
-            r2 <- liftIO (try (typeOfExpr env ast)
+            env' <- liftIO (ensureQualifiedNamesLoaded loadedRef importsRef env ast)
+            r2 <- liftIO (try (typeOfExpr env' ast)
                               :: IO (Either SomeException String))
             case r2 of
                 Left  e   -> outputStrLn (expr <> " :: <error: " <> show e <> ">")
@@ -210,29 +220,31 @@ doLoadFile path existingEnv = do
 -- | Handle a line that starts with @import@ typed at the REPL prompt.
 -- Parses the import declaration, loads the named module (discovering all
 -- its exported bindings), and merges the result into the session env.
-doImport :: IORef Env -> String -> InputT IO ()
-doImport envRef line = do
+doImport :: IORef Env -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
+doImport envRef loadedRef importsRef line = do
     let src = mkSource "<repl>" (BC.pack line)
     mDecl <- liftIO (parseSingleImport src)
     case mDecl of
         Nothing -> outputStrLn ("Import parse error: " <> show line)
         Just imp -> do
             env <- liftIO (readIORef envRef)
-            -- Use the current directory as the default search path for
-            -- REPL-level imports. The user can :load a file first to
-            -- widen the search to that file's directory.
-            let searchPath = ["."]
-            r <- liftIO (tryImportModule searchPath imp env)
-            case r of
-                Left err           ->
-                    outputStrLn ("Import error: " <> err)
-                Right (newEnv, n)  -> do
-                    liftIO (writeIORef envRef newEnv)
-                    outputStrLn ( "imported "
-                                <> BC.unpack (impModule imp)
-                                <> " ("
-                                <> show n
-                                <> " names)" )
+            searchPath <- liftIO (currentImportSearchPath loadedRef)
+            if impQualified imp || impAlias imp /= Nothing
+                then do
+                    liftIO $ modifyIORef' importsRef (imp :)
+                    outputStrLn ("imported " <> BC.unpack (impModule imp) <> " (deferred)")
+                else do
+                    r <- liftIO (tryImportModule searchPath imp env)
+                    case r of
+                        Left err           ->
+                            outputStrLn ("Import error: " <> err)
+                        Right (newEnv, n)  -> do
+                            liftIO (writeIORef envRef newEnv)
+                            outputStrLn ( "imported "
+                                        <> BC.unpack (impModule imp)
+                                        <> " ("
+                                        <> show n
+                                        <> " names)" )
 
 tryImportModule
     :: [FilePath]
@@ -394,17 +406,17 @@ evalInstanceMethods src env methods =
 -- Expression evaluation
 --------------------------------------------------------------------------------
 
-evalLine :: IORef Env -> ClassRegistry -> String -> InputT IO ()
-evalLine envRef classReg input = do
+evalLine :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
+evalLine envRef classReg loadedRef importsRef input = do
     env <- liftIO (readIORef envRef)
     case letBindingName input of
         Just name -> do
-            r <- liftIO (tryEvalLetDecl env name input)
+            r <- liftIO (tryEvalLetDecl loadedRef importsRef env name input)
             case r of
                 Left  err     -> outputStrLn ("Error: " <> err)
                 Right newEnv  -> liftIO (writeIORef envRef newEnv)
         Nothing -> do
-            r <- liftIO (tryEvalExpr env classReg input)
+            r <- liftIO (tryEvalExpr loadedRef importsRef env classReg input)
             case r of
                 Left  err -> outputStrLn ("Error: " <> err)
                 Right ()  -> pure ()
@@ -446,8 +458,8 @@ letBindingName s =
 -- Parser pipeline so that function-style LHSs like @f x y = body@ are
 -- correctly desugared into lambdas, and the binding is knot-tied so
 -- recursive references inside the body (e.g. @map@ calling @map@) work.
-tryEvalLetDecl :: Env -> String -> String -> IO (Either String Env)
-tryEvalLetDecl env name input = do
+tryEvalLetDecl :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> String -> String -> IO (Either String Env)
+tryEvalLetDecl loadedRef importsRef env name input = do
     -- Strip the leading "let " and wrap in a synthetic module so that
     -- findBinding can locate the top-level declaration at column 1.
     let decl = dropLetPrefix input
@@ -458,12 +470,13 @@ tryEvalLetDecl env name input = do
     case r of
         Left  err  -> pure (Left (show err))
         Right expr -> do
+            env0 <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
             -- Knot-tying: allocate a slot first, extend the env to
             -- include the binding, then fill the slot with a closure
             -- that captures the extended env.  This makes the binding
             -- visible to itself (recursion) and to later REPL lines.
             slot <- newIORef BlackHole
-            let env' = Map.insert key slot env
+            let env' = Map.insert key slot env0
             writeIORef slot (Unevaluated (Closure env' emptyIPMap expr))
             pure (Right env')
 
@@ -486,19 +499,62 @@ parseLetBinding src name = do
                                          <> BC.unpack name <> "`"))
         Just lhs -> parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
 
-tryEvalExpr :: Env -> ClassRegistry -> String -> IO (Either String ())
-tryEvalExpr env classReg input = do
+tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> ClassRegistry -> String -> IO (Either String ())
+tryEvalExpr loadedRef importsRef env classReg input = do
     let src = mkSource "<repl>" (BC.pack input)
     r <- try (parseExprOnly src defaultFixityTable)
             :: IO (Either SomeException Expr)
     case r of
         Left  err  -> pure (Left (show err))
         Right expr -> do
-            r2 <- try (evalAndPrint env classReg expr)
+            env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
+            r2 <- try (evalAndPrint env' classReg expr)
                     :: IO (Either SomeException ())
             case r2 of
                 Left  e  -> pure (Left (show e))
                 Right () -> pure (Right ())
+
+currentImportSearchPath :: IORef [FilePath] -> IO [FilePath]
+currentImportSearchPath loadedRef = do
+    loaded <- readIORef loadedRef
+    pure (nub ("." : map takeDirectory loaded))
+
+ensureQualifiedNamesLoaded :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> Expr -> IO Env
+ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
+    imports <- readIORef importsRef
+    if null imports
+        then pure env
+        else do
+            searchPath <- currentImportSearchPath loadedRef
+            let requested =
+                    foldr addRequest []
+                        [ (imp, bare)
+                        | fv <- freeVars expr
+                        , Just (qual, bare) <- [splitQualified fv]
+                        , imp <- matchingImports qual imports
+                        ]
+            foldM (loadOne searchPath) env requested
+  where
+    matchingImports qual = filter (\imp ->
+        case impAlias imp of
+            Just a  -> a == qual
+            Nothing -> impQualified imp && impModule imp == qual)
+
+    addRequest (imp, bare) [] = [(imp, [bare])]
+    addRequest (imp, bare) ((imp', names) : rest)
+        | sameImport imp imp' = (imp', bare : names) : rest
+        | otherwise           = (imp', names) : addRequest (imp, bare) rest
+
+    sameImport a b =
+        impModule a == impModule b
+        && impQualified a == impQualified b
+        && impAlias a == impAlias b
+        && impSpec a == impSpec b
+
+    loadOne searchPath accEnv (imp, names) = do
+        let imp' = imp { impSpec = ImportOnly (nub names) }
+        (env', _) <- loadImportIntoEnv searchPath imp' accEnv
+        pure env'
 
 evalAndPrint :: Env -> ClassRegistry -> Expr -> IO ()
 evalAndPrint env classReg expr = do
