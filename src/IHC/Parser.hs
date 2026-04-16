@@ -491,31 +491,80 @@ parseBindingsIn src fx (start, end) = do
                     ((params, rhs) : acc)
             _ -> pure (reverse acc, cur)
 
+    -- | Try to skip a type signature at the current position.
+    -- Returns @Just curAfter@ if a @name[, name]* :: type@ sig was found
+    -- and skipped, or @Nothing@ if this is a regular value binding.
+    -- @bindCol@ is the binding column; the type body ends when a token
+    -- at column @<= bindCol@ is seen.
+    trySkipWhereSig ctx bindCol cur = do
+        let (tok1, cur1) = nextSig ctx cur
+        case tkKind tok1 of
+            TkIdent _ ->
+                -- Could be start of a sig: peek for ',' or '::'
+                let skipNames c = do
+                        let (t, c') = nextSig ctx c
+                        case tkKind t of
+                            TkComma ->
+                                -- multi-name sig: a, b, c :: T
+                                let (t2, c2) = nextSig ctx c' in
+                                case tkKind t2 of
+                                    TkIdent _ -> skipNames c2
+                                    _         -> pure Nothing  -- parse error, fall through
+                            TkDColon -> do
+                                curAfter <- skipTypeSigBody ctx bindCol c'
+                                pure (Just curAfter)
+                            _ -> pure Nothing   -- not a sig, let parseOne handle it
+                in skipNames cur1
+            _ -> pure Nothing
+
     braced ctx cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
             let (nameTok, _) = nextSig ctx cur
             -- Peek the bind column from the current position.
             let bindCol = tkCol nameTok
-            (b, cur') <- parseOne ctx bindCol cur
-            let (sep, curN) = nextSig ctx cur'
-            case tkKind sep of
-                TkSemi   -> braced ctx curN (b : acc)
-                TkRBrace -> pure (reverse (b : acc))
-                TkEof    -> pure (reverse (b : acc))
-                _        -> parseErr ctx "expected `;` or `}` in let/where" sep
+            mSkip <- trySkipWhereSig ctx bindCol cur
+            case mSkip of
+                Just cur' -> do
+                    let (nextTok, _) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkSemi   -> braced ctx cur' acc
+                        TkRBrace -> pure (reverse acc)
+                        TkEof    -> pure (reverse acc)
+                        _ | cPos cur' < ctxEnd ctx -> braced ctx cur' acc
+                          | otherwise -> pure (reverse acc)
+                Nothing -> do
+                    (b, cur') <- parseOne ctx bindCol cur
+                    let (sep, curN) = nextSig ctx cur'
+                    case tkKind sep of
+                        TkSemi   -> braced ctx curN (b : acc)
+                        TkRBrace -> pure (reverse (b : acc))
+                        TkEof    -> pure (reverse (b : acc))
+                        _        -> parseErr ctx "expected `;` or `}` in let/where" sep
 
     layout ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            (b, cur') <- parseOne ctx bindCol cur
-            let (nextTok, _) = nextSig ctx cur'
-            case tkKind nextTok of
-                TkEof -> pure (reverse (b : acc))
-                _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
-                       layout ctx bindCol cur' (b : acc)
-                  | otherwise ->
-                       pure (reverse (b : acc))
+            mSkip <- trySkipWhereSig ctx bindCol cur
+            case mSkip of
+                Just cur' -> do
+                    -- Type sig skipped; continue if next token is at same col.
+                    let (nextTok, _) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkEof -> pure (reverse acc)
+                        _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
+                               layout ctx bindCol cur' acc
+                          | otherwise ->
+                               pure (reverse acc)
+                Nothing -> do
+                    (b, cur') <- parseOne ctx bindCol cur
+                    let (nextTok, _) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkEof -> pure (reverse (b : acc))
+                        _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
+                               layout ctx bindCol cur' (b : acc)
+                          | otherwise ->
+                               pure (reverse (b : acc))
 
 --------------------------------------------------------------------------------
 -- nextSig with body-end bound
@@ -581,6 +630,30 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkRBracket -> go cur' (b - 1) p c
             TkLBrace   -> go cur' b p (c + 1)
             TkRBrace   -> go cur' b p (c - 1)
+            _          -> go cur' b p c
+
+-- | Skip the body of a @name :: type@ signature inside a where/let block.
+-- Called after consuming @::@. Stops when it finds a token whose column is
+-- @<= bindCol@ at bracket depth 0, or at EOF. This is column-aware rather
+-- than stopping at @=@, so it handles multi-token type expressions
+-- (@Int -> Int@, @Maybe (Foo -> Bar)@, etc.) correctly.
+skipTypeSigBody :: Ctx -> Int -> Cursor -> IO Cursor
+skipTypeSigBody ctx bindCol cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+  where
+    go cur b p c = do
+        let (tok, cur') = nextSig ctx cur
+        case tkKind tok of
+            TkEof -> pure cur
+            _ | tkCol tok <= bindCol && b == 0 && p == 0 && c == 0 -> pure cur
+            TkRParen | p > 0    -> go cur' b (p - 1) c
+            TkRParen            -> pure cur  -- unmatched ')' — stop before it
+            TkRBracket | b > 0  -> go cur' (b - 1) p c
+            TkRBracket          -> pure cur
+            TkRBrace | c > 0    -> go cur' b p (c - 1)
+            TkRBrace            -> pure cur
+            TkLParen   -> go cur' b (p + 1) c
+            TkLBracket -> go cur' (b + 1) p c
+            TkLBrace   -> go cur' b p (c + 1)
             _          -> go cur' b p c
 
 -- | Multi-way if: @if | g -> e | g -> e ...@. Assumes @if@ already
@@ -760,22 +833,61 @@ parseDoLet ctx cur0 = do
     let (firstTok, curAfter) = nextSig ctx cur0
     (binds, curEnd) <- case tkKind firstTok of
         TkLBrace -> bracedBinds curAfter []
-        _        -> singleBind cur0
+        _        ->
+            -- Layout mode: collect all bindings at the same column.
+            -- This handles `let x :: Int\n    x = 42` correctly.
+            let bindCol = tkCol firstTok
+            in layoutBinds bindCol cur0 []
     pure (SLet binds, curEnd)
   where
-    singleBind cur = do
-        let (nameTok, cur1) = nextSig ctx cur
-        name <- case tkKind nameTok of
-            TkIdent n -> pure n
-            _         -> parseErr ctx "expected identifier after `let`" nameTok
-        -- Allow curried params before `=`, e.g. `let f x y = ...`.
-        (params, cur2) <- collectLetParams ctx cur1 []
-        let (eqTok, cur3) = nextSig ctx cur2
-        case tkKind eqTok of
-            TkEq -> pure ()
-            _    -> parseErr ctx "expected `=` in let-binding" eqTok
-        (e, cur4) <- parseExpr ctx cur3
-        pure ([(name, wrapParams params e)], cur4)
+    -- | Try to detect and skip a type sig @name[, name]* :: type@ at the
+    -- current position. Returns @Just curAfter@ on success, @Nothing@ if
+    -- this looks like a value binding.
+    trySkipDoLetSig bindCol cur = do
+        let (tok1, cur1) = nextSig ctx cur
+        case tkKind tok1 of
+            TkIdent _ ->
+                let skipNames c = do
+                        let (t, c') = nextSig ctx c
+                        case tkKind t of
+                            TkComma ->
+                                let (t2, c2) = nextSig ctx c' in
+                                case tkKind t2 of
+                                    TkIdent _ -> skipNames c2
+                                    _         -> pure Nothing
+                            TkDColon -> do
+                                curAfter <- skipTypeSigBody ctx bindCol c'
+                                pure (Just curAfter)
+                            _ -> pure Nothing
+                in skipNames cur1
+            _ -> pure Nothing
+
+    -- Layout-mode: collect one or more bindings at `bindCol`, skipping type sigs.
+    -- Stops when the next token is at a different column or EOF.
+    layoutBinds bindCol cur acc = do
+        mSkip <- trySkipDoLetSig bindCol cur
+        case mSkip of
+            Just cur' -> do
+                let (peek, _) = nextSig ctx cur'
+                if tkCol peek == bindCol && tkKind peek /= TkEof
+                    then layoutBinds bindCol cur' acc
+                    else pure (reverse acc, cur')
+            Nothing -> do
+                let (nameTok, cur1) = nextSig ctx cur
+                name <- case tkKind nameTok of
+                    TkIdent n -> pure n
+                    _         -> parseErr ctx "expected identifier after `let`" nameTok
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (eqTok, cur3) = nextSig ctx cur2
+                case tkKind eqTok of
+                    TkEq -> pure ()
+                    _    -> parseErr ctx "expected `=` in let-binding" eqTok
+                (e, cur4) <- parseExpr ctx cur3
+                let bind = (name, wrapParams params e)
+                let (peek, _) = nextSig ctx cur4
+                if tkCol peek == bindCol && tkKind peek /= TkEof
+                    then layoutBinds bindCol cur4 (bind : acc)
+                    else pure (reverse (bind : acc), cur4)
 
     bracedBinds cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
@@ -884,6 +996,28 @@ parseLet ctx cur0 = do
         (body, curBody) <- parseExpr ctx curIn
         pure (ELet binds body, curBody)
 
+    -- | Check whether the current position starts a type signature line
+    -- @name[, name]* :: type@. If so, skip the sig body and return @Just curAfter@.
+    -- Otherwise return @Nothing@ (caller should parse it as a value binding).
+    trySkipLetSig bindCol cur = do
+        let (tok1, cur1) = nextSig ctx cur
+        case tkKind tok1 of
+            TkIdent _ ->
+                let skipNames c = do
+                        let (t, c') = nextSig ctx c
+                        case tkKind t of
+                            TkComma ->
+                                let (t2, c2) = nextSig ctx c' in
+                                case tkKind t2 of
+                                    TkIdent _ -> skipNames c2
+                                    _         -> pure Nothing
+                            TkDColon -> do
+                                curAfter <- skipTypeSigBody ctx bindCol c'
+                                pure (Just curAfter)
+                            _ -> pure Nothing   -- not a sig
+                in skipNames cur1
+            _ -> pure Nothing
+
     -- Parse one let-binding (name + params + = or | guards + body).
     -- Handles:
     --   name = expr
@@ -933,18 +1067,31 @@ parseLet ctx cur0 = do
     -- Collect layout-mode let items (bindings and pattern bindings).
     -- All items must be at `bindCol`.
     -- Stop when we see `in`, EOF, or a token at a column < bindCol.
+    -- Type signature lines (@name :: type@) are silently skipped.
     layoutLetItems bindCol cur acc = do
-        (item, cur') <- parseOneLetItem cur
-        let acc' = item : acc
-        -- Peek at the next significant token.
-        let (peek, _) = nextSig ctx cur'
-        case tkKind peek of
-            TkIn  -> pure (reverse acc', cur')
-            TkEof -> pure (reverse acc', cur')
-            _ | tkCol peek == bindCol && tkKind peek /= TkIn ->
-                    -- Same column and not `in` — another binding follows.
-                    layoutLetItems bindCol cur' acc'
-              | otherwise -> pure (reverse acc', cur')
+        mSkip <- trySkipLetSig bindCol cur
+        case mSkip of
+            Just cur' -> do
+                -- Type sig skipped; continue if more bindings follow.
+                let (peek, _) = nextSig ctx cur'
+                case tkKind peek of
+                    TkIn  -> pure (reverse acc, cur')
+                    TkEof -> pure (reverse acc, cur')
+                    _ | tkCol peek == bindCol ->
+                            layoutLetItems bindCol cur' acc
+                      | otherwise -> pure (reverse acc, cur')
+            Nothing -> do
+                (item, cur') <- parseOneLetItem cur
+                let acc' = item : acc
+                -- Peek at the next significant token.
+                let (peek, _) = nextSig ctx cur'
+                case tkKind peek of
+                    TkIn  -> pure (reverse acc', cur')
+                    TkEof -> pure (reverse acc', cur')
+                    _ | tkCol peek == bindCol && tkKind peek /= TkIn ->
+                            -- Same column and not `in` — another binding follows.
+                            layoutLetItems bindCol cur' acc'
+                      | otherwise -> pure (reverse acc', cur')
 
     bracedLetBinds cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
