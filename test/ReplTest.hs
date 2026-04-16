@@ -216,6 +216,50 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "True"
         out `shouldContain` "unbound"
 
+    -- Transitive re-export tests (effectiveExports + import-operator-fix)
+    it "import Data.List: map (+1) [1,2,3] = [2,3,4]" do
+        -- Data.List re-exports map transitively via Data.OldList → GHC.Base.
+        -- The import-operator-list fix ensures all of Data.OldList's imports
+        -- (including GHC.List, GHC.Base) are correctly parsed past `(.&.)`.
+        (code, out, _err) <- runRepl
+            ( "import Data.List\n"
+           <> "map (+1) [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "[2,3,4]"
+
+    it "import Data.List: head and filter work (transitive via GHC.List)" do
+        -- head and filter are defined in GHC.List, which is two hops away
+        -- from Data.List via Data.OldList.
+        (code, out, _err) <- runRepl
+            ( "import Data.List\n"
+           <> "head [10,20,30]\n"
+           <> "filter (>2) [1,2,3,4]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "10"
+        out `shouldContain` "[3,4]"
+
+    it "import qualified Data.List as L: L.head [1,2,3] = 1" do
+        -- Qualified import: transitive re-exports should be reachable via
+        -- the L. prefix.  head is in GHC.List (two hops via Data.OldList).
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.List as L\n"
+           <> "L.head [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "1"
+
+    it "import qualified Data.List as L: L.map works (recursive closure via effectivePairs)" do
+        -- Regression: qualified imports must put bare names in innerEnv so
+        -- that recursive calls inside GHC.Base.map can find `map` itself.
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.List as L\n"
+           <> "L.map (+1) [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "[2,3,4]"
+
     it ":r after modify-on-disk reflects new binding" do
         tmpDir <- getTemporaryDirectory
         (tmpPath, h) <- openTempFile tmpDir "ihc_reload_test.hs"
