@@ -593,6 +593,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "100\n"
 
+    it "CPP #include: template-include pattern — macros defined in wrapper expand in included body" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/CppInclude/template_include/main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "posix\nPosix\n'/'\n"
+
     it "CPP #include: missing file throws an exception mentioning the path" do
         result <- try (runFile "test/Fixtures/CppInclude/missing/main.hs")
                       :: IO (Either SomeException Int)

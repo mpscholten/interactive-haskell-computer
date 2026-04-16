@@ -85,9 +85,16 @@ defaultCppContext :: CppContext
 defaultCppContext = Map.fromList
     [ ("__GLASGOW_HASKELL__", MObj "910")
     , ("MIN_VERSION_base",    MFun ["ma","mi","pa"] "1")
-    -- Common bytestring guard macros — accept whatever the current
-    -- package configures; default to 1 (present) so the "happy path"
-    -- branch is taken.
+    -- Architecture: we target macOS aarch64 (Apple Silicon).
+    -- aarch64_HOST_ARCH is the GHC CPP convention for arm64 targets.
+    -- __ARM_FEATURE_UNALIGNED reflects Apple Silicon's unaligned-access
+    -- support (M1/M2/M3 all tolerate unaligned loads/stores natively).
+    , ("aarch64_HOST_ARCH",        MObj "1")
+    , ("__ARM_FEATURE_UNALIGNED",  MObj "1")
+    -- Common bytestring guard macros — set here so they survive even if
+    -- bytestring-cpp-macros.h redefines them as MIN_VERSION_base(...)
+    -- expressions (the CEVar evaluator now handles that expansion, but
+    -- having them pre-set to 1 also means #ifdef checks pass).
     , ("HS_cstringLength_AND_FinalPtr_AVAILABLE", MObj "1")
     , ("HS_unsafeWithForeignPtr_AVAILABLE",       MObj "1")
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
@@ -392,7 +399,11 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
         Nothing -> do
             -- Regular line. Emit iff active; otherwise blank.
             -- Note: for regular lines, contCount=0 and rest'=rest, so no change.
-            let emit = if active then ln else BS.empty
+            -- When active, expand object-like and function-like macros defined
+            -- in the context so that e.g. IS_WINDOWS, CHAR, FILEPATH, MODULE_NAME
+            -- (defined via #define in a template-include wrapper like Posix.hs)
+            -- are substituted into the body of the included file.
+            let emit = if active then expandMacrosInLine ctx ln else BS.empty
             (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
             pure (emit : xs, c)
 
@@ -756,9 +767,15 @@ evalCondExpr ctx = toBool . go
            then 1 else 0
     go (CEDef nm) = if Map.member nm ctx then 1 else 0
     go (CEVar nm) = case Map.lookup nm ctx of
-        Just (MObj body) -> case parseIntMaybe (BC.strip body) of
-            Just n  -> n
-            Nothing -> 0          -- undefined numeric → 0 per CPP rules
+        Just (MObj body) ->
+            let body' = BC.strip body
+            in case parseIntMaybe body' of
+                Just n  -> n
+                -- Body is not a bare integer: treat it as a CPP expression
+                -- (e.g. HS_timesInt2_PRIMOP_AVAILABLE is defined as
+                -- "MIN_VERSION_base(4,15,0)" by bytestring-cpp-macros.h).
+                -- Re-parse and evaluate recursively so macro chains resolve.
+                Nothing -> go (parseCondExpr body')
         Just (MFun _ _)  -> 0
         Nothing          -> 0
     go (CECall nm args) = case Map.lookup nm ctx of
@@ -768,7 +785,12 @@ evalCondExpr ctx = toBool . go
                              (zip params args)
                 expanded = parseCondExpr body
             in go (substExpr ctx' expanded)
-        Just (MObj _) -> 0        -- called an object-like macro; unusual
+        Just (MObj body) ->
+            -- Object-like macro called with arguments: expand the body as a
+            -- CPP expression (ignoring arguments, which is unusual but
+            -- happens with macros like HS_UNALIGNED_ByteArray_OPS_OK that
+            -- expand to a complex expression but take no args in practice).
+            go (parseCondExpr (BC.strip body))
         Nothing       -> 0
 
     -- Substitute CEVar references against the inner context that has
@@ -778,9 +800,12 @@ evalCondExpr ctx = toBool . go
     substExpr c = sub
       where
         sub (CEVar nm) = case Map.lookup nm c of
-            Just (MObj body) -> case parseIntMaybe (BC.strip body) of
-                Just n  -> CELit n
-                Nothing -> CELit 0
+            Just (MObj body) ->
+                let body' = BC.strip body
+                in case parseIntMaybe body' of
+                    Just n  -> CELit n
+                    -- Non-integer body: treat as a nested expression.
+                    Nothing -> parseCondExpr body'
             _ -> CEVar nm
         sub (CENot e)    = CENot (sub e)
         sub (CEAnd a b)  = CEAnd (sub a) (sub b)
@@ -792,6 +817,158 @@ parseIntMaybe :: ByteString -> Maybe Integer
 parseIntMaybe bs = case BC.unpack bs of
     s | all isDigit s && not (null s) -> Just (read s)
     _ -> Nothing
+
+--------------------------------------------------------------------------------
+-- Macro expansion in regular source lines
+--------------------------------------------------------------------------------
+
+-- | Expand object-like and function-like macros in a regular (non-directive)
+-- source line.  This implements the core C-preprocessor substitution rule:
+-- any identifier that names a macro in the context is replaced with its body,
+-- and the result is rescanned (up to a recursion limit) so chains of macros
+-- resolve correctly.
+--
+-- We skip expansion inside:
+--   * @\"...\"@ double-quoted string literals
+--   * @\'...\'@ character literals
+--   * @--@ line comments (everything to end-of-line)
+--   * @{- ... -}@ block comments (single-line occurrences only;
+--     multi-line block comments carry their open state across lines, which
+--     we approximate conservatively by not expanding after @{-@)
+--
+-- Recursion depth is capped at 16 to guard against self-referential macros.
+expandMacrosInLine :: CppContext -> ByteString -> ByteString
+expandMacrosInLine ctx ln
+    | Map.null ctx = ln   -- fast path: nothing to expand
+    | otherwise    = go ln 0
+  where
+    -- We rescan the result up to maxDepth times to resolve macro chains
+    -- (e.g. @FILEPATH@ expands to @FilePath@ which doesn't need rescanning).
+    maxDepth :: Int
+    maxDepth = 16
+
+    go :: ByteString -> Int -> ByteString
+    go bs depth
+        | depth >= maxDepth = bs
+        | otherwise =
+            let bs' = expandOnce bs
+            in if bs' == bs then bs else go bs' (depth + 1)
+
+    expandOnce :: ByteString -> ByteString
+    expandOnce bs = BC.concat (scanLine bs False)
+      where
+        -- scanLine: process bytes, skipping over literals/comments.
+        -- inBlockComment: True when we're past an unclosed {- on this line.
+        scanLine :: ByteString -> Bool -> [ByteString]
+        scanLine s _inBC
+            | BS.null s = []
+        scanLine s True =
+            -- Inside a block comment: look for -} to close.
+            case BC.uncons s of
+                Just ('-', rest) | not (BS.null rest) && BC.head rest == '}' ->
+                    let (prefix, afterClose) = BS.splitAt 2 s
+                    in prefix : scanLine afterClose False
+                Just (_, rest) -> BC.singleton (BC.head s) : scanLine rest True
+                Nothing -> []
+        scanLine s False =
+            case BC.uncons s of
+                Nothing -> []
+                -- Line comment: rest of line is verbatim.
+                Just ('-', rest) | not (BS.null rest) && BC.head rest == '-' ->
+                    [s]
+                -- Block comment open {-
+                Just ('{', rest) | not (BS.null rest) && BC.head rest == '-' ->
+                    BC.pack "{-" : scanLine (BS.drop 1 rest) True
+                -- Double-quoted string literal: copy verbatim until closing ".
+                Just ('"', rest) ->
+                    let (lit, after) = scanStringLit rest
+                    in BC.pack "\"" : lit : scanLine after False
+                -- Char literal: copy verbatim until closing '.
+                Just ('\'', rest) ->
+                    let (lit, after) = scanCharLit rest
+                    in BC.pack "'" : lit : scanLine after False
+                -- Identifier start: check for macro.
+                Just (c, _) | isIdentStart c ->
+                    let (ident, afterIdent) = BC.span isIdentChar s
+                    in case Map.lookup ident ctx of
+                        -- Function-like macro: consume the argument list.
+                        Just (MFun params body) ->
+                            case consumeArgs afterIdent of
+                                Just (args, afterArgs) ->
+                                    let argMap = Map.fromList
+                                            (zip params (map stripWs args))
+                                        expanded = substituteParams argMap body
+                                    in BC.pack (BC.unpack expanded)
+                                       : scanLine afterArgs False
+                                -- No '(' follows — treat as non-macro identifier.
+                                Nothing -> ident : scanLine afterIdent False
+                        -- Object-like macro: replace in-place.
+                        Just (MObj body) ->
+                            body : scanLine afterIdent False
+                        -- Not a macro: copy verbatim.
+                        Nothing -> ident : scanLine afterIdent False
+                -- Any other character: copy verbatim.
+                Just (c, rest) ->
+                    BC.singleton c : scanLine rest False
+
+        -- Scan past a string literal body (after the opening ").
+        -- Returns (body-including-closing-quote, rest-after-close) as ByteStrings.
+        scanStringLit :: ByteString -> (ByteString, ByteString)
+        scanStringLit s = go s []
+          where
+            go bs acc = case BC.uncons bs of
+                Nothing              -> (BC.pack (reverse acc), BS.empty)
+                Just ('\\', rest) ->
+                    case BC.uncons rest of
+                        Nothing   -> (BC.pack (reverse acc), BS.empty)
+                        Just (e, rest') -> go rest' (e : '\\' : acc)
+                Just ('"', rest)  -> (BC.pack (reverse ('"' : acc)), rest)
+                Just (c, rest)    -> go rest (c : acc)
+
+        -- Scan past a char literal body (after the opening ').
+        scanCharLit :: ByteString -> (ByteString, ByteString)
+        scanCharLit s = go s []
+          where
+            go bs acc = case BC.uncons bs of
+                Nothing              -> (BC.pack (reverse acc), BS.empty)
+                Just ('\\', rest) ->
+                    case BC.uncons rest of
+                        Nothing   -> (BC.pack (reverse acc), BS.empty)
+                        Just (e, rest') -> go rest' (e : '\\' : acc)
+                Just ('\'', rest) -> (BC.pack (reverse ('\'' : acc)), rest)
+                Just (c, rest)    -> go rest (c : acc)
+
+    -- Consume a function-like macro argument list @(arg1, arg2, ...)@ and
+    -- return (args, rest-after-close-paren).  Returns Nothing if the next
+    -- non-whitespace character is not @(@.
+    consumeArgs :: ByteString -> Maybe ([ByteString], ByteString)
+    consumeArgs s0 =
+        let s = BC.dropWhile isHSpace s0
+        in case BC.uncons s of
+            Just ('(', rest) ->
+                let (argsStr, after) = BC.break (== ')') rest
+                    args = splitComma argsStr
+                in case BC.uncons after of
+                    Just (')', rest') -> Just (args, rest')
+                    _                 -> Just (args, after)
+            _ -> Nothing
+
+    -- Substitute parameter names in a function-like macro body.
+    substituteParams :: Map ByteString ByteString -> ByteString -> ByteString
+    substituteParams paramMap body
+        | Map.null paramMap = body
+        | otherwise = BC.concat (go body)
+      where
+        go bs
+            | BS.null bs = []
+            | otherwise = case BC.uncons bs of
+                Just (c, rest) | isIdentStart c ->
+                    let (ident, rest') = BC.span isIdentChar bs
+                    in case Map.lookup ident paramMap of
+                        Just v  -> v : go rest'
+                        Nothing -> ident : go rest'
+                Just (c, rest) -> BC.singleton c : go rest
+                Nothing -> []
 
 --------------------------------------------------------------------------------
 -- Utilities
