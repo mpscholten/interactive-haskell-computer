@@ -550,7 +550,12 @@ nextToken s c0 =
         "module"    -> TkModule
         "import"    -> TkImport
         "qualified" -> TkQualified
-        "as"        -> TkAs
+        -- 'as' is a soft keyword: it is only meaningful in `import Foo as Bar`
+        -- context. Everywhere else (e.g. `let as = 42` in lens) it is a
+        -- plain identifier. We emit TkIdent so expression/binding parsers
+        -- never trip over it. The module-header parser explicitly checks for
+        -- the *string* "as" when it needs the keyword semantics.
+        "as"        -> TkIdent "as"
         "hiding"    -> TkHiding
         "newtype"   -> TkNewtype
         "type"      -> TkTypeKw

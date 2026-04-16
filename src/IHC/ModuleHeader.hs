@@ -285,7 +285,9 @@ parseOneImport src cur0 = do
             -- Optional: as Alias
             let (t2, cur3) = nextSigTok src cur2
             (alias, cur4) <- case tkKind t2 of
-                TkAs -> do
+                -- 'as' is a soft keyword (emitted as TkIdent "as" by the lexer);
+                -- match it by string value here in the import-header context.
+                TkIdent "as" -> do
                     (mAlias, curA) <- parseDottedName src cur3
                     pure (mAlias, curA)
                 _ -> pure (Nothing, cur2)
