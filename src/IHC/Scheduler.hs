@@ -39,13 +39,15 @@ module IHC.Scheduler
     ) where
 
 import Control.Exception (throwIO, Exception, catch)
+import qualified System.IO
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
-import System.Directory (doesFileExist)
+import System.Directory (doesFileExist, getHomeDirectory)
 import System.FilePath ((</>))
 
 import IHC.AST
@@ -385,7 +387,7 @@ buildImportRewrites registry lm = do
             Just (Loaded tm) -> do
                 -- Gather (name, qualifiedKey) pairs from the module's own
                 -- bodies plus any `module Foo` re-exports.
-                directPairs <- directRewritePairs tm
+                directPairs <- directRewritePairs reg tm
                 reexportPairs <- concat <$>
                     mapM (rewritePairsFromReexport reg)
                          (moduleReexports (lmHeader tm))
@@ -404,20 +406,66 @@ buildImportRewrites registry lm = do
                 pure (bare ++ qual)
             _ -> pure []
 
-    -- | @(bare-name, fully-qualified-key)@ pairs for names defined
-    -- directly in a module.
-    directRewritePairs tm = do
+    -- | @(bare-name, fully-qualified-key)@ pairs for names exported by a
+    -- module — including names re-exported from its own imports via
+    -- @ExportName@ entries (the named re-export chain).
+    directRewritePairs reg tm = do
         bodiesMap <- readIORef (lmBodies tm)
-        let prefix  = lmName tm <> BC.pack "."
+        let prefix   = lmName tm <> BC.pack "."
             allNames = Map.keys bodiesMap
-            exported = filter (exportsNameDirect (lmHeader tm)) allNames
-        pure [(n, prefix <> n) | n <- exported]
+            -- Names defined directly in tm and exported.
+            localExported = filter (exportsNameDirect (lmHeader tm)) allNames
+            localPairs = [(n, prefix <> n) | n <- localExported]
+        -- For ExportName entries not covered by local bodies, follow
+        -- tm's own unqualified imports (named re-export chain).
+        namedPairs <- namedReexportPairs reg tm bodiesMap
+        pure (localPairs ++ namedPairs)
+
+    -- | Collect (name, qualified-key) pairs for ExportName entries that
+    -- are not locally defined in @tm@ but are re-exported via @tm@'s
+    -- own unqualified imports.
+    namedReexportPairs reg tm bodiesMap = do
+        case mhExports (lmHeader tm) of
+            ExportAll    -> pure []   -- ExportAll: no explicit name list to iterate
+            ExportList xs -> do
+                let exportedNames = [ n | ExportName n <- xs ]
+                    -- Names that appear in the export list but are NOT locally defined
+                    -- must come from an import (named re-export chain).
+                    missingNames  = filter (\n -> not (Map.member n bodiesMap)) exportedNames
+                concat <$> mapM (findNameInImports reg tm) missingNames
+
+    -- | Find which of @tm@'s unqualified imports provides @n@, returning
+    -- a @(n, qualified-key)@ pair if found.
+    findNameInImports reg tm n = do
+        let viaImports = filter (not . impQualified)
+                           (mhImports (lmHeader tm))
+            viable = filter (\i ->
+                impModule i /= BC.pack "Prelude" &&
+                specAllows (impSpec i) n) viaImports
+        go viable
+      where
+        go []         = pure []
+        go (imp:rest) =
+            case Map.lookup (impModule imp) reg of
+                Just (Loaded srcLm) -> do
+                    srcBodies <- readIORef (lmBodies srcLm)
+                    if Map.member n srcBodies
+                        then do
+                            let srcPrefix = lmName srcLm <> BC.pack "."
+                            pure [(n, srcPrefix <> n)]
+                        else do
+                            -- Try one level deeper (srcLm might also re-export).
+                            deeper <- findNameInImports reg srcLm n
+                            case deeper of
+                                [] -> go rest
+                                ps -> pure ps
+                _ -> go rest
 
     -- | @(bare-name, fully-qualified-key)@ pairs from a re-exported
     -- module (@module Foo@ in the export list).
     rewritePairsFromReexport reg modName =
         case Map.lookup modName reg of
-            Just (Loaded reLm) -> directRewritePairs reLm
+            Just (Loaded reLm) -> directRewritePairs reg reLm
             _                  -> pure []
 
 -- | Rewrite every free 'EVar' in @expr@ whose name appears in the
@@ -535,17 +583,60 @@ buildAliases registry _searchPath entry slots qualPairs = do
                     pure (bareAliases ++ qualAliases)
                 _ -> pure []
 
-    -- | Return @(bare-name, Thunk)@ pairs for names defined and exported
-    -- directly by a loaded module (not via re-exports).
+    -- | Return @(bare-name, Thunk)@ pairs for names exported by a loaded
+    -- module — including names re-exported via ExportName from its imports.
     namesFromModule thunkByKey tm = do
+        reg <- readIORef registry
         bodiesMap <- readIORef (lmBodies tm)
-        let prefix  = lmName tm <> BC.pack "."
-            allN    = Map.keys bodiesMap
-            exported = filter (exportsNameDirect (lmHeader tm)) allN
-        pure [ (n, t)
-             | n <- exported
-             , Just t <- [Map.lookup (prefix <> n) thunkByKey]
-             ]
+        let prefix   = lmName tm <> BC.pack "."
+            allN     = Map.keys bodiesMap
+            -- Names defined directly in tm and exported.
+            localExported = filter (exportsNameDirect (lmHeader tm)) allN
+            localPairs = [ (n, t)
+                         | n <- localExported
+                         , Just t <- [Map.lookup (prefix <> n) thunkByKey]
+                         ]
+        -- Also follow ExportName re-exports via tm's imports.
+        namedPairs <- namesFromNamedReexports reg thunkByKey tm bodiesMap
+        pure (localPairs ++ namedPairs)
+
+    -- | Collect (name, Thunk) pairs for ExportName entries that are not
+    -- locally defined in @tm@ but are re-exported from @tm@'s imports.
+    namesFromNamedReexports reg thunkByKey tm bodiesMap =
+        case mhExports (lmHeader tm) of
+            ExportAll    -> pure []
+            ExportList xs -> do
+                let exportedNames = [ n | ExportName n <- xs ]
+                    missingNames  = filter (\n -> not (Map.member n bodiesMap)) exportedNames
+                pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm) missingNames
+                pure pairs
+
+    -- | Find the Thunk for @n@ by walking @tm@'s unqualified imports.
+    findThunkInImports reg thunkByKey tm n = do
+        let viaImports = filter (not . impQualified)
+                           (mhImports (lmHeader tm))
+            viable = filter (\i ->
+                impModule i /= BC.pack "Prelude" &&
+                specAllows (impSpec i) n) viaImports
+        go viable
+      where
+        go [] = pure []
+        go (imp:rest) =
+            case Map.lookup (impModule imp) reg of
+                Just (Loaded srcLm) -> do
+                    srcBodies <- readIORef (lmBodies srcLm)
+                    if Map.member n srcBodies
+                        then do
+                            let srcPrefix = lmName srcLm <> BC.pack "."
+                            case Map.lookup (srcPrefix <> n) thunkByKey of
+                                Just t  -> pure [(n, t)]
+                                Nothing -> go rest
+                        else do
+                            deeper <- findThunkInImports reg thunkByKey srcLm n
+                            case deeper of
+                                [] -> go rest
+                                ps -> pure ps
+                _ -> go rest
 
     -- | Collect exported name-thunk pairs from a re-exported module
     -- (a @module Foo@ entry in an export list).
@@ -707,6 +798,23 @@ locateModule searchPath name = go searchPath
         exists <- doesFileExist p
         if exists then pure p else tryCands d cs rest
 
+-- | Return 'True' if @name@ can be found in the search path AND its file
+-- is NOT under the global package cache (@~\/.cache\/ihc\/sources\/@).
+-- Used by 'followNamedReexport' to avoid eagerly loading large library
+-- dependency subtrees (e.g. GHC.Base from base-4.19) during re-export
+-- chain following — those should only be followed if already in the
+-- registry.
+isLocalModule :: [FilePath] -> ModuleName -> IO Bool
+isLocalModule searchPath name = do
+    home <- getHomeDirectory
+    let cachePrefix = home </> ".cache" </> "ihc" </> "sources"
+    -- locateModule throws ModuleNotFound if absent; treat that as non-local.
+    mPath <- (Just <$> locateModule searchPath name)
+                `catch` (\(_ :: ModuleNotFound) -> pure Nothing)
+    case mPath of
+        Nothing -> pure False
+        Just p  -> pure (not (cachePrefix `isPrefixOf` p))
+
 --------------------------------------------------------------------------------
 -- Demand-driven discovery
 --------------------------------------------------------------------------------
@@ -772,7 +880,14 @@ resolveQualified
     -> IO (Maybe LoadedModule)
 resolveQualified registry searchPath lm qual = do
     let imports = mhImports (lmHeader lm)
-    case filter (importMatchesQual qual) imports of
+    let matched = filter (importMatchesQual qual) imports
+    System.IO.hPutStrLn System.IO.stderr $
+        "[resolveQualified] mod=" <> BC.unpack (lmName lm)
+        <> " qual=" <> BC.unpack qual
+        <> " imports=" <> show (length imports)
+        <> " matched=" <> show (length matched)
+        <> " allAliases=" <> show [(BC.unpack (impModule i), fmap BC.unpack (impAlias i)) | i <- imports]
+    case matched of
         (imp:_) -> Just <$> loadModule registry searchPath (impModule imp)
         []      -> pure Nothing
 
@@ -818,9 +933,95 @@ resolveImport registry searchPath lm name = do
                         else tryImports rest
                 Nothing ->
                     -- The name isn't defined locally in targetLm.
-                    -- Check whether targetLm re-exports it via
-                    -- `module Foo` entries in its export list.
-                    followModuleReexports targetLm rest
+                    -- Two ways it might still be exported:
+                    --
+                    -- 1. `module Foo` re-export entry — follow those.
+                    -- 2. `ExportName n` re-export via unqualified import:
+                    --    e.g. `Data.Map.Strict` lists `fromList` in its
+                    --    export list but the definition lives in
+                    --    `Data.Map.Internal`.  Follow all unqualified
+                    --    imports of @targetLm@ to find the definition.
+                    if exportsName (lmHeader targetLm) name
+                        then followNamedReexport targetLm rest
+                        else followModuleReexports targetLm rest
+
+    -- | @targetLm@ exports @name@ by name (ExportName entry) but doesn't
+    -- define it locally.  Walk @targetLm@'s own unqualified imports and
+    -- recurse into each until we find the definition.
+    --
+    -- @depth@ limits how many import-levels we traverse.  We use depth 2
+    -- so that two-hop re-export chains (A → B → C where C defines the
+    -- name) are found, but we don't blow up loading entire base dependency
+    -- trees for name searches in large library modules.
+    followNamedReexport via rest = followNamedReexportD 1 via rest
+
+    followNamedReexportD depth via rest
+        | depth <= 0 = tryImports rest
+        | otherwise = do
+            -- First try module-form re-exports (they may also apply).
+            let reexportedMods = moduleReexports (lmHeader via)
+            r <- tryReexports reexportedMods rest
+            case r of
+                Just () -> pure (Just ())
+                Nothing -> do
+                    -- Follow the via module's own unqualified imports.
+                    let viaImports = filter (not . impQualified)
+                                       (mhImports (lmHeader via))
+                        filteredImports = filter (\i ->
+                            impModule i /= BC.pack "Prelude" &&
+                            specAllows (impSpec i) name) viaImports
+                    tryViaImports filteredImports depth rest
+
+    tryViaImports [] _depth rest = tryImports rest
+    tryViaImports (imp:moreImps) depth rest = do
+        -- Only load the via-module if it is already in the registry.
+        -- This prevents eagerly loading large library dependency subgraphs
+        -- (e.g., GHC.Base) just to search for a re-exported name.
+        -- If the module is not yet loaded, we fall through to the next import.
+        reg <- readIORef registry
+        case Map.lookup (impModule imp) reg of
+            Just (Loaded srcLm) -> do
+                mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
+                case mLhs of
+                    Just _ ->
+                        if exportsName (lmHeader srcLm) name
+                            then do
+                                discoverInModule registry searchPath srcLm name
+                                pure (Just ())
+                            else tryViaImports moreImps depth rest
+                    Nothing ->
+                        -- srcLm might itself re-export via unqualified imports
+                        -- (go one level deeper, decrementing the depth cap).
+                        if exportsName (lmHeader srcLm) name
+                            then followNamedReexportD (depth - 1) srcLm rest >>= \case
+                                    Just () -> pure (Just ())
+                                    Nothing -> tryViaImports moreImps depth rest
+                            else tryViaImports moreImps depth rest
+            _ ->
+                -- Module not yet loaded. Only attempt to load it when the
+                -- file resolves to a LOCAL path (not under ~/.cache/ihc/sources/).
+                -- Library modules (GHC.Base, GHC.IO, etc.) are huge; loading
+                -- them eagerly to search for one re-exported name causes OOM.
+                -- Local modules (e.g. Inner.hs in a test fixture) are small
+                -- and safe to load once.
+                do
+                    local <- isLocalModule searchPath (impModule imp)
+                    if not local
+                        then tryViaImports moreImps depth rest
+                        else do
+                            srcLm <- loadModule registry searchPath (impModule imp)
+                            mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
+                            case mLhs of
+                                Just _ ->
+                                    if exportsName (lmHeader srcLm) name
+                                        then do
+                                            discoverInModule registry searchPath srcLm name
+                                            pure (Just ())
+                                        else tryViaImports moreImps depth rest
+                                Nothing ->
+                                    -- Newly loaded module doesn't define the name
+                                    -- either. Don't recurse further.
+                                    tryViaImports moreImps depth rest
 
     -- | Chase every `module Foo` entry in the export list of @via@ to
     -- see whether any of them provides @name@.  We recurse through

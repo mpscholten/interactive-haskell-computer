@@ -413,6 +413,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hi\n"
 
+    it "module: ExportName re-export via unqualified import — Alias re-exports Inner.fn" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/reexport_via_unqualified_import/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hi\n"
+
     it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
         home <- getHomeDirectory
         let mtlDir = home <> "/.cache/ihc/sources/mtl-2.3.2"
