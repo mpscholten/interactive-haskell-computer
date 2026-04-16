@@ -28,6 +28,7 @@ import IHC.CabalProject
     , parseFreezeFile
     , resolve
     , cachedPackageSearchPath
+    , cabalTarballSearchPath
     )
 import IHC.PackageStore (buildSearchEnvWithRoot)
 
@@ -174,3 +175,42 @@ spec = describe "Phase 2.7 — Cabal project loader" do
                     let nixHspecPaths = filter (\p -> nixDir `isPrefixOf` p
                                                       && "hspec" `isInfixOf` p) paths
                     nixHspecPaths `shouldNotBe` []
+
+    --------------------------------------------------------------------
+    -- Cabal tarball cache (~/.cabal/packages/hackage.haskell.org/)
+    --------------------------------------------------------------------
+    describe "cabalTarballSearchPath" do
+        it "returns an empty list (or valid paths) without crashing" $ do
+            -- The function must not throw even when no extracted dirs
+            -- exist.  On machines where `cabal get` has been run for
+            -- some package, paths will be non-empty; on CI the cache is
+            -- cold and the result is legitimately [].
+            paths <- cabalTarballSearchPath
+            -- All returned paths must be absolute (rooted at home).
+            mapM_ (\p -> p `shouldSatisfy` ("/" `isPrefixOf`)) paths
+
+        it "cabalTarballSearchPath paths are rooted inside ~/.cabal" $ do
+            -- Every path that IS returned must live under
+            -- ~/.cabal/packages/hackage.haskell.org/ because that is
+            -- the only directory we scan.  We derive the expected root
+            -- dynamically to avoid hardcoding the home directory.
+            home <- lookupEnv "HOME"
+            case home of
+                Nothing -> pendingWith "HOME not set"
+                Just h -> do
+                    let cabalRoot = h </> ".cabal" </> "packages" </> "hackage.haskell.org"
+                    cabalRootExists <- doesDirectoryExist cabalRoot
+                    paths <- cabalTarballSearchPath
+                    -- Paths may belong to the package root itself or to a
+                    -- sub-directory declared via hs-source-dirs, so we
+                    -- only check that each path starts under cabalRoot.
+                    if not cabalRootExists
+                        then paths `shouldBe` []
+                        else mapM_ (\p -> p `shouldSatisfy` (cabalRoot `isPrefixOf`)) paths
+
+        it "cachedPackageSearchPath includes cabalTarballSearchPath results" $ do
+            -- Verify the two are consistent: everything from the tarball
+            -- path must also appear in the combined search path.
+            tarballPaths <- cabalTarballSearchPath
+            allPaths     <- cachedPackageSearchPath
+            mapM_ (\p -> allPaths `shouldContain` [p]) tarballPaths

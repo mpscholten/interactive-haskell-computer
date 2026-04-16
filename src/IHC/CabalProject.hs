@@ -31,6 +31,7 @@ module IHC.CabalProject
     , findLocalCabalFile
       -- * Cache-wide search path
     , cachedPackageSearchPath
+    , cabalTarballSearchPath
     ) where
 
 import Control.Exception (Exception, throwIO, try, SomeException)
@@ -336,15 +337,20 @@ emptyBuildInfoStub = libBuildInfo emptyLib
 -- checking whether a @src\/@ subdirectory exists (common convention);
 -- otherwise use the package root itself.
 --
--- The user-managed @~\/.cache\/ihc\/sources\/@ entries come first so
--- that locally checked-out overrides shadow the nix bundle.
+-- Priority order (highest first):
 --
--- Returns an empty list if neither directory exists.
+--   1. Nix-pinned source tree (@IHC_NIX_SOURCE_DIR@) — reproducible.
+--   2. User-managed @~\/.cache\/ihc\/sources\/@ — @cabal get@ overrides.
+--   3. Cabal tarball cache @~\/.cabal\/packages\/hackage.haskell.org\/@ —
+--      already-extracted tarballs, broadest pool.
+--
+-- Returns an empty list if none of the directories exist.
 cachedPackageSearchPath :: IO [FilePath]
 cachedPackageSearchPath = do
-    userDirs <- enumerateSourceDir =<< userCacheDir
-    nixDirs  <- nixSourceDirs
-    pure (userDirs ++ nixDirs)
+    nixDirs     <- nixSourceDirs
+    userDirs    <- enumerateSourceDir =<< userCacheDir
+    cabalDirs   <- cabalTarballSearchPath
+    pure (nixDirs ++ userDirs ++ cabalDirs)
   where
     userCacheDir :: IO FilePath
     userCacheDir = do
@@ -387,6 +393,77 @@ cachedPackageSearchPath = do
     -- When we can't parse a .cabal, try the conventional src/ dir first,
     -- then fall back to the package root.
     fallback pkgDir = do
+        let srcDir = pkgDir </> "src"
+        hasSrc <- doesDirectoryExist srcDir
+        pure [if hasSrc then srcDir else pkgDir]
+
+-- | Enumerate already-extracted source trees from Cabal's local tarball
+-- cache at @~\/.cabal\/packages\/hackage.haskell.org\/@.
+--
+-- Cabal stores downloaded tarballs as:
+--
+-- @
+-- ~\/.cabal\/packages\/hackage.haskell.org\/\<pkg\>\/\<ver\>\/\<pkg\>-\<ver\>.tar.gz
+-- @
+--
+-- When a user runs @cabal get \<pkg\>@ (or cabal extracts it for inspection),
+-- the unpacked tree appears as a sibling directory:
+--
+-- @
+-- ~\/.cabal\/packages\/hackage.haskell.org\/\<pkg\>\/\<ver\>\/\<pkg\>-\<ver\>\/
+-- @
+--
+-- This function enumerates those already-extracted directories only —
+-- it never extracts tarballs itself. That keeps startup overhead
+-- proportional to the number of @cabal get@ invocations the user has
+-- actually done, not the total number of packages in the store.
+--
+-- Returns an empty list if the cabal package store does not exist or
+-- contains no extracted source trees.
+cabalTarballSearchPath :: IO [FilePath]
+cabalTarballSearchPath = do
+    home <- getHomeDirectory
+    let cabalRoot = home </> ".cabal" </> "packages" </> "hackage.haskell.org"
+    exists <- doesDirectoryExist cabalRoot
+    if not exists
+        then pure []
+        else do
+            pkgDirs <- listDirectory cabalRoot
+            fmap concat $ mapM (dirsForPkg cabalRoot) pkgDirs
+  where
+    dirsForPkg cabalRoot pkg = do
+        let pkgRoot = cabalRoot </> pkg
+        isDir <- doesDirectoryExist pkgRoot
+        if not isDir
+            then pure []
+            else do
+                verDirs <- listDirectory pkgRoot
+                fmap concat $ mapM (dirsForVer pkgRoot pkg) verDirs
+
+    dirsForVer pkgRoot pkg ver = do
+        let verRoot   = pkgRoot </> ver
+            extracted = verRoot </> (pkg <> "-" <> ver)
+        hasDir <- doesDirectoryExist extracted
+        if not hasDir
+            then pure []
+            else resolveHsSourceDirs extracted
+
+    -- | Resolve the actual @hs-source-dirs@ for a package root by
+    -- parsing its @.cabal@ file. Falls back to a @src\/@ check and then
+    -- the package root itself, matching the behaviour of 'dirsForEntry'
+    -- in 'cachedPackageSearchPath'.
+    resolveHsSourceDirs :: FilePath -> IO [FilePath]
+    resolveHsSourceDirs pkgDir = do
+        mCabal <- findLocalCabalFile pkgDir
+        case mCabal of
+            Just cabalPath -> do
+                mInfo <- parseCabalFile pkgDir cabalPath
+                case mInfo of
+                    Just info -> pure (pkgSourceDirs info)
+                    Nothing   -> fallbackDir pkgDir
+            Nothing -> fallbackDir pkgDir
+
+    fallbackDir pkgDir = do
         let srcDir = pkgDir </> "src"
         hasSrc <- doesDirectoryExist srcDir
         pure [if hasSrc then srcDir else pkgDir]
