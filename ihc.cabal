@@ -94,7 +94,7 @@ executable ihc
       , filepath
       , ihc
       , text
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
 
     -- Post-build codesigning must be handled outside cabal (see Makefile /
     -- scripts/codesign-jit.sh). cabal does not have a portable post-build hook.
@@ -119,4 +119,4 @@ test-suite ihc-test
       , filepath
       , hspec            >= 2.10
       , process          >= 1.6
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
