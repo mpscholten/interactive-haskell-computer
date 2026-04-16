@@ -1491,7 +1491,8 @@ parseAtom ctx cur0 = do
         TkChar c   -> pure (ELit (LChar c), cur1)
         TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference
-        TkImplicitRef n -> pure (EImplicitRef n, cur1)
+        -- Also support postfix dot-chain: ?ctx.field -> field ?ctx
+        TkImplicitRef n -> applyRecordDots ctx tok (EImplicitRef n) cur1
         TkIdent n
             | n == "_" -> parseErr ctx "wildcard `_` in expression position" tok
             | otherwise -> applyRecordDots ctx tok (EVar n) cur1
