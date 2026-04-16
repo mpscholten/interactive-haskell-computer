@@ -78,7 +78,10 @@ import System.IO
     )
 
 import IHC.AST  (Name)
-import IHC.Classes (ClassRegistry, lookupInstance, typeTagOf)
+import IHC.Classes
+    ( ClassRegistry, lookupInstance, typeTagOf
+    , mkTypeRep, typeRepEq
+    )
 import IHC.Eval (apply, force)
 import IHC.Scan (DataRegistry, FieldRegistry)
 import IHC.TH (thBuiltinPairs)
@@ -144,9 +147,22 @@ builtinEnv reg = do
     exitSuccT <- newWHNFThunk (VCon "ExitSuccess" [])
     exitFailT <- newWHNFThunk (VFun $ \n -> pure (VCon "ExitFailure" [n]))
     let exitCtors = [("ExitSuccess", exitSuccT), ("ExitFailure", exitFailT)]
+    -- Either constructors: always present regardless of whether Data.Either
+    -- is source-loaded. Previously provided implicitly via GHC.* stubs; now
+    -- explicitly registered so they survive whitelist minimisation (GAP-3).
+    leftT  <- newWHNFThunk (VFun $ \x -> pure (VCon "Left"  [x]))
+    rightT <- newWHNFThunk (VFun $ \x -> pure (VCon "Right" [x]))
+    let eitherCtors = [("Left", leftT), ("Right", rightT)]
+    -- Phase 2.9.5: Proxy and Dynamic constructors.
+    proxyT    <- newWHNFThunk (VCon "Proxy" [])
+    dynCtorV  <- dynamicCtorB
+    dynCtorT  <- newWHNFThunk dynCtorV
+    let phase295Ctors = [("Proxy", proxyT), ("Dynamic", dynCtorT)]
+    -- Phase 2.9.5: Built-in Typeable dictionaries for primitive types.
+    typeableInsts <- buildBuiltinTypeableInsts
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors
-                         ++ unitCtor)
+                         ++ unitCtor ++ eitherCtors ++ phase295Ctors ++ typeableInsts)
                         emptyEnv)
   where
     consV = VFun $ \h -> pure $ VFun $ \t -> pure (VCon ":" [h, t])
@@ -407,9 +423,7 @@ builtins reg =
     , ("onException",     onExceptionB)
     , ("throwTo",         throwToB)
     , ("displayException", displayExceptionB)
-    -- Phase 2.11: TH Lift builtins. Registered under short and
-    -- fully-qualified names so $(TH.lift x), $(lift x), and
-    -- $(Language.Haskell.TH.lift x) all resolve.
+    -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
 --------------------------------------------------------------------------------
@@ -2594,3 +2608,164 @@ displayExceptionB = pure $ VFun $ \eT -> do
                 VCon n _  -> BC.unpack n
                 _         -> showValForDebug ev
     stringToListValIO s
+
+--------------------------------------------------------------------------------
+-- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic builtins
+--------------------------------------------------------------------------------
+-- Runtime representation:
+--   TypeRep  = VCon "TypeRep"  [tyConThunk, argsListThunk]
+--   TyCon    = VCon "TyCon"    [nameCharListThunk]
+--   Dynamic  = VCon "Dynamic"  [typeRepThunk, valThunk]
+--   Typeable dict = VCon "Dict_Typeable" [typeRepThunk]
+
+typeRepB :: IO Val
+typeRepB = pure $ VFun $ \dictT -> pure $ VFun $ \_proxyT -> do
+    dictV <- force dictT
+    extractTypeRep dictV
+
+typeOfB :: IO Val
+typeOfB = pure $ VFun $ \dictT -> pure $ VFun $ \_valT -> do
+    dictV <- force dictT
+    extractTypeRep dictV
+
+castB :: IO Val
+castB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> pure $ VFun $ \valT -> do
+    dictAV <- force dictAT
+    dictBV <- force dictBT
+    trA    <- extractTypeRep dictAV
+    trB    <- extractTypeRep dictBV
+    eq     <- typeRepEq trA trB
+    if eq then pure (VCon "Just" [valT])
+          else pure (VCon "Nothing" [])
+
+eqTB :: IO Val
+eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
+    dictAV <- force dictAT
+    dictBV <- force dictBT
+    trA    <- extractTypeRep dictAV
+    trB    <- extractTypeRep dictBV
+    eq     <- typeRepEq trA trB
+    if eq
+        then do { reflT <- newWHNFThunk (VCon "Refl" []); pure (VCon "Just" [reflT]) }
+        else pure (VCon "Nothing" [])
+
+toDynB :: IO Val
+toDynB = pure $ VFun $ \dictT -> pure $ VFun $ \valT -> do
+    dictV <- force dictT
+    tr    <- extractTypeRep dictV
+    trT   <- newWHNFThunk tr
+    pure (VCon "Dynamic" [trT, valT])
+
+fromDynamicB :: IO Val
+fromDynamicB = pure $ VFun $ \dictBT -> pure $ VFun $ \dynT -> do
+    dictBV <- force dictBT
+    dynV   <- force dynT
+    trB    <- extractTypeRep dictBV
+    case dynV of
+        VCon "Dynamic" [trAT, storedT] -> do
+            trA <- force trAT
+            eq  <- typeRepEq trA trB
+            pure (if eq then VCon "Just" [storedT] else VCon "Nothing" [])
+        _ -> pure (VCon "Nothing" [])
+
+fromDynB :: IO Val
+fromDynB = pure $ VFun $ \dictT -> pure $ VFun $ \dynT -> pure $ VFun $ \defT -> do
+    dictV <- force dictT
+    dynV  <- force dynT
+    trB   <- extractTypeRep dictV
+    case dynV of
+        VCon "Dynamic" [trAT, storedT] -> do
+            trA <- force trAT
+            eq  <- typeRepEq trA trB
+            if eq then force storedT else force defT
+        _ -> force defT
+
+dynTypeRepB :: IO Val
+dynTypeRepB = pure $ VFun $ \dynT -> do
+    dynV <- force dynT
+    case dynV of
+        VCon "Dynamic" [trT, _] -> force trT
+        _ -> mkTypeRep "Unknown"
+
+mkTyCon3B :: IO Val
+mkTyCon3B = pure $ VFun $ \_ -> pure $ VFun $ \_ -> pure $ VFun $ \nameT -> do
+    nameV    <- force nameT
+    nameStrT <- newWHNFThunk nameV
+    pure (VCon "TyCon" [nameStrT])
+
+mkTyConAppB :: IO Val
+mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
+    tyConV     <- force tyConT
+    argsV      <- force argsT
+    tyConThunk <- newWHNFThunk tyConV
+    argsThunk  <- newWHNFThunk argsV
+    pure (VCon "TypeRep" [tyConThunk, argsThunk])
+
+tyConNameB :: IO Val
+tyConNameB = pure $ VFun $ \tyConT -> do
+    tyConV <- force tyConT
+    case tyConV of
+        VCon "TyCon" [nameT] -> force nameT
+        _ -> pure (VCon "[]" [])
+
+typeRepTyConB :: IO Val
+typeRepTyConB = pure $ VFun $ \trT -> do
+    trV <- force trT
+    case trV of
+        VCon "TypeRep" [tcT, _] -> force tcT
+        _ -> pure (VCon "TyCon" [])
+
+typeRepArgsB :: IO Val
+typeRepArgsB = pure $ VFun $ \trT -> do
+    trV <- force trT
+    case trV of
+        VCon "TypeRep" [_, argsT] -> force argsT
+        _ -> pure (VCon "[]" [])
+
+-- | Extract a TypeRep from a Typeable dict or raw TypeRep value.
+extractTypeRep :: Val -> IO Val
+extractTypeRep (VCon "Dict_Typeable" [trT]) = force trT
+extractTypeRep v@(VCon "TypeRep" _)         = pure v
+extractTypeRep _                            = mkTypeRep "Unknown"
+
+-- | Dynamic constructor as a curried function value.
+dynamicCtorB :: IO Val
+dynamicCtorB = pure $ VFun $ \trT -> pure $ VFun $ \valT -> do
+    trV    <- force trT
+    trThunk <- newWHNFThunk trV
+    pure (VCon "Dynamic" [trThunk, valT])
+
+-- | Build built-in Typeable instance dictionaries for well-known types.
+buildBuiltinTypeableInsts :: IO [(Name, Thunk)]
+buildBuiltinTypeableInsts = mapM mkDict prims
+  where
+    prims :: [(Name, Name)]
+    prims =
+        [ ("Int",     "Int")
+        , ("Int8",    "Int8")
+        , ("Int16",   "Int16")
+        , ("Int32",   "Int32")
+        , ("Int64",   "Int64")
+        , ("Word",    "Word")
+        , ("Word8",   "Word8")
+        , ("Word16",  "Word16")
+        , ("Word32",  "Word32")
+        , ("Word64",  "Word64")
+        , ("Char",    "Char")
+        , ("Bool",    "Bool")
+        , ("Double",  "Double")
+        , ("Float",   "Float")
+        , ("Integer", "Integer")
+        , ("()",      "()")
+        , ("[]",      "[]")
+        , ("Maybe",   "Maybe")
+        , ("Either",  "Either")
+        , ("(,)",     "(,)")
+        , ("IO",      "IO")
+        ]
+    mkDict (tag, tyName) = do
+        tr    <- mkTypeRep tyName
+        trT   <- newWHNFThunk tr
+        dictT <- newWHNFThunk (VCon "Dict_Typeable" [trT])
+        pure ("typeableDict_" <> tag, dictT)
+
