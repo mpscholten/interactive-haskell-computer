@@ -18,6 +18,7 @@ module IHC.Eval
     ( eval
     , force
     , apply
+    , runIOVal
     ) where
 
 import Control.Exception (throwIO)

@@ -312,6 +312,35 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "[2,3,4]"
 
+    -- ghci-style top-level session bindings:  `a <- ioAction`
+    it "session bind: a <- pure 42 then print a prints 42" do
+        (code, out, _err) <- runRepl
+            ( "a <- pure 42\n"
+           <> "print a\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "42"
+
+    it "session bind: a <- readFile FILE then putStr a prints file contents" do
+        -- Read a known-stable fixture and echo its contents.
+        (code, out, _err) <- runRepl
+            ( "a <- readFile \"test/Fixtures/hello.hs\"\n"
+           <> "putStr a\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Hello, world!"
+
+    it "session bind error: a <- readFile MISSING does not leave a bound" do
+        -- The IO action fails; we must print an error AND keep the REPL
+        -- alive AND leave `a` unbound (partial state is worse than none).
+        (code, out, _err) <- runRepl
+            ( "a <- readFile \"/nonexistent-ihc-test-path\"\n"
+           <> "a\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Error"
+        out `shouldContain` "unbound variable"
+
     it ":r after modify-on-disk reflects new binding" do
         tmpDir <- getTemporaryDirectory
         (tmpPath, h) <- openTempFile tmpDir "ihc_reload_test.hs"

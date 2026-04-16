@@ -32,7 +32,7 @@ import IHC.AST (Expr)
 import IHC.Builtins (showValWith, buildConEnv, buildFieldEnv)
 import IHC.Classes (ClassRegistry, registerInstance)
 import IHC.Driver (resolveSearchPathFor)
-import IHC.Eval (eval, force)
+import IHC.Eval (eval, force, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), ImportSpec(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
@@ -409,17 +409,91 @@ evalInstanceMethods src env methods =
 evalLine :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
 evalLine envRef classReg loadedRef importsRef input = do
     env <- liftIO (readIORef envRef)
-    case letBindingName input of
-        Just name -> do
-            r <- liftIO (tryEvalLetDecl loadedRef importsRef env name input)
+    case sessionBindName input of
+        Just (name, rhs) -> do
+            r <- liftIO (tryEvalSessionBind loadedRef importsRef env name rhs)
             case r of
-                Left  err     -> outputStrLn ("Error: " <> err)
-                Right newEnv  -> liftIO (writeIORef envRef newEnv)
-        Nothing -> do
-            r <- liftIO (tryEvalExpr loadedRef importsRef env classReg input)
-            case r of
-                Left  err -> outputStrLn ("Error: " <> err)
-                Right ()  -> pure ()
+                Left  err    -> outputStrLn ("Error: " <> err)
+                Right newEnv -> liftIO (writeIORef envRef newEnv)
+        Nothing -> case letBindingName input of
+            Just name -> do
+                r <- liftIO (tryEvalLetDecl loadedRef importsRef env name input)
+                case r of
+                    Left  err     -> outputStrLn ("Error: " <> err)
+                    Right newEnv  -> liftIO (writeIORef envRef newEnv)
+            Nothing -> do
+                r <- liftIO (tryEvalExpr loadedRef importsRef env classReg input)
+                case r of
+                    Left  err -> outputStrLn ("Error: " <> err)
+                    Right ()  -> pure ()
+
+-- | Detect a ghci-style top-level session bind: @name <- ioExpr@.
+-- Returns @Just (name, rhs)@ when the line matches, where @name@ is
+-- the (lowercase-starting) identifier on the left of the top-level
+-- @<-@ and @rhs@ is the expression text to the right.
+--
+-- We use the lexer to find the first @<-@ that appears at bracket
+-- depth 0 (outside any @()@, @[]@, or @{}@), which correctly skips
+-- over @<-@ tokens inside nested @do@-blocks, list comprehensions,
+-- etc. The LHS must be exactly one identifier token (we do not yet
+-- support destructuring patterns at the REPL).
+sessionBindName :: String -> Maybe (String, String)
+sessionBindName input =
+    case findTopLevelLArrow src of
+        Nothing -> Nothing
+        Just arrowStart ->
+            let lhsTxt = take arrowStart input
+                rhsTxt = drop (arrowStart + 2) input  -- skip "<-"
+            in case words lhsTxt of
+                [nm@(c:_)] | isLowerStart c -> Just (nm, rhsTxt)
+                _                           -> Nothing
+  where
+    src = mkSource "<repl:bind>" (BC.pack input)
+    isLowerStart c = (c >= 'a' && c <= 'z') || c == '_'
+
+-- | Walk the token stream of @src@ looking for a 'TkLArrow' at bracket
+-- depth 0. Returns its byte offset in the source, or 'Nothing' if no
+-- such token exists. Used by 'sessionBindName' to distinguish a
+-- top-level @pat <- rhs@ from an @<-@ nested inside @(...)@ or a @do@.
+findTopLevelLArrow :: Source -> Maybe Int
+findTopLevelLArrow src = go (0 :: Int) startCursor
+  where
+    go !depth cur =
+        let (tok, cur') = nextToken src cur
+        in case tkKind tok of
+            TkEof                     -> Nothing
+            TkLArrow | depth == 0     -> Just (tkStart tok)
+            TkLParen                  -> go (depth + 1) cur'
+            TkLBracket                -> go (depth + 1) cur'
+            TkLBrace                  -> go (depth + 1) cur'
+            TkRParen                  -> go (max 0 (depth - 1)) cur'
+            TkRBracket                -> go (max 0 (depth - 1)) cur'
+            TkRBrace                  -> go (max 0 (depth - 1)) cur'
+            _                         -> go depth cur'
+
+-- | Parse @rhs@ as an expression, evaluate it, force the result
+-- through 'runIOVal' (so IO actions are executed), and bind the
+-- resulting value under @name@ in the session env. If anything
+-- throws, the env is left unchanged and the exception is returned
+-- as a @Left@ — the caller prints it and the REPL keeps going.
+tryEvalSessionBind :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> String -> String -> IO (Either String Env)
+tryEvalSessionBind loadedRef importsRef env name rhs = do
+    let src = mkSource "<repl>" (BC.pack rhs)
+    r <- try (parseExprOnly src defaultFixityTable)
+            :: IO (Either SomeException Expr)
+    case r of
+        Left  err  -> pure (Left (show err))
+        Right expr -> do
+            env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
+            r2 <- try (do
+                        v  <- eval env' emptyIPMap expr
+                        runIOVal v)
+                    :: IO (Either SomeException Val)
+            case r2 of
+                Left  e   -> pure (Left (show e))
+                Right res -> do
+                    slot <- newWHNFThunk res
+                    pure (Right (Map.insert (BC.pack name) slot env'))
 
 -- | Extract the binding name from a REPL-level @let@ declaration.
 -- Returns 'Just name' when the input looks like @let f ...@ with an @=@
