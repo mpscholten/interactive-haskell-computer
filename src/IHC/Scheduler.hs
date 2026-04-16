@@ -1641,10 +1641,28 @@ resolveImport registry searchPath includeMap lm name = do
     -- define it locally.  Walk @targetLm@'s own unqualified imports and
     -- recurse into each until we find the definition.
     --
-    -- @depth@ limits how many import-levels we traverse.  We use depth 2
-    -- so that two-hop re-export chains (A → B → C where C defines the
-    -- name) are found, but we don't blow up loading entire base dependency
-    -- trees for name searches in large library modules.
+    -- This is the key piece of the named re-export chain: when a module
+    -- @M@ has @ExportName n@ in its export list but no local definition
+    -- of @n@, the name must come from one of @M@'s unqualified imports.
+    -- We walk those imports, recursively following further named
+    -- re-exports, until we find the module that actually defines @n@.
+    --
+    -- Real-world example (aeson):
+    --
+    -- @
+    --   module Data.Aeson.Encoding (encodingToLazyByteString, ...) where
+    --   import Data.Aeson.Encoding.Internal   -- defines encodingToLazyByteString
+    -- @
+    --
+    -- The export list uses @ExportName "encodingToLazyByteString"@, not a
+    -- @module Data.Aeson.Encoding.Internal@ re-export, so the
+    -- 'followModuleReexports' path alone would miss it.
+    --
+    -- @depth@ limits how many import-levels we traverse.  Depth 3 covers
+    -- three-hop chains (A → B → C → D where D defines the name), which
+    -- is enough for typical base/aeson/bytestring style gateway modules
+    -- without blowing up loading entire dependency subgraphs when a name
+    -- simply isn't there.
     followNamedReexport via rest = followNamedReexportD (3 :: Int) via rest
 
     followNamedReexportD depth via rest
