@@ -5,7 +5,7 @@ import Data.List (isInfixOf)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory)
 import System.IO
-import System.Directory (removeFile, getTemporaryDirectory)
+import System.Directory (removeFile, getTemporaryDirectory, doesDirectoryExist, getHomeDirectory)
 
 import Test.Hspec
 
@@ -409,6 +409,19 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hi\n"
 
+    it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
+        home <- getHomeDirectory
+        let mtlDir = home <> "/.cache/ihc/sources/mtl-2.3.2"
+        cached <- doesDirectoryExist mtlDir
+        if not cached
+            then pendingWith "mtl-2.3.2 not in ~/.cache/ihc/sources/ — skipping"
+            else do
+                (n, out) <- captureStdout
+                    (runMainWithSiblings
+                        "test/Fixtures/Coverage/Modules/cached_mtl_import/Main.hs")
+                n   `shouldBe` 0
+                out `shouldBe` "0\n1\n"
+
     --------------------------------------------------------------------
     -- Phase 2.6: language extensions + hand-rolled CPP.
     --------------------------------------------------------------------
@@ -721,7 +734,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- Error message quality: parse errors carry file:line:col
     --------------------------------------------------------------------
     it "parse error shows file:line:col instead of raw byte offset" do
-        result <- try (runFile "test/Fixtures/Coverage/parse_error_position.hs")
+        result <- try (runFile "test/Fixtures/Coverage/parse_error_position_XFAIL.hs")
                       :: IO (Either ParseError Int)
         case result of
             Right _ -> expectationFailure "expected a ParseError but the file succeeded"

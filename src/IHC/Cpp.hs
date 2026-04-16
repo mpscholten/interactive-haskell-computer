@@ -49,7 +49,9 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
-import System.FilePath (takeDirectory, (</>))
+import Data.List (isSuffixOf)
+import System.FilePath (takeDirectory, splitDrive, (</>))
+import System.IO (hPutStrLn, stderr)
 
 -- | A macro body: either a simple replacement text, or a function-like
 -- macro with parameter names and a replacement template containing
@@ -235,17 +237,40 @@ processIO ctx active (ln : rest) stack filePath depth =
             if depth >= maxIncludeDepth
                 then throwIO (IncludeDepthExceeded resolved)
                 else do
-                    -- Read and preprocess the included file with the
-                    -- current macro table (C semantics: #define from
-                    -- the outer file is visible in the included file).
-                    incBytes <- readFileOrThrow resolved incPath
-                    let incLines = splitLines incBytes
-                    (incOut, ctx') <- processIO ctx True incLines [] resolved (depth + 1)
-                    -- The included lines replace the single #include
-                    -- directive line; then continue with the rest of
-                    -- the current file using the updated ctx'.
-                    (xs, c) <- processIO ctx' active rest stack filePath depth
-                    pure (incOut ++ xs, c)
+                    maybeBytes <- tryReadFile resolved
+                    -- Fallback: search ancestor include/ directories.
+                    -- This handles Hackage packages that ship headers in
+                    -- a top-level include/ dir (e.g. bytestring).
+                    maybeBytes' <- case maybeBytes of
+                        Just _  -> pure maybeBytes
+                        Nothing -> do
+                            mAncestor <- findInAncestorIncludes dir incPath
+                            case mAncestor of
+                                Just ancestorPath -> tryReadFile ancestorPath
+                                Nothing           -> pure Nothing
+                    case maybeBytes' of
+                        Just incBytes -> do
+                            -- Read and preprocess the included file with the
+                            -- current macro table (C semantics: #define from
+                            -- the outer file is visible in the included file).
+                            let incLines = splitLines incBytes
+                            (incOut, ctx') <- processIO ctx True incLines [] resolved (depth + 1)
+                            -- The included lines replace the single #include
+                            -- directive line; then continue with the rest of
+                            -- the current file using the updated ctx'.
+                            (xs, c) <- processIO ctx' active rest stack filePath depth
+                            pure (incOut ++ xs, c)
+                        Nothing
+                            | isSystemHeader incPath -> do
+                                -- Unresolvable system header (.h/.hpp/.hsc config
+                                -- headers): emit a warning and produce zero lines.
+                                -- This is safe for generated headers like
+                                -- HsBaseConfig.h that live only in the build tree.
+                                hPutStrLn stderr ("IHC.Cpp: skipping unresolvable system include: " ++ incPath)
+                                (xs, c) <- processIO ctx active rest stack filePath depth
+                                pure (BS.empty : xs, c)
+                            | otherwise ->
+                                throwIO (IncludeMissing incPath resolved)
 
         Just (DirInclude _) -> do
             -- #include in a disabled block: skip it.
@@ -262,6 +287,19 @@ processIO ctx active (ln : rest) stack filePath depth =
             (xs, c) <- processIO ctx active rest stack filePath depth
             pure (emit : xs, c)
 
+-- | True when an include path looks like a C/C++ system header rather than
+-- a Haskell source file.  We identify these by their extension: @.h@, @.hpp@,
+-- or any suffix that does not end in @.hs@ / @.lhs@.  Unresolvable system
+-- headers are silently skipped rather than causing a hard error, because they
+-- usually come from the GHC build tree (e.g. @HsBaseConfig.h@) which is not
+-- present in the IHC source cache.
+isSystemHeader :: FilePath -> Bool
+isSystemHeader p =
+       ".h"    `isSuffixOf` p
+    || ".hpp"  `isSuffixOf` p
+    || ".H"    `isSuffixOf` p
+    || not (".hs"  `isSuffixOf` p || ".lhs" `isSuffixOf` p)
+
 -- | Read a file, throwing 'IncludeMissing' if it doesn't exist.
 readFileOrThrow :: FilePath -> FilePath -> IO ByteString
 readFileOrThrow resolved original = do
@@ -269,6 +307,29 @@ readFileOrThrow resolved original = do
     case result of
         Just bs -> pure bs
         Nothing -> throwIO (IncludeMissing original resolved)
+
+-- | Search ancestor directories for @include\/<incPath>@.
+-- Many Hackage packages place their @.h@ headers in a top-level
+-- @include\/@ directory rather than co-located with the @.hs@ source.
+-- E.g. @bytestring@ ships @include\/bytestring-cpp-macros.h@, but
+-- the source at @Data\/ByteString\/Internal\/Type.hs@ includes it as
+-- @#include "bytestring-cpp-macros.h"@, expecting the compiler to
+-- know the package root.  We replicate that by walking up the
+-- directory tree until we hit the filesystem root or find a match.
+findInAncestorIncludes :: FilePath -> FilePath -> IO (Maybe FilePath)
+findInAncestorIncludes startDir incPath = go startDir
+  where
+    (drive, _) = splitDrive startDir
+    go dir = do
+        let candidate = dir </> "include" </> incPath
+        exists <- fileExists candidate
+        if exists
+            then pure (Just candidate)
+            else do
+                let parent = takeDirectory dir
+                if parent == dir || parent == drive
+                    then pure Nothing
+                    else go parent
 
 -- | Try reading a file; return Nothing on any IO error.
 tryReadFile :: FilePath -> IO (Maybe ByteString)

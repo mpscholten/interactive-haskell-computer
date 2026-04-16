@@ -45,11 +45,12 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe)
-import System.Directory (doesFileExist, doesDirectoryExist, getHomeDirectory)
+import System.Directory (doesFileExist)
 import System.FilePath ((</>))
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
+import IHC.CabalProject (cachedPackageSearchPath)
 import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance)
 import IHC.Cpp (cppPreprocess, defaultCppContext)
 import IHC.Eval (force)
@@ -122,8 +123,19 @@ loadProgram = loadProgramFromSource []
 
 -- | Multi-module entry point: @searchPath@ is the list of directories
 -- to look in when resolving @import Foo@ statements.
+--
+-- Computes 'cachedPackageSearchPath' once at startup and appends it
+-- after the explicit @searchPath@, so all packages cached under
+-- @~\/.cache\/ihc\/sources\/@ (including @mtl@, @transformers@,
+-- @splitmix@, @random@, etc.) are available without the caller having
+-- to enumerate them.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
+    -- Enumerate cached packages once; hs-source-dirs are respected via
+    -- parseCabalFile inside cachedPackageSearchPath.
+    cacheDirs <- cachedPackageSearchPath
+    let fullSearchPath = searchPath ++ cacheDirs
+
     registry <- newIORef Map.empty
 
     -- Phase 2.6: run CPP on the entry module's bytes before anything
@@ -141,7 +153,7 @@ loadProgramFromSource searchPath src0 = do
     let entryName = lmName entry
 
     -- Drive discovery from `main`.
-    discoverInModule registry searchPath entry "main"
+    discoverInModule registry fullSearchPath entry "main"
 
     -- Collect every loaded module.
     reg <- readIORef registry
@@ -178,7 +190,7 @@ loadProgramFromSource searchPath src0 = do
     -- Name collisions: last-writer-wins via Map.union right-bias.
     -- Entry-module bindings are inserted LAST so they always shadow
     -- imported aliases.
-    aliases <- buildAliases registry searchPath entry slots qualPairs
+    aliases <- buildAliases registry fullSearchPath entry slots qualPairs
     let envWithAliases = Map.union aliases qualEnv
     let env = envWithAliases
 
@@ -234,14 +246,17 @@ loadImportIntoEnv
 loadImportIntoEnv searchPath imp existingEnv
     | isBuiltinBackedModule (impModule imp) = pure (existingEnv, 0)
     | otherwise = do
+        -- Append cached package search dirs so mtl, transformers, etc. resolve.
+        cacheDirs <- cachedPackageSearchPath
+        let fullSearchPath = searchPath ++ cacheDirs
         registry <- newIORef Map.empty
         -- Load the target module (and its transitive imports).
-        targetLm <- loadModule registry searchPath (impModule imp)
+        targetLm <- loadModule registry fullSearchPath (impModule imp)
         -- Discover ALL exported top-level names in the target module.
         allNames <- scanAllTopLevelNames (lmSource targetLm)
         let exported = filter (exportsName (lmHeader targetLm))
                      $ filter (specAllows (impSpec imp)) allNames
-        mapM_ (discoverInModule registry searchPath targetLm) exported
+        mapM_ (discoverInModule registry fullSearchPath targetLm) exported
         -- Collect every loaded module and build a combined env.
         reg <- readIORef registry
         let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
@@ -673,26 +688,14 @@ buildLoadedModule name isEntry header src = do
 emptyHeader :: ModuleHeader
 emptyHeader = ModuleHeader Nothing ExportAll []
 
--- | Return the source root(s) of the cached @base@ package, if present.
--- base's @.cabal@ file omits @hs-source-dirs@, so the package root is
--- itself the source root.  Returns an empty list if the cache directory
--- does not exist (caller falls through to the normal "module not found"
--- error path).
-baseCacheSearchPath :: IO [FilePath]
-baseCacheSearchPath = do
-    home <- getHomeDirectory
-    let dir = home </> ".cache" </> "ihc" </> "sources" </> "base-4.19.0.0"
-    exists <- doesDirectoryExist dir
-    pure (if exists then [dir] else [])
-
 -- | Given a dotted module name, search each entry in @searchPath@ for
--- a matching file.  On miss, falls back to the base source cache at
--- @~\/.cache\/ihc\/sources\/base-4.19.0.0\/@.  Raises 'ModuleNotFound'
--- only when both the user search path AND the base cache miss.
+-- a matching file.  The @searchPath@ should already include the cached
+-- package source directories (see 'cachedPackageSearchPath' from
+-- 'IHC.CabalProject', which is prepended by the public entry points
+-- 'loadProgramFromSource' and 'loadImportIntoEnv').  Raises
+-- 'ModuleNotFound' only when the entire search path misses.
 locateModule :: [FilePath] -> ModuleName -> IO FilePath
-locateModule searchPath name = do
-    baseDirs <- baseCacheSearchPath
-    go (searchPath ++ baseDirs)
+locateModule searchPath name = go searchPath
   where
     candidates = modulePathCandidates name
     go []     = throwIO (ModuleNotFound name)

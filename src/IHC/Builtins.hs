@@ -423,6 +423,20 @@ builtins reg =
     , ("onException",     onExceptionB)
     , ("throwTo",         throwToB)
     , ("displayException", displayExceptionB)
+    -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
+    , ("typeRep",        typeRepB)
+    , ("typeOf",         typeOfB)
+    , ("cast",           castB)
+    , ("eqT",            eqTB)
+    , ("toDyn",          toDynB)
+    , ("fromDynamic",    fromDynamicB)
+    , ("fromDyn",        fromDynB)
+    , ("dynTypeRep",     dynTypeRepB)
+    , ("mkTyCon3",       mkTyCon3B)
+    , ("mkTyConApp",     mkTyConAppB)
+    , ("tyConName",      tyConNameB)
+    , ("typeRepTyCon",   typeRepTyConB)
+    , ("typeRepArgs",    typeRepArgsB)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 

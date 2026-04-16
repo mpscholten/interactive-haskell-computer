@@ -324,6 +324,9 @@ type FieldRegistry = Map ByteString [(ByteString, Int)]
 -- @
 -- data TyCon tyvar* = Con0 field*              -- positional ctor
 --                   | ConR { f1 :: T1, ... }    -- record-syntax ctor
+-- data TyCon where                             -- GADT form
+--   Ctor :: ctx => T1 -> T2 -> TyCon
+-- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
 scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry)
 scanDataDecls src = go Map.empty Map.empty startCursor
@@ -340,12 +343,25 @@ scanDataDecls src = go Map.empty Map.empty startCursor
     -- Parse: (TkConId tyvar*) '=' ctor ('|' ctor)*  until the decl ends.
     -- Decl ends at a column-1 token (next top-level binding / data) or
     -- at EOF. TkNewline is trivia.
+    -- Also handles GADT form: TkWhere after the type name.
     scanOneDataDecl !regs cur0 = do
-        -- Skip tyname + tyvars.
-        curHeader <- skipUntilEq cur0
-        -- Now collect ctors separated by '|'.
-        collectCtors regs curHeader
+        -- Peek at tokens to find either '=' (traditional) or 'where' (GADT).
+        (eqOrWhere, curAfterSep) <- peekEqOrWhere cur0
+        case eqOrWhere of
+            TkWhere -> collectGadtCtors regs curAfterSep
+            _       -> collectCtors regs curAfterSep
 
+    -- Scan forward until we find '=' (traditional) or 'where' (GADT).
+    -- Returns the separator token kind and cursor after it.
+    peekEqOrWhere cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEq    -> pure (TkEq, cur')
+            TkWhere -> pure (TkWhere, cur')
+            TkEof   -> pure (TkEof, cur)
+            _       -> peekEqOrWhere cur'
+
+    skipUntilEq :: Cursor -> IO Cursor
     skipUntilEq cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
@@ -353,34 +369,139 @@ scanDataDecls src = go Map.empty Map.empty startCursor
             TkEof  -> pure cur
             _      -> skipUntilEq cur'
 
+    -- Collect GADT-form constructors: each line is
+    --   CtorName :: [ctx =>] T1 -> T2 -> ... -> ReturnType
+    -- We count all '->' arrows at depth 0 and subtract 1 (last arrow
+    -- leads to the return type, not a field). Plus one per constraint
+    -- (each constraint in a tuple counts separately).
+    collectGadtCtors (!dReg, !fReg) cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkNewline -> collectGadtCtors (dReg, fReg) cur'
+            TkConId name -> do
+                -- Expect '::' after constructor name.
+                let (sep, curSig) = nextToken src cur'
+                case tkKind sep of
+                    TkDColon -> do
+                        (arity, curEnd) <- countGadtArity 0 0 curSig
+                        let dReg' = Map.insert name arity dReg
+                        collectGadtCtors (dReg', fReg) curEnd
+                    _ -> collectGadtCtors (dReg, fReg) cur'
+            -- Column-1 non-newline means next top-level decl.
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure ((dReg, fReg), cur)
+              | otherwise -> collectGadtCtors (dReg, fReg) cur'
+
+    -- Count arity of a GADT constructor signature.
+    -- We count top-level '->' and ',' (for tuple constraints) minus 1.
+    -- The '->' count minus 1 gives the number of fields (last one is return type).
+    -- Each constraint before '=>' adds dictionary args.
+    countGadtArity !arrows !dicts cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (arrows + dicts, cur)
+            TkNewline ->
+                -- Each GADT ctor signature is on its own line.
+                -- Stop at newline if the next token is col-1 (top-level)
+                -- OR is a ConId (next GADT ctor in the where block).
+                let (nxt, _) = nextToken src cur' in
+                case tkKind nxt of
+                    TkEof -> pure (arrows + dicts, cur')
+                    TkConId _ -> pure (arrows + dicts, cur')
+                    _ | tkCol nxt == 1 -> pure (arrows + dicts, cur')
+                      | otherwise      -> countGadtArity arrows dicts cur'
+            TkDArrow ->
+                -- Everything before '=>' was constraints. Count commas as
+                -- additional dicts (tuple constraints). Reset arrow count.
+                countGadtArity 0 (dicts + max 1 arrows) cur'
+            TkArrow -> countGadtArity (arrows + 1) dicts cur'
+            TkLParen -> do
+                -- Skip parenthesised types (tuples, etc.)
+                curAfter <- skipToMatchingRParen 1 cur'
+                countGadtArity arrows dicts curAfter
+            _ -> countGadtArity arrows dicts cur'
+
+    -- Skip forall binders up to and including the '.'.
+    -- `forall a b c .` — skip everything until we see TkDot.
+    skipForallBinders cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkDot -> pure cur'   -- '.' ends the forall binder list
+            TkEof -> pure cur
+            _     -> skipForallBinders cur'
+
+    -- Peek ahead to decide if the current context is a constraint context.
+    -- Returns True if we see '=>' before '|' or col-1 at depth 0.
+    checkIfConstraint cur = go cur 0
+      where
+        go c depth = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof    -> pure False
+                TkDArrow | depth == 0 -> pure True
+                TkBar    | depth == 0 -> pure False
+                TkNewline ->
+                    let (nxt, _) = nextToken src c' in
+                    if tkCol nxt == 1
+                        then pure False
+                        else go c' depth
+                TkLParen   -> go c' (depth + 1)
+                TkRParen   -> go c' (max 0 (depth - 1))
+                TkLBracket -> go c' (depth + 1)
+                TkRBracket -> go c' (max 0 (depth - 1))
+                _          -> go c' depth
+
+    -- Skip everything up to and including '=>' at depth 0.
+    skipConstraintContext cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure cur
+            TkDArrow -> pure cur'
+            TkLParen   -> skipConstraintContext cur' >>= \c -> pure c
+            _          -> skipConstraintContext cur'
+
     -- At start of each ctor: expect TkConId, then consume field atoms
     -- until TkBar / decl-end.
+    -- Also handles existential prefix: `forall a. C a =>` before ctor name.
     collectCtors (!dReg, !fReg) cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkNewline -> collectCtors (dReg, fReg) cur'
+            -- `forall tvars .` prefix — skip until '.' then check for constraints
+            TkForall -> do
+                curAfterDot <- skipForallBinders cur'
+                collectCtors (dReg, fReg) curAfterDot
             TkConId name -> do
-                -- Peek ahead: if '{' follows immediately, it is record syntax.
-                let (peek, _) = nextToken src cur'
-                (arity, fields, curN) <- case tkKind peek of
-                    TkLBrace -> do
-                        let (_, curBrace) = nextToken src cur'
-                        collectRecordFields 0 [] curBrace
-                    _ -> do
-                        (n, curN') <- countCtorFields 0 cur'
-                        pure (n, [], curN')
-                let dReg' = Map.insert name arity dReg
-                    fReg' = foldr
-                        (\(fieldName, idx) acc ->
-                            Map.insertWith (++) fieldName [(name, idx)] acc)
-                        fReg
-                        fields
-                -- After fields, check for '|' (more ctors) or decl end.
-                let (sep, curSep) = nextToken src curN
-                case tkKind sep of
-                    TkBar     -> collectCtors (dReg', fReg') curSep
-                    TkNewline -> collectCtors (dReg', fReg') curSep
-                    _         -> pure ((dReg', fReg'), curN)
+                -- Check if this ConId is a class constraint (existential form).
+                -- If we eventually hit '=>' before any '|' or col-1, it was a
+                -- constraint context; skip it and restart collectCtors.
+                isConstraint <- checkIfConstraint cur'
+                if isConstraint
+                    then do
+                        -- Skip through the constraint(s) and '=>'.
+                        curAfterArrow <- skipConstraintContext cur'
+                        collectCtors (dReg, fReg) curAfterArrow
+                    else do
+                        -- Peek ahead: if '{' follows immediately, it is record syntax.
+                        let (peek, _) = nextToken src cur'
+                        (arity, fields, curN) <- case tkKind peek of
+                            TkLBrace -> do
+                                let (_, curBrace) = nextToken src cur'
+                                collectRecordFields 0 [] curBrace
+                            _ -> do
+                                (n, curN') <- countCtorFields 0 cur'
+                                pure (n, [], curN')
+                        let dReg' = Map.insert name arity dReg
+                            fReg' = foldr
+                                (\(fieldName, idx) acc ->
+                                    Map.insertWith (++) fieldName [(name, idx)] acc)
+                                fReg
+                                fields
+                        -- After fields, check for '|' (more ctors) or decl end.
+                        let (sep, curSep) = nextToken src curN
+                        case tkKind sep of
+                            TkBar     -> collectCtors (dReg', fReg') curSep
+                            TkNewline -> collectCtors (dReg', fReg') curSep
+                            _         -> pure ((dReg', fReg'), curN)
             -- Missing constructor (malformed) or decl ended.
             _ -> pure ((dReg, fReg), cur)
 

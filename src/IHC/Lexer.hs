@@ -88,6 +88,7 @@ data TokenKind
     | TkInfixL                -- ^ keyword @infixl@
     | TkInfixR                -- ^ keyword @infixr@
     | TkInfix                 -- ^ keyword @infix@
+    | TkForall                -- ^ keyword @forall@ (RankNTypes / ExistentialQuantification)
     | TkBar                   -- ^ @|@ (data-decl alternative separator)
     | TkLBrace                -- ^ @{@
     | TkRBrace                -- ^ @}@
@@ -462,6 +463,7 @@ nextToken s c0 =
         "infixl"    -> TkInfixL
         "infixr"    -> TkInfixR
         "infix"     -> TkInfix
+        "forall"    -> TkForall
         "_"         -> TkUnderscore
         _           -> TkIdent bs
 

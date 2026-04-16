@@ -36,7 +36,7 @@ import IHC.ModuleHeader (ImportDecl(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
 import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
 import IHC.Scheduler (buildBaseEnv, loadImportIntoEnv, loadProgramFromSource)
-import IHC.Source (mkSource, readSourceFile, Source(..), srcBytes)
+import IHC.Source (mkSource, readSourceFile, withBytes, Source(..), srcBytes)
 import IHC.TypeDescribe (describeType)
 import IHC.Val
 
@@ -172,8 +172,7 @@ loadFile path = do
     case r of
         Right (env, _) -> pure env
         Left  _        -> do
-            let patched = src { srcBytes = srcBytes src
-                                           <> BC.pack "\nmain = ()\n" }
+            let patched = withBytes src (srcBytes src <> BC.pack "\nmain = ()\n")
             (env, _) <- loadProgramFromSource searchPath patched
             pure env
 

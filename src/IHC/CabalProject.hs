@@ -29,6 +29,8 @@ module IHC.CabalProject
       -- * Utilities (exposed for testing)
     , parseFreezeFile
     , findLocalCabalFile
+      -- * Cache-wide search path
+    , cachedPackageSearchPath
     ) where
 
 import Control.Exception (Exception, throwIO, try, SomeException)
@@ -43,6 +45,8 @@ import System.Directory
     ( doesDirectoryExist
     , doesFileExist
     , getDirectoryContents
+    , getHomeDirectory
+    , listDirectory
     )
 import System.FilePath
     ( (</>)
@@ -311,3 +315,55 @@ emptyBuildInfoStub = libBuildInfo emptyLib
     -- Using mempty works for all Cabal versions from 3.0+.
     emptyLib :: Library
     emptyLib = mempty
+
+--------------------------------------------------------------------------------
+-- Cache-wide search path
+--------------------------------------------------------------------------------
+
+-- | Enumerate every package cached under @~\/.cache\/ihc\/sources\/@
+-- and return the actual source roots (respecting @hs-source-dirs@ from
+-- each package's @.cabal@ file).
+--
+-- Algorithm for each subdirectory @\<pkg\>-\<ver\>@:
+--
+--   1. Find the @.cabal@ file (via 'findLocalCabalFile').
+--   2. Parse it with 'parseCabalFile' to get @pkgSourceDirs@.
+--   3. Append those absolute paths to the result.
+--
+-- If no @.cabal@ file is found or it fails to parse, fall back to
+-- checking whether a @src\/@ subdirectory exists (common convention);
+-- otherwise use the package root itself.
+--
+-- Returns an empty list if the cache directory does not exist.
+cachedPackageSearchPath :: IO [FilePath]
+cachedPackageSearchPath = do
+    home <- getHomeDirectory
+    let sourcesDir = home </> ".cache" </> "ihc" </> "sources"
+    exists <- doesDirectoryExist sourcesDir
+    if not exists
+        then pure []
+        else do
+            entries <- listDirectory sourcesDir
+            concat <$> mapM (dirsForEntry sourcesDir) entries
+  where
+    dirsForEntry sourcesDir entry = do
+        let pkgDir = sourcesDir </> entry
+        isDir <- doesDirectoryExist pkgDir
+        if not isDir
+            then pure []
+            else do
+                mCabal <- findLocalCabalFile pkgDir
+                case mCabal of
+                    Just cabalPath -> do
+                        mInfo <- parseCabalFile pkgDir cabalPath
+                        case mInfo of
+                            Just info -> pure (pkgSourceDirs info)
+                            Nothing   -> fallback pkgDir
+                    Nothing -> fallback pkgDir
+
+    -- When we can't parse a .cabal, try the conventional src/ dir first,
+    -- then fall back to the package root.
+    fallback pkgDir = do
+        let srcDir = pkgDir </> "src"
+        hasSrc <- doesDirectoryExist srcDir
+        pure [if hasSrc then srcDir else pkgDir]
