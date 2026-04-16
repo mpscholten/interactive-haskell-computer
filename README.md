@@ -33,7 +33,7 @@ Remaining slices (rough order):
 - 2.9.5 — GADTs + `Typeable`/`cast`/`Dynamic` — surfaced by tasty survey
 - 2.10a — STM + async exceptions (2.10b abandoned — containers interpreted from source)
 - 2.11 — `Lift`-splice TH (subset of full TH)
-- 2.12 — tasty-load pipeline integration
+- 2.12 — tasty/QuickCheck/optparse-applicative source-load + end-to-end run (no shims; same rule as 2.10b)
 - 2.13 — ⭐ bytestring test suite (north-star)
 - 2.16 — **cold-start latency benchmark** vs `ghci :load` + `cabal run` on a real IHP project. Hypothesis: we win on first-request-served time because we skip type checking, Core pipeline, linking, and load sources on demand rather than eagerly.
 - 3.1 — **full Template Haskell**: `[|…|]` quotation, `$(…)` AST-returning splices, `Q` IO, `reify`. Required by `aeson-th`, `lens` `makeLenses`, `persistent` TH — anything IHP uses heavily.
