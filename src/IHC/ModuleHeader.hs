@@ -15,10 +15,16 @@
 --   import Foo hiding (c, d)
 --   import Foo ((.&.), (++))    -- operator imports are skipped (name ignored)
 --
--- Not yet supported (designed-out of 2.5): package-qualified imports
--- @import \"base\" Data.List@, and @module Foo (module Bar) where@
--- re-exports. These degrade gracefully — the scanner stops at the
--- unrecognised form and the rest of the file is still reachable.
+-- Package-qualified imports (@import \"base\" Data.List@ and
+-- @import qualified \"base\" Data.List as L@, from the GHC
+-- @PackageImports@ extension) are accepted: the package-name string
+-- between @qualified@ (if present) and the module name is parsed and
+-- silently discarded, since ihc resolves modules by name across its
+-- source cache.
+--
+-- Not yet supported: @module Foo (module Bar) where@ re-exports. These
+-- degrade gracefully — the scanner stops at the unrecognised form and
+-- the rest of the file is still reachable.
 -- Operator imports like @import Foo ((<>))@ are now parsed correctly
 -- (the operator name is skipped/ignored, but subsequent names in the
 -- list are preserved and the import is not aborted).
@@ -321,7 +327,14 @@ parseOneImport src cur0 = do
     (qualified, curQ) <- case tkKind t1 of
         TkQualified -> pure (True, cur1)
         _           -> pure (False, cur0)
-    (mModName, cur2) <- parseDottedName src curQ
+    -- PackageImports: an optional "pkg" string between `qualified` (if
+    -- present) and the module name. We accept it unconditionally and
+    -- discard the contents — module resolution is by name only.
+    let (tPkg, curAfterPkg) = nextSigTok src curQ
+    let curName = case tkKind tPkg of
+            TkStr _ -> curAfterPkg
+            _       -> curQ
+    (mModName, cur2) <- parseDottedName src curName
     case mModName of
         Nothing   -> pure Nothing
         Just modN -> do

@@ -420,6 +420,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hi\n"
 
+    it "module: PackageImports `import \"base\" Data.List (sort)` parses + runs" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Modules/package_import.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "[1,2,3]\n"
+
     it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
         home <- getHomeDirectory
         let mtlDir = home <> "/.cache/ihc/sources/mtl-2.3.2"
