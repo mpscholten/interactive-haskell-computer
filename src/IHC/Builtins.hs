@@ -240,8 +240,8 @@ builtins reg =
     , ("signum",   unaryOpNum signum signum)
     , ("succ",     unaryOpNum (+1) (+1))
     , ("pred",     unaryOpNum (subtract 1) (subtract 1))
-    , ("min",      binOpNum min min)
-    , ("max",      binOpNum max max)
+    , ("min",      minDispatch reg)
+    , ("max",      maxDispatch reg)
     , ("gcd",      binOpInt gcd)
     , ("subtract", binOpNum (\a b -> b - a) (\a b -> b - a))
     , ("sqrt",     unaryOpFloat sqrt)
@@ -767,17 +767,25 @@ ordCmp _reg slot av bv = case (av, bv) of
                 bT <- newWHNFThunk bv
                 r1 <- apply method aT
                 apply r1 bT
-            _ ->
-                -- Fall back to Eq for <= and >=
-                case slot of
-                    1 -> do r <- eqVals _reg av bv
-                            if isTruthy r then pure (boolVal True)
-                            else ordCmp _reg 0 av bv
-                    3 -> do r <- eqVals _reg av bv
-                            if isTruthy r then pure (boolVal True)
-                            else ordCmp _reg 2 av bv
-                    _ -> error ("Ord: no instance for type tag `"
-                                <> BC.unpack (typeTagOf av) <> "`")
+            _ -> do
+                -- No user Ord instance registered. Try the structural
+                -- fallback: if both values are VCon, derive an Ord by
+                -- comparing constructor identity first, then fields
+                -- left-to-right. This mirrors 'eqVals' for Eq.
+                mOrd <- structuralOrdering _reg av bv
+                case mOrd of
+                    Just o  -> pure (boolVal (ordSlot slot o))
+                    Nothing ->
+                        -- Fall back to Eq for <= and >=
+                        case slot of
+                            1 -> do r <- eqVals _reg av bv
+                                    if isTruthy r then pure (boolVal True)
+                                    else ordCmp _reg 0 av bv
+                            3 -> do r <- eqVals _reg av bv
+                                    if isTruthy r then pure (boolVal True)
+                                    else ordCmp _reg 2 av bv
+                            _ -> error ("Ord: no instance for type tag `"
+                                        <> BC.unpack (typeTagOf av) <> "`")
   where
     intOrdSlot 0 x y = x < y
     intOrdSlot 1 x y = x <= y
@@ -809,37 +817,165 @@ ordCmp _reg slot av bv = case (av, bv) of
     foreignPtrOrdSlot 3 x y = x >= y
     foreignPtrOrdSlot _ _ _ = False
 
+    -- Map a host 'Ordering' into the comparison result the caller's
+    -- dispatch slot expects. Slot 0 = (<), 1 = (<=), 2 = (>), 3 = (>=).
+    -- Slot 4 is unused at this level (compareDispatch calls slot 0 then
+    -- consults Eq for EQ), but we handle it defensively.
+    ordSlot 0 o = o == LT
+    ordSlot 1 o = o == LT || o == EQ
+    ordSlot 2 o = o == GT
+    ordSlot 3 o = o == GT || o == EQ
+    ordSlot _ _ = False
+
+-- | Structural Ord fallback for VCon values.
+--
+-- Returns 'Just ord' when @av@ and @bv@ can be compared structurally,
+-- 'Nothing' when the shapes don't line up and the caller should keep
+-- trying (e.g. fall back to Eq-based slot dispatch for slot 1 / 3).
+--
+-- Semantics for user-derived Ord on sums-of-products:
+--
+--   1. Same constructor → compare fields lexicographically
+--      (left-to-right, short-circuit on first non-EQ).
+--   2. Different constructor → use the constructor *index* within its
+--      declaring data decl, i.e. @data Color = Red | Green | Blue@
+--      gives @Red < Green < Blue@.
+--
+-- TODO(ctor-index): IHC.Scan.DataRegistry currently stores only
+-- @Map ConName Arity@ and therefore loses declaration order. Until the
+-- registry is extended to carry a (typeName, index) pair per
+-- constructor — or a separate CtorIndexRegistry is threaded through
+-- Scheduler/Builtins — we fall back to **lexicographic comparison of
+-- the constructor name**. This matches derived-Ord semantics only when
+-- the constructors happen to be declared in alphabetical order; it's
+-- wrong in general (e.g. @data Color = Red | Green | Blue@ gives
+-- @Blue < Green < Red@ with this fallback).
+--
+-- This is the pragmatic mid-step called out in the original task:
+-- "compare ctor names lexicographically — wrong but better than
+-- crashing — and document the TODO". The structural *fields* half is
+-- correct; only the cross-constructor ordering is a placeholder.
+structuralOrdering :: ClassRegistry -> Val -> Val -> IO (Maybe Ordering)
+structuralOrdering reg av bv = case (av, bv) of
+    (VUnit, VUnit) -> pure (Just EQ)
+    -- Bool is declared `data Bool = False | True` so False < True.
+    (VCon "False" _, VCon "False" _) -> pure (Just EQ)
+    (VCon "True"  _, VCon "True"  _) -> pure (Just EQ)
+    (VCon "False" _, VCon "True"  _) -> pure (Just LT)
+    (VCon "True"  _, VCon "False" _) -> pure (Just GT)
+    -- Lists: @[] < (_ : _)@; then compare heads, then tails.
+    (VCon "[]" _, VCon "[]" _) -> pure (Just EQ)
+    (VCon "[]" _, VCon ":"  _) -> pure (Just LT)
+    (VCon ":"  _, VCon "[]" _) -> pure (Just GT)
+    -- Generic VCon path: covers @:@, tuples, and user-defined ADTs.
+    (VCon n1 ts1, VCon n2 ts2)
+        | n1 == n2 && length ts1 == length ts2 -> do
+            o <- compareFields ts1 ts2
+            pure (Just o)
+        | otherwise ->
+            -- See TODO(ctor-index) on structuralOrdering: lex-compare
+            -- constructor names as a placeholder for the real index.
+            pure (Just (compare n1 n2))
+    _ -> pure Nothing
+  where
+    compareFields []     []     = pure EQ
+    compareFields (t1:r1) (t2:r2) = do
+        v1 <- force t1
+        v2 <- force t2
+        -- Recurse through the full Ord dispatch (user instances +
+        -- structural fallback) rather than structuralOrdering directly,
+        -- so primitive fields (Int, Char, etc.) hit their fast paths.
+        mo <- valOrdering reg v1 v2
+        case mo of
+            EQ -> compareFields r1 r2
+            o  -> pure o
+    compareFields _ _ = pure EQ   -- unreachable (arity equal check above)
+
+-- | Run the full Ord dispatch and distil the result into a host
+-- 'Ordering'. Used by 'structuralOrdering' and 'compareDispatch' so
+-- every code path shares the same ordering logic.
+valOrdering :: ClassRegistry -> Val -> Val -> IO Ordering
+valOrdering reg av bv = case (av, bv) of
+    (VInt x,   VInt y)   -> pure (compare x y)
+    (VFloat x, VFloat y) -> pure (compare x y)
+    (VInt x,   VFloat y) -> pure (compare (fromIntegral x :: Double) y)
+    (VFloat x, VInt y)   -> pure (compare x (fromIntegral y :: Double))
+    (VChar x,  VChar y)  -> pure (compare x y)
+    (VStr x,   VStr y)   -> pure (compare x y)
+    (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
+        pure (compare p1 p2)
+    (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
+        pure (compare fp1 fp2)
+    _ -> do
+        -- Try user Ord instance first (compare at slot 4 if present).
+        let tag = typeTagOf av
+        mMethods <- lookupInstance reg "Ord" tag
+        case mMethods of
+            Just methods | length methods > 4 -> do
+                let cmpMethod = methods !! 4
+                aT <- newWHNFThunk av
+                bT <- newWHNFThunk bv
+                r1 <- apply cmpMethod aT
+                cv <- apply r1 bT
+                pure (orderingFromVCon cv)
+            _ -> do
+                mo <- structuralOrdering reg av bv
+                case mo of
+                    Just o  -> pure o
+                    Nothing -> do
+                        -- Last resort: use slot-0 (<) and Eq to triangulate.
+                        lt <- ordCmp reg 0 av bv
+                        if isTruthy lt then pure LT
+                        else do
+                            eq <- eqVals reg av bv
+                            if isTruthy eq then pure EQ else pure GT
+  where
+    orderingFromVCon (VCon "LT" _) = LT
+    orderingFromVCon (VCon "EQ" _) = EQ
+    orderingFromVCon (VCon "GT" _) = GT
+    orderingFromVCon other = error ("valOrdering: user Ord `compare` "
+                                    <> "returned non-Ordering: "
+                                    <> showValForDebug other)
+
 -- | @compare@ returns an Ordering constructor: LT, EQ, or GT.
+--
+-- Shared path with ordCmp via 'valOrdering', so user-defined ADTs
+-- (including 'deriving Ord') pick up the same structural fallback
+-- that drives @<@, @<=@, @>@, @>=@.
 compareDispatch :: ClassRegistry -> IO Val
 compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VCon (orderingName (compare x y)) [])
-        (VFloat x, VFloat y) ->
-            pure (VCon (orderingName (compare x y)) [])
-        (VInt x, VFloat y) ->
-            pure (VCon (orderingName (compare (fromIntegral x :: Double) y)) [])
-        (VFloat x, VInt y) ->
-            pure (VCon (orderingName (compare x (fromIntegral y :: Double))) [])
-        (VChar x, VChar y) ->
-            pure (VCon (orderingName (compare x y)) [])
-        (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
-            pure (VCon (orderingName (compare p1 p2)) [])
-        (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
-            pure (VCon (orderingName (compare fp1 fp2)) [])
-        _ -> do
-            lt <- ordCmp reg 0 av bv
-            if isTruthy lt then pure (VCon "LT" [])
-            else do
-                eq <- eqVals reg av bv
-                if isTruthy eq then pure (VCon "EQ" [])
-                else pure (VCon "GT" [])
+    o  <- valOrdering reg av bv
+    pure (VCon (orderingName o) [])
   where
     orderingName LT = "LT"
     orderingName EQ = "EQ"
     orderingName GT = "GT"
+
+-- | @min x y@ dispatched through 'valOrdering': returns @x@ when
+-- @compare x y /= GT@, otherwise @y@. Works for every type 'ordCmp'
+-- supports (numeric, primitive, and any VCon via the structural
+-- fallback), not just numbers.
+minDispatch :: ClassRegistry -> IO Val
+minDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    o  <- valOrdering reg av bv
+    case o of
+        GT -> pure bv
+        _  -> pure av
+
+-- | @max x y@ dispatched through 'valOrdering'. Counterpart to
+-- 'minDispatch'.
+maxDispatch :: ClassRegistry -> IO Val
+maxDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a
+    bv <- force b
+    o  <- valOrdering reg av bv
+    case o of
+        LT -> pure bv
+        _  -> pure av
 
 -- | Show dispatch: look up "show" in the Show class registry.
 -- Slot 0 = show. Falls back to built-in showVal for base types.
