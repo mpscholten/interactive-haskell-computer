@@ -1312,6 +1312,11 @@ startsAtom TkPrimId{}      = True
 startsAtom TkLUnbox        = True
 startsAtom TkImplicitRef{} = True  -- Phase 3.6: ?name can start an atom
 startsAtom TkSpliceLParen  = True  -- Phase 2.11: $( starts a TH splice
+startsAtom TkOQuote        = True  -- Phase 2.12: [| starts a TH expression bracket
+startsAtom TkOQuoteD       = True  -- Phase 2.12: [d| (silently skipped)
+startsAtom TkOQuoteT       = True  -- Phase 2.12: [t| (silently skipped)
+startsAtom TkOQuoteP       = True  -- Phase 2.12: [p| (silently skipped)
+startsAtom TkOQuoteTy      = True  -- Phase 2.12: [|| (silently skipped)
 startsAtom _               = False
 
 --------------------------------------------------------------------------------
@@ -1359,6 +1364,20 @@ parseAtom ctx cur0 = do
             case tkKind closeTok of
                 TkRParen -> pure (ESplice inner, cur3)
                 _        -> parseErr ctx "expected `)` to close splice $(...)" closeTok
+        -- Phase 2.12: TemplateHaskellQuotes
+        -- [| expr |]  or  [e| expr |]  — expression bracket: parse body, emit EQuote.
+        TkOQuote -> do
+            (inner, cur2) <- parseExpr ctx cur1
+            let (closeTok, cur3) = nextSig ctx cur2
+            case tkKind closeTok of
+                TkCQuote -> pure (EQuote inner, cur3)
+                _        -> parseErr ctx "expected `|]` to close expression bracket [|...|]" closeTok
+        -- [d| ... |], [t| ... |], [p| ... |], [|| ... ||] — not yet implemented.
+        -- Silently skip the body (up to the matching close) and return a placeholder.
+        TkOQuoteD  -> skipQuoteBody ctx cur1 TkCQuote
+        TkOQuoteT  -> skipQuoteBody ctx cur1 TkCQuote
+        TkOQuoteP  -> skipQuoteBody ctx cur1 TkCQuote
+        TkOQuoteTy -> skipQuoteBody ctx cur1 TkCQuoteTy
         TkEof -> parseErr ctx "unexpected end of input" tok
         _ -> parseErr ctx "unexpected token" tok
 
@@ -1782,6 +1801,34 @@ parseListLit ctx cur0 = do
     buildCons :: [Expr] -> Expr
     buildCons []     = EVar "[]"
     buildCons (e:es) = EApp (EApp (EVar ":") e) (buildCons es)
+
+-- | Skip the body of an unsupported TH quote bracket up to (and including)
+-- the matching close token (@TkCQuote@ = @|]@ or @TkCQuoteTy@ = @||]@).
+-- Returns a placeholder expression so the surrounding code can continue
+-- parsing without a hard error. Tracks bracket depth for nested quotes.
+skipQuoteBody :: Ctx -> Cursor -> TokenKind -> IO (Expr, Cursor)
+skipQuoteBody ctx cur0 closeTk = go cur0 (0 :: Int)
+  where
+    placeholder = EQuote (ELit (LStr "<unsupported-quote>"))
+
+    go cur !depth =
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            TkEof -> pure (placeholder, cur)
+            k | k == closeTk && depth == 0 -> pure (placeholder, cur')
+              | k == closeTk               -> go cur' (depth - 1)
+            TkOQuote   -> go cur' (depth + 1)
+            TkOQuoteD  -> go cur' (depth + 1)
+            TkOQuoteT  -> go cur' (depth + 1)
+            TkOQuoteP  -> go cur' (depth + 1)
+            TkOQuoteTy -> go cur' (depth + 1)
+            TkLParen   -> go cur' (depth + 1)
+            TkRParen   -> go cur' (max 0 (depth - 1))
+            TkLBracket -> go cur' (depth + 1)
+            TkRBracket -> go cur' (max 0 (depth - 1))
+            TkLBrace   -> go cur' (depth + 1)
+            TkRBrace   -> go cur' (max 0 (depth - 1))
+            _          -> go cur' depth
 
 -- | Fast-forward through a balanced bracket group, returning the cursor
 -- just past the matching @]@. Used only for list-comprehensions and

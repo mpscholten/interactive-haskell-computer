@@ -118,6 +118,14 @@ data TokenKind
     | TkSymOp !ByteString     -- ^ generic user-defined symbolic operator
                               --   (e.g. @<>@, @>>=@, @<$>@, @.&.@, @:|@)
     | TkImplicitRef !ByteString -- ^ @?name@ implicit parameter reference
+    -- TemplateHaskellQuotes tokens (Phase 2.12)
+    | TkOQuote                -- ^ @[|@ or @[e|@ — expression bracket open
+    | TkCQuote                -- ^ @|]@ — expression bracket close
+    | TkOQuoteD               -- ^ @[d|@ — declaration bracket open
+    | TkOQuoteT               -- ^ @[t|@ — type bracket open
+    | TkOQuoteP               -- ^ @[p|@ — pattern bracket open
+    | TkOQuoteTy              -- ^ @[||@ — typed expression bracket open
+    | TkCQuoteTy              -- ^ @||]@ — typed expression bracket close
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -224,7 +232,9 @@ nextToken s c0 =
             | b == 0x29        -> (mkTok TkRParen   c (step c), step c)  -- ')'
             | b == 0x7B        -> (mkTok TkLBrace   c (step c), step c)  -- '{'
             | b == 0x7D        -> (mkTok TkRBrace   c (step c), step c)  -- '}'
-            | b == 0x5B        -> (mkTok TkLBracket c (step c), step c)  -- '['
+            -- '[' — either a TemplateHaskellQuotes bracket or a regular '['.
+            -- Check for [|, [e|, [d|, [t|, [p|, [||  before emitting TkLBracket.
+            | b == 0x5B -> lexLBracket c
             | b == 0x5D        -> (mkTok TkRBracket c (step c), step c)  -- ']'
             | b == 0x2C        -> (mkTok TkComma    c (step c), step c)  -- ','
             | b == 0x3B        -> (mkTok TkSemi     c (step c), step c)  -- ';'
@@ -237,6 +247,13 @@ nextToken s c0 =
             -- Bar: matched as a single-char token unless it starts '||'.
             -- '||' is handled in lexSymOp as a recognised SymOp form, but
             -- our existing parser expects TkOr — so keep the explicit check.
+            -- TemplateHaskellQuotes: '||]' = TkCQuoteTy, '|]' = TkCQuote.
+            -- Check TH close-quote cases first so they take priority.
+            | b == 0x7C, Just 0x7C <- peekByte s (cPos c + 1)
+                        , Just 0x5D <- peekByte s (cPos c + 2)
+                               -> let c' = step (step (step c)) in (mkTok TkCQuoteTy c c', c')
+            | b == 0x7C, Just 0x5D <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c) in (mkTok TkCQuote c c', c')
             | b == 0x7C, Just 0x7C <- peekByte s (cPos c + 1)
                                -> let c' = step (step c) in (mkTok TkOr c c', c')
             | b == 0x7C, not (isOpChar (peekByte s (cPos c + 1)))
@@ -466,6 +483,58 @@ nextToken s c0 =
         go p = case peekByte s p of
             Just b | isIdentCont b -> go (p + 1)
             _      -> p
+
+    -- | Disambiguate '[' — emit a TemplateHaskellQuotes open-bracket token
+    -- when followed by a quote-form prefix, otherwise plain TkLBracket.
+    --
+    -- Recognised forms (GHC spec):
+    --   [|   or  [e|   → TkOQuote   (expression bracket)
+    --   [d|           → TkOQuoteD  (declaration bracket)
+    --   [t|           → TkOQuoteT  (type bracket)
+    --   [p|           → TkOQuoteP  (pattern bracket)
+    --   [||  or  [e|| → TkOQuoteTy (typed expression bracket)
+    --   anything else → TkLBracket
+    lexLBracket start =
+        let p1 = cPos start + 1   -- byte just after '['
+        in case peekByte s p1 of
+            Just 0x7C ->                                    -- '[|'
+                case peekByte s (p1 + 1) of
+                    Just 0x7C ->                            -- '[||' typed
+                        let c' = step (step (step start))
+                        in (mkTok TkOQuoteTy start c', c')
+                    _ ->                                    -- '[|'
+                        let c' = step (step start)
+                        in (mkTok TkOQuote start c', c')
+            Just 0x65 ->                                    -- '[e...'
+                case peekByte s (p1 + 1) of
+                    Just 0x7C ->                            -- '[e|'
+                        case peekByte s (p1 + 2) of
+                            Just 0x7C ->                    -- '[e||' typed
+                                let c' = step (step (step (step start)))
+                                in (mkTok TkOQuoteTy start c', c')
+                            _ ->                            -- '[e|'
+                                let c' = step (step (step start))
+                                in (mkTok TkOQuote start c', c')
+                    _ -> (mkTok TkLBracket start (step start), step start)
+            Just 0x64 ->                                    -- '[d...'
+                case peekByte s (p1 + 1) of
+                    Just 0x7C ->                            -- '[d|'
+                        let c' = step (step (step start))
+                        in (mkTok TkOQuoteD start c', c')
+                    _ -> (mkTok TkLBracket start (step start), step start)
+            Just 0x74 ->                                    -- '[t...'
+                case peekByte s (p1 + 1) of
+                    Just 0x7C ->                            -- '[t|'
+                        let c' = step (step (step start))
+                        in (mkTok TkOQuoteT start c', c')
+                    _ -> (mkTok TkLBracket start (step start), step start)
+            Just 0x70 ->                                    -- '[p...'
+                case peekByte s (p1 + 1) of
+                    Just 0x7C ->                            -- '[p|'
+                        let c' = step (step (step start))
+                        in (mkTok TkOQuoteP start c', c')
+                    _ -> (mkTok TkLBracket start (step start), step start)
+            _ -> (mkTok TkLBracket start (step start), step start)
 
     keywordOr bs = case bs of
         "if"        -> TkIf

@@ -11,7 +11,7 @@
 module CabalLoader (spec) where
 
 import qualified Data.ByteString.Char8 as BC
-import Data.List (isPrefixOf, isInfixOf)
+import Data.List (isPrefixOf, isInfixOf, isSuffixOf)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import System.Directory (canonicalizePath, doesDirectoryExist, getCurrentDirectory, listDirectory, makeAbsolute)
@@ -28,8 +28,10 @@ import IHC.CabalProject
     , parseFreezeFile
     , resolve
     , cachedPackageSearchPath
+    , cachedPackageSearchPathWithIncludes
     , cabalTarballSearchPath
     )
+import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.PackageStore (buildSearchEnvWithRoot)
 
 fixtureRoot :: FilePath
@@ -112,6 +114,71 @@ spec = describe "Phase 2.7 — Cabal project loader" do
             mInfo <- parseCabalFile rootAbs
                          (rootAbs </> "foo.cabal")
             fmap pkgSourceDirs mInfo `shouldBe` Just [rootAbs </> "src"]
+
+        it "parses pkgIncludeDirs from bytestring's include-dirs: include" $ do
+            -- bytestring-0.12.2.0 ships bytestring-cpp-macros.h in include/
+            -- and declares include-dirs: include in its cabal file.
+            let bsRoot   = "bytestring-0.12.2.0"
+                bsCabal  = bsRoot </> "bytestring.cabal"
+            bsExists <- doesDirectoryExist bsRoot
+            if not bsExists
+                then pendingWith "bytestring-0.12.2.0 not present in project root"
+                else do
+                    rootAbs <- makeAbsolute bsRoot
+                    mInfo   <- parseCabalFile rootAbs bsCabal
+                    mInfo `shouldSatisfy` isJust
+                    let Just info = mInfo
+                    -- pkgIncludeDirs should contain rootAbs/include
+                    pkgIncludeDirs info `shouldContain` [rootAbs </> "include"]
+
+    describe "cppPreprocessWithIncludes" do
+        it "resolves #include \"defs.h\" from an explicit includeDirs" $ do
+            -- Write a temp header and use cppPreprocessWithIncludes to find it.
+            -- We use the CPP fixtures dir for convenience.
+            let incDir  = "test/Fixtures/CppIncludes/inc"
+                srcFile = "test/Fixtures/CppIncludes/Main.hs"
+            incDirExists <- doesDirectoryExist incDir
+            if not incDirExists
+                then pendingWith "test/Fixtures/CppIncludes/inc not present"
+                else do
+                    -- defs.h defines FOO=42; use it in an #if so CPP evaluates it.
+                    let src = BC.pack
+                                "#include \"defs.h\"\n\
+                                \#if FOO == 42\n\
+                                \main = putStrLn \"ok\"\n\
+                                \#else\n\
+                                \main = putStrLn \"bad\"\n\
+                                \#endif\n"
+                    result <- cppPreprocessWithIncludes [incDir] defaultCppContext srcFile src
+                    -- The #if FOO == 42 branch should be active (defs.h was found and
+                    -- FOO was defined), so "ok" must be present and "bad" must not.
+                    result `shouldSatisfy` BC.isInfixOf (BC.pack "\"ok\"")
+                    result `shouldSatisfy` (\r -> not (BC.isInfixOf (BC.pack "\"bad\"") r))
+
+    describe "cachedPackageSearchPathWithIncludes" do
+        it "returns (srcDir, includeDirs) pairs without crashing" $ do
+            pairs <- cachedPackageSearchPathWithIncludes
+            -- All source dirs must be absolute paths.
+            mapM_ (\(sd, _) -> sd `shouldSatisfy` ("/" `isPrefixOf`)) pairs
+
+        it "bytestring source dirs are paired with the include/ directory" $ do
+            -- When bytestring is in the nix source dir or the cabal tarball
+            -- cache, its source dir should be associated with its include/ dir.
+            pairs <- cachedPackageSearchPathWithIncludes
+            let bsPairs = [ (sd, incs)
+                          | (sd, incs) <- pairs
+                          , "bytestring" `isInfixOf` sd
+                          ]
+            case bsPairs of
+                [] -> pendingWith "bytestring not found in package search path"
+                _ -> do
+                    -- At least one bytestring srcDir should have a non-empty includeDirs.
+                    let nonEmpty = [ (sd, incs) | (sd, incs) <- bsPairs, not (null incs) ]
+                    nonEmpty `shouldNotBe` []
+                    -- Each include dir should end with "include".
+                    mapM_ (\(_, incs) ->
+                        mapM_ (\inc -> inc `shouldSatisfy` ("include" `isSuffixOf`)) incs)
+                        nonEmpty
 
     describe "buildSearchEnvWithRoot (no network)" do
         it "assembles a SearchEnv covering local + fake-cached deps" do

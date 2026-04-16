@@ -24,6 +24,7 @@ module IHC.TH
     , thExpToExpr
     , expandSplicesInExpr
     , thBuiltinPairs
+    , exprToVal
     ) where
 
 import Control.Exception (throwIO, Exception)
@@ -402,12 +403,80 @@ expandSplicesInExpr env ipm depth expr
         fields' <- mapM (\(fn, fe) -> (fn,) <$> go fe) fields
         pure (ERecordCon n fields')
     go (ERecordWild n) = pure (ERecordWild n)
+    go (ELabel n) = pure (ELabel n)   -- Phase 3.5: labels are self-contained
+    -- Phase 2.12: EQuote is a leaf in the splice-expansion pass.
+    -- Its body is NOT expanded (it's a quotation, not a splice).
+    go (EQuote e) = pure (EQuote e)
 
     goAlt (Alt p e) = Alt p <$> go e
 
     goStmt (SExpr e)   = SExpr <$> go e
     goStmt (SBind n e) = SBind n <$> go e
     goStmt (SLet bs)   = SLet <$> mapM (\(n, b) -> (n,) <$> go b) bs
+
+--------------------------------------------------------------------------------
+-- exprToVal — quotation: Expr -> TH Exp Val  (Phase 2.12)
+--
+-- Walks an IHC AST Expr and encodes it as a TH Exp-shaped Val.
+-- This is the runtime implementation of [| expr |] brackets.
+-- The encoding matches what liftVal / thExpToExpr use, so
+-- $( [| expr |] ) round-trips correctly.
+--------------------------------------------------------------------------------
+
+-- | Convert an IHC 'Expr' (the body of a [| ... |] bracket) into
+-- a 'Val' encoding the corresponding TH 'Exp'. The result is the
+-- same encoding as 'liftVal' / 'liftBuiltin' produces.
+exprToVal :: Expr -> IO Val
+exprToVal (EVar n)
+    -- Capitalised name → ConE; lowercase/operator → VarE.
+    | not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z' = do
+        nt <- thName n
+        force =<< newWHNFThunk (VCon "ConE" [nt])
+    | otherwise = do
+        nt <- thName n
+        force =<< newWHNFThunk (VCon "VarE" [nt])
+exprToVal (ELit (LInt n)) = do
+    litT <- integerL n
+    force =<< litE litT
+exprToVal (ELit (LFloat d)) = do
+    -- Encode floating-point as IntegerL (round) — RationalL needs more infra.
+    litT <- integerL (round d)
+    force =<< litE litT
+exprToVal (ELit (LStr bs)) = do
+    charListVal <- buildCharList (BC.unpack bs)
+    litT <- stringL charListVal
+    force =<< litE litT
+  where
+    buildCharList []     = pure (VCon "[]" [])
+    buildCharList (c:cs) = do
+        h    <- newWHNFThunk (VChar c)
+        rest <- buildCharList cs
+        t    <- newWHNFThunk rest
+        pure (VCon ":" [h, t])
+exprToVal (ELit (LChar c)) = do
+    litT <- charL c
+    force =<< litE litT
+exprToVal (EApp f x) = do
+    fV  <- exprToVal f
+    xV  <- exprToVal x
+    fT  <- newWHNFThunk fV
+    xT  <- newWHNFThunk xV
+    force =<< appE fT xT
+exprToVal (ETuple es) = do
+    elemVals <- mapM exprToVal es
+    elemTs   <- mapM newWHNFThunk elemVals
+    force =<< tupE elemTs
+exprToVal (ENeg e) = do
+    -- negate x  =  AppE (VarE "negate") x
+    negT <- do
+        nt <- thName "negate"
+        newWHNFThunk (VCon "VarE" [nt])
+    xV   <- exprToVal e
+    xT   <- newWHNFThunk xV
+    force =<< appE negT xT
+-- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
+exprToVal _ =
+    force =<< newWHNFThunk (VCon "VarE" [])
 
 --------------------------------------------------------------------------------
 -- Builtin name pairs to register in the environment

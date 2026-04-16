@@ -31,6 +31,7 @@ module IHC.CabalProject
     , findLocalCabalFile
       -- * Cache-wide search path
     , cachedPackageSearchPath
+    , cachedPackageSearchPathWithIncludes
     , cabalTarballSearchPath
     ) where
 
@@ -81,16 +82,20 @@ import qualified Distribution.Utils.Path as CabalPath
 -- | Everything we care about from a single @.cabal@ file for the
 -- purposes of module loading. See the Phase 2.7 plan for context.
 data PackageInfo = PackageInfo
-    { pkgName       :: !ByteString
-    , pkgVersion    :: !ByteString
-    , pkgSourceDirs :: ![FilePath]
+    { pkgName        :: !ByteString
+    , pkgVersion     :: !ByteString
+    , pkgSourceDirs  :: ![FilePath]
       -- ^ Absolute paths to the package's @hs-source-dirs@. Defaults
       -- to the package root itself if the @.cabal@ file omits
       -- @hs-source-dirs@.
-    , pkgExtensions :: ![ByteString]
+    , pkgExtensions  :: ![ByteString]
       -- ^ Library's @default-extensions@, verbatim.
-    , pkgCppOptions :: ![ByteString]
+    , pkgCppOptions  :: ![ByteString]
       -- ^ Library's @cpp-options@, verbatim.
+    , pkgIncludeDirs :: ![FilePath]
+      -- ^ Absolute paths from the library's @include-dirs:@ stanza.
+      -- These are the directories the C preprocessor searches when
+      -- resolving @#include \"file.h\"@ directives.
     }
     deriving stock (Show, Eq)
 
@@ -297,16 +302,18 @@ gpdToPackageInfo packageRoot gpd =
                        else [ packageRoot </> CabalPath.getSymbolicPath sd
                             | sd <- srcDirs0
                             ]
-        exts     = [ BC.pack (CabalPretty.prettyShow e)
-                   | e <- defaultExtensions bi
-                   ]
-        cppOpts  = [ BC.pack s | s <- cppOptions bi ]
+        exts      = [ BC.pack (CabalPretty.prettyShow e)
+                    | e <- defaultExtensions bi
+                    ]
+        cppOpts   = [ BC.pack s | s <- cppOptions bi ]
+        incDirs   = [ packageRoot </> d | d <- includeDirs bi ]
     in PackageInfo
-        { pkgName       = name
-        , pkgVersion    = version
-        , pkgSourceDirs = srcDirs
-        , pkgExtensions = exts
-        , pkgCppOptions = cppOpts
+        { pkgName        = name
+        , pkgVersion     = version
+        , pkgSourceDirs  = srcDirs
+        , pkgExtensions  = exts
+        , pkgCppOptions  = cppOpts
+        , pkgIncludeDirs = incDirs
         }
 
 -- Local stub so we don't depend on a specific Cabal BuildInfo default
@@ -396,6 +403,104 @@ cachedPackageSearchPath = do
         let srcDir = pkgDir </> "src"
         hasSrc <- doesDirectoryExist srcDir
         pure [if hasSrc then srcDir else pkgDir]
+
+-- | Like 'cachedPackageSearchPath' but returns @(srcDir, includeDirs)@
+-- pairs so callers can look up the @include-dirs@ for the package that
+-- owns a given source file.
+--
+-- For each package directory we return one entry per @hs-source-dirs@
+-- entry, all sharing the same @pkgIncludeDirs@.  When a package has no
+-- @include-dirs@ the list is empty (no overhead for callers).
+--
+-- Priority order matches 'cachedPackageSearchPath':
+-- nix-pinned → user cache → cabal tarball cache.
+cachedPackageSearchPathWithIncludes :: IO [(FilePath, [FilePath])]
+cachedPackageSearchPathWithIncludes = do
+    home <- getHomeDirectory
+    let userCache = home </> ".cache" </> "ihc" </> "sources"
+    nixPairs   <- nixIncludePairs
+    userPairs  <- enumerateWithIncludes userCache
+    cabalPairs <- cabalTarballIncludePairs
+    pure (nixPairs ++ userPairs ++ cabalPairs)
+  where
+    nixIncludePairs :: IO [(FilePath, [FilePath])]
+    nixIncludePairs = do
+        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
+        case mDir of
+            Nothing  -> pure []
+            Just dir -> enumerateWithIncludes dir
+
+    enumerateWithIncludes :: FilePath -> IO [(FilePath, [FilePath])]
+    enumerateWithIncludes sourcesDir = do
+        exists <- doesDirectoryExist sourcesDir
+        if not exists
+            then pure []
+            else do
+                entries <- listDirectory sourcesDir
+                concat <$> mapM (pairsForEntry sourcesDir) entries
+
+    pairsForEntry sourcesDir entry = do
+        let pkgDir = sourcesDir </> entry
+        isDir <- doesDirectoryExist pkgDir
+        if not isDir
+            then pure []
+            else do
+                mCabal <- findLocalCabalFile pkgDir
+                case mCabal of
+                    Just cabalPath -> do
+                        mInfo <- parseCabalFile pkgDir cabalPath
+                        case mInfo of
+                            Just info ->
+                                pure [ (sd, pkgIncludeDirs info)
+                                     | sd <- pkgSourceDirs info
+                                     ]
+                            Nothing -> fallbackPair pkgDir
+                    Nothing -> fallbackPair pkgDir
+
+    -- No .cabal to parse → no include-dirs known; emit an empty pair.
+    fallbackPair pkgDir = do
+        let srcDir = pkgDir </> "src"
+        hasSrc <- doesDirectoryExist srcDir
+        let sd = if hasSrc then srcDir else pkgDir
+        pure [(sd, [])]
+
+    cabalTarballIncludePairs :: IO [(FilePath, [FilePath])]
+    cabalTarballIncludePairs = do
+        home <- getHomeDirectory
+        let cabalRoot = home </> ".cabal" </> "packages" </> "hackage.haskell.org"
+        exists <- doesDirectoryExist cabalRoot
+        if not exists
+            then pure []
+            else do
+                pkgDirs <- listDirectory cabalRoot
+                fmap concat $ mapM (pkgPairs cabalRoot) pkgDirs
+
+    pkgPairs cabalRoot pkg = do
+        let pkgRoot = cabalRoot </> pkg
+        isDir <- doesDirectoryExist pkgRoot
+        if not isDir
+            then pure []
+            else do
+                verDirs <- listDirectory pkgRoot
+                fmap concat $ mapM (verPairs pkgRoot pkg) verDirs
+
+    verPairs pkgRoot pkg ver = do
+        let extracted = pkgRoot </> ver </> (pkg <> "-" <> ver)
+        hasDir <- doesDirectoryExist extracted
+        if not hasDir
+            then pure []
+            else do
+                mCabal <- findLocalCabalFile extracted
+                case mCabal of
+                    Just cabalPath -> do
+                        mInfo <- parseCabalFile extracted cabalPath
+                        case mInfo of
+                            Just info ->
+                                pure [ (sd, pkgIncludeDirs info)
+                                     | sd <- pkgSourceDirs info
+                                     ]
+                            Nothing -> fallbackPair extracted
+                    Nothing -> fallbackPair extracted
 
 -- | Enumerate already-extracted source trees from Cabal's local tarball
 -- cache at @~\/.cabal\/packages\/hackage.haskell.org\/@.

@@ -34,13 +34,14 @@ module IHC.Scheduler
     , loadProgramFromSource
     , buildBaseEnv
     , loadImportIntoEnv
+    , loadFileIntoEnv
       -- * Types exposed for testing
     , ModuleRegistry
     ) where
 
 import Control.Exception (throwIO, Exception, catch)
 import qualified System.IO
-import Data.ByteString (ByteString)
+import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
@@ -48,13 +49,13 @@ import Data.Map.Strict (Map)
 import Data.List (isPrefixOf)
 import Data.Maybe (fromMaybe)
 import System.Directory (doesFileExist, getHomeDirectory)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
-import IHC.CabalProject (cachedPackageSearchPath)
+import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
 import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance)
-import IHC.Cpp (cppPreprocess, defaultCppContext)
+import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force)
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
@@ -67,9 +68,17 @@ import IHC.Val
 
 -- | Run our hand-rolled CPP over the source bytes, returning a new
 -- 'Source' with the same filename and the preprocessed contents.
+-- Uses no extra include-dirs; call 'cppSourceWithIncludes' when the
+-- owning package's @include-dirs:@ is known.
 cppSource :: Source -> IO Source
-cppSource src = do
-    bs' <- cppPreprocess defaultCppContext (srcName src) (srcBytes src)
+cppSource = cppSourceWithIncludes []
+
+-- | Like 'cppSource' but also searches the given @includeDirs@ when
+-- resolving @#include "file"@ directives (from the package's
+-- @include-dirs:@ cabal stanza).
+cppSourceWithIncludes :: [FilePath] -> Source -> IO Source
+cppSourceWithIncludes includeDirs src = do
+    bs' <- cppPreprocessWithIncludes includeDirs defaultCppContext (srcName src) (srcBytes src)
     pure (src { srcBytes = bs' })
 
 --------------------------------------------------------------------------------
@@ -135,8 +144,11 @@ loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Enumerate cached packages once; hs-source-dirs are respected via
     -- parseCabalFile inside cachedPackageSearchPath.
-    cacheDirs <- cachedPackageSearchPath
-    let fullSearchPath = searchPath ++ cacheDirs
+    -- Also collect include-dirs so CPP can find package headers.
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs      = map fst cacheWithIncludes
+        includeMap     = Map.fromList cacheWithIncludes
+        fullSearchPath = searchPath ++ cacheDirs
 
     registry <- newIORef Map.empty
 
@@ -155,7 +167,7 @@ loadProgramFromSource searchPath src0 = do
     let entryName = lmName entry
 
     -- Drive discovery from `main`.
-    discoverInModule registry fullSearchPath entry "main"
+    discoverInModule registry fullSearchPath includeMap entry "main"
 
     -- Collect every loaded module.
     reg <- readIORef registry
@@ -192,7 +204,7 @@ loadProgramFromSource searchPath src0 = do
     -- Name collisions: last-writer-wins via Map.union right-bias.
     -- Entry-module bindings are inserted LAST so they always shadow
     -- imported aliases.
-    aliases <- buildAliases registry fullSearchPath entry slots qualPairs
+    aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let envWithAliases = Map.union aliases qualEnv
     let env = envWithAliases
 
@@ -222,6 +234,89 @@ buildBaseEnv = do
     let env = Map.union conEnv builtins
     pure (env, classReg)
 
+-- | Load a .hs file for the REPL's @:l@ command and bring its exported
+-- names into scope UNQUALIFIED, matching ghci semantics.
+--
+-- Algorithm:
+--   1. Parse the module header to learn the export spec.
+--   2. If the file declares @module Foo (exports) where@, only the
+--      exported names are brought into scope; otherwise ALL top-level
+--      names are exposed (bare file / @module Foo where@).
+--   3. Every exported name is demand-discovered so its body lands in
+--      the env.  The env keys for the entry module's own bindings are
+--      already unqualified (see 'exportBodies' / lmIsEntry).
+--   4. The result is the env keyed as bare names, plus the fully-
+--      qualified @Module.name@ aliases for any imported libraries that
+--      the file pulls in.
+--
+-- Returns @(updatedEnv, exportedNameCount)@.
+loadFileIntoEnv
+    :: [FilePath]   -- ^ search path (e.g. the file's own directory)
+    -> FilePath     -- ^ the .hs file path
+    -> Env          -- ^ existing REPL env (builtins etc.)
+    -> IO (Env, Int)
+loadFileIntoEnv searchPath path existingEnv = do
+    src0 <- readSourceFile path
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs      = map fst cacheWithIncludes
+        includeMap     = Map.fromList cacheWithIncludes
+        fullSearchPath = searchPath ++ cacheDirs
+    src <- cppSource src0
+    registry <- newIORef Map.empty
+    classReg <- newClassRegistry
+    -- Load the entry module.
+    entry <- loadEntryModule registry src
+    -- Determine which names to bring into scope.
+    allNames <- scanAllTopLevelNames (lmSource entry)
+    let header      = lmHeader entry
+        -- Names the module declares it exports (or all names if ExportAll).
+        exported = case mhExports header of
+            ExportAll    -> allNames
+            ExportList _ -> filter (exportsNameDirect header) allNames
+    -- Demand-discover every exported name.
+    mapM_ (discoverInModule registry fullSearchPath includeMap entry) exported
+    -- Collect all loaded modules.
+    reg <- readIORef registry
+    let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
+    let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules)
+        unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+    conEnv    <- buildConEnv  unionedData
+    fieldEnv' <- buildFieldEnv unionedFields
+    builtins  <- builtinEnv classReg
+    let base = Map.union fieldEnv' (Map.union conEnv builtins)
+    -- Phase 2.11: expand TH splices.
+    mapM_ (expandSplicesInModule base) loadedModules
+    -- Build (key, Expr) pairs.  Entry module bindings are keyed bare.
+    qualPairs <- concat <$> mapM (exportBodies registry) loadedModules
+    -- Tie the knot.
+    slots <- mapM (\_ -> newIORef BlackHole) qualPairs
+    let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
+    -- Aliases: imported libs get bare+qualified aliases in the entry scope.
+    aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
+    let innerEnv = Map.union aliases qualEnv
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
+          (zip qualPairs slots)
+    -- Register type-class instances.
+    mapM_ (registerInstancesFrom classReg innerEnv) loadedModules
+    -- If the file has no `main` binding, inject `main = ()` so that the
+    -- REPL user can type `main` without getting "unbound variable main".
+    -- This matches the old :load behaviour and keeps the no_main regression
+    -- test green.
+    let hasMain = BC.pack "main" `elem` allNames
+    mainFallback <- if hasMain
+        then pure Map.empty
+        else do
+            slot <- newIORef (Evaluated VUnit)
+            pure (Map.singleton (BC.pack "main") slot)
+    -- Merge into the existing REPL env (existing wins on collision).
+    let newBindings = Map.union aliases (Map.union qualEnv mainFallback)
+        additions   = Map.difference newBindings existingEnv
+        merged      = Map.union existingEnv additions
+        -- Count exported names that are newly visible (bare unqualified keys).
+        newExportedCount = length (filter (`Map.member` additions) exported)
+    pure (merged, newExportedCount)
+
 -- | Load a single import declaration into an existing 'Env', as if the
 -- REPL user typed @import Foo@ at the prompt.
 --
@@ -249,16 +344,46 @@ loadImportIntoEnv searchPath imp existingEnv
     | isBuiltinBackedModule (impModule imp) = pure (existingEnv, 0)
     | otherwise = do
         -- Append cached package search dirs so mtl, transformers, etc. resolve.
-        cacheDirs <- cachedPackageSearchPath
-        let fullSearchPath = searchPath ++ cacheDirs
+        cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+        let cacheDirs      = map fst cacheWithIncludes
+            includeMap     = Map.fromList cacheWithIncludes
+            fullSearchPath = searchPath ++ cacheDirs
         registry <- newIORef Map.empty
         -- Load the target module (and its transitive imports).
-        targetLm <- loadModule registry fullSearchPath (impModule imp)
-        -- Discover ALL exported top-level names in the target module.
-        allNames <- scanAllTopLevelNames (lmSource targetLm)
-        let exported = filter (exportsName (lmHeader targetLm))
-                     $ filter (specAllows (impSpec imp)) allNames
-        mapM_ (discoverInModule registry fullSearchPath targetLm) exported
+        targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
+        -- Collect names to discover:
+        --   1. Locally-defined names exported by the module.
+        --   2. ExportName entries not locally defined but re-exported via
+        --      imports (e.g. Prelude exports `maybe` from Data.Maybe).
+        --      discoverInModule follows the module's imports automatically.
+        allLocalNames <- scanAllTopLevelNames (lmSource targetLm)
+        let exportedLocal = filter (exportsName (lmHeader targetLm))
+                          $ filter (specAllows (impSpec imp)) allLocalNames
+            -- Named re-exports not locally defined; discoverInModule will
+            -- chase through the module's imports to find them.
+            -- Only lowercase-first names are value bindings; type constructors
+            -- (uppercase or operators) would trigger loading GHC.Base → OOM.
+            namedReexports = case mhExports (lmHeader targetLm) of
+                ExportAll    -> []
+                ExportList xs ->
+                    [ n | ExportName n <- xs
+                        , n `notElem` allLocalNames
+                        , specAllows (impSpec imp) n
+                        , not (BC.null n) && BC.head n >= 'a' && BC.head n <= 'z'
+                    ]
+            exported = nubBS (exportedLocal ++ namedReexports)
+        mapM_ (discoverInModule registry fullSearchPath includeMap targetLm) exported
+        -- For ExportModule re-exports (e.g. `module Control.Monad` in
+        -- Prelude's export list) also load those modules and discover their
+        -- names, so names from re-exported modules are available.
+        let reexportedMods = moduleReexports (lmHeader targetLm)
+        reexportedLms <- mapM (loadModule registry fullSearchPath includeMap) reexportedMods
+        reexportedNamesPerMod <- mapM (\lm -> do
+            ns <- scanAllTopLevelNames (lmSource lm)
+            let ns' = filter (specAllows (impSpec imp)) ns
+            mapM_ (discoverInModule registry fullSearchPath includeMap lm) ns'
+            pure (lm, ns')
+            ) reexportedLms
         -- Collect every loaded module and build a combined env.
         reg <- readIORef registry
         let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
@@ -286,21 +411,59 @@ loadImportIntoEnv searchPath imp existingEnv
                 Nothing
                     | impQualified imp -> lmName targetLm <> BC.pack "."
                     | otherwise        -> BC.empty
+            -- Look up a bare name in thunkByKey.  Try the direct modPrefix
+            -- first (locally-defined names).  If not found, search for any
+            -- key with suffix "." <> n — this handles named re-exports
+            -- (e.g. Prelude exports `maybe` keyed as "Data.Maybe.maybe").
+            lookupThunk n =
+                case Map.lookup (modPrefix <> n) thunkByKey of
+                    Just t  -> Just t
+                    Nothing ->
+                        let suffix = BC.pack "." <> n
+                        in case [ t | (k, t) <- Map.toList thunkByKey
+                                    , suffix `isSuffixOf` k ] of
+                            (t:_) -> Just t
+                            []    -> Nothing
+            -- Aliases for exported names (local or re-exported via imports).
             bareAliases
                 | impQualified imp = []
                 | otherwise =
                     [ (n, t)
                     | n <- exported
-                    , Just t <- [Map.lookup (modPrefix <> n) thunkByKey]
+                    , Just t <- [lookupThunk n]
                     ]
             qualAliases
                 | BC.null qualPrefix = []
                 | otherwise =
                     [ (qualPrefix <> n, t)
                     | n <- exported
-                    , Just t <- [Map.lookup (modPrefix <> n) thunkByKey]
+                    , Just t <- [lookupThunk n]
                     ]
-        let aliasEnv = Map.fromList (bareAliases ++ qualAliases)
+            -- Aliases for names re-exported via `module Foo` entries.
+            -- These come from the re-exported modules' own exported names.
+            reexportBareAliases
+                | impQualified imp = []
+                | otherwise =
+                    [ (n, t)
+                    | (reLm, reNs) <- reexportedNamesPerMod
+                    , n <- reNs
+                    , exportsNameDirect (lmHeader reLm) n
+                    , let rePrefix = lmName reLm <> BC.pack "."
+                    , Just t <- [Map.lookup (rePrefix <> n) thunkByKey]
+                    ]
+            reexportQualAliases
+                | BC.null qualPrefix = []
+                | otherwise =
+                    [ (qualPrefix <> n, t)
+                    | (reLm, reNs) <- reexportedNamesPerMod
+                    , n <- reNs
+                    , exportsNameDirect (lmHeader reLm) n
+                    , let rePrefix = lmName reLm <> BC.pack "."
+                    , Just t <- [Map.lookup (rePrefix <> n) thunkByKey]
+                    ]
+        let aliasEnv = Map.fromList
+                ( bareAliases ++ qualAliases
+               ++ reexportBareAliases ++ reexportQualAliases )
         -- The final env visible to imported bindings: qualEnv + aliases.
         -- We also include the aliases so that intra-module cross-references
         -- (e.g. `greet` calling `suffix`) resolve properly.
@@ -314,7 +477,9 @@ loadImportIntoEnv searchPath imp existingEnv
         let newBindings = Map.union qualEnv aliasEnv
             additions   = Map.difference newBindings existingEnv
             merged      = Map.union existingEnv additions
-            newAliases  = Map.fromList (bareAliases ++ qualAliases)
+            newAliases  = Map.fromList
+                            ( bareAliases ++ qualAliases
+                           ++ reexportBareAliases ++ reexportQualAliases )
                           `Map.difference` existingEnv
         pure (merged, Map.size newAliases)
 
@@ -503,6 +668,7 @@ rewriteExpr rw = go []
                 bs'    = [(n, go bound' b) | (n, b) <- bs]
             in EImplicitLet bs' (go bound' e)
         ESplice inner   -> ESplice (go bound inner)
+        EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
@@ -539,11 +705,12 @@ rewriteExpr rw = go []
 buildAliases
     :: ModuleRegistry
     -> [FilePath]
+    -> Map FilePath [FilePath]  -- ^ include-dirs map (unused here, threaded for API consistency)
     -> LoadedModule
     -> [Thunk]
     -> [(ByteString, Expr)]
     -> IO Env
-buildAliases registry _searchPath entry slots qualPairs = do
+buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     -- Index qualPairs so we can look up "Module.name" -> Thunk fast.
     let thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
     -- Only the entry module contributes aliases (for now).
@@ -665,9 +832,10 @@ loadEntryModule registry src = do
 loadModule
     :: ModuleRegistry
     -> [FilePath]
+    -> Map FilePath [FilePath]  -- ^ include-dirs map: srcDir -> includeDirs
     -> ModuleName
     -> IO LoadedModule
-loadModule registry searchPath name = do
+loadModule registry searchPath includeMap name = do
     reg <- readIORef registry
     case Map.lookup name reg of
         Just (Loaded lm) -> pure lm
@@ -685,7 +853,11 @@ loadModule registry searchPath name = do
                 else do
                     path <- locateModule searchPath name
                     src0 <- readSourceFile path
-                    src  <- cppSource src0
+                    -- Look up the package's include-dirs by matching the
+                    -- file's directory against the includeMap.
+                    let fileDir    = takeDirectory path
+                        incDirs    = lookupIncludeDirs includeMap fileDir
+                    src  <- cppSourceWithIncludes incDirs src0
                     (mHeader, _) <- parseModuleHeader src startCursor
                     let header = fromMaybe emptyHeader mHeader
                         declared = fromMaybe name (mhName header)
@@ -693,6 +865,22 @@ loadModule registry searchPath name = do
                     lm <- buildLoadedModule declared False header src
                     modifyIORef' registry (Map.insert name (Loaded lm))
                     pure lm
+
+-- | Look up the include-dirs for a source file by matching its directory
+-- against the keys of the includeMap.  The file may live inside a
+-- subdirectory of the recorded source root (e.g. the source root is
+-- @bytestring-0.12.2.0/@ but the file is in @.../Data/ByteString/@), so
+-- we check every key as a prefix of @fileDir@.
+lookupIncludeDirs :: Map FilePath [FilePath] -> FilePath -> [FilePath]
+lookupIncludeDirs includeMap fileDir =
+    -- Walk all keys; return the first set of include-dirs whose source-dir
+    -- is a prefix of (or equal to) fileDir.
+    case [ dirs | (srcDir, dirs) <- Map.toList includeMap
+                , srcDir `isPrefixOf` fileDir
+                , not (null dirs)
+                ] of
+        (dirs : _) -> dirs
+        []         -> []
 
 -- | Phase 2.17: Minimal compiler-builtins-only whitelist.
 --
@@ -824,17 +1012,18 @@ isLocalModule searchPath name = do
 discoverInModule
     :: ModuleRegistry
     -> [FilePath]
+    -> Map FilePath [FilePath]  -- ^ include-dirs map: srcDir -> includeDirs
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModule registry searchPath lm name
+discoverInModule registry searchPath includeMap lm name
     -- Qualified name (contains a dot and the prefix looks like a module
     -- alias)? Route to the target module directly.
     | Just (qual, bareName) <- splitQualified name = do
-        mTarget <- resolveQualified registry searchPath lm qual
+        mTarget <- resolveQualified registry searchPath includeMap lm qual
         case mTarget of
             Just targetLm ->
-                discoverInModule registry searchPath targetLm bareName
+                discoverInModule registry searchPath includeMap targetLm bareName
             Nothing ->
                 throwIO (UnresolvedName
                     ("qualified name " <> BC.unpack name
@@ -857,11 +1046,11 @@ discoverInModule registry searchPath lm name
                         modifyIORef' (lmBodies lm) (Map.insert name expr)
                         -- Recurse into every free var. Qualified ones
                         -- will be routed on the next call.
-                        mapM_ (discoverInModule registry searchPath lm)
+                        mapM_ (discoverInModule registry searchPath includeMap lm)
                               (freeVars expr)
                     Nothing -> do
                         -- Not local. Try imports.
-                        mForeign <- resolveImport registry searchPath lm name
+                        mForeign <- resolveImport registry searchPath includeMap lm name
                         case mForeign of
                             Just () -> pure ()
                             Nothing ->
@@ -875,13 +1064,14 @@ discoverInModule registry searchPath lm name
 resolveQualified
     :: ModuleRegistry
     -> [FilePath]
+    -> Map FilePath [FilePath]  -- ^ include-dirs map
     -> LoadedModule
     -> ByteString
     -> IO (Maybe LoadedModule)
-resolveQualified registry searchPath lm qual = do
+resolveQualified registry searchPath includeMap lm qual = do
     let imports = mhImports (lmHeader lm)
     case filter (importMatchesQual qual) imports of
-        (imp:_) -> Just <$> loadModule registry searchPath (impModule imp)
+        (imp:_) -> Just <$> loadModule registry searchPath includeMap (impModule imp)
         []      -> pure Nothing
 
 importMatchesQual :: ByteString -> ImportDecl -> Bool
@@ -897,10 +1087,11 @@ importMatchesQual qual imp =
 resolveImport
     :: ModuleRegistry
     -> [FilePath]
+    -> Map FilePath [FilePath]  -- ^ include-dirs map
     -> LoadedModule
     -> ByteString
     -> IO (Maybe ())
-resolveImport registry searchPath lm name = do
+resolveImport registry searchPath includeMap lm name = do
     -- Only unqualified (non-qualified-import) imports can provide
     -- unqualified names.
     let imports = filter (not . impQualified) (mhImports (lmHeader lm))
@@ -912,7 +1103,7 @@ resolveImport registry searchPath lm name = do
         | impModule imp == BC.pack "Prelude" = tryImports rest
         | not (specAllows (impSpec imp) name) = tryImports rest
         | otherwise = do
-            targetLm <- loadModule registry searchPath (impModule imp)
+            targetLm <- loadModule registry searchPath includeMap (impModule imp)
             mLhs <- findOrResolveLhs (lmSource targetLm)
                                      (lmKnown targetLm) name
             case mLhs of
@@ -921,7 +1112,7 @@ resolveImport registry searchPath lm name = do
                     -- actually export @name@.
                     if exportsName (lmHeader targetLm) name
                         then do
-                            discoverInModule registry searchPath targetLm name
+                            discoverInModule registry searchPath includeMap targetLm name
                             pure (Just ())
                         else tryImports rest
                 Nothing ->
@@ -979,7 +1170,7 @@ resolveImport registry searchPath lm name = do
                     Just _ ->
                         if exportsName (lmHeader srcLm) name
                             then do
-                                discoverInModule registry searchPath srcLm name
+                                discoverInModule registry searchPath includeMap srcLm name
                                 pure (Just ())
                             else tryViaImports moreImps depth rest
                     Nothing ->
@@ -1002,13 +1193,13 @@ resolveImport registry searchPath lm name = do
                     if not local
                         then tryViaImports moreImps depth rest
                         else do
-                            srcLm <- loadModule registry searchPath (impModule imp)
+                            srcLm <- loadModule registry searchPath includeMap (impModule imp)
                             mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
                             case mLhs of
                                 Just _ ->
                                     if exportsName (lmHeader srcLm) name
                                         then do
-                                            discoverInModule registry searchPath srcLm name
+                                            discoverInModule registry searchPath includeMap srcLm name
                                             pure (Just ())
                                         else tryViaImports moreImps depth rest
                                 Nothing ->
@@ -1026,13 +1217,13 @@ resolveImport registry searchPath lm name = do
 
     tryReexports [] rest = tryImports rest
     tryReexports (modName:mods) rest = do
-        reLm <- loadModule registry searchPath modName
+        reLm <- loadModule registry searchPath includeMap modName
         mLhs <- findOrResolveLhs (lmSource reLm) (lmKnown reLm) name
         case mLhs of
             Just _ ->
                 if exportsName (lmHeader reLm) name
                     then do
-                        discoverInModule registry searchPath reLm name
+                        discoverInModule registry searchPath includeMap reLm name
                         pure (Just ())
                     else tryReexports mods rest
             Nothing ->
@@ -1045,6 +1236,15 @@ specAllows :: ImportSpec -> ByteString -> Bool
 specAllows ImportAll         _ = True
 specAllows (ImportOnly ns)   n = n `elem` ns
 specAllows (ImportHiding ns) n = n `notElem` ns
+
+-- | Remove duplicate 'ByteString' elements from a list, preserving order.
+nubBS :: [ByteString] -> [ByteString]
+nubBS = go []
+  where
+    go _    []     = []
+    go seen (x:xs)
+        | x `elem` seen = go seen xs
+        | otherwise      = x : go (x:seen) xs
 
 -- | Extract any @module Foo@ re-export module names from a module's
 -- export list.  Used by 'resolveImport' to follow re-export chains.
@@ -1154,6 +1354,7 @@ freeVars = goAll []
                 bound' = names ++ bound
             in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
         ESplice inner   -> goAll bound inner
+        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
         ELabel _        -> []   -- Phase 3.5: labels have no free variables
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
@@ -1230,6 +1431,7 @@ desugarRecordCons fldReg = go
     go (EImplicitRef n) = EImplicitRef n
     go (EImplicitLet bs e) =
         EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
+    go (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
     go e                = e  -- EVar, ELit
 
     goStmt (SExpr e)   = SExpr (go e)
@@ -1272,6 +1474,7 @@ desugarRecordPats fldReg = goExpr
     goExpr (EImplicitLet bs e) =
         EImplicitLet [(n, goExpr b) | (n, b) <- bs] (goExpr e)
     goExpr (ESplice inner)  = ESplice (goExpr inner)
+    goExpr (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
     goExpr e                = e  -- EVar, ELit
 
     goStmt (SExpr e)   = SExpr (goExpr e)

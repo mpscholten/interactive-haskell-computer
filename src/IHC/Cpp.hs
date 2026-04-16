@@ -37,6 +37,7 @@ module IHC.Cpp
     ( CppContext
     , MacroBody(..)
     , cppPreprocess
+    , cppPreprocessWithIncludes
     , defaultCppContext
     , emptyCppContext
     , defineObject
@@ -109,12 +110,25 @@ instance Exception IncludeMissing
 --------------------------------------------------------------------------------
 
 -- | Entry point. No-op if the source has no CPP directives.
+-- Uses no extra include directories; see 'cppPreprocessWithIncludes' for
+-- a variant that respects a package's @include-dirs:@ stanza.
 cppPreprocess :: CppContext -> FilePath -> ByteString -> IO ByteString
-cppPreprocess ctx0 path src
+cppPreprocess ctx0 path src = cppPreprocessWithIncludes [] ctx0 path src
+
+-- | Like 'cppPreprocess' but also searches the given @includeDirs@ when
+-- resolving a @#include "file"@ directive.  The search order is:
+--   1. The directory of the file containing the @#include@.
+--   2. Each directory in @includeDirs@ (in order).
+--   3. The existing ancestor-@include\/@ heuristic as a last resort.
+--
+-- This is the entry point used by the scheduler when it has looked up
+-- the owning package's @include-dirs:@ from its @.cabal@ file.
+cppPreprocessWithIncludes :: [FilePath] -> CppContext -> FilePath -> ByteString -> IO ByteString
+cppPreprocessWithIncludes includeDirs ctx0 path src
     | not (hasCppDirective src) = pure src
     | otherwise = do
         let ls = splitLines src
-        (outLs, _) <- processIO ctx0 True ls [] path 0
+        (outLs, _) <- processIO includeDirs ctx0 True ls [] path 0
         pure (joinLines outLs)
 
 -- | Quick scan: any `#` appearing at start of line? (Tolerates leading
@@ -179,15 +193,16 @@ joinContinuations ln rest
 -- For each input line, emit either the processed line (if active) or a
 -- blank line (if skipped / directive) so line numbers match.
 processIO
-    :: CppContext
+    :: [FilePath]        -- ^ extra include-dirs (from @include-dirs:@ in .cabal)
+    -> CppContext
     -> Bool              -- ^ current scope is active
     -> [ByteString]      -- ^ remaining input lines
     -> [BranchFrame]     -- ^ branch stack
     -> FilePath          -- ^ path of the file being processed (for #include resolution)
     -> Int               -- ^ current include nesting depth
     -> IO ([ByteString], CppContext)
-processIO ctx _active [] _ _ _ = pure ([], ctx)
-processIO ctx active (ln : rest) stack filePath depth =
+processIO _includeDirs ctx _active [] _ _ _ = pure ([], ctx)
+processIO includeDirs ctx active (ln : rest) stack filePath depth =
     -- For directive lines (starting with optional whitespace then '#'),
     -- join any backslash-continuation lines into a single logical directive.
     -- Continuation lines are replaced with blank output lines to preserve
@@ -205,21 +220,21 @@ processIO ctx active (ln : rest) stack filePath depth =
         Just (DirIf expr) -> do
             let taken = active && evalCondExpr ctx expr
                 frame = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            (xs, c) <- processIO includeDirs ctx taken rest' (frame : stack) filePath depth
             pure (emit1 xs, c)
 
         Just (DirIfdef name) -> do
             let defined = Map.member name ctx
                 taken   = active && defined
                 frame   = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            (xs, c) <- processIO includeDirs ctx taken rest' (frame : stack) filePath depth
             pure (emit1 xs, c)
 
         Just (DirIfndef name) -> do
             let defined = Map.member name ctx
                 taken   = active && not defined
                 frame   = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            (xs, c) <- processIO includeDirs ctx taken rest' (frame : stack) filePath depth
             pure (emit1 xs, c)
 
         Just (DirElif expr) -> case stack of
@@ -228,10 +243,10 @@ processIO ctx active (ln : rest) stack filePath depth =
                     newAct = bfParent f && not (bfAnyTaken f) && cond
                     f'     = f { bfAnyTaken = bfAnyTaken f || newAct
                                , bfActive   = newAct }
-                (xs, c) <- processIO ctx newAct rest' (f' : fs) filePath depth
+                (xs, c) <- processIO includeDirs ctx newAct rest' (f' : fs) filePath depth
                 pure (emit1 xs, c)
             [] -> do  -- stray #elif — pretend blank
-                (xs, c) <- processIO ctx active rest' stack filePath depth
+                (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
                 pure (emit1 xs, c)
 
         Just DirElse -> case stack of
@@ -239,10 +254,10 @@ processIO ctx active (ln : rest) stack filePath depth =
                 let newAct = bfParent f && not (bfAnyTaken f)
                     f'     = f { bfAnyTaken = bfAnyTaken f || newAct
                                , bfActive   = newAct }
-                (xs, c) <- processIO ctx newAct rest' (f' : fs) filePath depth
+                (xs, c) <- processIO includeDirs ctx newAct rest' (f' : fs) filePath depth
                 pure (emit1 xs, c)
             [] -> do
-                (xs, c) <- processIO ctx active rest' stack filePath depth
+                (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
                 pure (emit1 xs, c)
 
         Just DirEndif -> case stack of
@@ -250,22 +265,22 @@ processIO ctx active (ln : rest) stack filePath depth =
                 let parent = case fs of
                         (f:_) -> bfActive f
                         []    -> True
-                (xs, c) <- processIO ctx parent rest' fs filePath depth
+                (xs, c) <- processIO includeDirs ctx parent rest' fs filePath depth
                 pure (emit1 xs, c)
             [] -> do
-                (xs, c) <- processIO ctx active rest' stack filePath depth
+                (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
                 pure (emit1 xs, c)
 
         Just (DirDefine name body) -> do
             let ctx' | active    = Map.insert name body ctx
                      | otherwise = ctx
-            (xs, c) <- processIO ctx' active rest' stack filePath depth
+            (xs, c) <- processIO includeDirs ctx' active rest' stack filePath depth
             pure (emit1 xs, c)
 
         Just (DirUndef name) -> do
             let ctx' | active    = Map.delete name ctx
                      | otherwise = ctx
-            (xs, c) <- processIO ctx' active rest' stack filePath depth
+            (xs, c) <- processIO includeDirs ctx' active rest' stack filePath depth
             pure (emit1 xs, c)
 
         Just (DirInclude incPath) | active -> do
@@ -277,11 +292,16 @@ processIO ctx active (ln : rest) stack filePath depth =
                 then throwIO (IncludeDepthExceeded resolved)
                 else do
                     maybeBytes <- tryReadFile resolved
-                    -- Fallback: search ancestor include/ directories.
-                    -- This handles Hackage packages that ship headers in
-                    -- a top-level include/ dir (e.g. bytestring).
-                    maybeBytes' <- case maybeBytes of
+                    -- Fallback 1: search cabal include-dirs (from include-dirs: stanza).
+                    -- This is the primary fix for packages like bytestring that ship
+                    -- headers in a separate include/ directory.
+                    maybeBytes1 <- case maybeBytes of
                         Just _  -> pure maybeBytes
+                        Nothing -> searchIncludeDirs includeDirs incPath
+                    -- Fallback 2: walk ancestor include/ directories heuristically.
+                    -- Handles packages where the cabal include-dirs weren't parsed.
+                    maybeBytes' <- case maybeBytes1 of
+                        Just _  -> pure maybeBytes1
                         Nothing -> do
                             mAncestor <- findInAncestorIncludes dir incPath
                             case mAncestor of
@@ -292,12 +312,16 @@ processIO ctx active (ln : rest) stack filePath depth =
                             -- Read and preprocess the included file with the
                             -- current macro table (C semantics: #define from
                             -- the outer file is visible in the included file).
+                            -- The resolved path for the included file should be
+                            -- the path we actually found it at, so relative
+                            -- includes inside it also resolve correctly.
+                            resolvedPath <- findIncludePath dir includeDirs incPath
                             let incLines = splitLines incBytes
-                            (incOut, ctx') <- processIO ctx True incLines [] resolved (depth + 1)
+                            (incOut, ctx') <- processIO includeDirs ctx True incLines [] resolvedPath (depth + 1)
                             -- The included lines replace the single #include
                             -- directive line; then continue with the rest of
                             -- the current file using the updated ctx'.
-                            (xs, c) <- processIO ctx' active rest' stack filePath depth
+                            (xs, c) <- processIO includeDirs ctx' active rest' stack filePath depth
                             pure (incOut ++ contBlanks ++ xs, c)
                         Nothing
                             | isSystemHeader incPath -> do
@@ -306,26 +330,59 @@ processIO ctx active (ln : rest) stack filePath depth =
                                 -- This is safe for generated headers like
                                 -- HsBaseConfig.h that live only in the build tree.
                                 hPutStrLn stderr ("IHC.Cpp: skipping unresolvable system include: " ++ incPath)
-                                (xs, c) <- processIO ctx active rest' stack filePath depth
+                                (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
                                 pure (emit1 xs, c)
                             | otherwise ->
                                 throwIO (IncludeMissing incPath resolved)
 
         Just (DirInclude _) -> do
             -- #include in a disabled block: skip it.
-            (xs, c) <- processIO ctx active rest' stack filePath depth
+            (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
             pure (emit1 xs, c)
 
         Just DirIgnore -> do
-            (xs, c) <- processIO ctx active rest' stack filePath depth
+            (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
             pure (emit1 xs, c)
 
         Nothing -> do
             -- Regular line. Emit iff active; otherwise blank.
             -- Note: for regular lines, contCount=0 and rest'=rest, so no change.
             let emit = if active then ln else BS.empty
-            (xs, c) <- processIO ctx active rest' stack filePath depth
+            (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
             pure (emit : xs, c)
+
+-- | Search a list of include directories for @incPath@, returning the bytes
+-- of the first match or 'Nothing' if none is found.
+searchIncludeDirs :: [FilePath] -> FilePath -> IO (Maybe ByteString)
+searchIncludeDirs []       _       = pure Nothing
+searchIncludeDirs (d : ds) incPath = do
+    let candidate = d </> incPath
+    mb <- tryReadFile candidate
+    case mb of
+        Just _  -> pure mb
+        Nothing -> searchIncludeDirs ds incPath
+
+-- | Return the absolute path at which @incPath@ was found, searching
+-- first the source file's directory, then @includeDirs@, then the
+-- ancestor-include heuristic.  Falls back to @dir </> incPath@ when
+-- nothing matches (caller will either use the bytes already found or
+-- handle the error separately).
+findIncludePath :: FilePath -> [FilePath] -> FilePath -> IO FilePath
+findIncludePath dir includeDirs incPath = do
+    let direct = dir </> incPath
+    directOk <- fileExists direct
+    if directOk
+        then pure direct
+        else searchDirs includeDirs
+  where
+    searchDirs []       = do
+        -- Try ancestor heuristic.
+        mA <- findInAncestorIncludes dir incPath
+        pure (maybe (dir </> incPath) id mA)
+    searchDirs (d : ds) = do
+        let candidate = d </> incPath
+        ok <- fileExists candidate
+        if ok then pure candidate else searchDirs ds
 
 -- | True when an include path looks like a C/C++ system header rather than
 -- a Haskell source file.  We identify these by their extension: @.h@, @.hpp@,

@@ -161,6 +161,11 @@ eval env ipm = go
     go (ESplice _) =
         error "IHC.Eval: ESplice reached eval — splice expansion pass missed this node"
 
+    -- Phase 2.12: TemplateHaskellQuotes bracket [| expr |].
+    -- Produce a TH Exp-shaped Val encoding of the *syntax* of expr.
+    -- We do NOT evaluate expr — we encode its AST.
+    go (EQuote inner) = evalQuote inner
+
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
     tryAlts :: Val -> [Alt] -> IO Val
@@ -335,3 +340,76 @@ evalDo env ipm (SLet bs : rest) = do
 runIOVal :: Val -> IO Val
 runIOVal (VIO io) = io >>= runIOVal
 runIOVal v        = pure v
+
+--------------------------------------------------------------------------------
+-- Phase 2.12: TemplateHaskellQuotes — [| expr |] evaluation
+--
+-- evalQuote converts an IHC AST Expr into a TH Exp-shaped Val without
+-- evaluating the expression. This mirrors the encoding used by liftVal /
+-- thExpToExpr in IHC.TH so that $( [| e |] ) round-trips correctly.
+-- We define this here (not in IHC.TH) to avoid a module cycle since
+-- IHC.TH already imports IHC.Eval.
+--------------------------------------------------------------------------------
+
+evalQuote :: Expr -> IO Val
+evalQuote (EVar n)
+    -- Capitalised name → ConE; lowercase/operator → VarE.
+    | not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z' = do
+        nt <- newWHNFThunk (VStr n)
+        pure (VCon "ConE" [nt])
+    | otherwise = do
+        nt <- newWHNFThunk (VStr n)
+        pure (VCon "VarE" [nt])
+evalQuote (ELit (LInt n)) = do
+    nT   <- newWHNFThunk (VInt n)
+    litT <- newWHNFThunk (VCon "IntegerL" [nT])
+    pure (VCon "LitE" [litT])
+evalQuote (ELit (LFloat d)) = do
+    -- Store as IntegerL(round) — RationalL needs more infra for MVP.
+    nT   <- newWHNFThunk (VInt (round d))
+    litT <- newWHNFThunk (VCon "IntegerL" [nT])
+    pure (VCon "LitE" [litT])
+evalQuote (ELit (LChar c)) = do
+    cT   <- newWHNFThunk (VChar c)
+    litT <- newWHNFThunk (VCon "CharL" [cT])
+    pure (VCon "LitE" [litT])
+evalQuote (ELit (LStr bs)) = do
+    charListVal <- buildCharList (BC.unpack bs)
+    lT   <- newWHNFThunk charListVal
+    litT <- newWHNFThunk (VCon "StringL" [lT])
+    pure (VCon "LitE" [litT])
+  where
+    buildCharList []     = pure (VCon "[]" [])
+    buildCharList (c:cs) = do
+        h    <- newWHNFThunk (VChar c)
+        rest <- buildCharList cs
+        t    <- newWHNFThunk rest
+        pure (VCon ":" [h, t])
+evalQuote (EApp f x) = do
+    fV <- evalQuote f
+    xV <- evalQuote x
+    fT <- newWHNFThunk fV
+    xT <- newWHNFThunk xV
+    pure (VCon "AppE" [fT, xT])
+evalQuote (ENeg e) = do
+    -- negate x  →  AppE (VarE "negate") (evalQuote x)
+    negT <- newWHNFThunk =<< evalQuote (EVar "negate")
+    xV   <- evalQuote e
+    xT   <- newWHNFThunk xV
+    pure (VCon "AppE" [negT, xT])
+evalQuote (ETuple es) = do
+    elemVals <- mapM evalQuote es
+    elemTs   <- mapM newWHNFThunk elemVals
+    listVal  <- buildThunkList elemTs
+    lT       <- newWHNFThunk listVal
+    pure (VCon "TupE" [lT])
+  where
+    buildThunkList []     = pure (VCon "[]" [])
+    buildThunkList (x:xs) = do
+        tailVal <- buildThunkList xs
+        tailT   <- newWHNFThunk tailVal
+        pure (VCon ":" [x, tailT])
+-- Unsupported forms: emit a VarE "<unsupported>" placeholder.
+evalQuote _ = do
+    nt <- newWHNFThunk (VStr "<unsupported>")
+    pure (VCon "VarE" [nt])

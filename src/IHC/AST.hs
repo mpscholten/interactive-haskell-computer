@@ -46,6 +46,7 @@ data Expr
     | ERecordCon !Name ![(Name, Expr)] -- Con { f1 = e1, ... } record literal
     | ERecordWild !Name                -- Con {..} — RecordWildCards construction
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
+    | EQuote   !Expr                   -- [| expr |] TH expression bracket (Phase 2.12)
     | ELabel !Label                     -- #name OverloadedLabels label (Phase 3.5)
     deriving (Eq, Show)
 
