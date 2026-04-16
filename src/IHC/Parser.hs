@@ -1119,12 +1119,52 @@ parseApp ctx cur0 = do
     loop head_ cur1
   where
     loop fn cur =
-        let (tok, _) = nextSig ctx cur in
-        if startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx
-            then do
-                (arg, cur') <- parseAtom ctx cur
-                loop (EApp fn arg) cur'
-            else pure (fn, cur)
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            -- TypeApplications: @T is a type-level hint; discard and continue.
+            TkAt -> do
+                cur'' <- skipTypeArg ctx cur'
+                loop fn cur''
+            _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
+                    (arg, curA) <- parseAtom ctx cur
+                    loop (EApp fn arg) curA
+              | otherwise -> pure (fn, cur)
+
+-- | Skip one type-argument after @\@@ in a type application.
+-- Handles: plain ident/conid (@\@Int@, @\@a@), promoted (@\@\'Foo@),
+-- and balanced paren/bracket groups (@\@(Maybe Int)@, @\@[Int]@).
+skipTypeArg :: Ctx -> Cursor -> IO Cursor
+skipTypeArg ctx cur0 =
+    let (tok, cur1) = nextSig ctx cur0 in
+    case tkKind tok of
+        TkAt       -> pure cur0   -- bare '@' shouldn't nest; stop
+        TkLParen   -> skipBalanced ctx cur1 TkRParen
+        TkLBracket -> skipBalanced ctx cur1 TkRBracket
+        -- Promoted tick: lexer reads 'X as TkChar 'X' and leaves the rest
+        -- of the constructor name as a separate ident token. Skip both.
+        TkChar _   ->
+            let (tok2, cur2) = nextSig ctx cur1 in
+            case tkKind tok2 of
+                TkIdent{} -> pure cur2
+                TkConId{} -> pure cur2
+                _         -> pure cur1
+        _ -> pure cur1  -- single token consumed (ident, conid, primid, etc.)
+
+-- | Skip tokens until the matching close bracket/paren (depth-aware).
+-- @cur0@ is positioned just after the opening bracket.
+skipBalanced :: Ctx -> Cursor -> TokenKind -> IO Cursor
+skipBalanced ctx cur0 close = go cur0 (1 :: Int)
+  where
+    go cur !d =
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            TkEof -> pure cur
+            k | k == close -> if d == 1 then pure cur' else go cur' (d - 1)
+            TkLParen    -> go cur' (d + 1)
+            TkRParen    -> go cur' (d - 1)
+            TkLBracket  -> go cur' (d + 1)
+            TkRBracket  -> go cur' (d - 1)
+            _           -> go cur' d
 
 startsAtom :: TokenKind -> Bool
 startsAtom TkInt{}         = True
