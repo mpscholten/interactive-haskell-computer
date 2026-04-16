@@ -878,3 +878,8 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/lazy_pat_lambda.hs")
         n   `shouldBe` 0
         out `shouldBe` "30\n"
+
+    it "Either: Left/Right registered in builtin env regardless of Data.Either source-load" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/either_builtin.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Right 42\nLeft \"oops\"\n42\n"
