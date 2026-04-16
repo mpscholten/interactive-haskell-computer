@@ -883,3 +883,19 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/either_builtin.hs")
         n   `shouldBe` 0
         out `shouldBe` "Right 42\nLeft \"oops\"\n42\n"
+
+    it "UserInfixOp: (|>) defined via section form `x |> f = f x`" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "6\n"
+
+    it "UserInfixOp: (|>) defined via prefix form `(|>) x f = f x`" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator_prefix.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "6\n"
+
+    it "UserInfixOp: (|>) imported from another module" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings "test/Fixtures/QuickWins/user_op_module/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "6\n"

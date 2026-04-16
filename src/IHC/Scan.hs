@@ -103,9 +103,9 @@ scanAllTopLevelNames src = go [] startCursor
             TkNewline -> go acc cur'
             TkIdent name
                 | tkCol tok == 1 -> do
-                    -- Check if this is an infix binding: `arg \`op\` arg = ...`
-                    -- or `arg @op arg = ...`.  If so, report the operator name,
-                    -- not the first-argument name.
+                    -- Check if this is an infix binding: `arg \`op\` arg = ...`,
+                    -- `arg @op arg = ...`, or `arg |> arg = ...`. If so, report
+                    -- the operator name, not the first-argument name.
                     let bindName = case peekInfixOp src cur' of
                                        Just op -> op
                                        Nothing -> name
@@ -114,6 +114,15 @@ scanAllTopLevelNames src = go [] startCursor
                     curSkipped <- skipThroughBinding src name cur'
                     let acc' = if bindName `elem` acc then acc else bindName : acc
                     go acc' curSkipped
+            -- Prefix operator binding: @(|>) x f = ...@. The @(@ is at col 1,
+            -- followed by an operator token and @)@.
+            TkLParen | tkCol tok == 1 -> do
+                case peekPrefixOpBinding src (Cursor (tkStart tok) (tkLine tok) (tkCol tok)) of
+                    Just (opName, curAfterClose) -> do
+                        curSkipped <- skipThroughPrefixOpBinding src opName curAfterClose
+                        let acc' = if opName `elem` acc then acc else opName : acc
+                        go acc' curSkipped
+                    Nothing -> go acc cur'
             -- Phase 3.2 + 3.4: explicitly skip top-level type / type family /
             -- type instance declarations (DataKinds + TypeFamilies). These are
             -- not value bindings and must not be reported as names.
@@ -136,6 +145,40 @@ skipThroughBinding src name cur0 = do
                     skipThroughBinding src name peekAfter
                 _ -> pure curAfter
 
+-- | Skip through all consecutive clauses of a prefix-form operator
+-- binding @(op) pat* = ...@ so the scanner doesn't re-report the op.
+-- Subsequent clauses may repeat the prefix form or switch to the
+-- infix form @pat1 op pat2 = ...@.
+skipThroughPrefixOpBinding :: Source -> ByteString -> Cursor -> IO Cursor
+skipThroughPrefixOpBinding src opName curAfterClose = do
+    mClause <- scanOneClauseAfterName src curAfterClose
+    case mClause of
+        Nothing -> pure curAfterClose
+        Just (_, curAfter) -> loopClauses curAfter
+  where
+    loopClauses cur = do
+        let (peek, curAfterPeek) = peekSigTokFrom src cur
+        case tkKind peek of
+            -- Next clause in prefix form: `(op) ... = ...`
+            TkLParen | tkCol peek == 1 ->
+                case peekPrefixOpBinding src (Cursor (tkStart peek) (tkLine peek) (tkCol peek)) of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterClose'
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
+            -- Next clause in infix form: `x op y = ...`
+            TkIdent _ | tkCol peek == 1 ->
+                case peekInfixOp src curAfterPeek of
+                    Just op' | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterPeek
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
+            _ -> pure cur
+
 -- | 'peekSigTokFrom' — skip newlines and return the next non-newline token
 -- at the given cursor without actually advancing the returned cursor past it.
 peekSigTokFrom :: Source -> Cursor -> (Token, Cursor)
@@ -150,6 +193,7 @@ peekSigTokFrom src cur =
 --
 --   @arg1 \`op\` arg2 = ...@     — backtick operator
 --   @arg1 @?= arg2 = ...@       — @\@@-prefixed symbolic operator
+--   @arg1 |> arg2 = ...@        — symbolic operator (user-defined or builtin)
 --
 -- Returns @Just operatorName@ if the pattern matches, @Nothing@ if
 -- this is a plain binding (@f x y = ...@).
@@ -178,25 +222,69 @@ peekInfixOp src cur =
             in case tkKind t2 of
                 TkSymOp suf -> Just (BC.pack "@" <> suf)
                 _           -> Nothing
-        -- First token is a single-ident argument; check the token after it.
-        TkIdent _ ->
+        -- Immediately followed by a symbolic operator: `arg1 |> arg2 = ...`.
+        -- The op must be followed by something that could be a second argument
+        -- (ident, paren-wrapped pattern, literal, etc.) — otherwise this is
+        -- not an infix-op binding LHS.
+        _ | Just opName <- tokenOpNameBS (tkKind t1)
+          , opName /= "-"    -- leading minus in `f (- 1) = ...` patterns etc.
+                             -- already never matches here since col-1 ident
+                             -- already consumed; keeping the exception is a
+                             -- no-op safeguard.
+          -> let (t2, _) = peekSigTokFrom src c1
+             in case tkKind t2 of
+                 TkIdent _    -> Just opName
+                 TkConId _    -> Just opName
+                 TkLParen     -> Just opName
+                 TkLBracket   -> Just opName
+                 TkUnderscore -> Just opName
+                 TkInt   _    -> Just opName
+                 TkStr   _    -> Just opName
+                 TkChar  _    -> Just opName
+                 _            -> Nothing
+        _ -> Nothing
+
+-- | Map an operator-like token kind to its printable operator name.
+-- Mirrors 'IHC.Parser.tokenOpName' but returns a 'ByteString' for use
+-- inside the scanner (which doesn't depend on Parser).
+tokenOpNameBS :: TokenKind -> Maybe ByteString
+tokenOpNameBS = \case
+    TkPlus     -> Just (BC.pack "+")
+    TkPlusPlus -> Just (BC.pack "++")
+    TkMinus    -> Just (BC.pack "-")
+    TkStar     -> Just (BC.pack "*")
+    TkEqEq     -> Just (BC.pack "==")
+    TkNeq      -> Just (BC.pack "/=")
+    TkLt       -> Just (BC.pack "<")
+    TkLe       -> Just (BC.pack "<=")
+    TkGt       -> Just (BC.pack ">")
+    TkGe       -> Just (BC.pack ">=")
+    TkAnd      -> Just (BC.pack "&&")
+    TkOr       -> Just (BC.pack "||")
+    TkColon    -> Just (BC.pack ":")
+    TkDot      -> Just (BC.pack ".")
+    TkDollar   -> Just (BC.pack "$")
+    TkSymOp n  -> Just n
+    _          -> Nothing
+
+-- | Detect a prefix-form operator binding: @(op) pat* = ...@. The cursor
+-- must be positioned at the @(@ token start (i.e. just before the opening
+-- paren has been consumed).  Returns @Just (opName, cursorAfterCloseParen)@
+-- if the opening paren wraps an operator; @Nothing@ otherwise (e.g. a
+-- tuple pattern like @(x, y) = ...@).
+peekPrefixOpBinding :: Source -> Cursor -> Maybe (ByteString, Cursor)
+peekPrefixOpBinding src cur0 =
+    let (t1, c1) = nextToken src cur0       -- consume '('
+    in case tkKind t1 of
+        TkLParen ->
             let (t2, c2) = peekSigTokFrom src c1
-            in case tkKind t2 of
-                TkBacktick ->
+            in case tokenOpNameBS (tkKind t2) of
+                Just opName ->
                     let (t3, c3) = peekSigTokFrom src c2
                     in case tkKind t3 of
-                        TkIdent op ->
-                            let (t4, _) = peekSigTokFrom src c3
-                            in case tkKind t4 of
-                                TkBacktick -> Just op
-                                _          -> Nothing
-                        _ -> Nothing
-                TkAt ->
-                    let (t3, _) = peekSigTokFrom src c2
-                    in case tkKind t3 of
-                        TkSymOp suf -> Just (BC.pack "@" <> suf)
-                        _           -> Nothing
-                _ -> Nothing
+                        TkRParen -> Just (opName, c3)
+                        _        -> Nothing
+                Nothing -> Nothing
         _ -> Nothing
 
 -- | Advance looking for a top-level binding named @target@. Returns
@@ -222,10 +310,67 @@ findBinding src ref target = do
             TkIdent name
                 | tkCol tok == 1 -> handleTopIdent acc name tok cur'
                 | otherwise      -> go acc cur'
+            -- Prefix-form operator binding: @(|>) x f = ...@
+            TkLParen | tkCol tok == 1 ->
+                case peekPrefixOpBinding src (Cursor (tkStart tok) (tkLine tok) (tkCol tok)) of
+                    Just (opName, curAfterClose) ->
+                        handlePrefixOp acc opName tok curAfterClose
+                    Nothing -> go acc cur'
             -- Phase 3.2 + 3.4: explicitly skip type family / type instance /
             -- type synonym declarations so they are never mistaken for bindings.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
+
+    -- Found `(op) ...` at column 1. Scan this clause, then collect any
+    -- follow-on clauses that refer to the same op — either in prefix
+    -- form @(op) ... = ...@ or infix form @arg op arg = ...@.
+    handlePrefixOp acc opName startTok curAfterClose = do
+        mClause <- scanOneClauseAfterName src curAfterClose
+        case mClause of
+            Nothing      -> skipBadBinding acc startTok curAfterClose
+            Just (clause, curAfter) -> do
+                (moreClauses, curFinal) <-
+                    collectMoreOpClauses opName [clause] curAfter
+                let lhs  = BindingLhs (reverse moreClauses)
+                    acc' = Map.insert opName (SpanOnly lhs) acc
+                if opName == target
+                    then do
+                        writeIORef ref (acc', curFinal)
+                        pure (Just lhs)
+                    else go acc' curFinal
+
+    -- After an operator-binding clause body ends, peek for another
+    -- clause of the SAME operator (in either prefix or infix form).
+    collectMoreOpClauses opName acc cur = do
+        let (tok, _curAfter) = peekSigTok cur
+        case tkKind tok of
+            -- Another prefix clause `(op) ... = ...`
+            TkLParen | tkCol tok == 1 ->
+                case peekPrefixOpBinding src (Cursor (tkStart tok) (tkLine tok) (tkCol tok)) of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterClose'
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                collectMoreOpClauses opName (cl : acc) curNext
+                    _ -> pure (acc, cur)
+            -- Infix clause `arg op arg = ...`
+            TkIdent _ | tkCol tok == 1 -> do
+                let (identTok, curAfterIdent) = nextToken src cur
+                case tkKind identTok of
+                    TkIdent _ ->
+                        case peekInfixOp src curAfterIdent of
+                            Just op' | op' == opName -> do
+                                mClause <- scanOneClauseAfterName src curAfterIdent
+                                case mClause of
+                                    Nothing -> pure (acc, cur)
+                                    Just (cl, curNext) ->
+                                        let cl' = cl { clausePats =
+                                                (tkStart identTok, snd (clausePats cl)) }
+                                        in collectMoreOpClauses opName (cl' : acc) curNext
+                            _ -> pure (acc, cur)
+                    _ -> pure (acc, cur)
+            _ -> pure (acc, cur)
 
     -- We saw `name` at column 1. Scan through its params+rhs to find
     -- the clause boundaries, then peek ahead: if the next column-1
@@ -252,8 +397,9 @@ findBinding src ref target = do
                         Just _ -> clause { clausePats =
                                     (tkStart startTok, snd (clausePats clause)) }
                         Nothing -> clause
-                (moreClauses, curFinal) <-
-                    collectMoreClauses name [clause'] curAfter
+                (moreClauses, curFinal) <- case mInfixOp of
+                    Just op -> collectMoreOpClauses op [clause'] curAfter
+                    Nothing -> collectMoreClauses name [clause'] curAfter
                 let lhs  = BindingLhs (reverse moreClauses)
                     acc' = Map.insert realName (SpanOnly lhs) acc
                 if realName == target
