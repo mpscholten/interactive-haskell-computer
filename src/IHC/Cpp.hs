@@ -147,6 +147,32 @@ data BranchFrame = BranchFrame
     , bfParent   :: !Bool        -- was the enclosing scope active?
     }
 
+-- | Join backslash-continuation lines into a single logical line.
+-- If @ln@ ends with a @\\@ (after stripping trailing horizontal whitespace),
+-- consume lines from @rest@ recursively until a line without a trailing @\\@.
+-- Returns @(logicalLine, continuationCount, remainingLines)@.
+-- Each consumed continuation line will be replaced by a blank output line
+-- by the caller, preserving source line numbers.
+joinContinuations :: ByteString -> [ByteString] -> (ByteString, Int, [ByteString])
+joinContinuations ln rest
+    | endsWithBackslash ln =
+        let ln' = stripTrailingBackslash ln
+        in case rest of
+            []     -> (ln', 0, [])
+            (r:rs) -> let (joined, n, rest'') = joinContinuations r rs
+                      in (ln' <> BC.singleton ' ' <> joined, n + 1, rest'')
+    | otherwise = (ln, 0, rest)
+  where
+    endsWithBackslash l =
+        let stripped = BC.dropWhileEnd isHSpace l
+        in not (BS.null stripped) && BC.last stripped == '\\'
+    stripTrailingBackslash l =
+        -- Remove the trailing backslash, then strip any trailing whitespace
+        -- that was before the backslash (and any after it, though there
+        -- shouldn't be any after stripping).
+        let stripped = BC.dropWhileEnd isHSpace l
+        in BC.dropWhileEnd isHSpace (BC.init stripped)
+
 -- | Drive line-by-line processing in IO (needed for #include).
 --
 -- Returns accumulated output lines (in order) and the final context.
@@ -162,26 +188,39 @@ processIO
     -> IO ([ByteString], CppContext)
 processIO ctx _active [] _ _ _ = pure ([], ctx)
 processIO ctx active (ln : rest) stack filePath depth =
-    case parseDirective ln of
+    -- For directive lines (starting with optional whitespace then '#'),
+    -- join any backslash-continuation lines into a single logical directive.
+    -- Continuation lines are replaced with blank output lines to preserve
+    -- line numbers. Regular (non-directive) lines are NOT joined.
+    let isDirectiveLine l = case BC.dropWhile isHSpace l of
+                                bs | not (BS.null bs) && BC.head bs == '#' -> True
+                                _                                           -> False
+        (logicalLn, contCount, rest')
+            | isDirectiveLine ln = joinContinuations ln rest
+            | otherwise          = (ln, 0, rest)
+        contBlanks = replicate contCount BS.empty
+        emit1 xs = BS.empty : contBlanks ++ xs
+    in
+    case parseDirective logicalLn of
         Just (DirIf expr) -> do
             let taken = active && evalCondExpr ctx expr
                 frame = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            pure (emit1 xs, c)
 
         Just (DirIfdef name) -> do
             let defined = Map.member name ctx
                 taken   = active && defined
                 frame   = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            pure (emit1 xs, c)
 
         Just (DirIfndef name) -> do
             let defined = Map.member name ctx
                 taken   = active && not defined
                 frame   = BranchFrame taken taken active
-            (xs, c) <- processIO ctx taken rest (frame : stack) filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx taken rest' (frame : stack) filePath depth
+            pure (emit1 xs, c)
 
         Just (DirElif expr) -> case stack of
             (f : fs) -> do
@@ -189,45 +228,45 @@ processIO ctx active (ln : rest) stack filePath depth =
                     newAct = bfParent f && not (bfAnyTaken f) && cond
                     f'     = f { bfAnyTaken = bfAnyTaken f || newAct
                                , bfActive   = newAct }
-                (xs, c) <- processIO ctx newAct rest (f' : fs) filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx newAct rest' (f' : fs) filePath depth
+                pure (emit1 xs, c)
             [] -> do  -- stray #elif — pretend blank
-                (xs, c) <- processIO ctx active rest stack filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx active rest' stack filePath depth
+                pure (emit1 xs, c)
 
         Just DirElse -> case stack of
             (f : fs) -> do
                 let newAct = bfParent f && not (bfAnyTaken f)
                     f'     = f { bfAnyTaken = bfAnyTaken f || newAct
                                , bfActive   = newAct }
-                (xs, c) <- processIO ctx newAct rest (f' : fs) filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx newAct rest' (f' : fs) filePath depth
+                pure (emit1 xs, c)
             [] -> do
-                (xs, c) <- processIO ctx active rest stack filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx active rest' stack filePath depth
+                pure (emit1 xs, c)
 
         Just DirEndif -> case stack of
             (_ : fs) -> do
                 let parent = case fs of
                         (f:_) -> bfActive f
                         []    -> True
-                (xs, c) <- processIO ctx parent rest fs filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx parent rest' fs filePath depth
+                pure (emit1 xs, c)
             [] -> do
-                (xs, c) <- processIO ctx active rest stack filePath depth
-                pure (BS.empty : xs, c)
+                (xs, c) <- processIO ctx active rest' stack filePath depth
+                pure (emit1 xs, c)
 
         Just (DirDefine name body) -> do
             let ctx' | active    = Map.insert name body ctx
                      | otherwise = ctx
-            (xs, c) <- processIO ctx' active rest stack filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx' active rest' stack filePath depth
+            pure (emit1 xs, c)
 
         Just (DirUndef name) -> do
             let ctx' | active    = Map.delete name ctx
                      | otherwise = ctx
-            (xs, c) <- processIO ctx' active rest stack filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx' active rest' stack filePath depth
+            pure (emit1 xs, c)
 
         Just (DirInclude incPath) | active -> do
             -- Resolve relative to the directory of the including file.
@@ -258,8 +297,8 @@ processIO ctx active (ln : rest) stack filePath depth =
                             -- The included lines replace the single #include
                             -- directive line; then continue with the rest of
                             -- the current file using the updated ctx'.
-                            (xs, c) <- processIO ctx' active rest stack filePath depth
-                            pure (incOut ++ xs, c)
+                            (xs, c) <- processIO ctx' active rest' stack filePath depth
+                            pure (incOut ++ contBlanks ++ xs, c)
                         Nothing
                             | isSystemHeader incPath -> do
                                 -- Unresolvable system header (.h/.hpp/.hsc config
@@ -267,24 +306,25 @@ processIO ctx active (ln : rest) stack filePath depth =
                                 -- This is safe for generated headers like
                                 -- HsBaseConfig.h that live only in the build tree.
                                 hPutStrLn stderr ("IHC.Cpp: skipping unresolvable system include: " ++ incPath)
-                                (xs, c) <- processIO ctx active rest stack filePath depth
-                                pure (BS.empty : xs, c)
+                                (xs, c) <- processIO ctx active rest' stack filePath depth
+                                pure (emit1 xs, c)
                             | otherwise ->
                                 throwIO (IncludeMissing incPath resolved)
 
         Just (DirInclude _) -> do
             -- #include in a disabled block: skip it.
-            (xs, c) <- processIO ctx active rest stack filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx active rest' stack filePath depth
+            pure (emit1 xs, c)
 
         Just DirIgnore -> do
-            (xs, c) <- processIO ctx active rest stack filePath depth
-            pure (BS.empty : xs, c)
+            (xs, c) <- processIO ctx active rest' stack filePath depth
+            pure (emit1 xs, c)
 
         Nothing -> do
             -- Regular line. Emit iff active; otherwise blank.
+            -- Note: for regular lines, contCount=0 and rest'=rest, so no change.
             let emit = if active then ln else BS.empty
-            (xs, c) <- processIO ctx active rest stack filePath depth
+            (xs, c) <- processIO ctx active rest' stack filePath depth
             pure (emit : xs, c)
 
 -- | True when an include path looks like a C/C++ system header rather than
