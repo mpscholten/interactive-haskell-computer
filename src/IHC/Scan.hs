@@ -2353,8 +2353,14 @@ scanForeignImports src = pure (reverse (loop [] startCursor))
         cc <- case tkKind t1 of
             TkIdent n | n `elem` callConvIdents -> Just (identToCallConv n)
             _ -> Nothing
-        let (safety, curAfterSafety) = parseOptSafety cur1
-        let (mSym,   curAfterSym)    = parseOptSymbol curAfterSafety
+        let (safety, curAfterSafety)       = parseOptSafety cur1
+        let (mSymRaw, curAfterSym)         = parseOptSymbol curAfterSafety
+        -- Detect the address-of marker: an @&@ prefix inside the symbol
+        -- string.  The flag is preserved on the decl so the FFI layer
+        -- can return the raw pointer instead of a callable closure.
+        let (isAddrOf, mSym) = case mSymRaw of
+                Just s | BC.take 1 s == BC.pack "&" -> (True, Just (BC.drop 1 s))
+                _                                   -> (False, mSymRaw)
         let (t2, cur2) = peekSigTokFrom src curAfterSym
         case tkKind t2 of
             TkIdent nm -> do
@@ -2363,14 +2369,22 @@ scanForeignImports src = pure (reverse (loop [] startCursor))
                     TkDColon -> do
                         (argTys, retTy, isIO, curAfter) <- parseForeignType src cur3
                         let sym = fromMaybe nm mSym
+                        -- For addr-of imports, clobber the parsed type
+                        -- with the canonical @Ptr ()@ shape — no args,
+                        -- not in IO.  We still call parseForeignType to
+                        -- advance the cursor past the @:: ...@.
+                        let (argTys', retTy', isIO')
+                                | isAddrOf  = ([], FFIPtr FFIVoid, False)
+                                | otherwise = (argTys, retTy, isIO)
                         pure ( ForeignDecl
                                  { fdName     = nm
                                  , fdSymbol   = sym
                                  , fdSafety   = safety
                                  , fdCallConv = cc
-                                 , fdArgTypes = argTys
-                                 , fdRetType  = retTy
-                                 , fdIsIO     = isIO
+                                 , fdArgTypes = argTys'
+                                 , fdRetType  = retTy'
+                                 , fdIsIO     = isIO'
+                                 , fdIsAddrOf = isAddrOf
                                  }
                              , curAfter
                              )

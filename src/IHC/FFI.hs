@@ -58,7 +58,7 @@ import Foreign.LibFFI
     , retCFloat, retCDouble, retCSize
     , retCChar, retCUChar, retPtr, retCString
     )
-import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr)
+import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Posix.DynamicLinker as DL
 
@@ -106,12 +106,18 @@ data CallConv = CCall | CApi | StdCall | Prim
 -- | The scanned form of a @foreign import@ declaration.
 data ForeignDecl = ForeignDecl
     { fdName     :: !ByteString     -- ^ Haskell name, e.g. @"c_strlen"@
-    , fdSymbol   :: !ByteString     -- ^ C symbol, e.g. @"strlen"@
+    , fdSymbol   :: !ByteString     -- ^ C symbol, e.g. @"strlen"@.  For
+                                    --   address-of imports, the leading
+                                    --   @&@ is already stripped.
     , fdSafety   :: !Safety
     , fdCallConv :: !CallConv
     , fdArgTypes :: ![FFIType]
     , fdRetType  :: !FFIType        -- ^ type inside IO (or pure)
     , fdIsIO     :: !Bool           -- ^ does the result sit inside @IO@?
+    , fdIsAddrOf :: !Bool           -- ^ @foreign import ccall "&sym" p :: Ptr T@
+                                    --   — take the address of a C global
+                                    --   symbol rather than call it.  No
+                                    --   args, return is always a pointer.
     } deriving (Eq, Show)
 
 --------------------------------------------------------------------------------
@@ -355,8 +361,25 @@ callForeign decl argVals = do
 --   * a 'VIO' action if the declared return type was wrapped in 'IO'
 --     (the common case);
 --   * the raw value directly if the import was declared pure.
+--
+-- Address-of imports (@foreign import ccall "&sym" p :: Ptr T@) take a
+-- different shape: no args, no call — just the raw address of the C
+-- symbol wrapped as a 'Ptr'.  They are used by Hackage libraries for
+-- lookup tables (bytestring's hex/float tables), signal constants
+-- (unix's @nocldstop@), and finalizer function pointers.
 makeForeignVal :: ForeignDecl -> IO Val
-makeForeignVal decl = collect []
+makeForeignVal decl
+    | fdIsAddrOf decl = do
+          mFp <- resolveSymbol (fdSymbol decl)
+          case mFp of
+              Nothing -> do
+                  msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found"))
+                  throwIO (IhcException
+                      ("FFI: symbol '" <> fdSymbol decl
+                       <> "' (address-of) not found in any loaded library")
+                      msgT)
+              Just fp -> pure (VPrimObj (PrimPtr (castPtr (castFunPtrToPtr fp))))
+    | otherwise = collect []
   where
     argc = length (fdArgTypes decl)
 
