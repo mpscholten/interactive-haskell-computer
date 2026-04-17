@@ -22,6 +22,7 @@ module IHC.Lexer
     , skipTrivia
     ) where
 
+import Data.Bits (shiftL, shiftR, (.|.), (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -453,9 +454,12 @@ nextToken s c0 =
                  in (mkTok k start end, end)
 
     -- Starts at the opening quote. Consume up to the matching @"@, handling
-    -- a handful of backslash escapes. On malformed input (unterminated
+    -- backslash escapes (both simple \\n/\\t and numeric \\x41, \\123, \\o77,
+    -- plus named escapes like \\NUL). On malformed input (unterminated
     -- string, bad escape), we just stop at EOF / keep bytes as-is; the
-    -- parser will surface a clearer error if needed.
+    -- parser will surface a clearer error if needed. UTF-8 bytes are
+    -- preserved as-is so multi-byte characters round-trip through the
+    -- byte-oriented TkStr payload.
     lexString openCur =
         let openP = cPos openCur + 1 in      -- past the opening quote
         let (bs, endP) = scanStr openP [] in
@@ -467,32 +471,30 @@ nextToken s c0 =
             Nothing   -> (BS.pack (reverse acc), p)          -- EOF; close loosely
             Just 0x22 -> (BS.pack (reverse acc), p)          -- closing quote
             Just 0x5C ->                                      -- backslash
-                case peekByte s (p + 1) of
-                    Just 0x6E -> scanStr (p + 2) (0x0A : acc)  -- \n
-                    Just 0x74 -> scanStr (p + 2) (0x09 : acc)  -- \t
-                    Just 0x22 -> scanStr (p + 2) (0x22 : acc)  -- \"
-                    Just 0x5C -> scanStr (p + 2) (0x5C : acc)  -- \\
-                    Just 0x30 -> scanStr (p + 2) (0x00 : acc)  -- \0
-                    Just ch   -> scanStr (p + 2) (ch   : acc)  -- unknown: pass through
-                    Nothing   -> (BS.pack (reverse acc), p + 1)
+                case readEscape s (p + 1) of
+                    Just (c, p') ->
+                        scanStr p' (reverse (encodeCharUtf8 c) ++ acc)
+                    Nothing ->
+                        -- Unrecognized escape: drop the backslash, skip
+                        -- a char to avoid looping. Unterminated on EOF.
+                        case peekByte s (p + 1) of
+                            Just b' -> scanStr (p + 2) (b' : acc)
+                            Nothing -> (BS.pack (reverse acc), p + 1)
             Just b    -> scanStr (p + 1) (b : acc)
 
     -- Starts at the opening single-quote. One logical character, possibly
-    -- escaped, followed by a closing single-quote. Malformed input degrades
-    -- gracefully (we just emit whatever we scanned).
+    -- escaped or a multi-byte UTF-8 code point, followed by a closing
+    -- single-quote. Malformed input degrades gracefully (we just emit
+    -- whatever we scanned).
     lexChar openCur =
         let p0 = cPos openCur + 1 in
         let (ch, endP) = case peekByte s p0 of
-                Just 0x5C -> case peekByte s (p0 + 1) of           -- backslash
-                    Just 0x6E -> ('\n', p0 + 2)
-                    Just 0x74 -> ('\t', p0 + 2)
-                    Just 0x5C -> ('\\', p0 + 2)
-                    Just 0x27 -> ('\'', p0 + 2)
-                    Just 0x22 -> ('"',  p0 + 2)
-                    Just 0x30 -> ('\0', p0 + 2)
-                    Just cc   -> (chr (fromIntegral cc), p0 + 2)
-                    Nothing   -> ('?',  p0 + 1)
-                Just b    -> (chr (fromIntegral b), p0 + 1)
+                Just 0x5C -> case readEscape s (p0 + 1) of
+                    Just (c, p')       -> (c, p')
+                    Nothing -> case peekByte s (p0 + 1) of
+                        Just cc  -> (chr (fromIntegral cc), p0 + 2)
+                        Nothing  -> ('?', p0 + 1)
+                Just b    -> decodeUtf8At s p0 b
                 Nothing   -> ('?', p0)
         in
         -- skip closing '\''
@@ -699,6 +701,156 @@ utf8CharLen b
     | b < 0xF0  = 3
     | b < 0xF8  = 4
     | otherwise = 1
+
+-- | Decode a single UTF-8 code point at position @p@, given its leading
+-- byte @b@. Returns @(char, pastEnd)@ where @pastEnd@ is the byte offset
+-- just past the code point. Malformed sequences degrade to the single
+-- byte, matching the rest of the lexer's permissive stance.
+decodeUtf8At :: Source -> Pos -> Word8 -> (Char, Pos)
+decodeUtf8At src p b
+    | b < 0x80 = (chr (fromIntegral b), p + 1)
+    | b < 0xC0 = (chr (fromIntegral b), p + 1)   -- stray cont byte
+    | b < 0xE0 =
+        case peekByte src (p + 1) of
+            Just b1 | isCont b1 ->
+                let cp = ((fromIntegral b .&. 0x1F) `shiftL` 6)
+                     .|. (fromIntegral b1 .&. 0x3F) :: Int
+                in (chr cp, p + 2)
+            _ -> (chr (fromIntegral b), p + 1)
+    | b < 0xF0 =
+        case (peekByte src (p + 1), peekByte src (p + 2)) of
+            (Just b1, Just b2) | isCont b1, isCont b2 ->
+                let cp = ((fromIntegral b .&. 0x0F) `shiftL` 12)
+                     .|. ((fromIntegral b1 .&. 0x3F) `shiftL` 6)
+                     .|. (fromIntegral b2 .&. 0x3F) :: Int
+                in (chr cp, p + 3)
+            _ -> (chr (fromIntegral b), p + 1)
+    | b < 0xF8 =
+        case (peekByte src (p + 1), peekByte src (p + 2), peekByte src (p + 3)) of
+            (Just b1, Just b2, Just b3) | isCont b1, isCont b2, isCont b3 ->
+                let cp = ((fromIntegral b  .&. 0x07) `shiftL` 18)
+                     .|. ((fromIntegral b1 .&. 0x3F) `shiftL` 12)
+                     .|. ((fromIntegral b2 .&. 0x3F) `shiftL` 6)
+                     .|. (fromIntegral b3 .&. 0x3F) :: Int
+                in (chr cp, p + 4)
+            _ -> (chr (fromIntegral b), p + 1)
+    | otherwise = (chr (fromIntegral b), p + 1)
+  where
+    isCont x = x .&. 0xC0 == 0x80
+
+-- | Encode a 'Char' as its UTF-8 byte sequence. Used when decoding
+-- string escapes (e.g. @"\\x3BB"@) back into the byte-oriented TkStr
+-- payload.
+encodeCharUtf8 :: Char -> [Word8]
+encodeCharUtf8 c
+    | n < 0x80    = [fromIntegral n]
+    | n < 0x800   = [ fromIntegral (0xC0 .|. (n `shiftR` 6))
+                    , fromIntegral (0x80 .|. (n .&. 0x3F)) ]
+    | n < 0x10000 = [ fromIntegral (0xE0 .|. (n `shiftR` 12))
+                    , fromIntegral (0x80 .|. ((n `shiftR` 6) .&. 0x3F))
+                    , fromIntegral (0x80 .|. (n .&. 0x3F)) ]
+    | otherwise   = [ fromIntegral (0xF0 .|. (n `shiftR` 18))
+                    , fromIntegral (0x80 .|. ((n `shiftR` 12) .&. 0x3F))
+                    , fromIntegral (0x80 .|. ((n `shiftR` 6) .&. 0x3F))
+                    , fromIntegral (0x80 .|. (n .&. 0x3F)) ]
+  where
+    n = fromEnum c
+
+-- | Parse a Haskell character escape starting at byte @p@, which is
+-- the byte immediately after the backslash. Returns @(char, endPos)@
+-- or 'Nothing' if the input isn't a recognized escape.
+--
+-- Supported forms:
+--   * Simple:  @\\n \\t \\r \\0 \\\\ \\\" \\\'@ ...
+--   * Named:   @\\NUL@, @\\SOH@, ..., @\\DEL@, @\\SP@
+--   * Hex:     @\\xHH...@
+--   * Octal:   @\\oOO...@
+--   * Decimal: @\\123@
+readEscape :: Source -> Pos -> Maybe (Char, Pos)
+readEscape src p = case peekByte src p of
+    Nothing   -> Nothing
+    Just 0x6E -> Just ('\n', p + 1)   -- n
+    Just 0x74 -> Just ('\t', p + 1)   -- t
+    Just 0x72 -> Just ('\r', p + 1)   -- r
+    Just 0x61 -> Just ('\a', p + 1)   -- a
+    Just 0x62 -> Just ('\b', p + 1)   -- b
+    Just 0x66 -> Just ('\f', p + 1)   -- f
+    Just 0x76 -> Just ('\v', p + 1)   -- v
+    Just 0x5C -> Just ('\\', p + 1)   -- \\
+    Just 0x27 -> Just ('\'', p + 1)   -- '
+    Just 0x22 -> Just ('"',  p + 1)   -- "
+    Just 0x26 -> Just ('\0', p + 1)   -- &  (null sep — treated as empty; use '\0')
+    -- Hex escape: \x followed by hex digits.
+    Just 0x78 -> readNumEscape 16 isHexDigit hexVal (p + 1)
+    -- Octal escape: \o followed by octal digits.
+    Just 0x6F -> readNumEscape 8  isOctDigit octVal (p + 1)
+    -- Decimal escape: \<digits>
+    Just b | isDigit b -> readNumEscape 10 isDigit digitVal p
+    -- Named control escapes: \NUL, \SOH, ..., \DEL, \SP
+    Just b | isUpperStart b -> readNamedEscape src p
+    _ -> Nothing
+  where
+    readNumEscape :: Int -> (Word8 -> Bool) -> (Word8 -> Int) -> Pos
+                   -> Maybe (Char, Pos)
+    readNumEscape base isD val p0 =
+        let (n, p1) = collectDigits base isD val 0 p0 in
+        if p1 == p0
+            then Nothing
+            else Just (chr n, p1)
+
+    collectDigits :: Int -> (Word8 -> Bool) -> (Word8 -> Int) -> Int -> Pos
+                   -> (Int, Pos)
+    collectDigits base isD val !acc !pp = case peekByte src pp of
+        Just b | isD b -> collectDigits base isD val
+                           (acc * base + val b) (pp + 1)
+        _              -> (acc, pp)
+
+    isOctDigit b = b >= 0x30 && b <= 0x37
+    octVal, digitVal :: Word8 -> Int
+    octVal   b = fromIntegral (b - 0x30)
+    digitVal b = fromIntegral (b - 0x30)
+
+-- | Parse a named control escape starting at @p@ (the byte after the
+-- backslash). Recognises the standard ASCII control-code mnemonics.
+readNamedEscape :: Source -> Pos -> Maybe (Char, Pos)
+readNamedEscape src p0 = go 3
+  where
+    -- Try longest-match first (3 chars, then 2).
+    go 0 = Nothing
+    go k = case matchK k of
+        Just (c, p') -> Just (c, p')
+        Nothing      -> go (k - 1)
+
+    matchK k =
+        case sliceN p0 k of
+            Just bs ->
+                case lookup (BC.unpack bs) namedEscapes of
+                    Just c  -> Just (c, p0 + k)
+                    Nothing -> Nothing
+            Nothing -> Nothing
+
+    -- | Slice @k@ bytes starting at @pp@ from the source. Returns
+    -- 'Nothing' if we can't read that many bytes (EOF in the middle).
+    sliceN pp k =
+        let collect !i acc
+                | i == k    = Just (BS.pack (reverse acc))
+                | otherwise = case peekByte src (pp + i) of
+                    Just b  -> collect (i + 1) (b : acc)
+                    Nothing -> Nothing
+        in collect 0 []
+
+    namedEscapes :: [(String, Char)]
+    namedEscapes =
+        [ ("NUL", '\NUL'), ("SOH", '\SOH'), ("STX", '\STX'), ("ETX", '\ETX')
+        , ("EOT", '\EOT'), ("ENQ", '\ENQ'), ("ACK", '\ACK'), ("BEL", '\BEL')
+        , ("BS",  '\BS'),  ("HT",  '\HT'),  ("LF",  '\LF'),  ("VT",  '\VT')
+        , ("FF",  '\FF'),  ("CR",  '\CR'),  ("SO",  '\SO'),  ("SI",  '\SI')
+        , ("DLE", '\DLE'), ("DC1", '\DC1'), ("DC2", '\DC2'), ("DC3", '\DC3')
+        , ("DC4", '\DC4'), ("NAK", '\NAK'), ("SYN", '\SYN'), ("ETB", '\ETB')
+        , ("CAN", '\CAN'), ("EM",  '\EM'),  ("SUB", '\SUB'), ("ESC", '\ESC')
+        , ("FS",  '\FS'),  ("GS",  '\GS'),  ("RS",  '\RS'),  ("US",  '\US')
+        , ("SP",  ' '),    ("DEL", '\DEL')
+        ]
 
 -- | Drop NumericUnderscores separators from a raw numeric literal slice
 -- before handing it to 'read'. The lexer only admits @_@ between digits,

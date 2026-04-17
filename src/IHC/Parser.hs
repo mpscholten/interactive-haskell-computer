@@ -2633,10 +2633,9 @@ parseListLit ctx cur0 = do
                     -- Plain list: continue gathering
                     _ -> gatherMore [second, first] cur2
             TkRBracket -> pure (buildCons [first], cur1)
-            -- List comprehension @[ e | q1, q2, ... ]@ — swallow to ']'.
-            TkBar -> do
-                curEnd <- skipToCloseBracket ctx cur1
-                pure (buildCons [first], curEnd)
+            -- List comprehension @[ e | q1, q2, ... ]@ — desugar per the
+            -- Haskell report (see 'parseListComp').
+            TkBar -> parseListComp ctx first cur1
             _ -> parseErr ctx "expected `,`, `..`, or `]` in list literal" tok
 
     gatherMore acc cur = do
@@ -2654,6 +2653,176 @@ parseListLit ctx cur0 = do
     buildCons :: [Expr] -> Expr
     buildCons []     = EVar "[]"
     buildCons (e:es) = EApp (EApp (EVar ":") e) (buildCons es)
+
+--------------------------------------------------------------------------------
+-- List comprehensions
+--------------------------------------------------------------------------------
+
+-- | A single qualifier inside a list comprehension.
+data Qual
+    = QGen  !Pat !Expr       -- ^ @pat <- expr@
+    | QLet  ![(Name, Expr)]  -- ^ @let x = e1; y = e2@
+    | QBool !Expr            -- ^ boolean guard
+
+-- | Parse a list comprehension body. The caller has already consumed the
+-- opening @[@, the head expression, and the leading @|@; we're now
+-- looking at the first qualifier. Returns an expression that evaluates
+-- the comprehension using a recursive helper + @if-then-else@ + @let@.
+--
+-- Desugaring (Haskell report 3.11):
+--
+-- @
+--   [ e | ]                 = [e]
+--   [ e | b, qs ]           = if b then [e | qs] else []
+--   [ e | pat <- xs, qs ]   = let go []      = []
+--                                 go (h:t)   = case h of
+--                                                pat -> [e | qs] ++ go t
+--                                                _   -> go t
+--                             in go xs
+--   [ e | let bs, qs ]      = let bs in [e | qs]
+-- @
+--
+-- Inlining the @concatMap@ makes list comprehensions work without
+-- depending on Foldable class-method dispatch (which routes @foldr@
+-- through the class machinery). Only @(:)@, @(++)@ and @[]@ are
+-- required, all of which are primitive cons-list operations.
+parseListComp :: Ctx -> Expr -> Cursor -> IO (Expr, Cursor)
+parseListComp ctx headExpr cur0 = do
+    (quals, curEnd) <- parseQuals cur0 []
+    pure (desugarQuals 0 quals, curEnd)
+  where
+    parseQuals :: Cursor -> [Qual] -> IO ([Qual], Cursor)
+    parseQuals cur acc = do
+        (q, cur1) <- parseQual cur
+        let (sep, cur2) = nextSig ctx cur1
+        case tkKind sep of
+            TkComma    -> parseQuals cur2 (q : acc)
+            TkRBracket -> pure (reverse (q : acc), cur2)
+            _ -> parseErr ctx "expected `,` or `]` in list comprehension" sep
+
+    -- Parse a single qualifier. @let@ qualifiers are spotted by the
+    -- leading @TkLet@; otherwise we look ahead for a top-level @<-@ to
+    -- distinguish a generator from a boolean guard.
+    parseQual :: Cursor -> IO (Qual, Cursor)
+    parseQual cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkLet -> do
+                (binds, cur2) <- parseListCompLetBinds ctx cur1
+                pure (QLet binds, cur2)
+            _ ->
+                if hasGenArrow ctx cur
+                    then do
+                        (pat, cur2) <- parseTopPat ctx cur
+                        let (arr, cur3) = nextSig ctx cur2
+                        case tkKind arr of
+                            TkLArrow -> pure ()
+                            _ -> parseErr ctx "expected `<-` in generator" arr
+                        (src, cur4) <- parseExpr ctx cur3
+                        pure (QGen pat src, cur4)
+                    else do
+                        (e, cur') <- parseExpr ctx cur
+                        pure (QBool e, cur')
+
+    -- | Desugar a sequence of qualifiers into a cons-list expression.
+    -- The @depth@ argument freshens the recursive-helper name so that
+    -- nested comprehensions (@[ [y | y <- x] | x <- xs ]@) don't alias
+    -- each other's @go@.
+    desugarQuals :: Int -> [Qual] -> Expr
+    desugarQuals _ [] =
+        EApp (EApp (EVar ":") headExpr) (EVar "[]")
+    desugarQuals d (QBool p : qs) =
+        EIf p (desugarQuals d qs) (EVar "[]")
+    desugarQuals d (QLet bs : qs) =
+        ELet bs (desugarQuals d qs)
+    desugarQuals d (QGen pat src : qs) =
+        let goName = BC.pack ("$lcGo" ++ show d)
+            hName  = BC.pack ("$lcH"  ++ show d)
+            tName  = BC.pack ("$lcT"  ++ show d)
+            xsName = BC.pack ("$lcXs" ++ show d)
+            inner  = desugarQuals (d + 1) qs
+            recurseTail = EApp (EVar goName) (EVar tName)
+            append xs ys = EApp (EApp (EVar "++") xs) ys
+            matchBody = ECase (EVar hName)
+                          [ Alt pat               (append inner recurseTail)
+                          , Alt PWild             recurseTail
+                          ]
+            -- \xs -> case xs of [] -> []; (h:t) -> matchBody
+            goBody = ELam xsName
+                        (ECase (EVar xsName)
+                            [ Alt (PCon "[]" [])              (EVar "[]")
+                            , Alt (PCon ":" [PVar hName, PVar tName])
+                                  matchBody
+                            ])
+        in ELet [(goName, goBody)] (EApp (EVar goName) src)
+
+-- | True iff the next qualifier contains a top-level @<-@ before the
+-- next comma or closing bracket. Used by the list-comprehension parser
+-- to tell a generator from a boolean guard without committing to a
+-- pattern-parse first.
+hasGenArrow :: Ctx -> Cursor -> Bool
+hasGenArrow ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+  where
+    go cur !b !p !c =
+        let (tok, cur') = nextSig ctx cur in
+        case tkKind tok of
+            TkEof      -> False
+            TkLArrow   | b == 0 && p == 0 && c == 0 -> True
+            TkComma    | b == 0 && p == 0 && c == 0 -> False
+            TkRBracket | b == 0 && p == 0 && c == 0 -> False
+            TkLParen   -> go cur' b (p + 1) c
+            TkRParen   -> go cur' b (p - 1) c
+            TkLBracket -> go cur' (b + 1) p c
+            TkRBracket -> go cur' (b - 1) p c
+            TkLBrace   -> go cur' b p (c + 1)
+            TkRBrace   -> go cur' b p (c - 1)
+            _          -> go cur' b p c
+
+-- | Parse the let-binding sequence for a list-comprehension @let@
+-- qualifier, up to but not including the trailing @,@ / @]@. Supports
+-- both brace-delimited (@let { x = 1; y = 2 }@) and layout-driven
+-- bindings on the same line.
+parseListCompLetBinds :: Ctx -> Cursor -> IO ([(Name, Expr)], Cursor)
+parseListCompLetBinds ctx cur0 = do
+    let (firstTok, _) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkLBrace -> braced cur0
+        _        -> layout (tkCol firstTok) cur0 []
+  where
+    braced cur = do
+        let (_, cur1) = nextSig ctx cur   -- consume the `{`
+        brGo cur1 []
+      where
+        brGo cur' acc' = do
+            (n, e, cur2) <- parseLetCompBinding ctx cur'
+            let (sep, cur3) = nextSig ctx cur2
+            case tkKind sep of
+                TkSemi   -> brGo cur3 ((n, e) : acc')
+                TkRBrace -> pure (reverse ((n, e) : acc'), cur3)
+                _ -> parseErr ctx "expected `;` or `}` in braced let" sep
+
+    layout col cur acc = do
+        (n, e, cur1) <- parseLetCompBinding ctx cur
+        let (peek, _) = nextSig ctx cur1
+        case tkKind peek of
+            TkIdent _ | tkCol peek == col -> layout col cur1 ((n, e) : acc)
+            _                              -> pure (reverse ((n, e) : acc), cur1)
+
+-- | Parse a single @name = expr@ binding for a list-comprehension
+-- @let@. Returns the name, the expression, and the cursor just past
+-- the expression.
+parseLetCompBinding :: Ctx -> Cursor -> IO (Name, Expr, Cursor)
+parseLetCompBinding ctx cur = do
+    let (nameTok, cur1) = nextSig ctx cur
+    name <- case tkKind nameTok of
+        TkIdent n -> pure n
+        _         -> parseErr ctx "expected identifier in let-binding" nameTok
+    let (eqTok, cur2) = nextSig ctx cur1
+    case tkKind eqTok of
+        TkEq -> pure ()
+        _    -> parseErr ctx "expected `=` in let-binding" eqTok
+    (e, cur3) <- parseExpr ctx cur2
+    pure (name, e, cur3)
 
 -- | Skip the body of an unsupported TH quote bracket up to (and including)
 -- the matching close token (@TkCQuote@ = @|]@ or @TkCQuoteTy@ = @||]@).

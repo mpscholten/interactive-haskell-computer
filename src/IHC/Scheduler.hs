@@ -200,6 +200,30 @@ loadProgramFromSource searchPath src0 = do
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
+    -- If discovery swallowed a ParseError inside @main@ (the caller's
+    -- entry binding), the scheduler would silently report "no `main`
+    -- binding". Re-parse @main@ directly so any syntax error surfaces
+    -- with its file:line:col. The cost is tiny — one extra parse of
+    -- one binding — and only runs for the entry module.
+    entryBodies <- readIORef (lmBodies entry)
+    case Map.lookup (BC.pack "main") entryBodies of
+        Just _  -> pure ()
+        Nothing -> do
+            mLhs <- findOrResolveLhs (lmSource entry) (lmKnown entry)
+                                     (BC.pack "main")
+            case mLhs of
+                Nothing  -> pure ()   -- no LHS at all; downstream handles "no main"
+                Just lhs ->
+                    -- This re-parse deliberately does NOT catch
+                    -- ParseError — surfacing it is the whole point.
+                    -- A successful re-parse means the earlier failure
+                    -- was in a free var of main, not main itself; let
+                    -- downstream dispatch surface that.
+                    do _ <- Parser.parseBodyExprWithFixity
+                                (lmSource entry) (lmFixity entry)
+                                (lhsClauses lhs)
+                       pure ()
+
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
     -- are in the tied env before methods are evaluated. Without this,
