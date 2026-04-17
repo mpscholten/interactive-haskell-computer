@@ -1,7 +1,7 @@
-GT
-False
-Red
-[Blue,Green,Red]
+LT
+True
+Blue
+[Red,Green,Blue]
 LT
 EQ
 GT

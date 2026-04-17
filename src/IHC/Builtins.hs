@@ -44,7 +44,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr, ord)
-import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
@@ -62,6 +62,7 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr, nullPtr, minusPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
+import System.IO.Unsafe (unsafePerformIO)
 import System.IO
     ( BufferMode(..)
     , Handle
@@ -895,6 +896,38 @@ ordCmp _reg slot av bv = case (av, bv) of
     ordSlot 3 o = o == GT || o == EQ
     ordSlot _ _ = False
 
+-- | Global map from constructor name to @(typeName, declIndex)@, kept
+-- alive for the lifetime of the interpreter. Populated as a side effect
+-- of 'buildConEnv' (every call merges the DataRegistry entries in) and
+-- consulted by 'structuralOrdering' when two different constructors of
+-- the same type need to be compared.
+--
+-- We use a module-level 'IORef' (via 'unsafePerformIO') because
+-- 'structuralOrdering' is invoked through a long chain of Ord-dispatch
+-- helpers (ordCmp, valOrdering, compareDispatch, …) and threading an
+-- extra registry through every one of them for a purely-derived
+-- fallback would touch far too many call sites. The ref is written
+-- once per module load and read many times per comparison; races
+-- aren't a concern because the scheduler only rebuilds the env
+-- single-threaded.
+{-# NOINLINE ctorIndexRegistry #-}
+ctorIndexRegistry :: IORef (Map.Map ByteString (ByteString, Int))
+ctorIndexRegistry = unsafePerformIO (newIORef Map.empty)
+
+-- | Merge the @(typeName, declIndex)@ entries from a 'DataRegistry'
+-- into the global 'ctorIndexRegistry'. Arity is intentionally dropped
+-- here — the index registry only cares about ordering.
+populateCtorIndex :: DataRegistry -> IO ()
+populateCtorIndex reg =
+    modifyIORef' ctorIndexRegistry $ \m ->
+        Map.union m (Map.map (\(tyName, _arity, idx) -> (tyName, idx)) reg)
+
+-- | Look up a constructor's @(typeName, declIndex)@ in the global
+-- registry. Built-in constructors (list, Bool, tuples, Unit) aren't
+-- recorded there — structural ordering handles them explicitly.
+lookupCtorIndex :: ByteString -> IO (Maybe (ByteString, Int))
+lookupCtorIndex name = Map.lookup name <$> readIORef ctorIndexRegistry
+
 -- | Structural Ord fallback for VCon values.
 --
 -- Returns 'Just ord' when @av@ and @bv@ can be compared structurally,
@@ -905,24 +938,14 @@ ordCmp _reg slot av bv = case (av, bv) of
 --
 --   1. Same constructor → compare fields lexicographically
 --      (left-to-right, short-circuit on first non-EQ).
---   2. Different constructor → use the constructor *index* within its
---      declaring data decl, i.e. @data Color = Red | Green | Blue@
---      gives @Red < Green < Blue@.
---
--- TODO(ctor-index): IHC.Scan.DataRegistry currently stores only
--- @Map ConName Arity@ and therefore loses declaration order. Until the
--- registry is extended to carry a (typeName, index) pair per
--- constructor — or a separate CtorIndexRegistry is threaded through
--- Scheduler/Builtins — we fall back to **lexicographic comparison of
--- the constructor name**. This matches derived-Ord semantics only when
--- the constructors happen to be declared in alphabetical order; it's
--- wrong in general (e.g. @data Color = Red | Green | Blue@ gives
--- @Blue < Green < Red@ with this fallback).
---
--- This is the pragmatic mid-step called out in the original task:
--- "compare ctor names lexicographically — wrong but better than
--- crashing — and document the TODO". The structural *fields* half is
--- correct; only the cross-constructor ordering is a placeholder.
+--   2. Different constructors of the *same* type → compare by
+--      declaration index, so @data Color = Red | Green | Blue@ gives
+--      @Red < Green < Blue@ (matching GHC's derived-Ord semantics).
+--   3. Different constructors with no recorded type (built-ins not in
+--      the registry, or types from different declarations) → fall back
+--      to lexicographic comparison of the constructor name. This is a
+--      best-effort last resort; correct programs shouldn't compare
+--      values of unrelated types.
 structuralOrdering :: ClassRegistry -> Val -> Val -> IO (Maybe Ordering)
 structuralOrdering reg av bv = case (av, bv) of
     (VUnit, VUnit) -> pure (Just EQ)
@@ -940,10 +963,19 @@ structuralOrdering reg av bv = case (av, bv) of
         | n1 == n2 && length ts1 == length ts2 -> do
             o <- compareFields ts1 ts2
             pure (Just o)
-        | otherwise ->
-            -- See TODO(ctor-index) on structuralOrdering: lex-compare
-            -- constructor names as a placeholder for the real index.
-            pure (Just (compare n1 n2))
+        | otherwise -> do
+            -- Different constructors: prefer the declaration-index
+            -- registry so user-derived Ord matches GHC semantics.
+            mIdx1 <- lookupCtorIndex n1
+            mIdx2 <- lookupCtorIndex n2
+            case (mIdx1, mIdx2) of
+                (Just (ty1, i1), Just (ty2, i2)) | ty1 == ty2 ->
+                    pure (Just (compare i1 i2))
+                _ ->
+                    -- Last-resort fallback: neither constructor (or
+                    -- both from different types) carries index data.
+                    -- Fall back to lex-comparing the name.
+                    pure (Just (compare n1 n2))
     _ -> pure Nothing
   where
     compareFields []     []     = pure EQ
@@ -2861,10 +2893,13 @@ appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 -- The argument thunks are stored unevaluated — a 'VCon' field is lazy.
 buildConEnv :: DataRegistry -> IO Env
 buildConEnv reg = do
+    -- Populate the global ctor-index map as a side effect so
+    -- 'structuralOrdering' can derive Ord by declaration order.
+    populateCtorIndex reg
     pairs <- mapM mkBinding (Map.toList reg)
     pure (extendEnvMany pairs emptyEnv)
   where
-    mkBinding (name, arity) = do
+    mkBinding (name, (_tyName, arity, _idx)) = do
         v <- mkCon name arity
         t <- newWHNFThunk v
         pure (name, t)

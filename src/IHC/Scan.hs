@@ -569,9 +569,23 @@ skipTypeDecl src cur0 =
 -- Data declarations
 --------------------------------------------------------------------------------
 
--- | Map from constructor name to arity. Populated once per program by
--- 'scanDataDecls', consumed by 'IHC.Builtins.buildConEnv'.
-type DataRegistry = Map ByteString Int
+-- | Map from constructor name to @(typeName, arity, declIndex)@.
+--
+-- * @typeName@ is the LHS type-constructor name of the enclosing @data@ /
+--   @newtype@ declaration (empty 'ByteString' if the scanner couldn't
+--   identify it — e.g. malformed input).
+-- * @arity@ is the number of fields the constructor takes.
+-- * @declIndex@ is the 0-based position of this constructor within its
+--   own data declaration. @data Color = Red | Green | Blue@ gives Red→0,
+--   Green→1, Blue→2. Consumers use this to derive Ord (constructors are
+--   ordered by declaration position), matching GHC's derived-Ord
+--   semantics.
+--
+-- Populated once per program by 'scanDataDecls', consumed by
+-- 'IHC.Builtins.buildConEnv' (which uses the arity to build the
+-- constructor value) and by 'IHC.Builtins.structuralOrdering' (which
+-- uses the @(typeName, declIndex)@ pair for cross-constructor Ord).
+type DataRegistry = Map ByteString (ByteString, Int, Int)
 
 -- | Map from record-field name to a list of @(constructor name, field index)@
 -- pairs. Used by 'IHC.Builtins.buildFieldEnv' to generate field-accessor
@@ -607,14 +621,16 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkEof -> pure (dReg, fReg, tReg)
             TkData | tkCol tok == 1 -> do
                 let mTyName = peekTypeName cur'
-                ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
+                    tyName  = maybe BC.empty id mTyName
+                ((dReg', fReg'), curAfter) <- scanOneDataDecl tyName (dReg, fReg) cur'
                 let tReg' = recordTypeCtors mTyName dReg dReg' tReg
                 go dReg' fReg' tReg' curAfter
             -- Phase 3.6: newtype declarations behave like single-constructor
             -- data declarations for our purposes (constructor name → arity 1).
             TkNewtype | tkCol tok == 1 -> do
                 let mTyName = peekTypeName cur'
-                ((dReg', fReg'), curAfter) <- scanOneDataDecl (dReg, fReg) cur'
+                    tyName  = maybe BC.empty id mTyName
+                ((dReg', fReg'), curAfter) <- scanOneDataDecl tyName (dReg, fReg) cur'
                 let tReg' = recordTypeCtors mTyName dReg dReg' tReg
                 go dReg' fReg' tReg' curAfter
             -- Phase 3.2 + 3.4: skip top-level type / type family / type instance
@@ -675,12 +691,17 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
     -- Decl ends at a column-1 token (next top-level binding / data) or
     -- at EOF. TkNewline is trivia.
     -- Also handles GADT form: TkWhere after the type name.
-    scanOneDataDecl !regs cur0 = do
+    --
+    -- @tyName@ is the name of the LHS type constructor (empty if the
+    -- scanner couldn't identify it); it's stored alongside each
+    -- collected constructor so downstream passes can tell which data
+    -- decl a constructor belongs to.
+    scanOneDataDecl !tyName !regs cur0 = do
         -- Peek at tokens to find either '=' (traditional) or 'where' (GADT).
         (eqOrWhere, curAfterSep) <- peekEqOrWhere cur0
         case eqOrWhere of
-            TkWhere -> collectGadtCtors regs curAfterSep
-            _       -> collectCtors regs curAfterSep
+            TkWhere -> collectGadtCtors tyName 0 regs curAfterSep
+            _       -> collectCtors     tyName 0 regs curAfterSep
 
     -- Scan forward until we find '=' (traditional) or 'where' (GADT).
     -- Returns the separator token kind and cursor after it.
@@ -705,22 +726,26 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
     -- We count all '->' arrows at depth 0 and subtract 1 (last arrow
     -- leads to the return type, not a field). Plus one per constraint
     -- (each constraint in a tuple counts separately).
-    collectGadtCtors (!dReg, !fReg) cur = do
+    --
+    -- @tyName@ is the enclosing type-constructor name; @idx@ is the
+    -- running 0-based declaration index assigned to each successfully
+    -- parsed constructor (incremented as we collect them).
+    collectGadtCtors !tyName !idx (!dReg, !fReg) cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkNewline -> collectGadtCtors (dReg, fReg) cur'
+            TkNewline -> collectGadtCtors tyName idx (dReg, fReg) cur'
             TkConId name -> do
                 -- Expect '::' after constructor name.
                 let (sep, curSig) = nextToken src cur'
                 case tkKind sep of
                     TkDColon -> do
                         (arity, curEnd) <- countGadtArity 0 0 curSig
-                        let dReg' = Map.insert name arity dReg
-                        collectGadtCtors (dReg', fReg) curEnd
-                    _ -> collectGadtCtors (dReg, fReg) cur'
+                        let dReg' = Map.insert name (tyName, arity, idx) dReg
+                        collectGadtCtors tyName (idx + 1) (dReg', fReg) curEnd
+                    _ -> collectGadtCtors tyName idx (dReg, fReg) cur'
             -- Column-1 non-newline means next top-level decl.
             _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure ((dReg, fReg), cur)
-              | otherwise -> collectGadtCtors (dReg, fReg) cur'
+              | otherwise -> collectGadtCtors tyName idx (dReg, fReg) cur'
 
     -- Count arity of a GADT constructor signature.
     -- We count top-level '->' and ',' (for tuple constraints) minus 1.
@@ -793,14 +818,20 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
     -- At start of each ctor: expect TkConId, then consume field atoms
     -- until TkBar / decl-end.
     -- Also handles existential prefix: `forall a. C a =>` before ctor name.
-    collectCtors (!dReg, !fReg) cur = do
+    --
+    -- @tyName@ is the enclosing type-constructor name; @cIdx@ is the
+    -- running 0-based declaration index of the *next* constructor to
+    -- record. It's incremented only when a constructor is actually
+    -- committed to the registry (constraint/existential prefixes don't
+    -- advance it).
+    collectCtors !tyName !cIdx (!dReg, !fReg) cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkNewline -> collectCtors (dReg, fReg) cur'
+            TkNewline -> collectCtors tyName cIdx (dReg, fReg) cur'
             -- `forall tvars .` prefix — skip until '.' then check for constraints
             TkForall -> do
                 curAfterDot <- skipForallBinders cur'
-                collectCtors (dReg, fReg) curAfterDot
+                collectCtors tyName cIdx (dReg, fReg) curAfterDot
             TkConId name -> do
                 -- Check if this ConId is a class constraint (existential form).
                 -- If we eventually hit '=>' before any '|' or col-1, it was a
@@ -810,7 +841,7 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                     then do
                         -- Skip through the constraint(s) and '=>'.
                         curAfterArrow <- skipConstraintContext cur'
-                        collectCtors (dReg, fReg) curAfterArrow
+                        collectCtors tyName cIdx (dReg, fReg) curAfterArrow
                     else do
                         -- Peek ahead: if '{' follows immediately, it is record syntax.
                         let (peek, _) = nextToken src cur'
@@ -821,7 +852,7 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                             _ -> do
                                 (n, curN') <- countCtorFields 0 cur'
                                 pure (n, [], curN')
-                        let dReg' = Map.insert name arity dReg
+                        let dReg' = Map.insert name (tyName, arity, cIdx) dReg
                             fReg' = foldr
                                 (\(fieldName, idx) acc ->
                                     Map.insertWith (++) fieldName [(name, idx)] acc)
@@ -830,8 +861,8 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                         -- After fields, check for '|' (more ctors) or decl end.
                         let (sep, curSep) = nextToken src curN
                         case tkKind sep of
-                            TkBar     -> collectCtors (dReg', fReg') curSep
-                            TkNewline -> collectCtors (dReg', fReg') curSep
+                            TkBar     -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
+                            TkNewline -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
                             _         -> pure ((dReg', fReg'), curN)
             -- Missing constructor (malformed) or decl ended.
             _ -> pure ((dReg, fReg), cur)
