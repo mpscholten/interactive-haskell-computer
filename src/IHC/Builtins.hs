@@ -2210,20 +2210,19 @@ realWorldB = pure (VPrimObj PrimRealWorld)
 noDuplicateB :: IO Val
 noDuplicateB = pure $ VFun $ \_ -> pure (VPrimObj PrimRealWorld)
 
--- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> (# State# RealWorld, a #)
--- In our interpreter: apply the function to the RealWorld token, run any
--- resulting VIO action, and return the (# State# RealWorld, a #) unboxed tuple.
--- Callers (like runST, unsafePerformIO) are expected to extract the second
--- element themselves via case pattern matching.
--- NOTE: previous versions extracted the result here, but that broke source-loaded
--- callers like GHC.ST.runST that pattern-match on the returned tuple themselves.
+-- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> a
+-- Apply the function to the RealWorld token, run any bridged VIO layer,
+-- then extract and return the result component of the unboxed tuple.
 runRWB :: IO Val
 runRWB = pure $ VFun $ \ft -> do
     fv <- force ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     resRaw <- apply fv rwT
     result <- runIOVal resRaw
-    pure result
+    case result of
+        VCon "(#,#)" [_stT, resT] -> force resT
+        other -> error ("runRW#: expected (# State# RealWorld, a #), got: "
+                        <> showValForDebug other)
 
 lazyB :: IO Val
 lazyB = pure $ VFun $ \a -> force a
