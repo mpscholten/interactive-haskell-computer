@@ -419,6 +419,15 @@ builtins reg =
     , ("cstringLength#",  cstringLengthB)
     , ("unpackCString#",  unpackCStringB)
     , ("unpackCStringUtf8#", unpackCStringB)
+    -- Foreign.C.String shortcuts — source bodies reach for RTS locale
+    -- state via getForeignEncoding; we bypass that and go straight to
+    -- ASCII-byte marshalling (matches GHC's default for libc FFI).
+    , ("withCString",     withCStringB)
+    , ("withCStringLen",  withCStringLenB)
+    , ("peekCString",     peekCStringB)
+    , ("peekCAString",    peekCStringB)
+    , ("newCString",      newCStringB)
+    , ("newCAString",     newCStringB)
     , ("sizeOf",       sizeOfB)
     , ("alignment",    alignmentB)
     -- Phase 2.8: additional numeric ops needed by containers
@@ -2897,6 +2906,64 @@ unpackCStringB = pure $ VFun $ \a -> do
             stringToListValIO s
         VStr s -> stringToListValIO (BC.unpack s)
         _ -> error ("unpackCString#: bad arg: " <> showValForDebug av)
+
+-- Foreign.C.String helpers.  The real @Foreign.C.String.withCString@ in
+-- base reaches for @getForeignEncoding@, which sits on RTS locale
+-- plumbing we don't model.  We register a direct host shortcut that
+-- packs each 'Char' as one byte — matching GHC's ASCII-only default
+-- good enough for the libc-FFI common case — and feeds a raw 'Ptr
+-- CChar' to the callback.
+withCStringB :: IO Val
+withCStringB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
+    sv <- force sT
+    s  <- valToString sv
+    kv <- force kT
+    BS.useAsCString (BC.pack s) $ \p -> do
+        argT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr p)))
+        r    <- apply kv argT
+        case r of
+            VIO io -> io
+            _      -> pure r
+
+-- Like 'withCString' but also passes the length to the callback, as a
+-- 2-tuple @(Ptr CChar, Int)@.  'Foreign.C.String.withCStringLen' has
+-- the same RTS-encoding dependency as 'withCString' and is trivially
+-- derived here.
+withCStringLenB :: IO Val
+withCStringLenB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
+    sv <- force sT
+    s  <- valToString sv
+    kv <- force kT
+    let bs = BC.pack s
+    BS.useAsCString bs $ \p -> do
+        ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr p)))
+        lenT <- newWHNFThunk (VInt (fromIntegral (BS.length bs)))
+        tupT <- newWHNFThunk (VCon "(,)" [ptrT, lenT])
+        r    <- apply kv tupT
+        case r of
+            VIO io -> io
+            _      -> pure r
+
+-- Pure pointer peek — materialise a 'Ptr CChar' as a Haskell @String@.
+peekCStringB :: IO Val
+peekCStringB = pure $ VFun $ \pT -> pure $ VIO $ do
+    pv <- force pT
+    p  <- ptrValToPtr pv
+    s  <- peekCAString (castPtr p)
+    stringToListValIO s
+
+-- Allocate a fresh NUL-terminated C string (via 'mallocBytes') and
+-- return its raw pointer.  Caller is responsible for freeing.
+newCStringB :: IO Val
+newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
+    sv <- force sT
+    s  <- valToString sv
+    let bs  = BC.pack s
+        len = BS.length bs
+    cp <- mallocBytes (len + 1)
+    BS.useAsCString bs $ \src -> copyBytes cp (castPtr src) len
+    poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
+    pure (VPrimObj (PrimPtr cp))
 
 sizeOfB :: IO Val
 sizeOfB = pure $ VFun $ \a -> do
