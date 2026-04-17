@@ -851,6 +851,23 @@ parseLambdaCase ctx cur0 = do
 -- Anything that doesn't match the above falls back to the standard monadic
 -- >>= / >> chain.
 
+-- | Sentinel prefix used to mark a 'SLet' produced by 'parseStmt' for
+-- an implicit-param do-statement (@let ?x = e@).  The binder name in
+-- the emitted bind starts with a @?@ byte, which is not a legal
+-- identifier byte anywhere else in the parser output.  'desugarDo'
+-- detects this and rewrites the containing 'SLet' into an
+-- 'EImplicitLet' wrapping the do-block continuation.
+iparamSentinelPrefix :: Char
+iparamSentinelPrefix = '?'
+
+isImplicitLetBinds :: [Bind] -> Bool
+isImplicitLetBinds []           = False
+isImplicitLetBinds ((n, _) : _) = not (BC.null n)
+                                  && BC.head n == iparamSentinelPrefix
+
+stripIParamPrefix :: [Bind] -> [(Name, Expr)]
+stripIParamPrefix = map (\(n, e) -> (BC.drop 1 n, e))
+
 parseDo :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseDo ctx cur0 = do
     let (firstTok, curAfter) = nextSig ctx cur0
@@ -895,6 +912,15 @@ parseDo ctx cur0 = do
 
     -- | Desugar a list of do-statements.  First try the applicative form;
     -- if that doesn't apply, fall back to the classical monadic chain.
+    --
+    -- Phase 3.6 (do-block implicit-param binding): a do-block item of the
+    -- form @let ?x = e@ is emitted by 'parseStmt' as a sentinel
+    -- @SLet [("?x", e), ...]@ — note the @?@-prefixed binder name, which
+    -- is otherwise unreachable from the surface syntax (regular let
+    -- binders are plain identifiers).  We detect this here and desugar
+    -- it to @EImplicitLet binds (rest)@ wrapping the continuation,
+    -- preserving the scoping semantics of GHC's @let ?x = e@ inside a
+    -- do-block.
     desugarDo :: [Stmt] -> Expr
     desugarDo ss
       | Just appl <- tryApplicativeDo ss = appl
@@ -905,16 +931,22 @@ parseDo ctx cur0 = do
     monadicDo []               = EDo []  -- shouldn't happen; fallback
     monadicDo [SExpr e]        = e
     monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
-    monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
+    monadicDo [SLet bs]
+        | isImplicitLetBinds bs = EImplicitLet (stripIParamPrefix bs) (EDo [])
+        | otherwise             = ELet bs (EDo [])  -- shouldn't happen
     monadicDo (SExpr e : rest) =
         -- e >> do { rest }
         EApp (EApp (EVar ">>") e) (monadicDo rest)
     monadicDo (SBind name e : rest) =
         -- e >>= \name -> do { rest }
         EApp (EApp (EVar ">>=") e) (ELam name (monadicDo rest))
-    monadicDo (SLet bs : rest) =
-        -- let bs in do { rest }
-        ELet bs (monadicDo rest)
+    monadicDo (SLet bs : rest)
+        | isImplicitLetBinds bs =
+            -- implicit-param let ?x = e: wrap the rest in EImplicitLet.
+            EImplicitLet (stripIParamPrefix bs) (monadicDo rest)
+        | otherwise =
+            -- regular let bs in do { rest }
+            ELet bs (monadicDo rest)
 
     -- | If the do-block matches the applicative pattern, return its
     -- applicative desugaring.  See the header comment on 'parseDo' for the
@@ -1065,15 +1097,62 @@ parseStmt ctx cur0 = do
 parseDoLet :: Ctx -> Cursor -> IO (Stmt, Cursor)
 parseDoLet ctx cur0 = do
     let (firstTok, curAfter) = nextSig ctx cur0
-    (binds, curEnd) <- case tkKind firstTok of
-        TkLBrace -> bracedBinds curAfter []
-        _        ->
-            -- Layout mode: collect all bindings at the same column.
-            -- This handles `let x :: Int\n    x = 42` correctly.
+    case tkKind firstTok of
+        -- Phase 3.6: do-block implicit-param binding.  Emit the binds with
+        -- a '?'-prefixed binder so 'desugarDo' / 'monadicDo' can route
+        -- them into 'EImplicitLet' wrapping the continuation.  The '?'
+        -- byte is otherwise unreachable in regular binder names, so this
+        -- is a safe sentinel.
+        TkImplicitRef _ -> do
+            (ibs, curEnd) <- singleIPBind cur0
+            pure (SLet ibs, curEnd)
+        TkLBrace ->
+            -- Braced: could be regular `{ x = e; ... }` or implicit
+            -- `{ ?x = e; ... }`.  Peek inside to decide.
+            let (peek, _) = nextSig ctx curAfter
+            in case tkKind peek of
+                TkImplicitRef _ -> do
+                    (ibs, curEnd) <- bracedIPBinds curAfter []
+                    pure (SLet ibs, curEnd)
+                _ -> do
+                    (binds, curEnd) <- bracedBinds curAfter []
+                    pure (SLet binds, curEnd)
+        _ -> do
             let bindCol = tkCol firstTok
-            in layoutBinds bindCol cur0 []
-    pure (SLet binds, curEnd)
+            (binds, curEnd) <- layoutBinds bindCol cur0 []
+            pure (SLet binds, curEnd)
   where
+    -- | Single-line @?name = expr@ implicit-param bind inside do { }.
+    -- The result bind is prefixed with '?' so 'desugarDo' can detect it.
+    singleIPBind cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _ -> parseErr ctx "expected `?name` in implicit do-let" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr ctx "expected `=` in implicit do-let" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        pure ([(BC.cons iparamSentinelPrefix name, e)], cur3)
+
+    bracedIPBinds cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _ -> parseErr ctx "expected `?name` in implicit do-let" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr ctx "expected `=` in implicit do-let" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let bind = (BC.cons iparamSentinelPrefix name, e)
+        let (sep, curN) = nextSig ctx cur3
+        case tkKind sep of
+            TkSemi   -> bracedIPBinds curN (bind : acc)
+            TkRBrace -> pure (reverse (bind : acc), curN)
+            _        -> parseErr ctx "expected `;` or `}` in implicit do-let" sep
+
     -- | Try to detect and skip a type sig @name[, name]* :: type@ at the
     -- current position. Returns @Just curAfter@ on success, @Nothing@ if
     -- this looks like a value binding.
