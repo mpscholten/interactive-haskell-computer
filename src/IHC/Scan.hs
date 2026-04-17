@@ -27,6 +27,8 @@ module IHC.Scan
     , lookupSymbol
     , markCompiled
     , scanAllTopLevelNames
+      -- * Top-level TH splices ($( ... )) — Phase 2.13
+    , scanTopLevelSplices
       -- * Data declarations
     , DataRegistry
     , FieldRegistry
@@ -142,6 +144,40 @@ scanAllTopLevelNames src = go [] startCursor
             -- not value bindings and must not be reported as names.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
+
+-- | Phase 2.13: find every top-level splice @$( ... )@ and return the
+-- byte span of the INNER expression (between the @(@ and matching @)@).
+-- The splice token @$(@ must appear at column 1.  Nested parens inside
+-- the splice body are tracked so the scan finds the right terminator.
+scanTopLevelSplices :: Source -> IO [Span]
+scanTopLevelSplices src = go [] startCursor
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkSpliceLParen | tkCol tok == 1 -> do
+                let innerStart = tkEnd tok
+                    (innerEnd, curAfter) = skipToMatchingRParen cur'
+                if innerEnd > innerStart
+                    then go ((innerStart, innerEnd) : acc) curAfter
+                    else go acc cur'
+            _ -> go acc cur'
+
+    skipToMatchingRParen :: Cursor -> (Pos, Cursor)
+    skipToMatchingRParen c0 = loop (1 :: Int) c0
+      where
+        loop !depth c
+            | depth <= 0 = (cPos c, c)
+            | otherwise  =
+                let (tk, c') = nextToken src c
+                in case tkKind tk of
+                    TkEof          -> (cPos c, c)
+                    TkLParen       -> loop (depth + 1) c'
+                    TkRParen       | depth == 1 -> (tkStart tk, c')
+                                   | otherwise  -> loop (depth - 1) c'
+                    TkSpliceLParen -> loop (depth + 1) c'
+                    _              -> loop depth c'
 
 -- | Skip through all consecutive clauses of the given binding name so
 -- that the scanner doesn't report it multiple times.

@@ -25,13 +25,19 @@ module IHC.TH
     , expandSplicesInExpr
     , thBuiltinPairs
     , exprToVal
+    -- * Phase 2.13: top-level splice decl decoder
+    , thDecsToBindings
+    , thExpandSpliceDecl
+    , resetNewNameCounter
     ) where
 
 import Control.Exception (throwIO, Exception)
 import Control.Monad ((<=<))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
+import Data.IORef
 import Data.Int (Int64)
+import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Eval (eval, force)
 import IHC.Val
@@ -326,7 +332,20 @@ decodeLit v =
 
 decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
-decodeName (VCon n _) = pure n   -- sometimes names are stored as VCon
+decodeName (VCon "Name" [nT]) = do
+    -- @VCon "Name" [VStr bs]@ — the shape produced by 'mkNameBuiltin'.
+    nV <- force nT
+    case nV of
+        VStr bs    -> pure bs
+        VCon bs [] -> pure bs
+        other      -> decodeName other
+decodeName (VCon "NameU" [nT]) = do
+    nV <- force nT; decodeName nV
+decodeName (VCon "NameS" [nT]) = do
+    nV <- force nT; decodeName nV
+decodeName (VCon "OccName" [nT]) = do
+    nV <- force nT; decodeName nV
+decodeName (VCon n _) = pure n   -- sometimes names are stored as VCon tag
 decodeName v = throwTH ("decodeName: expected VStr, got " <> showValForDebug v)
 
 decodeList :: Val -> (Val -> IO a) -> IO [a]
@@ -503,5 +522,366 @@ thBuiltinPairs =
     , ("Language.Haskell.TH.lift",            liftBuiltin)
     , ("Language.Haskell.TH.Syntax.lift",     liftBuiltin)
     , ("Language.Haskell.TH.Lib.lift",        liftBuiltin)
+    -- Phase 2.13: Q monad + Name primitives for top-level splices.
+    , ("mkName",                              mkNameBuiltin)
+    , ("Language.Haskell.TH.mkName",          mkNameBuiltin)
+    , ("Language.Haskell.TH.Syntax.mkName",   mkNameBuiltin)
+    , ("newName",                             newNameBuiltin)
+    , ("Language.Haskell.TH.newName",         newNameBuiltin)
+    , ("Language.Haskell.TH.Syntax.newName",  newNameBuiltin)
+    , ("runQ",                                runQBuiltin)
+    , ("Language.Haskell.TH.runQ",            runQBuiltin)
+    , ("Language.Haskell.TH.Syntax.runQ",     runQBuiltin)
+    , ("reify",                               reifyBuiltin)
+    , ("Language.Haskell.TH.reify",           reifyBuiltin)
+    , ("Language.Haskell.TH.Syntax.reify",    reifyBuiltin)
     ]
+    -- Phase 2.13: TH AST constructors.  These have no Haskell source in
+    -- our cache (the template-haskell package isn't source-loaded) and
+    -- the decoder expects VCon-shaped values, so we auto-generate
+    -- curried constructor builtins for the shapes deriveJSON emits.
+    ++ thConstructorPairs
+
+-- | Every @(name, arity)@ pair for the Template Haskell constructors we
+-- support as builtin shims.  Registered under the bare name and the
+-- fully-qualified @Language.Haskell.TH.*@ path so imports resolve.
+thConstructorCatalog :: [(ByteString, Int)]
+thConstructorCatalog =
+    -- Dec
+    [ ("ValD", 3)           -- pat, body, wheres
+    , ("FunD", 2)           -- name, clauses
+    , ("SigD", 2)           -- name, type
+    , ("InstanceD", 4)      -- overlap, ctx, typ, decs
+    , ("DataD", 6)
+    , ("NewtypeD", 6)
+    , ("ClassD", 4)
+    , ("PragmaD", 1)
+    -- Clause (fun body form: Clause [pat] body [dec])
+    , ("Clause", 3)
+    -- Body
+    , ("NormalB", 1)
+    , ("GuardedB", 1)
+    -- Exp
+    , ("VarE", 1)
+    , ("ConE", 1)
+    , ("LitE", 1)
+    , ("AppE", 2)
+    , ("AppTypeE", 2)
+    , ("InfixE", 3)
+    , ("UInfixE", 3)
+    , ("ParensE", 1)
+    , ("LamE", 2)
+    , ("LamCaseE", 1)
+    , ("TupE", 1)
+    , ("UnboxedTupE", 1)
+    , ("CondE", 3)
+    , ("MultiIfE", 1)
+    , ("LetE", 2)
+    , ("CaseE", 2)
+    , ("DoE", 2)
+    , ("CompE", 1)
+    , ("ArithSeqE", 1)
+    , ("ListE", 1)
+    , ("SigE", 2)
+    , ("RecConE", 2)
+    , ("RecUpdE", 2)
+    , ("StaticE", 1)
+    , ("UnboundVarE", 1)
+    , ("LabelE", 1)
+    , ("ImplicitParamVarE", 1)
+    -- Pat
+    , ("VarP", 1)
+    , ("ConP", 3)        -- name, [type], [pat] (modern) / (name, [pat])
+    , ("LitP", 1)
+    , ("TupP", 1)
+    , ("UnboxedTupP", 1)
+    , ("InfixP", 3)
+    , ("UInfixP", 3)
+    , ("ParensP", 1)
+    , ("TildeP", 1)
+    , ("BangP", 1)
+    , ("AsP", 2)
+    , ("RecP", 2)
+    , ("ListP", 1)
+    , ("SigP", 2)
+    , ("ViewP", 2)
+    , ("WildP", 0)
+    -- Lit
+    , ("IntegerL", 1)
+    , ("RationalL", 1)
+    , ("CharL", 1)
+    , ("StringL", 1)
+    , ("IntPrimL", 1)
+    , ("WordPrimL", 1)
+    , ("FloatPrimL", 1)
+    , ("DoublePrimL", 1)
+    , ("StringPrimL", 1)
+    , ("CharPrimL", 1)
+    -- Type
+    , ("ConT", 1)
+    , ("VarT", 1)
+    , ("AppT", 2)
+    , ("ArrowT", 0)
+    , ("ListT", 0)
+    , ("TupleT", 1)
+    , ("ForallT", 3)
+    , ("PromotedT", 1)
+    , ("LitT", 1)
+    , ("StarT", 0)
+    -- TyVarBndr
+    , ("PlainTV", 1)
+    , ("KindedTV", 2)
+    -- Info (returned by reify)
+    , ("TyConI", 1)
+    , ("ClassI", 2)
+    , ("ClassOpI", 3)
+    , ("VarI", 3)
+    , ("PrimTyConI", 3)
+    , ("FamilyI", 2)
+    -- Name wrapper
+    -- NOTE: @Name@ is used as VCon "Name" [VStr bytes] by mkName.
+    -- We don't register it here because the parser treats @Name@
+    -- uses as a type, and user code doesn't apply "Name" as a ctor.
+    ]
+
+-- | Flatten the catalog into @(name, IO Val)@ pairs for 'thBuiltinPairs'.
+thConstructorPairs :: [(ByteString, IO Val)]
+thConstructorPairs =
+    concatMap oneCtor thConstructorCatalog
+  where
+    oneCtor (name, arity) =
+        let mkV = pure (buildCtor name arity)
+        in [ (name,                                    mkV)
+           , ("Language.Haskell.TH." <> name,          mkV)
+           , ("Language.Haskell.TH.Syntax." <> name,   mkV)
+           , ("Language.Haskell.TH.Lib." <> name,      mkV)
+           ]
+
+    buildCtor :: Name -> Int -> Val
+    buildCtor name 0    = VCon name []
+    buildCtor name n    = buildLam name n []
+
+    buildLam :: Name -> Int -> [Thunk] -> Val
+    buildLam name 0    acc = VCon name (reverse acc)
+    buildLam name left acc = VFun $ \t ->
+        pure (buildLam name (left - 1) (t : acc))
+
+--------------------------------------------------------------------------------
+-- Phase 2.13: Q monad + Name primitives
+--
+-- The @Q@ monad is represented as @VIO@ at the Val level.  It is simply a
+-- suspended @IO Val@ action; the @return@/@>>=@ machinery is whatever the
+-- interpreter uses for plain @IO@.  We encode Template Haskell Names as
+-- @VCon "Name" [VStr bytes]@ to match the constructor that the decoder
+-- expects.
+--------------------------------------------------------------------------------
+
+-- | Global counter for 'newName'. Reset once per load via
+-- 'resetNewNameCounter'.
+{-# NOINLINE newNameCounterRef #-}
+newNameCounterRef :: IORef Int
+newNameCounterRef = unsafePerformIO (newIORef 0)
+
+resetNewNameCounter :: IO ()
+resetNewNameCounter = writeIORef newNameCounterRef 0
+
+-- | @mkName :: String -> Name@.  Returns @VCon "Name" [VStr bytes]@.
+mkNameBuiltin :: IO Val
+mkNameBuiltin = pure $ VFun $ \argT -> do
+    v <- force argT
+    bs <- valToBytes v
+    bsT <- newWHNFThunk (VStr bs)
+    pure (VCon "Name" [bsT])
+
+-- | @newName :: String -> Q Name@.  Gensym by appending @_N@.
+newNameBuiltin :: IO Val
+newNameBuiltin = pure $ VFun $ \argT -> do
+    v <- force argT
+    base <- valToBytes v
+    pure $ VIO $ do
+        n <- atomicModifyIORef' newNameCounterRef (\c -> (c + 1, c))
+        let unique = base <> BC.pack ("_" <> show n)
+        uT <- newWHNFThunk (VStr unique)
+        pure (VCon "Name" [uT])
+
+-- | @runQ :: Quasi m => Q a -> m a@.  Identity on 'VIO' values.
+runQBuiltin :: IO Val
+runQBuiltin = pure $ VFun $ \argT -> do
+    v <- force argT
+    case v of
+        VIO _ -> pure v
+        other -> pure (VIO (pure other))
+
+-- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
+reifyBuiltin :: IO Val
+reifyBuiltin = pure $ VFun $ \argT -> do
+    _ <- force argT
+    pure $ VIO $ do
+        nameT  <- thName (BC.pack "<reify-stub>")
+        let nameV = VCon "Name" [nameT]
+        nameT2 <- newWHNFThunk nameV
+        emptyCtx <- newWHNFThunk (VCon "[]" [])
+        emptyTvs <- newWHNFThunk (VCon "[]" [])
+        nothing  <- newWHNFThunk (VCon "Nothing" [])
+        emptyCtors  <- newWHNFThunk (VCon "[]" [])
+        emptyDerivs <- newWHNFThunk (VCon "[]" [])
+        dataDT <- newWHNFThunk
+                    (VCon "DataD"
+                        [emptyCtx, nameT2, emptyTvs, nothing, emptyCtors, emptyDerivs])
+        pure (VCon "TyConI" [dataDT])
+
+-- | Convert a String-shaped 'Val' into a 'ByteString'.
+valToBytes :: Val -> IO ByteString
+valToBytes (VStr bs) = pure bs
+valToBytes (VCon "Name" [nT]) = do
+    nV <- force nT
+    case nV of
+        VStr bs -> pure bs
+        _       -> valToBytes nV
+valToBytes v = do
+    cs <- collectChars v
+    pure (BC.pack cs)
+  where
+    collectChars (VCon "[]" []) = pure []
+    collectChars (VCon ":" [hT, tT]) = do
+        hV <- force hT
+        tV <- force tT
+        case hV of
+            VChar c -> (c :) <$> collectChars tV
+            _       -> throwTH ("valToBytes: expected VChar, got "
+                                 <> showValForDebug hV)
+    collectChars other =
+        throwTH ("valToBytes: expected string-shaped value, got "
+                 <> showValForDebug other)
+
+--------------------------------------------------------------------------------
+-- Phase 2.13: TH Dec -> IHC binding decoder
+--------------------------------------------------------------------------------
+
+-- | Evaluate a top-level splice expression and decode its result into
+-- a list of @(name, body)@ top-level bindings.
+thExpandSpliceDecl :: Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
+thExpandSpliceDecl env ipm spliceExpr = do
+    v0 <- eval env ipm spliceExpr
+    decsVal <- unwrapQ v0
+    thDecsToBindings decsVal
+
+-- | Transparent @VIO@ unwrapper.
+unwrapQ :: Val -> IO Val
+unwrapQ (VIO act) = act >>= unwrapQ
+unwrapQ v         = pure v
+
+-- | Decode @[Dec]@ → @[(Name, Expr)]@.
+thDecsToBindings :: Val -> IO [(Name, Expr)]
+thDecsToBindings (VCon "[]" []) = pure []
+thDecsToBindings (VCon ":" [hT, tT]) = do
+    hV <- force hT
+    tV <- force tT
+    mThis <- thDecToBinding hV
+    rest  <- thDecsToBindings tV
+    pure $ case mThis of
+        Nothing -> rest
+        Just b  -> b : rest
+thDecsToBindings v =
+    throwTH ("thDecsToBindings: expected a [Dec] list, got " <> showValForDebug v)
+
+-- | Decode a single TH 'Dec' into a value-binding pair; 'Nothing' if the
+-- 'Dec' doesn't bind a runtime value (e.g. a type sig).
+thDecToBinding :: Val -> IO (Maybe (Name, Expr))
+thDecToBinding dec = case dec of
+    VCon "ValD" [patT, bodyT, _decsT] -> do
+        patV <- force patT
+        bodyV <- force bodyT
+        name <- decodeVarP patV
+        body <- decodeBody bodyV
+        pure (Just (name, body))
+    VCon "FunD" [nameT, clausesT] -> do
+        nameV <- force nameT
+        name <- decodeName nameV
+        clausesV <- force clausesT
+        body <- decodeClauses clausesV
+        pure (Just (name, body))
+    VCon "SigD" _ -> pure Nothing
+    VCon "InstanceD" _ -> pure Nothing
+    VCon "DataD" _ -> pure Nothing
+    VCon "NewtypeD" _ -> pure Nothing
+    VCon "ClassD" _ -> pure Nothing
+    VCon "PragmaD" _ -> pure Nothing
+    VCon n _ ->
+        throwTH ("thDecToBinding: unsupported Dec constructor: " <> BC.unpack n)
+    other ->
+        throwTH ("thDecToBinding: expected a Dec VCon, got "
+                 <> showValForDebug other)
+  where
+    decodeVarP (VCon "VarP" [nameT]) = do
+        nameV <- force nameT
+        decodeName nameV
+    decodeVarP v =
+        throwTH ("thDecToBinding: ValD LHS must be VarP, got "
+                 <> showValForDebug v)
+
+    decodeBody (VCon "NormalB" [eT]) = do
+        eV <- force eT
+        thExpToExpr eV
+    decodeBody (VCon "GuardedB" _) =
+        throwTH "thDecToBinding: GuardedB (guards) not yet supported"
+    decodeBody v =
+        throwTH ("thDecToBinding: expected NormalB, got " <> showValForDebug v)
+
+    decodeClauses (VCon "[]" []) =
+        throwTH "thDecToBinding: FunD has no clauses"
+    decodeClauses (VCon ":" [clT, restT]) = do
+        clV <- force clT
+        restV <- force restT
+        case restV of
+            VCon "[]" [] -> decodeOneClause clV
+            _ -> throwTH "thDecToBinding: FunD with multiple clauses not yet supported"
+    decodeClauses v =
+        throwTH ("thDecToBinding: FunD clauses must be a list, got "
+                 <> showValForDebug v)
+
+    decodeOneClause (VCon "Clause" [patsT, bodyT, _decsT]) = do
+        patsV <- force patsT
+        bodyV <- force bodyT
+        pats <- decodePats patsV
+        body <- decodeBody bodyV
+        pure (foldr wrapLam body pats)
+    decodeOneClause v =
+        throwTH ("thDecToBinding: expected Clause VCon, got "
+                 <> showValForDebug v)
+
+    wrapLam (PVar n) e = ELam n e
+    wrapLam p       e =
+        ELam (BC.pack "__thArg") (ECase (EVar (BC.pack "__thArg")) [Alt p e])
+
+    decodePats (VCon "[]" []) = pure []
+    decodePats (VCon ":" [hT, tT]) = do
+        hV <- force hT
+        tV <- force tT
+        p  <- decodePat hV
+        ps <- decodePats tV
+        pure (p : ps)
+    decodePats v =
+        throwTH ("thDecToBinding: expected [Pat], got " <> showValForDebug v)
+
+    decodePat (VCon "VarP" [nT]) = do
+        nV <- force nT
+        PVar <$> decodeName nV
+    decodePat (VCon "WildP" []) = pure PWild
+    decodePat (VCon "LitP" [lT]) = do
+        lV <- force lT
+        case lV of
+            VCon "IntegerL" [iT] -> do
+                iV <- force iT
+                case iV of
+                    VInt n -> pure (PLit (LInt n))
+                    _ -> throwTH "LitP: IntegerL payload must be VInt"
+            VCon "CharL" [cT] -> do
+                cV <- force cT
+                case cV of
+                    VChar c -> pure (PLit (LChar c))
+                    _ -> throwTH "LitP: CharL payload must be VChar"
+            _ -> throwTH "LitP: unsupported literal"
+    decodePat v =
+        throwTH ("thDecToBinding: unsupported pattern " <> showValForDebug v)
 
