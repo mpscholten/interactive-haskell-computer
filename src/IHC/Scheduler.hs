@@ -2937,19 +2937,16 @@ resolveImport registry searchPath includeMap lm name = do
                                             discoverInModule registry searchPath includeMap targetLm name
                                             pure (Just ())
                                         else tryImports rest
-                                Nothing ->
+                                Nothing
+                                    -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
+                                    -- the type's data registry has the field, the export
+                                    -- list admits it via `T(..)`. No separate binding; the
+                                    -- later-built fieldEnv will synthesize it.
+                                    | Map.member name (lmFieldReg targetLm)
+                                    , exportsName targetLm name -> pure (Just ())
                                     -- The name isn't defined locally in targetLm.
-                                    -- Two ways it might still be exported:
-                                    --
-                                    -- 1. `module Foo` re-export entry — follow those.
-                                    -- 2. `ExportName n` re-export via unqualified import:
-                                    --    e.g. `Data.Map.Strict` lists `fromList` in its
-                                    --    export list but the definition lives in
-                                    --    `Data.Map.Internal`.  Follow all unqualified
-                                    --    imports of @targetLm@ to find the definition.
-                                    if exportsName targetLm name
-                                        then followNamedReexport targetLm rest
-                                        else followModuleReexports targetLm rest
+                                    | exportsName targetLm name -> followNamedReexport targetLm rest
+                                    | otherwise -> followModuleReexports targetLm rest
 
     -- | @targetLm@ exports @name@ by name (ExportName entry) but doesn't
     -- define it locally.  Walk @targetLm@'s own unqualified imports and
@@ -3190,13 +3187,27 @@ exportsName lm n = case mhExports (lmHeader lm) of
     ExportList xs -> any matchExport xs
   where
     tCtors = lmTypeCtorReg lm
+    fields = lmFieldReg lm  -- field name → [(ctor, idx)]
+
+    -- Is @n@ a record-field accessor for any constructor of @typeHead@?
+    -- Used for the @T(..)@ export form, which implicitly exports every
+    -- field selector of T's constructors (e.g. @Identity(..)@ exports
+    -- @runIdentity@, not just the @Identity@ constructor).
+    isFieldOfType typeHead =
+        let ctorsOfT = Map.findWithDefault [] typeHead tCtors
+        in case Map.lookup n fields of
+            Just ctorIdx -> any (\(c, _) -> c `elem` ctorsOfT) ctorIdx
+            Nothing      -> False
 
     matchExport (ExportName m)            = n == m
     matchExport (ExportType m Nothing)    = n == m
     matchExport (ExportType m (Just [])) =
         -- The `T(..)` form: the type head plus every constructor of T
-        -- that the scanner saw in this module's source.
-        n == m || n `elem` Map.findWithDefault [] m tCtors
+        -- that the scanner saw in this module's source, plus every
+        -- record-field accessor defined by those constructors.
+        n == m
+        || n `elem` Map.findWithDefault [] m tCtors
+        || isFieldOfType m
     matchExport (ExportType m (Just subs)) =
         -- The `T(Ctor1, Ctor2, field1, ...)` form: the type head plus
         -- every explicitly-listed sub-name.
@@ -3524,4 +3535,5 @@ desugarRecordPats fldReg = goExpr
     goPat (PBang p)        = PBang (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit
+
 
