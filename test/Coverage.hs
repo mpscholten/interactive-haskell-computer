@@ -48,9 +48,23 @@ discoverFixtures dir = do
     if not present then pure []
     else do
         entries <- sort <$> listDirectory dir
+        -- Fixtures whose @main@ intentionally throws (for the raise#
+        -- end-to-end test) are excluded from auto-discovery because
+        -- 'runFile' propagates the exception through the
+        -- hspec test.  They're exercised by a dedicated
+        -- @runExpectFail@ test in "RunFile".
         let hsFiles = filter (\e -> ".hs" `isSuffixOf` e
-                                  && not ("_XFAIL.hs" `isSuffixOf` e)) entries
+                                  && not ("_XFAIL.hs" `isSuffixOf` e)
+                                  && e `notElem` expectedFailureFixtures) entries
         mapM (mkPair dir) hsFiles
+
+-- | Fixtures that exit non-zero by design (so the auto-runner would
+-- choke on them).  Keep this list tiny: each entry needs a dedicated
+-- test verifying the expected failure mode.
+expectedFailureFixtures :: [FilePath]
+expectedFailureFixtures =
+    [ "error_message.hs"
+    ]
 
 mkPair :: FilePath -> FilePath -> IO (FilePath, Maybe FilePath)
 mkPair dir hsName = do

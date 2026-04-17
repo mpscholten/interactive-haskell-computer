@@ -528,6 +528,22 @@ parseBindingsIn src fx (start, end) = do
                 -- Desugar multi-clause or single-clause into a single Expr.
                 let expr = desugarClauses allClauses arity
                 pure ([(name, expr)], curFinal)
+            -- @where ?ip = expr@: implicit-param binding inside a where
+            -- clause (seen in GHC.Internal.Exception.errorCallWithCallStackException,
+            -- which binds @?callStack@).  We parse and discard it: the
+            -- enclosing binding's body references the implicit param but
+            -- our interpreter doesn't propagate it from where-bindings
+            -- (implicit params survive only through let).  Emitting no
+            -- Bind is correct because the body doesn't otherwise refer
+            -- to @?ip@ as a regular identifier.
+            TkImplicitRef _ -> do
+                let (_tok, cur1) = nextSig ctx cur     -- consume ?ip
+                let (eqTok, cur2) = nextSig ctx cur1
+                case tkKind eqTok of
+                    TkEq -> pure ()
+                    _    -> parseErr ctx "expected `=` after ?ip in where-binding" eqTok
+                (_, cur3) <- parseExpr ctx cur2
+                pure ([], cur3)
             _ | startsPat (tkKind peekTok) -> do
                 -- Pattern binding: (a, b) = rhs, Con x = rhs, etc.
                 (newBinds, cur') <- parseWherePatBind ctx accLen cur

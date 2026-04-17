@@ -279,16 +279,24 @@ spec = describe "REPL smoke tests" do
         -- raise# primop must throw an IhcException that the REPL's
         -- top-level handler catches and reports. Subsequent lines must
         -- still evaluate.
+        --
+        -- With the Scheduler pre-discovering GHC.Exception helpers and
+        -- raise#'s forceToException peeking at the well-known helper
+        -- applications, the reported message is now the real
+        -- @Prelude.head: empty list@ string rather than the fallback
+        -- @unbound variable errorCallWithCallStackException@.
         (code, out, _err) <- runRepl
             ( "import Data.List\n"
            <> "head \"\"\n"
            <> "1 + 2\n"
            <> ":q\n" )
         code `shouldBe` ExitSuccess
-        -- Either we get a proper IhcException message, or at minimum the
-        -- REPL must NOT report `raise#` as unbound.
         out `shouldNotContain` "unbound variable `raise#`"
+        out `shouldNotContain` "unbound variable `errorCallWithCallStackException`"
         out `shouldContain` "Error:"
+        -- Real error payload:
+        out `shouldContain` "head"
+        out `shouldContain` "empty list"
         -- REPL must keep running after the error: the 1 + 2 must print.
         out `shouldContain` "3"
 

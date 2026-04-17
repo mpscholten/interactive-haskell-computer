@@ -941,3 +941,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/QuickWins/islabel_user_instance.hs")
         n   `shouldBe` 0
         out `shouldBe` "Wrap \"custom\"\n"
+
+    it "error_message: head [] surfaces the real `Prelude.head: empty list` payload" do
+        -- Source-loaded error + raise# path must produce a message
+        -- containing the real payload string rather than the fallback
+        -- unbound-variable form.  See Scheduler.buildBaseEnv and
+        -- Builtins.forceToException for the interacting machinery.
+        r <- try (runFile "test/Fixtures/QuickWins/error_message.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected non-zero exit / thrown exception; runFile returned "
+                 <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy` (\m -> "head" `isInfixOf` m)
+                msg `shouldSatisfy` (\m -> "empty list" `isInfixOf` m)
+                msg `shouldNotSatisfy`
+                    (\m -> "unbound variable `errorCallWithCallStackException`"
+                           `isInfixOf` m)

@@ -80,7 +80,7 @@ import System.IO
     , stdout
     )
 
-import IHC.AST  (Name)
+import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstance, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
@@ -3267,15 +3267,94 @@ raiseIOHashB = pure $ VFun $ \eT -> pure $ VFun $ \_rwT -> do
 -- aren't yet in scope; without this guard, forcing the exception value
 -- would itself crash the interpreter with an @unbound variable@ error
 -- instead of raising a proper Haskell exception.
+--
+-- Before falling back to the raw SomeException show-text, we inspect
+-- the unevaluated thunk for well-known error-constructor applications
+-- (@errorCallWithCallStackException s _@, @errorCallException s@,
+-- @error s@, @toException (ErrorCall s)@) and evaluate just the
+-- message sub-expression.  That avoids the case where the enclosing
+-- helper's body references a transitively-unbound name
+-- (e.g. @currentCallStack@, which lives in @.hsc@ source we can't
+-- load) but the message itself is a perfectly fine @VStr@.  The
+-- result is that @head []@ reports @Prelude.head: empty list@
+-- instead of @unbound variable \`currentCallStack\`@.
 forceToException :: Thunk -> IO IhcException
 forceToException t = do
-    r <- CE.try @SomeException (force t)
-    case r of
-        Right v  -> valToIhcException v
-        Left  se -> do
-            let msg = BC.pack (show se)
-            t' <- newWHNFThunk (VStr msg)
-            pure (IhcException msg t')
+    mShortcut <- tryShortcutMessage t
+    case mShortcut of
+        Just (msg, payloadT) ->
+            pure (IhcException msg payloadT)
+        Nothing -> do
+            r <- CE.try @SomeException (force t)
+            case r of
+                Right v  -> valToIhcException v
+                Left  se -> do
+                    let msg = BC.pack (show se)
+                    t' <- newWHNFThunk (VStr msg)
+                    pure (IhcException msg t')
+
+-- | Peek at a thunk's unevaluated expression, looking for the
+-- well-known shape @HELPER msgExpr [stackExpr]@ where @HELPER@ is
+-- one of the source-loaded error constructors.  If matched,
+-- evaluate @msgExpr@ alone (via the thunk's own closure env) and
+-- package it as a ready-made 'IhcException' message.
+--
+-- Returns @Nothing@ when the thunk is already evaluated or the
+-- expression shape doesn't match a known helper — callers then fall
+-- through to the normal force-and-unwrap path.
+tryShortcutMessage :: Thunk -> IO (Maybe (ByteString, Thunk))
+tryShortcutMessage t = do
+    state <- readIORef t
+    case state of
+        Unevaluated (Closure env ipm expr) ->
+            case stripHelperApp expr of
+                Just msgExpr -> do
+                    r <- CE.try @SomeException (do
+                        msgT <- newThunkIP env ipm msgExpr
+                        v    <- force msgT
+                        pure (v, msgT))
+                    case r of
+                        Right (v, msgT) -> case v of
+                            VStr s -> pure (Just (s, msgT))
+                            _ -> do
+                                -- [Char] list → try to decode.
+                                r2 <- CE.try @SomeException (valToString v)
+                                case r2 of
+                                    Right s -> do
+                                        payloadT <- newWHNFThunk (VStr (BC.pack s))
+                                        pure (Just (BC.pack s, payloadT))
+                                    Left _ -> pure Nothing
+                        Left _ -> pure Nothing
+                Nothing -> pure Nothing
+        _ -> pure Nothing
+
+-- | Recognise an @error@-family application and return the message
+-- sub-expression.  Matches:
+--
+--   * @errorCallWithCallStackException msg stk@
+--   * @errorCallException msg@
+--   * @error msg@               (source-loaded)
+--   * @toException (ErrorCall msg)@
+stripHelperApp :: Expr -> Maybe Expr
+stripHelperApp = go
+  where
+    go e = case e of
+        -- errorCallWithCallStackException msg stk → msg
+        EApp (EApp (EVar n) msg) _stk
+            | n == BC.pack "errorCallWithCallStackException" -> Just msg
+        -- errorCallException msg  or  error msg
+        EApp (EVar n) msg
+            | n == BC.pack "errorCallException" -> Just msg
+            | n == BC.pack "error"              -> Just msg
+        -- toException (ErrorCall msg)
+        EApp (EVar n) inner
+            | n == BC.pack "toException" -> stripErrorCall inner
+        _ -> Nothing
+
+    stripErrorCall e = case e of
+        EApp (EVar n) msg
+            | n == BC.pack "ErrorCall" -> Just msg
+        _ -> Nothing
 
 -- | @raiseDivZero# :: (# #) -> b@. GHC primop invoked by source-loaded
 -- numeric dispatch (e.g. @divZeroError = raise# divZeroException@ lives

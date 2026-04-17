@@ -288,13 +288,65 @@ loadProgramFromSource searchPath src0 = do
 -- | Build a fresh base environment with all builtins and an empty
 -- ClassRegistry. Used by the REPL to get a starting env without
 -- requiring a @main@ binding.
+--
+-- In addition to builtins, we source-load a small set of
+-- @GHC.Exception@ / @GHC.Internal.Exception@ helpers that source-loaded
+-- @error@ and @throw@ reach into via @raise#@.  Concretely, when a
+-- partial function like @GHC.Internal.List.head []@ bottoms out, the
+-- source definition is:
+--
+-- @
+--     head [] = error \"Prelude.head: empty list\"
+-- @
+--
+-- and source-loaded @error@ is:
+--
+-- @
+--     error s = raise# (errorCallWithCallStackException s ?callStack)
+-- @
+--
+-- Without @errorCallWithCallStackException@ (and friends) reachable
+-- in the evaluation env, the evaluator fails with
+-- @IhcException: IHC.Eval: unbound variable errorCallWithCallStackException@
+-- before @raise#@ ever sees the real message.  Pre-discovering the
+-- helpers here lets the REPL's top-level handler report the real
+-- @Prelude.head: empty list@ text instead.
 buildBaseEnv :: IO (Env, ClassRegistry)
 buildBaseEnv = do
     classReg <- newClassRegistry
     builtins <- builtinEnv classReg
     conEnv   <- buildConEnv Map.empty
-    let env = Map.union builtins conEnv
-    pure (env, classReg)
+    let env0 = Map.union builtins conEnv
+    -- Pre-discover GHC.Exception / GHC.Internal.Exception helpers.
+    -- Best-effort: swallow any exception so a cache miss (missing
+    -- source, stale cache, etc.) never blocks REPL startup — the REPL
+    -- still runs, just with the older fallback error message.
+    env1 <- preDiscoverExceptionHelpers env0
+                `catch` (\(_ :: SomeException) -> pure env0)
+    pure (env1, classReg)
+
+-- | Source-load @errorCallWithCallStackException@, @errorCallException@,
+-- @SomeException@, @displayException@ from @GHC.Internal.Exception@
+-- and merge them into the base env unqualified.  Uses
+-- 'loadImportIntoEnv' with an explicit @ImportOnly@ name list so only
+-- the requested symbols and their transitive dependencies are
+-- materialised — no bulk fan-out.
+preDiscoverExceptionHelpers :: Env -> IO Env
+preDiscoverExceptionHelpers env = do
+    let names =
+            [ BC.pack "errorCallWithCallStackException"
+            , BC.pack "errorCallException"
+            , BC.pack "SomeException"
+            , BC.pack "displayException"
+            ]
+        imp = ImportDecl
+                { impModule    = BC.pack "GHC.Internal.Exception"
+                , impQualified = False
+                , impAlias     = Nothing
+                , impSpec      = ImportOnly names
+                }
+    (env', _) <- loadImportIntoEnv [] imp env
+    pure env'
 
 -- | Load a .hs file for the REPL's @:l@ command and bring its exported
 -- names into scope UNQUALIFIED, matching ghci semantics.
@@ -733,9 +785,18 @@ loadImportIntoEnv searchPath imp existingEnv
                 ]
         -- The final env visible to imported bindings: qualEnv + aliases +
         -- bare-name aliases for ALL effective exports (for recursive closures).
+        -- We also fall back to @existingEnv@ at the bottom of the lookup
+        -- chain so that REPL-level pre-discoveries (e.g. the GHC.Exception
+        -- helpers primed by 'buildBaseEnv') remain reachable from inside
+        -- imported source bindings.  This matters for source-loaded
+        -- @error@: its body references @errorCallWithCallStackException@,
+        -- which @loadImportIntoEnv@'s fresh registry does not resolve on
+        -- its own, but the REPL's pre-primed slot is still valid and
+        -- must remain visible under the fresh import's innerEnv.
         let innerEnv = Map.union (Map.fromList selfAliases)
                      $ Map.union (Map.fromList effectivePairs)
-                     $ Map.union aliasEnv qualEnv
+                     $ Map.union aliasEnv
+                     $ Map.union qualEnv existingEnv
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
               (zip qualPairs slots)
@@ -818,10 +879,16 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             , BC.isPrefixOf modPrefix qualKey
             , let n = BC.drop (BC.length modPrefix) qualKey
             ]
+        -- innerEnv (see the parallel note in 'loadImportIntoEnv'): we
+        -- include @existingEnv@ as the lowest-priority layer so that
+        -- REPL-level pre-discoveries (e.g. the GHC.Exception helpers
+        -- primed by 'buildBaseEnv') remain reachable from inside the
+        -- imported bindings.
         innerEnv = Map.union (Map.fromList selfAliases)
                  $ Map.union (Map.fromList requestedPairs)
                  $ Map.union (Map.fromList rewriteAliasPairs)
-                 $ Map.union aliases qualEnv
+                 $ Map.union aliases
+                 $ Map.union qualEnv existingEnv
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
           (zip qualPairs slots)
