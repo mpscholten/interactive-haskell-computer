@@ -82,7 +82,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -266,7 +266,7 @@ loadProgramFromSource searchPath src0 = do
     -- Run AFTER all modules are discovered (so imports are resolved) but
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
     -- contains all builtins including the 'lift' function.
-    mapM_ (expandSplicesInModule base) loadedModules
+    mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules
@@ -515,7 +515,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = Map.union classMethodEnv baseNoClass
     -- Phase 2.11: expand TH splices.
-    mapM_ (expandSplicesInModule base) loadedModules
+    mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
     -- Build (key, Expr) pairs.  Entry module bindings are keyed bare.
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules
     -- Tie the knot.
@@ -1045,7 +1045,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
     let baseForImport = Map.union classMethodEnv baseNoClass
-    mapM_ (expandSplicesInModule baseForImport) loadedModules0
+    mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
     requestedPairs <- mapMaybe id <$> mapM (resolveRequestedPair targetLm qualPairs slots) requested
@@ -1122,11 +1122,66 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
 
 -- | Phase 2.11: expand TH splices in all bodies of a loaded module.
 -- Mutates the @lmBodies@ IORef in place.
-expandSplicesInModule :: Env -> LoadedModule -> IO ()
-expandSplicesInModule spliceEnv lm = do
-    bodies <- readIORef (lmBodies lm)
-    expanded <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) bodies
-    writeIORef (lmBodies lm) expanded
+expandSplicesInModule
+    :: IORef (Map ModuleName ModuleState)
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> Env
+    -> LoadedModule
+    -> IO ()
+expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
+    -- Stage 1: expand ESplice nodes nested inside existing body exprs.
+    bodies0 <- readIORef (lmBodies lm)
+    expanded0 <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) bodies0
+    writeIORef (lmBodies lm) expanded0
+
+    -- Stage 2 (Phase 2.13 wiring): evaluate top-level $(...) splices
+    -- and merge the decoded [(Name, Expr)] into lmBodies.
+    spans <- scanTopLevelSplices (lmSource lm)
+    case spans of
+        [] -> pure ()
+        _  -> do
+            newPairs <- concat <$> mapM evalOneSplice spans
+            case newPairs of
+                [] -> pure ()
+                _  -> do
+                    bodiesNow <- readIORef (lmBodies lm)
+                    let merged = Map.union (Map.fromList newPairs) bodiesNow
+                    expanded1 <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) merged
+                    writeIORef (lmBodies lm) expanded1
+  where
+    -- Build a let-wrapper over ALL bodies currently parsed into the
+    -- module so the splice evaluator can reach same-module helpers
+    -- like `mySplice`. Normal discovery is driven from `main`, so
+    -- splice-only helpers would otherwise be unparsed — we first
+    -- force-discover the splice's free vars, then snapshot bodies.
+    wrapWithLocals e = do
+        b <- readIORef (lmBodies lm)
+        pure $ case Map.toList b of
+            []    -> e
+            binds -> ELet binds e
+
+    evalOneSplice :: Span -> IO [(Name, Expr)]
+    evalOneSplice sp@(start, end)
+        | end <= start = pure []
+        | otherwise = do
+            let innerBytes = sliceBytes (lmSource lm) sp
+                src = mkSource ("<splice:" <> srcName (lmSource lm) <> ">") innerBytes
+            spliceExpr <- Parser.parseExprOnly src (lmFixity lm)
+            -- Pre-discover free vars of the splice expr in the module
+            -- so same-module helpers like `mySplice` get parsed into
+            -- lmBodies before we wrap and evaluate.
+            let fvs = freeVars spliceExpr
+            mapM_ (\fv -> do
+                    r <- try (discoverInModule registry searchPath includeMap lm fv)
+                             :: IO (Either SomeException ())
+                    case r of
+                        Right () -> pure ()
+                        Left _   -> pure ()
+                ) fvs
+            spliceExprExp <- expandSplicesInExpr spliceEnv emptyIPMap 0 spliceExpr
+            wrapped <- wrapWithLocals spliceExprExp
+            thExpandSpliceDecl spliceEnv emptyIPMap wrapped
 
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
