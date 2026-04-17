@@ -1334,8 +1334,8 @@ fromLabelB :: ClassRegistry -> IO Val
 fromLabelB reg = pure $ VFun $ \a -> do
     av <- force a
     case av of
-        VLabel _ -> do
-            mMethods <- lookupUserIsLabel reg
+        VLabel lbl -> do
+            mMethods <- lookupUserIsLabel reg lbl
             case mMethods of
                 Just (fromLabelM : _) ->
                     -- User-defined @fromLabel@ typically has type
@@ -1353,22 +1353,56 @@ fromLabelB reg = pure $ VFun $ \a -> do
         other -> error ("fromLabel: expected a Label value, got: "
                         <> showValForDebug other)
 
--- | Find a user-defined IsLabel instance (anything registered under a tag
--- other than the synthetic \"Proxy\" default). Returns the method list of
--- the first such instance encountered, or 'Nothing'.
-lookupUserIsLabel :: ClassRegistry -> IO (Maybe [Val])
-lookupUserIsLabel reg = do
+-- | Find a user-defined IsLabel instance keyed by the label's Symbol.
+--
+-- The class registry stores @IsLabel@ instances under composite keys from
+-- 'registerInstanceMulti'. For an IHP-shaped
+-- @instance IsLabel \"email\" Wrap where ...@ the key is
+-- @(\"IsLabel\", [\"email\", \"Wrap\"])@, and for a polymorphic
+-- @instance IsLabel s Wrap where ...@ the key is
+-- @(\"IsLabel\", [\"s\", \"Wrap\"])@.
+--
+-- Dispatch strategy given a runtime @VLabel \"email\"@:
+--
+-- 1. Look for an exact Symbol-keyed match — first tag equals the label
+--    name.  This is what makes two @IsLabel \"email\" Wrap@ and
+--    @IsLabel \"name\" Wrap@ instances route to distinct method bodies.
+-- 2. Fall back to a polymorphic user instance (first tag is a lower-case
+--    type variable, i.e. not a Symbol or upper-case type name).  Those
+--    are written @instance IsLabel s Wrap where ...@ and should fire
+--    for any label.
+-- 3. Skip the built-in default @(IsLabel s (Proxy s'))@ registered
+--    under @[\"Proxy\"]@ — that's the fallthrough handled by the caller.
+lookupUserIsLabel :: ClassRegistry -> ByteString -> IO (Maybe [Val])
+lookupUserIsLabel reg lbl = do
     m <- readIORef reg
-    let userInsts = [ methods
-                    | ((cls, tags), methods) <- Map.toList m
-                    , cls == BC.pack "IsLabel"
-                    , case tags of
-                        [tag] -> tag /= BC.pack "Proxy"
-                        _     -> True
-                    ]
-    case userInsts of
-        (methods : _) -> pure (Just methods)
-        []            -> pure Nothing
+    let entries = [ (tags, methods)
+                  | ((cls, tags), methods) <- Map.toList m
+                  , cls == BC.pack "IsLabel"
+                  ]
+        -- First pass: instance whose leading tag matches the label literal.
+        symbolMatches =
+            [ methods
+            | (tag : _, methods) <- entries
+            , tag == lbl
+            ]
+        -- Second pass: polymorphic user instance — first tag is a lower-case
+        -- type variable (e.g. 's'), not the @Proxy@ default and not a
+        -- concrete Symbol/type.  'normalizeTyTag' leaves these lower-case.
+        polymorphicMatches =
+            [ methods
+            | (tag : _, methods) <- entries
+            , tag /= BC.pack "Proxy"
+            , tag /= lbl
+            , not (BS.null tag)
+            , let c = BC.head tag
+            , c >= 'a' && c <= 'z'
+            ]
+    case symbolMatches of
+        (ms : _) -> pure (Just ms)
+        []       -> case polymorphicMatches of
+            (ms : _) -> pure (Just ms)
+            []       -> pure Nothing
 
 -- DataKinds Tier 1 -------------------------------------------------------------
 

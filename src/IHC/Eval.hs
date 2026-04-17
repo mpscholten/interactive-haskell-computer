@@ -227,6 +227,32 @@ eval env ipm = go
                 -- call can look up the instance by composite key.
                 VClassMethod m slot tags fn ->
                     pure (VClassMethod m slot (tags ++ [normalizeTyTag ty]) fn)
+                -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
+                -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
+                -- when a bare VLabel flows through a non-@Proxy@ type
+                -- ascription we route it through @fromLabel@ in the env
+                -- (which in turn calls @lookupUserIsLabel@ keyed by the
+                -- Symbol).  This picks the right instance for
+                -- @instance IsLabel "email" Wrap where fromLabel = ...@
+                -- without needing an explicit @fromLabel #email@.
+                --
+                -- @Proxy s@ annotations are left as raw @VLabel@ on purpose:
+                -- the default IHP-style instance is @IsLabel s (Proxy s')@
+                -- and the pattern-match transparency at 'PCon \"Proxy\"' /
+                -- 'VLabel _' (see below) lets callers treat the label as a
+                -- proxy without an eager conversion.
+                VLabel _
+                    | isProxyTyAnnotation ty -> pure v
+                    | otherwise              ->
+                        case lookupEnv (BC.pack "fromLabel") env of
+                            Just t -> do
+                                flv <- force t
+                                case flv of
+                                    VFun _ -> do
+                                        lblT <- newWHNFThunk v
+                                        apply flv lblT
+                                    _ -> pure v
+                            Nothing -> pure v
                 _               -> pure v
 
     -- Pattern match alternatives. Returns the matched alt's body or
@@ -332,6 +358,26 @@ tyAppLitsClosure mname tyBytes = VFun $ \_arg -> do
 -- level.  When the bytes start with a constructor (e.g. @Proxy \"x\"@
 -- from a @(Proxy :: Proxy \"x\")@ annotation) we fall back to scanning
 -- the bytes for the first @\"…\"@ / numeric literal.
+-- | Detect a @Proxy ...@ type annotation (possibly parenthesised) without
+-- a full type parse. Used by the 'ETyApp' VLabel fast-path to skip the
+-- @fromLabel@ dispatch when the user wrote @(#email :: Proxy \"email\")@ —
+-- we want the label to remain a raw 'VLabel' there, matching IHP's
+-- default @IsLabel s (Proxy s')@ behaviour and the pattern-match
+-- transparency at @PCon \"Proxy\" []@.
+isProxyTyAnnotation :: ByteString -> Bool
+isProxyTyAnnotation bs0 = go (strip bs0)
+  where
+    strip s =
+        let t = BC.dropWhile (\c -> c == ' ' || c == '\t') s
+            u = BC.reverse (BC.dropWhile (\c -> c == ' ' || c == '\t') (BC.reverse t))
+        in if BS.length u >= 2 && BC.head u == '(' && BC.last u == ')'
+              then strip (BS.init (BS.tail u))
+              else u
+    proxyBs = BC.pack "Proxy"
+    go bs = proxyBs `BS.isPrefixOf` bs
+        && (BS.length bs == 5
+            || (let c = BC.index bs 5 in c == ' ' || c == ')' || c == '\t'))
+
 parseTyArgLit :: ByteString -> IO Val
 parseTyArgLit bs0 =
     let bs = stripParens bs0
