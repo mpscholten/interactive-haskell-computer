@@ -1434,27 +1434,40 @@ scanInstanceDecls src = go [] startCursor
     -- We grab the first TkConId as class name, then look for the type.
     -- Simplified: first ConId = class, next ConId/Ident after `=>` or
     -- directly = type. Stop at `where`.
-    parseInstanceHead cur0 = scanHead cur0 Nothing Nothing False
+    --
+    -- Phase 3.5: For IsLabel-style instances with a Symbol literal class
+    -- parameter (e.g. @instance IsLabel \"email\" Wrap where ...@), we
+    -- capture the @TkStr@ between the class name and the type name so
+    -- multiple @IsLabel \"s\" T@ instances don't collide in the registry.
+    -- The literal is encoded into the type-tag as @"\\"s\\"|T"@; a tag
+    -- without @|@ is treated as the usual @IsLabel s T@ form.
+    parseInstanceHead cur0 = scanHead cur0 Nothing Nothing Nothing False
       where
-        scanHead cur mCls mTyp seenArrow = do
+        scanHead cur mCls mSym mTyp seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (mCls, mTyp, cur)
-                TkWhere  -> pure (mCls, mTyp, cur')
-                TkNewline -> scanHead cur' mCls mTyp seenArrow
-                TkDArrow -> scanHead cur' mCls Nothing True
+                TkEof    -> pure (mCls, mkTypeTag mSym mTyp, cur)
+                TkWhere  -> pure (mCls, mkTypeTag mSym mTyp, cur')
+                TkNewline -> scanHead cur' mCls mSym mTyp seenArrow
+                TkDArrow -> scanHead cur' mCls Nothing Nothing True
                 TkConId n ->
                     case mCls of
-                        Nothing -> scanHead cur' (Just n) mTyp seenArrow
+                        Nothing -> scanHead cur' (Just n) mSym mTyp seenArrow
                         Just _  ->
                             case mTyp of
-                                Nothing -> scanHead cur' mCls (Just n) seenArrow
-                                Just _  -> scanHead cur' mCls mTyp seenArrow
+                                Nothing -> scanHead cur' mCls mSym (Just n) seenArrow
+                                Just _  -> scanHead cur' mCls mSym mTyp seenArrow
                 TkIdent _ ->
                     -- Lower-case type variable or instance argument like
                     -- `instance Eq a => Eq [a]` — skip for now, the
                     -- bracket-balanced scan below handles more complex heads.
-                    scanHead cur' mCls mTyp seenArrow
+                    scanHead cur' mCls mSym mTyp seenArrow
+                TkStr s
+                    | Just _ <- mCls, Nothing <- mSym, Nothing <- mTyp ->
+                        -- Symbol literal class parameter between class
+                        -- and type, e.g. `IsLabel "email" Wrap`.
+                        scanHead cur' mCls (Just s) mTyp seenArrow
+                    | otherwise -> scanHead cur' mCls mSym mTyp seenArrow
                 TkLParen -> do
                     -- Skip parenthesised types like `(,)` or `(a, b)`.
                     curAfter <- skipParens 1 cur'
@@ -1462,14 +1475,23 @@ scanInstanceDecls src = go [] startCursor
                     let headTyp = case mTyp of
                             Nothing -> Just (BC.pack "(,)")
                             Just _  -> mTyp
-                    scanHead curAfter mCls headTyp seenArrow
+                    scanHead curAfter mCls mSym headTyp seenArrow
                 TkLBracket -> do
                     curAfter <- skipBrackets 1 cur'
                     let headTyp = case mTyp of
                             Nothing -> Just (BC.pack "[]")
                             Just _  -> mTyp
-                    scanHead curAfter mCls headTyp seenArrow
-                _ -> scanHead cur' mCls mTyp seenArrow
+                    scanHead curAfter mCls mSym headTyp seenArrow
+                _ -> scanHead cur' mCls mSym mTyp seenArrow
+
+        -- Fold an optional Symbol-literal class parameter into the
+        -- type-tag. Encoding: @"\\"sym\\"|Type"@. Absent Symbol yields
+        -- the plain type name (backward compatible).
+        mkTypeTag Nothing    mTyp = mTyp
+        mkTypeTag (Just sym) (Just typ) =
+            Just (BC.concat [BC.pack "\"", sym, BC.pack "\"|", typ])
+        mkTypeTag (Just sym) Nothing =
+            Just (BC.concat [BC.pack "\"", sym, BC.pack "\"|"])
 
     skipParens :: Int -> Cursor -> IO Cursor
     skipParens !d cur

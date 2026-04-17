@@ -966,6 +966,14 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Wrap \"custom\"\n"
 
+    it "IsLabel dispatch: IHP-shaped `IsLabel \"field\" T` with Symbol literal" do
+        -- Each Symbol-keyed instance must select its own fromLabel body
+        -- rather than colliding on a single (class, Type) registry slot.
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/islabel_symbol_dispatch.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Wrap \"from-email\"\nWrap \"from-name\"\n"
+
     it "error_message: head [] surfaces the real `Prelude.head: empty list` payload" do
         -- Source-loaded error + raise# path must produce a message
         -- containing the real payload string rather than the fallback
