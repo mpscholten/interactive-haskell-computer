@@ -66,7 +66,7 @@ import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
-    , findLocalCabalFile, parseCabalFile, pkgExtraLibs
+    , cachedPackageTable, pkgExtraLibs
     )
 import IHC.Diagnostics (warnStub)
 import IHC.Classes
@@ -2557,42 +2557,25 @@ buildForeignEnv lms searchPath = do
         t <- newLazyBuiltinThunk (FFI.makeForeignVal decl)
         pure (ffiSynthKey (lmName lm) (FFI.fdName decl), t)
 
--- | For every loaded module, find the owning package's @.cabal@ file
--- (by walking up from the module's source directory), parse it, and
--- @dlopen@ every @extra-libraries:@ entry.  Deduplicated across modules
--- so we never @dlopen@ the same lib twice.
+-- | @dlopen@ every @extra-libraries:@ entry declared by every package
+-- known to the source-root walker.  Reads the session-memoised
+-- 'cachedPackageTable' (a single pass over the three source roots —
+-- nix bundle, user cache, cabal tarball) and takes the union of every
+-- package's @pkgExtraLibs@.  The per-module ad-hoc walk that used to
+-- live here was superseded by 'cachedPackageTable' (added upstream in
+-- commit 8048e3c) — using it removes a redundant cabal-file parse per
+-- module and guarantees we see every declared extra, even for
+-- packages no module in the current run has imported (harmless, and
+-- the @dlopen@ cost for extras a program doesn't use is negligible).
 registerPackageExtras :: [LoadedModule] -> [FilePath] -> IO ()
-registerPackageExtras lms _searchPath = do
-    -- Collect unique source directories.
-    srcDirs <- mapM (pure . takeDirectory . srcName . lmSource) lms
-    let uniqSrcDirs = Set.toList (Set.fromList srcDirs)
-    libsPerDir <- mapM extraLibsForDir uniqSrcDirs
-    let allLibs = Set.toList (Set.fromList (concat libsPerDir))
-    mapM_ FFI.registerLibrary allLibs
-  where
-    extraLibsForDir :: FilePath -> IO [ByteString]
-    extraLibsForDir d = do
-        -- Walk up from the module's directory looking for a .cabal file.
-        mCabalPair <- findCabalFileUpwards d 8
-        case mCabalPair of
-            Nothing -> pure []
-            Just (pkgRoot, cabalPath) -> do
-                mInfo <- parseCabalFile pkgRoot cabalPath
-                case mInfo of
-                    Just info -> pure (pkgExtraLibs info)
-                    Nothing   -> pure []
-
-    -- Walk up at most @n@ steps looking for a *.cabal sibling.  Returns
-    -- @(packageRoot, cabalPath)@ or Nothing.
-    findCabalFileUpwards :: FilePath -> Int -> IO (Maybe (FilePath, FilePath))
-    findCabalFileUpwards _   0 = pure Nothing
-    findCabalFileUpwards dir n = do
-        m <- findLocalCabalFile dir
-        case m of
-            Just p  -> pure (Just (dir, p))
-            Nothing ->
-                let up = takeDirectory dir in
-                if up == dir then pure Nothing else findCabalFileUpwards up (n - 1)
+registerPackageExtras _lms _searchPath = do
+    table <- cachedPackageTable
+    let libs = Set.toList (Set.fromList
+                   [ lib
+                   | (_, info) <- table
+                   , lib       <- pkgExtraLibs info
+                   ])
+    mapM_ FFI.registerLibrary libs
 
 emptyHeader :: ModuleHeader
 emptyHeader = ModuleHeader Nothing ExportAll []
