@@ -77,6 +77,22 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "3"
 
+    it "import qualified Data.ByteString as BS: BS.length (BS.pack \"test\") = 4" do
+        -- User-reported: `BS.pack "test"` (a String literal, which is [Char])
+        -- hangs the REPL indefinitely.  Whereas `BS.pack [97,98,99]` (Word8
+        -- list) above succeeds, this String-via-OverloadedStrings path
+        -- currently doesn't complete.  The `runRepl` helper has a 20s
+        -- timeout guard and reports "REPL timed out" as the failure
+        -- message, so this assertion fires a clear regression signal if
+        -- the hang ever gets fixed — flip the expected code to ExitSuccess
+        -- and expect "4" in the output.
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length (BS.pack \"test\")\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "4"
+
     it "import parse error is reported gracefully, REPL continues" do
         -- A malformed import should print an error but not crash.
         (code, out, _err) <- runRepl "import\n1 + 1\n:q\n"
