@@ -63,7 +63,7 @@ import System.FilePath ((</>), takeDirectory)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
-import IHC.Diagnostics (warnStub)
+import IHC.Diagnostics (warnStub, traceLine)
 import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti, lookupInstance, lookupInstanceMulti, typeTagOf, normalizeTyTag)
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
@@ -660,6 +660,8 @@ preloadForEffectiveExportsMemo memo registry searchPath includeMap lm visited = 
     if Set.member (lmName lm) done
         then pure ()
         else do
+            traceLine $ "preload " <> BC.unpack (lmName lm)
+                       <> " (visited depth=" <> show (length visited) <> ")"
             -- Mark BEFORE recursing so cycles that reach back into @lm@
             -- don't re-enter.  The body below is idempotent (scanAllTop... +
             -- discoverSafe skip on missing names; loadReexportMod already
@@ -813,7 +815,7 @@ loadImportIntoEnv searchPath imp existingEnv
         preloadMemo <- newPreloadMemo
         preloadForEffectiveExportsMemo preloadMemo registry fullSearchPath
             includeMap targetLm [lmName targetLm]
-        let runUntilStable processed = do
+        let runUntilStable round_ processed = do
                 regBefore <- readIORef registry
                 let knownNames = Map.keysSet regBefore
                 -- Only preload modules that were added since the previous pass.
@@ -825,6 +827,9 @@ loadImportIntoEnv searchPath imp existingEnv
                         | (m, Loaded lm) <- Map.toList regBefore
                         , m `Set.notMember` processed
                         ]
+                traceLine $ "runUntilStable round=" <> show round_
+                           <> " pending=" <> show (length newlyLoaded)
+                           <> " loaded=" <> show (Set.size knownNames)
                 mapM_ (\lm -> do
                     r <- try (preloadForEffectiveExportsMemo preloadMemo registry
                                   fullSearchPath includeMap lm [lmName lm])
@@ -835,8 +840,8 @@ loadImportIntoEnv searchPath imp existingEnv
                 let newNames = Map.keysSet regAfter
                 if newNames == knownNames
                     then pure ()   -- stable: no new modules loaded
-                    else runUntilStable (Set.union processed newNames)
-        runUntilStable (Set.singleton (lmName targetLm))
+                    else runUntilStable (round_ + 1) (Set.union processed newNames)
+        runUntilStable (1 :: Int) (Set.singleton (lmName targetLm))
         -- Step 3: collect all loaded modules and build the combined env.
         reg0 <- readIORef registry
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
@@ -1900,6 +1905,7 @@ loadModule registry searchPath includeMap name = do
         Just (Loaded lm) -> pure lm
         Just Loading     -> throwIO (ImportCycle name)
         Nothing -> do
+            traceLine $ "loadModule " <> BC.unpack name
             -- GHC.*, System.IO.Unsafe, Foreign.*, Data.Bits, etc. are
             -- intercepted as empty stubs because their names are provided
             -- directly by the builtin environment. Trying to parse their
