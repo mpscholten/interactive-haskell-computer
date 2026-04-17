@@ -71,6 +71,23 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "imported Prelude (deferred)"
 
+    it "import Prelude: bare map is a function and does not hang" do
+        (code, out, _err) <- runRepl
+            ( "import Prelude\n"
+           <> "map\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Prelude (deferred)"
+        out `shouldContain` "<function>"
+
+    it "import Prelude: map (+1) [1,2,3] = [2,3,4]" do
+        (code, out, _err) <- runRepl
+            ( "import Prelude\n"
+           <> "map (+1) [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "[2,3,4]"
+
     it "import qualified Data.ByteString as BS succeeds" do
         (code, out, _err) <- runRepl "import qualified Data.ByteString as BS\n:q\n"
         code `shouldBe` ExitSuccess

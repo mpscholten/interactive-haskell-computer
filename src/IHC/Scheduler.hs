@@ -48,6 +48,7 @@ module IHC.Scheduler
     ) where
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try)
+import Control.Applicative ((<|>))
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -57,7 +58,7 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf)
 import Control.Monad (forM_, when)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
@@ -1013,23 +1014,10 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     classReg <- newClassRegistry
     targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
     mapM_ (discoverInModule registry fullSearchPath includeMap targetLm) requested
-    regAfterDiscover <- readIORef registry
-    let discoveredDeps =
-            [ lm
-            | (m, Loaded lm) <- Map.toList regAfterDiscover
-            , m /= lmName targetLm
-            ]
-    -- Share a preload memo across the batch so deps preloaded via one module
-    -- aren't re-walked when another module also reaches them.
-    preloadMemo <- newPreloadMemo
-    mapM_ (\lm -> do
-        r <- try (preloadForEffectiveExportsMemo preloadMemo registry
-                      fullSearchPath includeMap lm [lmName lm])
-                 :: IO (Either SomeException ())
-        case r of
-            Right () -> pure ()
-            Left _   -> pure ()
-        ) discoveredDeps
+    -- ImportOnly is the REPL's deferred-name path: keep it targeted.
+    -- Preloading every discovered dependency's full export surface defeats
+    -- the point and makes requests like Prelude.map bulk-load GHC.Base's
+    -- entire ExportAll set before the prompt can return.
     reg0 <- readIORef registry
     let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
@@ -1047,6 +1035,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mapM_ (expandSplicesInModule baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
+    requestedPairs <- mapMaybe id <$> mapM (resolveRequestedPair targetLm qualPairs slots) requested
     let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
         thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
@@ -1055,11 +1044,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             Nothing
                 | impQualified imp -> lmName targetLm <> BC.pack "."
                 | otherwise        -> BC.empty
-        requestedPairs =
-            [ (n, t)
-            | n <- requested
-            , Just t <- [lookupRequestedThunk targetLm thunkByKey n]
-            ]
         bareAliases
             | impQualified imp = []
             | otherwise        = requestedPairs
@@ -1096,16 +1080,23 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
   where
-    lookupRequestedThunk lm thunkByKey n =
-        let prefix = lmName lm <> BC.pack "."
-            suffix = BC.pack "." <> n
-        in case Map.lookup (prefix <> n) thunkByKey of
-            Just t  -> Just t
-            Nothing ->
+    resolveRequestedPair lm qualPairs slots n = do
+        bodies <- readIORef (lmBodies lm)
+        let thunkByKey   = Map.fromList (zip (map fst qualPairs) slots)
+            ownKey       = lmName lm <> BC.pack "." <> n
+            ownIsLocal   = case Map.lookup n bodies of
+                Just expr -> expr /= EVar n
+                Nothing   -> False
+            suffix       = BC.pack "." <> n
+            fallbackSlot =
                 case [ t | (k, t) <- Map.toList thunkByKey
                          , suffix `isSuffixOf` k ] of
                     (t:_) -> Just t
                     []    -> Nothing
+            slot
+                | ownIsLocal = Map.lookup ownKey thunkByKey
+                | otherwise  = fallbackSlot <|> Map.lookup ownKey thunkByKey
+        pure ((n,) <$> slot)
 
     rewriteAliases registry thunkByKey builtinNames lm = do
         rw <- buildImportRewrites registry lm builtinNames
