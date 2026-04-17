@@ -30,7 +30,7 @@ import System.Console.Haskeline
 
 import IHC.AST (Expr)
 import IHC.Builtins (showValWith, buildConEnv, buildFieldEnv)
-import IHC.Classes (ClassRegistry, registerInstance)
+import IHC.Classes (ClassRegistry, registerInstance, registerInstanceMulti)
 import IHC.Driver (resolveSearchPathFor)
 import IHC.Eval (eval, force, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
@@ -436,14 +436,21 @@ tryInstanceDecl envRef classReg line = do
     case r of
         Left err -> pure (Left (show err))
         Right [] -> pure (Left "no instance declaration found (parse error?)")
-        Right (InstanceDecl cls typ methods : _) -> do
+        Right (InstanceDecl cls typ typs methods : _) -> do
             env <- readIORef envRef
             r2 <- (try (evalInstanceMethods src env methods)
                     :: IO (Either SomeException [Val]))
             case r2 of
                 Left err     -> pure (Left (show err))
                 Right vals   -> do
+                    -- Single-tag registration for the head type (preserves
+                    -- the existing single-param class behaviour at the
+                    -- REPL prompt).
                     registerInstance classReg cls typ vals
+                    -- Composite-tag registration for MPTC heads so
+                    -- TypeApplications dispatch (@setField \@\"name\"
+                    -- \@User \@String@) resolves.
+                    registerInstanceMulti classReg cls typs vals
                     let n   = length methods
                         msg = "instance " <> BC.unpack cls <>
                               " " <> BC.unpack typ <>

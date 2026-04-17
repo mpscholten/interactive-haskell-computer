@@ -56,6 +56,7 @@ import Control.Monad (when)
 import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
+import IHC.Classes (normalizeTyTag)
 import IHC.Lexer
 import IHC.Source
 
@@ -1381,12 +1382,21 @@ scanFunctorDerivings src = go [] startCursor
 
 -- | One top-level @instance C T where method = body@ declaration.
 -- 'instClassName' is the class name, 'instTypeName' is the head type
--- (first uppercase identifier after the class name, before @where@).
--- 'instMethods' is a list of (method-name, Clause-list) pairs exactly
--- like the output of 'findBinding'.
+-- (first uppercase identifier after the class name, before @where@ — or
+-- for MPTC heads, the first parameter; see 'instTypeNames' for the full
+-- list). 'instMethods' is a list of (method-name, Clause-list) pairs
+-- exactly like the output of 'findBinding'.
+--
+-- 'instTypeNames' holds every head-position type argument in source
+-- order. For a single-parameter class this is a one-element list
+-- @[instTypeName]@. For a multi-parameter class like
+-- @instance SetField \"name\" User String where ...@ it is
+-- @[\"name\", \"User\", \"String\"]@ (normalised via
+-- 'IHC.Classes.normalizeTyTag' — quotes stripped).
 data InstanceDecl = InstanceDecl
     { instClassName :: !ByteString
     , instTypeName  :: !ByteString
+    , instTypeNames :: ![ByteString]
     , instMethods   :: ![(ByteString, BindingLhs)]
     } deriving (Eq, Show)
 
@@ -1419,79 +1429,78 @@ scanInstanceDecls src = go [] startCursor
                     Just decl -> go (decl : acc) cur'
             _ -> go acc cur'
 
-    -- After `instance`, scan the head to find class name + type name,
+    -- After `instance`, scan the head to find class name + type names,
     -- then scan the `where` body for method bindings.
     scanOneInstance cur0 = do
         -- Collect tokens up to `where`.
-        (mClassName, mTypeName, curWhere) <- parseInstanceHead cur0
-        case (mClassName, mTypeName) of
-            (Just cls, Just typ) -> do
+        (mClassName, tyArgs, curWhere) <- parseInstanceHead cur0
+        case (mClassName, tyArgs) of
+            (Just cls, (firstTyp : _)) -> do
                 methods <- parseInstanceBody curWhere
-                pure (Just (InstanceDecl cls typ methods))
+                pure (Just (InstanceDecl cls firstTyp tyArgs methods))
             _ -> pure Nothing
 
-    -- Parse: [context =>] ClassName TypeHead where
-    -- We grab the first TkConId as class name, then look for the type.
-    -- Simplified: first ConId = class, next ConId/Ident after `=>` or
-    -- directly = type. Stop at `where`.
-    --
-    -- Phase 3.5: For IsLabel-style instances with a Symbol literal class
-    -- parameter (e.g. @instance IsLabel \"email\" Wrap where ...@), we
-    -- capture the @TkStr@ between the class name and the type name so
-    -- multiple @IsLabel \"s\" T@ instances don't collide in the registry.
-    -- The literal is encoded into the type-tag as @"\\"s\\"|T"@; a tag
-    -- without @|@ is treated as the usual @IsLabel s T@ form.
-    parseInstanceHead cur0 = scanHead cur0 Nothing Nothing Nothing False
+    -- Parse: [context =>] ClassName TyHead1 TyHead2 ... where
+    -- We grab the first TkConId (after any constraint @=>@) as class
+    -- name, then every subsequent head token becomes a type argument.
+    -- 'TkConId' / 'TkStr' / 'TkInt' / 'TkIdent' at the top level produce
+    -- their raw bytes; parenthesised groups are kept verbatim so the
+    -- caller can pattern-match them if needed.  Each tag is normalised
+    -- via 'IHC.Classes.normalizeTyTag' so registration and dispatch
+    -- agree on the key.
+    parseInstanceHead cur0 = scanHead cur0 Nothing [] False
       where
-        scanHead cur mCls mSym mTyp seenArrow = do
+        scanHead cur mCls acc seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (mCls, mkTypeTag mSym mTyp, cur)
-                TkWhere  -> pure (mCls, mkTypeTag mSym mTyp, cur')
-                TkNewline -> scanHead cur' mCls mSym mTyp seenArrow
-                TkDArrow -> scanHead cur' mCls Nothing Nothing True
+                TkEof    -> pure (mCls, reverse acc, cur)
+                TkWhere  -> pure (mCls, reverse acc, cur')
+                TkNewline -> scanHead cur' mCls acc seenArrow
+                TkDArrow -> scanHead cur' mCls [] True  -- reset acc past context
                 TkConId n ->
                     case mCls of
-                        Nothing -> scanHead cur' (Just n) mSym mTyp seenArrow
-                        Just _  ->
-                            case mTyp of
-                                Nothing -> scanHead cur' mCls mSym (Just n) seenArrow
-                                Just _  -> scanHead cur' mCls mSym mTyp seenArrow
+                        Nothing -> scanHead cur' (Just n) acc seenArrow
+                        Just _  -> scanHead cur' mCls (normalize n : acc) seenArrow
+                TkStr s | isJust mCls ->
+                    -- DataKinds Symbol literal used as a type arg, e.g.
+                    -- @instance SetField "name" ...@. Store the string
+                    -- contents verbatim (quotes already stripped by the
+                    -- lexer — 'TkStr' holds the decoded bytes).
+                    scanHead cur' mCls (normalize s : acc) seenArrow
+                TkInt i | isJust mCls ->
+                    -- DataKinds Nat literal used as a type arg.
+                    scanHead cur' mCls (BC.pack (show i) : acc) seenArrow
+                TkChar c | isJust mCls ->
+                    -- DataKinds Char literal used as a type arg.
+                    scanHead cur' mCls (BC.pack [c] : acc) seenArrow
+                TkIdent n | isJust mCls ->
+                    -- Lower-case identifier used as a type arg (rare —
+                    -- typically a type variable in the context). Capture
+                    -- it so the tag list has a sensible length; callers
+                    -- use this for composite-key registration.
+                    scanHead cur' mCls (normalize n : acc) seenArrow
                 TkIdent _ ->
-                    -- Lower-case type variable or instance argument like
-                    -- `instance Eq a => Eq [a]` — skip for now, the
-                    -- bracket-balanced scan below handles more complex heads.
-                    scanHead cur' mCls mSym mTyp seenArrow
-                TkStr s
-                    | Just _ <- mCls, Nothing <- mSym, Nothing <- mTyp ->
-                        -- Symbol literal class parameter between class
-                        -- and type, e.g. `IsLabel "email" Wrap`.
-                        scanHead cur' mCls (Just s) mTyp seenArrow
-                    | otherwise -> scanHead cur' mCls mSym mTyp seenArrow
+                    -- Lower-case type variable before the class name;
+                    -- skip.
+                    scanHead cur' mCls acc seenArrow
                 TkLParen -> do
-                    -- Skip parenthesised types like `(,)` or `(a, b)`.
                     curAfter <- skipParens 1 cur'
-                    -- The head type might BE a tuple or list; extract its name.
-                    let headTyp = case mTyp of
-                            Nothing -> Just (BC.pack "(,)")
-                            Just _  -> mTyp
-                    scanHead curAfter mCls mSym headTyp seenArrow
+                    let acc' = case mCls of
+                            Nothing -> acc  -- still pre-class; ignore
+                            Just _  -> BC.pack "(,)" : acc
+                    scanHead curAfter mCls acc' seenArrow
                 TkLBracket -> do
                     curAfter <- skipBrackets 1 cur'
-                    let headTyp = case mTyp of
-                            Nothing -> Just (BC.pack "[]")
-                            Just _  -> mTyp
-                    scanHead curAfter mCls mSym headTyp seenArrow
-                _ -> scanHead cur' mCls mSym mTyp seenArrow
+                    let acc' = case mCls of
+                            Nothing -> acc
+                            Just _  -> BC.pack "[]" : acc
+                    scanHead curAfter mCls acc' seenArrow
+                _ -> scanHead cur' mCls acc seenArrow
 
-        -- Fold an optional Symbol-literal class parameter into the
-        -- type-tag. Encoding: @"\\"sym\\"|Type"@. Absent Symbol yields
-        -- the plain type name (backward compatible).
-        mkTypeTag Nothing    mTyp = mTyp
-        mkTypeTag (Just sym) (Just typ) =
-            Just (BC.concat [BC.pack "\"", sym, BC.pack "\"|", typ])
-        mkTypeTag (Just sym) Nothing =
-            Just (BC.concat [BC.pack "\"", sym, BC.pack "\"|"])
+        isJust (Just _) = True
+        isJust Nothing  = False
+
+        normalize = normalizeTyTag
 
     skipParens :: Int -> Cursor -> IO Cursor
     skipParens !d cur

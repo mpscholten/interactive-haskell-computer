@@ -16,8 +16,11 @@ module IHC.Classes
     ( ClassRegistry
     , newClassRegistry
     , registerInstance
+    , registerInstanceMulti
     , lookupInstance
+    , lookupInstanceMulti
     , typeTagOf
+    , normalizeTyTag
       -- * Phase 2.9.5: TypeRep helpers
     , mkTyCon
     , mkTypeRep
@@ -158,24 +161,82 @@ forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState BlackHole = pure (VStr (BC.pack "<blackhole>"))
 
--- | The global class registry. Maps (ClassName, TypeTag) to an ordered
+-- | The global class registry. Maps @(ClassName, [TypeTag])@ to an ordered
 -- list of method values (one per method, in class-declaration order).
-type ClassRegistry = IORef (Map (ByteString, ByteString) [Val])
+--
+-- The tag list supports multi-parameter type classes (MPTC) where an
+-- instance is identified by several types — e.g. @instance SetField
+-- \"name\" User String where ...@ registers under
+-- @(\"SetField\", [\"name\", \"User\", \"String\"])@. Single-parameter
+-- classes use a 1-element list for their tag.
+type ClassRegistry = IORef (Map (ByteString, [ByteString]) [Val])
 
 newClassRegistry :: IO ClassRegistry
 newClassRegistry = newIORef Map.empty
 
--- | Register a dict (method list) for a (class, type-tag) pair.
--- Overwrites any previously registered instance (last write wins).
+-- | Register a dict (method list) for a single-tag @(class, type-tag)@
+-- pair. Overwrites any previously registered instance (last write wins).
+--
+-- Kept for backwards compatibility with the single-parameter class path;
+-- equivalent to 'registerInstanceMulti' with a 1-element tag list.
 registerInstance :: ClassRegistry -> ByteString -> ByteString -> [Val] -> IO ()
 registerInstance reg className typeTag methods =
-    modifyIORef' reg (Map.insert (className, typeTag) methods)
+    registerInstanceMulti reg className [typeTag] methods
 
--- | Look up the method list for a given (class, type-tag) pair.
+-- | Register a dict (method list) for a @(class, [type-tag])@ composite
+-- key. Overwrites any previously registered instance (last write wins).
+registerInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> [Val] -> IO ()
+registerInstanceMulti reg className typeTags methods =
+    modifyIORef' reg (Map.insert (className, typeTags) methods)
+
+-- | Look up the method list for a given @(class, type-tag)@ pair.
+-- Single-tag convenience wrapper.
 lookupInstance :: ClassRegistry -> ByteString -> ByteString -> IO (Maybe [Val])
-lookupInstance reg className typeTag = do
+lookupInstance reg className typeTag =
+    lookupInstanceMulti reg className [typeTag]
+
+-- | Look up the method list for a given @(class, [type-tag])@ composite
+-- key. Used for multi-parameter class dispatch.
+lookupInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> IO (Maybe [Val])
+lookupInstanceMulti reg className typeTags = do
     m <- readIORef reg
-    pure (Map.lookup (className, typeTag) m)
+    pure (Map.lookup (className, typeTags) m)
+
+-- | Normalise a type-application source slice into a stable dispatch
+-- tag. The parser's 'captureTypeArg' stores the raw bytes of a
+-- type-application argument verbatim — this means quotes, parens, and
+-- whitespace slip through. Collapse those so both registration (scanned
+-- from an instance head) and dispatch (parsed from an 'ETyApp' in a
+-- call site) agree on the same key.
+--
+-- Examples:
+--
+--   * @\"name\"@ (a @Symbol@ literal) → @name@
+--   * @User@     (a type ctor)       → @User@
+--   * @(Maybe Int)@                   → @Maybe Int@ (parens stripped)
+--   * @42@       (a @Nat@ literal)   → @42@
+--   * @\'x\'@    (a @Char@ literal)   → @x@
+normalizeTyTag :: ByteString -> ByteString
+normalizeTyTag bs0 = stripQuotes (trimSpace (stripParens bs0))
+  where
+    trimSpace s =
+        BC.dropWhile isSpace (BC.reverse (BC.dropWhile isSpace (BC.reverse s)))
+    isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    stripParens s
+        | BC.length s >= 2
+        , BC.head s == '('
+        , BC.last s == ')'    = stripParens (trimSpace (BC.init (BC.tail s)))
+        | otherwise           = s
+
+    stripQuotes s
+        | BC.length s >= 2
+        , BC.head s == '"'
+        , BC.last s == '"'    = BC.init (BC.tail s)
+        | BC.length s >= 2
+        , BC.head s == '\''
+        , BC.last s == '\''   = BC.init (BC.tail s)
+        | otherwise           = s
 
 -- | Return a stable string tag for the runtime type of a value.
 -- Used by dispatch builtins to find the right class instance.
@@ -194,6 +255,7 @@ typeTagOf (VCon "(,,)" _)  = BC.pack "(,,)"
 typeTagOf (VCon n _)    = n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
+typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
 typeTagOf (VIO _)       = BC.pack "<IO>"
 typeTagOf (VPrimObj (PrimIORef _))       = BC.pack "<IORef>"
 typeTagOf (VPrimObj (PrimHandle _))      = BC.pack "<Handle>"

@@ -32,6 +32,7 @@ import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 
 import IHC.AST
+import IHC.Classes (normalizeTyTag)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -212,6 +213,11 @@ eval env ipm = go
             v <- go e
             case v of
                 VCon "Proxy" [] -> attachProxyType ty
+                -- Multi-key class dispatch: @setField \@\"name\" \@User \@String@
+                -- accumulates type-arg tags onto the dispatcher so the final
+                -- call can look up the instance by composite key.
+                VClassMethod m slot tags fn ->
+                    pure (VClassMethod m slot (tags ++ [normalizeTyTag ty]) fn)
                 _               -> pure v
 
     -- Pattern match alternatives. Returns the matched alt's body or
@@ -571,17 +577,19 @@ matchPat (PView fn p) v = do
 --------------------------------------------------------------------------------
 
 apply :: Val -> Thunk -> IO Val
-apply (VFun f)        arg = f arg
-apply (VFunIP _ f)    arg = f Map.empty arg
-apply v               _   = error ("IHC.Eval.apply: not a function: "
+apply (VFun f)                    arg = f arg
+apply (VFunIP _ f)                arg = f Map.empty arg
+apply (VClassMethod _ _ tags go)  arg = go tags arg
+apply v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 
 -- | Apply with the caller's ImplicitParamMap — used by EApp so that
 -- implicit params flow from the call site into the callee.
 applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
-applyIP callerIPM (VFun f)     arg = f arg
-applyIP callerIPM (VFunIP _ f) arg = f callerIPM arg
-applyIP _         v            arg  = do
+applyIP _         (VFun f)                   arg = f arg
+applyIP callerIPM (VFunIP _ f)               arg = f callerIPM arg
+applyIP _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP _         v                          arg  = do
     a <- force arg
     error ("IHC.Eval.applyIP: not a function: "
            <> showValForDebug v <> " applied to " <> showValForDebug a)

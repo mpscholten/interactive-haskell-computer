@@ -73,6 +73,17 @@ data Val
     | VIO   !(IO Val)                  -- suspended IO action (Phase 2.4)
     | VPrimObj !PrimObj                -- opaque host object (Phase 2.4)
     | VLabel   !ByteString             -- #name OverloadedLabels value (Phase 3.5)
+    -- | Unsaturated class-method dispatcher. Accumulates TypeApplications
+    -- type args as it flows through 'ETyApp' nodes, then performs
+    -- multi-key lookup in the 'ClassRegistry' when applied to a value
+    -- argument. The list of 'ByteString' tags is type-arg tags in source
+    -- order (e.g. @setField \@\"name\" \@User \@String@ accumulates
+    -- @[\"name\",\"User\",\"String\"]@ — quotes stripped by the
+    -- normaliser). The 'Thunk -> IO Val' callback does the actual
+    -- lookup+apply at the point the dispatcher is applied to a runtime
+    -- argument; the 'Name' and 'Int' payloads are informational (method
+    -- name + class-slot) kept for error messages.
+    | VClassMethod !Name !Int ![ByteString] !([ByteString] -> Thunk -> IO Val)
 
 -- | Opaque host-side objects surfaced to the interpreter. Not
 -- user-inspectable — programs pass them through primops only
@@ -110,6 +121,9 @@ showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
 showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
 showValForDebug (VLabel name)                = "#" <> BC.unpack name
+showValForDebug (VClassMethod m _ tags _)     =
+    "<classMethod " <> BC.unpack m
+    <> (if null tags then "" else " @" <> show (map BC.unpack tags)) <> ">"
 
 --------------------------------------------------------------------------------
 -- Thunks

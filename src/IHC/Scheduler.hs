@@ -64,7 +64,7 @@ import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
 import IHC.Diagnostics (warnStub)
-import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, lookupInstance, typeTagOf)
+import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti, lookupInstance, lookupInstanceMulti, typeTagOf, normalizeTyTag)
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
 import IHC.Lexer (startCursor)
@@ -1055,7 +1055,7 @@ registerInstancesFrom classReg typeCtors env lm = do
     mapM_ (registerOne classReg typeCtors env lm) decls
 
 registerOne :: ClassRegistry -> TypeCtorRegistry -> Env -> LoadedModule -> InstanceDecl -> IO ()
-registerOne classReg typeCtors env lm (InstanceDecl cls typ methods) = do
+registerOne classReg typeCtors env lm (InstanceDecl cls typ typs methods) = do
     -- Evaluate each method; skip the entire instance if any method fails
     -- (e.g. unbound variable in a transitive library dependency).  A failed
     -- instance just means class-dispatch won't find that instance at runtime
@@ -1064,6 +1064,12 @@ registerOne classReg typeCtors env lm (InstanceDecl cls typ methods) = do
     case r of
         Left  _ -> pure ()   -- silently skip unresolvable instances
         Right methodVals -> do
+            -- Multi-parameter instances (MPTC) register under the full
+            -- composite tag list so TypeApplications-driven dispatch
+            -- (e.g. @setField \@\"name\" \@User \@String@) can find
+            -- them.  For single-parameter instances this is a 1-element
+            -- list and collapses to the legacy single-tag key.
+            registerInstanceMulti classReg cls typs methodVals
             -- Register under the head type name (used by Bool/Int/Char/String
             -- dispatch via 'typeTagOf' specializations).
             registerInstance classReg cls typ methodVals
@@ -1232,28 +1238,43 @@ defaultTypeTag = BC.pack "<default>"
 
 -- | Build a dispatcher Val for a single class method.
 --
--- @classMethodDispatcher reg cls slot methodName@ returns a VFun that,
--- when applied to its first argument, looks up the instance dict for
--- the argument's type tag and re-applies the instance method at the
--- given slot. Remaining arguments (if any) flow through naturally via
--- the returned VFun's own arity.
+-- @classMethodDispatcher reg cls slot methodName@ returns a 'VClassMethod'
+-- seed (with an empty type-arg accumulator) that the evaluator either:
+--
+--   * Extends through @ETyApp@ chains — e.g. @setField \@\"name\" \@User
+--     \@String@ accumulates @[\"name\",\"User\",\"String\"]@ into the
+--     seed. See 'IHC.Eval.go' @ETyApp@ case.
+--   * Fires on first value-arg application — look up the instance by
+--     composite key @(cls, tags)@ and apply the method's slot to the
+--     argument, currying any further arguments.
+--
+-- When no TypeApplications were used (empty accumulator), we fall back
+-- to single-tag dispatch on @typeTagOf argT@ — this preserves the
+-- behaviour for ordinary single-parameter classes.
 classMethodDispatcher :: ClassRegistry -> ByteString -> Int -> ByteString -> Val
-classMethodDispatcher reg cls slot methodName = VFun $ \argT -> do
-    av <- force argT
-    let tag = typeTagOf av
-    mMethods <- lookupInstance reg cls tag
-    case mMethods of
-        Just methods | slot < length methods ->
-            apply (methods !! slot) argT
-        _ -> do
-            mDef <- lookupInstance reg cls defaultTypeTag
-            case mDef of
-                Just defs | slot < length defs ->
-                    apply (defs !! slot) argT
-                _ -> error ( "class-method dispatch: no instance of `"
-                            <> BC.unpack cls
-                            <> "` for type `" <> BC.unpack tag
-                            <> "` (method `" <> BC.unpack methodName <> "`)" )
+classMethodDispatcher reg cls slot methodName =
+    VClassMethod methodName slot [] go
+  where
+    go tags argT = do
+        keyTags <- case tags of
+            []    -> do
+                av <- force argT
+                pure [typeTagOf av]
+            _     -> pure tags
+        mMethods <- lookupInstanceMulti reg cls keyTags
+        case mMethods of
+            Just methods | slot < length methods ->
+                apply (methods !! slot) argT
+            _ -> do
+                mDef <- lookupInstance reg cls defaultTypeTag
+                case mDef of
+                    Just defs | slot < length defs ->
+                        apply (defs !! slot) argT
+                    _ -> error ( "class-method dispatch: no instance of `"
+                                <> BC.unpack cls
+                                <> "` for types `"
+                                <> show (map BC.unpack keyTags)
+                                <> "` (method `" <> BC.unpack methodName <> "`)" )
 
 -- | Build an Env containing a dispatcher thunk for every method of every
 -- user-defined class visible in any loaded module. Method-name collisions
@@ -2110,7 +2131,7 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
         -- Instance method bodies.
         instDecls  <- scanInstanceDecls (lmSource lm)
         mapM_ (discoverMethods lm)
-              [ (n, lhs) | InstanceDecl _ _ ms <- instDecls, (n, lhs) <- ms ]
+              [ (n, lhs) | InstanceDecl _ _ _ ms <- instDecls, (n, lhs) <- ms ]
         -- Class default-method bodies.
         classDecls <- scanClassDecls (lmSource lm)
         mapM_ (discoverMethods lm)

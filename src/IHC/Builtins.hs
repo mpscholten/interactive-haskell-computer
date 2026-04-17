@@ -1094,20 +1094,7 @@ showDispatch reg = pure $ VFun $ \a -> do
 -- | Show a value, consulting the ClassRegistry for user-defined Show.
 showValWith :: ClassRegistry -> Val -> IO String
 showValWith reg av = case av of
-    VLabel name -> do
-        -- Phase 3.5: if a user-defined IsLabel instance claims this
-        -- Symbol (either exactly — @IsLabel \"name\" T@ — or generically
-        -- — @IsLabel s T@), run @fromLabel@ and show the converted value.
-        -- Otherwise keep the raw @#name@ presentation.
-        mMethods <- lookupUserIsLabel reg name
-        case mMethods of
-            Just (fromLabelM : _) -> do
-                v <- case fromLabelM of
-                    VFun _     -> do aT <- newWHNFThunk av; apply fromLabelM aT
-                    VFunIP _ _ -> do aT <- newWHNFThunk av; apply fromLabelM aT
-                    other      -> pure other
-                showValWith reg v
-            _ -> pure ("#" <> BC.unpack name)   -- Phase 3.5: #name
+    VLabel name -> pure ("#" <> BC.unpack name)   -- Phase 3.5: #name
     VInt _    -> showVal av
     VFloat _  -> showVal av
     VChar _   -> showVal av
@@ -1228,6 +1215,7 @@ showVal (VCon name thunks)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
+showVal (VClassMethod _ _ _ _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _))      = pure "<IORef>"
 showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"
@@ -1298,13 +1286,10 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 --
 -- Dispatch strategy:
 --
--- * If the user has registered an IHP-shaped instance with a Symbol
---   literal class parameter (@instance IsLabel \"email\" Wrap where ...@),
---   the scanner keys it as @\"\\\"email\\\"|Wrap\"@. When the VLabel's
---   name matches the Symbol part, that instance wins.
--- * Otherwise we walk the class registry looking for a generic user-defined
---   @IsLabel s T@ instance (type tag has no @|@ and isn't the synthetic
---   @Proxy@ default). The first such instance is picked.
+-- * We first walk the class registry looking for an @IsLabel@ instance
+--   whose type tag is something other than the synthetic @Proxy@ default.
+--   The first such user-defined instance is picked (its @fromLabel@
+--   method receives the VLabel and produces the instance's target value).
 -- * Otherwise we fall through to the registered default instance for
 --   @(IsLabel s (Proxy s'))@ (IHP's instance) which produces
 --   @VCon "Proxy" []@.
@@ -1313,17 +1298,16 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 --   @Proxy@ still works whether or not @fromLabel@ was called first.
 --
 -- Note on user overrides: with no type information we cannot tell which
--- user instance to pick when multiple Symbol-keyed instances share the
--- same Symbol but differ in target type. The first match wins — userland
--- code that relies on specific dispatch should call @fromLabel@
--- explicitly in a monomorphic context where exactly one instance is in
--- scope.
+-- user instance to pick when multiple are visible. The first non-default
+-- instance wins — userland code that relies on specific dispatch should
+-- call @fromLabel@ explicitly in a monomorphic context where exactly one
+-- instance is in scope.
 fromLabelB :: ClassRegistry -> IO Val
 fromLabelB reg = pure $ VFun $ \a -> do
     av <- force a
     case av of
-        VLabel name -> do
-            mMethods <- lookupUserIsLabel reg name
+        VLabel _ -> do
+            mMethods <- lookupUserIsLabel reg
             case mMethods of
                 Just (fromLabelM : _) ->
                     -- User-defined @fromLabel@ typically has type
@@ -1333,44 +1317,28 @@ fromLabelB reg = pure $ VFun $ \a -> do
                     -- method is a function, apply it to the label; otherwise
                     -- return the stored value directly.
                     case fromLabelM of
-                        VFun _      -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
-                        VFunIP _ _  -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
-                        v           -> pure v
+                        VFun _               -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        VFunIP _ _           -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        VClassMethod _ _ _ _ -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        v                    -> pure v
                 _ -> pure (VCon "Proxy" [])   -- default: Proxy IsLabel instance
         other -> error ("fromLabel: expected a Label value, got: "
                         <> showValForDebug other)
 
--- | Find a user-defined IsLabel instance for the given label name.
---
--- Preference order:
---
---   1. A Symbol-keyed instance @IsLabel \"name\" T@ registered by the
---      scanner as @\"\\\"name\\\"|T\"@ — this is how IHP-style label
---      dispatch becomes distinguishable at the registry layer.
---   2. A generic @IsLabel s T@ instance (tag has no @|@ and isn't the
---      synthetic @Proxy@ default).
---
--- Returns the method list of the first match, or 'Nothing'.
-lookupUserIsLabel :: ClassRegistry -> ByteString -> IO (Maybe [Val])
-lookupUserIsLabel reg labelName = do
+-- | Find a user-defined IsLabel instance (anything registered under a tag
+-- other than the synthetic \"Proxy\" default). Returns the method list of
+-- the first such instance encountered, or 'Nothing'.
+lookupUserIsLabel :: ClassRegistry -> IO (Maybe [Val])
+lookupUserIsLabel reg = do
     m <- readIORef reg
-    let symbolPrefix = BC.concat [BC.pack "\"", labelName, BC.pack "\"|"]
-        -- Tags matching the VLabel's Symbol (highest priority).
-        symbolMatches =
-            [ methods
-            | ((cls, tag), methods) <- Map.toList m
-            , cls == BC.pack "IsLabel"
-            , symbolPrefix `BC.isPrefixOf` tag
-            ]
-        -- Generic `IsLabel s T` instances (no Symbol, not the Proxy default).
-        genericMatches =
-            [ methods
-            | ((cls, tag), methods) <- Map.toList m
-            , cls == BC.pack "IsLabel"
-            , tag /= BC.pack "Proxy"
-            , not (BC.pack "|" `BC.isInfixOf` tag)
-            ]
-    case symbolMatches ++ genericMatches of
+    let userInsts = [ methods
+                    | ((cls, tags), methods) <- Map.toList m
+                    , cls == BC.pack "IsLabel"
+                    , case tags of
+                        [tag] -> tag /= BC.pack "Proxy"
+                        _     -> True
+                    ]
+    case userInsts of
         (methods : _) -> pure (Just methods)
         []            -> pure Nothing
 
