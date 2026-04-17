@@ -1627,10 +1627,23 @@ parseSubPat ctx cur = do
         TkStr s      -> pure (PLit (LStr s), cur1)
         TkChar c     -> pure (PLit (LChar c), cur1)
         TkConId n    -> do
-            -- Handle qualified constructor: M.Ctor or M.N.Ctor
-            -- Read adjacent dots/segments; strip the qualifier for pattern matching.
+            -- Handle qualified constructor: M.Ctor or M.N.Ctor.
+            -- In atomic-pattern positions (lambda params, function lhs
+            -- params, list elems, etc.) a constructor can still carry
+            -- record syntax, e.g. `User{..}` / `User{name}`. Those forms
+            -- must parse to PRecord/PRecordWild here so the scheduler can
+            -- later desugar them to positional PCon patterns.
             (qname, cur2) <- readQualConId ctx n tok cur1
-            pure (PCon (stripQualifier qname) [], cur2)
+            let name = stripQualifier qname
+                (nextTok, cur3) = nextSig ctx cur2
+            case tkKind nextTok of
+                TkLBrace -> do
+                    (fieldPats, curEnd, isWild) <- parseRecordPatFields ctx name cur3 []
+                    if isWild
+                        then pure (PRecordWild name, curEnd)
+                        else pure (PRecord name fieldPats, curEnd)
+                _ ->
+                    pure (PCon name [], cur2)
         TkLParen     -> parseParenPat ctx cur1
         TkLBracket   -> parseListPat ctx cur1
         TkLUnbox     -> parseUnboxedTuplePat ctx cur1
