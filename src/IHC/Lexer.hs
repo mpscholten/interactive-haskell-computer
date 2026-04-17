@@ -50,6 +50,11 @@ data TokenKind
     | TkStr   !ByteString     -- ^ @\"...\"@ string literal (contents after
                               --   basic \\n \\t \\\\ \\\" escapes)
     | TkChar  !Char           -- ^ @\'c\'@ character literal
+    | TkTick                  -- ^ promoted-list/tuple tick — the bare @\'@
+                              --   when followed by @[@, @(@, or @{@. The
+                              --   lexer disambiguates on lookahead so
+                              --   @\'[a,b]@ parses as a promoted-list
+                              --   literal, not a char literal of @[@.
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
     | TkPlusPlus              -- ^ @++@ (string / list concat)
@@ -210,7 +215,7 @@ nextToken s c0 =
             | isUpperStart b   -> lexIdent True  c
             -- String/char literals first: quotes aren't operator chars.
             | b == 0x22        -> lexString c                          -- '"'
-            | b == 0x27        -> lexChar   c                          -- '\''
+            | b == 0x27        -> lexQuote  c                          -- '\''
             -- Structural punctuation (non-op chars): parens, brackets,
             -- braces, comma, semicolon, backtick, backslash.
             -- OverloadedLabels: '#' followed immediately by a lowercase
@@ -504,6 +509,26 @@ nextToken s c0 =
             end = Cursor endP' (cLine openCur)
                          (cCol openCur + (endP' - cPos openCur))
         in (mkTok (TkChar ch) openCur end, end)
+
+    -- | Entry point for the byte @0x27@ (@\'@). Disambiguates between:
+    --
+    --   * @\'[...]@ / @\'(...)@ / @\'{...}@ promoted-list/tuple/record
+    --     literals (DataKinds) — emit 'TkTick', advance by one byte, let
+    --     the next call lex the bracket/paren/brace on its own.
+    --   * Everything else — delegate to 'lexChar' (true char literal or
+    --     promoted constructor like @\'True@ consumed as @TkChar \'T\'@
+    --     + ident, handled downstream in 'captureTypeArg').
+    lexQuote openCur =
+        let p1 = cPos openCur + 1 in
+        case peekByte s p1 of
+            Just b | b == 0x5B || b == 0x28 || b == 0x7B
+                -- '[' (0x5B), '(' (0x28), '{' (0x7B) — always TkTick
+                -- since the corresponding char-literal form would need a
+                -- closing '\'' three bytes later, which is rare in source
+                -- and even then ambiguous. DataKinds wins.
+                -> let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
+                   in (mkTok TkTick openCur end, end)
+            _   -> lexChar openCur
 
     -- | Lex an OverloadedLabels label: '#' followed by a run of
     -- identifier-continuation chars. The '#' is consumed as part of the

@@ -855,6 +855,16 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "User\nPost\n"
 
+    it "TF: HeadSym cons-pattern on promoted Symbol list reduces" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/tf_include_nested.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\n"
+
+    it "TF: FieldIndex (IHP-shape recursive Nat arithmetic) reduces" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/tf_nat_arith.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
     it "KnownSymbol dict: foo :: KnownSymbol s => Proxy s -> String; symbolVal p" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/known_symbol_dict.hs")
         n   `shouldBe` 0

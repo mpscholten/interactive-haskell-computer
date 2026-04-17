@@ -2159,8 +2159,25 @@ captureTypeArg ctx cur0 =
         TkLBracket -> do
             cur2 <- skipBalanced ctx cur1 TkRBracket
             pure (slice (cPos cur2), cur2)
-        -- Promoted tick: lexer reads 'X as TkChar 'X' and leaves the rest
-        -- of the constructor name as a separate ident token. Skip both.
+        -- Promoted-list/tuple tick: the lexer emits TkTick for `'[`/`'(`,
+        -- then the structural token separately. Capture the whole
+        -- `'[...]` / `'(...)` region.
+        TkTick ->
+            let (tok2, cur2) = nextSig ctx cur1 in
+            case tkKind tok2 of
+                TkLBracket -> do
+                    cur3 <- skipBalanced ctx cur2 TkRBracket
+                    pure (slice (cPos cur3), cur3)
+                TkLParen -> do
+                    cur3 <- skipBalanced ctx cur2 TkRParen
+                    pure (slice (cPos cur3), cur3)
+                -- `'True`/`'Nothing` — legacy shape now reached via TkTick
+                -- followed by an identifier.
+                TkConId{} -> pure (slice (tkEnd tok2), cur2)
+                TkIdent{} -> pure (slice (tkEnd tok2), cur2)
+                _         -> pure (slice (tkEnd tok), cur1)
+        -- Legacy fallback: older lexings where `'X` was still TkChar 'X'.
+        -- Kept for safety while the lexer migration settles.
         TkChar _   ->
             let (tok2, cur2) = nextSig ctx cur1 in
             case tkKind tok2 of
