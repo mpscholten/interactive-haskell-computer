@@ -153,10 +153,6 @@ builtinEnv reg = do
     stdoutT <- newWHNFThunk (VPrimObj (PrimHandle stdout))
     stderrT <- newWHNFThunk (VPrimObj (PrimHandle stderr))
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
-    -- Builtin Maybe constructors (commonly needed without an explicit data decl).
-    nothingT <- newWHNFThunk (VCon "Nothing" [])
-    justT    <- newWHNFThunk (VFun $ \x -> pure (VCon "Just" [x]))
-    let maybeCtors = [("Nothing", nothingT), ("Just", justT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
     eqT <- newWHNFThunk (VCon "EQ" [])
@@ -173,16 +169,6 @@ builtinEnv reg = do
     unbox2T <- newWHNFThunk (VFun $ \a -> pure $ VFun $ \b -> pure (VCon "(#,#)" [a, b]))
     unbox3T <- newWHNFThunk (VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure (VCon "(#,,#)" [a, b, c]))
     let unboxCtors = [("(#,#)", unbox2T), ("(#,,#)", unbox3T)]
-    -- ExitCode constructors.
-    exitSuccT <- newWHNFThunk (VCon "ExitSuccess" [])
-    exitFailT <- newWHNFThunk (VFun $ \n -> pure (VCon "ExitFailure" [n]))
-    let exitCtors = [("ExitSuccess", exitSuccT), ("ExitFailure", exitFailT)]
-    -- Either constructors: always present regardless of whether Data.Either
-    -- is source-loaded. Previously provided implicitly via GHC.* stubs; now
-    -- explicitly registered so they survive whitelist minimisation (GAP-3).
-    leftT  <- newWHNFThunk (VFun $ \x -> pure (VCon "Left"  [x]))
-    rightT <- newWHNFThunk (VFun $ \x -> pure (VCon "Right" [x]))
-    let eitherCtors = [("Left", leftT), ("Right", rightT)]
     -- IO constructor: IO wraps a (State# RealWorld -> (# State# RealWorld, a #))
     -- function into a VIO action.  GHC.Types defines `newtype IO a = IO (State# ...)`
     -- but since GHC.Types is builtin-backed (no .hs source), we register it here.
@@ -217,8 +203,8 @@ builtinEnv reg = do
     defaultFromLabel <- fromLabelB reg
     registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy") [defaultFromLabel]
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
-                         ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors
-                         ++ unitCtor ++ eitherCtors ++ [("IO", ioCtorT)]
+                         ++ orderingCtors ++ unboxCtors
+                         ++ unitCtor ++ [("IO", ioCtorT)]
                          ++ [("Ptr", ptrCtorT)]
                          ++ phase295Ctors ++ typeableInsts)
                         emptyEnv)
