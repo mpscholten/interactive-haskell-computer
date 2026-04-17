@@ -2665,51 +2665,64 @@ findOrResolveLhs src known name = do
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
 -- The scheduler uses this list to drive demand-driven discovery.
+-- | Collect free variables of an 'Expr'.
+--
+-- Uses a 'Set ByteString' for the @bound@ set so membership checks are
+-- O(log n) rather than O(n).  Library sources like
+-- 'Data.ByteString.Internal.Type' have many nested lets and tens of
+-- local bindings per function body; with a naive @[ByteString]@ bound
+-- list and @\`elem\`@, @freeVars@ became quadratic per body and —
+-- combined with the scheduler calling it once per discovered body —
+-- turned @BS.pack@ discovery into a multi-minute hang.
 freeVars :: Expr -> [ByteString]
-freeVars = goAll []
+freeVars e = Set.toList (goAll Set.empty e)
   where
+    goAll :: Set ByteString -> Expr -> Set ByteString
     goAll bound = \case
         EVar n
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELit _      -> []
-        EApp f x    -> goAll bound f ++ goAll bound x
-        ELam n e    -> goAll (n : bound) e
-        ELet bs e   ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-               ++ goAll bound' e
-        ECase s as  -> goAll bound s ++ concatMap (goAlt bound) as
-        EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
+            | Set.member n bound -> Set.empty
+            | otherwise          -> Set.singleton n
+        ELit _      -> Set.empty
+        EApp f x    -> goAll bound f `Set.union` goAll bound x
+        ELam n e'   -> goAll (Set.insert n bound) e'
+        ELet bs e'  ->
+            let names  = map fst bs
+                bound' = Set.union bound (Set.fromList names)
+            in Set.unions (goAll bound' e' : map (goAll bound' . snd) bs)
+        ECase s as  -> Set.union (goAll bound s) (Set.unions (map (goAlt bound) as))
+        EIf c t e'  -> Set.unions [goAll bound c, goAll bound t, goAll bound e']
         EDo stmts   -> goStmts bound stmts
-        ENeg e      -> goAll bound e
-        ETuple es   -> concatMap (goAll bound) es
-        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
-        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
-        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
-        EImplicitRef _  -> []
-        EImplicitLet bs e ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
+        ENeg e'     -> goAll bound e'
+        ETuple es   -> Set.unions (map (goAll bound) es)
+        ERecordCon _ fields -> Set.unions (map (goAll bound . snd) fields)
+        ERecordWild _       -> Set.empty   -- fields resolved by scheduler; no expr free vars
+        ERecordUpdate e' fields ->
+            Set.union (goAll bound e')
+                     (Set.unions (map (goAll bound . snd) fields))
+        EImplicitRef _      -> Set.empty
+        EImplicitLet bs e'  ->
+            let names  = map fst bs
+                bound' = Set.union bound (Set.fromList names)
+            in Set.unions (goAll bound' e' : map (goAll bound' . snd) bs)
         ESplice inner   -> goAll bound inner
-        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
-        ELabel _        -> []   -- Phase 3.5: labels have no free variables
+        EQuote _        -> Set.empty   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        ELabel _        -> Set.empty   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
-    goStmts _     []                  = []
-    goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
-    goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
+    goStmts :: Set ByteString -> [Stmt] -> Set ByteString
+    goStmts _     []                  = Set.empty
+    goStmts bound (SExpr e'  : rest)  = Set.union (goAll bound e') (goStmts bound rest)
+    goStmts bound (SBind n e': rest)  = Set.union (goAll bound e') (goStmts (Set.insert n bound) rest)
     goStmts bound (SLet bs   : rest)  =
         let names  = map fst bs
-            bound' = names ++ bound
-        in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-           ++ goStmts bound' rest
+            bound' = Set.union bound (Set.fromList names)
+        in Set.unions (goStmts bound' rest : map (goAll bound' . snd) bs)
 
-    goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
+    goAlt :: Set ByteString -> Alt -> Set ByteString
+    goAlt bound (Alt p e') =
+        goAll (Set.union bound (Set.fromList (patBound p))) e'
 
     patBound :: Pat -> [ByteString]
     patBound (PVar n)            = [n]
