@@ -33,6 +33,11 @@ module IHC.CabalProject
     , cachedPackageSearchPath
     , cachedPackageSearchPathWithIncludes
     , cabalTarballSearchPath
+      -- * Per-package scoping
+    , PackageTable
+    , cachedPackageTable
+    , findOwningPackage
+    , scopedSearchDirs
     ) where
 
 import Control.Exception (Exception, throwIO, try, SomeException, evaluate)
@@ -46,7 +51,7 @@ import Data.IORef
     , readIORef
     , writeIORef
     )
-import Data.List (isSuffixOf, sortBy)
+import Data.List (isPrefixOf, isSuffixOf, maximumBy, sortBy)
 import Data.Ord (Down(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -83,6 +88,7 @@ import Distribution.PackageDescription
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
 import qualified Distribution.Types.PackageId as CabalPkgId
 import qualified Distribution.Types.PackageName as CabalPkgName
+import Distribution.Types.Dependency (depPkgName)
 import qualified Distribution.Types.Version as CabalVer
 import qualified Distribution.ModuleName as ModuleName
 import qualified Distribution.Pretty as CabalPretty
@@ -120,6 +126,11 @@ data PackageInfo = PackageInfo
       -- ^ @pkgconfig-depends:@ stanza — package-config names (e.g.
       -- @"libpq"@).  Resolved to concrete lib names via @pkg-config
       -- --libs@ by the FFI loader.
+    , pkgBuildDepends :: ![ByteString]
+      -- ^ @build-depends:@ package names (without version constraints).
+      -- Used by 'scopedSearchDirs' to restrict import resolution to
+      -- the importer's declared dependencies, so two packages with
+      -- the same module name don't collide.
     }
     deriving stock (Show, Eq)
 
@@ -343,6 +354,11 @@ gpdToPackageInfo packageRoot gpd =
         pkgCfg    = [ BC.pack (CabalPretty.prettyShow d)
                     | d <- pkgconfigDepends bi
                     ]
+        -- build-depends: extract just the package names (version
+        -- constraints are irrelevant for per-package import scoping).
+        buildDeps = [ BC.pack (CabalPkgName.unPackageName (depPkgName d))
+                    | d <- targetBuildDepends bi
+                    ]
     in PackageInfo
         { pkgName        = name
         , pkgVersion     = version
@@ -352,6 +368,7 @@ gpdToPackageInfo packageRoot gpd =
         , pkgIncludeDirs = incDirs
         , pkgExtraLibs   = extraLbs
         , pkgPkgConfig   = pkgCfg
+        , pkgBuildDepends = buildDeps
         }
 
 -- Local stub so we don't depend on a specific Cabal BuildInfo default
@@ -552,11 +569,19 @@ searchPathMemoRef :: IORef (Maybe [(FilePath, [FilePath])])
 searchPathMemoRef = unsafePerformIO (newIORef Nothing)
 {-# NOINLINE searchPathMemoRef #-}
 
+-- | In-process memo for 'cachedPackageTable'.  Session-scoped, never
+-- expires during a run; computed lazily on first request.
+packageTableMemoRef :: IORef (Maybe PackageTable)
+packageTableMemoRef = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE packageTableMemoRef #-}
+
 -- | Clear the in-process search-path memo.  Exposed for tests that
 -- mutate the underlying directories and expect a fresh read.  Not
 -- currently wired up; kept as a private helper for future use.
 _resetSearchPathMemo :: IO ()
-_resetSearchPathMemo = writeIORef searchPathMemoRef Nothing
+_resetSearchPathMemo = do
+    writeIORef searchPathMemoRef Nothing
+    writeIORef packageTableMemoRef Nothing
 
 -- | Fingerprint summarising the state of the source directories the
 -- search path depends on.  Two fingerprints agreeing means "nothing
@@ -761,6 +786,148 @@ traceCache msg = do
 -- so both entry points share one memo / one disk cache.
 cachedPackageSearchPath :: IO [FilePath]
 cachedPackageSearchPath = map fst <$> cachedPackageSearchPathWithIncludes
+
+-- | Per-package table for scoped import resolution. Entries are
+-- @(sourceDir, PackageInfo)@ — one row per 'hs-source-dirs' entry
+-- per package, all rows for a package sharing the same 'PackageInfo'.
+-- Ordered the same as 'cachedPackageSearchPath' (nix → user cache →
+-- cabal tarball), which gives a stable precedence for duplicate package
+-- names across sources.
+type PackageTable = [(FilePath, PackageInfo)]
+
+-- | Cached 'PackageTable'.  Session-scoped; computed lazily by walking
+-- every source root once.  Subsequent calls are O(1).
+cachedPackageTable :: IO PackageTable
+cachedPackageTable = do
+    memo <- readIORef packageTableMemoRef
+    case memo of
+        Just t  -> pure t
+        Nothing -> do
+            fresh <- computePackageTableFresh
+            _     <- evaluate (length fresh)
+            atomicModifyIORef' packageTableMemoRef $ \cur ->
+                case cur of
+                    Just existing -> (Just existing, existing)
+                    Nothing       -> (Just fresh, fresh)
+
+computePackageTableFresh :: IO PackageTable
+computePackageTableFresh = do
+    home <- getHomeDirectory
+    let userCache = home </> ".cache" </> "ihc" </> "sources"
+    nixPairs   <- nixPairs
+    userPairs  <- enumeratePkg userCache
+    cabalPairs <- cabalTarballPairs
+    pure (nixPairs ++ userPairs ++ cabalPairs)
+  where
+    nixPairs :: IO PackageTable
+    nixPairs = do
+        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
+        case mDir of
+            Nothing  -> pure []
+            Just dir -> enumeratePkg dir
+
+    enumeratePkg sourcesDir = do
+        exists <- doesDirectoryExist sourcesDir
+        if not exists
+            then pure []
+            else do
+                entries <- listDirectory sourcesDir
+                let sorted = sortBy (\a b -> compare (Down a) (Down b)) entries
+                concat <$> mapM (rowsForPkg sourcesDir) sorted
+
+    rowsForPkg sourcesDir entry = do
+        let pkgDir = sourcesDir </> entry
+        isDir <- doesDirectoryExist pkgDir
+        if not isDir
+            then pure []
+            else do
+                mCabal <- findLocalCabalFile pkgDir
+                case mCabal of
+                    Just cabalPath -> do
+                        mInfo <- parseCabalFile pkgDir cabalPath
+                        case mInfo of
+                            Just info -> pure [(sd, info) | sd <- pkgSourceDirs info]
+                            Nothing   -> pure []
+                    Nothing -> pure []
+
+    cabalTarballPairs = do
+        home <- getHomeDirectory
+        let cabalRoot = home </> ".cabal" </> "packages" </> "hackage.haskell.org"
+        exists <- doesDirectoryExist cabalRoot
+        if not exists
+            then pure []
+            else do
+                pkgDirs <- listDirectory cabalRoot
+                fmap concat $ mapM (cabalPkgRows cabalRoot) pkgDirs
+
+    cabalPkgRows cabalRoot pkg = do
+        let pkgRoot = cabalRoot </> pkg
+        isDir <- doesDirectoryExist pkgRoot
+        if not isDir
+            then pure []
+            else do
+                verDirs <- listDirectory pkgRoot
+                fmap concat $ mapM (cabalVerRows pkgRoot pkg) verDirs
+
+    cabalVerRows pkgRoot pkg ver = do
+        let extracted = pkgRoot </> ver </> (pkg <> "-" <> ver)
+        hasDir <- doesDirectoryExist extracted
+        if not hasDir
+            then pure []
+            else do
+                mCabal <- findLocalCabalFile extracted
+                case mCabal of
+                    Just cabalPath -> do
+                        mInfo <- parseCabalFile extracted cabalPath
+                        case mInfo of
+                            Just info -> pure [(sd, info) | sd <- pkgSourceDirs info]
+                            Nothing   -> pure []
+                    Nothing -> pure []
+
+-- | Given an absolute source-file path, find the package that owns it
+-- by longest matching prefix against the table's source dirs.
+findOwningPackage :: PackageTable -> FilePath -> Maybe PackageInfo
+findOwningPackage table path =
+    let candidates = [(length sd, info) | (sd, info) <- table, sd `isPrefixOfPath` path]
+    in case candidates of
+        [] -> Nothing
+        _  -> Just (snd (maximumBy (\a b -> compare (fst a) (fst b)) candidates))
+  where
+    isPrefixOfPath p full =
+        p == full || (p <> "/") `isPrefixOf` full
+
+-- | Resolution scope for an import from @owner@ with optional
+-- @PackageImports@ qualifier. Returns source dirs in priority order:
+--   1. Owner's own source dirs first (module in the same package
+--      always wins against a same-named module in a build-dep).
+--   2. When a PackageImports qualifier is present: the qualified
+--      package's dirs only.
+--   3. Otherwise: every package in owner's @build-depends@, in
+--      REVERSE declaration order (later declarations take precedence
+--      on duplicate module names — matches GHC behavior).
+-- Returns an empty list if no owner is known; callers fall back to
+-- the global flat search path.
+scopedSearchDirs
+    :: PackageTable
+    -> Maybe PackageInfo        -- ^ owning package of the importing file
+    -> Maybe ByteString         -- ^ optional PackageImports qualifier
+    -> [FilePath]
+scopedSearchDirs _ Nothing _ = []
+scopedSearchDirs table (Just owner) mQual =
+    let ownerDirs = pkgSourceDirs owner
+        depDirs = case mQual of
+            Just q  ->
+                [ sd
+                | (sd, info) <- table
+                , pkgName info == q
+                ]
+            Nothing ->
+                let deps = reverse (pkgBuildDepends owner)
+                in concat
+                    [ [ sd | (sd, info) <- table, pkgName info == dep ]
+                    | dep <- deps
+                    ]
+    in ownerDirs ++ depDirs
 
 -- | Like 'cachedPackageSearchPath' but returns @(srcDir, includeDirs)@
 -- pairs so callers can look up the @include-dirs@ for the package that
