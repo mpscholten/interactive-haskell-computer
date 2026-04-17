@@ -993,6 +993,7 @@ parseDo ctx cur0 = do
             ESplice inner      -> fv bound inner
             EQuote  _          -> []
             ELabel  _          -> []
+            ETyApp e _         -> fv bound e
 
         fvStmts _     []                  = []
         fvStmts bound (SExpr e   : rest)  = fv bound e ++ fvStmts bound rest
