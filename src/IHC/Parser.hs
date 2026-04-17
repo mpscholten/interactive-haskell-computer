@@ -2117,11 +2117,13 @@ parseParenExpr ctx _openTok cur0 = do
             in case tkKind fieldTok of
                 TkIdent fname | tkStart fieldTok == tkEnd peek -> do
                     -- Adjacent: (.fname) is a record-dot section \$s -> fname $s
+                    -- Uses the synthetic $fldProj$ key so it works under
+                    -- NoFieldSelectors.
                     let (closeTok, curClose) = nextSig ctx curAfterField
                     case tkKind closeTok of
                         TkRParen ->
                             let n = "$s"
-                            in pure (ELam n (EApp (EVar fname) (EVar n)), curClose)
+                            in pure (ELam n (EApp (EVar (recordDotProjName fname)) (EVar n)), curClose)
                         _ -> do
                             -- (.fname expr) is unusual but parse generically.
                             (e, cur1) <- parseExpr ctx cur0
@@ -2477,10 +2479,23 @@ applyRecordDots ctx lastTok expr cur =
             let (fieldTok, curAfterField) = nextToken src curAfterDot in
             case tkKind fieldTok of
                 TkIdent fname | tkStart fieldTok == tkEnd dotTok ->
-                    -- Desugar: expr.fname -> fname expr, then recurse for chaining.
-                    applyRecordDots ctx fieldTok (EApp (EVar fname) expr) curAfterField
+                    -- Desugar: expr.fname -> ($fldProj$fname) expr, then recurse for chaining.
+                    -- Using the synthetic $fldProj$ prefix keeps record-dot working
+                    -- even under {-# LANGUAGE NoFieldSelectors #-}, where the bare-
+                    -- name accessor is suppressed.  The scheduler binds both names:
+                    -- bare for non-NoFieldSelectors modules, $fldProj$ for every
+                    -- field globally.  See IHC.Scheduler.fieldProjName.
+                    applyRecordDots ctx fieldTok
+                        (EApp (EVar (recordDotProjName fname)) expr) curAfterField
                 _ -> pure (expr, cur)
         _ -> pure (expr, cur)
+
+-- | Build the synthetic env-key used by the record-dot desugaring.
+-- Must match 'IHC.Scheduler.fieldProjName'.  The @$fldProj$@ prefix is
+-- not a valid Haskell identifier, so it can never collide with a
+-- user-defined name.
+recordDotProjName :: ByteString -> ByteString
+recordDotProjName fname = BC.pack "$fldProj$" <> fname
 
 --------------------------------------------------------------------------------
 -- String literal desugar + list literals

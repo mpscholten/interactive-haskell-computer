@@ -299,8 +299,16 @@ tryDataDecl envRef fieldRegRef src _line = do
             then pure (Left "no constructors found (parse error?)")
             else do
                 conEnv   <- buildConEnv  reg
+                -- Bind field accessors under both the bare name (for
+                -- explicit selector use) AND the synthetic $fldProj$
+                -- key so @x.field@ at the REPL desugars correctly.
+                -- NoFieldSelectors at the REPL is a no-op — every
+                -- declaration there is considered to have selectors
+                -- enabled since the REPL has no module-level pragma.
                 fieldEnv <- buildFieldEnv fldReg
-                modifyIORef' envRef (Map.union fieldEnv . Map.union conEnv)
+                let projEnv = Map.mapKeys (BC.append (BC.pack "$fldProj$")) fieldEnv
+                modifyIORef' envRef
+                    (Map.union projEnv . Map.union fieldEnv . Map.union conEnv)
                 -- Accumulate the field registry so subsequent expressions
                 -- can desugar record-construction / record-update / wild
                 -- patterns against the types declared at this prompt.
