@@ -42,6 +42,9 @@ module IHC.Scheduler
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
+      -- * Record-syntax desugaring (used by the REPL)
+    , desugarRecordCons
+    , desugarRecordPats
     ) where
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try)
@@ -111,6 +114,12 @@ data LoadedModule = LoadedModule
       -- | Per-module fixity table: defaults + any @infixl/infixr/infix@
       -- declarations found at column 1 in this source.
     , lmFixity      :: !FixityTable
+      -- | Whether this module opts out of top-level record-field
+      -- accessor generation via @{-# LANGUAGE NoFieldSelectors #-}@.
+      -- When true, fields from this module's 'lmFieldReg' are NOT bound
+      -- under their bare names in the final env — only under the
+      -- internal 'fieldProjName' alias that record-dot uses.
+    , lmNoFieldSelectors :: !Bool
     }
 
 data ModuleState
@@ -203,10 +212,10 @@ loadProgramFromSource searchPath src0 = do
 
     -- Union data registries and field registries across all modules.
     let unionedData  = foldr Map.union Map.empty (map lmDataReg  loadedModules)
-        unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+        (publicFields, unionedFields) = partitionFieldRegistries loadedModules
         unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
     conEnv   <- buildConEnv  unionedData
-    fieldEnv <- buildFieldEnv unionedFields
+    fieldEnv <- buildFieldAccessorEnv publicFields unionedFields
     builtins <- builtinEnv classReg
     let baseNoClass = Map.union builtins (Map.union fieldEnv conEnv)
     -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
@@ -398,10 +407,10 @@ loadFileIntoEnv searchPath path existingEnv = do
     reg <- readIORef registry
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
     let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules)
-        unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+        (publicFields, unionedFields) = partitionFieldRegistries loadedModules
         unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
     conEnv    <- buildConEnv  unionedData
-    fieldEnv' <- buildFieldEnv unionedFields
+    fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
     let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
@@ -732,9 +741,9 @@ loadImportIntoEnv searchPath imp existingEnv
         reg0 <- readIORef registry
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules0)
-            unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules0)
+            (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
         conEnv    <- buildConEnv  unionedData
-        fieldEnv' <- buildFieldEnv unionedFields
+        fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
         builtins <- builtinEnv =<< newClassRegistry
         let baseForImport = Map.union builtins (Map.union fieldEnv' conEnv)
         -- Build (qualified-key, Expr) pairs for each loaded module.
@@ -839,10 +848,10 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     reg0 <- readIORef registry
     let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
-        unionedFields  = foldr Map.union Map.empty (map lmFieldReg loadedModules0)
+        (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
         unionedTypeCtors0 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
     conEnv    <- buildConEnv unionedData
-    fieldEnv' <- buildFieldEnv unionedFields
+    fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
     let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
@@ -1576,6 +1585,63 @@ hasNoImplicitPrelude :: Source -> Bool
 hasNoImplicitPrelude src =
     BC.pack "NoImplicitPrelude" `BC.isInfixOf` srcBytes src
 
+-- | Check whether the source bytes contain a @{-# LANGUAGE NoFieldSelectors #-}@
+-- pragma.  Used to opt out of auto-synthesised top-level record-field
+-- accessor functions.  Cheap substring test — same caveats as
+-- 'hasNoImplicitPrelude'.  When this is on for a module, the field
+-- accessors for record types declared in that module are NOT bound
+-- under their bare names in the environment, so user-defined top-level
+-- names can reuse them without collision.  Record-dot (@x.field@) still
+-- works because the parser desugars it to a reference under the
+-- internal 'fieldProjName' key, which is populated for every field
+-- regardless of the pragma.
+hasNoFieldSelectors :: Source -> Bool
+hasNoFieldSelectors src =
+    BC.pack "NoFieldSelectors" `BC.isInfixOf` srcBytes src
+
+-- | Internal synthetic name used as the env key for record-dot field
+-- access.  The parser's @x.field@ desugaring emits
+-- @EApp (EVar (fieldProjName "field")) x@ so that record-dot continues
+-- to work even when @{-# LANGUAGE NoFieldSelectors #-}@ suppresses the
+-- bare-name accessor.  The @$fldProj$@ prefix is non-parseable as a
+-- user identifier, so collision with user code is impossible.
+fieldProjName :: ByteString -> ByteString
+fieldProjName fname = BC.pack "$fldProj$" <> fname
+
+-- | Partition a list of loaded modules' field registries into:
+--
+--   * @publicFields@: the union of field registries from modules whose
+--     'lmNoFieldSelectors' is 'False' — these get bare-name accessor
+--     bindings (the normal Haskell record-selector behaviour).
+--   * @allFields@: the union of every module's field registry — this
+--     is used both for record-dot desugaring (always populated under
+--     the 'fieldProjName' prefix) and for the record-con / record-pat
+--     desugarers.
+--
+-- The two maps differ only when at least one module opts out via
+-- @NoFieldSelectors@.
+partitionFieldRegistries
+    :: [LoadedModule]
+    -> (FieldRegistry, FieldRegistry)
+partitionFieldRegistries lms =
+    let allFields    = foldr Map.union Map.empty (map lmFieldReg lms)
+        publicFields = foldr Map.union Map.empty
+                         [ lmFieldReg lm | lm <- lms, not (lmNoFieldSelectors lm) ]
+    in (publicFields, allFields)
+
+-- | Build the combined field-accessor env: every field is bound under
+-- its 'fieldProjName' prefix (for record-dot), and fields from modules
+-- that do NOT have 'NoFieldSelectors' are also bound under their bare
+-- name (so legacy @fname record@ application works).
+buildFieldAccessorEnv :: FieldRegistry -> FieldRegistry -> IO Env
+buildFieldAccessorEnv publicFields allFields = do
+    -- Bare-name accessors only for non-NoFieldSelectors modules.
+    bareEnv <- buildFieldEnv publicFields
+    -- Internal record-dot accessors for every field.
+    projEnv <- buildFieldEnv allFields
+    let projKeyed = Map.mapKeys fieldProjName projEnv
+    pure (Map.union bareEnv projKeyed)
+
 -- | Locate, read, parse, and register a module. Returns the
 -- 'LoadedModule' (and reuses a cached one on subsequent calls).
 -- Cycles raise 'ImportCycle'.
@@ -1704,6 +1770,7 @@ buildEmptyStubModule name = do
         , lmBodies      = bodies
         , lmIsEntry     = False
         , lmFixity      = defaultFixityTable
+        , lmNoFieldSelectors = False
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
@@ -1723,6 +1790,7 @@ buildLoadedModule name isEntry header src = do
         , lmBodies      = bodies
         , lmIsEntry     = isEntry
         , lmFixity      = fixity
+        , lmNoFieldSelectors = hasNoFieldSelectors src
         }
 
 emptyHeader :: ModuleHeader

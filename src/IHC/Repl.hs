@@ -36,7 +36,7 @@ import IHC.Eval (eval, force, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), ImportSpec(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
-import IHC.Scan (scanDataDecls, scanInstanceDecls, scanClassDecls, InstanceDecl(..), ClassDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
+import IHC.Scan (scanDataDecls, scanInstanceDecls, scanClassDecls, InstanceDecl(..), ClassDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding, FieldRegistry)
 import IHC.Scheduler
     ( buildBaseEnv
     , freeVars
@@ -45,6 +45,8 @@ import IHC.Scheduler
     , splitQualified
     , classMethodDispatcher
     , defaultTypeTag
+    , desugarRecordCons
+    , desugarRecordPats
     )
 import IHC.Source (mkSource, Source(..))
 import IHC.TypeDescribe (describeType)
@@ -57,10 +59,16 @@ runRepl = do
     envRef      <- newIORef baseEnv
     loadedRef   <- newIORef ([] :: [FilePath])
     importsRef  <- newIORef ([] :: [ImportDecl])
+    -- Accumulated record-field registry for every `data`/`newtype`
+    -- declared at the REPL. Used by 'desugarRecordCons' /
+    -- 'desugarRecordPats' so record-construction and record-update
+    -- expressions like `x { name = 1 }` evaluate correctly instead of
+    -- falling through the ERecordUpdate no-op in Eval.
+    fieldRegRef <- newIORef (Map.empty :: FieldRegistry)
     histDir     <- historyDir
     let settings = defaultSettings
             { historyFile = Just (histDir </> "repl_history") }
-    runInputT settings (loop envRef classReg loadedRef importsRef)
+    runInputT settings (loop envRef classReg loadedRef importsRef fieldRegRef)
 
 historyDir :: IO FilePath
 historyDir = do
@@ -73,8 +81,8 @@ historyDir = do
 -- Main REPL loop
 --------------------------------------------------------------------------------
 
-loop :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> InputT IO ()
-loop envRef classReg loadedRef importsRef = go
+loop :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> IORef FieldRegistry -> InputT IO ()
+loop envRef classReg loadedRef importsRef fieldRegRef = go
   where
     go = do
         mLine <- getInputLine "ihc> "
@@ -82,20 +90,20 @@ loop envRef classReg loadedRef importsRef = go
             Nothing   -> pure ()
             Just ""   -> go
             Just line -> do
-                continue <- dispatch envRef classReg loadedRef importsRef line
+                continue <- dispatch envRef classReg loadedRef importsRef fieldRegRef line
                 if continue then go else pure ()
 
-dispatch :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO Bool
-dispatch envRef classReg loadedRef importsRef line =
+dispatch :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> IORef FieldRegistry -> String -> InputT IO Bool
+dispatch envRef classReg loadedRef importsRef fieldRegRef line =
     case words line of
         ((':':cmd):rest) -> metaCmd envRef classReg loadedRef importsRef cmd rest
         ("import":_)     -> doImport envRef loadedRef importsRef line >> pure True
-        ("data":_)       -> doDataDecl envRef line >> pure True
-        ("newtype":_)    -> doDataDecl envRef line >> pure True
+        ("data":_)       -> doDataDecl envRef fieldRegRef line >> pure True
+        ("newtype":_)    -> doDataDecl envRef fieldRegRef line >> pure True
         ("type":_)       -> doTypeDecl line >> pure True
         ("class":_)      -> doClassDecl envRef classReg line >> pure True
         ("instance":_)   -> doInstanceDecl envRef classReg line >> pure True
-        _                -> evalLine envRef classReg loadedRef importsRef line >> pure True
+        _                -> evalLine envRef classReg loadedRef importsRef fieldRegRef line >> pure True
 
 --------------------------------------------------------------------------------
 -- Meta-commands
@@ -273,16 +281,16 @@ syntheticModule decl = BC.pack ("module IhcRepl where\n" <> decl <> "\n")
 -- We wrap the declaration in a synthetic module, run 'scanDataDecls' to
 -- extract (constructor, arity) pairs, build VFun/VCon thunks via
 -- 'buildConEnv', and merge the result into the REPL env.
-doDataDecl :: IORef Env -> String -> InputT IO ()
-doDataDecl envRef line = do
+doDataDecl :: IORef Env -> IORef FieldRegistry -> String -> InputT IO ()
+doDataDecl envRef fieldRegRef line = do
     let src = mkSource "<repl>" (syntheticModule line)
-    r <- liftIO (tryDataDecl envRef src line)
+    r <- liftIO (tryDataDecl envRef fieldRegRef src line)
     case r of
         Left err -> outputStrLn ("Error: " <> err)
         Right msg -> outputStrLn msg
 
-tryDataDecl :: IORef Env -> Source -> String -> IO (Either String String)
-tryDataDecl envRef src _line = do
+tryDataDecl :: IORef Env -> IORef FieldRegistry -> Source -> String -> IO (Either String String)
+tryDataDecl envRef fieldRegRef src _line = do
     r <- (try (scanDataDecls src) :: IO (Either SomeException (Map.Map BC.ByteString (BC.ByteString, Int, Int), Map.Map BC.ByteString [(BC.ByteString, Int)], Map.Map BC.ByteString [BC.ByteString])))
     case r of
         Left err  -> pure (Left (show err))
@@ -293,6 +301,10 @@ tryDataDecl envRef src _line = do
                 conEnv   <- buildConEnv  reg
                 fieldEnv <- buildFieldEnv fldReg
                 modifyIORef' envRef (Map.union fieldEnv . Map.union conEnv)
+                -- Accumulate the field registry so subsequent expressions
+                -- can desugar record-construction / record-update / wild
+                -- patterns against the types declared at this prompt.
+                modifyIORef' fieldRegRef (Map.union fldReg)
                 let ctorCount = Map.size reg
                     ctors     = Map.keys reg
                     msg = "data decl: " <> show ctorCount <>
@@ -448,23 +460,24 @@ evalInstanceMethods src env methods =
 -- Expression evaluation
 --------------------------------------------------------------------------------
 
-evalLine :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
-evalLine envRef classReg loadedRef importsRef input = do
+evalLine :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl] -> IORef FieldRegistry -> String -> InputT IO ()
+evalLine envRef classReg loadedRef importsRef fieldRegRef input = do
     env <- liftIO (readIORef envRef)
+    fldReg <- liftIO (readIORef fieldRegRef)
     case sessionBindName input of
         Just (name, rhs) -> do
-            r <- liftIO (tryEvalSessionBind loadedRef importsRef env name rhs)
+            r <- liftIO (tryEvalSessionBind loadedRef importsRef fldReg env name rhs)
             case r of
                 Left  err    -> outputStrLn ("Error: " <> err)
                 Right newEnv -> liftIO (writeIORef envRef newEnv)
         Nothing -> case letBindingName input of
             Just name -> do
-                r <- liftIO (tryEvalLetDecl loadedRef importsRef env name input)
+                r <- liftIO (tryEvalLetDecl loadedRef importsRef fldReg env name input)
                 case r of
                     Left  err     -> outputStrLn ("Error: " <> err)
                     Right newEnv  -> liftIO (writeIORef envRef newEnv)
             Nothing -> do
-                r <- liftIO (tryEvalExpr loadedRef importsRef env classReg input)
+                r <- liftIO (tryEvalExpr loadedRef importsRef fldReg env classReg input)
                 case r of
                     Left  err -> outputStrLn ("Error: " <> err)
                     Right ()  -> pure ()
@@ -518,14 +531,15 @@ findTopLevelLArrow src = go (0 :: Int) startCursor
 -- resulting value under @name@ in the session env. If anything
 -- throws, the env is left unchanged and the exception is returned
 -- as a @Left@ — the caller prints it and the REPL keeps going.
-tryEvalSessionBind :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> String -> String -> IO (Either String Env)
-tryEvalSessionBind loadedRef importsRef env name rhs = do
+tryEvalSessionBind :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> String -> String -> IO (Either String Env)
+tryEvalSessionBind loadedRef importsRef fldReg env name rhs = do
     let src = mkSource "<repl>" (BC.pack rhs)
     r <- try (parseExprOnly src defaultFixityTable)
             :: IO (Either SomeException Expr)
     case r of
         Left  err  -> pure (Left (show err))
-        Right expr -> do
+        Right expr0 -> do
+            let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
             r2 <- try (do
                         v  <- eval env' emptyIPMap expr
@@ -574,8 +588,8 @@ letBindingName s =
 -- Parser pipeline so that function-style LHSs like @f x y = body@ are
 -- correctly desugared into lambdas, and the binding is knot-tied so
 -- recursive references inside the body (e.g. @map@ calling @map@) work.
-tryEvalLetDecl :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> String -> String -> IO (Either String Env)
-tryEvalLetDecl loadedRef importsRef env name input = do
+tryEvalLetDecl :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> String -> String -> IO (Either String Env)
+tryEvalLetDecl loadedRef importsRef fldReg env name input = do
     -- Strip the leading "let " and wrap in a synthetic module so that
     -- findBinding can locate the top-level declaration at column 1.
     let decl = dropLetPrefix input
@@ -585,7 +599,8 @@ tryEvalLetDecl loadedRef importsRef env name input = do
             :: IO (Either SomeException Expr)
     case r of
         Left  err  -> pure (Left (show err))
-        Right expr -> do
+        Right expr0 -> do
+            let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env0 <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
             -- Knot-tying: allocate a slot first, extend the env to
             -- include the binding, then fill the slot with a closure
@@ -615,14 +630,15 @@ parseLetBinding src name = do
                                          <> BC.unpack name <> "`"))
         Just lhs -> parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
 
-tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> Env -> ClassRegistry -> String -> IO (Either String ())
-tryEvalExpr loadedRef importsRef env classReg input = do
+tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> ClassRegistry -> String -> IO (Either String ())
+tryEvalExpr loadedRef importsRef fldReg env classReg input = do
     let src = mkSource "<repl>" (BC.pack input)
     r <- try (parseExprOnly src defaultFixityTable)
             :: IO (Either SomeException Expr)
     case r of
         Left  err  -> pure (Left (show err))
-        Right expr -> do
+        Right expr0 -> do
+            let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
             r2 <- try (evalAndPrint env' classReg expr)
                     :: IO (Either SomeException ())
