@@ -813,12 +813,25 @@ parseLambdaCase ctx cur0 = do
 --------------------------------------------------------------------------------
 
 -- Note: {-# LANGUAGE ApplicativeDo #-} is accepted (the lexer silently skips
--- all pragmas) but does NOT trigger a different desugaring path here.
--- We always desugar do-blocks monadically (>>=).  For the use-cases that
--- matter to us (IHP generated decoders, IHP.FetchPipelined), Applicative is
--- a superclass of Monad, so monadic desugaring produces the same observable
--- result.  If true parallel applicative semantics are ever needed, this
--- function is the place to add an independence analysis pass.
+-- all pragmas).  Regardless of the pragma, we always try the applicative
+-- desugaring when a do-block's binds are independent — monadic fallback is
+-- semantically equivalent (Applicative is a superclass of Monad), and the
+-- applicative form signals pipelineable structure to backends that care
+-- (e.g. hasql's generated row decoders, IHP.FetchPipelined).
+--
+-- The applicative transform fires when all of the following hold:
+--
+--   1. Every non-final statement is an 'SBind' (no middle 'SLet' or 'SExpr').
+--   2. The final statement is @SExpr (pure e)@ or @SExpr (return e)@.
+--   3. No bind's RHS references a name bound by an earlier bind.
+--
+-- Under those conditions,
+--   do { x1 <- a1; ... ; xn <- an; pure e }
+-- becomes
+--   (\x1 ... xn -> e) <$> a1 <*> a2 <*> ... <*> an
+--
+-- Anything that doesn't match the above falls back to the standard monadic
+-- >>= / >> chain.
 
 parseDo :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseDo ctx cur0 = do
@@ -862,23 +875,145 @@ parseDo ctx cur0 = do
             _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' (s : acc)
               | otherwise                -> pure (reverse (s : acc), cur')
 
-    -- | Desugar a list of do-statements into a >>=/>>/let chain.
-    -- This is the standard Haskell do-notation desugaring, making do-blocks
-    -- work for any monad (IO, ST, Maybe, etc.) via the global >>= and >>.
+    -- | Desugar a list of do-statements.  First try the applicative form;
+    -- if that doesn't apply, fall back to the classical monadic chain.
     desugarDo :: [Stmt] -> Expr
-    desugarDo []               = EDo []  -- shouldn't happen; fallback
-    desugarDo [SExpr e]        = e
-    desugarDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
-    desugarDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
-    desugarDo (SExpr e : rest) =
+    desugarDo ss
+      | Just appl <- tryApplicativeDo ss = appl
+      | otherwise                        = monadicDo ss
+
+    -- | Standard Haskell do-notation desugaring using >>=/>>/let.
+    monadicDo :: [Stmt] -> Expr
+    monadicDo []               = EDo []  -- shouldn't happen; fallback
+    monadicDo [SExpr e]        = e
+    monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
+    monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
+    monadicDo (SExpr e : rest) =
         -- e >> do { rest }
-        EApp (EApp (EVar ">>") e) (desugarDo rest)
-    desugarDo (SBind name e : rest) =
+        EApp (EApp (EVar ">>") e) (monadicDo rest)
+    monadicDo (SBind name e : rest) =
         -- e >>= \name -> do { rest }
-        EApp (EApp (EVar ">>=") e) (ELam name (desugarDo rest))
-    desugarDo (SLet bs : rest) =
+        EApp (EApp (EVar ">>=") e) (ELam name (monadicDo rest))
+    monadicDo (SLet bs : rest) =
         -- let bs in do { rest }
-        ELet bs (desugarDo rest)
+        ELet bs (monadicDo rest)
+
+    -- | If the do-block matches the applicative pattern, return its
+    -- applicative desugaring.  See the header comment on 'parseDo' for the
+    -- full set of conditions.
+    tryApplicativeDo :: [Stmt] -> Maybe Expr
+    tryApplicativeDo stmts = do
+        -- Need at least one SBind plus a final SExpr (pure e).  A single
+        -- bind still benefits: @do { x <- a; pure e }@ becomes
+        -- @fmap (\\x -> e) a@, which is a cheap win over @a >>= \\x -> pure e@.
+        (binds, finalExpr) <- splitBindsAndPure stmts
+        case binds of
+            []      -> Nothing          -- no binds → nothing to parallelize
+            _       -> buildAppl binds finalExpr
+      where
+        -- | Expect @[SBind n1 a1, ..., SBind nk ak, SExpr (pure e)]@ and
+        -- return @(binds, e)@ on success.  Any middle 'SExpr'/'SLet', or a
+        -- final statement that isn't literally @pure …@ / @return …@, fails.
+        splitBindsAndPure :: [Stmt] -> Maybe ([(Name, Expr)], Expr)
+        splitBindsAndPure []             = Nothing
+        splitBindsAndPure [SExpr final]  = do
+            inner <- pureBody final
+            pure ([], inner)
+        splitBindsAndPure (SBind n e : rest) = do
+            (bs, inner) <- splitBindsAndPure rest
+            pure ((n, e) : bs, inner)
+        splitBindsAndPure _              = Nothing
+
+        -- | Detect a final expression of the form @pure e@ or @return e@
+        -- (unqualified only — qualified Prelude.pure is rare and easy to
+        -- conservatively miss).
+        pureBody :: Expr -> Maybe Expr
+        pureBody (EApp (EVar "pure")   e) = Just e
+        pureBody (EApp (EVar "return") e) = Just e
+        pureBody _                        = Nothing
+
+        -- | Check independence: for @binds = [(n1,a1), …, (nk,ak)]@, no
+        -- @ai@ may reference any @nj@ with j < i.  If that holds, build
+        -- @(\\n1 … nk -> body) <$> a1 <*> a2 <*> … <*> ak@.
+        buildAppl :: [(Name, Expr)] -> Expr -> Maybe Expr
+        buildAppl binds body
+            | not (independent [] binds) = Nothing
+            -- Emit @fmap (\\x1 … xk -> e) a1 \<*\> a2 \<*\> … \<*\> ak@.
+            -- Using 'fmap' rather than @\<\$\>@ avoids pulling in the
+            -- @Data.Functor@ import when the user's module didn't already
+            -- do so; 'fmap' is a known builtin in 'IHC.Builtins'.
+            | (a : as) <- map snd binds =
+                let names    = map fst binds
+                    lam      = foldr ELam body names
+                    fmapPart = EApp (EApp (EVar "fmap") lam) a
+                    stepAp acc rhs = EApp (EApp (EVar "<*>") acc) rhs
+                in Just (foldl stepAp fmapPart as)
+            | otherwise = Nothing    -- empty binds caught by caller
+          where
+            -- Each bind's RHS is checked against previously-bound names,
+            -- then that bind's own name is added to the seen set for
+            -- subsequent binds.
+            independent _    []             = True
+            independent seen ((n, rhs) : rs) =
+                all (`notElem` seen) (exprFreeVars rhs)
+                && independent (n : seen) rs
+
+    -- | Free variables of an 'Expr' (names referenced via 'EVar' that
+    -- aren't shadowed by a lambda, let, or pattern binding within).  Kept
+    -- local so the parser doesn't depend on the scheduler; the version in
+    -- 'IHC.Scheduler' covers more constructors but this subset is enough
+    -- for ApplicativeDo's independence check.
+    exprFreeVars :: Expr -> [Name]
+    exprFreeVars = fv []
+      where
+        fv bound = \case
+            EVar n
+                | n `elem` bound -> []
+                | otherwise      -> [n]
+            ELit _      -> []
+            EApp f x    -> fv bound f ++ fv bound x
+            ELam n e    -> fv (n : bound) e
+            ELet bs e   ->
+                let names = map fst bs
+                    bound' = names ++ bound
+                in concatMap (fv bound' . snd) bs ++ fv bound' e
+            ECase s as  -> fv bound s ++ concatMap (fvAlt bound) as
+            EIf c t e   -> fv bound c ++ fv bound t ++ fv bound e
+            EDo ss      -> fvStmts bound ss
+            ENeg e      -> fv bound e
+            ETuple es   -> concatMap (fv bound) es
+            ERecordCon    _ fs -> concatMap (fv bound . snd) fs
+            ERecordWild   _    -> []
+            ERecordUpdate e fs -> fv bound e ++ concatMap (fv bound . snd) fs
+            EImplicitRef  _    -> []
+            EImplicitLet bs e  ->
+                let names = map fst bs
+                    bound' = names ++ bound
+                in concatMap (fv bound' . snd) bs ++ fv bound' e
+            ESplice inner      -> fv bound inner
+            EQuote  _          -> []
+            ELabel  _          -> []
+
+        fvStmts _     []                  = []
+        fvStmts bound (SExpr e   : rest)  = fv bound e ++ fvStmts bound rest
+        fvStmts bound (SBind n e : rest)  = fv bound e ++ fvStmts (n : bound) rest
+        fvStmts bound (SLet bs   : rest)  =
+            let names  = map fst bs
+                bound' = names ++ bound
+            in concatMap (fv bound' . snd) bs ++ fvStmts bound' rest
+
+        fvAlt bound (Alt p e) = fv (patBound p ++ bound) e
+
+        patBound :: Pat -> [Name]
+        patBound (PVar n)        = [n]
+        patBound (PCon _ ps)     = concatMap patBound ps
+        patBound (PAs n p)       = n : patBound p
+        patBound (PBang p)       = patBound p
+        patBound (PTuple ps)     = concatMap patBound ps
+        patBound (PRecord _ fps) = concatMap (patBound . snd) fps
+        patBound (PRecordWild _) = []
+        patBound (PView _ p)     = patBound p
+        patBound _               = []
 
 parseStmt :: Ctx -> Cursor -> IO (Stmt, Cursor)
 parseStmt ctx cur0 = do
