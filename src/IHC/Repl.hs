@@ -9,7 +9,7 @@
 module IHC.Repl (runRepl) where
 
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (foldM)
+import Control.Monad (foldM, unless)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -370,11 +370,13 @@ tryClassDecl envRef classReg src = do
             env <- readIORef envRef
             -- 1. Bind each method name as a dispatcher thunk.
             dispatcherPairs <- mapM (mkDispatcher classReg (classClassName decl))
-                                    (zip [0..] (classMethodNames decl))
+                                    (classMethodNames decl)
             -- 2. Evaluate default method bodies (if any) in the current
             --    env, producing a slot list keyed by method-name order.
-            defaults <- mapM (mkDefault env src decl)
-                             (classMethodNames decl)
+            defaults <- Map.fromList <$> mapM (\methodName -> do
+                            v <- mkDefault env src decl methodName
+                            pure (methodName, v))
+                        (classMethodNames decl)
             let existing = [ n | (n, _) <- dispatcherPairs, Map.member n env ]
             -- Names already bound in the REPL env (builtins like show/==/
             -- compare or earlier user classes) are NOT overwritten — the
@@ -382,10 +384,9 @@ tryClassDecl envRef classReg src = do
             let newPairs = [ p | p@(n, _) <- dispatcherPairs, not (Map.member n env) ]
             writeIORef envRef (Map.union (Map.fromList newPairs) env)
             -- Register the default-method list under the sentinel tag.
-            case defaults of
-                [] -> pure ()
-                _  -> registerInstance classReg (classClassName decl)
-                                       defaultTypeTag defaults
+            unless (Map.null defaults) $
+                registerInstance classReg (classClassName decl)
+                                 defaultTypeTag defaults
             let skippedNote
                   | null existing = ""
                   | otherwise = " (skipped " <> show (length existing)
@@ -397,10 +398,10 @@ tryClassDecl envRef classReg src = do
 mkDispatcher
     :: ClassRegistry
     -> BC.ByteString
-    -> (Int, BC.ByteString)
+    -> BC.ByteString
     -> IO (BC.ByteString, Thunk)
-mkDispatcher classReg cls (slot, methodName) = do
-    let v = classMethodDispatcher classReg cls slot methodName
+mkDispatcher classReg cls methodName = do
+    let v = classMethodDispatcher classReg cls methodName
     t <- newWHNFThunk v
     pure (methodName, t)
 
@@ -450,18 +451,18 @@ tryInstanceDecl envRef classReg line = do
         Right (InstanceDecl cls typ typs methods : _) -> do
             env <- readIORef envRef
             r2 <- (try (evalInstanceMethods src env methods)
-                    :: IO (Either SomeException [Val]))
+                    :: IO (Either SomeException (Map.Map BC.ByteString Val)))
             case r2 of
-                Left err     -> pure (Left (show err))
-                Right vals   -> do
+                Left err        -> pure (Left (show err))
+                Right methodMap -> do
                     -- Single-tag registration for the head type (preserves
                     -- the existing single-param class behaviour at the
                     -- REPL prompt).
-                    registerInstance classReg cls typ vals
+                    registerInstance classReg cls typ methodMap
                     -- Composite-tag registration for MPTC heads so
                     -- TypeApplications dispatch (@setField \@\"name\"
                     -- \@User \@String@) resolves.
-                    registerInstanceMulti classReg cls typs vals
+                    registerInstanceMulti classReg cls typs methodMap
                     let n   = length methods
                         msg = "instance " <> BC.unpack cls <>
                               " " <> BC.unpack typ <>
@@ -473,14 +474,15 @@ evalInstanceMethods
     :: Source
     -> Env
     -> [(BC.ByteString, BindingLhs)]
-    -> IO [Val]
+    -> IO (Map.Map BC.ByteString Val)
 evalInstanceMethods src env methods =
-    mapM evalOne methods
+    Map.fromList <$> mapM evalOne methods
   where
-    evalOne (_, lhs) = do
+    evalOne (methodName, lhs) = do
         expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
         t    <- newThunk env expr
-        force t
+        v    <- force t
+        pure (methodName, v)
 
 --------------------------------------------------------------------------------
 -- Expression evaluation

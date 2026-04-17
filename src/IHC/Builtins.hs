@@ -82,7 +82,7 @@ import System.IO
 
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
-    ( ClassRegistry, lookupInstance, registerInstance, typeTagOf
+    ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
 import IHC.Eval (apply, force)
@@ -214,7 +214,8 @@ builtinEnv reg = do
     -- fromLabelB just builds a small VFun — leave eager to avoid special-casing
     -- the ClassRegistry (which is a separate store from the Env).
     defaultFromLabel <- fromLabelB reg
-    registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy") [defaultFromLabel]
+    registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy")
+        (Map.singleton (BC.pack "fromLabel") defaultFromLabel)
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ orderingCtors ++ unboxCtors
                          ++ unitCtor ++ [("IO", ioCtorT)]
@@ -835,9 +836,9 @@ eqVals reg av bv = case (av, bv) of
     _ -> do
         -- Try user-defined instance.
         let tag = typeTagOf av
-        mMethods <- lookupInstance reg "Eq" tag
-        case mMethods of
-            Just (eqMethod : _) -> do
+        mEqMethod <- lookupInstanceMethod reg "Eq" tag "=="
+        case mEqMethod of
+            Just eqMethod -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
                 r1 <- apply eqMethod aT
@@ -872,10 +873,17 @@ ordCmp _reg slot av bv = case (av, bv) of
         pure (boolVal (foreignPtrOrdSlot slot fp1 fp2))
     _ -> do
         let tag = typeTagOf av
-        mMethods <- lookupInstance _reg "Ord" tag
-        case mMethods of
-            Just methods | length methods > slot -> do
-                let method = methods !! slot
+        let ordMethodName = case slot of
+                0 -> Just (BC.pack "<")
+                1 -> Just (BC.pack "<=")
+                2 -> Just (BC.pack ">")
+                3 -> Just (BC.pack ">=")
+                _ -> Nothing
+        mMethod <- maybe (pure Nothing)
+                         (lookupInstanceMethod _reg "Ord" tag)
+                         ordMethodName
+        case mMethod of
+            Just method -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
                 r1 <- apply method aT
@@ -1053,10 +1061,9 @@ valOrdering reg av bv = case (av, bv) of
     _ -> do
         -- Try user Ord instance first (compare at slot 4 if present).
         let tag = typeTagOf av
-        mMethods <- lookupInstance reg "Ord" tag
-        case mMethods of
-            Just methods | length methods > 4 -> do
-                let cmpMethod = methods !! 4
+        mCmpMethod <- lookupInstanceMethod reg "Ord" tag "compare"
+        case mCmpMethod of
+            Just cmpMethod -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
                 r1 <- apply cmpMethod aT
@@ -1152,9 +1159,9 @@ showValWith reg av = case av of
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
         let tag = n
-        mMethods <- lookupInstance reg "Show" tag
-        case mMethods of
-            Just (showMethod : _) -> do
+        mShowMethod <- lookupInstanceMethod reg "Show" tag "show"
+        case mShowMethod of
+            Just showMethod -> do
                 aT <- newWHNFThunk av
                 rv <- apply showMethod aT
                 valToString rv
@@ -1345,9 +1352,9 @@ fromLabelB reg = pure $ VFun $ \a -> do
     av <- force a
     case av of
         VLabel lbl -> do
-            mMethods <- lookupUserIsLabel reg lbl
-            case mMethods of
-                Just (fromLabelM : _) ->
+            mMethod <- lookupUserIsLabel reg lbl
+            case mMethod of
+                Just fromLabelM ->
                     -- User-defined @fromLabel@ typically has type
                     -- @forall s. IsLabel s a => a@ and is 0-arity
                     -- (e.g. @fromLabel = Wrap \"x\"@), but some instances
@@ -1383,7 +1390,7 @@ fromLabelB reg = pure $ VFun $ \a -> do
 --    for any label.
 -- 3. Skip the built-in default @(IsLabel s (Proxy s'))@ registered
 --    under @[\"Proxy\"]@ — that's the fallthrough handled by the caller.
-lookupUserIsLabel :: ClassRegistry -> ByteString -> IO (Maybe [Val])
+lookupUserIsLabel :: ClassRegistry -> ByteString -> IO (Maybe Val)
 lookupUserIsLabel reg lbl = do
     m <- readIORef reg
     let entries = [ (tags, methods)
@@ -1392,21 +1399,23 @@ lookupUserIsLabel reg lbl = do
                   ]
         -- First pass: instance whose leading tag matches the label literal.
         symbolMatches =
-            [ methods
+            [ fromLabelMethod
             | (tag : _, methods) <- entries
             , tag == lbl
+            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
             ]
         -- Second pass: polymorphic user instance — first tag is a lower-case
         -- type variable (e.g. 's'), not the @Proxy@ default and not a
         -- concrete Symbol/type.  'normalizeTyTag' leaves these lower-case.
         polymorphicMatches =
-            [ methods
+            [ fromLabelMethod
             | (tag : _, methods) <- entries
             , tag /= BC.pack "Proxy"
             , tag /= lbl
             , not (BS.null tag)
             , let c = BC.head tag
             , c >= 'a' && c <= 'z'
+            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
             ]
     case symbolMatches of
         (ms : _) -> pure (Just ms)
@@ -1708,12 +1717,9 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         _ -> do
             -- Look up Monad instance for this value's type tag.
             let tag = typeTagOf mv
-            mMethods <- lookupInstance reg "Monad" tag
-            case mMethods of
-                Just methods | not (null methods) -> do
-                    -- Monad methods are stored in the order they appear in the
-                    -- instance declaration.  We search by name.
-                    let bindMethod = last methods   -- >>=  is typically the key method
+            mBindMethod <- lookupInstanceMethod reg "Monad" tag ">>="
+            case mBindMethod of
+                Just bindMethod -> do
                     maT <- newWHNFThunk mv
                     r1  <- apply bindMethod maT
                     apply r1 kt
@@ -1772,10 +1778,9 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
             pure (VCon "ST" [stFunc])
         _ -> do
             let tag = typeTagOf mv
-            mMethods <- lookupInstance reg "Monad" tag
-            case mMethods of
-                Just methods | length methods >= 2 -> do
-                    let seqMethod = head methods   -- >>  is typically stored first
+            mSeqMethod <- lookupInstanceMethod reg "Monad" tag ">>"
+            case mSeqMethod of
+                Just seqMethod -> do
                     maT <- newWHNFThunk mv
                     r1  <- apply seqMethod maT
                     apply r1 mb
@@ -1824,9 +1829,9 @@ fmapDispatch :: ClassRegistry -> IO Val
 fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     mv <- force mt
     let tag = typeTagOf mv
-    mInst <- lookupInstance reg (BC.pack "Functor") tag
-    case mInst of
-        Just (fmapMethod : _) -> do
+    mFmapMethod <- lookupInstanceMethod reg (BC.pack "Functor") tag (BC.pack "fmap")
+    case mFmapMethod of
+        Just fmapMethod -> do
             -- Re-supply the original thunks; the instance implementation
             -- is free to evaluate @mv@ lazily via its own pattern match.
             mT <- newWHNFThunk mv

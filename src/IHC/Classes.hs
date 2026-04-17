@@ -1,8 +1,7 @@
 -- | Type class registry for Phase 2.3 dictionary-passing implementation.
 --
 -- Type classes are implemented via runtime dispatch: a global
--- 'ClassRegistry' maps (ClassName, TypeTag) -> [method_Val] where each
--- slot corresponds to one method of the class (in declaration order).
+-- 'ClassRegistry' maps (ClassName, TypeTag) -> method-name/value table.
 --
 -- 'typeTagOf' inspects a 'Val' and returns a stable string tag that
 -- identifies its runtime type for dispatch purposes.
@@ -19,6 +18,8 @@ module IHC.Classes
     , registerInstanceMulti
     , lookupInstance
     , lookupInstanceMulti
+    , lookupInstanceMethod
+    , lookupInstanceMethodMulti
     , typeTagOf
     , normalizeTyTag
       -- * Phase 2.9.5: TypeRep helpers
@@ -162,46 +163,57 @@ forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState BlackHole = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
--- | The global class registry. Maps @(ClassName, [TypeTag])@ to an ordered
--- list of method values (one per method, in class-declaration order).
+type MethodTable = Map ByteString Val
+
+-- | The global class registry. Maps @(ClassName, [TypeTag])@ to a
+-- method-name/value table.
 --
 -- The tag list supports multi-parameter type classes (MPTC) where an
 -- instance is identified by several types — e.g. @instance SetField
 -- \"name\" User String where ...@ registers under
 -- @(\"SetField\", [\"name\", \"User\", \"String\"])@. Single-parameter
 -- classes use a 1-element list for their tag.
-type ClassRegistry = IORef (Map (ByteString, [ByteString]) [Val])
+type ClassRegistry = IORef (Map (ByteString, [ByteString]) MethodTable)
 
 newClassRegistry :: IO ClassRegistry
 newClassRegistry = newIORef Map.empty
 
--- | Register a dict (method list) for a single-tag @(class, type-tag)@
+-- | Register a dict (method table) for a single-tag @(class, type-tag)@
 -- pair. Overwrites any previously registered instance (last write wins).
 --
 -- Kept for backwards compatibility with the single-parameter class path;
 -- equivalent to 'registerInstanceMulti' with a 1-element tag list.
-registerInstance :: ClassRegistry -> ByteString -> ByteString -> [Val] -> IO ()
+registerInstance :: ClassRegistry -> ByteString -> ByteString -> MethodTable -> IO ()
 registerInstance reg className typeTag methods =
     registerInstanceMulti reg className [typeTag] methods
 
--- | Register a dict (method list) for a @(class, [type-tag])@ composite
+-- | Register a dict (method table) for a @(class, [type-tag])@ composite
 -- key. Overwrites any previously registered instance (last write wins).
-registerInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> [Val] -> IO ()
+registerInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> MethodTable -> IO ()
 registerInstanceMulti reg className typeTags methods =
     modifyIORef' reg (Map.insert (className, typeTags) methods)
 
--- | Look up the method list for a given @(class, type-tag)@ pair.
+-- | Look up the method table for a given @(class, type-tag)@ pair.
 -- Single-tag convenience wrapper.
-lookupInstance :: ClassRegistry -> ByteString -> ByteString -> IO (Maybe [Val])
+lookupInstance :: ClassRegistry -> ByteString -> ByteString -> IO (Maybe MethodTable)
 lookupInstance reg className typeTag =
     lookupInstanceMulti reg className [typeTag]
 
--- | Look up the method list for a given @(class, [type-tag])@ composite
+-- | Look up the method table for a given @(class, [type-tag])@ composite
 -- key. Used for multi-parameter class dispatch.
-lookupInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> IO (Maybe [Val])
+lookupInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> IO (Maybe MethodTable)
 lookupInstanceMulti reg className typeTags = do
     m <- readIORef reg
     pure (Map.lookup (className, typeTags) m)
+
+lookupInstanceMethod :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
+lookupInstanceMethod reg className typeTag methodName =
+    lookupInstanceMethodMulti reg className [typeTag] methodName
+
+lookupInstanceMethodMulti :: ClassRegistry -> ByteString -> [ByteString] -> ByteString -> IO (Maybe Val)
+lookupInstanceMethodMulti reg className typeTags methodName = do
+    mMethods <- lookupInstanceMulti reg className typeTags
+    pure (mMethods >>= Map.lookup methodName)
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a

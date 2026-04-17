@@ -65,7 +65,10 @@ import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
 import IHC.Diagnostics (warnStub)
-import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, lookupInstance, typeTagOf)
+import IHC.Classes
+    ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
+    , lookupInstanceMethod, typeTagOf
+    )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
 import IHC.Lexer (startCursor)
@@ -1152,14 +1155,10 @@ registerInstancesFrom registry searchPath includeMap classReg typeCtors classTab
     decls <- scanInstanceDecls (lmSource lm)
     mapM_ (registerOne registry searchPath includeMap classReg typeCtors classTable env lm) decls
 
--- | Sentinel used as a slot placeholder when an instance method can't be
--- evaluated (parse error, unbound helper, etc.).  The 'classMethodDispatcher'
--- detects this sentinel and falls through to the class's default method
--- body, preserving the "partial instance" semantics of GHC: if an
--- instance doesn't define a method explicitly or the body is broken,
--- the class default should be used instead of erroring out.  Per-slot
--- isolation lets other methods of the same instance still dispatch to
--- their real Vals.
+-- | Sentinel used as a placeholder when an instance method can't be
+-- evaluated (parse error, unbound helper, etc.). The dispatcher detects
+-- this sentinel and falls through to the class's default method body,
+-- preserving partial-instance semantics.
 methodPlaceholder :: Val
 methodPlaceholder = VCon (BC.pack "<ihc-method-placeholder>") []
 
@@ -1203,20 +1202,37 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                   Left  _  -> pure ())
           (Set.toList instMethodFVs)
     rewrites <- buildImportRewritesForNames registry lm instMethodFVs
-    -- Align the instance's method map to the class's full slot layout.
-    -- For each class-method name (alphabetical), if the instance defines
-    -- it and it parses/evaluates cleanly, use that Val; otherwise insert
-    -- a per-method placeholder so the remaining methods of the instance
-    -- stay usable.  If we don't know the class (e.g. the class lives in
-    -- a package not yet scanned), fall back to the instance-ordered
-    -- list with per-method try isolation — this preserves the pre-fix
-    -- behaviour for standalone instances whose class decl is missing.
+    -- Build a name-keyed method table. When the class declaration is
+    -- known, the class's declared method names are canonical for
+    -- dispatch. Extra instance bindings are preserved under their own
+    -- names so non-standard extensions don't crash registration, but
+    -- dispatch only consults the class-declared names. If the class
+    -- declaration isn't available, keep every method the instance
+    -- provided so the legacy fallback still works.
     let methodMap = Map.fromList methods
     methodVals <- case Map.lookup cls classTable of
-        Just classMethods ->
-            mapM (\mn -> evalOneMethod rewrites mn (Map.lookup mn methodMap)) classMethods
+        Just classMethods -> do
+            let classMethodSet = Set.fromList classMethods
+                extraMethods =
+                    [ (mn, lhs)
+                    | (mn, lhs) <- methods
+                    , not (Set.member mn classMethodSet)
+                    ]
+            classEntries <- mapM (\mn -> do
+                    v <- evalOneMethod rewrites mn (Map.lookup mn methodMap)
+                    pure (mn, v))
+                classMethods
+            extraEntries <- mapM (\(mn, lhs) -> do
+                    v <- evalOneMethod rewrites mn (Just lhs)
+                    pure (mn, v))
+                extraMethods
+            pure (Map.fromList (classEntries ++ extraEntries))
         Nothing ->
-            mapM (\(mn, lhs) -> evalOneMethod rewrites mn (Just lhs)) methods
+            Map.fromList <$>
+                mapM (\(mn, lhs) -> do
+                    v <- evalOneMethod rewrites mn (Just lhs)
+                    pure (mn, v))
+                methods
     -- Register under the head type name (used by Bool/Int/Char/String
     -- dispatch via 'typeTagOf' specializations).
     registerInstance classReg cls typ methodVals
@@ -1439,7 +1455,7 @@ registerDerivedFunctorInstances classReg loadedModules = do
 registerOneFunctor :: ClassRegistry -> FunctorDerivDecl -> IO ()
 registerOneFunctor classReg decl = do
     let fmapVal = synthFmapForDecl classReg decl
-        methods = [fmapVal]
+        methods = Map.singleton (BC.pack "fmap") fmapVal
         functorCls = BC.pack "Functor"
     existing <- lookupInstance classReg functorCls (fdTyName decl)
     case existing of
@@ -1491,9 +1507,9 @@ applyRoleOne classReg fT (FRRec, t) = do
     v <- force t
     case v of
         VCon innerTag _ -> do
-            mInst <- lookupInstance classReg (BC.pack "Functor") innerTag
-            case mInst of
-                Just (innerFmap : _) -> do
+            mInnerFmap <- lookupInstanceMethod classReg (BC.pack "Functor") innerTag (BC.pack "fmap")
+            case mInnerFmap of
+                Just innerFmap -> do
                     stepT <- newWHNFThunk v
                     r1 <- apply innerFmap fT
                     r2 <- apply r1 stepT
@@ -1513,9 +1529,9 @@ shortShow _          = "<other>"
 -- User-defined class method dispatchers
 --
 -- For every @class C a where m1 :: ..., m2 :: ..., ...@ declaration we
--- synthesize a top-level binding @m_i = dispatcher C "m_i" i@. The
+-- synthesize a top-level binding @m_i = dispatcher C "m_i"@. The
 -- dispatcher forces its first argument, looks up the
--- @(C, typeTagOf firstArg)@ slot in the ClassRegistry, and applies the
+-- @(C, typeTagOf firstArg)@ entry in the ClassRegistry, and applies the
 -- instance's method value to the original thunk (currying through any
 -- remaining arguments). If no instance is registered for that type, it
 -- falls back to the class-level default body (stored in the registry
@@ -1535,13 +1551,13 @@ defaultTypeTag = BC.pack "<default>"
 
 -- | Build a dispatcher Val for a single class method.
 --
--- @classMethodDispatcher reg cls slot methodName@ returns a VFun that,
+-- @classMethodDispatcher reg cls methodName@ returns a VFun that,
 -- when applied to its first argument, looks up the instance dict for
--- the argument's type tag and re-applies the instance method at the
--- given slot. Remaining arguments (if any) flow through naturally via
+-- the argument's type tag and re-applies the named instance method.
+-- Remaining arguments (if any) flow through naturally via
 -- the returned VFun's own arity.
-classMethodDispatcher :: ClassRegistry -> ByteString -> Int -> ByteString -> Val
-classMethodDispatcher reg cls slot methodName = dispatch 4 []
+classMethodDispatcher :: ClassRegistry -> ByteString -> ByteString -> Val
+classMethodDispatcher reg cls methodName = dispatch 4 []
   where
     -- @dispatch remaining accArgs@: try looking up an instance for the
     -- next argument.  If the argument isn't dispatchable (it's a
@@ -1557,21 +1573,19 @@ classMethodDispatcher reg cls slot methodName = dispatch 4 []
             let tag = typeTagOf av
             if isDispatchableTag tag
                 then do
-                    mMethods <- lookupInstance reg cls tag
-                    case mMethods of
-                        Just methods
-                          | slot < length methods
-                          , let slotVal = methods !! slot
-                          , not (isMethodPlaceholder slotVal) ->
-                                applyAll slotVal (reverse (argT : accArgs))
+                    mMethod <- lookupInstanceMethod reg cls tag methodName
+                    case mMethod of
+                        Just methodVal
+                          | not (isMethodPlaceholder methodVal) ->
+                                applyAll methodVal (reverse (argT : accArgs))
                         _ -> do
                             -- Dispatchable arg but no matching instance (or the
-                            -- slot is a placeholder) — fall back to the class's
-                            -- default body for this slot.
-                            mDef <- lookupInstance reg cls defaultTypeTag
+                            -- method is a placeholder) — fall back to the
+                            -- class's default body for this method.
+                            mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
                             case mDef of
-                                Just defs | slot < length defs ->
-                                    applyAll (defs !! slot) (reverse (argT : accArgs))
+                                Just defVal ->
+                                    applyAll defVal (reverse (argT : accArgs))
                                 _ -> error
                                     ( "class-method dispatch: no instance of `"
                                      <> BC.unpack cls
@@ -1588,10 +1602,10 @@ classMethodDispatcher reg cls slot methodName = dispatch 4 []
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
     fallback accArgs = VFun $ \finalArgT -> do
-        mDef <- lookupInstance reg cls defaultTypeTag
+        mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
         case mDef of
-            Just defs | slot < length defs ->
-                applyAll (defs !! slot) (reverse (finalArgT : accArgs))
+            Just defVal ->
+                applyAll defVal (reverse (finalArgT : accArgs))
             _ -> error
                 ( "class-method dispatch: no dispatchable instance of `"
                  <> BC.unpack cls
@@ -1632,9 +1646,9 @@ buildClassMethodEnv classReg existing loadedModules = do
     pure (Map.fromList filtered)
   where
     buildOne (ClassDecl cls methodNames _defaults) =
-        mapM (mkMethodEntry cls) (zip [0..] methodNames)
-    mkMethodEntry cls (slot, methodName) = do
-        let v = classMethodDispatcher classReg cls slot methodName
+        mapM (mkMethodEntry cls) methodNames
+    mkMethodEntry cls methodName = do
+        let v = classMethodDispatcher classReg cls methodName
         t <- newWHNFThunk v
         pure (methodName, t)
 
@@ -1643,11 +1657,8 @@ buildClassMethodEnv classReg existing loadedModules = do
 -- the sentinel type tag '<default>'. The dispatcher falls back to these
 -- when no real instance is registered for a given type.
 --
--- Slot layout mirrors the method-name ordering from 'scanClassDecls'
--- (alphabetical), so a default-body slot may be filled with a sentinel
--- error Val if there is no default for that particular method. At
--- dispatch time the dispatcher applies that Val only for the exact slot
--- it needs, so unused defaults never trip.
+-- The default entry stores one name-keyed method table. Methods without a
+-- default body get a placeholder Val that errors only if dispatched to.
 registerClassDefaults :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath] -> ClassRegistry -> Env -> [LoadedModule] -> IO ()
 registerClassDefaults registry searchPath includeMap classReg env loadedModules =
     mapM_ oneModule loadedModules
@@ -1684,9 +1695,10 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                            Left  _  -> pure ())
                   (Set.toList fvs)
             rewrites <- buildImportRewritesForNames registry lm fvs
-            -- Evaluate each method slot: either the parsed default body
-            -- or a host Val that errors if dispatched to.
-            vals <- mapM (slotVal lm cls defaults rewrites) methodNames
+            vals <- Map.fromList <$> mapM (\methodName -> do
+                        v <- slotVal lm cls defaults rewrites methodName
+                        pure (methodName, v))
+                    methodNames
             registerInstance classReg cls defaultTypeTag vals
 
     slotVal lm cls defaults rewrites methodName =
