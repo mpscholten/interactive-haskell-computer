@@ -480,6 +480,42 @@ builtins reg =
     , ("raiseDivZero#",   raiseDivZeroB)
     , ("raiseOverflow#",  raiseOverflowB)
     , ("raiseUnderflow#", raiseUnderflowB)
+    -- catch#: GHC.Prim primop with no Haskell source. Backbone of
+    -- Control.Exception.catch source:
+    --   catch (IO io) h = IO $ catch# io handler'
+    -- Takes the IO action (State# -> (# State#, a #)), the handler (exc ->
+    -- State# -> (# State#, a #)), and the state token; runs the action and,
+    -- on IhcException, invokes the handler with the exception value.
+    -- Compiler-intrinsic / RTS-exclusive per CLAUDE.md.
+    , ("catch#",           catchHashB)
+    -- newMVar# / takeMVar# / putMVar# / readMVar#: GHC.Prim primops with no
+    -- Haskell source. Source-loaded GHC.MVar operations bottom out into
+    -- these. The RTS provides the underlying synchronisation machinery; we
+    -- thread it through the host's Control.Concurrent.MVar.
+    , ("newMVar#",         newMVarHashB)
+    , ("takeMVar#",        takeMVarHashB)
+    , ("putMVar#",         putMVarHashB)
+    , ("readMVar#",        readMVarHashB)
+    , ("tryTakeMVar#",     tryTakeMVarHashB)
+    , ("tryPutMVar#",      tryPutMVarHashB)
+    , ("tryReadMVar#",     tryReadMVarHashB)
+    , ("isEmptyMVar#",     isEmptyMVarHashB)
+    -- keepAlive#: GHC.Prim primop with no Haskell source. Used by
+    -- Foreign.ForeignPtr.withForeignPtr to keep a ForeignPtr live across the
+    -- body. Signature is `a -> State# s -> (State# s -> b) -> b`; we cannot
+    -- express the GC-reachability guarantee in the interpreter, but we can
+    -- faithfully apply the continuation to the state — which is all the
+    -- source-loaded ForeignPtr machinery needs at the Val level (the actual
+    -- lifetime is managed by host GC via PrimForeignPtr).
+    , ("keepAlive#",       keepAliveHashB)
+    -- Async-exception masking primops. GHC.Prim, no Haskell source. In the
+    -- interpreter we don't deliver async exceptions through the mask
+    -- machinery, so the three state-token wrappers are identity on the IO
+    -- action and getMaskingState# always returns 0 (Unmasked).
+    , ("getMaskingState#",      getMaskingStateHashB)
+    , ("maskAsyncExceptions#",  maskAsyncExceptionsHashB)
+    , ("maskUninterruptible#",  maskAsyncExceptionsHashB)
+    , ("unmaskAsyncExceptions#", maskAsyncExceptionsHashB)
     -- unsafeCoerce / unsafeCoerce#: compiler-intrinsic. The Unsafe.Coerce
     -- source defines these in terms of `unsafeEqualityProof`, whose
     -- recursive body is rewritten by GHC's CoreToStg.Prep pass to
@@ -491,6 +527,30 @@ builtins reg =
     , ("unsafeCoerce#",   unsafeCoerceB)
     , ("unsafeCoerceUnlifted", unsafeCoerceB)
     , ("unsafeCoerceAddr", unsafeCoerceB)
+    -- toExceptionWithBacktrace: lives in GHC.Internal.Exception. Source
+    -- exists there but wiring the ghc-internal package through import
+    -- resolution is a separate project; source-loaded throwIO/throw still
+    -- calls it by name. We shim it as an IO action that wraps the value in
+    -- SomeException (dropping the actual CallStack-capture — the backtrace
+    -- is cosmetic at the Val level, and our `extractExceptionMessage`
+    -- already understands the SomeException wrapper).
+    , ("toExceptionWithBacktrace", toExceptionWithBacktraceB)
+    -- toException: class method of Exception. Source-loaded throwIO
+    -- chain also reaches this via `throwIO e = IO (raiseIO# (toException e))`.
+    -- In the Val world we have no type-driven dispatch, so identity-with-
+    -- SomeException-wrap is fine (same contract as toExceptionWithBacktrace).
+    , ("toException",     toExceptionB)
+    -- fromException: pair of toException. Used by source-loaded catch:
+    --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
+    -- With Val-level dynamic typing we cannot implement the type match;
+    -- we always return Just, so the user handler sees the raw exception Val.
+    , ("fromException",   fromExceptionB)
+    -- unIO: inverse of the IO constructor. Source at
+    -- GHC.Internal.Base defines `unIO (IO a) = a`. At the Val level VIO
+    -- hides the state-transformer shape, so we reconstruct a fresh one:
+    -- take a State# token, run the VIO action, wrap the result as
+    -- (# State#, a #).
+    , ("unIO",            unIOB)
     , ("catch",           catchB)
     , ("handle",          handleB)
     , ("try",             tryB)
@@ -3165,6 +3225,288 @@ raiseUnderflowB :: IO Val
 raiseUnderflowB = pure $ VFun $ \_ -> do
     t <- newWHNFThunk (VStr (BC.pack "arithmetic underflow"))
     throwIO (IhcException (BC.pack "arithmetic underflow") t)
+
+-- | @catch# :: (State# RealWorld -> (# State# RealWorld, a #))
+--          -> (b -> State# RealWorld -> (# State# RealWorld, a #))
+--          -> State# RealWorld
+--          -> (# State# RealWorld, a #)@
+--
+-- GHC.Prim primop, compiler-intrinsic. Source-loaded @catch@ desugars to
+--
+--   catch (IO io) h = IO $ catch# io handler'
+--
+-- so we receive the unwrapped state-transformer directly. We apply @io@ to
+-- the state token; on an 'IhcException' we instead call the handler with
+-- the exception value and re-thread the state. Result is an unboxed pair
+-- @(# State#, a #)@ matching the primop signature.
+catchHashB :: IO Val
+catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
+    ioV <- force ioT
+    hV  <- force hT
+    let runAction = do
+            rRaw <- apply ioV sT
+            runIOVal rRaw
+    rRes <- CE.try @IhcException (CE.try @SomeException runAction)
+    case rRes of
+        Right (Right v) -> ensurePair v
+        Right (Left se) -> do
+            -- Non-IhcException host error — wrap & hand to handler.
+            let msg = BC.pack (show se)
+            excT <- newWHNFThunk (VStr msg)
+            invokeHandler hV excT
+        Left exc -> do
+            excVal <- ihcExceptionToVal exc
+            excT   <- newWHNFThunk excVal
+            invokeHandler hV excT
+  where
+    -- Ensure the result is shaped as (# State#, a #). If the IO action
+    -- already returned a proper unboxed pair, pass through; otherwise wrap.
+    ensurePair :: Val -> IO Val
+    ensurePair v = case v of
+        VCon "(#,#)" _ -> pure v
+        _ -> do
+            sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
+            vT   <- newWHNFThunk v
+            pure (VCon "(#,#)" [sT', vT])
+    invokeHandler hV excT = do
+        -- Handler' signature: exc -> State# -> (# State#, a #)
+        r1 <- apply hV excT
+        case r1 of
+            VFun _ -> do
+                sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
+                rRaw <- apply r1 sT'
+                v    <- runIOVal rRaw
+                ensurePair v
+            _ -> do
+                v <- runIOVal r1
+                ensurePair v
+
+-- | @newMVar# :: State# s -> (# State# s, MVar# s a #)@
+--
+-- GHC.Prim primop. Source-loaded @newEmptyMVar@:
+--
+--   newEmptyMVar = IO $ \s -> case newMVar# s of (# s2, svar# #) -> (# s2, MVar svar# #)
+--
+-- Creates an empty MVar. We return an unboxed pair carrying the state and
+-- the fresh 'PrimMVar'; the source pattern re-wraps it as 'MVar svar#'.
+newMVarHashB :: IO Val
+newMVarHashB = pure $ VFun $ \_sT -> do
+    mv   <- newEmptyMVar
+    sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    mvT  <- newWHNFThunk (VPrimObj (PrimMVar mv))
+    pure (VCon "(#,#)" [sT', mvT])
+
+-- | Extract the host MVar from either a raw 'PrimMVar' (our builtin-
+-- returned shape) or the source-wrapped @MVar mvar#@ VCon.
+requireMVarPrim :: String -> Val -> IO (MVar Val)
+requireMVarPrim fn v = case v of
+    VPrimObj (PrimMVar mv) -> pure mv
+    VCon "MVar" [tvT]      -> force tvT >>= requireMVarPrim fn
+    _ -> error (fn <> ": not an MVar#: " <> showValForDebug v)
+
+-- | @takeMVar# :: MVar# s a -> State# s -> (# State# s, a #)@
+takeMVarHashB :: IO Val
+takeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "takeMVar#" mvv
+    v   <- takeMVar mv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    vT  <- newWHNFThunk v
+    pure (VCon "(#,#)" [sT', vT])
+
+-- | @putMVar# :: MVar# s a -> a -> State# s -> State# s@
+putMVarHashB :: IO Val
+putMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "putMVar#" mvv
+    av  <- force aT
+    putMVar mv av
+    pure (VPrimObj PrimRealWorld)
+
+-- | @readMVar# :: MVar# s a -> State# s -> (# State# s, a #)@
+readMVarHashB :: IO Val
+readMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "readMVar#" mvv
+    v   <- readMVar mv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    vT  <- newWHNFThunk v
+    pure (VCon "(#,#)" [sT', vT])
+
+-- | @tryTakeMVar# :: MVar# s a -> State# s -> (# State# s, Int#, a #)@
+-- where the Int# is 0 if empty (a undefined) and non-zero otherwise.
+tryTakeMVarHashB :: IO Val
+tryTakeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "tryTakeMVar#" mvv
+    r   <- tryTakeMVar mv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    case r of
+        Just v -> do
+            vT  <- newWHNFThunk v
+            okT <- newWHNFThunk (VInt 1)
+            pure (VCon "(#,,#)" [sT', okT, vT])
+        Nothing -> do
+            dummyT <- newWHNFThunk (VStr (BC.pack ""))
+            okT    <- newWHNFThunk (VInt 0)
+            pure (VCon "(#,,#)" [sT', okT, dummyT])
+
+-- | @tryPutMVar# :: MVar# s a -> a -> State# s -> (# State# s, Int# #)@
+tryPutMVarHashB :: IO Val
+tryPutMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "tryPutMVar#" mvv
+    av  <- force aT
+    ok  <- tryPutMVar mv av
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    okT <- newWHNFThunk (VInt (if ok then 1 else 0))
+    pure (VCon "(#,#)" [sT', okT])
+
+-- | @tryReadMVar# :: MVar# s a -> State# s -> (# State# s, Int#, a #)@
+tryReadMVarHashB :: IO Val
+tryReadMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "tryReadMVar#" mvv
+    r   <- tryTakeMVar mv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    case r of
+        Just v -> do
+            -- readMVar = takeMVar + putMVar to preserve value
+            putMVar mv v
+            vT  <- newWHNFThunk v
+            okT <- newWHNFThunk (VInt 1)
+            pure (VCon "(#,,#)" [sT', okT, vT])
+        Nothing -> do
+            dummyT <- newWHNFThunk (VStr (BC.pack ""))
+            okT    <- newWHNFThunk (VInt 0)
+            pure (VCon "(#,,#)" [sT', okT, dummyT])
+
+-- | @isEmptyMVar# :: MVar# s a -> State# s -> (# State# s, Int# #)@
+isEmptyMVarHashB :: IO Val
+isEmptyMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
+    mvv <- force mvT
+    mv  <- requireMVarPrim "isEmptyMVar#" mvv
+    b   <- isEmptyMVar mv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    rT  <- newWHNFThunk (VInt (if b then 1 else 0))
+    pure (VCon "(#,#)" [sT', rT])
+
+-- | @keepAlive# :: a -> State# s -> (State# s -> b) -> b@
+--
+-- GHC.Prim primop. Source-loaded @withForeignPtr@:
+--
+--   withForeignPtr fo\@(ForeignPtr _ r) f = IO $ \s ->
+--     case f (unsafeForeignPtrToPtr fo) of
+--       IO action# -> keepAlive# r s action#
+--
+-- Ensures that the first argument (the ForeignPtrContents) is kept alive
+-- while the action runs. In the interpreter we can't control GC the same
+-- way; host allocation lifetime is managed via 'PrimForeignPtr' holding a
+-- strong reference. We force the "keep alive" argument (to exercise any
+-- pending evaluation) and then apply the continuation to the state token.
+keepAliveHashB :: IO Val
+keepAliveHashB = pure $ VFun $ \keepT -> pure $ VFun $ \sT -> pure $ VFun $ \kT -> do
+    -- Force the "keep alive" argument so the host GC sees a live reference
+    -- for the duration of the continuation. Our PrimForeignPtr / PrimPtr
+    -- values hold the underlying allocation via a host ForeignPtr, so
+    -- touching them here is sufficient.
+    _   <- force keepT
+    kV  <- force kT
+    rRaw <- apply kV sT
+    runIOVal rRaw
+
+-- | @getMaskingState# :: State# RealWorld -> (# State# RealWorld, Int# #)@
+--
+-- GHC.Prim primop. Returns the current async-exception masking state:
+--   0# = Unmasked, 1# = MaskedUninterruptible, otherwise = MaskedInterruptible.
+-- The interpreter does not actually block async exceptions, so we return
+-- @0#@ (Unmasked). Source-loaded @mask@ / @uninterruptibleMask@ branch on
+-- this — the Unmasked branch just wraps the action; we preserve that shape.
+getMaskingStateHashB :: IO Val
+getMaskingStateHashB = pure $ VFun $ \_sT -> do
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    iT  <- newWHNFThunk (VInt 0)
+    pure (VCon "(#,#)" [sT', iT])
+
+-- | @maskAsyncExceptions# :: (State# RealWorld -> (# State# RealWorld, a #))
+--                        -> State# RealWorld
+--                        -> (# State# RealWorld, a #)@
+--
+-- Also serves @maskUninterruptible#@ and @unmaskAsyncExceptions#@ — all
+-- three are identity on the IO action at the interpreter level, since we
+-- do not deliver async exceptions via masking primitives.
+maskAsyncExceptionsHashB :: IO Val
+maskAsyncExceptionsHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
+    ioV  <- force ioT
+    rRaw <- apply ioV sT
+    v    <- runIOVal rRaw
+    case v of
+        VCon "(#,#)" _ -> pure v
+        _ -> do
+            sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+            vT  <- newWHNFThunk v
+            pure (VCon "(#,#)" [sT', vT])
+
+-- | @toExceptionWithBacktrace :: (HasCallStack, Exception e) => e -> IO SomeException@
+--
+-- Source defined in @GHC.Internal.Exception@:
+--
+--   toExceptionWithBacktrace e
+--     | backtraceDesired e = do bt <- collectBacktraces
+--                               return (addExceptionContext bt (toException e))
+--     | otherwise          = return (toException e)
+--
+-- Wiring ghc-internal through the import resolver is a separate task; we
+-- shim it here. The backtrace is cosmetic at the Val level (no stack
+-- traces are captured by the interpreter), and 'extractExceptionMessage'
+-- already unwraps 'SomeException'.
+toExceptionWithBacktraceB :: IO Val
+toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
+    ev <- force eT
+    case ev of
+        VCon "SomeException" _ -> pure ev
+        _                       -> do
+            eT' <- newWHNFThunk ev
+            pure (VCon "SomeException" [eT'])
+
+-- | @toException :: Exception e => e -> SomeException@ — identity-with-wrap
+-- at the Val level (we lack the Exception class dispatch; SomeException is
+-- idempotent). Complements 'toExceptionWithBacktraceB' for the pure throw
+-- path (@throwIO e = IO (raiseIO# (toException e))@).
+toExceptionB :: IO Val
+toExceptionB = pure $ VFun $ \eT -> do
+    ev <- force eT
+    case ev of
+        VCon "SomeException" _ -> pure ev
+        _                       -> do
+            eT' <- newWHNFThunk ev
+            pure (VCon "SomeException" [eT'])
+
+-- | @fromException :: Exception e => SomeException -> Maybe e@ — inverse
+-- of 'toException'. In real GHC the dispatch is type-directed; at the Val
+-- level there is no type to check against, so we always unwrap and wrap in
+-- 'Just'. Source-loaded @catch@ uses this to route handlers: returning
+-- 'Just' keeps the exception value flowing to the user handler (which is
+-- what we want), 'Nothing' would rethrow.
+fromExceptionB :: IO Val
+fromExceptionB = pure $ VFun $ \eT -> do
+    ev <- force eT
+    let inner = case ev of
+                    VCon "SomeException" [innerT] -> innerT
+                    _                              -> eT
+    pure (VCon "Just" [inner])
+
+-- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
+--
+-- Source at @GHC.Internal.Base@: @unIO (IO a) = a@. At the Val level VIO
+-- hides the state-transformer shape, so we reconstruct it.
+unIOB :: IO Val
+unIOB = pure $ VFun $ \ioT -> pure $ VFun $ \_sT -> do
+    ioV <- force ioT
+    v   <- runIOVal ioV
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    vT  <- newWHNFThunk v
+    pure (VCon "(#,#)" [sT', vT])
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
