@@ -876,7 +876,38 @@ loadImportIntoEnv
     -> Env          -- ^ current REPL env
     -> IO (Env, Int)
 loadImportIntoEnv searchPath imp existingEnv
-    | isBuiltinBackedModule (impModule imp) = pure (existingEnv, 0)
+    | isBuiltinBackedModule (impModule imp) = do
+        -- For builtin-backed modules we don't parse source. But if the
+        -- builtin env carries FQN-keyed bindings for this module (e.g.
+        -- "Data.ByteString.length"), install them under the caller's
+        -- chosen qualifier so `BS.length` resolves.
+        classReg <- newClassRegistry
+        builtins <- builtinEnv classReg
+        let modName = impModule imp
+            prefix  = modName <> BC.pack "."
+            fqnMap  = Map.filterWithKey (\k _ -> BC.isPrefixOf prefix k) builtins
+        if Map.null fqnMap
+            then pure (existingEnv, 0)
+            else do
+                let qualPrefix = case impAlias imp of
+                        Just a                    -> a <> BC.pack "."
+                        Nothing | impQualified imp -> prefix
+                                | otherwise        -> BC.empty
+                    aliasUnder p =
+                        [ (p <> BC.drop (BC.length prefix) k, slot)
+                        | (k, slot) <- Map.toList fqnMap
+                        ]
+                    bareAliases
+                        | impQualified imp = []
+                        | otherwise        = aliasUnder BC.empty
+                    qualAliases
+                        | BC.null qualPrefix = []
+                        | otherwise          = aliasUnder qualPrefix
+                    additions = Map.fromList
+                                    (bareAliases ++ qualAliases)
+                                    `Map.difference` existingEnv
+                    merged    = Map.union existingEnv additions
+                pure (merged, Map.size additions)
     | ImportOnly names <- impSpec imp = loadImportOnlyIntoEnv searchPath imp names existingEnv
     | otherwise = do
         -- Append cached package search dirs so mtl, transformers, etc. resolve.
@@ -1026,7 +1057,9 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     registry <- newIORef Map.empty
     classReg <- newClassRegistry
     targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
-    mapM_ (discoverInModule registry fullSearchPath includeMap targetLm) requested
+    earlyBuiltins <- builtinEnv classReg
+    let earlyBuiltinNames = Map.keysSet earlyBuiltins
+    mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
     -- ImportOnly is the REPL's deferred-name path: keep it targeted.
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
@@ -1048,7 +1081,20 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
-    requestedPairs <- mapMaybe id <$> mapM (resolveRequestedPair targetLm qualPairs slots) requested
+    -- For builtin-backed stubs with no qualPairs, synthesize alias
+    -- slots for any requested name whose FQN has a builtin binding.
+    -- This makes e.g. `BS.length` resolve to the host `Data.ByteString.length`
+    -- shim when Data.ByteString is on the builtin-backed list.
+    let synthFromBuiltin n =
+            let fqn = lmName targetLm <> BC.pack "." <> n
+            in case Map.lookup fqn baseForImport of
+                Just slot -> pure (Just (n, slot))
+                Nothing   -> pure Nothing
+    requestedStandard <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
+    requestedFromBuiltins <- mapM synthFromBuiltin
+        [ n | (n, Nothing) <- zip requested requestedStandard ]
+    let requestedPairs =
+            mapMaybe id requestedStandard ++ mapMaybe id requestedFromBuiltins
     let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
         thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
@@ -2407,9 +2453,14 @@ lookupIncludeDirs includeMap fileDir =
 -- the Phase 2.17 punchlist documents.
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
-    -- GHC.Prim: no source; all primops are wired-in by the GHC
-    -- compiler itself (primops.txt.pp → GHC.Prim at build time).
-       n == "GHC.Prim"
+    -- Data.ByteString: source loads but discovery of Show+friends
+    -- takes ~9 minutes due to O(big) traversal of GHC.Internal.Show's
+    -- transitive closure. Short-circuit until the perf fix lands; the
+    -- common ops (pack/unpack/length/null/empty) are provided as
+    -- builtin bare names (see IHC.Builtins). Shim per CLAUDE.md guidance
+    -- — remove once source-load perf is diagnosed and fixed.
+       n == "Data.ByteString"
+    || n == "GHC.Prim"
     -- GHC.Types: wired-in kinds, Constraint, RuntimeRep, Int#, etc.
     -- The compiler synthesises this module; base-4.19 has no GHC/Types.hs.
     || n == "GHC.Types"
@@ -2707,8 +2758,6 @@ discoverInModuleWith
     -> ByteString
     -> IO ()
 discoverInModuleWith builtins registry searchPath includeMap lm name
-    -- Qualified name (contains a dot and the prefix looks like a module
-    -- alias)? Route to the target module directly.
     | Just (qual, bareName) <- splitQualified name = do
         mTarget <- resolveQualified registry searchPath includeMap lm qual
         case mTarget of
@@ -2722,9 +2771,15 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                 -- name which may be resolved as a builtin/Prelude binding.
                 targetBodies <- readIORef (lmBodies targetLm)
                 let fqn = lmName targetLm <> BC.pack "." <> bareName
-                    rhs = if Map.member bareName targetBodies
-                            then EVar fqn
-                            else EVar bareName  -- fallback to bare name (builtin/Prelude)
+                    -- If bareName is in target's bodies, use target's FQN
+                    -- (the actual source-loaded binding). Else prefer an
+                    -- FQN-keyed builtin over a bare-name fallback so
+                    -- `BS.pack` routes to `Data.ByteString.pack` rather
+                    -- than Prelude's polymorphic `pack`.
+                    rhs
+                      | Map.member bareName targetBodies = EVar fqn
+                      | Set.member fqn builtins          = EVar fqn
+                      | otherwise                        = EVar bareName
                 modifyIORef' (lmBodies lm) (Map.insert name rhs)
             Nothing ->
                 throwIO (UnresolvedName
@@ -3469,3 +3524,4 @@ desugarRecordPats fldReg = goExpr
     goPat (PBang p)        = PBang (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit
+

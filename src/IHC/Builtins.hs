@@ -60,7 +60,7 @@ import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, castPtr, plusPtr, nullPtr, minusPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, sizeOf)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -281,6 +281,15 @@ builtins reg =
     , ("++",       listConcat)
     , ("show",     showDispatch reg)
     , ("length",   lengthB)
+    -- Data.ByteString shims (see isBuiltinBackedModule comment).
+    -- Registered under bare names so qualified-alias fallback
+    -- (`BS.pack` → `EVar "pack"`) hits these. Remove when
+    -- source-load perf is fixed.
+    , ("Data.ByteString.empty",   bsEmptyB)
+    , ("Data.ByteString.null",    bsNullB)
+    , ("Data.ByteString.length",  bsLengthShimB)
+    , ("Data.ByteString.pack",    bsPackB)
+    , ("Data.ByteString.unpack",  bsUnpackB)
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
@@ -2338,6 +2347,100 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
             fp <- mallocForeignPtrBytes (fromIntegral n)
             mkForeignPtrVal fp
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
+
+--------------------------------------------------------------------------------
+-- Data.ByteString shims
+--
+-- Temporary short-circuits for Data.ByteString operations. Data.ByteString.hs
+-- source-loads correctly but takes ~9 minutes to complete because discovery
+-- of GHC.Internal.Show's transitive closure cascades through thousands of
+-- bindings. See isBuiltinBackedModule comment. Remove once the perf fix
+-- lands on Scheduler discovery.
+--
+-- A ByteString is represented at runtime as @VCon "BS" [VPrimObj (PrimForeignPtr fp), VInt len]@
+-- — matches the shape that Data.ByteString.Internal.Type.BS would produce.
+--------------------------------------------------------------------------------
+
+-- | Build a fresh VCon "BS" with the given ForeignPtr and length.
+mkBsVal :: ForeignPtr Word8 -> Int -> IO Val
+mkBsVal fp len = do
+    fpT  <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
+    lenT <- newWHNFThunk (VInt (fromIntegral len))
+    pure (VCon "BS" [fpT, lenT])
+
+-- | Unpack a 'VCon "BS"' into its '(ForeignPtr Word8, Int)' payload.
+bsValPayload :: Val -> IO (ForeignPtr Word8, Int)
+bsValPayload v = case v of
+    VCon "BS" [fpT, lenT] -> do
+        fpv  <- force fpT
+        lenv <- force lenT
+        fp   <- foreignPtrValToForeignPtr fpv
+        case lenv of
+            VInt n -> pure (fp, fromIntegral n)
+            _      -> error ("BS.length: second field is not Int: " <> showValForDebug lenv)
+    _ -> error ("expected a ByteString, got: " <> showValForDebug v)
+
+bsEmptyB :: IO Val
+bsEmptyB = do
+    fp <- mallocForeignPtrBytes 0
+    mkBsVal fp 0
+
+bsLengthShimB :: IO Val
+bsLengthShimB = pure $ VFun $ \a -> do
+    av <- force a
+    (_, len) <- bsValPayload av
+    pure (VInt (fromIntegral len))
+
+bsNullB :: IO Val
+bsNullB = pure $ VFun $ \a -> do
+    av <- force a
+    (_, len) <- bsValPayload av
+    pure (VCon (if len == 0 then "True" else "False") [])
+
+bsPackB :: IO Val
+bsPackB = pure $ VFun $ \a -> do
+    av <- force a
+    ws <- valToWord8List av
+    let len = length ws
+        bs  = BS.pack ws
+    fp <- BS.useAsCStringLen bs $ \(ptr, _) -> do
+        newfp <- mallocForeignPtrBytes len
+        withForeignPtr newfp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
+            copyBytes (castPtr dst) (castPtr src) l
+        pure newfp
+    mkBsVal fp len
+
+bsUnpackB :: IO Val
+bsUnpackB = pure $ VFun $ \a -> do
+    av <- force a
+    (fp, len) <- bsValPayload av
+    ws <- withForeignPtr fp $ \ptr ->
+        mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
+    wordsToConsList ws
+
+valToWord8List :: Val -> IO [Word8]
+valToWord8List v0 = go v0
+  where
+    go (VCon "[]" _)        = pure []
+    go (VStr s)             = pure (BS.unpack s)
+    go (VCon ":" [hT, tT])  = do
+        hv <- force hT
+        w  <- case hv of
+            VInt n  -> pure (fromIntegral n :: Word8)
+            VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
+            _       -> error ("BS.pack: element not a Word8: " <> showValForDebug hv)
+        tv <- force tT
+        ws <- go tv
+        pure (w : ws)
+    go other = error ("BS.pack: expected [Word8] list, got " <> showValForDebug other)
+
+wordsToConsList :: [Word8] -> IO Val
+wordsToConsList []     = pure (VCon "[]" [])
+wordsToConsList (w:ws) = do
+    hT <- newWHNFThunk (VInt (fromIntegral w))
+    tV <- wordsToConsList ws
+    tT <- newWHNFThunk tV
+    pure (VCon ":" [hT, tT])
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
