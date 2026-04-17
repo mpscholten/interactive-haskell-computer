@@ -550,6 +550,16 @@ builtins reg =
     , ("unsafeCoerce#",   unsafeCoerceB)
     , ("unsafeCoerceUnlifted", unsafeCoerceB)
     , ("unsafeCoerceAddr", unsafeCoerceB)
+    -- coerce: GHC.Prim primop, re-exported by Data.Coerce.  No Haskell
+    -- source: GHC resolves the type-safe @Coercible@ constraint at
+    -- compile time and erases the call.  At the Val level there are no
+    -- runtime types to coerce between (same-representation is vacuously
+    -- true), so the primop is the identity on Val — same shape as
+    -- unsafeCoerce.  Used by Data.Functor.Utils's @(#.)@ composition
+    -- operator, transitively reached through Data.Foldable's default
+    -- 'foldr' body, which every source-loaded Foldable instance we
+    -- rely on.
+    , ("coerce",          unsafeCoerceB)
     -- toExceptionWithBacktrace: lives in GHC.Internal.Exception. Source
     -- exists there but wiring the ghc-internal package through import
     -- resolution is a separate project; source-loaded throwIO/throw still
