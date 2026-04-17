@@ -363,7 +363,15 @@ buildBaseEnv = do
     -- still runs, just with the older fallback error message.
     env1 <- preDiscoverExceptionHelpers env0
                 `catch` (\(_ :: SomeException) -> pure env0)
-    pure (env1, classReg)
+    -- Pre-discover implicit-Prelude constructors (Just/Nothing/Left/
+    -- Right/ExitSuccess/ExitFailure) so that bare @Just 42@ at the
+    -- prompt — and @:t Just 42@, which has no separate Prelude-loading
+    -- hook — resolve without requiring an explicit @import Data.Maybe@.
+    -- Best-effort: a cache miss or parse failure leaves the REPL
+    -- running with whatever subset we managed to load.
+    env2 <- preDiscoverPreludeConstructors env1
+                `catch` (\(_ :: SomeException) -> pure env1)
+    pure (env2, classReg)
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
 -- @SomeException@, @displayException@ from @GHC.Internal.Exception@
@@ -387,6 +395,70 @@ preDiscoverExceptionHelpers env = do
                 }
     (env', _) <- loadImportIntoEnv [] imp env
     pure env'
+
+-- | Source-load the small set of ordinary-Hackage ADT constructors that
+-- users expect to be reachable unqualified at the REPL prompt without
+-- typing an explicit @import@. Concretely: @Just@ / @Nothing@ (from
+-- @GHC.Internal.Maybe@), @Left@ / @Right@ (from
+-- @GHC.Internal.Data.Either@), and @ExitSuccess@ / @ExitFailure@ (from
+-- @GHC.Internal.IO.Exception@ — @ExitCode@'s canonical declaration
+-- lives there, @System.Exit@ merely re-exports it).
+--
+-- These used to live in 'buildConEnv' as Phase 2.17 stopgaps; commit
+-- @e19365c@ removed them per CLAUDE.md rule 4 (no host shims for
+-- ordinary-Hackage libraries). Module loads (via 'addImplicitPrelude')
+-- get the constructors back through Prelude's re-export chain, but
+-- REPL expressions are parsed and evaluated directly against the base
+-- env with no implicit-Prelude wrapping — hence @Just 42@ at the
+-- prompt (and @:t Just 42@) failed with "unbound variable `Just`"
+-- until this pass.
+--
+-- Strategy: bypass 'loadImportIntoEnv' entirely because its preload
+-- phase ('preloadForEffectiveExportsMemo') transitively walks the
+-- re-export chain into @GHC.Internal.Base@ and friends, which is
+-- catastrophic for REPL startup latency (minutes for
+-- @GHC.Internal.Data.Either@). Instead we call 'loadModule' on each
+-- target module, which only runs 'scanDataDecls' over that single file
+-- to populate 'lmDataReg', and feed the resulting 'DataRegistry' to
+-- 'buildConEnv' directly. The constructor thunks returned by
+-- 'buildConEnv' are pure 'VCon' builders that carry no references to
+-- the module's other exports, so no import chasing is needed for them
+-- to work at the evaluator.
+--
+-- Each target load is wrapped in 'try' so a cache miss for one module
+-- doesn't prevent the others from succeeding.
+preDiscoverPreludeConstructors :: Env -> IO Env
+preDiscoverPreludeConstructors env0 = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs  = map fst cacheWithIncludes
+        includeMap = Map.fromList cacheWithIncludes
+    registry <- newIORef Map.empty
+    let targets =
+            -- GHC.Internal.Maybe declares Maybe(Just, Nothing).
+            [ BC.pack "GHC.Internal.Maybe"
+            -- GHC.Internal.Data.Either declares Either(Left, Right).
+            , BC.pack "GHC.Internal.Data.Either"
+            -- NOTE: ExitCode is NOT declared in GHC.Internal.System.Exit;
+            -- that module merely re-exports it.  The real declaration
+            -- @data ExitCode = ExitSuccess | ExitFailure Int@ lives in
+            -- GHC.Internal.IO.Exception, so we scan that module for the
+            -- data decl.
+            , BC.pack "GHC.Internal.IO.Exception"
+            ]
+    dataRegs <- mapM (scanDataRegFor registry cacheDirs includeMap) targets
+    let unionedData = foldr Map.union Map.empty dataRegs
+    conEnv <- buildConEnv unionedData
+    -- Right-biased union means existing bindings in env0 (builtins,
+    -- prior discoveries, etc.) take precedence; we only add constructor
+    -- names that weren't already registered.
+    pure (Map.union env0 conEnv)
+  where
+    scanDataRegFor registry cacheDirs includeMap modName = do
+        r <- try (loadModule registry cacheDirs includeMap modName)
+                :: IO (Either SomeException LoadedModule)
+        case r of
+            Right lm -> pure (lmDataReg lm)
+            Left  _  -> pure Map.empty
 
 -- | Load a .hs file for the REPL's @:l@ command and bring its exported
 -- names into scope UNQUALIFIED, matching ghci semantics.
