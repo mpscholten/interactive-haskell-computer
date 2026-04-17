@@ -959,6 +959,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello\nworld\n42\n99\n"
 
+    it "AllowAmbiguousTypes: pragma is a no-op since ihc skips type checking" do
+        -- Regression for the IHP unsupported-scan: IHP uses this pragma
+        -- in ~55 files to allow signatures whose type variables only
+        -- appear in constraints (picked at use sites via
+        -- TypeApplications).  ihc doesn't enforce ambiguity checks, so
+        -- the pragma is parse-and-discard; the actual mechanism
+        -- (value-level @T + symbolVal) already works.
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/allow_ambiguous_types.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
 
     it "IsLabel dispatch: user-defined instance overrides default Proxy" do
         (n, out) <- captureStdout
