@@ -35,20 +35,31 @@ module IHC.CabalProject
     , cabalTarballSearchPath
     ) where
 
-import Control.Exception (Exception, throwIO, try, SomeException)
+import Control.Exception (Exception, throwIO, try, SomeException, evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.IORef
+    ( IORef
+    , atomicModifyIORef'
+    , newIORef
+    , readIORef
+    , writeIORef
+    )
 import Data.List (isSuffixOf, sortBy)
 import Data.Ord (Down(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Time.Clock.POSIX (POSIXTime, utcTimeToPOSIXSeconds)
+import GHC.IO (unsafePerformIO)
 import System.Directory
-    ( doesDirectoryExist
+    ( createDirectoryIfMissing
+    , doesDirectoryExist
     , doesFileExist
     , getDirectoryContents
     , getHomeDirectory
+    , getModificationTime
     , listDirectory
     )
 import System.Environment (lookupEnv)
@@ -59,6 +70,7 @@ import System.FilePath
     , splitDirectories
     , isDrive
     )
+import System.IO (hPutStrLn, stderr)
 
 import Distribution.PackageDescription
     ( GenericPackageDescription(..)
@@ -486,7 +498,223 @@ dedupPreserveOrder = go []
 
 --------------------------------------------------------------------------------
 -- Cache-wide search path
+--
+-- Enumerating the cache-wide search path requires parsing every
+-- .cabal file under three source roots (IHC_NIX_SOURCE_DIR, the user
+-- ihc cache, the cabal tarball cache).  On a typical devshell that's
+-- ~350 .cabal files and dominates ihc startup (~100ms of a ~150ms
+-- "main = putStrLn \"hi\"" run).
+--
+-- The result is deterministic for a given filesystem state, so we
+-- memoise it at two levels:
+--
+--   * Process-wide IORef memo: the first call does the real work,
+--     every subsequent call in the same process is O(1).  Multiple
+--     Scheduler call sites (loadProgramFromSource, loadImportIntoEnv,
+--     loadImportOnlyIntoEnv, loadFileIntoEnv) all hit the same memo.
+--
+--   * On-disk cache at ~/.cache/ihc/search-path.cache: keyed by a
+--     cheap mtime signature of the three root dirs plus their
+--     immediate children.  If no package has been added / removed /
+--     modified since the cache was written, the cache is reused and
+--     we skip the entire .cabal parse pass across runs.
+--
+-- Invalidation signal:
+--   * Root dir mtime changes when an immediate child is added / removed.
+--   * Each child dir's mtime changes when its own contents are touched
+--     (e.g. a .cabal file is edited in place after a re-nix).
+-- We combine both so renaming or editing any package dir invalidates
+-- the cache.  Content hashing is avoided deliberately — stat'ing ~350
+-- dirs is ~1ms, vs reading and hashing hundreds of KB of .cabal data.
 --------------------------------------------------------------------------------
+
+-- | Process-wide memo for 'cachedPackageSearchPathWithIncludes'.
+--
+-- 'Nothing' = not yet computed.  'Just pairs' = computed, reuse
+-- verbatim.  Thread-safe via 'atomicModifyIORef''.
+searchPathMemoRef :: IORef (Maybe [(FilePath, [FilePath])])
+searchPathMemoRef = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE searchPathMemoRef #-}
+
+-- | Clear the in-process search-path memo.  Exposed for tests that
+-- mutate the underlying directories and expect a fresh read.  Not
+-- currently wired up; kept as a private helper for future use.
+_resetSearchPathMemo :: IO ()
+_resetSearchPathMemo = writeIORef searchPathMemoRef Nothing
+
+-- | Fingerprint summarising the state of the source directories the
+-- search path depends on.  Two fingerprints agreeing means "nothing
+-- relevant changed" and the cached result is still valid.
+--
+-- Each entry is @(rootAbsPath, rootMtime, [(childName, childMtime)])@.
+-- Root mtime catches add/remove of direct children; child mtime
+-- catches edits inside the package (e.g. .cabal rewrites).
+newtype SearchPathFingerprint = SearchPathFingerprint [(FilePath, POSIXTime, [(FilePath, POSIXTime)])]
+    deriving stock (Eq, Show)
+
+-- | Compute a fingerprint for all three source roots (or the subset
+-- that exists).  Missing roots are elided, matching the semantics of
+-- 'cachedPackageSearchPathWithIncludes'.
+computeSearchPathFingerprint :: IO SearchPathFingerprint
+computeSearchPathFingerprint = do
+    home <- getHomeDirectory
+    mNix <- lookupEnv "IHC_NIX_SOURCE_DIR"
+    let userCache = home </> ".cache" </> "ihc" </> "sources"
+        cabalRoot = home </> ".cabal" </> "packages" </> "hackage.haskell.org"
+        roots = maybe id (:) mNix [userCache, cabalRoot]
+    entries <- mapM fingerprintRoot roots
+    pure (SearchPathFingerprint (mapMaybe id entries))
+  where
+    fingerprintRoot :: FilePath -> IO (Maybe (FilePath, POSIXTime, [(FilePath, POSIXTime)]))
+    fingerprintRoot root = do
+        exists <- doesDirectoryExist root
+        if not exists
+            then pure Nothing
+            else do
+                rootMtime <- mtime root
+                children  <- listDirectory root
+                childPairs <- mapM (childEntry root) children
+                -- Sort for deterministic comparison.
+                let sorted = sortBy (\(a, _) (b, _) -> compare a b)
+                                    (mapMaybe id childPairs)
+                pure (Just (root, rootMtime, sorted))
+
+    childEntry root c = do
+        let p = root </> c
+        r <- try (mtime p) :: IO (Either SomeException POSIXTime)
+        case r of
+            Right t -> pure (Just (c, t))
+            Left _  -> pure Nothing
+
+    mtime :: FilePath -> IO POSIXTime
+    mtime p = utcTimeToPOSIXSeconds <$> getModificationTime p
+
+-- | Serialise a fingerprint to the on-disk cache format.  Line-based,
+-- human-inspectable: one line per (root, mtime, [child, mtime]), with
+-- NUL separators between fields.  The cabal tarball cache can contain
+-- names with unusual characters but never NULs, so this is unambiguous.
+encodeFingerprint :: SearchPathFingerprint -> ByteString
+encodeFingerprint (SearchPathFingerprint rs) =
+    BC.intercalate (BC.pack "\n") (map encodeRoot rs) <> BC.pack "\n"
+  where
+    encodeRoot (root, rootM, kids) =
+        BC.intercalate (BC.pack "\0")
+            ( BC.pack "R"
+            : BC.pack root
+            : BC.pack (show (toRational rootM))
+            : concatMap (\(c, m) -> [BC.pack c, BC.pack (show (toRational m))]) kids
+            )
+
+-- | Serialise the computed search path (list of (srcDir, includeDirs))
+-- to the on-disk cache format.  One record per line:
+-- @"P\0<srcDir>\0<inc1>\0<inc2>..."@.
+encodeResult :: [(FilePath, [FilePath])] -> ByteString
+encodeResult pairs =
+    BC.intercalate (BC.pack "\n") (map encodePair pairs) <> BC.pack "\n"
+  where
+    encodePair (sd, incs) =
+        BC.intercalate (BC.pack "\0")
+            (BC.pack "P" : BC.pack sd : map BC.pack incs)
+
+-- | Parse the on-disk cache back into a list of (srcDir, includeDirs).
+-- Silently returns 'Nothing' on malformed input — the caller then
+-- recomputes and overwrites.
+decodeResult :: ByteString -> Maybe [(FilePath, [FilePath])]
+decodeResult bs =
+    let ls = filter (not . BC.null) (BC.lines bs)
+    in mapM decodeLine ls
+  where
+    decodeLine l = case BC.split '\0' l of
+        (tag : sd : incs)
+            | tag == BC.pack "P" -> Just (BC.unpack sd, map BC.unpack incs)
+        _ -> Nothing
+
+-- | Location of the on-disk cache file.
+--
+-- Stored next to the other ihc cache contents so the whole directory
+-- can be wiped to force a rebuild.
+cacheFilePath :: IO FilePath
+cacheFilePath = do
+    home <- getHomeDirectory
+    pure (home </> ".cache" </> "ihc" </> "search-path.cache")
+
+-- | On-disk cache is considered disabled when @IHC_NO_SEARCH_PATH_CACHE@
+-- is set in the environment.  Useful for benchmarking the slow path
+-- and for test isolation.
+searchPathCacheDisabled :: IO Bool
+searchPathCacheDisabled = do
+    m <- lookupEnv "IHC_NO_SEARCH_PATH_CACHE"
+    pure (case m of
+              Just v | not (null v) && v /= "0" -> True
+              _                                 -> False)
+
+-- | Separator line between the fingerprint section and the payload
+-- section of the on-disk cache file.  Chosen so the file is readable
+-- in a text editor when debugging.
+cacheSectionSeparator :: ByteString
+cacheSectionSeparator = BC.pack "===SEP===\n"
+
+-- | Attempt to load the on-disk cache IFF its fingerprint matches
+-- the current filesystem state.  Returns 'Nothing' on any failure
+-- (missing file, bad format, fingerprint mismatch) so the caller
+-- falls back to the slow path and rewrites the cache.
+tryLoadOnDiskCache :: SearchPathFingerprint -> IO (Maybe [(FilePath, [FilePath])])
+tryLoadOnDiskCache fp = do
+    disabled <- searchPathCacheDisabled
+    if disabled
+        then pure Nothing
+        else do
+            path <- cacheFilePath
+            r <- try (BS.readFile path) :: IO (Either SomeException ByteString)
+            case r of
+                Left _   -> pure Nothing
+                Right bs ->
+                    case BC.breakSubstring cacheSectionSeparator bs of
+                        (fpEnc, rest)
+                            | not (BC.null rest) ->
+                                let payload = BC.drop (BC.length cacheSectionSeparator) rest
+                                    expected = encodeFingerprint fp
+                                in if fpEnc == expected
+                                     then do
+                                         traceCache "hit"
+                                         pure (decodeResult payload)
+                                     else do
+                                         traceCache "fingerprint mismatch"
+                                         pure Nothing
+                        _ -> do
+                            traceCache "malformed (no separator)"
+                            pure Nothing
+
+-- | Persist the computed search path to the on-disk cache.  Best
+-- effort: any I/O error is swallowed (we log to stderr if
+-- @IHC_TRACE@ is set, but otherwise stay silent).
+writeOnDiskCache :: SearchPathFingerprint -> [(FilePath, [FilePath])] -> IO ()
+writeOnDiskCache fp pairs = do
+    disabled <- searchPathCacheDisabled
+    if disabled
+        then pure ()
+        else do
+            path <- cacheFilePath
+            let payload = encodeFingerprint fp
+                      <> cacheSectionSeparator
+                      <> encodeResult pairs
+            r <- try (do
+                        createDirectoryIfMissing True (takeDirectory path)
+                        BS.writeFile path payload)
+                   :: IO (Either SomeException ())
+            case r of
+                Right () -> traceCache ("wrote (" <> show (BS.length payload) <> " bytes)")
+                Left e   -> traceCache ("write failed: " <> show e)
+
+-- | Emit a one-line trace message when @IHC_TRACE@ is enabled,
+-- prefixed with @[ihc:cache]@ so cache events are easy to grep.
+traceCache :: String -> IO ()
+traceCache msg = do
+    trace <- lookupEnv "IHC_TRACE"
+    case trace of
+        Just v | not (null v) && v /= "0" ->
+            hPutStrLn stderr ("[ihc:cache] search-path: " <> msg)
+        _ -> pure ()
 
 -- | Enumerate every package cached under @~\/.cache\/ihc\/sources\/@
 -- and (if the @IHC_NIX_SOURCE_DIR@ environment variable is set) under
@@ -511,63 +739,12 @@ dedupPreserveOrder = go []
 --      already-extracted tarballs, broadest pool.
 --
 -- Returns an empty list if none of the directories exist.
+--
+-- Implementation: delegates to the cached
+-- 'cachedPackageSearchPathWithIncludes' and strips the include-dirs,
+-- so both entry points share one memo / one disk cache.
 cachedPackageSearchPath :: IO [FilePath]
-cachedPackageSearchPath = do
-    nixDirs     <- nixSourceDirs
-    userDirs    <- enumerateSourceDir =<< userCacheDir
-    cabalDirs   <- cabalTarballSearchPath
-    pure (nixDirs ++ userDirs ++ cabalDirs)
-  where
-    userCacheDir :: IO FilePath
-    userCacheDir = do
-        home <- getHomeDirectory
-        pure (home </> ".cache" </> "ihc" </> "sources")
-
-    -- Enumerate the nix-pinned source tree exported by the devShell.
-    -- If the variable is unset or the path does not exist, returns [].
-    nixSourceDirs :: IO [FilePath]
-    nixSourceDirs = do
-        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
-        case mDir of
-            Nothing  -> pure []
-            Just dir -> enumerateSourceDir dir
-
-    enumerateSourceDir :: FilePath -> IO [FilePath]
-    enumerateSourceDir sourcesDir = do
-        exists <- doesDirectoryExist sourcesDir
-        if not exists
-            then pure []
-            else do
-                entries <- listDirectory sourcesDir
-                -- Sort in descending order so that the highest version of each
-                -- package is found first in the search path.  For package
-                -- directories named like "base-4.20.2.0" and "base-4.19.0.0",
-                -- reverse-alphabetical order puts the higher version first
-                -- because the version string compares lexicographically.
-                let sortedEntries = sortBy (\a b -> compare (Down a) (Down b)) entries
-                concat <$> mapM (dirsForEntry sourcesDir) sortedEntries
-
-    dirsForEntry sourcesDir entry = do
-        let pkgDir = sourcesDir </> entry
-        isDir <- doesDirectoryExist pkgDir
-        if not isDir
-            then pure []
-            else do
-                mCabal <- findLocalCabalFile pkgDir
-                case mCabal of
-                    Just cabalPath -> do
-                        mInfo <- parseCabalFile pkgDir cabalPath
-                        case mInfo of
-                            Just info -> pure (pkgSourceDirs info)
-                            Nothing   -> fallback pkgDir
-                    Nothing -> fallback pkgDir
-
-    -- When we can't parse a .cabal, try the conventional src/ dir first,
-    -- then fall back to the package root.
-    fallback pkgDir = do
-        let srcDir = pkgDir </> "src"
-        hasSrc <- doesDirectoryExist srcDir
-        pure [if hasSrc then srcDir else pkgDir]
+cachedPackageSearchPath = map fst <$> cachedPackageSearchPathWithIncludes
 
 -- | Like 'cachedPackageSearchPath' but returns @(srcDir, includeDirs)@
 -- pairs so callers can look up the @include-dirs@ for the package that
@@ -579,8 +756,50 @@ cachedPackageSearchPath = do
 --
 -- Priority order matches 'cachedPackageSearchPath':
 -- nix-pinned → user cache → cabal tarball cache.
+--
+-- Caching strategy (see the "Cache-wide search path" section header
+-- above for rationale):
+--
+--   1. In-process memo: the first call does the work, subsequent calls
+--      reuse the result via 'searchPathMemoRef'.
+--   2. On-disk cache at @~\/.cache\/ihc\/search-path.cache@ keyed by a
+--      cheap mtime fingerprint of the source roots and their immediate
+--      children.  Survives across ihc invocations.
 cachedPackageSearchPathWithIncludes :: IO [(FilePath, [FilePath])]
 cachedPackageSearchPathWithIncludes = do
+    memo <- readIORef searchPathMemoRef
+    case memo of
+        Just pairs -> pure pairs
+        Nothing    -> computeAndStore
+  where
+    computeAndStore = do
+        -- Compute the fingerprint *before* touching the slow path so we
+        -- can decide whether to reuse the on-disk cache.
+        fp <- computeSearchPathFingerprint
+        mDisk <- tryLoadOnDiskCache fp
+        pairs <- case mDisk of
+            Just cached -> pure cached
+            Nothing     -> do
+                fresh <- computeSearchPathFresh
+                -- Force the list spine so subsequent readers never
+                -- trigger the slow path lazily.
+                _     <- evaluate (length fresh)
+                writeOnDiskCache fp fresh
+                pure fresh
+        -- Install the memo.  We use atomicModifyIORef' so a racing
+        -- second caller doesn't end up with a different list.  The
+        -- race is harmless correctness-wise (both branches produce
+        -- the same result); the atomic CAS just avoids redundant work.
+        atomicModifyIORef' searchPathMemoRef $ \cur ->
+            case cur of
+                Just existing -> (Just existing, existing)
+                Nothing       -> (Just pairs, pairs)
+
+-- | The "slow path" used on cold cache: actually walk every source
+-- directory and parse every .cabal file.  Kept as a separate function
+-- so the caching wrapper above stays small and easy to read.
+computeSearchPathFresh :: IO [(FilePath, [FilePath])]
+computeSearchPathFresh = do
     home <- getHomeDirectory
     let userCache = home </> ".cache" </> "ihc" </> "sources"
     nixPairs   <- nixIncludePairs

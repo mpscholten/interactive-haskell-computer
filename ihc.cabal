@@ -69,6 +69,7 @@ library
       , process          >= 1.6
       , stm              >= 2.5
       , text             >= 2.0
+      , time             >= 1.12
 
     c-sources:
         rts/jit.c
