@@ -907,6 +907,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Right 42\nLeft \"oops\"\n42\n"
 
+    it "Data.Text.IO.putStrLn source-loads (no host shim for hPutStreamOrUtf8)" do
+        -- Regression test for the ihp-smoke-probe finding #3: when an
+        -- earlier probe loaded Data.Text.IO via IHP.Prelude it blew up on
+        -- `unbound variable hPutStreamOrUtf8`. Source-loading improvements
+        -- made the symbol resolve cleanly, so the "add a host builtin"
+        -- mitigation is no longer needed. Pin that we can reach the
+        -- Data.Text.IO output path without host shims.
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/text_io.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello text\n"
+
     it "UserInfixOp: (|>) defined via section form `x |> f = f x`" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator.hs")
         n   `shouldBe` 0
