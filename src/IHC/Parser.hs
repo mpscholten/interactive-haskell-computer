@@ -691,6 +691,12 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
         let (tok, cur') = nextSig ctx cur
         case tkKind tok of
             TkEof -> pure cur
+            -- Layout-aware stop: any significant token at a column
+            -- @<= ctxMinCol@ outside any bracket/paren/brace ends the
+            -- type annotation. Prevents it from eating the next
+            -- statement in a do-block or the next binding in a
+            -- layout-mode let.
+            _ | tkCol tok <= ctxMinCol ctx && b == 0 && p == 0 && c == 0 -> pure cur
             TkRParen | b == 0 && p == 0 && c == 0 -> pure cur   -- don't consume
             TkRBracket | b == 0 && p == 0 && c == 0 -> pure cur
             TkRBrace | b == 0 && p == 0 && c == 0 -> pure cur
@@ -1337,7 +1343,8 @@ parseLet ctx cur0 = do
     --   name params = expr
     --   name params | guard = expr | guard = expr
     --   (pat, ...) = expr            (pattern binding, returned as Right)
-    parseOneLetItem cur = do
+    parseOneLetItem bindCol cur = do
+        let rhsCtx = ctx { ctxMinCol = max bindCol (ctxMinCol ctx) }
         let (nameTok, cur1) = nextSig ctx cur
         case tkKind nameTok of
             TkIdent n -> do
@@ -1345,10 +1352,10 @@ parseLet ctx cur0 = do
                 let (sepTok, cur3) = nextSig ctx cur2
                 case tkKind sepTok of
                     TkEq -> do
-                        (e, cur4) <- parseExpr ctx cur3
+                        (e, cur4) <- parseExpr rhsCtx cur3
                         pure (Left (n, wrapParams params e), cur4)
                     TkBar -> do
-                        (branches, cur4) <- parseLetGuardBranches ctx cur3 []
+                        (branches, cur4) <- parseLetGuardBranches rhsCtx cur3 []
                         let e = desugarClauses [(params, RhsGuards branches)] (length params)
                         pure (Left (n, e), cur4)
                     _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
@@ -1358,7 +1365,7 @@ parseLet ctx cur0 = do
                 let (eqTok, cur3) = nextSig ctx cur2
                 case tkKind eqTok of
                     TkEq -> do
-                        (e, cur4) <- parseExpr ctx cur3
+                        (e, cur4) <- parseExpr rhsCtx cur3
                         pure (Right (pat, e), cur4)
                     _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
               | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
@@ -1394,7 +1401,7 @@ parseLet ctx cur0 = do
                             layoutLetItems bindCol cur' acc
                       | otherwise -> pure (reverse acc, cur')
             Nothing -> do
-                (item, cur') <- parseOneLetItem cur
+                (item, cur') <- parseOneLetItem bindCol cur
                 let acc' = item : acc
                 -- Peek at the next significant token.
                 let (peek, _) = nextSig ctx cur'
@@ -1507,12 +1514,36 @@ layoutAlts ctx altCol cur acc = do
 parseAlt :: Ctx -> Ctx -> Cursor -> IO (Alt, Cursor)
 parseAlt ctx altCtx cur = do
     (pat, cur1) <- parseTopPat ctx cur
+    let (sep, cur2) = nextSig ctx cur1
+    case tkKind sep of
+        TkArrow -> do
+            (e, cur3) <- parseExpr altCtx cur2
+            pure (Alt pat e, cur3)
+        -- Guarded alt: pat | g1 -> e1 | g2 -> e2 ...
+        TkBar -> do
+            (branches, cur3) <- parseCaseGuards altCtx cur2 []
+            let fallback = EApp (EVar "error")
+                                (stringToConsList
+                                    "Non-exhaustive guards in case alternative")
+                body = guardChain branches fallback
+            pure (Alt pat body, cur3)
+        _ -> parseErr ctx "expected `->` or `|` in case alternative" sep
+
+-- | Parse one or more `| guard -> expr` branches for a single case
+-- alternative. Stops when the next `|` is at a column outside this alt.
+parseCaseGuards :: Ctx -> Cursor -> [(Expr, Expr)] -> IO ([(Expr, Expr)], Cursor)
+parseCaseGuards ctx cur acc = do
+    (g, cur1) <- parseExpr ctx cur
     let (arr, cur2) = nextSig ctx cur1
     case tkKind arr of
         TkArrow -> pure ()
-        _       -> parseErr ctx "expected `->` in case alternative" arr
-    (e, cur3) <- parseExpr altCtx cur2
-    pure (Alt pat e, cur3)
+        _       -> parseErr ctx "expected `->` after guard in case alt" arr
+    (b, cur3) <- parseExpr ctx cur2
+    let (sep, cur4) = nextSig ctx cur3
+    case tkKind sep of
+        TkBar | tkCol sep > ctxMinCol ctx ->
+            parseCaseGuards ctx cur4 ((g, b) : acc)
+        _ -> pure (reverse ((g, b) : acc), cur3)
 
 --------------------------------------------------------------------------------
 -- Pattern parsing

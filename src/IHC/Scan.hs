@@ -887,12 +887,22 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                         curAfterArrow <- skipConstraintContext cur'
                         collectCtors tyName cIdx (dReg, fReg) curAfterArrow
                     else do
-                        -- Peek ahead: if '{' follows immediately, it is record syntax.
-                        let (peek, _) = nextToken src cur'
+                        -- Peek ahead: if '{' follows (possibly after
+                        -- one or more newlines), it is record syntax.
+                        -- GHC allows:
+                        --   data T = C
+                        --       { f1 :: ... }
+                        -- so newlines between the ctor name and '{'
+                        -- must not prevent record-syntax detection.
+                        let skipNls c0 =
+                                let (t, c1) = nextToken src c0
+                                in case tkKind t of
+                                    TkNewline -> skipNls c1
+                                    _         -> (t, c1)
+                            (peek, curAfterPeek) = skipNls cur'
                         (arity, fields, curN) <- case tkKind peek of
-                            TkLBrace -> do
-                                let (_, curBrace) = nextToken src cur'
-                                collectRecordFields 0 [] curBrace
+                            TkLBrace ->
+                                collectRecordFields 0 [] curAfterPeek
                             _ -> do
                                 (n, curN') <- countCtorFields 0 cur'
                                 pure (n, [], curN')
@@ -982,6 +992,12 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkLParen -> do
                 curAfter <- skipToMatchingRParen 1 cur'
                 countCtorFields (n + 1) curAfter
+            -- '[' opens a list type like @[Rose]@ — count as one field
+            -- and skip to the matching ']'. Without this the scanner
+            -- treats '[' as a decl terminator and under-counts arity.
+            TkLBracket -> do
+                curAfter <- skipToMatchingRBracket 1 cur'
+                countCtorFields (n + 1) curAfter
             TkConId _ -> countCtorFields (n + 1) cur'
             TkIdent _ -> countCtorFields (n + 1) cur'
             TkPrimId _ -> countCtorFields (n + 1) cur'
@@ -1001,6 +1017,17 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                 TkRParen -> skipToMatchingRParen (depth - 1) cur'
                 TkEof    -> pure cur'
                 _        -> skipToMatchingRParen depth cur'
+
+    skipToMatchingRBracket :: Int -> Cursor -> IO Cursor
+    skipToMatchingRBracket !depth cur
+        | depth <= 0 = pure cur
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLBracket -> skipToMatchingRBracket (depth + 1) cur'
+                TkRBracket -> skipToMatchingRBracket (depth - 1) cur'
+                TkEof      -> pure cur'
+                _          -> skipToMatchingRBracket depth cur'
 
 --------------------------------------------------------------------------------
 -- Deriving Functor synthesis
