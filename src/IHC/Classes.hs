@@ -160,6 +160,7 @@ forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState BlackHole = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 -- | The global class registry. Maps @(ClassName, [TypeTag])@ to an ordered
 -- list of method values (one per method, in class-declaration order).

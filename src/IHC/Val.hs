@@ -16,6 +16,7 @@ module IHC.Val
     , newThunk
     , newThunkIP
     , newWHNFThunk
+    , newLazyBuiltinThunk
       -- * Environments
     , Env
     , emptyEnv
@@ -135,6 +136,14 @@ data ThunkState
     = Unevaluated !Closure
     | Evaluated   !Val
     | BlackHole                         -- entered, not yet returned
+    -- | Lazy-init for builtins: a host @IO Val@ action that produces the
+    -- builtin's value on first force. Used by 'IHC.Builtins.builtinEnv'
+    -- so startup doesn't pay the cost of materialising every primop,
+    -- dispatch wrapper, and Typeable dict up-front. Semantics match
+    -- 'Unevaluated' — the value is produced once and memoised — but we
+    -- avoid building a Closure+Env+Expr around a host function that
+    -- doesn't come from source.
+    | LazyBuiltin !(IO Val)
 
 -- | Map of implicit-parameter names (@?x@) to thunks, threaded through
 -- closures for lexical scoping. Empty for most code; non-empty only when
@@ -163,6 +172,13 @@ newThunkIP env ipm expr = newIORef (Unevaluated (Closure env ipm expr))
 
 newWHNFThunk :: Val -> IO Thunk
 newWHNFThunk v = newIORef (Evaluated v)
+
+-- | Make a thunk whose evaluation runs a host @IO Val@ action. Used by
+-- 'IHC.Builtins.builtinEnv' to defer materialisation of primop values
+-- until they're actually referenced. The action runs at most once —
+-- 'IHC.Eval.force' writes the produced 'Val' back with 'Evaluated'.
+newLazyBuiltinThunk :: IO Val -> IO Thunk
+newLazyBuiltinThunk mkV = newIORef (LazyBuiltin mkV)
 
 --------------------------------------------------------------------------------
 -- Environments

@@ -129,9 +129,17 @@ foreignPtrValToForeignPtr other = error ("expected ForeignPtr: " <> showValForDe
 -- and @show@ can look up user-defined instances at runtime.
 builtinEnv :: ClassRegistry -> IO Env
 builtinEnv reg = do
-    pairs <- mapM (\(n, mkV) -> do { v <- mkV; t <- newWHNFThunk v; pure (n, t) })
+    -- Lazy-init the bulk of the builtin table: a hello-world program only
+    -- touches a handful of these (putStrLn, show, …), yet eager allocation
+    -- used to spend ~60-80ms on IORef + VFun allocation per startup. We now
+    -- store each entry as a 'LazyBuiltin' thunk that runs the host 'IO Val'
+    -- action on first force (see 'IHC.Val.ThunkState' and 'IHC.Eval.force').
+    pairs <- mapM (\(n, mkV) -> do { t <- newLazyBuiltinThunk mkV; pure (n, t) })
                   (builtins reg)
-    -- Built-in list constructors.
+    -- Arity-0 ctor thunks (VCon name []) are already tiny constant values,
+    -- so we keep them eager — deferring wouldn't save anything meaningful
+    -- and many of these (True/False/[]/LT/…) are on virtually every hot
+    -- path anyway.
     nilT  <- newWHNFThunk (VCon "[]" [])
     consT <- newWHNFThunk consV
     let listCtors = [("[]", nilT), (":", consT)]
@@ -165,14 +173,16 @@ builtinEnv reg = do
     unitT <- newWHNFThunk VUnit
     let unitCtor = [("()", unitT)]
     -- Phase 2.8: unboxed tuple constructors (# , #), (# ,, #) etc.
-    -- The parser builds EApp chains using these names.
-    unbox2T <- newWHNFThunk (VFun $ \a -> pure $ VFun $ \b -> pure (VCon "(#,#)" [a, b]))
-    unbox3T <- newWHNFThunk (VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure (VCon "(#,,#)" [a, b, c]))
+    -- Lazy-init — most programs never construct unboxed tuples.
+    unbox2T <- newLazyBuiltinThunk (pure (VFun $ \a -> pure $ VFun $ \b -> pure (VCon "(#,#)" [a, b])))
+    unbox3T <- newLazyBuiltinThunk (pure (VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure (VCon "(#,,#)" [a, b, c])))
     let unboxCtors = [("(#,#)", unbox2T), ("(#,,#)", unbox3T)]
     -- IO constructor: IO wraps a (State# RealWorld -> (# State# RealWorld, a #))
     -- function into a VIO action.  GHC.Types defines `newtype IO a = IO (State# ...)`
     -- but since GHC.Types is builtin-backed (no .hs source), we register it here.
-    ioCtorT <- newWHNFThunk (VFun $ \fThunk -> do
+    -- Deferred: the VFun isn't needed until the source actually constructs an IO
+    -- value from a state-passing function (most programs go through primops).
+    ioCtorT <- newLazyBuiltinThunk (pure (VFun $ \fThunk -> do
         f <- force fThunk
         pure (VIO (do
             let stok = VPrimObj PrimRealWorld
@@ -182,17 +192,18 @@ builtinEnv reg = do
                 VCon "(#,#)" [_stT, aT] -> do
                     v <- force aT
                     pure v
-                other                    -> pure other)))
+                other                    -> pure other))))
     -- Ptr smart constructor: `Ptr addr#` wraps an Addr# (PrimPtr) back into PrimPtr.
-    ptrCtorT <- newWHNFThunk ptrCtorV
+    ptrCtorT <- newLazyBuiltinThunk (pure ptrCtorV)
     -- Phase 2.9.5: Proxy and Dynamic constructors.
     -- Phase 3.5 note: when a VLabel is used where a Proxy is expected,
     -- fromLabel produces VCon "Proxy" [VLabel name].
     proxyT    <- newWHNFThunk (VCon "Proxy" [])
-    dynCtorV  <- dynamicCtorB
-    dynCtorT  <- newWHNFThunk dynCtorV
+    dynCtorT  <- newLazyBuiltinThunk dynamicCtorB
     let phase295Ctors = [("Proxy", proxyT), ("Dynamic", dynCtorT)]
     -- Phase 2.9.5: Built-in Typeable dictionaries for primitive types.
+    -- Lazy-init: each dict costs two IORef allocs + a VCon, and most
+    -- programs only touch typeableDict_Int / _Char / _Bool.
     typeableInsts <- buildBuiltinTypeableInsts
     -- Phase 3.5: Default IsLabel dispatch.
     -- Register the IHP-style default instance `(s ~ s') => IsLabel s (Proxy s')`
@@ -200,6 +211,8 @@ builtinEnv reg = do
     -- VLabel and no user-defined IsLabel instance wins, dispatch falls through
     -- to this one which produces `VCon "Proxy" []`.
     -- The method slot order mirrors the class declaration: [fromLabel].
+    -- fromLabelB just builds a small VFun — leave eager to avoid special-casing
+    -- the ClassRegistry (which is a separate store from the Env).
     defaultFromLabel <- fromLabelB reg
     registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy") [defaultFromLabel]
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
@@ -3077,17 +3090,16 @@ buildConEnv reg = do
     pairs <- mapM mkBinding (Map.toList reg)
     pure (extendEnvMany pairs emptyEnv)
   where
-    mkBinding (name, (_tyName, arity, _idx)) = do
-        v <- mkCon name arity
-        t <- newWHNFThunk v
+    -- Arity-0 ctors are a single cheap 'VCon' — keep them eager since
+    -- they're constants. Arity-n ctors build a chain of n VFun
+    -- closures; defer that allocation until the ctor is actually
+    -- referenced.
+    mkBinding (name, (_tyName, 0, _idx)) = do
+        t <- newWHNFThunk (VCon name [])
         pure (name, t)
-
-    -- arity 0: the VCon itself (wrapped later in a thunk).
-    -- arity n: a chain of n VFuns that accumulate thunks in reverse, then
-    --          return a saturated VCon.
-    mkCon :: Name -> Int -> IO Val
-    mkCon name 0 = pure (VCon name [])
-    mkCon name n = pure (buildLam name n [])
+    mkBinding (name, (_tyName, arity, _idx)) = do
+        t <- newLazyBuiltinThunk (pure (buildLam name arity []))
+        pure (name, t)
 
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
@@ -3126,8 +3138,10 @@ buildFieldEnv reg = do
     pairs <- mapM mkAccessor (Map.toList reg)
     pure (Map.fromList pairs)
   where
+    -- Defer VFun allocation for each record-field accessor. A program that
+    -- never projects out that particular field never pays the cost.
     mkAccessor (fieldName, clauses) = do
-        t <- newWHNFThunk (VFun (access fieldName clauses))
+        t <- newLazyBuiltinThunk (pure (VFun (access fieldName clauses)))
         pure (fieldName, t)
 
     -- Build a function that, given a VCon, extracts the right field.
@@ -4127,6 +4141,10 @@ dynamicCtorB = pure $ VFun $ \trT -> pure $ VFun $ \valT -> do
     pure (VCon "Dynamic" [trThunk, valT])
 
 -- | Build built-in Typeable instance dictionaries for well-known types.
+--
+-- Each dict is registered as a 'LazyBuiltin' thunk so startup doesn't pay
+-- the cost of allocating a TypeRep + wrapper VCon for every primitive
+-- type — a hello-world program never touches any of these.
 buildBuiltinTypeableInsts :: IO [(Name, Thunk)]
 buildBuiltinTypeableInsts = mapM mkDict prims
   where
@@ -4155,7 +4173,8 @@ buildBuiltinTypeableInsts = mapM mkDict prims
         , ("IO",      "IO")
         ]
     mkDict (tag, tyName) = do
-        tr    <- mkTypeRep tyName
-        trT   <- newWHNFThunk tr
-        dictT <- newWHNFThunk (VCon "Dict_Typeable" [trT])
+        dictT <- newLazyBuiltinThunk $ do
+            tr  <- mkTypeRep tyName
+            trT <- newWHNFThunk tr
+            pure (VCon "Dict_Typeable" [trT])
         pure ("typeableDict_" <> tag, dictT)

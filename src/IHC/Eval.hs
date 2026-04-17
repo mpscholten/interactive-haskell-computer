@@ -50,6 +50,15 @@ force t = do
             v <- eval env ipm expr
             writeIORef t (Evaluated v)
             pure v
+        -- Lazy-init builtin: run the host @IO Val@ action exactly once,
+        -- then memoise. Mirrors the 'Unevaluated' path (same black-hole
+        -- protocol) so concurrent forces see 'LoopException' instead of
+        -- double-running the initialiser. See 'IHC.Val.newLazyBuiltinThunk'.
+        LazyBuiltin mkV -> do
+            writeIORef t BlackHole
+            v <- mkV
+            writeIORef t (Evaluated v)
+            pure v
 
 --------------------------------------------------------------------------------
 -- eval
