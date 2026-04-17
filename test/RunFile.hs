@@ -905,3 +905,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runMainWithSiblings "test/Fixtures/QuickWins/user_op_module/Main.hs")
         n   `shouldBe` 0
         out `shouldBe` "6\n"
+
+    it "IsLabel dispatch: default Proxy instance + pattern-match transparency" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/islabel_dispatch.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "#email\nfromLabel-yielded Proxy matched\nraw VLabel matched Proxy\n"
+
+    it "IsLabel dispatch: user-defined instance overrides default Proxy" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/islabel_user_instance.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Wrap \"custom\"\n"

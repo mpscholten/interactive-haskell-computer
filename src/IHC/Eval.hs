@@ -320,6 +320,14 @@ matchPat (PCon "Ptr" [pAddr]) (VPrimObj (PrimPtr ptr)) = do
             Nothing   -> pure Nothing
             Just subs -> matchFields rest (reverse subs ++ acc)
 
+-- Phase 3.5: OverloadedLabels IsLabel dispatch.
+-- IHP's default instance `(s ~ s') => IsLabel s (Proxy s')` converts #email
+-- into `Proxy @"email"`. Since we have no types, we make this transparent
+-- at the pattern-match layer: matching `Proxy` against a `VLabel _` succeeds
+-- (0 sub-patterns since Proxy is nullary). This lets source code like
+-- `case lbl of Proxy -> ...` work whether the label was already forced
+-- through `fromLabel` or is still a raw VLabel.
+matchPat (PCon "Proxy" []) (VLabel _) = pure (Just [])
 matchPat (PCon "IO" [p]) (VIO action) = do
     let stFn = VFun $ \_stateThunk -> do
             -- Run the IO action, return an unboxed tuple (# state, result #)

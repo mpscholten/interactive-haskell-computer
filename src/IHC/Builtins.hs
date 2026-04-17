@@ -81,7 +81,7 @@ import System.IO
 
 import IHC.AST  (Name)
 import IHC.Classes
-    ( ClassRegistry, lookupInstance, typeTagOf
+    ( ClassRegistry, lookupInstance, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
 import IHC.Eval (apply, force)
@@ -207,6 +207,14 @@ builtinEnv reg = do
     let phase295Ctors = [("Proxy", proxyT), ("Dynamic", dynCtorT)]
     -- Phase 2.9.5: Built-in Typeable dictionaries for primitive types.
     typeableInsts <- buildBuiltinTypeableInsts
+    -- Phase 3.5: Default IsLabel dispatch.
+    -- Register the IHP-style default instance `(s ~ s') => IsLabel s (Proxy s')`
+    -- under the synthetic type tag "Proxy": when `fromLabel` is applied to a
+    -- VLabel and no user-defined IsLabel instance wins, dispatch falls through
+    -- to this one which produces `VCon "Proxy" []`.
+    -- The method slot order mirrors the class declaration: [fromLabel].
+    defaultFromLabel <- fromLabelB reg
+    registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy") [defaultFromLabel]
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ maybeCtors ++ orderingCtors ++ exitCtors ++ unboxCtors
                          ++ unitCtor ++ eitherCtors ++ [("IO", ioCtorT)]
@@ -1230,20 +1238,62 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | @fromLabel :: VLabel name -> Val@
 --
 -- In GHC, @fromLabel \@"name"@ selects an @IsLabel@ instance via type
--- inference. We have no type inference, so we dispatch at runtime:
+-- inference. We have no type inference, so we dispatch at runtime.
 --
--- * When the label is used in any context we don't yet recognise, we
---   return a @VCon "Proxy" [VLabel name]@ — the Proxy IsLabel instance.
---   Downstream code can pattern-match on this to recover the name.
--- * Field-accessor dispatch is deferred until the OverloadedRecordDot
---   agent lands its field-lookup primitive.
+-- Dispatch strategy:
+--
+-- * We first walk the class registry looking for an @IsLabel@ instance
+--   whose type tag is something other than the synthetic @Proxy@ default.
+--   The first such user-defined instance is picked (its @fromLabel@
+--   method receives the VLabel and produces the instance's target value).
+-- * Otherwise we fall through to the registered default instance for
+--   @(IsLabel s (Proxy s'))@ (IHP's instance) which produces
+--   @VCon "Proxy" []@.
+-- * Pattern-matching in the evaluator treats @Proxy@ as transparently
+--   matching a @VLabel@, so downstream code that pattern-matches on
+--   @Proxy@ still works whether or not @fromLabel@ was called first.
+--
+-- Note on user overrides: with no type information we cannot tell which
+-- user instance to pick when multiple are visible. The first non-default
+-- instance wins — userland code that relies on specific dispatch should
+-- call @fromLabel@ explicitly in a monomorphic context where exactly one
+-- instance is in scope.
 fromLabelB :: ClassRegistry -> IO Val
-fromLabelB _reg = pure $ VFun $ \a -> do
+fromLabelB reg = pure $ VFun $ \a -> do
     av <- force a
     case av of
-        VLabel name -> pure (VCon "Proxy" [])   -- Proxy IsLabel instance
+        VLabel _ -> do
+            mMethods <- lookupUserIsLabel reg
+            case mMethods of
+                Just (fromLabelM : _) ->
+                    -- User-defined @fromLabel@ typically has type
+                    -- @forall s. IsLabel s a => a@ and is 0-arity
+                    -- (e.g. @fromLabel = Wrap \"x\"@), but some instances
+                    -- may define it as a function taking the label. If the
+                    -- method is a function, apply it to the label; otherwise
+                    -- return the stored value directly.
+                    case fromLabelM of
+                        VFun _      -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        VFunIP _ _  -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        v           -> pure v
+                _ -> pure (VCon "Proxy" [])   -- default: Proxy IsLabel instance
         other -> error ("fromLabel: expected a Label value, got: "
                         <> showValForDebug other)
+
+-- | Find a user-defined IsLabel instance (anything registered under a tag
+-- other than the synthetic \"Proxy\" default). Returns the method list of
+-- the first such instance encountered, or 'Nothing'.
+lookupUserIsLabel :: ClassRegistry -> IO (Maybe [Val])
+lookupUserIsLabel reg = do
+    m <- readIORef reg
+    let userInsts = [ methods
+                    | ((cls, tag), methods) <- Map.toList m
+                    , cls == BC.pack "IsLabel"
+                    , tag /= BC.pack "Proxy"
+                    ]
+    case userInsts of
+        (methods : _) -> pure (Just methods)
+        []            -> pure Nothing
 
 -- showB replaced by showDispatch in Phase 2.3
 
