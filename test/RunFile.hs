@@ -840,6 +840,16 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "IHP integration OK\n42\n"
 
+    it "KnownSymbol dict: foo :: KnownSymbol s => Proxy s -> String; symbolVal p" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/known_symbol_dict.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\n"
+
+    it "KnownNat dict: bar :: KnownNat n => Proxy n -> Integer; natVal p" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/known_nat_dict.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
     --------------------------------------------------------------------
     -- Phase 3.5: OverloadedLabels
     --------------------------------------------------------------------
