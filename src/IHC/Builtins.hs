@@ -575,6 +575,26 @@ builtins reg =
     , ("typeRepArgs",    typeRepArgsB)
     -- Phase 3.5: OverloadedLabels
     , ("fromLabel",    fromLabelB reg)
+    -- DataKinds Tier 1: GHC.TypeLits runtime dispatch.
+    --
+    -- 'symbolVal', 'natVal', 'charVal' (and their @'@ Proxy# variants)
+    -- recover a DataKinds literal from a @Proxy@ at runtime. GHC
+    -- normally generates a 'KnownSymbol' / 'KnownNat' / 'KnownChar'
+    -- dictionary during type-checking; we don't type-check, so we
+    -- inspect the @VCon "Proxy" [payload]@ that the evaluator's 'ETyApp'
+    -- special case produced. Also copes with the "label" escape hatch
+    -- where a bare @VLabel name@ flows in (e.g. @symbolVal #email@).
+    -- Backstops @symbolVal \@"T" undefined@ / @natVal \@42 undefined@
+    -- style calls via the 'ETyApp' short-circuit in IHC.Eval.
+    , ("symbolVal",    symbolValB)
+    , ("symbolVal'",   symbolValB)
+    , ("natVal",       natValB)
+    , ("natVal'",      natValB)
+    , ("charVal",      charValB)
+    , ("charVal'",     charValB)
+    , ("someSymbolVal", someSymbolValB)
+    , ("someNatVal",    someNatValB)
+    , ("someCharVal",   someCharValB)
     -- Phase 3.6: MutVar# primops (backing ST monad source).
     -- GHC.Prim has no .hs source; these are wired-in by the GHC build system.
     , ("newMutVar#",            newMutVarB)
@@ -1090,6 +1110,7 @@ showValWith reg av = case av of
             pure ("[" <> intercalate "," parts <> "]")
     VCon "True" _  -> pure "True"
     VCon "False" _ -> pure "False"
+    VCon "Proxy" _ -> pure "Proxy"   -- DataKinds payload is invisible in show
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
         let tag = n
@@ -1183,6 +1204,10 @@ showVal (VCon name thunks)
     | isTupleConName name = do
         parts <- mapM (\t -> do v <- force t; showVal v) thunks
         pure ("(" <> intercalate "," parts <> ")")
+    -- @Proxy@ is rendered as just "Proxy" regardless of any DataKinds
+    -- payload the evaluator attached from an 'ETyApp' annotation
+    -- (GHC's @show (Proxy :: Proxy "foo") = "Proxy"@).
+    | name == "Proxy" = pure "Proxy"
     | otherwise = do
         parts <- mapM (\t -> do v <- force t; showVal v) thunks
         case parts of
@@ -1312,6 +1337,139 @@ lookupUserIsLabel reg = do
     case userInsts of
         (methods : _) -> pure (Just methods)
         []            -> pure Nothing
+
+-- DataKinds Tier 1 -------------------------------------------------------------
+
+-- | @symbolVal :: Proxy (n :: Symbol) -> String@ — recover the symbol
+-- literal attached to a 'Proxy' by the evaluator's @ETyApp@ special case.
+--
+-- Accepts:
+--
+--   * @VCon \"Proxy\" [VLabel name]@ — the normal post-@ETyApp@ shape.
+--   * @VCon \"Proxy\" [VInt n]@      — tolerates accidental @natVal@
+--     shapes (e.g. @symbolVal (Proxy @42)@ in debug code).
+--   * @VLabel name@                   — a bare @#name@ flowing straight
+--     in, since 'IsLabel' dispatch may short-circuit the @Proxy@
+--     wrapper altogether.
+--   * @VCon \"Proxy\" []@             — no payload (e.g. forgot @\@T@);
+--     returns the empty string rather than crashing.
+symbolValB :: IO Val
+symbolValB = pure $ VFun $ \p -> do
+    pv <- force p
+    bs <- proxySymbolPayload pv
+    stringToListValIO (BC.unpack bs)
+
+-- | @natVal :: Proxy (n :: Nat) -> Integer@ — dual of 'symbolValB'.
+-- Expects a @VInt@ payload; tolerates @VLabel@ by reading it as digits
+-- (raw DataKinds nat literal parses to @VInt@ via @parseTyArgLit@, but
+-- user-provided proxies may carry labels).
+natValB :: IO Val
+natValB = pure $ VFun $ \p -> do
+    pv <- force p
+    case pv of
+        VCon "Proxy" (t : _) -> do
+            x <- force t
+            case x of
+                VInt n   -> pure (VInt n)
+                VLabel s -> case BC.readInteger s of
+                    Just (n, rest) | BS.null rest -> pure (VInt (fromInteger n))
+                    _ -> error ("natVal: non-numeric Proxy payload: "
+                                 <> BC.unpack s)
+                other -> error ("natVal: unexpected Proxy payload: "
+                                 <> showValForDebug other)
+        VInt n -> pure (VInt n)
+        other -> error ("natVal: expected a Proxy, got: "
+                         <> showValForDebug other)
+
+-- | @charVal :: Proxy (n :: Char) -> Char@.
+charValB :: IO Val
+charValB = pure $ VFun $ \p -> do
+    pv <- force p
+    case pv of
+        VCon "Proxy" (t : _) -> do
+            x <- force t
+            case x of
+                VChar c  -> pure (VChar c)
+                VLabel s | BC.length s == 1 -> pure (VChar (BC.head s))
+                other -> error ("charVal: unexpected Proxy payload: "
+                                 <> showValForDebug other)
+        VChar c -> pure (VChar c)
+        other -> error ("charVal: expected a Proxy, got: "
+                         <> showValForDebug other)
+
+-- | @someSymbolVal :: String -> SomeSymbol@ — wrap a runtime string into
+-- a @SomeSymbol@ whose contained @Proxy@ carries the string as a
+-- @VLabel@ so 'symbolVal' round-trips.
+someSymbolValB :: IO Val
+someSymbolValB = pure $ VFun $ \s -> do
+    sv <- force s
+    bs <- listValToBS sv
+    lblT <- newWHNFThunk (VLabel bs)
+    proxyT <- newWHNFThunk (VCon "Proxy" [lblT])
+    pure (VCon "SomeSymbol" [proxyT])
+
+-- | @someNatVal :: Integer -> Maybe SomeNat@ — returns @Nothing@ for
+-- negatives, @Just (SomeNat (Proxy \@n))@ otherwise.
+someNatValB :: IO Val
+someNatValB = pure $ VFun $ \n -> do
+    nv <- force n
+    case nv of
+        VInt k | k < 0 -> pure (VCon "Nothing" [])
+               | otherwise -> do
+                   intT <- newWHNFThunk (VInt k)
+                   proxyT <- newWHNFThunk (VCon "Proxy" [intT])
+                   smT <- newWHNFThunk (VCon "SomeNat" [proxyT])
+                   pure (VCon "Just" [smT])
+        other -> error ("someNatVal: expected an Integer, got: "
+                         <> showValForDebug other)
+
+-- | @someCharVal :: Char -> SomeChar@.
+someCharValB :: IO Val
+someCharValB = pure $ VFun $ \c -> do
+    cv <- force c
+    case cv of
+        VChar ch -> do
+            chT <- newWHNFThunk (VChar ch)
+            proxyT <- newWHNFThunk (VCon "Proxy" [chT])
+            pure (VCon "SomeChar" [proxyT])
+        other -> error ("someCharVal: expected a Char, got: "
+                         <> showValForDebug other)
+
+-- | Extract the symbol-shaped payload bytes from whatever a user passed
+-- as the first argument of 'symbolVal'. See 'symbolValB' for the
+-- accepted shapes.
+proxySymbolPayload :: Val -> IO ByteString
+proxySymbolPayload (VCon "Proxy" (t : _)) = do
+    x <- force t
+    case x of
+        VLabel s -> pure s
+        VInt   n -> pure (BC.pack (show n))
+        VChar  c -> pure (BC.pack [c])
+        other    -> pure (BC.pack (showValForDebug other))
+proxySymbolPayload (VCon "Proxy" []) = pure BC.empty
+proxySymbolPayload (VLabel s) = pure s
+proxySymbolPayload (VCon "SomeSymbol" [t]) = do
+    x <- force t
+    proxySymbolPayload x
+proxySymbolPayload other = error
+    ("symbolVal: expected a Proxy or SomeSymbol, got: "
+     <> showValForDebug other)
+
+-- | Walk a Haskell 'String' (cons-list of 'VChar') down to a ByteString.
+listValToBS :: Val -> IO ByteString
+listValToBS = go []
+  where
+    go acc (VCon "[]" _)       = pure (BC.pack (reverse acc))
+    go acc (VCon ":"  [h, t])  = do
+        hv <- force h
+        tv <- force t
+        case hv of
+            VChar c -> go (c : acc) tv
+            _       -> error ("listValToBS: list element is not a Char: "
+                                <> showValForDebug hv)
+    go _   (VStr s)            = pure s
+    go _   other               = error
+        ("listValToBS: expected a String, got: " <> showValForDebug other)
 
 -- showB replaced by showDispatch in Phase 2.3
 

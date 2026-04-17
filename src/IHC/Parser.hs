@@ -38,7 +38,9 @@ module IHC.Parser
 
 import Control.Exception (Exception(..), throwIO)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 
@@ -2191,9 +2193,17 @@ parseParenExpr ctx _openTok cur0 = do
             -- Fully general expression, possibly followed by:
             --   - `)`  → single expression, or unit.
             --   - `,`  → tuple or tuple section, collect more.
-            --   - `::` → type annotation, swallow to matching `)`.
+            --   - `::` → type annotation (preserved as 'ETyApp' metadata
+            --            when the annotation is the whole @( e :: T )@
+            --            form; stripped silently when it precedes a
+            --            tuple comma, e.g. @( 1 :: Int, 2 :: Int )@).
             --   - an operator + `)` → left section.
-            (e, cur1) <- parseExpr ctx cur0
+            --
+            -- We use 'parseExprNoSig' so the @::@ token survives for the
+            -- 'TkDColon' branch below to capture the type bytes. (The
+            -- outer 'parseExpr' also swallows trailing signatures; inside
+            -- parens we need to do that work ourselves.)
+            (e, cur1) <- parseExprNoSig ctx cur0
             let (sep, cur2) = nextSig ctx cur1
             case tkKind sep of
                 TkRParen -> pure (e, cur2)
@@ -2205,8 +2215,24 @@ parseParenExpr ctx _openTok cur0 = do
                         then pure (desugarTupleSection elems, curEnd)
                         else pure (ETuple (map fromJustTs elems), curEnd)
                 TkDColon -> do
-                    curEnd <- skipTypeToClose ctx cur2
-                    pure (e, curEnd)
+                    -- @(e :: T)@ — type annotation. Two shapes:
+                    --
+                    --   * @(e :: T)@         — preserve @T@ as ETyApp metadata.
+                    --   * @(e :: T, ...)@    — annotation on a tuple
+                    --                          element; drop the type
+                    --                          and continue collecting
+                    --                          tuple elements.
+                    (tyBytes, afterTy, stopTok) <- captureTypeUntilTupleOrClose ctx cur2
+                    case stopTok of
+                        TupleStopComma -> do
+                            (rest, curEnd) <- gatherTupleSectionElems ctx afterTy []
+                            let elems = Just e : rest
+                            if any isTsHole elems
+                                then pure (desugarTupleSection elems, curEnd)
+                                else pure (ETuple (map fromJustTs elems), curEnd)
+                        TupleStopClose | BS.null tyBytes -> pure (e, afterTy)
+                        TupleStopClose                   -> pure (ETyApp e tyBytes, afterTy)
+                        TupleStopEof                     -> pure (e, afterTy)
                 _ | Just opName <- tokenOpName (tkKind sep) -> do
                     -- Left section: (e op) = \$x -> e op $x
                     let (afterOp, curAfterOp) = nextSig ctx cur2
@@ -2368,17 +2394,41 @@ skipUnboxClose ctx cur =
             let (_, cur2) = nextSig ctx cur1 in cur2
         _ -> cur1
 
--- | After consuming `::` inside a parenthesised expression, skip tokens
--- at paren-depth 0 until we see the closing `)`. Arbitrary type-level
--- tokens are tolerated (forall, =>, #, unboxed tuples, brackets).
-skipTypeToClose :: Ctx -> Cursor -> IO Cursor
-skipTypeToClose ctx cur0 = go cur0 (0 :: Int)
+-- | Where the parser stopped consuming type-annotation tokens.
+--
+--   * 'TupleStopClose' — saw the closing @)@ of the paren expression.
+--   * 'TupleStopComma' — saw a top-level @,@ (the surrounding parens
+--     are actually a tuple; the annotation applies to this tuple
+--     element only).
+--   * 'TupleStopEof'   — ran off the end of the input.
+data TupleStop = TupleStopClose | TupleStopComma | TupleStopEof
+
+-- | After consuming @::@ inside a parenthesised expression, capture
+-- tokens at paren-depth 0 until we hit the enclosing @)@ or a @,@
+-- (tuple element separator). Arbitrary type-level tokens are tolerated
+-- (forall, =>, #, unboxed tuples, brackets).
+--
+-- Returns the (trimmed) raw bytes spanning the annotation, the cursor
+-- positioned after the stop token (@)@ is consumed; @,@ is consumed),
+-- and which kind of stop token we hit. The bytes preserve DataKinds
+-- type literals on 'ETyApp' so runtime @symbolVal@ / @natVal@ dispatch
+-- can recover the lifted value.
+captureTypeUntilTupleOrClose :: Ctx -> Cursor -> IO (ByteString, Cursor, TupleStop)
+captureTypeUntilTupleOrClose ctx cur0 = go cur0 (0 :: Int)
   where
+    startPos = cPos cur0
+    src      = ctxSrc ctx
+    trim bs  = BC.dropWhile isSpace
+                 (BC.reverse (BC.dropWhile isSpace (BC.reverse bs)))
     go cur depth = do
         let (tok, cur') = nextSig ctx cur
         case tkKind tok of
-            TkEof                 -> pure cur'
-            TkRParen | depth == 0 -> pure cur'
+            TkEof                 ->
+                pure (trim (sliceBytes src (startPos, cPos cur)), cur', TupleStopEof)
+            TkRParen | depth == 0 ->
+                pure (trim (sliceBytes src (startPos, tkStart tok)), cur', TupleStopClose)
+            TkComma  | depth == 0 ->
+                pure (trim (sliceBytes src (startPos, tkStart tok)), cur', TupleStopComma)
             TkLParen              -> go cur' (depth + 1)
             TkRParen              -> go cur' (depth - 1)
             TkLBracket            -> go cur' (depth + 1)

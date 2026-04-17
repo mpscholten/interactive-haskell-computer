@@ -23,6 +23,7 @@ module IHC.Eval
 
 import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Int (Int64)
@@ -186,9 +187,32 @@ eval env ipm = go
     -- Value-level TypeApplications (@T). ihc is optimistic about types:
     -- the type argument is retained by the parser as AST metadata, but
     -- evaluation proceeds on the underlying expression as if the @T were
-    -- absent. When a future 'Typeable' / dictionary-selection path needs
-    -- the arg, it can inspect the 'ETyApp' node before this pass-through.
-    go (ETyApp e _ty) = go e
+    -- absent. Two special cases are peeled off here so DataKinds /
+    -- @GHC.TypeLits@ (@symbolVal@, @natVal@, @charVal@) can recover their
+    -- type arg at runtime:
+    --
+    --   (a) @Proxy \@T@ — when the inner expression evaluates to the bare
+    --       @VCon "Proxy" []@ produced by the @Proxy@ constructor, the
+    --       type argument is attached as a singleton field (@VLabel@ for
+    --       a symbol literal, @VInt@ for a nat literal, @VChar@ for a
+    --       char literal). @symbolVal@ / @natVal@ / @charVal@ inspect
+    --       this field at call time.
+    --
+    --   (b) @symbolVal \@\"name\"@ / @natVal \@42@ — when the inner
+    --       expression is a direct reference to one of these functions,
+    --       we can short-circuit and emit a closure that returns the
+    --       type arg as its result, ignoring whatever Proxy-shaped value
+    --       the caller supplies.  This keeps parity with GHC's behaviour
+    --       where a call like @symbolVal \@\"email\" undefined@ works.
+    --
+    -- All other uses are the plain pass-through on the inner expression.
+    go (ETyApp e ty)
+        | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
+        | otherwise      = do
+            v <- go e
+            case v of
+                VCon "Proxy" [] -> attachProxyType ty
+                _               -> pure v
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
@@ -210,6 +234,170 @@ eval env ipm = go
             restV <- goChars chs
             restT <- newWHNFThunk restV
             pure (VCon ":" [chT, restT])
+
+    -- Wrap a DataKinds type argument as a @Proxy@ payload. The raw bytes
+    -- come straight from the parser's 'captureTypeArg' slice and may be a
+    -- string literal (@\"email\"@), a natural-number literal (@42@), a
+    -- character literal (@\'x\'@), or anything else (type name, type
+    -- constructor application, ...). For constructors/type names we fall
+    -- back to a @VLabel@ holding the raw bytes so consumers that want the
+    -- name string still have something to show.
+    attachProxyType :: ByteString -> IO Val
+    attachProxyType tyBytes = do
+        payload <- parseTyArgLit tyBytes
+        payloadT <- newWHNFThunk payload
+        pure (VCon "Proxy" [payloadT])
+
+--------------------------------------------------------------------------------
+-- DataKinds / GHC.TypeLits runtime helpers.
+--
+-- See the 'ETyApp' case in 'eval' above for the call sites.  These helpers
+-- inspect the raw bytes captured by the parser's 'captureTypeArg' and
+-- decide how to surface them at the Val level.
+--------------------------------------------------------------------------------
+
+-- | Names we short-circuit when seen as the @f@ in @f \@T@ (value-level
+-- TypeApplications).  Used so @symbolVal \@\"email\" undefined@,
+-- @natVal \@42 undefined@, etc. can resolve without needing a typechecker
+-- to synthesise the @KnownSymbol@ / @KnownNat@ dictionary.
+isTypeLitsFn :: Expr -> Bool
+isTypeLitsFn e = case headName e of
+    Just n  -> n `elem` typeLitsFnNames
+    Nothing -> False
+
+typeLitsFnNames :: [Name]
+typeLitsFnNames =
+    [ "symbolVal", "symbolVal'"
+    , "natVal",    "natVal'"
+    , "charVal",   "charVal'"
+    ]
+
+-- | Extract the outermost applied variable name from an expression.
+-- Unwraps any already-applied 'ETyApp'; stops at non-variable heads.
+-- Uses the unqualified name so @GHC.TypeLits.symbolVal@ matches too.
+headName :: Expr -> Maybe Name
+headName (EVar n)      = Just (stripQualifier n)
+headName (ETyApp e _)  = headName e
+headName _             = Nothing
+
+-- | Build a closure that mimics @symbolVal \@\"T\"@, @natVal \@42@, etc.
+-- The returned @VFun@ ignores its argument (typically an @undefined@
+-- proxy) and returns the parsed type literal.
+tyAppLitsClosure :: Maybe Name -> ByteString -> Val
+tyAppLitsClosure mname tyBytes = VFun $ \_arg -> do
+    payload <- parseTyArgLit tyBytes
+    case (mname, payload) of
+        -- symbolVal :: Proxy -> String — return a cons-list of Char.
+        (Just "symbolVal",  VLabel n) -> stringLitVal n
+        (Just "symbolVal'", VLabel n) -> stringLitVal n
+        (Just "symbolVal",  VInt  n) -> stringLitVal (BC.pack (show n))
+        (Just "symbolVal'", VInt  n) -> stringLitVal (BC.pack (show n))
+        -- natVal :: Proxy -> Integer — return VInt directly.
+        (Just "natVal",  VInt n) -> pure (VInt n)
+        (Just "natVal'", VInt n) -> pure (VInt n)
+        -- charVal :: Proxy -> Char — return VChar.
+        (Just "charVal",  VChar c) -> pure (VChar c)
+        (Just "charVal'", VChar c) -> pure (VChar c)
+        -- Fallbacks: honour the parsed value if its shape matches.
+        (_, VLabel n) -> stringLitVal n
+        (_, VInt   n) -> pure (VInt n)
+        (_, VChar  c) -> pure (VChar c)
+        (_, other) -> pure other
+
+-- | Parse the raw bytes from a type-application argument into a Val.
+--
+--   * @\"foo\"@           → @VLabel \"foo\"@
+--   * @42@                → @VInt 42@
+--   * @\'x\'@             → @VChar \'x\'@
+--   * @Proxy \"foo\"@     → @VLabel \"foo\"@ (strip type-con prefix)
+--   * anything else       → @VLabel bytes@ (best-effort: keep the text).
+--
+-- This is intentionally forgiving — the evaluator never demands a full
+-- type parse; we just recover what DataKinds can lift to the value
+-- level.  When the bytes start with a constructor (e.g. @Proxy \"x\"@
+-- from a @(Proxy :: Proxy \"x\")@ annotation) we fall back to scanning
+-- the bytes for the first @\"…\"@ / numeric literal.
+parseTyArgLit :: ByteString -> IO Val
+parseTyArgLit bs0 =
+    let bs = stripParens bs0
+    in if BS.null bs
+           then pure (VLabel bs)
+           else case BC.head bs of
+               '"' -> pure (VLabel (stripOuter '"' bs))
+               '\'' -> case BC.unpack (stripOuter '\'' bs) of
+                   [c]  -> pure (VChar c)
+                   _    -> pure (VLabel bs)
+               c | c == '-' || (c >= '0' && c <= '9') ->
+                   case BC.readInteger bs of
+                       Just (n, rest)
+                         | BS.null (BC.dropWhile isAsciiSpace rest) ->
+                             pure (VInt (fromInteger n))
+                       _ -> pure (VLabel bs)
+                 | otherwise ->
+                     -- Constructor/type-name prefix (e.g. @Proxy "email"@)
+                     -- — rescan looking for the first lifted literal.
+                     case findInnerLit bs of
+                         Just v  -> pure v
+                         Nothing -> pure (VLabel bs)
+  where
+    stripOuter q s =
+        let s'  = if not (BS.null s) && BC.head s == q then BS.tail s else s
+            s'' = if not (BS.null s') && BC.last s' == q
+                    then BS.init s' else s'
+        in s''
+
+    -- Strip outer @( … )@ pairs iteratively. Type applications may come
+    -- in via @(Proxy "email")@.
+    stripParens s =
+        let t = trimAsciiSpace s
+        in if BS.length t >= 2 && BC.head t == '(' && BC.last t == ')'
+              then stripParens (BS.init (BS.tail t))
+              else t
+
+    trimAsciiSpace s =
+        BC.dropWhile isAsciiSpace
+            (BC.reverse (BC.dropWhile isAsciiSpace (BC.reverse s)))
+
+    isAsciiSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    -- Find the first string literal, character literal, or nat literal
+    -- embedded in the bytes.  Used to dig a DataKinds literal out of a
+    -- @Proxy "x"@ / @Proxy 42@ style annotation.
+    findInnerLit :: ByteString -> Maybe Val
+    findInnerLit s
+        | BS.null s = Nothing
+        | otherwise = case BC.head s of
+            '"' ->
+                -- Consume up to the next unescaped quote.
+                let rest = BS.tail s
+                in case BC.elemIndex '"' rest of
+                    Just i  -> Just (VLabel (BS.take i rest))
+                    Nothing -> Nothing
+            '\'' ->
+                -- Char literal: '\X' or 'X'. Look for closing quote.
+                let rest = BS.tail s
+                in case BC.elemIndex '\'' rest of
+                    Just i | i >= 1 -> case BC.unpack (BS.take i rest) of
+                        [c]        -> Just (VChar c)
+                        ['\\', c]  -> Just (VChar c)
+                        _          -> findInnerLit (BS.drop (i + 1) rest)
+                    _ -> findInnerLit (BS.tail s)
+            c | c >= '0' && c <= '9' ->
+                case BC.readInteger s of
+                    Just (n, _) -> Just (VInt (fromInteger n))
+                    Nothing     -> findInnerLit (BS.tail s)
+              | otherwise -> findInnerLit (BS.tail s)
+
+-- | Produce a Haskell @[Char]@ (cons-chain) Val from raw UTF-8 bytes.
+stringLitVal :: ByteString -> IO Val
+stringLitVal bs = go (BC.unpack bs)
+  where
+    go [] = pure (VCon "[]" [])
+    go (c:cs) = do
+        cT    <- newWHNFThunk (VChar c)
+        restV <- go cs
+        restT <- newWHNFThunk restV
+        pure (VCon ":" [cT, restT])
 
 -- | Try to match a pattern against a (already-WHNF) value. Returns
 -- the variable bindings introduced by the pattern, or 'Nothing'.
@@ -259,6 +447,10 @@ matchPat (PLit (LChar c)) (VChar d)
 matchPat (PLit (LChar _)) _      = pure Nothing
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
 matchPat (PCon "()" []) VUnit = pure (Just [])
+-- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@
+-- but pattern @Proxy@ (nullary) should still match — the payload is
+-- type-level metadata that user code doesn't observe via the ctor.
+matchPat (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For

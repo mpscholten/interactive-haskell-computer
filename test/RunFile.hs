@@ -951,6 +951,14 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "1\nJust 7\n"
 
+    it "DataKinds: symbolVal / natVal recover lifted literals at runtime" do
+        -- Covers both the @(Proxy :: Proxy "foo")@ annotation form and
+        -- the @(Proxy @"foo")@ TypeApplications form, for Symbol and Nat
+        -- kinds.
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/symbol_val.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\nworld\n42\n99\n"
+
 
     it "IsLabel dispatch: user-defined instance overrides default Proxy" do
         (n, out) <- captureStdout
