@@ -2908,9 +2908,25 @@ buildConEnv reg = do
 --
 -- > f (Con _ _ ... x _ ...) = x  -- where x is at position i
 --
--- If a field name appears in multiple constructors (unusual but legal) we
--- generate a single function that tries each one in order and falls back
--- to an @error@ on mismatch.
+-- When a field name appears in multiple constructors we generate a single
+-- accessor that dispatches on the VCon's constructor name at runtime.
+-- This is what makes @DuplicateRecordFields@ work: given
+--
+-- > data User    = User    { name :: String, age   :: Int }
+-- > data Product = Product { name :: String, price :: Int }
+--
+-- Scan merges both @name@ entries into the FieldRegistry as
+-- @name -> [("User", 0), ("Product", 0)]@; the accessor below then
+-- looks up the actual constructor name of its VCon argument. The
+-- runtime constructor name IS the type tag, so no separate "pick
+-- accessor matching typeTagOf arg" step is needed.
+--
+-- Record construction (@User { name = "Alice" }@) is already
+-- constructor-qualified at the AST level (@ERecordCon "User" ...@),
+-- so Scheduler.desugarRecordCons picks the right field index via the
+-- registry's @(conName, idx)@ pairs. Record update (@u { name = ... }@)
+-- case-splits on every constructor that owns the field — see
+-- @desugarRecordCons@'s ERecordUpdate arm.
 --
 -- The accessor is a plain @VFun@ so it participates in lazy evaluation.
 buildFieldEnv :: FieldRegistry -> IO Env

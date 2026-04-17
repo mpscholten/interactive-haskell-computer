@@ -620,6 +620,14 @@ type DataRegistry = Map ByteString (ByteString, Int, Int)
 -- | Map from record-field name to a list of @(constructor name, field index)@
 -- pairs. Used by 'IHC.Builtins.buildFieldEnv' to generate field-accessor
 -- functions automatically.
+--
+-- The list-valued codomain is what supports @DuplicateRecordFields@:
+-- two different constructors declaring a field of the same name both
+-- contribute entries to the same key. @collectCtors@ uses
+-- @Map.insertWith (++)@ so no entry is lost. At runtime the accessor
+-- built by 'IHC.Builtins.buildFieldEnv' dispatches on the VCon's
+-- constructor name — which is the observable type tag — to pick the
+-- right index.
 type FieldRegistry = Map ByteString [(ByteString, Int)]
 
 -- | Map from type-constructor name to the list of data-constructor names
