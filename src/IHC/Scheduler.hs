@@ -400,21 +400,60 @@ effectiveExports registry thunkByKey lm visited = do
                             effectiveExports registry thunkByKey reLm (m : visited)
                         _ -> pure []
 
-    -- Look up @n@ exported from @lm'@: first try the direct qualified key,
-    -- then fall back to a suffix search (for named re-exports whose binding
-    -- lives in a different module — e.g. Data.List exports `map` but it's
-    -- keyed as "Data.OldList.map" or "GHC.List.map").
+    -- Look up @n@ exported from @lm'@:
+    --   1. First try @lm'@'s own direct qualified key (name defined
+    --      locally in the module).
+    --   2. Then walk @lm'@'s unqualified imports, respecting each
+    --      import's filter (ImportOnly/ImportHiding). This is the
+    --      multi-level re-export chain: e.g. @Data.List@ lists
+    --      @sort@ in its export list but the definition lives in
+    --      @Data.OldList@, reached via
+    --      @import Data.OldList hiding (all, and, ...)@.  The chain
+    --      can extend further (Data.OldList → GHC.OldList → GHC.List)
+    --      so we recurse through 'lookupName' (cycle-guarded via
+    --      @visitedImports@) until we find a module whose direct
+    --      qualified key is in @thunkByKey@.
+    --   3. As a last-resort fallback, a plain suffix search catches
+    --      cases where a module was loaded outside the declared
+    --      import graph (e.g. via 'preloadImportsForNamedReexports'
+    --      but not reachable through the static import list).
     lookupName lm' n =
+        lookupNameIn [lmName lm'] lm' n
+
+    lookupNameIn visitedImports lm' n =
         let prefix = lmName lm' <> BC.pack "."
             suffix = BC.pack "." <> n
         in case Map.lookup (prefix <> n) thunkByKey of
             Just t  -> pure [(n, t)]
-            Nothing ->
-                -- Suffix search: any key ending in ".n".
-                case [ t | (k, t) <- Map.toList thunkByKey
-                          , suffix `isSuffixOf` k ] of
-                    (t:_) -> pure [(n, t)]
-                    []    -> pure []
+            Nothing -> do
+                -- Walk the module's own unqualified imports, filtered
+                -- by the import spec (ImportHiding / ImportOnly).
+                let viaImports = filter (\i ->
+                            not (impQualified i)
+                         && impModule i /= BC.pack "Prelude"
+                         && impModule i `notElem` visitedImports
+                         && specAllows (impSpec i) n)
+                        (mhImports (lmHeader lm'))
+                reg <- readIORef registry
+                foundViaImports <- goImports reg viaImports
+                case foundViaImports of
+                    (p:_) -> pure [p]
+                    [] ->
+                        -- Last-resort suffix search.
+                        case [ t | (k, t) <- Map.toList thunkByKey
+                                 , suffix `isSuffixOf` k ] of
+                            (t:_) -> pure [(n, t)]
+                            []    -> pure []
+      where
+        goImports _   []         = pure []
+        goImports reg (imp:rest) =
+            case Map.lookup (impModule imp) reg of
+                Just (Loaded viaLm) -> do
+                    ps <- lookupNameIn (impModule imp : visitedImports) viaLm n
+                    case ps of
+                        []  -> goImports reg rest
+                        xs  -> pure xs
+                _ -> goImports reg rest
 
 -- | Pre-load and discover all modules and bindings that will be needed by
 -- 'effectiveExports' for @lm@.  Unlike 'discoverInModule' / 'resolveImport',
