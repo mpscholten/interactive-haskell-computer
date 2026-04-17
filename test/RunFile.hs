@@ -887,6 +887,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "60\n"
 
+    it "RecordWildCards: Foo {..} in pattern binds fields, in expression reads them" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/record_wildcards.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n30\n"
+
     it "Lazy pattern: let ~(x, y) = ... binds through the tuple" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/lazy_pat.hs")
         n   `shouldBe` 0
