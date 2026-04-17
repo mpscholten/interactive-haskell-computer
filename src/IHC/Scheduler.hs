@@ -39,6 +39,9 @@ module IHC.Scheduler
     , ModuleRegistry
     , freeVars
     , splitQualified
+      -- * User-defined class dispatch (used by the REPL)
+    , classMethodDispatcher
+    , defaultTypeTag
     ) where
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try)
@@ -57,9 +60,9 @@ import System.FilePath ((</>), takeDirectory)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
-import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance)
+import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, lookupInstance, typeTagOf)
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
-import IHC.Eval (force)
+import IHC.Eval (force, apply)
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
 import qualified IHC.Parser as Parser
@@ -177,6 +180,13 @@ loadProgramFromSource searchPath src0 = do
     -- Drive discovery from `main`.
     discoverInModule registry fullSearchPath includeMap entry "main"
 
+    -- Discover free variables of class default-method bodies and
+    -- instance method bodies across every loaded module so those names
+    -- are in the tied env before methods are evaluated. Without this,
+    -- `class Foo a where m x = helper x` with `helper` at top-level
+    -- would fail with 'unbound variable `helper`' at dispatch time.
+    discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
+
     -- Collect every loaded module.
     reg <- readIORef registry
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
@@ -184,10 +194,19 @@ loadProgramFromSource searchPath src0 = do
     -- Union data registries and field registries across all modules.
     let unionedData  = foldr Map.union Map.empty (map lmDataReg  loadedModules)
         unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+        unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldEnv unionedFields
     builtins <- builtinEnv classReg
-    let base = Map.union builtins (Map.union fieldEnv conEnv)
+    let baseNoClass = Map.union builtins (Map.union fieldEnv conEnv)
+    -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
+    -- scanClassDecls). For every `class C a where m :: ...` declaration in
+    -- any loaded module, bind `m` as a top-level dispatcher that looks up
+    -- `(C, typeTagOf firstArg)` in the ClassRegistry and applies the
+    -- selected instance method. Names that collide with built-in
+    -- dispatchers (e.g. show/==/compare) are skipped.
+    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
+    let base = Map.union classMethodEnv baseNoClass
 
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
@@ -245,7 +264,11 @@ loadProgramFromSource searchPath src0 = do
     -- and register their method vals into the ClassRegistry. This must
     -- happen AFTER the env is fully tied so instance bodies can see all
     -- bindings (including recursive ones).
-    mapM_ (registerInstancesFrom classReg env) loadedModules
+    mapM_ (registerInstancesFrom classReg unionedTypeCtors env) loadedModules
+    -- Register class-level default method bodies under the sentinel tag
+    -- "<default>" so that the dispatcher can fall back to them when no
+    -- instance-specific override exists.
+    registerClassDefaults classReg env loadedModules
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -309,10 +332,13 @@ loadFileIntoEnv searchPath path existingEnv = do
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
     let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules)
         unionedFields = foldr Map.union Map.empty (map lmFieldReg loadedModules)
+        unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
     conEnv    <- buildConEnv  unionedData
     fieldEnv' <- buildFieldEnv unionedFields
     builtins  <- builtinEnv classReg
-    let base = Map.union builtins (Map.union fieldEnv' conEnv)
+    let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
+    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
+    let base = Map.union classMethodEnv baseNoClass
     -- Phase 2.11: expand TH splices.
     mapM_ (expandSplicesInModule base) loadedModules
     -- Build (key, Expr) pairs.  Entry module bindings are keyed bare.
@@ -327,7 +353,8 @@ loadFileIntoEnv searchPath path existingEnv = do
                writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
           (zip qualPairs slots)
     -- Register type-class instances.
-    mapM_ (registerInstancesFrom classReg innerEnv) loadedModules
+    mapM_ (registerInstancesFrom classReg unionedTypeCtors innerEnv) loadedModules
+    registerClassDefaults classReg innerEnv loadedModules
     -- If the file has no `main` binding, inject `main = ()` so that the
     -- REPL user can type `main` without getting "unbound variable main".
     -- This matches the old :load behaviour and keeps the no_main regression
@@ -737,10 +764,13 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
         unionedFields  = foldr Map.union Map.empty (map lmFieldReg loadedModules0)
+        unionedTypeCtors0 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
     conEnv    <- buildConEnv unionedData
     fieldEnv' <- buildFieldEnv unionedFields
     builtins  <- builtinEnv classReg
-    let baseForImport = Map.union builtins (Map.union fieldEnv' conEnv)
+    let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
+    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
+    let baseForImport = Map.union classMethodEnv baseNoClass
     mapM_ (expandSplicesInModule baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
@@ -780,7 +810,8 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
           (zip qualPairs slots)
-    mapM_ (registerInstancesFrom classReg innerEnv) loadedModules0
+    mapM_ (registerInstancesFrom classReg unionedTypeCtors0 innerEnv) loadedModules0
+    registerClassDefaults classReg innerEnv loadedModules0
     let additions  = Map.difference aliasEnv existingEnv
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
@@ -816,13 +847,19 @@ expandSplicesInModule spliceEnv lm = do
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
 -- resulting dict in the ClassRegistry.
-registerInstancesFrom :: ClassRegistry -> Env -> LoadedModule -> IO ()
-registerInstancesFrom classReg env lm = do
+--
+-- @typeCtors@ maps every user-declared type constructor to the list of
+-- its data-constructor names (e.g. @\"Color\" -> [\"Red\", \"Green\", \"Blue\"]@).
+-- Since 'typeTagOf' returns the data-constructor name at runtime, we
+-- register each instance under the type's head name AND under every
+-- data-constructor name so dispatch can find it either way.
+registerInstancesFrom :: ClassRegistry -> TypeCtorRegistry -> Env -> LoadedModule -> IO ()
+registerInstancesFrom classReg typeCtors env lm = do
     decls <- scanInstanceDecls (lmSource lm)
-    mapM_ (registerOne classReg env lm) decls
+    mapM_ (registerOne classReg typeCtors env lm) decls
 
-registerOne :: ClassRegistry -> Env -> LoadedModule -> InstanceDecl -> IO ()
-registerOne classReg env lm (InstanceDecl cls typ methods) = do
+registerOne :: ClassRegistry -> TypeCtorRegistry -> Env -> LoadedModule -> InstanceDecl -> IO ()
+registerOne classReg typeCtors env lm (InstanceDecl cls typ methods) = do
     -- Evaluate each method; skip the entire instance if any method fails
     -- (e.g. unbound variable in a transitive library dependency).  A failed
     -- instance just means class-dispatch won't find that instance at runtime
@@ -830,7 +867,19 @@ registerOne classReg env lm (InstanceDecl cls typ methods) = do
     r <- try (mapM (evalMethod env lm) methods) :: IO (Either SomeException [Val])
     case r of
         Left  _ -> pure ()   -- silently skip unresolvable instances
-        Right methodVals -> registerInstance classReg cls typ methodVals
+        Right methodVals -> do
+            -- Register under the head type name (used by Bool/Int/Char/String
+            -- dispatch via 'typeTagOf' specializations).
+            registerInstance classReg cls typ methodVals
+            -- Also register under every data constructor of that type so
+            -- that 'typeTagOf (VCon n _) = n' lookups succeed for user
+            -- ADTs like @data Color = Red | Green | Blue@.
+            case Map.lookup typ typeCtors of
+                Just ctors ->
+                    mapM_ (\ctor ->
+                              registerInstance classReg cls ctor methodVals)
+                          ctors
+                Nothing -> pure ()
 
 evalMethod :: Env -> LoadedModule -> (ByteString, BindingLhs) -> IO Val
 evalMethod env lm (_, lhs) = do
@@ -841,6 +890,130 @@ evalMethod env lm (_, lhs) = do
     -- Evaluate the method expression to a Val in the global env.
     -- We need Eval here but can't import it (cycle). Use a thunk trick:
     -- make a thunk and force it immediately.
+    t <- newThunk env expr
+    force t
+
+--------------------------------------------------------------------------------
+-- User-defined class method dispatchers
+--
+-- For every @class C a where m1 :: ..., m2 :: ..., ...@ declaration we
+-- synthesize a top-level binding @m_i = dispatcher C "m_i" i@. The
+-- dispatcher forces its first argument, looks up the
+-- @(C, typeTagOf firstArg)@ slot in the ClassRegistry, and applies the
+-- instance's method value to the original thunk (currying through any
+-- remaining arguments). If no instance is registered for that type, it
+-- falls back to the class-level default body (stored in the registry
+-- under the sentinel type-tag "<default>").
+--
+-- Method names that collide with existing names in the base env
+-- (e.g. the pre-registered 'show', '==' builtins, or an instance
+-- method name already added through another class) are skipped so the
+-- original behaviour is preserved.
+--------------------------------------------------------------------------------
+
+-- | Sentinel type tag used to store class-level default method bodies in
+-- the ClassRegistry. A dispatcher falls back to this slot when no
+-- instance is registered for the argument's type tag.
+defaultTypeTag :: ByteString
+defaultTypeTag = BC.pack "<default>"
+
+-- | Build a dispatcher Val for a single class method.
+--
+-- @classMethodDispatcher reg cls slot methodName@ returns a VFun that,
+-- when applied to its first argument, looks up the instance dict for
+-- the argument's type tag and re-applies the instance method at the
+-- given slot. Remaining arguments (if any) flow through naturally via
+-- the returned VFun's own arity.
+classMethodDispatcher :: ClassRegistry -> ByteString -> Int -> ByteString -> Val
+classMethodDispatcher reg cls slot methodName = VFun $ \argT -> do
+    av <- force argT
+    let tag = typeTagOf av
+    mMethods <- lookupInstance reg cls tag
+    case mMethods of
+        Just methods | slot < length methods ->
+            apply (methods !! slot) argT
+        _ -> do
+            mDef <- lookupInstance reg cls defaultTypeTag
+            case mDef of
+                Just defs | slot < length defs ->
+                    apply (defs !! slot) argT
+                _ -> error ( "class-method dispatch: no instance of `"
+                            <> BC.unpack cls
+                            <> "` for type `" <> BC.unpack tag
+                            <> "` (method `" <> BC.unpack methodName <> "`)" )
+
+-- | Build an Env containing a dispatcher thunk for every method of every
+-- user-defined class visible in any loaded module. Method-name collisions
+-- with 'existing' (builtins, constructors, real bindings) are skipped —
+-- those names already have a correct definition.
+buildClassMethodEnv
+    :: ClassRegistry
+    -> Env            -- ^ env of names we should NOT shadow (e.g. builtins)
+    -> [LoadedModule]
+    -> IO Env
+buildClassMethodEnv classReg existing loadedModules = do
+    decls <- concat <$> mapM (\lm -> scanClassDecls (lmSource lm)) loadedModules
+    -- Build each method as (name, thunk). Later entries overwrite earlier
+    -- so a later class with the same method name "wins", but this only
+    -- happens in pathological source; typical modules don't clash.
+    pairs <- concat <$> mapM buildOne decls
+    let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
+    pure (Map.fromList filtered)
+  where
+    buildOne (ClassDecl cls methodNames _defaults) =
+        mapM (mkMethodEntry cls) (zip [0..] methodNames)
+    mkMethodEntry cls (slot, methodName) = do
+        let v = classMethodDispatcher classReg cls slot methodName
+        t <- newWHNFThunk v
+        pure (methodName, t)
+
+-- | After the environment is fully tied, evaluate each class's default
+-- method bodies in that env and register them in the ClassRegistry under
+-- the sentinel type tag '<default>'. The dispatcher falls back to these
+-- when no real instance is registered for a given type.
+--
+-- Slot layout mirrors the method-name ordering from 'scanClassDecls'
+-- (alphabetical), so a default-body slot may be filled with a sentinel
+-- error Val if there is no default for that particular method. At
+-- dispatch time the dispatcher applies that Val only for the exact slot
+-- it needs, so unused defaults never trip.
+registerClassDefaults :: ClassRegistry -> Env -> [LoadedModule] -> IO ()
+registerClassDefaults classReg env loadedModules =
+    mapM_ oneModule loadedModules
+  where
+    oneModule lm = do
+        decls <- scanClassDecls (lmSource lm)
+        mapM_ (oneClass lm) decls
+
+    oneClass lm (ClassDecl cls methodNames defaults)
+        | Map.null defaults = pure ()
+        | otherwise = do
+            -- Evaluate each method slot: either the parsed default body
+            -- or a host Val that errors if dispatched to.
+            vals <- mapM (slotVal lm cls defaults) methodNames
+            registerInstance classReg cls defaultTypeTag vals
+
+    slotVal lm cls defaults methodName =
+        case Map.lookup methodName defaults of
+            Just lhs -> do
+                r <- try (evalDefaultMethod env lm lhs)
+                        :: IO (Either SomeException Val)
+                case r of
+                    Right v -> pure v
+                    Left  _ -> pure (placeholder cls methodName)
+            Nothing -> pure (placeholder cls methodName)
+
+    placeholder cls methodName = VFun $ \_ -> error
+        ( "class-method `" <> BC.unpack methodName
+       <> "` of class `"   <> BC.unpack cls
+       <> "`: no instance and no default implementation" )
+
+evalDefaultMethod :: Env -> LoadedModule -> BindingLhs -> IO Val
+evalDefaultMethod env lm lhs = do
+    expr0 <- Parser.parseBodyExprWithFixity
+                (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+    let expr = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0)
     t <- newThunk env expr
     force t
 
@@ -1154,9 +1327,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     internalPairs <- concat <$> mapM (internalAliases thunkByKey) allModules
     pure (Map.fromList (internalPairs ++ entryPairs))
   where
-    aliasesForImport thunkByKey imp
-        | impModule imp == BC.pack "Prelude" = pure []
-        | otherwise = do
+    aliasesForImport thunkByKey imp = do
             -- We need to know which names the target module actually
             -- exports. We only have the loaded registry, so look it up.
             reg <- readIORef registry
@@ -1278,12 +1449,50 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
 loadEntryModule :: ModuleRegistry -> Source -> IO LoadedModule
 loadEntryModule registry src = do
     (mHeader, _) <- parseModuleHeader src startCursor
-    let header = fromMaybe emptyHeader mHeader
-        name   = fromMaybe (BC.pack "Main") (mhName header)
+    let header0 = fromMaybe emptyHeader mHeader
+        name    = fromMaybe (BC.pack "Main") (mhName header0)
+        header  = addImplicitPrelude name src header0
     writeIORef registry (Map.singleton name Loading)
     lm <- buildLoadedModule name True header src
     modifyIORef' registry (Map.insert name (Loaded lm))
     pure lm
+
+-- | Inject an implicit @import Prelude@ at the head of @mhImports@ unless:
+--
+--   * the module IS Prelude itself (the base Prelude module),
+--   * the source already contains a @\{-# LANGUAGE NoImplicitPrelude #-\}@
+--     pragma (opt-out), OR
+--   * the user wrote an explicit @import Prelude@ / @import qualified Prelude@
+--     in their source (any form of explicit import disables the implicit one,
+--     matching GHC).
+--
+-- This mirrors Haskell 2010 / GHC behaviour: every module gets an implicit
+-- @import Prelude@ unless it opts out.  The implicit import is prepended so
+-- that later explicit imports can shadow/override it.
+addImplicitPrelude :: ModuleName -> Source -> ModuleHeader -> ModuleHeader
+addImplicitPrelude modName src hdr
+    | modName == BC.pack "Prelude"        = hdr
+    | hasNoImplicitPrelude src            = hdr
+    | any isPreludeImport (mhImports hdr) = hdr
+    | otherwise = hdr { mhImports = implicitPreludeImport : mhImports hdr }
+  where
+    isPreludeImport imp = impModule imp == BC.pack "Prelude"
+
+implicitPreludeImport :: ImportDecl
+implicitPreludeImport = ImportDecl
+    { impModule    = BC.pack "Prelude"
+    , impQualified = False
+    , impAlias     = Nothing
+    , impSpec      = ImportAll
+    }
+
+-- | Check whether the source bytes contain a @\{-# LANGUAGE NoImplicitPrelude #-\}@
+-- pragma.  Used to opt out of the implicit Prelude injection.  This is a cheap
+-- substring test; it does not try to parse pragmas properly (a LANGUAGE pragma
+-- with multiple extensions including NoImplicitPrelude still matches).
+hasNoImplicitPrelude :: Source -> Bool
+hasNoImplicitPrelude src =
+    BC.pack "NoImplicitPrelude" `BC.isInfixOf` srcBytes src
 
 -- | Locate, read, parse, and register a module. Returns the
 -- 'LoadedModule' (and reuses a cached one on subsequent calls).
@@ -1483,6 +1692,58 @@ isLocalCacheModule searchPath name = do
                 Just _  -> pure True   -- found anywhere is OK (we blocked bare GHC.* above)
 
 --------------------------------------------------------------------------------
+-- Class / instance body free-var discovery
+--------------------------------------------------------------------------------
+
+-- | Walk every loaded module's class default-method bodies and instance
+-- method bodies, parse each one, collect free variables, and drive
+-- 'discoverInModule' for every free var so the names are pre-loaded
+-- before 'registerInstancesFrom' / 'registerClassDefaults' evaluate the
+-- bodies against the tied env.
+--
+-- This fills the gap left by demand-driven discovery, which only walks
+-- free vars reachable from @main@. Class/instance method bodies are not
+-- reachable from @main@ via the expression-tree walk — they live in
+-- metadata the scheduler only inspects at registration time.
+discoverClassAndInstanceFreeVars
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> IO ()
+discoverClassAndInstanceFreeVars registry searchPath includeMap = do
+    reg <- readIORef registry
+    let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
+    mapM_ discoverOne loadedModules
+  where
+    discoverOne lm = do
+        -- Instance method bodies.
+        instDecls  <- scanInstanceDecls (lmSource lm)
+        mapM_ (discoverMethods lm)
+              [ (n, lhs) | InstanceDecl _ _ ms <- instDecls, (n, lhs) <- ms ]
+        -- Class default-method bodies.
+        classDecls <- scanClassDecls (lmSource lm)
+        mapM_ (discoverMethods lm)
+              [ (n, lhs)
+              | ClassDecl _ _ defs <- classDecls
+              , (n, lhs) <- Map.toList defs
+              ]
+
+    discoverMethods lm (_, lhs) = do
+        r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
+                     (lhsClauses lhs))
+                :: IO (Either SomeException Expr)
+        case r of
+            Left _     -> pure ()
+            Right expr -> mapM_ (discoverFree lm) (freeVars expr)
+
+    discoverFree lm name = do
+        r <- try (discoverInModule registry searchPath includeMap lm name)
+                :: IO (Either SomeException ())
+        case r of
+            Right () -> pure ()
+            Left  _  -> pure ()   -- tolerate unresolved names
+
+--------------------------------------------------------------------------------
 -- Demand-driven discovery
 --------------------------------------------------------------------------------
 
@@ -1620,8 +1881,6 @@ resolveImport registry searchPath includeMap lm name = do
   where
     tryImports [] = pure Nothing
     tryImports (imp:rest)
-        -- Prelude is handled as a global-builtin no-op for Phase 2.5.
-        | impModule imp == BC.pack "Prelude" = tryImports rest
         | not (specAllows (impSpec imp) name) = tryImports rest
         | otherwise = do
             -- Load-guard: don't eagerly load cache modules that could pull in

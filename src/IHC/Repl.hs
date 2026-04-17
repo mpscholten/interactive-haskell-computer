@@ -36,13 +36,15 @@ import IHC.Eval (eval, force, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), ImportSpec(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
-import IHC.Scan (scanDataDecls, scanInstanceDecls, InstanceDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
+import IHC.Scan (scanDataDecls, scanInstanceDecls, scanClassDecls, InstanceDecl(..), ClassDecl(..), BindingLhs(..), emptyKnownSymbols, findBinding)
 import IHC.Scheduler
     ( buildBaseEnv
     , freeVars
     , loadImportIntoEnv
     , loadFileIntoEnv
     , splitQualified
+    , classMethodDispatcher
+    , defaultTypeTag
     )
 import IHC.Source (mkSource, Source(..))
 import IHC.TypeDescribe (describeType)
@@ -91,7 +93,7 @@ dispatch envRef classReg loadedRef importsRef line =
         ("data":_)       -> doDataDecl envRef line >> pure True
         ("newtype":_)    -> doDataDecl envRef line >> pure True
         ("type":_)       -> doTypeDecl line >> pure True
-        ("class":_)      -> doClassDecl line >> pure True
+        ("class":_)      -> doClassDecl envRef classReg line >> pure True
         ("instance":_)   -> doInstanceDecl envRef classReg line >> pure True
         _                -> evalLine envRef classReg loadedRef importsRef line >> pure True
 
@@ -310,51 +312,91 @@ doTypeDecl line =
             outputStrLn "type synonym (not checked in ihc)"
 
 -- | Handle @class C a where foo :: a -> a@ at the REPL.
--- We do a lightweight scan to count the method signatures/defaults declared
--- in the @where@ block, then register the class name in the output.
--- No ClassRegistry entry is created — dispatch is resolved at instance time.
-doClassDecl :: String -> InputT IO ()
-doClassDecl line = do
-    let src     = mkSource "<repl>" (syntheticModule line)
-        methods = countClassMethods src
-        name    = extractClassName line
-        msg     = "class " <> name <> " with " <> show methods <> " method(s)"
-    outputStrLn msg
+-- Runs the real 'scanClassDecls' pipeline and:
+--
+--   * Binds each declared method as a top-level dispatcher in the REPL
+--     env via 'classMethodDispatcher' so @foo someVal@ at the prompt
+--     resolves to the registered instance for the argument's type.
+--   * Parses + evaluates any default-method bodies in the current env
+--     and stores them in the 'ClassRegistry' under the '<default>'
+--     sentinel tag so dispatch can fall back to them when no instance
+--     is registered for a given type.
+doClassDecl :: IORef Env -> ClassRegistry -> String -> InputT IO ()
+doClassDecl envRef classReg line = do
+    let src = mkSource "<repl>" (syntheticModule line)
+    r <- liftIO (tryClassDecl envRef classReg src)
+    case r of
+        Left  err -> outputStrLn ("Error: " <> err)
+        Right msg -> outputStrLn msg
 
--- | Count method declarations in a @class … where@ block by scanning
--- for indented (col > 1) identifier tokens that are followed eventually
--- by @::@ or @=@ on the same or continuation line.
--- Simplified heuristic: count distinct indented idents before @::@.
-countClassMethods :: Source -> Int
-countClassMethods src = go 0 False startCursor
+tryClassDecl :: IORef Env -> ClassRegistry -> Source -> IO (Either String String)
+tryClassDecl envRef classReg src = do
+    r <- try (scanClassDecls src) :: IO (Either SomeException [ClassDecl])
+    case r of
+        Left err -> pure (Left (show err))
+        Right [] -> pure (Left "no class declaration found (parse error?)")
+        Right (decl : _) -> do
+            env <- readIORef envRef
+            -- 1. Bind each method name as a dispatcher thunk.
+            dispatcherPairs <- mapM (mkDispatcher classReg (classClassName decl))
+                                    (zip [0..] (classMethodNames decl))
+            -- 2. Evaluate default method bodies (if any) in the current
+            --    env, producing a slot list keyed by method-name order.
+            defaults <- mapM (mkDefault env src decl)
+                             (classMethodNames decl)
+            let existing = [ n | (n, _) <- dispatcherPairs, Map.member n env ]
+            -- Names already bound in the REPL env (builtins like show/==/
+            -- compare or earlier user classes) are NOT overwritten — the
+            -- existing dispatcher/implementation stays in charge.
+            let newPairs = [ p | p@(n, _) <- dispatcherPairs, not (Map.member n env) ]
+            writeIORef envRef (Map.union (Map.fromList newPairs) env)
+            -- Register the default-method list under the sentinel tag.
+            case defaults of
+                [] -> pure ()
+                _  -> registerInstance classReg (classClassName decl)
+                                       defaultTypeTag defaults
+            let skippedNote
+                  | null existing = ""
+                  | otherwise = " (skipped " <> show (length existing)
+                                <> " existing name(s))"
+            pure (Right ( "class " <> BC.unpack (classClassName decl)
+                       <> " with " <> show (length (classMethodNames decl))
+                       <> " method(s)" <> skippedNote ))
+
+mkDispatcher
+    :: ClassRegistry
+    -> BC.ByteString
+    -> (Int, BC.ByteString)
+    -> IO (BC.ByteString, Thunk)
+mkDispatcher classReg cls (slot, methodName) = do
+    let v = classMethodDispatcher classReg cls slot methodName
+    t <- newWHNFThunk v
+    pure (methodName, t)
+
+-- | If the class declared a default body for this method, parse and
+-- evaluate it in @env@. Otherwise return a placeholder 'Val' that errors
+-- only if dispatched to for that slot. This mirrors
+-- 'IHC.Scheduler.registerClassDefaults'.
+mkDefault :: Env -> Source -> ClassDecl -> BC.ByteString -> IO Val
+mkDefault env src decl methodName =
+    case Map.lookup methodName (classDefaults decl) of
+        Just lhs -> do
+            r <- try (do
+                        expr <- parseBodyExprWithFixity src defaultFixityTable
+                                    (lhsClauses lhs)
+                        t <- newThunk env expr
+                        force t)
+                    :: IO (Either SomeException Val)
+            case r of
+                Right v -> pure v
+                Left  _ -> pure (placeholder (classClassName decl) methodName)
+        Nothing ->
+            pure (placeholder (classClassName decl) methodName)
   where
-    go !n inWhere cur =
-        let (tok, cur') = nextToken src cur
-        in case tkKind tok of
-            TkEof    -> n
-            TkWhere  -> go n True cur'
-            TkNewline -> go n inWhere cur'
-            TkIdent _
-                | inWhere && tkCol tok > 1 ->
-                    -- Count this as a method name; skip to end of this line.
-                    go (n + 1) inWhere (skipToLineEnd src cur')
-            _ -> go n inWhere cur'
-
-    skipToLineEnd s c =
-        let (tok, c') = nextToken s c
-        in case tkKind tok of
-            TkEof     -> c
-            TkNewline -> c'
-            _         -> skipToLineEnd s c'
-
--- | Extract the class name (first uppercase identifier after @class@).
-extractClassName :: String -> String
-extractClassName line =
-    case dropWhile (/= ' ') line of
-        []   -> "?"
-        rest -> case dropWhile (== ' ') rest of
-            []   -> "?"
-            rest2 -> takeWhile (\c -> c /= ' ' && c /= '\n') rest2
+    placeholder cls n = VFun $ \_ -> error
+        ( "class-method `" <> BC.unpack n
+       <> "` of class `"   <> BC.unpack cls
+       <> "`: no instance and no default implementation" )
 
 -- | Handle @instance C Int where foo x = x + 1@ at the REPL.
 -- Wraps the declaration in a synthetic module, scans with

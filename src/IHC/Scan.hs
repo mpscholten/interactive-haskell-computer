@@ -35,6 +35,9 @@ module IHC.Scan
       -- * Instance declarations
     , InstanceDecl(..)
     , scanInstanceDecls
+      -- * Class declarations
+    , ClassDecl(..)
+    , scanClassDecls
       -- * Phase 3.2 + 3.4: type family / type instance skip helper
     , skipTypeDecl
     ) where
@@ -454,16 +457,27 @@ findBinding src ref target = do
 -- If we fail to find either @=@ or @|@ on this line, returns Nothing so
 -- the caller can recover.
 scanOneClauseAfterName :: Source -> Cursor -> IO (Maybe (Clause, Cursor))
-scanOneClauseAfterName src curAfterName = do
+scanOneClauseAfterName src = scanOneClauseAfterNameAtCol src 1
+
+-- | Like 'scanOneClauseAfterName' but uses @minBodyCol@ as the column at
+-- or below which a subsequent line terminates the current clause body.
+-- For top-level bindings @minBodyCol == 1@ (the default). For methods
+-- inside an @instance C T where@ or @class C a where@ block, pass the
+-- column at which the method name was found; the body then ends at the
+-- next line starting at that column (the next sibling clause / method)
+-- or at any smaller column.
+scanOneClauseAfterNameAtCol :: Source -> Int -> Cursor -> IO (Maybe (Clause, Cursor))
+scanOneClauseAfterNameAtCol src minBodyCol curAfterName = do
     let patsStart = cPos (skipTrivia src curAfterName)
     mEqOrBar <- findEqOrBarOnLine src curAfterName
     case mEqOrBar of
         Nothing -> pure Nothing
-        Just (sepTokStart, cur1) -> do
+        Just (sepTokStart, _cur1) -> do
             -- RHS starts at sepTokStart (the `=` or `|` character).
-            -- Body extends to the next column-1 significant position.
+            -- Body extends to the next col <= minBodyCol significant
+            -- position (col 1 for top-level, method-indent for methods).
             let bodyStart = sepTokStart
-                bodyEnd   = findBodyEnd src bodyStart
+                bodyEnd   = findBodyEndAtCol src minBodyCol bodyStart
                 patsEnd   = sepTokStart
                 clause    = Clause (patsStart, patsEnd) (bodyStart, bodyEnd)
                 curAfter  = Cursor bodyEnd 0 1
@@ -518,23 +532,39 @@ findLineEnd s p = case peekByte s p of
 -- byte (the start of the next top-level binding). Indented continuation
 -- lines and blank lines are part of the body.
 findBodyEnd :: Source -> Pos -> Pos
-findBodyEnd s = scanBody
+findBodyEnd s = findBodyEndAtCol s 1
+
+-- | Like 'findBodyEnd' but terminates the body at the next line whose
+-- first non-whitespace byte is at column @<= minCol@. For top-level
+-- bindings pass @minCol == 1@. For methods inside an instance/class
+-- body pass the column at which the method identifier sits; this makes
+-- the body stop at the next sibling clause (same column) rather than
+-- greedily swallowing it.
+findBodyEndAtCol :: Source -> Int -> Pos -> Pos
+findBodyEndAtCol s minCol = scanBody
   where
     -- Keep scanning bytes; at each newline, decide whether the body
-    -- continues (next line is indented or blank) or ends.
+    -- continues (next line is indented deeper than minCol or blank) or
+    -- ends (next line starts at column <= minCol).
     scanBody p = case peekByte s p of
         Nothing   -> p
-        Just 0x0A -> checkNext (p + 1) p
-        Just 0x0D -> checkNext (p + 1) p
+        Just 0x0A -> checkNext (p + 1) p 1
+        Just 0x0D -> checkNext (p + 1) p 1
         Just _    -> scanBody (p + 1)
 
-    checkNext q lastNl = case peekByte s q of
-        Nothing   -> lastNl        -- EOF terminates body.
-        Just 0x20 -> scanBody q    -- space: indented continuation, keep going.
-        Just 0x09 -> scanBody q    -- tab: same.
-        Just 0x0A -> checkNext (q + 1) q   -- blank line, check after.
-        Just 0x0D -> checkNext (q + 1) q
-        Just _    -> lastNl        -- col-1 content: body ends at last newline.
+    -- @col@ tracks the 1-based column of the current position @q@ on
+    -- the new line. We consume leading spaces/tabs, then look at the
+    -- first non-whitespace byte: if its column is <= minCol, the body
+    -- ends at @lastNl@; otherwise the indented line is a continuation.
+    checkNext q lastNl !col = case peekByte s q of
+        Nothing   -> lastNl
+        Just 0x20 -> checkNext (q + 1) lastNl (col + 1)
+        Just 0x09 -> checkNext (q + 1) lastNl (col + 1)   -- treat tab as +1
+        Just 0x0A -> checkNext (q + 1) q 1                -- blank line
+        Just 0x0D -> checkNext (q + 1) q 1
+        Just _
+            | col <= minCol -> lastNl                     -- sibling / top-level
+            | otherwise     -> scanBody q                 -- deeper indent
 
 --------------------------------------------------------------------------------
 -- Phase 3.2 + 3.4: type family / type instance skip helper
@@ -1094,12 +1124,12 @@ scanInstanceDecls src = go [] startCursor
                 case mSkip of
                     Just curAfter -> scanMethods acc curAfter
                     Nothing -> do
-                        mClause <- scanOneClauseAfterName src cur'
+                        mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'
                         case mClause of
                             Nothing -> scanMethods acc cur'
                             Just (clause, curNext) -> do
                                 (moreClauses, curFinal) <-
-                                    collectInstanceClauses name [clause] curNext
+                                    collectInstanceClauses name (tkCol tok) [clause] curNext
                                 let lhs  = BindingLhs (reverse moreClauses)
                                     acc' = Map.insert name lhs acc
                                 scanMethods acc' curFinal
@@ -1121,7 +1151,7 @@ scanInstanceDecls src = go [] startCursor
                                         curAfter <- skipInstanceSigType (tkCol tok) cur'''
                                         scanMethods acc curAfter
                                     _ -> do
-                                        mClause <- scanOneClauseAfterName src cur'''
+                                        mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'''
                                         case mClause of
                                             Nothing -> scanMethods acc cur'
                                             Just (clause, curNext) -> do
@@ -1142,15 +1172,15 @@ scanInstanceDecls src = go [] startCursor
             _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (Map.toList acc)
               | otherwise -> scanMethods acc cur'
 
-    collectInstanceClauses name acc cur = do
+    collectInstanceClauses name bindCol acc cur = do
         let (tok, curAfter) = peekSig cur
         case tkKind tok of
-            TkIdent n | n == name && tkCol tok > 1 -> do
-                mClause <- scanOneClauseAfterName src curAfter
+            TkIdent n | n == name && tkCol tok == bindCol -> do
+                mClause <- scanOneClauseAfterNameAtCol src bindCol curAfter
                 case mClause of
                     Nothing -> pure (acc, cur)
                     Just (cl, curNext) ->
-                        collectInstanceClauses name (cl : acc) curNext
+                        collectInstanceClauses name bindCol (cl : acc) curNext
             _ -> pure (acc, cur)
 
     peekSig cur0 =
@@ -1206,3 +1236,268 @@ scanInstanceDecls src = go [] startCursor
                 TkRBrace   | c > 0 -> go cur' b p (c - 1)
                 TkRBrace           -> pure cur
                 _          -> go cur' b p c
+
+--------------------------------------------------------------------------------
+-- Class declarations
+--------------------------------------------------------------------------------
+
+-- | One top-level @class C a where ...@ declaration.
+--
+-- 'classClassName' is the class name (first uppercase identifier after
+-- @class@, ignoring any optional @(ctx) =>@ superclass context).
+--
+-- 'classMethodNames' is the alphabetical list of every declared method
+-- name. The order matches what 'scanInstanceDecls' produces for instance
+-- bodies so that positional slot dispatch lines up.
+--
+-- 'classDefaults' is a Map from method-name to a 'BindingLhs' capturing
+-- a default-method body (if one is provided in the class body). Only
+-- methods with a default appear in the map.
+data ClassDecl = ClassDecl
+    { classClassName   :: !ByteString
+    , classMethodNames :: ![ByteString]
+    , classDefaults    :: !(Map ByteString BindingLhs)
+    } deriving (Eq, Show)
+
+-- | Scan the whole source for top-level @class@ declarations and return
+-- each one as a 'ClassDecl'. We mirror 'scanInstanceDecls': the class
+-- head is parsed loosely (we grab the first ConId after any optional
+-- context), the @where@-body is walked for both method-signature lines
+-- (@name[, name]* :: type@) and default-method bindings
+-- (@name pat* = expr@). Type sigs contribute to the method-name set;
+-- default bodies are captured as 'BindingLhs' byte-spans for later parse.
+--
+-- Method names are returned in alphabetical order so positional slot
+-- dispatch matches 'scanInstanceDecls' (which uses @Map.toList@).
+scanClassDecls :: Source -> IO [ClassDecl]
+scanClassDecls src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkClass | tkCol tok == 1 -> do
+                mDecl <- scanOneClass cur'
+                case mDecl of
+                    Nothing   -> go acc cur'
+                    Just decl -> go (decl : acc) cur'
+            _ -> go acc cur'
+
+    -- After `class`, parse head to find the class name, then walk the
+    -- `where` body collecting method sigs + default-method bindings.
+    scanOneClass cur0 = do
+        (mClassName, curWhere) <- parseClassHead cur0
+        case mClassName of
+            Just cls -> do
+                (methodNames, defaults) <- parseClassBody curWhere
+                pure (Just (ClassDecl cls methodNames defaults))
+            Nothing -> pure Nothing
+
+    -- Parse: [context =>] ClassName tyvar* where
+    -- Grab the first ConId AFTER any =>.  Stop at `where`.
+    parseClassHead cur0 = scanHead cur0 Nothing False
+      where
+        scanHead cur mCls seenArrow = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof    -> pure (mCls, cur)
+                TkWhere  -> pure (mCls, cur')
+                TkNewline -> scanHead cur' mCls seenArrow
+                -- `=>` ends the context; reset our candidate class name
+                -- so the NEXT ConId is the real class.
+                TkDArrow -> scanHead cur' Nothing True
+                TkConId n ->
+                    case mCls of
+                        Nothing -> scanHead cur' (Just n) seenArrow
+                        Just _  -> scanHead cur' mCls seenArrow
+                TkLParen -> do
+                    curAfter <- skipParensC 1 cur'
+                    scanHead curAfter mCls seenArrow
+                TkLBracket -> do
+                    curAfter <- skipBracketsC 1 cur'
+                    scanHead curAfter mCls seenArrow
+                _ -> scanHead cur' mCls seenArrow
+
+    skipParensC :: Int -> Cursor -> IO Cursor
+    skipParensC !d cur
+        | d <= 0    = pure cur
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLParen -> skipParensC (d + 1) cur'
+                TkRParen -> skipParensC (d - 1) cur'
+                TkEof    -> pure cur'
+                _        -> skipParensC d cur'
+
+    skipBracketsC :: Int -> Cursor -> IO Cursor
+    skipBracketsC !d cur
+        | d <= 0    = pure cur
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLBracket -> skipBracketsC (d + 1) cur'
+                TkRBracket -> skipBracketsC (d - 1) cur'
+                TkEof      -> pure cur'
+                _          -> skipBracketsC d cur'
+
+    -- Parse the `where` body of a class. Each binding is either:
+    --   * a type sig: `name[, name]* :: type`   — adds names to method set
+    --   * a default:  `name [pat*] = body`      — captured as BindingLhs
+    parseClassBody cur0 = scanBody Map.empty Map.empty cur0
+      where
+        -- @sigs@: Map from method-name to () (acts as a Set).
+        -- @defs@: Map from method-name to default BindingLhs.
+        scanBody !sigs !defs cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof     -> pure (finishBody sigs defs)
+                TkNewline -> scanBody sigs defs cur'
+                TkIdent name | tkCol tok > 1 -> do
+                    -- Check whether this line is a type sig. If so, collect
+                    -- every name before `::` and skip through the type.
+                    mSigNames <- trySkipClassSig (tkCol tok) name cur'
+                    case mSigNames of
+                        Just (names, curAfter) -> do
+                            let sigs' = foldr (`Map.insert` ()) sigs names
+                            scanBody sigs' defs curAfter
+                        Nothing -> do
+                            -- Default-method body: `name pat* = rhs` (or guards).
+                            mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'
+                            case mClause of
+                                Nothing -> scanBody sigs defs cur'
+                                Just (clause, curNext) -> do
+                                    (moreClauses, curFinal) <-
+                                        collectClassClauses name (tkCol tok) [clause] curNext
+                                    let lhs  = BindingLhs (reverse moreClauses)
+                                        defs' = Map.insert name lhs defs
+                                    scanBody sigs defs' curFinal
+                -- Operator methods: `(<>) :: ...` or `(<>) x y = ...`
+                TkLParen | tkCol tok > 1 -> do
+                    let (opTok, cur'') = nextToken src cur'
+                    case tkKind opTok of
+                        TkSymOp opName -> do
+                            let (closeTok, cur''') = nextToken src cur''
+                            case tkKind closeTok of
+                                TkRParen -> do
+                                    -- Peek: `::` means type sig, otherwise default.
+                                    let (peek, _) = peekSigC cur'''
+                                    case tkKind peek of
+                                        TkDColon -> do
+                                            mNames <- trySkipClassSig (tkCol tok) opName cur'''
+                                            case mNames of
+                                                Just (names, curAfter) -> do
+                                                    let sigs' = foldr (`Map.insert` ()) sigs names
+                                                    scanBody sigs' defs curAfter
+                                                Nothing -> scanBody sigs defs cur'
+                                        _ -> do
+                                            mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'''
+                                            case mClause of
+                                                Nothing -> scanBody sigs defs cur'
+                                                Just (clause, curNext) -> do
+                                                    let lhs  = BindingLhs [clause]
+                                                        defs' = Map.insert opName lhs defs
+                                                    scanBody sigs defs' curNext
+                                _ -> scanBody sigs defs cur'
+                        _ -> scanBody sigs defs cur'
+                -- Associated-type declarations inside class bodies: skip.
+                TkTypeKw | tkCol tok > 1 ->
+                    let lineEnd = findLineEnd src (cPos cur')
+                        curNext = Cursor lineEnd 0 (tkCol tok)
+                    in scanBody sigs defs curNext
+                -- Hit a new column-1 token: end of class body.
+                _ | tkCol tok == 1 && tkKind tok /= TkNewline ->
+                      pure (finishBody sigs defs)
+                  | otherwise -> scanBody sigs defs cur'
+
+        finishBody sigs defs =
+            -- Method-names = union of sigs and default-bodies, sorted.
+            let allNames = Map.keys (Map.union sigs (Map.map (const ()) defs))
+            in (allNames, defs)
+
+    -- | Try to parse a @name[, name]* :: type@ signature line inside the
+    -- class body. @firstName@ is the identifier at the start of the line
+    -- (already consumed by the caller). @cur@ is positioned just after
+    -- that identifier. Returns @Just (names, curAfter)@ if the line is a
+    -- signature.
+    trySkipClassSig bindCol firstName cur = do
+        let (t, c) = peekSigC cur
+        case tkKind t of
+            TkDColon -> do
+                curAfter <- skipClassSigType bindCol c
+                pure (Just ([firstName], curAfter))
+            TkComma -> do
+                -- Walk a comma-separated list of names.
+                (names, curAfter) <- collectSigNames [firstName] c
+                case names of
+                    [] -> pure Nothing
+                    _  -> pure (Just (names, curAfter))
+            _ -> pure Nothing
+
+    collectSigNames acc cur = do
+        let (t, c) = peekSigC cur
+        case tkKind t of
+            TkIdent n -> do
+                let (t2, c2) = peekSigC c
+                case tkKind t2 of
+                    TkComma  -> collectSigNames (n : acc) c2
+                    TkDColon -> do
+                        curAfter <- skipClassSigType 0 c2
+                        pure (reverse (n : acc), curAfter)
+                    _ -> pure ([], cur)
+            TkLParen -> do
+                -- Operator name in sig list: (<>).
+                let (opTok, c2) = peekSigC c
+                case tkKind opTok of
+                    TkSymOp opName -> do
+                        let (t3, c3) = peekSigC c2
+                        case tkKind t3 of
+                            TkRParen -> do
+                                let (t4, c4) = peekSigC c3
+                                case tkKind t4 of
+                                    TkComma  -> collectSigNames (opName : acc) c4
+                                    TkDColon -> do
+                                        curAfter <- skipClassSigType 0 c4
+                                        pure (reverse (opName : acc), curAfter)
+                                    _ -> pure ([], cur)
+                            _ -> pure ([], cur)
+                    _ -> pure ([], cur)
+            _ -> pure ([], cur)
+
+    -- Skip the type body after a `::`.  Stops when a significant token
+    -- appears at column @<= bindCol@ at bracket depth 0.
+    skipClassSigType bindCol cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+      where
+        go cur b p c = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof     -> pure cur
+                TkNewline -> go cur' b p c
+                _ | tkCol tok <= bindCol && b == 0 && p == 0 && c == 0 -> pure cur
+                TkLParen   -> go cur' b (p + 1) c
+                TkLBracket -> go cur' (b + 1) p c
+                TkLBrace   -> go cur' b p (c + 1)
+                TkRParen   | p > 0 -> go cur' b (p - 1) c
+                TkRParen           -> pure cur
+                TkRBracket | b > 0 -> go cur' (b - 1) p c
+                TkRBracket         -> pure cur
+                TkRBrace   | c > 0 -> go cur' b p (c - 1)
+                TkRBrace           -> pure cur
+                _          -> go cur' b p c
+
+    -- Continuation clauses of a default-method body.
+    collectClassClauses name bindCol acc cur = do
+        let (tok, curAfter) = peekSigC cur
+        case tkKind tok of
+            TkIdent n | n == name && tkCol tok == bindCol -> do
+                mClause <- scanOneClauseAfterNameAtCol src bindCol curAfter
+                case mClause of
+                    Nothing -> pure (acc, cur)
+                    Just (cl, curNext) ->
+                        collectClassClauses name bindCol (cl : acc) curNext
+            _ -> pure (acc, cur)
+
+    peekSigC cur0 =
+        let (tok, curN) = nextToken src cur0 in
+        case tkKind tok of
+            TkNewline -> peekSigC curN
+            _         -> (tok, curN)
