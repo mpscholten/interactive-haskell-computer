@@ -912,6 +912,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "#email\nfromLabel-yielded Proxy matched\nraw VLabel matched Proxy\n"
 
+    it "TypeApplications: value-level @T parses and evaluator ignores" do
+        -- Proxy @\"email\" and id' @Int both keep their inner semantics
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/value_level_tyapp.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Proxy\n42\n"
+
+    it "TypeApplications: chained @T @T on a user function" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/value_level_tyapp_chained.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\nJust 7\n"
+
+
     it "IsLabel dispatch: user-defined instance overrides default Proxy" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/QuickWins/islabel_user_instance.hs")

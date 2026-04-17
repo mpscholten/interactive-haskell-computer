@@ -411,6 +411,10 @@ expandSplicesInExpr env ipm depth expr
     -- Phase 2.12: EQuote is a leaf in the splice-expansion pass.
     -- Its body is NOT expanded (it's a quotation, not a splice).
     go (EQuote e) = pure (EQuote e)
+    -- Value-level @T: recurse into the inner expression; the type arg is opaque.
+    go (ETyApp e ty) = do
+        e' <- go e
+        pure (ETyApp e' ty)
 
     goAlt (Alt p e) = Alt p <$> go e
 
@@ -478,6 +482,10 @@ exprToVal (ENeg e) = do
     xV   <- exprToVal e
     xT   <- newWHNFThunk xV
     force =<< appE negT xT
+-- Value-level @T: the type argument is opaque metadata. Encode the inner
+-- expression as the TH Exp; a future splice pass that cares about type
+-- applications can inspect the 'ETyApp' node before reaching here.
+exprToVal (ETyApp e _ty) = exprToVal e
 -- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
 exprToVal _ =
     force =<< newWHNFThunk (VCon "VarE" [])

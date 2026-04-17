@@ -183,6 +183,13 @@ eval env ipm = go
     -- We do NOT evaluate expr — we encode its AST.
     go (EQuote inner) = evalQuote inner
 
+    -- Value-level TypeApplications (@T). ihc is optimistic about types:
+    -- the type argument is retained by the parser as AST metadata, but
+    -- evaluation proceeds on the underlying expression as if the @T were
+    -- absent. When a future 'Typeable' / dictionary-selection path needs
+    -- the arg, it can inspect the 'ETyApp' node before this pass-through.
+    go (ETyApp e _ty) = go e
+
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
     tryAlts :: Val -> [Alt] -> IO Val

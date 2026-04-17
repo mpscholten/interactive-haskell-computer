@@ -1097,6 +1097,7 @@ rewriteExpr rw = go []
         ESplice inner   -> ESplice (go bound inner)
         EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
+        ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -1995,6 +1996,7 @@ freeVars = goAll []
         ESplice inner   -> goAll bound inner
         EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
         ELabel _        -> []   -- Phase 3.5: labels have no free variables
+        ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
@@ -2115,6 +2117,7 @@ desugarRecordCons fldReg = go
     go (EImplicitLet bs e) =
         EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
     go (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
+    go (ETyApp inner ty) = ETyApp (go inner) ty   -- value-level @T: recurse into inner
     go e                = e  -- EVar, ELit
 
     goStmt (SExpr e)   = SExpr (go e)
@@ -2159,6 +2162,7 @@ desugarRecordPats fldReg = goExpr
         EImplicitLet [(n, goExpr b) | (n, b) <- bs] (goExpr e)
     goExpr (ESplice inner)  = ESplice (goExpr inner)
     goExpr (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
+    goExpr (ETyApp inner ty) = ETyApp (goExpr inner) ty   -- value-level @T: recurse
     goExpr e                = e  -- EVar, ELit
 
     goStmt (SExpr e)   = SExpr (goExpr e)

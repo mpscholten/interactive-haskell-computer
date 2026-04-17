@@ -51,6 +51,12 @@ data Expr
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
     | EQuote   !Expr                   -- [| expr |] TH expression bracket (Phase 2.12)
     | ELabel !Label                     -- #name OverloadedLabels label (Phase 3.5)
+    -- | @f \@T@ — value-level TypeApplications. The @Name@ holds the raw
+    -- source bytes of the type argument (e.g. @"Int"@, @"Maybe Int"@, @"\"email\""@).
+    -- ihc is optimistic about types: the evaluator treats this as a
+    -- pass-through on the inner expression. The type argument is retained
+    -- as metadata for future @Typeable@ / dictionary-selection use.
+    | ETyApp !Expr !Name
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

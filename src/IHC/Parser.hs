@@ -1871,7 +1871,11 @@ parseApp ctx cur0 = do
     loop fn cur =
         let (tok, cur') = nextSig ctx cur in
         case tkKind tok of
-            -- TypeApplications: @T is a type-level hint; discard and continue.
+            -- TypeApplications: @T is a value-level type hint. We capture
+            -- the raw source bytes of the type argument into an 'ETyApp'
+            -- node so downstream passes (e.g. Typeable / dictionary
+            -- selection) can read it, but the evaluator itself treats
+            -- 'ETyApp' as a pass-through on the inner expression.
             -- But @?=, @=?, etc. are operator-infix uses, not type applications:
             -- peek at the token right after '@' (without skipping whitespace).
             -- If it's a TkSymOp, leave for the Pratt operator parser.
@@ -1880,8 +1884,8 @@ parseApp ctx cur0 = do
                 in case tkKind nextTok of
                     TkSymOp _ -> pure (fn, cur)   -- operator, hand off to Pratt
                     _ -> do
-                        cur'' <- skipTypeArg ctx cur'
-                        loop fn cur''
+                        (tyArg, cur'') <- captureTypeArg ctx cur'
+                        loop (ETyApp fn tyArg) cur''
             -- Record-update: expr { field = val, ... }
             -- Disambiguate from block syntax: only treat as record-update when
             -- we see '{' immediately followed by 'ident =' or '}'.
@@ -1937,21 +1941,35 @@ parseRecordUpdateFields ctx cur acc = do
 -- Handles: plain ident/conid (@\@Int@, @\@a@), promoted (@\@\'Foo@),
 -- and balanced paren/bracket groups (@\@(Maybe Int)@, @\@[Int]@).
 skipTypeArg :: Ctx -> Cursor -> IO Cursor
-skipTypeArg ctx cur0 =
-    let (tok, cur1) = nextSig ctx cur0 in
-    case tkKind tok of
-        TkAt       -> pure cur0   -- bare '@' shouldn't nest; stop
-        TkLParen   -> skipBalanced ctx cur1 TkRParen
-        TkLBracket -> skipBalanced ctx cur1 TkRBracket
+skipTypeArg ctx cur0 = snd <$> captureTypeArg ctx cur0
+
+-- | Like 'skipTypeArg', but also returns the raw source-byte slice that
+-- spans the consumed type argument (opening bracket/tick through closing
+-- token). Used to produce 'ETyApp' nodes that retain the type for later
+-- inspection. Returns an empty string if nothing was consumed.
+captureTypeArg :: Ctx -> Cursor -> IO (Name, Cursor)
+captureTypeArg ctx cur0 =
+    let (tok, cur1) = nextSig ctx cur0
+        start       = tkStart tok
+        slice end   = sliceBytes (ctxSrc ctx) (start, end)
+    in case tkKind tok of
+        TkAt       -> pure (BC.empty, cur0)   -- bare '@' shouldn't nest; stop
+        TkLParen   -> do
+            cur2 <- skipBalanced ctx cur1 TkRParen
+            pure (slice (cPos cur2), cur2)
+        TkLBracket -> do
+            cur2 <- skipBalanced ctx cur1 TkRBracket
+            pure (slice (cPos cur2), cur2)
         -- Promoted tick: lexer reads 'X as TkChar 'X' and leaves the rest
         -- of the constructor name as a separate ident token. Skip both.
         TkChar _   ->
             let (tok2, cur2) = nextSig ctx cur1 in
             case tkKind tok2 of
-                TkIdent{} -> pure cur2
-                TkConId{} -> pure cur2
-                _         -> pure cur1
-        _ -> pure cur1  -- single token consumed (ident, conid, primid, etc.)
+                TkIdent{} -> pure (slice (tkEnd tok2), cur2)
+                TkConId{} -> pure (slice (tkEnd tok2), cur2)
+                _         -> pure (slice (tkEnd tok), cur1)
+        _ -> pure (slice (tkEnd tok), cur1)
+            -- single token consumed (ident, conid, primid, strlit symbol, etc.)
 
 -- | Skip tokens until the matching close bracket/paren (depth-aware).
 -- @cur0@ is positioned just after the opening bracket.
