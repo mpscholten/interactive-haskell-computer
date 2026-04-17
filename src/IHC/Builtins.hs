@@ -280,7 +280,7 @@ builtins reg =
     , (">>",       seqDispatch reg)
     , ("return",   returnB)
     , ("pure",     returnB)
-    , ("fmap",     fmapB)
+    , ("fmap",     fmapDispatch reg)
     , ("<*>",      apB)
     , ("join",     joinB)
     -- IORef
@@ -1735,6 +1735,36 @@ fmapB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     fv <- force ft
     vT <- newWHNFThunk v
     apply fv vT
+
+-- | Dispatching @fmap@. Forces the container argument and looks up a
+-- @(Functor, typeTagOf mv)@ entry in the 'ClassRegistry'. If one is
+-- registered (either hand-written or synthesised from a @deriving
+-- Functor@ clause), that instance's @fmap@ is applied. Otherwise we
+-- fall back to the @VIO@-only behaviour of 'fmapB' — so existing IO
+-- uses keep working, and a @fmap@ on a container type that truly has
+-- no registered instance still produces a runtime error from the IO
+-- path rather than silently misbehaving.
+fmapDispatch :: ClassRegistry -> IO Val
+fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
+    mv <- force mt
+    let tag = typeTagOf mv
+    mInst <- lookupInstance reg (BC.pack "Functor") tag
+    case mInst of
+        Just (fmapMethod : _) -> do
+            -- Re-supply the original thunks; the instance implementation
+            -- is free to evaluate @mv@ lazily via its own pattern match.
+            mT <- newWHNFThunk mv
+            r1 <- apply fmapMethod ft
+            apply r1 mT
+        _ -> case mv of
+            VIO _ -> pure $ VIO $ do
+                v  <- runIOVal mv
+                fv <- force ft
+                vT <- newWHNFThunk v
+                apply fv vT
+            _ -> error
+                ( "fmap: no Functor instance registered for type `"
+                  <> BC.unpack tag <> "`" )
 
 -- | @f <*> m = do { fun <- f; v <- m; return (fun v) }@.
 apB :: IO Val

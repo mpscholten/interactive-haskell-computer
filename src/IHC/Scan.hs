@@ -32,6 +32,11 @@ module IHC.Scan
     , FieldRegistry
     , TypeCtorRegistry
     , scanDataDecls
+      -- * Deriving synthesis
+    , FunctorFieldRole(..)
+    , FunctorCtor(..)
+    , FunctorDerivDecl(..)
+    , scanFunctorDerivings
       -- * Instance declarations
     , InstanceDecl(..)
     , scanInstanceDecls
@@ -995,6 +1000,380 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
                 TkRParen -> skipToMatchingRParen (depth - 1) cur'
                 TkEof    -> pure cur'
                 _        -> skipToMatchingRParen depth cur'
+
+--------------------------------------------------------------------------------
+-- Deriving Functor synthesis
+--
+-- A separate, lexer-only pass that walks every top-level @data@ or
+-- @newtype@ declaration, captures the list of type variables, and for
+-- each constructor classifies every positional/record field against the
+-- LAST type variable (the Functor parameter). The result is consumed by
+-- 'IHC.Scheduler.registerDerivedFunctorInstances' which synthesizes an
+-- @fmap@ method Val per type and registers it in the class registry.
+--
+-- Grammar handled is a strict subset of 'scanDataDecls':
+--   * Plain positional constructors: @C t1 t2 ...@
+--   * Record-syntax constructors: @C { f1 :: T1, f2 :: T2 }@
+-- (We skip GADT-form declarations for now; a @where@-style data decl
+-- just won't get a derived Functor instance.)
+--
+-- A field's role is derived from its type token stream:
+--   * If the type is exactly the functor tyvar ('TkIdent tvN'): FRVar
+--   * Else if the type mentions the tyvar anywhere: FRRec
+--   * Otherwise: FRNone
+--------------------------------------------------------------------------------
+
+-- | What to do with a constructor field when synthesizing @fmap@.
+data FunctorFieldRole
+    = FRNone   -- ^ Field type doesn't mention the functor tyvar; keep as-is.
+    | FRVar    -- ^ Field type IS the functor tyvar; apply @f@ to the field.
+    | FRRec    -- ^ Field type mentions the tyvar; apply @fmap f@ recursively.
+    deriving (Eq, Show)
+
+-- | Roles of every positional field in one derived-Functor constructor.
+data FunctorCtor = FunctorCtor
+    { fcName  :: !ByteString
+    , fcRoles :: ![FunctorFieldRole]
+    } deriving (Eq, Show)
+
+-- | One @data T tv1 ... tvN = ... deriving (... Functor ...)@ decl with
+-- the per-constructor field-role information needed to synthesize
+-- @fmap@.
+data FunctorDerivDecl = FunctorDerivDecl
+    { fdTyName :: !ByteString
+    , fdCtors  :: ![FunctorCtor]
+    } deriving (Eq, Show)
+
+-- | Scan the whole source for top-level @data@ / @newtype@ declarations
+-- that carry @deriving Functor@ (in any position of the deriving list,
+-- with or without a stock/newtype strategy, with or without
+-- parentheses). For each such declaration, return a 'FunctorDerivDecl'
+-- listing constructors and their per-field roles.
+--
+-- Declarations without @deriving Functor@ are silently skipped. If the
+-- scanner can't determine the type's name or tyvars, the declaration is
+-- also skipped (no entry in the result list).
+scanFunctorDerivings :: Source -> IO [FunctorDerivDecl]
+scanFunctorDerivings src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkData    | tkCol tok == 1 -> handle acc cur'
+            TkNewtype | tkCol tok == 1 -> handle acc cur'
+            _ -> go acc cur'
+
+    handle acc cur0 = do
+        -- Parse header: optional '(ctx) =>' + type name + tyvars + '='
+        mh <- parseDataHeader cur0
+        case mh of
+            Nothing -> go acc cur0
+            Just (tyName, tyvars, curAfterEq) -> do
+                (ctors, curAfterCtors) <- parseFunctorCtors tyvars curAfterEq
+                derivClasses <- peekDerivingClause curAfterCtors
+                if elem (BC.pack "Functor") derivClasses
+                    then go (FunctorDerivDecl tyName ctors : acc) curAfterCtors
+                    else go acc curAfterCtors
+
+    -- Parse the LHS of a data/newtype decl up to the first '=' at depth 0.
+    -- Returns (typeName, [tyvarName], cursorAfterEq) if it looks like a
+    -- standard parameterised ADT, else Nothing.
+    -- Skips an optional '(Ctx a) =>' prefix and any GADT '... where'.
+    parseDataHeader :: Cursor -> IO (Maybe (ByteString, [ByteString], Cursor))
+    parseDataHeader cur = do
+        -- First, detect GADT-form by peeking for 'where' before '='.
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure Nothing
+            TkLParen -> do
+                -- Could be '(Ctx a) =>' or '(,) a' (tuple head). Peek for
+                -- '=>' to decide.
+                let curAfter = skipParensPure 1 cur'
+                    (sep, _) = nextToken src curAfter
+                case tkKind sep of
+                    TkDArrow ->
+                        -- was a context; skip past '=>' and retry.
+                        let (_, curAfterArr) = nextToken src curAfter
+                        in parseDataHeader curAfterArr
+                    _ -> pure Nothing   -- unusual LHS; skip
+            TkConId name -> collectTyvars name [] cur'
+            _ -> pure Nothing
+
+    -- Collect tyvar names up to '=' (traditional) or give up at 'where'.
+    collectTyvars tyName acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure Nothing
+            TkEq     -> pure (Just (tyName, reverse acc, cur'))
+            TkWhere  -> pure Nothing       -- GADT; skip
+            TkIdent v | isLowerStart v -> collectTyvars tyName (v : acc) cur'
+            -- Kind annotation on a tyvar: '(a :: Type)' — strip.
+            TkLParen -> do
+                -- Grab the tyvar name inside the parens, then skip to ')'.
+                let (inner, curIn) = nextToken src cur'
+                case tkKind inner of
+                    TkIdent v | isLowerStart v -> do
+                        let curRest = skipParensPure 1 curIn
+                        collectTyvars tyName (v : acc) curRest
+                    _ -> collectTyvars tyName acc (skipParensPure 1 cur')
+            TkNewline -> collectTyvars tyName acc cur'
+            _ -> collectTyvars tyName acc cur'
+
+    isLowerStart bs = case BC.uncons bs of
+        Just (c, _) -> c >= 'a' && c <= 'z' || c == '_'
+        Nothing     -> False
+
+    -- Parse constructors (similar shape to collectCtors but also records
+    -- each positional field's raw type token stream so we can classify
+    -- against the Functor tyvar). Stops at the end of the data decl or
+    -- at an explicit 'deriving' keyword. Returns (ctors, cursor-at-deriving-or-eof).
+    parseFunctorCtors :: [ByteString] -> Cursor -> IO ([FunctorCtor], Cursor)
+    parseFunctorCtors tyvars cur = loop [] cur
+      where
+        tvN = case reverse tyvars of
+                (x : _) -> x
+                []      -> BC.empty
+        loop !acc c = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof      -> pure (reverse acc, c)
+                TkDeriving -> pure (reverse acc, c)       -- stop before consuming
+                -- Top-level (col-1) anything except a newline → end of this decl.
+                _ | tkCol tok == 1 && tkKind tok /= TkNewline ->
+                      pure (reverse acc, c)
+                TkNewline  -> loop acc c'
+                TkForall   -> do
+                    cAfterDot <- skipUntilDot c'
+                    loop acc cAfterDot
+                TkConId name -> do
+                    -- Existential constraint context: skip if '=>' lies ahead
+                    -- before a '|' at depth 0.
+                    isCtx <- peekIsConstraint c'
+                    if isCtx
+                        then do
+                            cAfterArr <- skipUntilDArrow c'
+                            loop acc cAfterArr
+                        else do
+                            -- Peek: '{' → record syntax; else positional.
+                            let (peek, _) = nextToken src c'
+                            (roles, cEnd) <- case tkKind peek of
+                                TkLBrace -> do
+                                    let (_, cBrace) = nextToken src c'
+                                    collectRecordRoles tvN cBrace
+                                _ -> collectPositionalRoles tvN c'
+                            let ctor = FunctorCtor name roles
+                            -- After fields, see if another ctor follows.
+                            let (sep, cSep) = nextToken src cEnd
+                            case tkKind sep of
+                                TkBar     -> loop (ctor : acc) cSep
+                                _         -> pure (reverse (ctor : acc), cEnd)
+                _ -> loop acc c'
+
+    -- Positional field parser. Each field is a type-atom (single token or
+    -- a parenthesised/bracketed group) optionally preceded by '!' or '~'.
+    -- Stops at TkBar / TkDeriving / newline-col-1 / EOF.
+    collectPositionalRoles :: ByteString -> Cursor -> IO ([FunctorFieldRole], Cursor)
+    collectPositionalRoles tv cur = loop [] cur
+      where
+        loop !acc c = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof      -> pure (reverse acc, c)
+                TkBar      -> pure (reverse acc, c)
+                TkDeriving -> pure (reverse acc, c)
+                TkLBrace   -> pure (reverse acc, c)   -- record syntax boundary (unreachable here)
+                TkNewline  ->
+                    let (peek, _) = nextToken src c' in
+                    case tkKind peek of
+                        TkEof                        -> pure (reverse acc, c')
+                        _ | tkCol peek == 1          -> pure (reverse acc, c')
+                          | otherwise                -> loop acc c'
+                TkBang -> loop acc c'                 -- strictness, skip
+                -- Parenthesised group: read the whole balanced span as
+                -- one field type atom.
+                TkLParen -> do
+                    (toks, cEnd) <- collectBalancedTokens TkLParen TkRParen c'
+                    let role = roleOfTokens tv (TkLParen : toks ++ [TkRParen])
+                    loop (role : acc) cEnd
+                -- Bracketed group: @[T a]@.
+                TkLBracket -> do
+                    (toks, cEnd) <- collectBalancedTokens TkLBracket TkRBracket c'
+                    let role = roleOfTokens tv (TkLBracket : toks ++ [TkRBracket])
+                    loop (role : acc) cEnd
+                TkConId n   -> loop (roleOfTokens tv [TkConId n] : acc) c'
+                TkIdent n   -> loop (roleOfTokens tv [TkIdent n] : acc) c'
+                TkPrimId n  -> loop (roleOfTokens tv [TkPrimId n] : acc) c'
+                _ -> pure (reverse acc, c)
+
+    -- Record-syntax field parser. Fields are @name1, name2, ... :: T1@
+    -- groups separated by commas. For each named field we classify the
+    -- type tokens (up to the next ',' or '}') and add one role per name.
+    collectRecordRoles :: ByteString -> Cursor -> IO ([FunctorFieldRole], Cursor)
+    collectRecordRoles tv cur = loop [] cur
+      where
+        loop !acc c = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof    -> pure (reverse acc, c)
+                TkRBrace -> pure (reverse acc, c')
+                TkNewline -> loop acc c'
+                TkComma  -> loop acc c'
+                TkIdent _ -> do
+                    -- Consume further names until '::'.
+                    (nCount, cSig) <- consumeFieldNames 1 c'
+                    -- Parse the type, capturing its tokens up to ',' or '}'.
+                    (toks, cEnd) <- collectFieldTypeTokens cSig
+                    let role = roleOfTokens tv toks
+                    loop (replicate nCount role ++ acc) cEnd
+                TkBang -> loop acc c'
+                _ -> loop acc c'
+
+        consumeFieldNames !n c = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkComma -> do
+                    -- Peek — if next is another ident, that's another name
+                    -- sharing the same type signature.
+                    let (nxt, cNxt) = nextToken src c'
+                    case tkKind nxt of
+                        TkIdent _ -> consumeFieldNames (n + 1) cNxt
+                        _         -> pure (n, c)           -- shouldn't happen in record syntax
+                TkDColon -> pure (n, c')
+                TkBang   -> consumeFieldNames n c'
+                TkIdent _ -> consumeFieldNames (n + 1) c'  -- @a, b :: T@
+                _        -> pure (n, c)
+
+        collectFieldTypeTokens = collectUntilCommaOrBrace []
+        collectUntilCommaOrBrace !acc c = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof    -> pure (reverse acc, c)
+                TkComma  -> pure (reverse acc, c)
+                TkRBrace -> pure (reverse acc, c)
+                TkLParen -> do
+                    (inner, cEnd) <- collectBalancedTokens TkLParen TkRParen c'
+                    collectUntilCommaOrBrace (reverse (TkLParen : inner ++ [TkRParen]) ++ acc) cEnd
+                TkLBracket -> do
+                    (inner, cEnd) <- collectBalancedTokens TkLBracket TkRBracket c'
+                    collectUntilCommaOrBrace (reverse (TkLBracket : inner ++ [TkRBracket]) ++ acc) cEnd
+                TkNewline -> collectUntilCommaOrBrace acc c'
+                _ -> collectUntilCommaOrBrace (tkKind tok : acc) c'
+
+    -- Collect tokens between balanced open/close brackets, consuming the
+    -- closing token. Returns (inner tokens, cursor after close).
+    collectBalancedTokens :: TokenKind -> TokenKind -> Cursor -> IO ([TokenKind], Cursor)
+    collectBalancedTokens open close cur = go' 1 [] cur
+      where
+        go' !depth !acc c
+            | depth <= 0 = pure (reverse acc, c)
+            | otherwise = do
+                let (tok, c') = nextToken src c
+                case tkKind tok of
+                    TkEof -> pure (reverse acc, c')
+                    k | k == close ->
+                            if depth - 1 <= 0
+                                then pure (reverse acc, c')
+                                else go' (depth - 1) (k : acc) c'
+                      | k == open  -> go' (depth + 1) (k : acc) c'
+                      | otherwise  -> go' depth (k : acc) c'
+
+    -- Classify a field's type-token stream against the functor tyvar.
+    -- * [TkIdent tv]                           → FRVar
+    -- * tokens mention TkIdent tv elsewhere    → FRRec
+    -- * otherwise                              → FRNone
+    roleOfTokens :: ByteString -> [TokenKind] -> FunctorFieldRole
+    roleOfTokens tv toks
+        | BC.null tv = FRNone
+        | toks == [TkIdent tv] = FRVar
+        | any (== TkIdent tv) toks = FRRec
+        | otherwise = FRNone
+
+    -- Peek at the cursor (positioned right AFTER the data-decl body has
+    -- ended) for a 'deriving' clause, and return the list of class names
+    -- it mentions (empty list if there is no clause). Handles the shapes:
+    --
+    -- @
+    -- deriving Cls
+    -- deriving (Cls1, Cls2, ...)
+    -- deriving stock/newtype/anyclass (Cls, ...)
+    -- deriving (Cls) via ...
+    -- @
+    peekDerivingClause :: Cursor -> IO [ByteString]
+    peekDerivingClause cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkDeriving -> scanClasses cur'
+            TkNewline  -> peekDerivingClause cur'
+            _          -> pure []
+
+    scanClasses cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure []
+            -- Optional strategy keyword (stock / newtype / anyclass): the
+            -- Haskell lexer sees these as TkIdent.
+            TkIdent s | s == BC.pack "stock"
+                     || s == BC.pack "anyclass" -> scanClasses cur'
+            TkNewtype  -> scanClasses cur'
+            TkLParen  -> collectClassList [] cur'
+            TkConId c -> pure [c]
+            _         -> pure []
+
+    collectClassList !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkRParen  -> pure (reverse acc)
+            TkConId c -> collectClassList (c : acc) cur'
+            _         -> collectClassList acc cur'
+
+    -- Local helpers — smaller / specialised versions of the ones inside
+    -- 'scanDataDecls' that only advance the cursor.
+    skipUntilDot cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure cur
+            TkDot -> pure cur'
+            _     -> skipUntilDot cur'
+
+    skipUntilDArrow cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure cur
+            TkDArrow -> pure cur'
+            _        -> skipUntilDArrow cur'
+
+    peekIsConstraint cur = go' cur 0
+      where
+        go' c !depth = do
+            let (tok, c') = nextToken src c
+            case tkKind tok of
+                TkEof -> pure False
+                TkDArrow | depth == 0 -> pure True
+                TkBar    | depth == 0 -> pure False
+                TkEq     | depth == 0 -> pure False
+                TkNewline ->
+                    let (nxt, _) = nextToken src c' in
+                    if tkCol nxt == 1
+                        then pure False
+                        else go' c' depth
+                TkLParen -> go' c' (depth + 1)
+                TkRParen -> go' c' (max 0 (depth - 1))
+                TkLBracket -> go' c' (depth + 1)
+                TkRBracket -> go' c' (max 0 (depth - 1))
+                _ -> go' c' depth
+
+    skipParensPure :: Int -> Cursor -> Cursor
+    skipParensPure d c
+        | d <= 0 = c
+        | otherwise =
+            let (tk, c') = nextToken src c
+            in case tkKind tk of
+                TkEof    -> c
+                TkLParen -> skipParensPure (d + 1) c'
+                TkRParen -> skipParensPure (d - 1) c'
+                _        -> skipParensPure d c'
 
 --------------------------------------------------------------------------------
 -- Instance declarations

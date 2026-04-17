@@ -289,6 +289,12 @@ loadProgramFromSource searchPath src0 = do
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
     registerClassDefaults classReg env loadedModules
+    -- Synthesize user-derived Functor instances for every @deriving
+    -- Functor@ annotated data/newtype decl. Runs after the explicit
+    -- instance-registration pass so we can honour any hand-written
+    -- @instance Functor T where ...@ already in the registry (the
+    -- registrar skips types that already have a Functor dict).
+    registerDerivedFunctorInstances classReg loadedModules
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -432,6 +438,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- Register type-class instances.
     mapM_ (registerInstancesFrom classReg unionedTypeCtors innerEnv) loadedModules
     registerClassDefaults classReg innerEnv loadedModules
+    registerDerivedFunctorInstances classReg loadedModules
     -- If the file has no `main` binding, inject `main = ()` so that the
     -- REPL user can type `main` without getting "unbound variable main".
     -- This matches the old :load behaviour and keeps the no_main regression
@@ -1000,6 +1007,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
           (zip qualPairs slots)
     mapM_ (registerInstancesFrom classReg unionedTypeCtors0 innerEnv) loadedModules0
     registerClassDefaults classReg innerEnv loadedModules0
+    registerDerivedFunctorInstances classReg loadedModules0
     let additions  = Map.difference aliasEnv existingEnv
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
@@ -1080,6 +1088,123 @@ evalMethod env lm (_, lhs) = do
     -- make a thunk and force it immediately.
     t <- newThunk env expr
     force t
+
+--------------------------------------------------------------------------------
+-- Deriving Functor synthesis
+--
+-- For each @data T tv1 ... tvN ... deriving (... Functor ...)@ declaration
+-- we synthesize a dictionary containing one method — @fmap@ — and
+-- register it in the 'ClassRegistry' under class name @"Functor"@ and
+-- under every constructor name of the type. The method's shape is:
+--
+-- @
+--     fmap f x = case x of
+--         C1 v1 v2 ...     -> C1 [role-apply roles v1 v2 ...]
+--         C2 v1 v2 ...     -> C2 [role-apply roles v1 v2 ...]
+--         ...
+-- @
+--
+-- where @role-apply@ is determined by 'FunctorFieldRole' per position:
+--   * 'FRVar' — field type is exactly the functor tyvar, apply @f@
+--   * 'FRRec' — field type mentions the tyvar, apply @fmap f@
+--             (recursive dispatch via the 'ClassRegistry' at runtime)
+--   * 'FRNone' — untouched
+--
+-- Constructors whose tag doesn't match (e.g. sharing class registration
+-- with another constructor of the same type) can still be fmap'd because
+-- we register the full dispatch method under every ctor name of @T@.
+--------------------------------------------------------------------------------
+
+-- | Synthesise and register @Functor@ instances for every @deriving
+-- Functor@ declaration found in the loaded modules. The instance Val is
+-- keyed under the class name @"Functor"@ and under every constructor
+-- name of the owning type (since 'typeTagOf' yields the ctor name at
+-- runtime).
+registerDerivedFunctorInstances :: ClassRegistry -> [LoadedModule] -> IO ()
+registerDerivedFunctorInstances classReg loadedModules = do
+    mapM_ oneModule loadedModules
+  where
+    oneModule lm = do
+        decls <- scanFunctorDerivings (lmSource lm)
+        mapM_ (registerOneFunctor classReg) decls
+
+-- | Register one 'FunctorDerivDecl' as a Functor instance in the
+-- registry. The instance's only method is @fmap@, built by
+-- 'synthFmapForDecl' below. If the user wrote an explicit @instance
+-- Functor T where ...@ it will have been registered first and this
+-- derived synthesis is a no-op for that type (we don't overwrite).
+registerOneFunctor :: ClassRegistry -> FunctorDerivDecl -> IO ()
+registerOneFunctor classReg decl = do
+    let fmapVal = synthFmapForDecl classReg decl
+        methods = [fmapVal]
+        functorCls = BC.pack "Functor"
+    existing <- lookupInstance classReg functorCls (fdTyName decl)
+    case existing of
+        Just _  -> pure ()    -- user-written instance already registered
+        Nothing -> do
+            registerInstance classReg functorCls (fdTyName decl) methods
+            mapM_ (\c -> registerInstance classReg functorCls (fcName c) methods)
+                  (fdCtors decl)
+
+-- | Build the @fmap@ method Val for one derived-Functor type. The Val
+-- takes @f@ (the mapping function) and @x@ (the container value), and
+-- returns a new VCon whose fields are either untouched, the result of
+-- @f field@, or the result of a recursive fmap dispatch.
+synthFmapForDecl :: ClassRegistry -> FunctorDerivDecl -> Val
+synthFmapForDecl classReg decl = VFun $ \fT -> pure $ VFun $ \xT -> do
+    xv <- force xT
+    case xv of
+        VCon ctorName oldThunks -> do
+            let roles = lookupCtorRoles ctorName decl oldThunks
+            newThunks <- mapM (applyRoleOne classReg fT) (zip roles oldThunks)
+            pure (VCon ctorName newThunks)
+        other -> error
+            ( "derived-Functor fmap: expected constructor value for "
+              <> BC.unpack (fdTyName decl)
+              <> ", got " <> shortShow other )
+
+-- | Look up the roles for @ctorName@ in @decl@. If the ctor isn't listed
+-- (e.g. arity mismatch), default to all-FRNone of the right length.
+lookupCtorRoles :: ByteString -> FunctorDerivDecl -> [Thunk] -> [FunctorFieldRole]
+lookupCtorRoles ctorName decl oldThunks =
+    case [ fcRoles c | c <- fdCtors decl, fcName c == ctorName ] of
+        (rs : _)
+            | length rs == length oldThunks -> rs
+            | otherwise ->
+                -- Arity recorded in the scan differs from the runtime
+                -- VCon's arity (shouldn't normally happen; play safe).
+                replicate (length oldThunks) FRNone
+        [] -> replicate (length oldThunks) FRNone
+
+-- | Apply a field's role to one thunk, producing a new thunk.
+applyRoleOne :: ClassRegistry -> Thunk -> (FunctorFieldRole, Thunk) -> IO Thunk
+applyRoleOne _classReg _fT (FRNone, t) = pure t
+applyRoleOne _classReg fT  (FRVar,  t) = do
+    -- f field
+    fv <- force fT
+    v  <- apply fv t
+    newWHNFThunk v
+applyRoleOne classReg fT (FRRec, t) = do
+    v <- force t
+    case v of
+        VCon innerTag _ -> do
+            mInst <- lookupInstance classReg (BC.pack "Functor") innerTag
+            case mInst of
+                Just (innerFmap : _) -> do
+                    stepT <- newWHNFThunk v
+                    r1 <- apply innerFmap fT
+                    r2 <- apply r1 stepT
+                    newWHNFThunk r2
+                _ -> pure t   -- no Functor instance; leave field untouched
+        _ -> pure t
+
+shortShow :: Val -> String
+shortShow (VCon n _) = "VCon " <> BC.unpack n
+shortShow (VInt _)   = "VInt"
+shortShow (VFloat _) = "VFloat"
+shortShow (VChar _)  = "VChar"
+shortShow (VStr _)   = "VStr"
+shortShow _          = "<other>"
 
 --------------------------------------------------------------------------------
 -- User-defined class method dispatchers
