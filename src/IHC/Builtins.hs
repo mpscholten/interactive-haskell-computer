@@ -508,6 +508,21 @@ builtins reg =
     , ("tryPutMVar#",      tryPutMVarHashB)
     , ("tryReadMVar#",     tryReadMVarHashB)
     , ("isEmptyMVar#",     isEmptyMVarHashB)
+    -- STM primops: GHC.Prim, compiler-intrinsic, no Haskell source.
+    -- Source-loaded GHC.Conc.Sync wrappers (atomically/newTVar/readTVar/
+    -- writeTVar/retry/catchSTM/orElse) bottom out into these. The RTS owns
+    -- the transactional scheduler; our interpreter is single-threaded at
+    -- the eval level so STM collapses cleanly onto IO (mirroring the
+    -- ST s a ≈ IO a bridge, commit 1ed2881). Compiler-intrinsic +
+    -- RTS-exclusive per CLAUDE.md.
+    , ("atomically#",      atomicallyHashB)
+    , ("retry#",           retryHashB)
+    , ("catchRetry#",      catchRetryHashB)
+    , ("catchSTM#",        catchSTMHashB)
+    , ("newTVar#",         newTVarHashB)
+    , ("readTVar#",        readTVarHashB)
+    , ("readTVarIO#",      readTVarIOHashB)
+    , ("writeTVar#",       writeTVarHashB)
     -- keepAlive#: GHC.Prim primop with no Haskell source. Used by
     -- Foreign.ForeignPtr.withForeignPtr to keep a ForeignPtr live across the
     -- body. Signature is `a -> State# s -> (State# s -> b) -> b`; we cannot
@@ -3392,6 +3407,163 @@ readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
     case tvv of
         VPrimObj (PrimTVar tv) -> readTVarIO tv
         _ -> error ("readTVarIO: not a TVar: " <> showValForDebug tvv)
+
+--------------------------------------------------------------------------------
+-- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
+--
+-- GHC.Prim STM primops, compiler-intrinsic — no Haskell source. The
+-- source-loaded @GHC.Conc.Sync@ wrappers (@atomically@, @retry@,
+-- @newTVar@, @readTVar@, @writeTVar@, @catchSTM@, @orElse@) all bottom
+-- out into these. The RTS provides the underlying transactional
+-- machinery; our interpreter is single-threaded at the eval level, so
+-- STM collapses cleanly onto IO — same bridge strategy as @ST s a ≈
+-- IO a@ (commit 1ed2881). Justification per CLAUDE.md: compiler-
+-- intrinsic / RTS-exclusive, no userland Haskell could implement the
+-- transactional scheduler.
+--------------------------------------------------------------------------------
+
+-- | Extract the host 'TVar' from either a raw 'PrimTVar' (our builtin-
+-- returned shape) or the source-wrapped @TVar tvar#@ VCon.
+requireTVarPrim :: String -> Val -> IO (TVar Val)
+requireTVarPrim fn v = case v of
+    VPrimObj (PrimTVar tv) -> pure tv
+    VCon "TVar" [tvT]      -> force tvT >>= requireTVarPrim fn
+    _ -> error (fn <> ": not a TVar#: " <> showValForDebug v)
+
+-- | Wrap a 'Val' as an unboxed-pair @(# State#, a #)@ result. Used by
+-- the @#@-suffixed primops that return their value threaded through a
+-- State# token. Pass-through if the value is already shaped correctly.
+ensureStatePair :: Val -> IO Val
+ensureStatePair v = case v of
+    VCon "(#,#)" _ -> pure v
+    _ -> do
+        sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+        vT  <- newWHNFThunk v
+        pure (VCon "(#,#)" [sT', vT])
+
+-- | @atomically# :: (State# RealWorld -> (# State# RealWorld, a #))
+--                 -> State# RealWorld
+--                 -> (# State# RealWorld, a #)@
+--
+-- Source-loaded: @atomically (STM m) = IO (\\s -> (atomically# m) s)@.
+-- Since ihc is single-threaded at the eval level, an STM action IS an
+-- IO action in our world — we just apply the state-transformer.
+atomicallyHashB :: IO Val
+atomicallyHashB = pure $ VFun $ \stmT -> pure $ VFun $ \sT -> do
+    stmV <- force stmT
+    rRaw <- apply stmV sT
+    v    <- runIOVal rRaw
+    ensureStatePair v
+
+-- | @retry# :: State# RealWorld -> (# State# RealWorld, a #)@.
+--
+-- In a concurrent runtime this blocks until a watched TVar changes.
+-- Since we're single-threaded, a retry can never succeed — treat it
+-- as an exception (the host 'atomically' call would do the same on
+-- the underlying 'BlockedIndefinitelyOnSTM').
+retryHashB :: IO Val
+retryHashB = pure $ VFun $ \_sT -> atomically retry
+
+-- | @catchRetry# :: (State# RealWorld -> (# State# RealWorld, a #))
+--                -> (State# RealWorld -> (# State# RealWorld, a #))
+--                -> State# RealWorld
+--                -> (# State# RealWorld, a #)@
+--
+-- Source-loaded: @orElse (STM m) e = STM $ \\s -> catchRetry# m (unSTM e) s@.
+-- Try the first action; if it raises a retry-like exception, fall
+-- back to the second.
+catchRetryHashB :: IO Val
+catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT -> do
+    aV <- force aT
+    bV <- force bT
+    let runAction stm = do
+            rRaw <- apply stm sT
+            runIOVal rRaw
+    r <- CE.try @CE.SomeException (runAction aV)
+    case r of
+        Right v -> ensureStatePair v
+        Left _  -> do
+            v <- runAction bV
+            ensureStatePair v
+
+-- | @catchSTM# :: (State# RealWorld -> (# State# RealWorld, a #))
+--              -> (b -> State# RealWorld -> (# State# RealWorld, a #))
+--              -> State# RealWorld
+--              -> (# State# RealWorld, a #)@
+--
+-- Source-loaded: @catchSTM (STM m) handler = STM $ catchSTM# m handler'@.
+-- Same shape as 'catch#' but for STM actions — in our single-threaded
+-- STM-as-IO bridge the implementation is identical.
+catchSTMHashB :: IO Val
+catchSTMHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
+    ioV <- force ioT
+    hV  <- force hT
+    let runAction = do
+            rRaw <- apply ioV sT
+            runIOVal rRaw
+    rRes <- CE.try @IhcException (CE.try @SomeException runAction)
+    case rRes of
+        Right (Right v) -> ensureStatePair v
+        Right (Left se) -> do
+            let msg = BC.pack (show se)
+            excT <- newWHNFThunk (VStr msg)
+            invokeHandler hV excT
+        Left exc -> do
+            excVal <- ihcExceptionToVal exc
+            excT   <- newWHNFThunk excVal
+            invokeHandler hV excT
+  where
+    invokeHandler hV excT = do
+        r1 <- apply hV excT
+        case r1 of
+            VFun _ -> do
+                sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+                rRaw <- apply r1 sT'
+                v    <- runIOVal rRaw
+                ensureStatePair v
+            _ -> do
+                v <- runIOVal r1
+                ensureStatePair v
+
+-- | @newTVar# :: a -> State# s -> (# State# s, TVar# s a #)@.
+-- Source-loaded @newTVar@ / @newTVarIO@ bottom out here.
+newTVarHashB :: IO Val
+newTVarHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    av  <- force aT
+    tv  <- newTVarIO av
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    tvT <- newWHNFThunk (VPrimObj (PrimTVar tv))
+    pure (VCon "(#,#)" [sT', tvT])
+
+-- | @readTVar# :: TVar# s a -> State# s -> (# State# s, a #)@.
+readTVarHashB :: IO Val
+readTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
+    tvv <- force tvT
+    tv  <- requireTVarPrim "readTVar#" tvv
+    v   <- atomically (readTVar tv)
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    vT  <- newWHNFThunk v
+    pure (VCon "(#,#)" [sT', vT])
+
+-- | @readTVarIO# :: TVar# s a -> State# s -> (# State# s, a #)@.
+-- Like readTVar# but without a surrounding transaction.
+readTVarIOHashB :: IO Val
+readTVarIOHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
+    tvv <- force tvT
+    tv  <- requireTVarPrim "readTVarIO#" tvv
+    v   <- readTVarIO tv
+    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+    vT  <- newWHNFThunk v
+    pure (VCon "(#,#)" [sT', vT])
+
+-- | @writeTVar# :: TVar# s a -> a -> State# s -> State# s@.
+writeTVarHashB :: IO Val
+writeTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    tvv <- force tvT
+    tv  <- requireTVarPrim "writeTVar#" tvv
+    av  <- force aT
+    atomically (writeTVar tv av)
+    pure (VPrimObj PrimRealWorld)
 
 --------------------------------------------------------------------------------
 -- Phase 2.10a: exception primitives
