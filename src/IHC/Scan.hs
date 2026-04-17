@@ -2135,6 +2135,21 @@ scanClassDecls src = go [] startCursor
             case tkKind tok of
                 TkEof     -> pure (finishBody sigs defs)
                 TkNewline -> scanBody sigs defs cur'
+                -- DefaultSignatures: `default methodName :: Sig` inside a
+                -- class head. Skip the whole sig line; the actual default
+                -- body arrives on a later line as `methodName pat* = rhs`
+                -- and is picked up by the normal path below.
+                TkIdent "default" | tkCol tok > 1 -> do
+                    let (peek, cur'') = peekSigC cur'
+                    case tkKind peek of
+                        TkIdent _ -> do
+                            let (peek2, _) = peekSigC cur''
+                            case tkKind peek2 of
+                                TkDColon -> do
+                                    curAfter <- skipClassSigType (tkCol tok) cur''
+                                    scanBody sigs defs curAfter
+                                _ -> scanBody sigs defs cur'
+                        _ -> scanBody sigs defs cur'
                 TkIdent name | tkCol tok > 1 -> do
                     -- Check whether this line is a type sig. If so, collect
                     -- every name before `::` and skip through the type.
