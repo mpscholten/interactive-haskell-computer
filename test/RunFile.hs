@@ -445,6 +445,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello, ok\n"
 
+    it "module: qualified class methods (P.negate, P.maxBound) in non-entry module" do
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Modules/qualified_class_method/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "-42\n<function>\n"
+
     it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
         -- Runs end-to-end only when BOTH (a) mtl-2.3.2 is available in
         -- the user's ihc source cache AND (b) IHC_MTL_CACHED_TEST=1 is

@@ -1795,7 +1795,6 @@ buildImportRewrites registry lm _builtinNames = do
             -- module's prefix in the flat env, not under this module's prefix.
             pure [ (n, prefix <> n)
                  | (n, expr) <- Map.toList bodiesNow
-                 , BC.elem '.' n == False
                  , expr /= EVar n   -- skip foreign-alias sentinels
                  ]
     importPairs <- concat <$> mapM (rewritesForImport reg neededNames) imports
