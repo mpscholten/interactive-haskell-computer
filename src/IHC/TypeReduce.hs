@@ -328,6 +328,14 @@ parseAtom (TTLParen : rest) =
             case parseTupleRest [first] rest' of
                 Just (es, rest'') -> Just (TyTup es, rest'')
                 Nothing           -> Nothing
+        -- (x ': xs) — cons pattern as a paren-wrapped atom. Produce
+        -- 'TyApp (TyApp (TyCon "':") lhs) rhs'; 'match' handles
+        -- destructuring this against a concrete 'TyList'.
+        Just (lhs, TTColonCons : rest') ->
+            case parseType rest' of
+                Just (rhs, TTRParen : rest'') ->
+                    Just (TyApp (TyApp (TyCon (BC.pack "':")) lhs) rhs, rest'')
+                _ -> Nothing
         _ -> Nothing
 parseAtom _ = Nothing
 
@@ -509,6 +517,17 @@ match env (TyApp p1 p2) (TyApp a1 a2) = do
 match env (TyList ps) (TyList as)
     | length ps == length as = matchAll env ps as
     | otherwise              = Nothing
+-- Cons pattern '(x ': xs)' against a concrete promoted list: split head/tail.
+match env (TyApp (TyApp (TyCon c) ph) pt) (TyList (a:as))
+    | c == BC.pack "':" = do
+        env' <- match env ph a
+        match env' pt (TyList as)
+-- Same shape against a cons-shaped concrete value (e.g. recursive cases
+-- that haven't re-packed into TyList).
+match env (TyApp (TyApp (TyCon c) ph) pt) (TyApp (TyApp (TyCon c') ah) at)
+    | c == BC.pack "':" && c' == BC.pack "':" = do
+        env' <- match env ph ah
+        match env' pt at
 match env (TyTup ps) (TyTup as)
     | length ps == length as = matchAll env ps as
     | otherwise              = Nothing

@@ -840,6 +840,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "IHP integration OK\n42\n"
 
+    it "TF: GetTableName User reduces to \"users\" at runtime (IHP shape)" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/tf_get_table_name.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "users\n"
+
+    it "TF: PrimaryKey model closed-family constant RHS reduces" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/tf_primary_key.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "id\n"
+
+    it "TF: GetModelByTableName reverse-lookup closed family picks correct branch" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/tf_get_model_by_table_name.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "User\nPost\n"
+
     it "KnownSymbol dict: foo :: KnownSymbol s => Proxy s -> String; symbolVal p" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase32_34/known_symbol_dict.hs")
         n   `shouldBe` 0
