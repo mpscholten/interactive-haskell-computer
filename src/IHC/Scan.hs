@@ -1711,8 +1711,16 @@ scanClassDecls src = go [] startCursor
                 pure (Just (ClassDecl cls methodNames defaults))
             Nothing -> pure Nothing
 
-    -- Parse: [context =>] ClassName tyvar* where
+    -- Parse: [context =>] ClassName tyvar* [| fundep, ...] where
     -- Grab the first ConId AFTER any =>.  Stop at `where`.
+    --
+    -- FunctionalDependencies: the optional `| a b -> c, d -> e` clause
+    -- between the class-head params and `where` has no runtime meaning
+    -- in IHC (fundeps are a type-checker hint in GHC), so on `TkBar`
+    -- we consume tokens until `where` without touching mCls. This keeps
+    -- lowercase tyvars in the fundep body from ever being mistaken for
+    -- something meaningful, and documents the intent explicitly rather
+    -- than relying on the default fallthrough.
     parseClassHead cur0 = scanHead cur0 Nothing False
       where
         scanHead cur mCls seenArrow = do
@@ -1724,6 +1732,9 @@ scanClassDecls src = go [] startCursor
                 -- `=>` ends the context; reset our candidate class name
                 -- so the NEXT ConId is the real class.
                 TkDArrow -> scanHead cur' Nothing True
+                -- FunctionalDependencies: `| a -> b, c -> d` — skip the
+                -- whole fundep clause, stopping only at `where`/EOF.
+                TkBar -> skipFundep cur' mCls
                 TkConId n ->
                     case mCls of
                         Nothing -> scanHead cur' (Just n) seenArrow
@@ -1735,6 +1746,22 @@ scanClassDecls src = go [] startCursor
                     curAfter <- skipBracketsC 1 cur'
                     scanHead curAfter mCls seenArrow
                 _ -> scanHead cur' mCls seenArrow
+
+        -- After `|` in the class head, consume the fundep list without
+        -- interpreting it. Stop at `where`/EOF; keep any class-name
+        -- candidate already captured in @mCls@.
+        skipFundep cur mCls = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof   -> pure (mCls, cur)
+                TkWhere -> pure (mCls, cur')
+                TkLParen -> do
+                    curAfter <- skipParensC 1 cur'
+                    skipFundep curAfter mCls
+                TkLBracket -> do
+                    curAfter <- skipBracketsC 1 cur'
+                    skipFundep curAfter mCls
+                _ -> skipFundep cur' mCls
 
     skipParensC :: Int -> Cursor -> IO Cursor
     skipParensC !d cur
