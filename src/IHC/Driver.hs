@@ -19,11 +19,12 @@ import System.FilePath (takeDirectory)
 import System.IO (hPutStrLn, stderr)
 
 import IHC.CabalProject
-    ( CabalProjectError
+    ( CabalProjectError(..)
     , SearchEnv(..)
     , detectProjectRoot
     , resolve
     )
+import IHC.Diagnostics (warnStub)
 import IHC.Eval (force)
 import IHC.PackageStore (acquire, buildSearchEnv)
 import IHC.Scheduler (loadProgramFromSource)
@@ -60,12 +61,26 @@ resolveSearchPathFor path = do
             r <- try (resolve root)
                     :: IO (Either CabalProjectError [(ByteString, ByteString)])
             case r of
-                Left _err ->
-                    -- Common, quiet fallback: project has no freeze file.
-                    -- The single-file behaviour covers every Phase 2.5
-                    -- fixture, so we don't log here to keep test output
-                    -- clean. A future --verbose flag can restore the
-                    -- diagnostic.
+                Left err -> do
+                    -- Common fallback: project has no freeze file (or the
+                    -- cabal file failed to parse). We still drop to
+                    -- single-file mode so that Phase 2.5 fixtures keep
+                    -- working, but we log a one-line diagnostic so
+                    -- downstream 'UnresolvedName' errors don't appear
+                    -- out of nowhere. Silenceable via IHC_WARN_STUBS=0.
+                    case err of
+                        NoFreezeFile freezePath ->
+                            warnStub
+                                ("cabal.project.freeze not found at "
+                                 <> freezePath
+                                 <> "; single-file mode (entry dir: "
+                                 <> entryDir <> ")")
+                        CabalParseFailed cabalPath msg ->
+                            warnStub
+                                ("failed to parse " <> cabalPath
+                                 <> " (" <> msg
+                                 <> "); single-file mode (entry dir: "
+                                 <> entryDir <> ")")
                     pure fallback
                 Right deps -> do
                     acqR <- try (acquire deps) :: IO (Either SomeException ())

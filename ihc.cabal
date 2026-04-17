@@ -35,6 +35,7 @@ library
       , IHC.CabalProject
       , IHC.Classes
       , IHC.Cpp
+      , IHC.Diagnostics
       , IHC.Driver
       , IHC.Eval
       , IHC.Lexer

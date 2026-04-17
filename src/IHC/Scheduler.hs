@@ -63,6 +63,7 @@ import System.FilePath ((</>), takeDirectory)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
+import IHC.Diagnostics (warnStub)
 import IHC.Classes (ClassRegistry, newClassRegistry, registerInstance, lookupInstance, typeTagOf)
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
@@ -699,7 +700,9 @@ preloadForEffectiveExportsMemo memo registry searchPath includeMap lm visited = 
 
     loadReexportMod m = do
         reLm <- loadModule registry searchPath includeMap m
-                   `catch` (\(_ :: ModuleNotFound) -> buildEmptyStubModule m)
+                   `catch` (\(_ :: ModuleNotFound) ->
+                       warnMissingStub m searchPath
+                         >> buildEmptyStubModule m)
         -- Wrap entire sub-load in try so a broken re-exported module
         -- doesn't abort preloading of other modules.
         r <- try (preloadForEffectiveExportsMemo memo registry searchPath
@@ -740,7 +743,9 @@ preloadImportsForNamedReexportsMemo memo registry searchPath includeMap lm visit
         -- module we silently skip it (best-effort).
         result <- try $ do
             srcLm <- loadModule registry searchPath includeMap (impModule imp)
-                       `catch` (\(_ :: ModuleNotFound) -> buildEmptyStubModule (impModule imp))
+                       `catch` (\(_ :: ModuleNotFound) ->
+                           warnMissingStub (impModule imp) searchPath
+                             >> buildEmptyStubModule (impModule imp))
             preloadForEffectiveExportsMemo memo registry searchPath includeMap srcLm
                 (impModule imp : visited)
         case (result :: Either SomeException ()) of
@@ -1845,6 +1850,25 @@ isBuiltinBackedModule n =
     -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
     -- builtins for splice execution.  The package is not in the base cache.
     || "Language.Haskell.TH" `BC.isPrefixOf` n
+
+-- | Emit a diagnostic to stderr when a missing module is being
+-- substituted with an empty stub. Keeps the first 3 search-path
+-- entries for context (the full list is usually dozens of cached
+-- package dirs). Silenceable via @IHC_WARN_STUBS=0@.
+warnMissingStub :: ModuleName -> [FilePath] -> IO ()
+warnMissingStub name searchPath =
+    let shown = take 3 searchPath
+        suffix
+            | length searchPath > 3 =
+                " (+" <> show (length searchPath - 3) <> " more)"
+            | otherwise = ""
+        pathStr = case shown of
+            [] -> "<empty>"
+            _  -> show shown <> suffix
+    in warnStub
+        ("module " <> BC.unpack name
+         <> " could not be located under " <> pathStr
+         <> "; substituting empty stub")
 
 buildEmptyStubModule :: ModuleName -> IO LoadedModule
 buildEmptyStubModule name = do
