@@ -1171,6 +1171,42 @@ parseDoLet ctx cur0 = do
                 in skipNames cur1
             _ -> pure Nothing
 
+    -- | Collect every variable bound by a pattern (left-to-right order).
+    doLetPatVars (PVar n)        = [n]
+    doLetPatVars (PAs n p)       = n : doLetPatVars p
+    doLetPatVars (PBang p)       = doLetPatVars p
+    doLetPatVars (PTuple ps)     = concatMap doLetPatVars ps
+    doLetPatVars (PCon _ ps)     = concatMap doLetPatVars ps
+    doLetPatVars (PRecord _ fps) = concatMap (doLetPatVars . snd) fps
+    doLetPatVars (PRecordWild _) = []
+    doLetPatVars (PView _ p)     = doLetPatVars p
+    doLetPatVars PWild           = []
+    doLetPatVars (PLit _)        = []
+
+    -- | Parse `pat = rhs` inside a do-block let and desugar into a list
+    -- of normal bindings: a `$doPatN` temp for the RHS, plus one
+    -- per bound variable that projects via `case $doPatN of pat -> v`.
+    parseDoLetPatBind n cur = do
+        (pat, cur1) <- parseTopPat ctx cur
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr ctx "expected `=` in pattern let-binding" eqTok
+        (rhsE, cur3) <- parseExpr ctx cur2
+        let tmpName = BC.pack ("$doPat" ++ show n)
+            vars    = doLetPatVars pat
+            perVar v =
+                ( v
+                , ECase (EVar tmpName)
+                    [ Alt pat (EVar v)
+                    , Alt PWild (EApp (EVar "error")
+                                  (stringToConsList
+                                    "Non-exhaustive pattern in let"))
+                    ]
+                )
+            newBinds = (tmpName, rhsE) : map perVar vars
+        pure (newBinds, cur3)
+
     -- Layout-mode: collect one or more bindings at `bindCol`, skipping type sigs.
     -- Stops when the next token is at a different column or EOF.
     layoutBinds bindCol cur acc = do
@@ -1183,22 +1219,47 @@ parseDoLet ctx cur0 = do
                     else pure (reverse acc, cur')
             Nothing -> do
                 let (nameTok, cur1) = nextSig ctx cur
-                name <- case tkKind nameTok of
-                    TkIdent n -> pure n
-                    _         -> parseErr ctx "expected identifier after `let`" nameTok
-                (params, cur2) <- collectLetParams ctx cur1 []
-                let (eqTok, cur3) = nextSig ctx cur2
-                case tkKind eqTok of
-                    TkEq -> pure ()
-                    _    -> parseErr ctx "expected `=` in let-binding" eqTok
-                (e, cur4) <- parseExpr ctx cur3
-                let bind = (name, wrapParams params e)
-                let (peek, _) = nextSig ctx cur4
-                if tkCol peek == bindCol && tkKind peek /= TkEof
-                    then layoutBinds bindCol cur4 (bind : acc)
-                    else pure (reverse (bind : acc), cur4)
+                case tkKind nameTok of
+                    TkIdent n -> do
+                        (params, cur2) <- collectLetParams ctx cur1 []
+                        let (eqTok, cur3) = nextSig ctx cur2
+                        case tkKind eqTok of
+                            TkEq -> pure ()
+                            _    -> parseErr ctx "expected `=` in let-binding" eqTok
+                        (e, cur4) <- parseExpr ctx cur3
+                        let bind = (n, wrapParams params e)
+                        let (peek, _) = nextSig ctx cur4
+                        if tkCol peek == bindCol && tkKind peek /= TkEof
+                            then layoutBinds bindCol cur4 (bind : acc)
+                            else pure (reverse (bind : acc), cur4)
+                    k | startsPat k -> do
+                        -- Pattern binding in do-block: `let (v, s) = rhs`
+                        -- desugars to a temp binding plus one per bound var.
+                        (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                        let (peek, _) = nextSig ctx cur4
+                            acc' = reverse patBinds ++ acc
+                        if tkCol peek == bindCol && tkKind peek /= TkEof
+                            then layoutBinds bindCol cur4 acc'
+                            else pure (reverse acc', cur4)
+                      | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
 
     bracedBinds cur acc = do
+        let (nameTok, _) = nextSig ctx cur
+        case tkKind nameTok of
+            k | startsPat k, not (isIdent k) -> do
+                (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                let (sep, curN) = nextSig ctx cur4
+                    acc' = reverse patBinds ++ acc
+                case tkKind sep of
+                    TkSemi   -> bracedBinds curN acc'
+                    TkRBrace -> pure (reverse acc', curN)
+                    _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+            _ -> bracedIdentBind cur acc
+
+    isIdent (TkIdent _) = True
+    isIdent _           = False
+
+    bracedIdentBind cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of
             TkIdent n -> pure n
