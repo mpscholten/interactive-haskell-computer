@@ -182,6 +182,12 @@ parseExportList src cur0 = go [] cur0
         case tkKind tok of
             TkRParen -> pure (ExportList (reverse acc), cur1)
             TkComma  -> go acc cur1
+            -- @ExplicitNamespaces@: export list entries may be prefixed with
+            -- @type@ (e.g. @type (~)@, @type Foo@) to disambiguate type-level
+            -- names from term-level names.  The namespace prefix is not
+            -- semantically meaningful for our resolver, so just swallow the
+            -- @type@ token and re-run the dispatch on whatever follows.
+            TkTypeKw -> go acc cur1
             TkIdent n   -> go (ExportName n : acc) cur1
             -- MagicHash primop identifiers like `unpackCString#` are
             -- valid export names in modules that enable MagicHash.

@@ -171,6 +171,16 @@ loadProgramFromSource searchPath src0 = do
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
 
+    -- Pre-build the builtin name set so the discovery loop can short-
+    -- circuit names that are provided by IHC.Builtins and never need to
+    -- be walked through Prelude's re-export chain.  Without this, every
+    -- use of a builtin (@putStrLn@, @print@, @+@, …) would trigger a
+    -- Prelude walk that eagerly loads much of base/ghc-internal — slow
+    -- and semantically pointless, because the evaluator resolves to the
+    -- builtin anyway.
+    earlyBuiltins <- builtinEnv classReg
+    let earlyBuiltinNames = Map.keysSet earlyBuiltins
+
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
     -- as the entry module so its bindings stay unqualified.
@@ -178,7 +188,7 @@ loadProgramFromSource searchPath src0 = do
     let entryName = lmName entry
 
     -- Drive discovery from `main`.
-    discoverInModule registry fullSearchPath includeMap entry "main"
+    discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
@@ -316,6 +326,11 @@ loadFileIntoEnv searchPath path existingEnv = do
     src <- cppSource src0
     registry <- newIORef Map.empty
     classReg <- newClassRegistry
+    -- Pre-build builtin name set so discovery can short-circuit names
+    -- resolved by IHC.Builtins (see 'discoverInModuleWith' for why this
+    -- matters for the implicit-Prelude walk).
+    earlyBuiltins <- builtinEnv classReg
+    let earlyBuiltinNames = Map.keysSet earlyBuiltins
     -- Load the entry module.
     entry <- loadEntryModule registry src
     -- Determine which names to bring into scope.
@@ -326,7 +341,7 @@ loadFileIntoEnv searchPath path existingEnv = do
             ExportAll    -> allNames
             ExportList _ -> filter (exportsNameDirect entry) allNames
     -- Demand-discover every exported name.
-    mapM_ (discoverInModule registry fullSearchPath includeMap entry) exported
+    mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry) exported
     -- Collect all loaded modules.
     reg <- readIORef registry
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
@@ -1460,7 +1475,7 @@ loadEntryModule registry src = do
 -- | Inject an implicit @import Prelude@ at the head of @mhImports@ unless:
 --
 --   * the module IS Prelude itself (the base Prelude module),
---   * the source already contains a @\{-# LANGUAGE NoImplicitPrelude #-\}@
+--   * the source already contains a @{-# LANGUAGE NoImplicitPrelude #-}@
 --     pragma (opt-out), OR
 --   * the user wrote an explicit @import Prelude@ / @import qualified Prelude@
 --     in their source (any form of explicit import disables the implicit one,
@@ -1486,7 +1501,7 @@ implicitPreludeImport = ImportDecl
     , impSpec      = ImportAll
     }
 
--- | Check whether the source bytes contain a @\{-# LANGUAGE NoImplicitPrelude #-\}@
+-- | Check whether the source bytes contain a @{-# LANGUAGE NoImplicitPrelude #-}@
 -- pragma.  Used to opt out of the implicit Prelude injection.  This is a cheap
 -- substring test; it does not try to parse pragmas properly (a LANGUAGE pragma
 -- with multiple extensions including NoImplicitPrelude still matches).
@@ -1756,14 +1771,30 @@ discoverInModule
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModule registry searchPath includeMap lm name
+discoverInModule = discoverInModuleWith Set.empty
+
+-- | Variant of 'discoverInModule' that accepts a set of known builtin names
+-- so that the demand-driven resolver can skip the Prelude source walk for
+-- names that the evaluator can already resolve via the host builtin env.
+-- This is the hot path: without it, every mention of @putStrLn@, @print@,
+-- @+@, etc. would trigger a cascading load of @Prelude -> GHC.Internal.*@
+-- subgraphs, hurting startup latency (sometimes catastrophically).
+discoverInModuleWith
+    :: Set ByteString          -- ^ builtin names to short-circuit on
+    -> ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO ()
+discoverInModuleWith builtins registry searchPath includeMap lm name
     -- Qualified name (contains a dot and the prefix looks like a module
     -- alias)? Route to the target module directly.
     | Just (qual, bareName) <- splitQualified name = do
         mTarget <- resolveQualified registry searchPath includeMap lm qual
         case mTarget of
             Just targetLm -> do
-                discoverInModule registry searchPath includeMap targetLm bareName
+                discoverInModuleWith builtins registry searchPath includeMap targetLm bareName
                 -- Check if the target module actually resolved the name.
                 -- If its bodies contain bareName, the standard qualified key
                 -- (e.g. "Data.List.length") will exist in the flat env.
@@ -1799,13 +1830,16 @@ discoverInModule registry searchPath includeMap lm name
                                             (lhsClauses lhs))
                                     `catch` (\(_ :: ParseError) -> pure Nothing)
                         case mExpr of
-                            Nothing -> do
-                                mForeign <- resolveImport registry searchPath includeMap lm name
-                                case mForeign of
-                                    Just () ->
-                                        modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
-                                    Nothing ->
-                                        pure ()
+                            Nothing
+                                | Set.member name builtins ->
+                                    pure ()
+                                | otherwise -> do
+                                    mForeign <- resolveImport registry searchPath includeMap lm name
+                                    case mForeign of
+                                        Just () ->
+                                            modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
+                                        Nothing ->
+                                            pure ()
                             Just expr0 -> do
                                 let expr = desugarRecordPats (lmFieldReg lm)
                                              (desugarRecordCons (lmFieldReg lm) expr0)
@@ -1819,26 +1853,34 @@ discoverInModule registry searchPath includeMap lm name
                                 -- missing name is treated as a builtin and the
                                 -- evaluator will complain if it is actually used.
                                 let discoverFreeVar fv =
-                                      discoverInModule registry searchPath includeMap lm fv
+                                      discoverInModuleWith builtins registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
                                 mapM_ discoverFreeVar (nubBS (freeVars expr))
-                    Nothing -> do
-                        -- Not local. Try imports.
-                        mForeign <- resolveImport registry searchPath includeMap lm name
-                        case mForeign of
-                            Just () ->
-                                -- Memoize: mark this name as handled in the
-                                -- current module's bodies so that repeated
-                                -- calls to discoverInModule for the same
-                                -- (module, name) pair short-circuit
-                                -- immediately without re-traversing imports.
-                                -- EVar name acts as a "foreign alias" sentinel.
-                                modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
-                            Nothing ->
-                                -- Assume a builtin; let the evaluator
-                                -- complain if truly missing.
-                                pure ()
+                    Nothing
+                        -- Names provided by IHC.Builtins resolve to the host
+                        -- builtin env — no need to walk the source re-export
+                        -- chain through Prelude.  Skipping this load is what
+                        -- makes implicit Prelude tractable for programs that
+                        -- only use builtin names (the common case).
+                        | Set.member name builtins ->
+                            pure ()
+                        | otherwise -> do
+                            -- Not local. Try imports.
+                            mForeign <- resolveImport registry searchPath includeMap lm name
+                            case mForeign of
+                                Just () ->
+                                    -- Memoize: mark this name as handled in the
+                                    -- current module's bodies so that repeated
+                                    -- calls to discoverInModule for the same
+                                    -- (module, name) pair short-circuit
+                                    -- immediately without re-traversing imports.
+                                    -- EVar name acts as a "foreign alias" sentinel.
+                                    modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
+                                Nothing ->
+                                    -- Assume a builtin; let the evaluator
+                                    -- complain if truly missing.
+                                    pure ()
 
 -- | Look up @B@ in the module's imports and return the module it refers
 -- to. Matches on alias when qualified is declared, otherwise on the
@@ -1904,7 +1946,8 @@ resolveImport registry searchPath includeMap lm name = do
                 then pure True
                 else isLocalCacheModule searchPath (impModule imp)
             if not shouldLoad
-                then tryImports rest
+                then do
+                    tryImports rest
                 else do
                     mTargetLm <- (Just <$> loadModule registry searchPath includeMap (impModule imp))
                                     `catch` (\(_ :: ModuleNotFound) -> pure Nothing)
@@ -1915,8 +1958,6 @@ resolveImport registry searchPath includeMap lm name = do
                                                      (lmKnown targetLm) name
                             case mLhs of
                                 Just _ ->
-                                    -- Export-list check: the target module must
-                                    -- actually export @name@.
                                     if exportsName targetLm name
                                         then do
                                             discoverInModule registry searchPath includeMap targetLm name
@@ -1962,10 +2003,12 @@ resolveImport registry searchPath includeMap lm name = do
     -- is enough for typical base/aeson/bytestring style gateway modules
     -- without blowing up loading entire dependency subgraphs when a name
     -- simply isn't there.
-    followNamedReexport via rest = followNamedReexportD (3 :: Int) via rest
+    followNamedReexport via rest = do
+        followNamedReexportD (3 :: Int) via rest
 
     followNamedReexportD depth via rest
-        | depth <= (0 :: Int) = tryImports rest
+        | depth <= (0 :: Int) = do
+            tryImports rest
         | otherwise = do
             -- First try module-form re-exports (they may also apply).
             let reexportedMods = filter (/= lmName via)
@@ -1982,7 +2025,8 @@ resolveImport registry searchPath includeMap lm name = do
                             specAllows (impSpec i) name) viaImports
                     tryViaImports filteredImports depth rest
 
-    tryViaImports [] _depth rest = tryImports rest
+    tryViaImports [] _depth rest = do
+        tryImports rest
     tryViaImports (imp:moreImps) depth rest = do
         -- Only load the via-module if it is already in the registry.
         -- This prevents eagerly loading large library dependency subgraphs
