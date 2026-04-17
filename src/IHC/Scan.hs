@@ -2355,12 +2355,21 @@ scanForeignImports src = pure (reverse (loop [] startCursor))
             _ -> Nothing
         let (safety, curAfterSafety)       = parseOptSafety cur1
         let (mSymRaw, curAfterSym)         = parseOptSymbol curAfterSafety
-        -- Detect the address-of marker: an @&@ prefix inside the symbol
-        -- string.  The flag is preserved on the decl so the FFI layer
-        -- can return the raw pointer instead of a callable closure.
+        -- The FFI spec allows the symbol string to carry a @static@
+        -- keyword and\/or a header-file hint before the actual symbol
+        -- (e.g. @\"static string.h strlen\"@ or @\"string.h strlen\"@
+        -- as bytestring uses).  The header is a C-source hint only;
+        -- at link\/dlsym time only the LAST whitespace-separated word
+        -- matters.  An address-of marker (@&@) may prefix that final
+        -- word.  Extract the clean symbol + flag here.
         let (isAddrOf, mSym) = case mSymRaw of
-                Just s | BC.take 1 s == BC.pack "&" -> (True, Just (BC.drop 1 s))
-                _                                   -> (False, mSymRaw)
+                Just s ->
+                    let ws  = BC.words s
+                        tok = if null ws then s else last ws
+                    in if BC.take 1 tok == BC.pack "&"
+                           then (True,  Just (BC.drop 1 tok))
+                           else (False, Just tok)
+                Nothing -> (False, Nothing)
         let (t2, cur2) = peekSigTokFrom src curAfterSym
         case tkKind t2 of
             TkIdent nm -> do
@@ -2429,10 +2438,16 @@ identToCallConv n
 parseForeignType :: Source -> Cursor -> Maybe ([FFIType], FFIType, Bool, Cursor)
 parseForeignType src cur0 = do
     (pieces, curEnd) <- splitArrows cur0 [] []
-    case reverse pieces of
-        (tail':init') -> do
-            argTys <- mapM tokensToFFI (reverse init')
-            (retTy, isIO) <- tailToFFI tail'
+    -- 'pieces' is accumulated in reverse appearance order (the last-seen
+    -- arrow segment is the head).  The HEAD is therefore the return type
+    -- and the REST (reversed back) are the argument types in source
+    -- order.  A bug here — treating the head as the first arg — slipped
+    -- past the first-pass tests because they all had matching shapes on
+    -- both sides of the final arrow.
+    case pieces of
+        (tailSeg : revArgs) -> do
+            argTys <- mapM tokensToFFI (reverse revArgs)
+            (retTy, isIO) <- tailToFFI tailSeg
             pure (argTys, retTy, isIO, curEnd)
         [] -> Nothing
   where

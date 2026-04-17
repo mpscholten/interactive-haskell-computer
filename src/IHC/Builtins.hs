@@ -377,10 +377,12 @@ builtins reg =
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
     , ("copyBytes",  copyBytesB)  -- Foreign.Marshal.Utils.copyBytes: wraps memcpy (primop-backed, no Haskell source)
-    , ("memset",     memsetB)
-    , ("memchr",     memchrB)
-    , ("memcmp",     memcmpB)
-    , ("c_strlen",   cStrlenB)
+    -- memset / memchr / memcmp / c_strlen retired: bytestring and the
+    -- rest of Hackage declare these as
+    --   foreign import ccall unsafe "string.h memset" c_memset
+    -- (and similarly for memchr/memcmp/strlen).  The generic libffi
+    -- dispatcher (src/IHC/FFI.hs) picks them up at scan time; hardcoded
+    -- shims are no longer needed to unblock source-loaded bytestring.
     -- Phase 2.8: buffered I/O
     , ("hPutBuf",    hPutBufB)
     -- Phase 2.8: Int/Word coercions + bit ops
@@ -2569,58 +2571,6 @@ copyBytesB = pure $ VFun $ \destT -> pure $ VFun $ \srcT -> pure $ VFun $ \nT ->
             copyBytes dest src (fromIntegral n)
             pure VUnit
         _ -> error $ "copyBytes: bad args"
-
-memsetB :: IO Val
-memsetB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    pv <- force a; vv <- force b; nv <- force c
-    case (pv, vv, nv) of
-        (VPrimObj (PrimPtr p), VInt v, VInt n) -> do
-            fillBytes p (fromIntegral v) (fromIntegral n)
-            pure VUnit
-        _ -> error "memset: bad args"
-
-memchrB :: IO Val
-memchrB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    pv <- force a; vv <- force b; nv <- force c
-    case (pv, vv, nv) of
-        (VPrimObj (PrimPtr p), VInt v, VInt n) -> do
-            let go i
-                  | i >= fromIntegral n = pure (VPrimObj (PrimPtr nullPtr))
-                  | otherwise = do
-                      w <- peek (plusPtr p i :: Ptr Word8)
-                      if fromIntegral w == v
-                          then pure (VPrimObj (PrimPtr (plusPtr p i)))
-                          else go (i + 1)
-            go (0 :: Int)
-        _ -> error "memchr: bad args"
-
-memcmpB :: IO Val
-memcmpB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    p1v <- force a; p2v <- force b; nv <- force c
-    case (p1v, p2v, nv) of
-        (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2), VInt n) -> do
-            let go i
-                  | i >= fromIntegral n = pure (VInt 0)
-                  | otherwise = do
-                      w1 <- peek (plusPtr p1 i :: Ptr Word8)
-                      w2 <- peek (plusPtr p2 i :: Ptr Word8)
-                      case compare w1 w2 of
-                          LT -> pure (VInt (-1))
-                          GT -> pure (VInt 1)
-                          EQ -> go (i + 1)
-            go (0 :: Int)
-        _ -> error "memcmp: bad args"
-
-cStrlenB :: IO Val
-cStrlenB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            let go i = do
-                  w <- peek (plusPtr p i :: Ptr Word8)
-                  if w == 0 then pure (VInt (fromIntegral i)) else go (i + 1)
-            go (0 :: Int)
-        _ -> error ("c_strlen: not a Ptr: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: buffered I/O
