@@ -45,9 +45,12 @@ module IHC.Scan
     , scanClassDecls
       -- * Phase 3.2 + 3.4: type family / type instance skip helper
     , skipTypeDecl
+      -- * Type-family reduction (tier-1 IHP blocker: GetTableName etc.)
+    , scanTypeFamilyDecls
     ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -59,6 +62,7 @@ import Foreign.Ptr (Ptr)
 import IHC.Classes (normalizeTyTag)
 import IHC.Lexer
 import IHC.Source
+import qualified IHC.TypeReduce as TR
 
 -- | What we know about a top-level name.
 data SymbolInfo
@@ -600,6 +604,274 @@ skipTypeDecl src cur0 =
     -- Cursor with dummy line/col (the scanner only uses cPos).
     let bodyEnd = findBodyEnd src (cPos cur0)
     in Cursor bodyEnd 0 1
+
+--------------------------------------------------------------------------------
+-- Type-family scanner
+--
+-- Second pass over the source collecting both open-family
+-- @type instance F a b = rhs@ equations and closed-family
+-- @type family F ... where ...@ equation blocks.  Uses the same
+-- cursor/next-token machinery as 'scanDataDecls' so it's cheap — one
+-- linear sweep per module.
+--
+-- We deliberately do NOT capture plain synonyms @type Foo = Bar@ —
+-- those are aliases that never surface in the runtime type-family path.
+-- 'symbolVal' / 'natVal' only ever see type-family applications.
+--------------------------------------------------------------------------------
+
+-- | Scan for @type family F where …@ equation blocks and @type instance
+-- F args = rhs@ decls.  Returns a merged 'TR.TypeFamilyRegistry' ready
+-- to hand off to 'TR.reduceTypeExpr' at runtime.
+scanTypeFamilyDecls :: Source -> IO TR.TypeFamilyRegistry
+scanTypeFamilyDecls src = go TR.emptyRegistry startCursor
+  where
+    go !reg cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure reg
+            TkTypeKw | tkCol tok == 1 -> do
+                (reg', curAfter) <- classifyAndConsume reg cur'
+                go reg' curAfter
+            _ -> go reg cur'
+
+    -- Called with cursor positioned right after 'type'.  Dispatches to
+    -- the equation / header scanner based on the next significant token.
+    classifyAndConsume reg cur0 = do
+        let (tok, cur1) = nextToken src cur0
+        case tkKind tok of
+            TkInstance -> scanOpenInstance reg src cur1
+            TkIdent name
+              | name == BC.pack "family" -> scanFamilyHeader reg src cur1
+            -- Plain 'type Foo = Bar' or stray token: skip the whole decl.
+            _ -> pure (reg, skipTypeDecl src cur0)
+
+-- | Consume an open-family equation: @F pat1 pat2 = rhs@.  Cursor is
+-- positioned just after the @instance@ keyword.
+scanOpenInstance
+    :: TR.TypeFamilyRegistry
+    -> Source
+    -> Cursor
+    -> IO (TR.TypeFamilyRegistry, Cursor)
+scanOpenInstance reg src cur0 = do
+    let (famTok, curAfterName) = nextToken src cur0
+    case tkKind famTok of
+        TkConId fam -> do
+            let lhsStart = cPos curAfterName
+            (rhsStart, lhsEnd) <- skipUntilEqualsPure src curAfterName
+            let bodyEnd  = findBodyEnd src rhsStart
+                lhsBytes = sliceBytes src (lhsStart, lhsEnd)
+                rhsBytes = sliceBytes src (rhsStart, bodyEnd)
+                pats     = parseArgList lhsBytes
+                rhsExpr  = TR.parseTypeExpr (stripTrailingSpaces rhsBytes)
+                reg'     = TR.addOpenInstance fam pats rhsExpr reg
+                curOut   = Cursor bodyEnd 0 1
+            pure (reg', curOut)
+        _ -> pure (reg, skipTypeDecl src cur0)
+
+-- | Consume a @type family F ... :: K where …@ header.  If a @where@
+-- block is present, scan its indented equations; otherwise treat as an
+-- open header with no equations (individual @type instance@ decls carry
+-- the reductions for the same family).
+scanFamilyHeader
+    :: TR.TypeFamilyRegistry
+    -> Source
+    -> Cursor
+    -> IO (TR.TypeFamilyRegistry, Cursor)
+scanFamilyHeader reg src cur0 = do
+    let (famTok, curAfterName) = nextToken src cur0
+    case tkKind famTok of
+        TkConId fam -> do
+            mWhere <- findWhereKeyword src curAfterName
+            case mWhere of
+                Nothing -> pure (reg, skipTypeDecl src cur0)
+                Just whereEnd -> do
+                    let bodyEnd = findBodyEnd src whereEnd
+                        body    = sliceBytes src (whereEnd, bodyEnd)
+                        eqs     = parseClosedEquations fam body
+                        reg'    = TR.addClosedEquations fam eqs reg
+                        curOut  = Cursor bodyEnd 0 1
+                    pure (reg', curOut)
+        _ -> pure (reg, skipTypeDecl src cur0)
+
+-- | Walk forward from @cur@ stopping at either @TkWhere@ or the first
+-- column-1 non-blank, non-newline token.  Returns @Just pos@ pointing
+-- just after @where@ on a match, @Nothing@ if the decl ends without one.
+findWhereKeyword :: Source -> Cursor -> IO (Maybe Pos)
+findWhereKeyword src = go
+  where
+    go cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure Nothing
+            TkWhere   -> pure (Just (cPos cur'))
+            TkNewline -> go cur'
+            _ | tkCol tok == 1 -> pure Nothing
+              | otherwise      -> go cur'
+
+-- | Consume tokens until we see @=@ at paren-depth 0.  Returns a pair
+-- of positions: the byte just after the @=@ and the byte just before
+-- it (= end of the LHS, start of the RHS).
+skipUntilEqualsPure :: Source -> Cursor -> IO (Pos, Pos)
+skipUntilEqualsPure src = go (0 :: Int)
+  where
+    go !depth cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (cPos cur, cPos cur)
+            TkEq | depth == 0 -> pure (cPos cur', tkStart tok)
+            TkLParen   -> go (depth + 1) cur'
+            TkLBracket -> go (depth + 1) cur'
+            TkLBrace   -> go (depth + 1) cur'
+            TkRParen   -> go (max 0 (depth - 1)) cur'
+            TkRBracket -> go (max 0 (depth - 1)) cur'
+            TkRBrace   -> go (max 0 (depth - 1)) cur'
+            _          -> go depth cur'
+
+-- | Split a closed-family @where@-block body into 'TR.FamilyClause's.
+parseClosedEquations :: ByteString -> ByteString -> [TR.FamilyClause]
+parseClosedEquations fam body =
+    [ clause
+    | line <- splitLogicalLines body
+    , Just (n, clause) <- [parseOneEquation line]
+    , n == fam
+    ]
+
+-- | Split a @where@-body into logical equation lines.  Deeper-indented
+-- continuation lines are glued to the preceding equation; blank lines
+-- are dropped.  Determines the equation indentation from the first
+-- non-blank line of the block.
+splitLogicalLines :: ByteString -> [ByteString]
+splitLogicalLines body =
+    let linesBs  = BC.split '\n' body
+        nonBlank = filter (not . allWhitespace) linesBs
+    in case nonBlank of
+        []        -> []
+        (first:_) -> chunkByIndent (leadingSpaces first) linesBs
+  where
+    allWhitespace bs =
+        BS.null bs
+          || BS.all (\b -> b == 0x20 || b == 0x09 || b == 0x0D) bs
+    leadingSpaces = BC.length . BC.takeWhile (\c -> c == ' ' || c == '\t')
+
+    isIndent c = c == ' ' || c == '\t'
+
+    -- Sweep top-to-bottom: a line at @startCol@ starts a new equation,
+    -- anything further indented is a continuation of the current one,
+    -- blanks are skipped.
+    chunkByIndent startCol = flush . foldl step ([], [])
+      where
+        step (cur, out) l
+          | allWhitespace l = (cur, out)
+          | leadingSpaces l == startCol =
+              let flushed = if null cur then out
+                                        else BC.unwords (reverse cur) : out
+              in ([BC.dropWhile isIndent l], flushed)
+          | otherwise = (BC.dropWhile isIndent l : cur, out)
+
+        flush (cur, out)
+          | null cur  = reverse out
+          | otherwise = reverse (BC.unwords (reverse cur) : out)
+
+-- | Parse one trimmed equation line of a closed family into
+-- @(familyName, clause)@.  Returns 'Nothing' if the line doesn't look
+-- like an equation (no '=', malformed head, etc.).
+parseOneEquation :: ByteString -> Maybe (ByteString, TR.FamilyClause)
+parseOneEquation line = do
+    let (lhs, rhs) = splitOnTopLevelEquals line
+    (fam, patsBytes) <- firstConIdent (BC.dropWhile isSp lhs)
+    let pats    = parseArgList patsBytes
+        rhsExpr = TR.parseTypeExpr (stripTrailingSpaces rhs)
+    pure (fam, TR.FamilyClause pats rhsExpr)
+  where
+    isSp c = c == ' ' || c == '\t'
+
+    splitOnTopLevelEquals bs = go 0 0
+      where
+        n = BC.length bs
+        go !depth !i
+          | i >= n = (bs, BC.empty)
+          | otherwise = case BC.index bs i of
+              '(' -> go (depth + 1) (i + 1)
+              '[' -> go (depth + 1) (i + 1)
+              ')' -> go (depth - 1) (i + 1)
+              ']' -> go (depth - 1) (i + 1)
+              '=' | depth == 0 ->
+                  (BS.take i bs, BS.drop (i + 1) bs)
+              _   -> go depth (i + 1)
+
+    firstConIdent bs =
+        let (tok, rest) = BC.span (\c -> isAlphaChar c || isDigitChar c
+                                       || c == '\'' || c == '_') bs
+        in if BS.null tok || not (isAlphaUpper (BC.head tok))
+             then Nothing
+             else Just (tok, rest)
+
+    isAlphaUpper c = c >= 'A' && c <= 'Z'
+    isAlphaChar c  = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    isDigitChar c  = c >= '0' && c <= '9'
+
+-- | Parse a whitespace-separated argument list into 'TR.TyExpr's.
+-- Balanced paren/bracket groups count as one argument; everything else
+-- is a whitespace-delimited atom.
+parseArgList :: ByteString -> [TR.TyExpr]
+parseArgList raw0 =
+    let bs = trim raw0
+    in go [] bs
+  where
+    trim s = BC.dropWhile isSp (BC.reverse (BC.dropWhile isSp (BC.reverse s)))
+    isSp c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    go acc s
+      | BS.null s = reverse acc
+      | otherwise =
+          let (argBs, rest) = takeOneArg s
+          in if BS.null argBs
+               then reverse acc
+               else go (TR.parseTypeExpr argBs : acc) (BC.dropWhile isSp rest)
+
+    takeOneArg s = case BC.head s of
+        c | isSp c -> takeOneArg (BC.dropWhile isSp s)
+        '(' -> takeBalanced '(' ')' s
+        '[' -> takeBalanced '[' ']' s
+        '\'' -> takeTickPrefixed s
+        '"' -> takeStringLit s
+        _   -> BC.span (\ch -> not (isSp ch)) s
+
+    takeBalanced openCh closeCh s = goBal 0 0
+      where
+        n = BC.length s
+        goBal !depth !i
+          | i >= n = (s, BC.empty)
+          | otherwise = case BC.index s i of
+              c | c == openCh  -> goBal (depth + 1) (i + 1)
+                | c == closeCh && depth == 1 ->
+                    (BS.take (i + 1) s, BS.drop (i + 1) s)
+                | c == closeCh -> goBal (depth - 1) (i + 1)
+                | otherwise    -> goBal depth (i + 1)
+
+    takeTickPrefixed s
+      | BC.length s >= 2 =
+          case BC.index s 1 of
+              '[' -> let (lst, rest) = takeBalanced '[' ']' (BC.tail s)
+                     in (BC.cons '\'' lst, rest)
+              '(' -> let (tup, rest) = takeBalanced '(' ')' (BC.tail s)
+                     in (BC.cons '\'' tup, rest)
+              _   -> BC.span (\ch -> not (isSp ch)) s
+      | otherwise = (s, BC.empty)
+
+    takeStringLit s =
+        let rest = BC.tail s
+            (inside, after) = BC.break (== '"') rest
+        in if BS.null after
+             then (s, BC.empty)
+             else (BC.cons '"' (BC.snoc inside '"'), BC.tail after)
+
+-- | Trim trailing ASCII whitespace from a ByteString.
+stripTrailingSpaces :: ByteString -> ByteString
+stripTrailingSpaces =
+    BC.reverse
+      . BC.dropWhile (\c -> c == ' ' || c == '\t' || c == '\n' || c == '\r')
+      . BC.reverse
 
 --------------------------------------------------------------------------------
 -- Data declarations

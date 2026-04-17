@@ -75,6 +75,7 @@ import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr)
+import qualified IHC.TypeReduce as TR
 import IHC.Val
 
 -- | Run our hand-rolled CPP over the source bytes, returning a new
@@ -122,6 +123,12 @@ data LoadedModule = LoadedModule
       -- under their bare names in the final env — only under the
       -- internal 'fieldProjName' alias that record-dot uses.
     , lmNoFieldSelectors :: !Bool
+      -- | Per-module 'TR.TypeFamilyRegistry'. Built by
+      -- 'scanTypeFamilyDecls' in the same pass that scans data decls.
+      -- Unioned across all loaded modules at knot-tying time and
+      -- installed into 'TR.globalRegistry' so the ETyApp path of the
+      -- evaluator can reduce type-family applications at runtime.
+    , lmTypeFamilies :: !TR.TypeFamilyRegistry
     }
 
 data ModuleState
@@ -216,6 +223,15 @@ loadProgramFromSource searchPath src0 = do
     let unionedData  = foldr Map.union Map.empty (map lmDataReg  loadedModules)
         (publicFields, unionedFields) = partitionFieldRegistries loadedModules
         unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
+        -- Union type-family registries across all loaded modules and
+        -- publish the merged result into the global 'TR.globalRegistry'
+        -- so the ETyApp path in 'IHC.Eval' can look up reductions for
+        -- 'symbolVal' / 'natVal' calls at runtime.  'Map.unionWith (++)'
+        -- preserves every clause — multiple modules may extend the
+        -- same open family with their own 'type instance' decls.
+        unionedTFReg = foldr (Map.unionWith (++)) Map.empty
+                         (map lmTypeFamilies loadedModules)
+    TR.setGlobalRegistry unionedTFReg
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv publicFields unionedFields
     builtins <- builtinEnv classReg
@@ -417,6 +433,9 @@ loadFileIntoEnv searchPath path existingEnv = do
     let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules)
         (publicFields, unionedFields) = partitionFieldRegistries loadedModules
         unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
+        unionedTFReg = foldr (Map.unionWith (++)) Map.empty
+                         (map lmTypeFamilies loadedModules)
+    TR.setGlobalRegistry unionedTFReg
     conEnv    <- buildConEnv  unionedData
     fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
@@ -843,6 +862,9 @@ loadImportIntoEnv searchPath imp existingEnv
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules0)
             (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
+            unionedTFReg = foldr (Map.unionWith (++)) Map.empty
+                             (map lmTypeFamilies loadedModules0)
+        TR.setGlobalRegistry unionedTFReg
         conEnv    <- buildConEnv  unionedData
         fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
         builtins <- builtinEnv =<< newClassRegistry
@@ -955,6 +977,9 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
         (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
         unionedTypeCtors0 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
+        unionedTFReg = foldr (Map.unionWith (++)) Map.empty
+                         (map lmTypeFamilies loadedModules0)
+    TR.setGlobalRegistry unionedTFReg
     conEnv    <- buildConEnv unionedData
     fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
@@ -2329,12 +2354,14 @@ buildEmptyStubModule name = do
         , lmIsEntry     = False
         , lmFixity      = defaultFixityTable
         , lmNoFieldSelectors = False
+        , lmTypeFamilies     = TR.emptyRegistry
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
 buildLoadedModule name isEntry header src = do
     known               <- emptyKnownSymbols
     (dataR, fldR, tCtR) <- scanDataDecls src
+    tfReg               <- scanTypeFamilyDecls src
     bodies              <- newIORef Map.empty
     fixity              <- scanFixityDecls src defaultFixityTable
     pure LoadedModule
@@ -2349,6 +2376,7 @@ buildLoadedModule name isEntry header src = do
         , lmIsEntry     = isEntry
         , lmFixity      = fixity
         , lmNoFieldSelectors = hasNoFieldSelectors src
+        , lmTypeFamilies     = tfReg
         }
 
 emptyHeader :: ModuleHeader

@@ -33,6 +33,7 @@ import qualified Data.Map.Strict as Map
 
 import IHC.AST
 import IHC.Classes (normalizeTyTag)
+import qualified IHC.TypeReduce as TR
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -216,7 +217,20 @@ eval env ipm = go
     --       where a call like @symbolVal \@\"email\" undefined@ works.
     --
     -- All other uses are the plain pass-through on the inner expression.
-    go (ETyApp e ty)
+    go (ETyApp e ty0) = do
+        -- Try to reduce the raw type-argument bytes through the
+        -- type-family registry built by the scheduler.  For ordinary
+        -- types the registry lookup misses and we keep @ty0@ as-is;
+        -- for type-family applications (e.g. @GetTableName User@) we
+        -- replace it with the reduced bytes (e.g. @"users"@) so the
+        -- downstream DataKinds extractors see the literal directly.
+        reg <- TR.getGlobalRegistry
+        let ty = case TR.reduceTypeExpr reg ty0 of
+                     Just reduced -> reduced
+                     Nothing      -> ty0
+        goTyApp e ty
+
+    goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
         | otherwise      = do
             v <- go e
