@@ -239,9 +239,9 @@ doImport envRef loadedRef importsRef line = do
         Just imp -> do
             env <- liftIO (readIORef envRef)
             searchPath <- liftIO (currentImportSearchPath loadedRef)
-            if impQualified imp || impAlias imp /= Nothing
+            if shouldDeferImport imp
                 then do
-                    liftIO $ modifyIORef' importsRef (imp :)
+                    liftIO $ modifyIORef' importsRef (\imports -> imports <> [imp])
                     outputStrLn ("imported " <> BC.unpack (impModule imp) <> " (deferred)")
                 else do
                     r <- liftIO (tryImportModule searchPath imp env)
@@ -255,6 +255,17 @@ doImport envRef loadedRef importsRef line = do
                                         <> " ("
                                         <> show n
                                         <> " names)" )
+
+-- | Most REPL imports are eager so their unqualified names are available
+-- immediately, but @import Prelude@ is special: bulk-loading the whole
+-- re-export surface is extremely expensive and makes the prompt look hung.
+-- We defer it and let 'ensureQualifiedNamesLoaded' pull in only the names
+-- that a later expression actually references.
+shouldDeferImport :: ImportDecl -> Bool
+shouldDeferImport imp =
+    impQualified imp
+    || impAlias imp /= Nothing
+    || impModule imp == BC.pack "Prelude"
 
 tryImportModule
     :: [FilePath]
@@ -675,17 +686,33 @@ ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
             searchPath <- currentImportSearchPath loadedRef
             let requested =
                     foldr addRequest []
-                        [ (imp, bare)
-                        | fv <- freeVars expr
-                        , Just (qual, bare) <- [splitQualified fv]
-                        , imp <- matchingImports qual imports
-                        ]
+                        (qualifiedRequests imports ++ unqualifiedRequests imports)
             foldM (loadOne searchPath) env requested
   where
-    matchingImports qual = filter (\imp ->
+    qualifiedRequests imports =
+        [ (imp, bare)
+        | fv <- freeVars expr
+        , Just (qual, bare) <- [splitQualified fv]
+        , imp <- matchingQualifiedImports qual imports
+        ]
+
+    unqualifiedRequests imports =
+        [ (imp, fv)
+        | fv <- freeVars expr
+        , splitQualified fv == Nothing
+        , Map.notMember fv env
+        , imp <- matchingUnqualifiedImports fv imports
+        ]
+
+    matchingQualifiedImports qual = filter (\imp ->
         case impAlias imp of
             Just a  -> a == qual
             Nothing -> impQualified imp && impModule imp == qual)
+
+    matchingUnqualifiedImports name = filter (\imp ->
+        not (impQualified imp)
+        && impAlias imp == Nothing
+        && specAllowsImport imp name)
 
     addRequest (imp, bare) [] = [(imp, [bare])]
     addRequest (imp, bare) ((imp', names) : rest)
@@ -697,6 +724,12 @@ ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
         && impQualified a == impQualified b
         && impAlias a == impAlias b
         && impSpec a == impSpec b
+
+    specAllowsImport imp = specAllowsName (impSpec imp)
+
+    specAllowsName ImportAll         _    = True
+    specAllowsName (ImportOnly ns)   name = name `elem` ns
+    specAllowsName (ImportHiding ns) name = name `notElem` ns
 
     loadOne searchPath accEnv (imp, names) = do
         let imp' = imp { impSpec = ImportOnly (nub names) }

@@ -64,6 +64,13 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "imported Data.List"
         out `shouldContain` "3"
 
+    it "import Prelude returns promptly" do
+        (code, out, _err) <- runRepl
+            ( "import Prelude\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Prelude (deferred)"
+
     it "import qualified Data.ByteString as BS succeeds" do
         (code, out, _err) <- runRepl "import qualified Data.ByteString as BS\n:q\n"
         code `shouldBe` ExitSuccess
