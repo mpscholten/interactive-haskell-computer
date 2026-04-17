@@ -384,6 +384,13 @@ parseImportList src cur0 = go [] cur0
             TkComma  -> go acc cur1
             TkIdent n -> nameOrSub acc n cur1
             TkConId n -> nameOrSub acc n cur1
+            -- MagicHash primop identifiers (e.g. `Addr#`, `unpackCString#`)
+            -- must be accepted in an explicit import list, same as in
+            -- parseExportList.  Before this, hitting a TkPrimId bailed
+            -- the list mid-stream and lost every subsequent import
+            -- declaration (seen in Data.Text.Show's `import GHC.Exts
+            -- (Ptr(..), Int(..), Addr#, indexWord8OffAddr#)`).
+            TkPrimId n -> nameOrSub acc n cur1
             TkEof    -> pure (reverse acc, cur1)
             -- Operator import: `(++)`, `(.&.)`, `(@?=)`, etc.
             -- Extract the operator name from the (op) group so that

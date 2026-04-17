@@ -432,6 +432,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Red\nGreen\nBlue\n"
 
+    it "module: MagicHash ident in explicit import list doesn't bail the list" do
+        -- Regression for the Data.Text.Show bug where `import GHC.Exts
+        -- (Ptr(..), Int(..), Addr#, indexWord8OffAddr#)` hit a TkPrimId
+        -- mid-list, silently truncated, and lost every subsequent
+        -- `import qualified ... as X` on the same module. Downstream
+        -- references to `X.name` then failed as UnresolvedName.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Modules/magichash_in_import_list/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello, ok\n"
+
     it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
         home <- getHomeDirectory
         let mtlDir = home <> "/.cache/ihc/sources/mtl-2.3.2"
