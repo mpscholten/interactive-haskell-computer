@@ -2217,12 +2217,13 @@ runRWB :: IO Val
 runRWB = pure $ VFun $ \ft -> do
     fv <- force ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    -- runRW# :: (State# RealWorld -> o) -> o
+    -- Just apply the function to the RealWorld token and return the raw
+    -- result.  The *caller* (e.g. runST) does any unboxed-tuple matching.
     resRaw <- apply fv rwT
-    result <- runIOVal resRaw
-    case result of
-        VCon "(#,#)" [_stT, resT] -> force resT
-        other -> error ("runRW#: expected (# State# RealWorld, a #), got: "
-                        <> showValForDebug other)
+    -- If the result is a VIO action (ST-VIO bridge), execute it so that
+    -- the caller sees the concrete value / unboxed tuple.
+    runIOVal resRaw
 
 lazyB :: IO Val
 lazyB = pure $ VFun $ \a -> force a

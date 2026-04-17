@@ -886,6 +886,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "True\n"
 
+    it "runST basic: runST (return 42) evaluates correctly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/runst_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "42\n"
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------
