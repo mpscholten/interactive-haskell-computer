@@ -52,6 +52,23 @@ nix develop -c cabal test ihc-test --test-show-details=streaming
 nix develop -c cabal run ihc -- run path/to/program.hs
 ```
 
+### Populating the source cache for test-framework packages
+
+The nix flake's `ihcSourceRoot` ships sources for the common runtime
+dependencies (hspec, QuickCheck, HUnit, aeson, attoparsec, …) but NOT the
+`tasty` family, which the bytestring / aeson / attoparsec test suites import.
+Fetch them once into the user-local cache:
+
+```sh
+scripts/cache-test-deps.sh
+```
+
+This populates `~/.cache/ihc/sources/tasty-*`, `tasty-quickcheck-*`,
+`tasty-hunit-*`, `tasty-ant-xml-*`, and their transitive Hackage-only deps
+(`ansi-terminal`, `ansi-terminal-types`, `colour`, `unbounded-delays`,
+`generic-deriving`, `xml`).  Idempotent — safe to re-run.  Pass extra package
+names as positional args to fetch additional tarballs.
+
 ## Layout
 
 | Path | Purpose |
