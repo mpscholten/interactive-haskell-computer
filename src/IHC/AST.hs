@@ -69,6 +69,7 @@ data Stmt
     = SExpr !Expr
     | SBind !Name !Expr
     | SLet  ![Bind]
+    | SImplicitLet ![(Name, Expr)]
     deriving (Eq, Show)
 
 type Bind = (Name, Expr)

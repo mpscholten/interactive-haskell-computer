@@ -743,6 +743,16 @@ evalDo env ipm (SLet bs : rest) = do
                writeIORef slot (Unevaluated (Closure env' ipm rhs)))
           (zip bs slots)
     evalDo env' ipm rest
+evalDo _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
+evalDo env ipm (SImplicitLet bs : rest) = do
+    slots <- mapM (\_ -> newIORef BlackHole) bs
+    let names = map fst bs
+        ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
+                      (zip names slots)
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure env ipm rhs)))
+          (zip bs slots)
+    evalDo env ipm' rest
 
 -- | Force a 'VIO' to execute its suspended action. Any other value
 -- is returned as-is (treated as a "pure" IO result -- shouldn't happen

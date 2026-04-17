@@ -1992,6 +1992,9 @@ rewriteExpr rw = go []
             bound' = names ++ bound
             bs'   = [(n, go bound' b) | (n, b) <- bs]
         in SLet bs' : goStmts bound' rest
+    goStmts bound (SImplicitLet bs : rest) =
+        SImplicitLet [(n, go bound b) | (n, b) <- bs]
+          : goStmts bound rest
 
     patBound (PVar n)        = [n]
     patBound (PCon _ ps)     = concatMap patBound ps
@@ -3098,6 +3101,9 @@ freeVars = goAll []
             bound' = names ++ bound
         in concatMap (\(_, rhs) -> goAll bound' rhs) bs
            ++ goStmts bound' rest
+    goStmts bound (SImplicitLet bs : rest) =
+        concatMap (\(_, rhs) -> goAll bound rhs) bs
+           ++ goStmts bound rest
 
     goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
 
@@ -3213,6 +3219,7 @@ desugarRecordCons fldReg = go
     goStmt (SExpr e)   = SExpr (go e)
     goStmt (SBind n e) = SBind n (go e)
     goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Look up all fields for a constructor from the FieldRegistry,
 -- sorted by their positional index.
@@ -3258,6 +3265,7 @@ desugarRecordPats fldReg = goExpr
     goStmt (SExpr e)   = SExpr (goExpr e)
     goStmt (SBind n e) = SBind n (goExpr e)
     goStmt (SLet bs)   = SLet [(n, goExpr b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, goExpr b) | (n, b) <- bs]
 
     -- Handle a case expression, desugaring view-pattern alts into a chain.
     -- View pattern alt: (f -> p) → fresh var, let vp = f scrut, case vp of p

@@ -930,6 +930,7 @@ parseDo ctx cur0 = do
     monadicDo [SExpr e]        = e
     monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
     monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
+    monadicDo [SImplicitLet bs] = EImplicitLet bs (EDo [])
     monadicDo (SExpr e : rest) =
         -- e >> do { rest }
         EApp (EApp (EVar ">>") e) (monadicDo rest)
@@ -939,6 +940,9 @@ parseDo ctx cur0 = do
     monadicDo (SLet bs : rest) =
         -- let bs in do { rest }
         ELet bs (monadicDo rest)
+    monadicDo (SImplicitLet bs : rest) =
+        -- let ?x = e in do { rest }
+        EImplicitLet bs (monadicDo rest)
 
     -- | If the do-block matches the applicative pattern, return its
     -- applicative desugaring.  See the header comment on 'parseDo' for the
@@ -1044,6 +1048,8 @@ parseDo ctx cur0 = do
             let names  = map fst bs
                 bound' = names ++ bound
             in concatMap (fv bound' . snd) bs ++ fvStmts bound' rest
+        fvStmts bound (SImplicitLet bs : rest) =
+            concatMap (fv bound . snd) bs ++ fvStmts bound rest
 
         fvAlt bound (Alt p e) = fv (patBound p ++ bound) e
 
@@ -1089,15 +1095,60 @@ parseStmt ctx cur0 = do
 parseDoLet :: Ctx -> Cursor -> IO (Stmt, Cursor)
 parseDoLet ctx cur0 = do
     let (firstTok, curAfter) = nextSig ctx cur0
-    (binds, curEnd) <- case tkKind firstTok of
-        TkLBrace -> bracedBinds curAfter []
-        _        ->
-            -- Layout mode: collect all bindings at the same column.
-            -- This handles `let x :: Int\n    x = 42` correctly.
+    case tkKind firstTok of
+        -- `let ?x = e` inside do — implicit-param binding that scopes
+        -- to the remainder of the do-block via 'EImplicitLet'.
+        TkImplicitRef _ -> do
+            (iBinds, curEnd) <- parseImplicitDoBinds (tkCol firstTok) cur0 []
+            pure (SImplicitLet iBinds, curEnd)
+        TkLBrace -> do
+            let (peek, _) = nextSig ctx curAfter
+            case tkKind peek of
+                TkImplicitRef _ -> do
+                    (iBinds, curEnd) <- parseImplicitBracedBinds curAfter []
+                    pure (SImplicitLet iBinds, curEnd)
+                _ -> do
+                    (binds, curEnd) <- bracedBinds curAfter []
+                    pure (SLet binds, curEnd)
+        _ ->
             let bindCol = tkCol firstTok
-            in layoutBinds bindCol cur0 []
-    pure (SLet binds, curEnd)
+            in do
+                (binds, curEnd) <- layoutBinds bindCol cur0 []
+                pure (SLet binds, curEnd)
   where
+    parseImplicitDoBinds bindCol cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _ -> parseErr ctx "expected `?name` in implicit let-binding" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr ctx "expected `=` in implicit let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let (peek, _) = nextSig ctx cur3
+        if tkCol peek == bindCol && tkKind peek /= TkEof
+            then case tkKind peek of
+                TkImplicitRef _ -> parseImplicitDoBinds bindCol cur3 ((name, e) : acc)
+                _ -> pure (reverse ((name, e) : acc), cur3)
+            else pure (reverse ((name, e) : acc), cur3)
+
+    parseImplicitBracedBinds cur acc = do
+        let (nameTok, cur1) = nextSig ctx cur
+        name <- case tkKind nameTok of
+            TkImplicitRef n -> pure n
+            _ -> parseErr ctx "expected `?name` in implicit let-binding" nameTok
+        let (eqTok, cur2) = nextSig ctx cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr ctx "expected `=` in implicit let-binding" eqTok
+        (e, cur3) <- parseExpr ctx cur2
+        let (sep, curN) = nextSig ctx cur3
+        case tkKind sep of
+            TkSemi   -> parseImplicitBracedBinds curN ((name, e) : acc)
+            TkRBrace -> pure (reverse ((name, e) : acc), curN)
+            _        -> parseErr ctx "expected `;` or `}` in implicit let-block" sep
+
     -- | Try to detect and skip a type sig @name[, name]* :: type@ at the
     -- current position. Returns @Just curAfter@ on success, @Nothing@ if
     -- this looks like a value binding.
