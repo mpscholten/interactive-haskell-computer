@@ -466,6 +466,28 @@ stringLitVal bs = go (BC.unpack bs)
 -- Returns 'Thunk' rather than 'Val' because nested constructor
 -- patterns may force sub-fields and rebind them; for a 'PVar' we
 -- reuse the existing thunk so the match itself doesn't lose sharing.
+
+-- | Match a Haskell string literal against a runtime cons-list value
+-- (@VCon ":" [h, t]@ chain ending in @VCon "[]" []@).  Succeeds when the
+-- list's characters equal @s@ (byte-for-byte over the UTF-8 payload).
+matchStringPatList :: ByteString -> Val -> IO (Maybe [(Name, Thunk)])
+matchStringPatList s0 v0 = go (BC.unpack s0) v0
+  where
+    go [] (VCon "[]" []) = pure (Just [])
+    go (c:cs) (VCon ":" [hT, tT]) = do
+        hv <- force hT
+        case hv of
+            VChar d | d == c -> do
+                tv <- force tT
+                go cs tv
+            _ -> pure Nothing
+    -- The runtime sometimes keeps short strings as VStr even after
+    -- head-normalization; fall back to direct bytes comparison.
+    go rest (VStr bs)
+        | BC.unpack bs == rest = pure (Just [])
+        | otherwise            = pure Nothing
+    go _ _ = pure Nothing
+
 matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
 matchPat PWild        _          = pure (Just [])
 matchPat (PVar n)     v          = do
@@ -501,6 +523,11 @@ matchPat (PLit (LFloat _)) _     = pure Nothing
 matchPat (PLit (LStr s)) (VStr t)
     | s == t    = pure (Just [])
     | otherwise = pure Nothing
+-- Strings are compiled to Haskell lists of 'Char' (@VCon ":" [h, t]@ /
+-- @VCon "[]" []@), so a string-literal pattern must also match the
+-- list-form runtime value.  Without this case a pattern like @"" -> ...@
+-- fails against @VCon "[]" []@ even though they denote the same string.
+matchPat (PLit (LStr s)) v = matchStringPatList s v
 matchPat (PLit (LStr _)) _       = pure Nothing
 matchPat (PLit (LChar c)) (VChar d)
     | c == d    = pure (Just [])

@@ -398,6 +398,23 @@ parseImportList src cur0 = go [] cur0
             -- (Ptr(..), Int(..), Addr#, indexWord8OffAddr#)`).
             TkPrimId n -> nameOrSub acc n cur1
             TkEof    -> pure (reverse acc, cur1)
+            -- @(#.)@ and similar: the lexer emits @(#@ as TkLUnbox
+            -- (unboxed-tuple open), then @.@ and @)@.  Treat this
+            -- shape as an operator-group open and capture the inner
+            -- operator name.  If it doesn't close cleanly just skip.
+            TkLUnbox -> do
+                let (inner, cur2) = nextSigTok src cur1
+                case tkKind inner of
+                    TkSymOp op -> do
+                        let (close, cur3) = nextSigTok src cur2
+                        let cur' = case tkKind close of
+                                TkRParen -> cur3
+                                _        -> cur2
+                        go (BC.pack "#" <> op : acc) cur'
+                    _ -> do
+                        -- Unknown — skip until we see TkRParen at depth 0.
+                        curSkip <- skipToCloseParen src cur1 1
+                        go acc curSkip
             -- Operator import: `(++)`, `(.&.)`, `(@?=)`, etc.
             -- Extract the operator name from the (op) group so that
             -- specAllows can match it during resolveImport.
