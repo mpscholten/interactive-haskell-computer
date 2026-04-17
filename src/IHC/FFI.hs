@@ -1,0 +1,371 @@
+-- | Generic @foreign import ccall@ dispatcher.
+--
+-- Replaces per-function host builtins: any @foreign import ccall "symbol"
+-- name :: T1 -> ... -> IO Tn@ parsed from source produces a 'Val' that, when
+-- applied to its arguments, dispatches the real libc\/libpq\/whatever symbol
+-- via libffi.
+--
+-- This is the standard interpreter answer to FFI: the library of dispatch
+-- types (@ffi_type_sint@, @ffi_type_pointer@, …) is how GHC's own FFI
+-- ultimately works.  Using it here means a source-loaded Hackage library
+-- gets its FFI imports \"for free\" — the interpreter never needs a shim.
+--
+-- Scope of the first commit:
+--
+--   * 'FFIType' covers the common scalar types (signed\/unsigned 8\/16\/32\/64,
+--     CInt\/CLong\/CSize, CFloat\/CDouble), 'Ptr', and 'CString'.
+--   * Variadic calls ('printf' family), @foreign import ccall \"wrapper\"@
+--     (Haskell→C→Haskell callbacks) and struct pass-by-value are NOT
+--     handled — they require @ffi_prep_cif_var@ \/ @ffi_closure@ and are
+--     explicitly out of scope here.  Deferred.
+--
+-- Symbol resolution: 'resolveSymbol' opens @libSystem@ on first use
+-- (Darwin — @libSystem.B.dylib@ covers libc, libm, and the POSIX surface).
+-- 'registerLibrary' lets the scheduler add per-package @extra-libraries@
+-- entries (e.g. @libpq.dylib@ for @hasql@).
+module IHC.FFI
+    ( -- * Types
+      FFIType(..)
+    , Safety(..)
+    , CallConv(..)
+    , ForeignDecl(..)
+      -- * Symbol resolution
+    , registerLibrary
+    , resolveSymbol
+      -- * Dispatch
+    , callForeign
+    , makeForeignVal
+    ) where
+
+import Control.Exception (throwIO, catch, SomeException)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
+import Data.IORef
+import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import Foreign.LibFFI
+    ( Arg, callFFI
+    , argCInt, argCUInt, argCLong, argCULong
+    , argInt8, argInt16, argInt32, argInt64
+    , argWord8, argWord16, argWord32, argWord64
+    , argCFloat, argCDouble, argCSize
+    , argCChar, argCUChar, argPtr, argConstByteString
+    , retVoid, retCInt, retCUInt, retCLong, retCULong
+    , retInt8, retInt16, retInt32, retInt64
+    , retWord8, retWord16, retWord32, retWord64
+    , retCFloat, retCDouble, retCSize
+    , retCChar, retCUChar, retPtr, retCString
+    )
+import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr)
+import System.IO.Unsafe (unsafePerformIO)
+import qualified System.Posix.DynamicLinker as DL
+
+import IHC.Eval (force)
+import IHC.Val
+
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
+-- | A subset of the C type vocabulary that appears in real Hackage
+-- @foreign import ccall@ declarations.  The parser (@scanForeignImports@)
+-- maps user-visible names like @CInt@, @CSize@, @Ptr@, @CString@ to one
+-- of these tags.
+data FFIType
+    = FFIVoid
+    | FFIInt
+    | FFIUInt
+    | FFILong
+    | FFIULong
+    | FFISize
+    | FFIChar
+    | FFIUChar
+    | FFIInt8
+    | FFIInt16
+    | FFIInt32
+    | FFIInt64
+    | FFIWord8
+    | FFIWord16
+    | FFIWord32
+    | FFIWord64
+    | FFIFloat
+    | FFIDouble
+    | FFIPtr      !FFIType   -- @Ptr a@ — payload type is carried for clarity
+    | FFIFunPtr   !FFIType   -- @FunPtr a@
+    | FFICString             -- @CString@ == @Ptr CChar@, specialised to marshal ByteString
+    deriving (Eq, Show)
+
+data Safety = Safe | Unsafe | Interruptible
+    deriving (Eq, Show)
+
+data CallConv = CCall | CApi | StdCall | Prim
+    deriving (Eq, Show)
+
+-- | The scanned form of a @foreign import@ declaration.
+data ForeignDecl = ForeignDecl
+    { fdName     :: !ByteString     -- ^ Haskell name, e.g. @"c_strlen"@
+    , fdSymbol   :: !ByteString     -- ^ C symbol, e.g. @"strlen"@
+    , fdSafety   :: !Safety
+    , fdCallConv :: !CallConv
+    , fdArgTypes :: ![FFIType]
+    , fdRetType  :: !FFIType        -- ^ type inside IO (or pure)
+    , fdIsIO     :: !Bool           -- ^ does the result sit inside @IO@?
+    } deriving (Eq, Show)
+
+--------------------------------------------------------------------------------
+-- Symbol resolution
+--------------------------------------------------------------------------------
+
+-- | Libraries opened via 'registerLibrary'. 'resolveSymbol' walks them
+-- in insertion order, then falls back to the process-global default
+-- (@libSystem@ on Darwin, which covers libc \/ libm \/ POSIX).
+openLibs :: IORef [(ByteString, DL.DL)]
+openLibs = unsafePerformIO (newIORef [])
+{-# NOINLINE openLibs #-}
+
+-- | Resolved @symbol → FunPtr@ cache. Shared across every call site so
+-- that repeated invocations of a builtin-backed symbol only pay the
+-- @dlsym@ cost once.
+symbolCache :: IORef (Map ByteString (FunPtr ()))
+symbolCache = unsafePerformIO (newIORef Map.empty)
+{-# NOINLINE symbolCache #-}
+
+-- | Open a shared library by name (or absolute path) and remember it for
+-- later symbol lookups.  Idempotent: opening the same library twice is
+-- a no-op.  Silently swallows @dlopen@ failures so that a package's
+-- declared @extra-libraries:@ doesn't abort interpreter startup when a
+-- user hasn't installed the dev package for it — the error only shows
+-- up later when an actual FFI symbol from that library is invoked.
+registerLibrary :: ByteString -> IO ()
+registerLibrary name = do
+    opened <- readIORef openLibs
+    case lookup name opened of
+        Just _  -> pure ()
+        Nothing -> do
+            r <- try' (DL.dlopen (BC.unpack name) [DL.RTLD_LAZY, DL.RTLD_GLOBAL])
+            case r of
+                Right dl -> modifyIORef' openLibs ((name, dl) :)
+                Left  _  -> pure ()
+  where
+    try' :: IO a -> IO (Either SomeException a)
+    try' io = (Right <$> io) `catch` (pure . Left)
+
+-- | Look up @sym@ in every registered library, then in the process
+-- default.  Caches the result.  Returns 'Nothing' if no library
+-- exposes the symbol.
+resolveSymbol :: ByteString -> IO (Maybe (FunPtr ()))
+resolveSymbol sym = do
+    cache <- readIORef symbolCache
+    case Map.lookup sym cache of
+        Just p  -> pure (Just p)
+        Nothing -> do
+            mPtr <- findInLibs
+            case mPtr of
+                Just p  -> do
+                    modifyIORef' symbolCache (Map.insert sym p)
+                    pure (Just p)
+                Nothing -> pure Nothing
+  where
+    findInLibs = do
+        libs <- readIORef openLibs
+        -- Try each registered library, then the process-global default.
+        -- DL.Default translates to dlsym(RTLD_DEFAULT, …) which on Darwin
+        -- walks every library already loaded by the binary (libSystem, any
+        -- -l flags the linker baked in, and anything previously dlopen'd).
+        tryEach (map snd libs ++ [DL.Default])
+    tryEach []     = pure Nothing
+    tryEach (h:hs) = do
+        r <- try' (DL.dlsym h (BC.unpack sym))
+        case r of
+            Right p | p /= nullFunPtr -> pure (Just p)
+            _                         -> tryEach hs
+
+    try' :: IO a -> IO (Either SomeException a)
+    try' io = (Right <$> io) `catch` (pure . Left)
+
+--------------------------------------------------------------------------------
+-- Marshalling
+--------------------------------------------------------------------------------
+
+-- | Convert a forced 'Val' plus a declared 'FFIType' into a libffi 'Arg'.
+-- Everything that the interpreter stores as 'VInt' is a machine @Int64@;
+-- we narrow to the declared ABI width here.  'VCon "Ptr" [_]' is unwrapped
+-- by 'ptrFromVal' — the IHC runtime shape for 'Ptr' is either a raw
+-- @PrimPtr@ (host-allocated) or a data-constructor @Ptr addr#@.
+valToArg :: FFIType -> Val -> IO Arg
+valToArg ty v = case ty of
+    FFIInt    -> pure (argCInt   (fromIntegral (asInt v)))
+    FFIUInt   -> pure (argCUInt  (fromIntegral (asInt v)))
+    FFILong   -> pure (argCLong  (fromIntegral (asInt v)))
+    FFIULong  -> pure (argCULong (fromIntegral (asInt v)))
+    FFISize   -> pure (argCSize  (fromIntegral (asInt v)))
+    FFIChar   -> pure (argCChar  (fromIntegral (asInt v)))
+    FFIUChar  -> pure (argCUChar (fromIntegral (asInt v)))
+    FFIInt8   -> pure (argInt8   (fromIntegral (asInt v)))
+    FFIInt16  -> pure (argInt16  (fromIntegral (asInt v)))
+    FFIInt32  -> pure (argInt32  (fromIntegral (asInt v)))
+    FFIInt64  -> pure (argInt64  (fromIntegral (asInt v)))
+    FFIWord8  -> pure (argWord8  (fromIntegral (asInt v)))
+    FFIWord16 -> pure (argWord16 (fromIntegral (asInt v)))
+    FFIWord32 -> pure (argWord32 (fromIntegral (asInt v)))
+    FFIWord64 -> pure (argWord64 (fromIntegral (asInt v)))
+    FFIFloat  -> pure (argCFloat  (realToFrac (asFloat v)))
+    FFIDouble -> pure (argCDouble (realToFrac (asFloat v)))
+    FFIVoid   -> throwIO (userError "IHC.FFI: void cannot appear as an argument")
+    FFIPtr _      -> do p <- ptrFromVal v; pure (argPtr p)
+    FFIFunPtr _   -> do p <- ptrFromVal v; pure (argPtr p)
+    FFICString    -> do
+        bs <- byteStringFromVal v
+        pure (argConstByteString bs)
+
+asInt :: Val -> Int64
+asInt (VInt n)    = n
+asInt (VChar c)   = fromIntegral (fromEnum c)
+asInt (VCon _ []) = 0    -- treat arity-0 constructors as 0 (e.g. False)
+asInt other       = error ("IHC.FFI: expected numeric value, got " <> showValForDebug other)
+
+asFloat :: Val -> Double
+asFloat (VFloat d) = d
+asFloat (VInt   n) = fromIntegral n
+asFloat other      = error ("IHC.FFI: expected floating value, got " <> showValForDebug other)
+
+-- | Unwrap a 'Val' to a raw host 'Ptr ()'.
+--
+--   * @VPrimObj (PrimPtr p)@ — already a raw host pointer.
+--   * @VCon "Ptr" [addrT]@ — the source-level @Ptr addr#@ constructor.
+--   * @VCon "ForeignPtr" [addrT, _]@ — use the address slot, caller
+--     is responsible for @touchForeignPtr@ separately (not modelled yet;
+--     fine for the MVP since the common uses pass the result promptly).
+--   * @VInt 0@ — null pointer literal.
+ptrFromVal :: Val -> IO (Ptr ())
+ptrFromVal v = case v of
+    VPrimObj (PrimPtr p)              -> pure (castPtr p)
+    VCon "Ptr" [t]                    -> force t >>= ptrFromVal
+    VCon "FunPtr" [t]                 -> force t >>= ptrFromVal
+    VCon "ForeignPtr" (addrT : _)     -> force addrT >>= ptrFromVal
+    VInt 0                            -> pure nullPtr
+    _ -> error ("IHC.FFI: expected Ptr/FunPtr, got " <> showValForDebug v)
+
+-- | Pull out a 'ByteString' for 'CString' marshalling.
+byteStringFromVal :: Val -> IO BS.ByteString
+byteStringFromVal v = case v of
+    VStr bs -> pure bs
+    -- Source-level Haskell strings are [Char] (consed from VCon ":" / "[]").
+    -- Build the byte stream by walking the list.
+    VCon "[]" _   -> pure BS.empty
+    VCon ":" _    -> consListToBS v
+    -- A raw Ptr to an existing NUL-terminated C string — let libffi pass
+    -- it straight through via argPtr.  We do NOT copy out the bytes here;
+    -- the caller decided to hand us a pointer, so honour that.
+    VPrimObj (PrimPtr _) -> BS.empty <$ error "IHC.FFI: Ptr passed where CString expected — wrap with withCString manually"
+    _ -> error ("IHC.FFI: expected String/CString, got " <> showValForDebug v)
+  where
+    consListToBS :: Val -> IO BS.ByteString
+    consListToBS = go []
+      where
+        go acc (VCon "[]" _) = pure (BS.pack (reverse acc))
+        go acc (VCon ":" [hT, tT]) = do
+            h <- force hT
+            t <- force tT
+            case h of
+                VChar c -> go (fromIntegral (fromEnum c) : acc) t
+                VInt  n -> go (fromIntegral n          : acc) t
+                _       -> error ("IHC.FFI: non-Char/Int in String: " <> showValForDebug h)
+        go _ other = error ("IHC.FFI: malformed [Char]: " <> showValForDebug other)
+
+--------------------------------------------------------------------------------
+-- Return-value unmarshalling
+--------------------------------------------------------------------------------
+
+-- | Call the resolved 'FunPtr' with the marshaled args, using the 'RetType'
+-- for the declared return type, and wrap the result back into a 'Val'.
+dispatchRet :: FFIType -> FunPtr () -> [Arg] -> IO Val
+dispatchRet ty fp args = case ty of
+    FFIVoid    -> callFFI fp retVoid   args >> pure VUnit
+    FFIInt     -> (VInt . fromIntegral) <$> callFFI fp retCInt    args
+    FFIUInt    -> (VInt . fromIntegral) <$> callFFI fp retCUInt   args
+    FFILong    -> (VInt . fromIntegral) <$> callFFI fp retCLong   args
+    FFIULong   -> (VInt . fromIntegral) <$> callFFI fp retCULong  args
+    FFISize    -> (VInt . fromIntegral) <$> callFFI fp retCSize   args
+    FFIChar    -> (VInt . fromIntegral) <$> callFFI fp retCChar   args
+    FFIUChar   -> (VInt . fromIntegral) <$> callFFI fp retCUChar  args
+    FFIInt8    -> (VInt . fromIntegral) <$> callFFI fp retInt8    args
+    FFIInt16   -> (VInt . fromIntegral) <$> callFFI fp retInt16   args
+    FFIInt32   -> (VInt . fromIntegral) <$> callFFI fp retInt32   args
+    FFIInt64   -> (VInt . fromIntegral) <$> callFFI fp retInt64   args
+    FFIWord8   -> (VInt . fromIntegral) <$> callFFI fp retWord8   args
+    FFIWord16  -> (VInt . fromIntegral) <$> callFFI fp retWord16  args
+    FFIWord32  -> (VInt . fromIntegral) <$> callFFI fp retWord32  args
+    FFIWord64  -> (VInt . fromIntegral) <$> callFFI fp retWord64  args
+    FFIFloat   -> (VFloat . realToFrac)  <$> callFFI fp retCFloat  args
+    FFIDouble  -> (VFloat . realToFrac)  <$> callFFI fp retCDouble args
+    FFIPtr _   -> do
+        p <- callFFI fp (retPtr retCChar) args
+        pure (VPrimObj (PrimPtr (castPtr p)))
+    FFIFunPtr _ -> do
+        p <- callFFI fp (retPtr retCChar) args
+        pure (VPrimObj (PrimPtr (castPtr p)))
+    FFICString -> do
+        p <- callFFI fp retCString args
+        if p == nullPtr
+            then pure (VCon "[]" [])
+            else do
+                bs <- BS.packCString p
+                bsToConsList bs
+
+-- | Build a strict Haskell 'String' (an IHC cons-list of 'VChar') from
+-- a 'ByteString'.  Materialises eagerly — trivial for the short strings
+-- libc returns.  Replace with a lazy tail thunk if a workload ever
+-- needs it.
+bsToConsList :: BS.ByteString -> IO Val
+bsToConsList bs = go (BS.unpack bs)
+  where
+    go []     = pure (VCon "[]" [])
+    go (c:cs) = do
+        hT  <- newWHNFThunk (VChar (toEnum (fromIntegral c)))
+        tV  <- go cs
+        tT  <- newWHNFThunk tV
+        pure (VCon ":" [hT, tT])
+
+--------------------------------------------------------------------------------
+-- Entry points
+--------------------------------------------------------------------------------
+
+-- | Call the foreign symbol once, given the fully-saturated argument list.
+-- Raises 'IhcException' (via 'throwIO') if the symbol cannot be resolved.
+callForeign :: ForeignDecl -> [Val] -> IO Val
+callForeign decl argVals = do
+    mFp <- resolveSymbol (fdSymbol decl)
+    case mFp of
+        Nothing -> do
+            msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found"))
+            throwIO (IhcException
+                ("FFI: symbol '" <> fdSymbol decl <> "' not found in any loaded library")
+                msgT)
+        Just fp -> do
+            argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
+            dispatchRet (fdRetType decl) fp argsFfi
+
+-- | Turn a 'ForeignDecl' into a runtime 'Val' that behaves like a
+-- curried Haskell function of the declared arity.  Applying the final
+-- argument produces:
+--
+--   * a 'VIO' action if the declared return type was wrapped in 'IO'
+--     (the common case);
+--   * the raw value directly if the import was declared pure.
+makeForeignVal :: ForeignDecl -> IO Val
+makeForeignVal decl = collect []
+  where
+    argc = length (fdArgTypes decl)
+
+    collect :: [Val] -> IO Val
+    collect acc
+        | length acc >= argc = do
+              -- All args collected — dispatch (or build IO action).
+              let call = callForeign decl (reverse acc)
+              if fdIsIO decl then pure (VIO call) else call
+        | otherwise = pure $ VFun $ \t -> do
+              v <- force t
+              collect (v : acc)

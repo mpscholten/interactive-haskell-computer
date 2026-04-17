@@ -49,6 +49,8 @@ module IHC.Scan
     , skipTypeDecl
       -- * Type-family reduction (tier-1 IHP blocker: GetTableName etc.)
     , scanTypeFamilyDecls
+      -- * Foreign imports (generic @foreign import ccall@ dispatcher, Phase 4)
+    , scanForeignImports
     ) where
 
 import Data.ByteString (ByteString)
@@ -62,6 +64,7 @@ import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
 import IHC.Classes (normalizeTyTag)
+import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
 import qualified IHC.TypeReduce as TR
@@ -2281,3 +2284,268 @@ scanClassDecls src = go [] startCursor
         case tkKind tok of
             TkNewline -> peekSigC curN
             _         -> (tok, curN)
+
+--------------------------------------------------------------------------------
+-- Foreign imports (Phase 4: generic libffi dispatcher)
+--------------------------------------------------------------------------------
+
+-- | Walk the source file and return every @foreign import ccall@
+-- declaration as a 'ForeignDecl'.  The grammar accepted here is:
+--
+-- @
+-- foreign_decl ::= \'foreign\' \'import\' callconv [safety] [STRING] name \'::\' type
+-- callconv     ::= \'ccall\' | \'capi\' | \'stdcall\' | \'prim\'
+-- safety       ::= \'safe\' | \'unsafe\' | \'interruptible\'
+-- type         ::= btype (\'->\' type)?
+-- btype        ::= atype+                       -- juxtaposition (type application)
+-- atype        ::= ConId | Ident | (type)       -- constructors, type vars, parens
+-- @
+--
+-- Limitations: variadic (@printf@-style) imports, @\"dynamic\"@ wrappers
+-- and @\"wrapper\"@ closures are not yet supported and produce an empty
+-- result (the scanner just skips past them) — they require libffi's
+-- @ffi_prep_cif_var@ \/ @ffi_closure@, which land in a follow-up.
+--
+-- Malformed declarations are skipped silently: a non-matching parse is
+-- not an error here because some Hackage modules use CPP to conditionally
+-- gate imports, and we'd rather lose that one symbol than abort the load.
+scanForeignImports :: Source -> IO [ForeignDecl]
+scanForeignImports src = pure (reverse (loop [] startCursor))
+  where
+    loop :: [ForeignDecl] -> Cursor -> [ForeignDecl]
+    loop acc cur =
+        let (tok, cur') = nextToken src cur in
+        case tkKind tok of
+            TkEof -> acc
+            TkIdent "foreign" | tkCol tok == 1 ->
+                case tryForeign cur' of
+                    Just (decl, curAfter) -> loop (decl : acc) curAfter
+                    Nothing               -> loop acc cur'
+            _ -> loop acc cur'
+
+    -- Cursor is positioned just after the @foreign@ identifier.
+    tryForeign :: Cursor -> Maybe (ForeignDecl, Cursor)
+    tryForeign cur0 = do
+        let (t1, cur1) = peekSigTokFrom src cur0
+        case tkKind t1 of
+            TkImport -> tryImport cur1
+            _        -> Nothing
+
+    -- Cursor is just after 'foreign import'.
+    tryImport :: Cursor -> Maybe (ForeignDecl, Cursor)
+    tryImport cur0 = do
+        let (t1, cur1) = peekSigTokFrom src cur0
+        cc <- case tkKind t1 of
+            TkIdent n | n `elem` callConvIdents -> Just (identToCallConv n)
+            _ -> Nothing
+        let (safety, curAfterSafety) = parseOptSafety cur1
+        let (mSym,   curAfterSym)    = parseOptSymbol curAfterSafety
+        let (t2, cur2) = peekSigTokFrom src curAfterSym
+        case tkKind t2 of
+            TkIdent nm -> do
+                let (t3, cur3) = peekSigTokFrom src cur2
+                case tkKind t3 of
+                    TkDColon -> do
+                        (argTys, retTy, isIO, curAfter) <- parseForeignType src cur3
+                        let sym = fromMaybe nm mSym
+                        pure ( ForeignDecl
+                                 { fdName     = nm
+                                 , fdSymbol   = sym
+                                 , fdSafety   = safety
+                                 , fdCallConv = cc
+                                 , fdArgTypes = argTys
+                                 , fdRetType  = retTy
+                                 , fdIsIO     = isIO
+                                 }
+                             , curAfter
+                             )
+                    _ -> Nothing
+            _ -> Nothing
+
+    parseOptSafety :: Cursor -> (Safety, Cursor)
+    parseOptSafety cur0 =
+        let (t, cur') = peekSigTokFrom src cur0
+        in case tkKind t of
+            TkIdent "unsafe"        -> (Unsafe,         cur')
+            TkIdent "safe"          -> (Safe,           cur')
+            TkIdent "interruptible" -> (Interruptible,  cur')
+            _                       -> (Unsafe,         cur0)   -- default
+
+    parseOptSymbol :: Cursor -> (Maybe ByteString, Cursor)
+    parseOptSymbol cur0 =
+        let (t, cur') = peekSigTokFrom src cur0
+        in case tkKind t of
+            TkStr s -> (Just s, cur')
+            _       -> (Nothing, cur0)
+
+    fromMaybe :: a -> Maybe a -> a
+    fromMaybe d Nothing  = d
+    fromMaybe _ (Just x) = x
+
+callConvIdents :: [ByteString]
+callConvIdents = [BC.pack "ccall", BC.pack "capi", BC.pack "stdcall", BC.pack "prim"]
+
+identToCallConv :: ByteString -> CallConv
+identToCallConv n
+    | n == BC.pack "ccall"   = CCall
+    | n == BC.pack "capi"    = CApi
+    | n == BC.pack "stdcall" = StdCall
+    | n == BC.pack "prim"    = Prim
+    | otherwise              = CCall   -- safe fallback; parser never feeds us anything else
+
+-- | Parse the right-hand-side type of a foreign import signature.
+-- Returns @(argTypes, retType, isIO, cursorAfter)@.  The @isIO@ flag is
+-- true iff the final arrow-tail is @IO T@.  All other type constructors
+-- are mapped via 'tyConToFFI' or reported as 'Nothing' if unrecognised.
+parseForeignType :: Source -> Cursor -> Maybe ([FFIType], FFIType, Bool, Cursor)
+parseForeignType src cur0 = do
+    (pieces, curEnd) <- splitArrows cur0 [] []
+    case reverse pieces of
+        (tail':init') -> do
+            argTys <- mapM tokensToFFI (reverse init')
+            (retTy, isIO) <- tailToFFI tail'
+            pure (argTys, retTy, isIO, curEnd)
+        [] -> Nothing
+  where
+    -- Collect tokens separated by top-level @->@ into groups.  Stops at
+    -- EOF or at a column-1 token that isn't part of this type (the next
+    -- top-level binding or another keyword).  Parenthesised sub-types
+    -- accumulate literally; we re-parse them recursively in 'tokensToFFI'.
+    splitArrows :: Cursor -> [Token] -> [[Token]] -> Maybe ([[Token]], Cursor)
+    splitArrows cur groupAcc groups =
+        let (tok, cur') = peekSigTokFrom src cur in
+        case tkKind tok of
+            TkEof ->
+                -- Finalise trailing group.
+                pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
+            -- Column 1 means we've fallen off the type onto the next
+            -- top-level binding.  STOP before consuming.
+            _ | tkCol tok == 1 ->
+                pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
+            TkArrow ->
+                splitArrows cur' [] (reverse groupAcc : groups)
+            TkLParen -> do
+                (inner, cur'') <- consumeBalanced cur' 1 [tok]
+                splitArrows cur'' (inner ++ groupAcc) groups
+            TkLBracket -> do
+                (inner, cur'') <- consumeBalanced cur' 1 [tok]
+                splitArrows cur'' (inner ++ groupAcc) groups
+            -- Stop at unknown top-level tokens (e.g. '=', ',', ';') that
+            -- can't be part of a type.
+            TkEq    -> pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
+            TkSemi  -> pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
+            TkComma -> pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
+            TkDArrow ->
+                -- Class-constraint arrow: @forall a. Storable a => Ptr a -> IO CInt@.
+                -- Throw away everything collected so far (the context) and start fresh.
+                splitArrows cur' [] []
+            _ -> splitArrows cur' (tok : groupAcc) groups
+      where
+        pushIfNonEmpty [] gs = gs
+        pushIfNonEmpty g  gs = g : gs
+
+    -- Consume tokens while tracking paren/bracket depth.  Returns the
+    -- tokens collected (NOT including the outermost opener/closer),
+    -- plus the cursor after the matching closer.
+    consumeBalanced :: Cursor -> Int -> [Token] -> Maybe ([Token], Cursor)
+    consumeBalanced cur 0 acc = Just (reverse acc, cur)
+    consumeBalanced cur d acc =
+        let (tok, cur') = peekSigTokFrom src cur in
+        case tkKind tok of
+            TkEof -> Nothing
+            TkLParen   -> consumeBalanced cur' (d + 1) (tok : acc)
+            TkLBracket -> consumeBalanced cur' (d + 1) (tok : acc)
+            TkRParen   -> consumeBalanced cur' (d - 1) (tok : acc)
+            TkRBracket -> consumeBalanced cur' (d - 1) (tok : acc)
+            _          -> consumeBalanced cur' d       (tok : acc)
+
+    -- Recognise @IO T@ as the tail marker.  Anything else is pure.
+    tailToFFI :: [Token] -> Maybe (FFIType, Bool)
+    tailToFFI toks = case map tkKind (dropParens toks) of
+        (TkConId "IO" : rest) ->
+            case tokensToFFIFromKinds rest of
+                Just t  -> Just (t, True)
+                Nothing -> Just (FFIVoid, True)      -- @IO ()@ round-trip
+        _ -> do
+            t <- tokensToFFIFromKinds (map tkKind (dropParens toks))
+            Just (t, False)
+
+    tokensToFFI :: [Token] -> Maybe FFIType
+    tokensToFFI toks = tokensToFFIFromKinds (map tkKind (dropParens toks))
+
+    -- Strip outermost matching @()@ — the parser emits them as literal
+    -- TkLParen/TkRParen pairs and we don't preserve grouping otherwise.
+    dropParens :: [Token] -> [Token]
+    dropParens toks@(t0:_)
+        | tkKind t0 == TkLParen
+        , Just toks' <- stripOutermost toks = dropParens toks'
+    dropParens toks = toks
+
+    -- Strip a matching outer @(@ … @)@ pair.  Assumes the caller has
+    -- already checked that the first token is @(@; we still verify the
+    -- closer so that mid-sequence parens don't wrongly shed their guards.
+    stripOutermost :: [Token] -> Maybe [Token]
+    stripOutermost []         = Nothing
+    stripOutermost (_ : rest) = case reverse rest of
+        (tLast : middleRev) | tkKind tLast == TkRParen -> Just (reverse middleRev)
+        _                                              -> Nothing
+
+tokensToFFIFromKinds :: [TokenKind] -> Maybe FFIType
+tokensToFFIFromKinds = go
+  where
+    go :: [TokenKind] -> Maybe FFIType
+    go []                     = Just FFIVoid                   -- @()@ round-trip after dropParens
+    -- Unit type: the sole remaining tokens may be a bare @()@ that
+    -- dropParens could not strip because there's nothing between the
+    -- parens; treat as void.
+    go [TkLParen, TkRParen]   = Just FFIVoid
+    go [TkConId c]            = tyConToFFI c Nothing
+    go [TkConId c, TkConId a] = tyConToFFI c (Just (Left a))
+    go [TkConId c, TkIdent a] = tyConToFFI c (Just (Right a))
+    -- Ptr-like: @Ptr CChar@ / @Ptr a@ / @Ptr (Ptr a)@. We don't track
+    -- the payload precisely — libffi treats every pointer as a pointer.
+    go (TkConId "Ptr" : _)       = Just (FFIPtr FFIVoid)
+    go (TkConId "FunPtr" : _)    = Just (FFIFunPtr FFIVoid)
+    go (TkConId "ConstPtr" : _)  = Just (FFIPtr FFIVoid)
+    -- Any longer sequence that starts with a recognised constructor
+    -- probably applies it to type args we don't care about — treat as
+    -- the constructor alone.
+    go (TkConId c : _)           = tyConToFFI c Nothing
+    go _                         = Nothing
+
+-- | Map a Haskell type constructor name to its 'FFIType'.  The optional
+-- second argument is the head of any type-application (as a 'ConId' or
+-- 'Ident' — we don't care which for this MVP).
+tyConToFFI :: ByteString -> Maybe (Either ByteString ByteString) -> Maybe FFIType
+tyConToFFI c _ = case c of
+    "CInt"     -> Just FFIInt
+    "CUInt"    -> Just FFIUInt
+    "CLong"    -> Just FFILong
+    "CULong"   -> Just FFIULong
+    "CSize"    -> Just FFISize
+    "CTime"    -> Just FFISize
+    "CChar"    -> Just FFIChar
+    "CUChar"   -> Just FFIUChar
+    "CSChar"   -> Just FFIChar
+    "CFloat"   -> Just FFIFloat
+    "CDouble"  -> Just FFIDouble
+    "Int"      -> Just FFIInt64
+    "Word"     -> Just FFIWord64
+    "Int8"     -> Just FFIInt8
+    "Int16"    -> Just FFIInt16
+    "Int32"    -> Just FFIInt32
+    "Int64"    -> Just FFIInt64
+    "Word8"    -> Just FFIWord8
+    "Word16"   -> Just FFIWord16
+    "Word32"   -> Just FFIWord32
+    "Word64"   -> Just FFIWord64
+    "Float"    -> Just FFIFloat
+    "Double"   -> Just FFIDouble
+    "Bool"     -> Just FFIInt
+    "Char"     -> Just FFIChar
+    "CString"  -> Just FFICString
+    "CStringLen" -> Just (FFIPtr FFIVoid)  -- CStringLen = (CString, Int) — tuple, deferred
+    "Ptr"      -> Just (FFIPtr FFIVoid)
+    "FunPtr"   -> Just (FFIFunPtr FFIVoid)
+    "ConstPtr" -> Just (FFIPtr FFIVoid)
+    _          -> Nothing

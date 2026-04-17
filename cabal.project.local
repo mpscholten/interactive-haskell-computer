@@ -1,1 +1,5 @@
 ignore-project: False
+
+-- libffi ships with a bundled libffi by default, but GHC from nix is configured
+-- with --with-system-libffi, so we need the system libffi instead.
+constraints: libffi -ghc-bundled-libffi

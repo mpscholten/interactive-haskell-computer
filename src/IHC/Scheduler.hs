@@ -64,7 +64,10 @@ import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
-import IHC.CabalProject (cachedPackageSearchPath, cachedPackageSearchPathWithIncludes)
+import IHC.CabalProject
+    ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
+    , findLocalCabalFile, parseCabalFile, pkgExtraLibs
+    )
 import IHC.Diagnostics (warnStub)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
@@ -72,6 +75,7 @@ import IHC.Classes
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
+import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
 import qualified IHC.Parser as Parser
@@ -133,6 +137,11 @@ data LoadedModule = LoadedModule
       -- installed into 'TR.globalRegistry' so the ETyApp path of the
       -- evaluator can reduce type-family applications at runtime.
     , lmTypeFamilies :: !TR.TypeFamilyRegistry
+      -- | @foreign import ccall@ declarations scanned from this module's
+      -- source.  Each entry becomes a host-backed 'Val' in the final env
+      -- (see 'registerForeignImports') that dispatches the real C symbol
+      -- via libffi at call time.  Populated by 'scanForeignImports'.
+    , lmForeignDecls :: ![FFI.ForeignDecl]
     }
 
 data ModuleState
@@ -239,7 +248,11 @@ loadProgramFromSource searchPath src0 = do
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv publicFields unionedFields
     builtins <- builtinEnv classReg
-    let baseNoClass = Map.union builtins (Map.union fieldEnv conEnv)
+    -- Install a thunk per scanned @foreign import ccall@ declaration
+    -- under a synthetic @__ffi.Module.name@ key. Module bodies reach
+    -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
+    ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
+    let baseNoClass = Map.union builtins (Map.union fieldEnv (Map.union conEnv ffiEnv))
     -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
     -- scanClassDecls). For every `class C a where m :: ...` declaration in
     -- any loaded module, bind `m` as a top-level dispatcher that looks up
@@ -2415,6 +2428,7 @@ buildEmptyStubModule name = do
         , lmFixity      = defaultFixityTable
         , lmNoFieldSelectors = False
         , lmTypeFamilies     = TR.emptyRegistry
+        , lmForeignDecls     = []
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
@@ -2422,7 +2436,19 @@ buildLoadedModule name isEntry header src = do
     known               <- emptyKnownSymbols
     (dataR, fldR, tCtR) <- scanDataDecls src
     tfReg               <- scanTypeFamilyDecls src
+    foreigns            <- scanForeignImports src
     bodies              <- newIORef Map.empty
+    -- Pre-populate 'lmBodies' with a sentinel @EVar ffiSynthKey@ for
+    -- every scanned 'foreign import ccall' decl.  discoverInModule will
+    -- short-circuit on these (the name is already in bodies) and the
+    -- synth key resolves to a host VFun thunk installed into the base
+    -- env before knot-tying (see 'buildForeignEnv').  The prefix
+    -- @__ffi.@ keeps the key out of the way of any plausible Haskell
+    -- identifier / qualified-module name.
+    forM_ foreigns $ \decl ->
+        modifyIORef' bodies
+            (Map.insert (FFI.fdName decl)
+                        (EVar (ffiSynthKey name (FFI.fdName decl))))
     fixity              <- scanFixityDecls src defaultFixityTable
     pure LoadedModule
         { lmName        = name
@@ -2437,7 +2463,81 @@ buildLoadedModule name isEntry header src = do
         , lmFixity      = fixity
         , lmNoFieldSelectors = hasNoFieldSelectors src
         , lmTypeFamilies     = tfReg
+        , lmForeignDecls     = foreigns
         }
+
+-- | Synthetic env key under which a foreign import's dispatch 'Val' is
+-- registered.  Derived from @(moduleName, haskellName)@ so collisions
+-- between different modules that import the same C symbol under
+-- different Haskell names are impossible.
+ffiSynthKey :: ModuleName -> ByteString -> ByteString
+ffiSynthKey modName nm = BC.pack "__ffi." <> modName <> BC.pack "." <> nm
+
+-- | Build an 'Env' containing one thunk per foreign import across every
+-- loaded module.  Each thunk, when forced, produces a curried 'VFun'
+-- that dispatches the real C symbol via libffi on application (see
+-- 'FFI.makeForeignVal').
+--
+-- The thunks are lazy — most programs never reference most of the
+-- foreign imports their transitively-loaded modules declare, so we
+-- don't pay the cost unless the user actually calls one.
+--
+-- Before building the env, the function also walks every loaded
+-- module's enclosing package and calls 'FFI.registerLibrary' for each
+-- @extra-libraries:@ entry declared in its @.cabal@ file.  This is how
+-- Hackage libraries like @postgresql-libpq@ (which needs @libpq@) become
+-- reachable — the bare @dlsym(RTLD_DEFAULT, ...)@ path only sees
+-- @libSystem@ unless we @dlopen@ the extras first.  Failures to
+-- @dlopen@ are silently swallowed; the error only surfaces later when
+-- the user actually calls a symbol that would have resolved from the
+-- missing library.
+buildForeignEnv :: [LoadedModule] -> [FilePath] -> IO Env
+buildForeignEnv lms searchPath = do
+    registerPackageExtras lms searchPath
+    pairs <- concat <$> mapM perModule lms
+    pure (Map.fromList pairs)
+  where
+    perModule lm = mapM (mkPair lm) (lmForeignDecls lm)
+    mkPair lm decl = do
+        t <- newLazyBuiltinThunk (FFI.makeForeignVal decl)
+        pure (ffiSynthKey (lmName lm) (FFI.fdName decl), t)
+
+-- | For every loaded module, find the owning package's @.cabal@ file
+-- (by walking up from the module's source directory), parse it, and
+-- @dlopen@ every @extra-libraries:@ entry.  Deduplicated across modules
+-- so we never @dlopen@ the same lib twice.
+registerPackageExtras :: [LoadedModule] -> [FilePath] -> IO ()
+registerPackageExtras lms _searchPath = do
+    -- Collect unique source directories.
+    srcDirs <- mapM (pure . takeDirectory . srcName . lmSource) lms
+    let uniqSrcDirs = Set.toList (Set.fromList srcDirs)
+    libsPerDir <- mapM extraLibsForDir uniqSrcDirs
+    let allLibs = Set.toList (Set.fromList (concat libsPerDir))
+    mapM_ FFI.registerLibrary allLibs
+  where
+    extraLibsForDir :: FilePath -> IO [ByteString]
+    extraLibsForDir d = do
+        -- Walk up from the module's directory looking for a .cabal file.
+        mCabalPair <- findCabalFileUpwards d 8
+        case mCabalPair of
+            Nothing -> pure []
+            Just (pkgRoot, cabalPath) -> do
+                mInfo <- parseCabalFile pkgRoot cabalPath
+                case mInfo of
+                    Just info -> pure (pkgExtraLibs info)
+                    Nothing   -> pure []
+
+    -- Walk up at most @n@ steps looking for a *.cabal sibling.  Returns
+    -- @(packageRoot, cabalPath)@ or Nothing.
+    findCabalFileUpwards :: FilePath -> Int -> IO (Maybe (FilePath, FilePath))
+    findCabalFileUpwards _   0 = pure Nothing
+    findCabalFileUpwards dir n = do
+        m <- findLocalCabalFile dir
+        case m of
+            Just p  -> pure (Just (dir, p))
+            Nothing ->
+                let up = takeDirectory dir in
+                if up == dir then pure Nothing else findCabalFileUpwards up (n - 1)
 
 emptyHeader :: ModuleHeader
 emptyHeader = ModuleHeader Nothing ExportAll []

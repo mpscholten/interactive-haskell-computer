@@ -110,6 +110,16 @@ data PackageInfo = PackageInfo
       -- ^ Absolute paths from the library's @include-dirs:@ stanza.
       -- These are the directories the C preprocessor searches when
       -- resolving @#include \"file.h\"@ directives.
+    , pkgExtraLibs   :: ![ByteString]
+      -- ^ @extra-libraries:@ stanza — bare library names (e.g. @"pq"@
+      -- for @hasql -> postgresql-libpq@, @"z"@ for @zlib@).  The FFI
+      -- dispatcher (see 'IHC.FFI.registerLibrary') consumes these at
+      -- load time to @dlopen@ the corresponding shared library so its
+      -- C symbols become resolvable from @foreign import ccall@ decls.
+    , pkgPkgConfig   :: ![ByteString]
+      -- ^ @pkgconfig-depends:@ stanza — package-config names (e.g.
+      -- @"libpq"@).  Resolved to concrete lib names via @pkg-config
+      -- --libs@ by the FFI loader.
     }
     deriving stock (Show, Eq)
 
@@ -329,6 +339,10 @@ gpdToPackageInfo packageRoot gpd =
         exts      = dedupPreserveOrder (langExts ++ declared)
         cppOpts   = [ BC.pack s | s <- cppOptions bi ]
         incDirs   = [ packageRoot </> d | d <- includeDirs bi ]
+        extraLbs  = [ BC.pack s | s <- extraLibs bi ]
+        pkgCfg    = [ BC.pack (CabalPretty.prettyShow d)
+                    | d <- pkgconfigDepends bi
+                    ]
     in PackageInfo
         { pkgName        = name
         , pkgVersion     = version
@@ -336,6 +350,8 @@ gpdToPackageInfo packageRoot gpd =
         , pkgExtensions  = exts
         , pkgCppOptions  = cppOpts
         , pkgIncludeDirs = incDirs
+        , pkgExtraLibs   = extraLbs
+        , pkgPkgConfig   = pkgCfg
         }
 
 -- Local stub so we don't depend on a specific Cabal BuildInfo default

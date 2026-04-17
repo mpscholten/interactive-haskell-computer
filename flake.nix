@@ -238,6 +238,7 @@
             hp.ormolu
             hp.haskell-language-server
             pkgs.pkg-config
+            pkgs.libffi
           ];
 
           shellHook = ''
