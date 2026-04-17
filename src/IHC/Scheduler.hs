@@ -468,6 +468,27 @@ loadFileIntoEnv searchPath path existingEnv = do
 --
 -- @visited@ prevents cycles from circular @module Foo@ re-export chains.
 -- Duplicate names deduplicate with last-entry-wins (Map.fromList keeps the last).
+--
+-- Memoization: modules like @IHP.Prelude@ re-export ~19 modules, each of which
+-- transitively re-exports others that share common sub-modules (e.g. @GHC.Base@
+-- appears in many chains).  Without memoization the walker has roughly cubic
+-- cost in (#re-exports × #imports × #names) and hangs the loader for several
+-- seconds or more.  We keep a per-call @IORef (Map ModuleName [(Name,Thunk)])@
+-- so the result for each module is computed at most once.
+--
+-- Cycle interaction: when an @ExportModule m@ entry would recurse into a
+-- module already in @visited@, we skip it and return @[]@ for that entry
+-- WITHOUT poisoning the memo.  The memo stores a module's result once it's
+-- been fully computed top-down (i.e. all its @ExportModule@ entries either
+-- completed or were cycle-pruned).  Because cycles are pathological and we
+-- always compute a module's exports the same way regardless of @visited@
+-- (aside from the cycle-prune which only matters on the pathological path),
+-- keying the memo by @ModuleName@ is safe in practice.
+type ExportsMemo = IORef (Map ModuleName [(ByteString, Thunk)])
+
+newExportsMemo :: IO ExportsMemo
+newExportsMemo = newIORef Map.empty
+
 effectiveExports
     :: ModuleRegistry
     -> Map ByteString Thunk     -- ^ thunkByKey: fully-qualified key → pre-built slot
@@ -475,7 +496,33 @@ effectiveExports
     -> [ModuleName]             -- ^ visited: cycle guard
     -> IO [(ByteString, Thunk)] -- ^ (bare-name, slot)
 effectiveExports registry thunkByKey lm visited = do
-    case mhExports (lmHeader lm) of
+    memo <- newExportsMemo
+    effectiveExportsMemo memo registry thunkByKey lm visited
+
+-- | Memoized variant of 'effectiveExports'.  Callers who make multiple
+-- 'effectiveExports' calls in a single session (e.g. 'loadImportIntoEnv'
+-- driving through a deeply re-exporting module) should build one memo via
+-- 'newExportsMemo' and share it across calls to get the full benefit.
+effectiveExportsMemo
+    :: ExportsMemo
+    -> ModuleRegistry
+    -> Map ByteString Thunk
+    -> LoadedModule
+    -> [ModuleName]
+    -> IO [(ByteString, Thunk)]
+effectiveExportsMemo memo registry thunkByKey lm visited = do
+    cached <- Map.lookup (lmName lm) <$> readIORef memo
+    case cached of
+        Just result -> pure result
+        Nothing -> do
+            result <- compute
+            -- Only cache once fully computed.  We don't cache mid-recursion,
+            -- so cycles (which return [] without recursing) don't poison the
+            -- memo for modules still on the stack.
+            modifyIORef' memo (Map.insert (lmName lm) result)
+            pure result
+  where
+    compute = case mhExports (lmHeader lm) of
         ExportAll -> do
             -- No export list: all locally-discovered bodies are exported.
             bodies <- readIORef (lmBodies lm)
@@ -488,7 +535,7 @@ effectiveExports registry thunkByKey lm visited = do
             pairs <- concat <$> mapM (exportItem lm) items
             -- Deduplicate: last entry wins, matching Haskell's import shadowing.
             pure (Map.toList (Map.fromList pairs))
-  where
+
     exportItem lm' item = case item of
         ExportName n    -> lookupName lm' n
         ExportType n _  -> lookupName lm' n
@@ -500,7 +547,8 @@ effectiveExports registry thunkByKey lm visited = do
                     reg <- readIORef registry
                     case Map.lookup m reg of
                         Just (Loaded reLm) ->
-                            effectiveExports registry thunkByKey reLm (m : visited)
+                            effectiveExportsMemo memo registry thunkByKey reLm
+                                (m : visited)
                         _ -> pure []
 
     -- Look up @n@ exported from @lm'@:
@@ -558,55 +606,88 @@ effectiveExports registry thunkByKey lm visited = do
                         xs  -> pure xs
                 _ -> goImports reg rest
 
+-- | Memoization set for 'preloadForEffectiveExports'.  Once we've fully
+-- processed a module (discovered its exported locals + walked its
+-- @ExportModule@ / @ExportName@ chains), there is no benefit to doing it
+-- again: the registry and @lmBodies@ IORefs already carry the results.
+--
+-- Without this set, the @O(re-exports × chain-depth)@ walk for modules like
+-- @IHP.Prelude@ revisits the same dozen modules (@GHC.Base@, @GHC.Show@,
+-- @GHC.Types@, …) on every re-export arm and hangs the loader.
+type PreloadMemo = IORef (Set ModuleName)
+
+newPreloadMemo :: IO PreloadMemo
+newPreloadMemo = newIORef Set.empty
+
 -- | Pre-load and discover all modules and bindings that will be needed by
 -- 'effectiveExports' for @lm@.  Unlike 'discoverInModule' / 'resolveImport',
 -- this helper explicitly loads cache modules because the user explicitly asked
 -- to import them.
 --
--- Steps:
+-- Callers driving multiple preloads over a shared set of modules (e.g.
+-- @loadImportIntoEnv@'s fixed-point loop) share a single 'PreloadMemo' via
+-- 'newPreloadMemo' so each module's preload runs at most once regardless of
+-- how many re-export chains reach it.  Before memoization, IHP.Prelude's ~19
+-- re-export arms caused the loader to hang for many seconds because the same
+-- dozen modules (@GHC.Base@, @GHC.Show@, @GHC.Types@, …) were visited once
+-- per arm.
+--
+-- Steps (idempotent):
 --   1. Discover all locally-defined top-level names in @lm@.
 --   2. For each missing @ExportName@ in @lm@, preload candidate unqualified
 --      import modules once so their local bodies and transitive re-exports
 --      are available to 'effectiveExports'.
 --   3. For each @ExportModule m@ in @lm@'s export list, recursively call
---      'preloadForEffectiveExports' on @m@ (cycle-guarded by @visited@).
-preloadForEffectiveExports
-    :: ModuleRegistry
+--      'preloadForEffectiveExportsMemo' on @m@ (cycle-guarded by @visited@).
+preloadForEffectiveExportsMemo
+    :: PreloadMemo
+    -> ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> LoadedModule
-    -> [ModuleName]             -- ^ visited: cycle guard
+    -> [ModuleName]
     -> IO ()
-preloadForEffectiveExports registry searchPath includeMap lm visited = do
-    -- 1. Discover only the locally-defined names that can actually contribute
-    --    to this module's export surface. Private helpers do not need to be
-    --    preloaded just to answer a REPL import.
-    allLocalNames <- scanAllTopLevelNames (lmSource lm)
-    let localSet = Set.fromList allLocalNames
-        exportedLocalNames = case mhExports (lmHeader lm) of
-            ExportAll    -> allLocalNames
-            ExportList xs ->
-                [ n
-                | item <- xs
-                , n <- case item of
-                    ExportName n'   -> [n']
-                    ExportType n' _ -> [n']
-                    ExportModule _  -> []
-                , n `Set.member` localSet
-                ]
-    mapM_ (discoverSafe lm) exportedLocalNames
-    -- 2. Named re-exports not locally defined.
-    let namedRe = case mhExports (lmHeader lm) of
-            ExportAll    -> []
-            ExportList xs ->
-                [ n | ExportName n <- xs
-                    , n `Set.notMember` localSet
-                    , not (BC.null n) && BC.head n >= 'a' && BC.head n <= 'z'
-                ]
-    preloadImportsForNamedReexports registry searchPath includeMap lm visited namedRe
-    -- 3. ExportModule re-exports — recurse.
-    let reexportMods = filter (`notElem` visited) (moduleReexports (lmHeader lm))
-    mapM_ loadReexportMod reexportMods
+preloadForEffectiveExportsMemo memo registry searchPath includeMap lm visited = do
+    done <- readIORef memo
+    if Set.member (lmName lm) done
+        then pure ()
+        else do
+            -- Mark BEFORE recursing so cycles that reach back into @lm@
+            -- don't re-enter.  The body below is idempotent (scanAllTop... +
+            -- discoverSafe skip on missing names; loadReexportMod already
+            -- tolerates re-entry through the registry's Loaded state).
+            modifyIORef' memo (Set.insert (lmName lm))
+            -- 1. Discover only the locally-defined names that can actually
+            --    contribute to this module's export surface. Private helpers
+            --    do not need to be preloaded just to answer a REPL import.
+            allLocalNames <- scanAllTopLevelNames (lmSource lm)
+            let localSet = Set.fromList allLocalNames
+                exportedLocalNames = case mhExports (lmHeader lm) of
+                    ExportAll    -> allLocalNames
+                    ExportList xs ->
+                        [ n
+                        | item <- xs
+                        , n <- case item of
+                            ExportName n'   -> [n']
+                            ExportType n' _ -> [n']
+                            ExportModule _  -> []
+                        , n `Set.member` localSet
+                        ]
+            mapM_ (discoverSafe lm) exportedLocalNames
+            -- 2. Named re-exports not locally defined.
+            let namedRe = case mhExports (lmHeader lm) of
+                    ExportAll    -> []
+                    ExportList xs ->
+                        [ n | ExportName n <- xs
+                            , n `Set.notMember` localSet
+                            , not (BC.null n) && BC.head n >= 'a' && BC.head n <= 'z'
+                        ]
+            preloadImportsForNamedReexportsMemo memo registry searchPath includeMap
+                lm visited namedRe
+            -- 3. ExportModule re-exports — recurse.
+            let reexportMods = filter (`notElem` visited)
+                                   (moduleReexports (lmHeader lm))
+            mapM_ loadReexportMod reexportMods
   where
     -- Discover a single name in the given module, ignoring any parse error.
     discoverSafe m' n = do
@@ -621,8 +702,8 @@ preloadForEffectiveExports registry searchPath includeMap lm visited = do
                    `catch` (\(_ :: ModuleNotFound) -> buildEmptyStubModule m)
         -- Wrap entire sub-load in try so a broken re-exported module
         -- doesn't abort preloading of other modules.
-        r <- try (preloadForEffectiveExports registry searchPath includeMap reLm
-                     (m : visited))
+        r <- try (preloadForEffectiveExportsMemo memo registry searchPath
+                     includeMap reLm (m : visited))
                  :: IO (Either SomeException ())
         case r of
             Right () -> pure ()
@@ -630,22 +711,23 @@ preloadForEffectiveExports registry searchPath includeMap lm visited = do
 
 -- | Preload the unqualified import modules of @lm@ that could provide any of
 -- the named re-exports in @missingNames@. Each candidate import module is
--- visited at most once per call, which avoids repeated graph walks for
--- export-heavy modules like Data.List.
+-- visited at most once per call (both because @viable@ filters against the
+-- cycle @visited@ list and because 'preloadForEffectiveExportsMemo' skips
+-- already-preloaded modules).
 --
 -- Parse errors and other exceptions from individual module loads or
 -- recursive preloads are silently swallowed: if a candidate module can't be
--- parsed, we skip it and continue. The caller (@preloadForEffectiveExports@)
--- will discover whatever was successfully loaded.
-preloadImportsForNamedReexports
-    :: ModuleRegistry
+-- parsed, we skip it and continue.
+preloadImportsForNamedReexportsMemo
+    :: PreloadMemo
+    -> ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> LoadedModule
-    -> [ModuleName]             -- ^ visited import chain
+    -> [ModuleName]
     -> [ByteString]
     -> IO ()
-preloadImportsForNamedReexports registry searchPath includeMap lm visited missingNames = do
+preloadImportsForNamedReexportsMemo memo registry searchPath includeMap lm visited missingNames = do
     let unqualImports = filter (not . impQualified) (mhImports (lmHeader lm))
         viable = filter (\i ->
             impModule i /= BC.pack "Prelude" &&
@@ -659,7 +741,7 @@ preloadImportsForNamedReexports registry searchPath includeMap lm visited missin
         result <- try $ do
             srcLm <- loadModule registry searchPath includeMap (impModule imp)
                        `catch` (\(_ :: ModuleNotFound) -> buildEmptyStubModule (impModule imp))
-            preloadForEffectiveExports registry searchPath includeMap srcLm
+            preloadForEffectiveExportsMemo memo registry searchPath includeMap srcLm
                 (impModule imp : visited)
         case (result :: Either SomeException ()) of
             Right () -> pure ()
@@ -711,8 +793,14 @@ loadImportIntoEnv searchPath imp existingEnv
         -- may have loaded GHC.List while processing Data.List → Data.OldList).
         -- Those newly loaded modules also need their local names discovered so
         -- they end up in thunkByKey.  Repeat until the registry stabilises.
-        preloadForEffectiveExports registry fullSearchPath includeMap targetLm
-            [lmName targetLm]
+        --
+        -- Share a single preload memo across ALL passes so modules reachable
+        -- via many re-export chains (common case: everything in base reaches
+        -- @GHC.Base@) are preloaded exactly once.  Without sharing, IHP.Prelude
+        -- (19 re-export arms) hangs the loader for many seconds.
+        preloadMemo <- newPreloadMemo
+        preloadForEffectiveExportsMemo preloadMemo registry fullSearchPath
+            includeMap targetLm [lmName targetLm]
         let runUntilStable processed = do
                 regBefore <- readIORef registry
                 let knownNames = Map.keysSet regBefore
@@ -726,8 +814,8 @@ loadImportIntoEnv searchPath imp existingEnv
                         , m `Set.notMember` processed
                         ]
                 mapM_ (\lm -> do
-                    r <- try (preloadForEffectiveExports registry fullSearchPath
-                                  includeMap lm [lmName lm])
+                    r <- try (preloadForEffectiveExportsMemo preloadMemo registry
+                                  fullSearchPath includeMap lm [lmName lm])
                              :: IO (Either SomeException ())
                     case r of { Right () -> pure (); Left _ -> pure () }
                     ) newlyLoaded
@@ -838,8 +926,12 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             | (m, Loaded lm) <- Map.toList regAfterDiscover
             , m /= lmName targetLm
             ]
+    -- Share a preload memo across the batch so deps preloaded via one module
+    -- aren't re-walked when another module also reaches them.
+    preloadMemo <- newPreloadMemo
     mapM_ (\lm -> do
-        r <- try (preloadForEffectiveExports registry fullSearchPath includeMap lm [lmName lm])
+        r <- try (preloadForEffectiveExportsMemo preloadMemo registry
+                      fullSearchPath includeMap lm [lmName lm])
                  :: IO (Either SomeException ())
         case r of
             Right () -> pure ()
