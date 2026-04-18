@@ -47,6 +47,13 @@
           vector
           scientific
           attoparsec
+          # network: ships .hsc sources and cbits/*.c.  Adding it here
+          # lets ihcSourceRootWithHsc run ./configure (to generate
+          # include/HsNetworkConfig.h) and then hsc2hs every *.hsc,
+          # producing the .hs shadows the interpreter needs for
+          # Network.Socket.*.  The cbits/HsNet.c + cbits/cmsg.c side
+          # is handled by the separate libhsnetDylib derivation below.
+          network
         ];
 
         # Keep only packages that actually have a derivation and are not
@@ -185,13 +192,26 @@
           min_ver_defs="$min_ver_defs -DMIN_VERSION_filepath(a,b,c)=(((a)<1)||((a)==1&&(b)<5)||((a)==1&&(b)==5&&(c)<=4))"
 
           # ── 2. Run ./configure in packages that have one ────────────────────
+          # Some tarballs (e.g. network-3.2.8.0) ship configure without the
+          # executable bit set, so `./configure` would fail with "permission
+          # denied" before autoconf's own logic runs.  chmod +x defensively.
+          # configure's stderr is captured to a log file rather than
+          # discarded — silent failures were making hsc2hs breakage
+          # very hard to diagnose.
           for pkg_dir in "$out"/*/; do
             [ -f "$pkg_dir/configure" ] || continue
             (
               cd "$pkg_dir"
+              chmod +x ./configure 2>/dev/null || true
               echo "[hsc2hs-prep] running ./configure in $pkg_dir" >&2
-              ./configure >/dev/null 2>&1 || \
+              conf_log="$(mktemp)"
+              if ./configure >"$conf_log" 2>&1; then
+                :
+              else
                 echo "[hsc2hs-prep] WARNING: configure failed in $pkg_dir" >&2
+                tail -20 "$conf_log" >&2
+              fi
+              rm -f "$conf_log"
             )
           done
 
@@ -229,7 +249,61 @@
 
           echo "[hsc2hs] done: $ok converted, $fail failed" >&2
         '';
+
+        # ────────────────────────────────────────────────────────────────
+        # libhsnet.dylib — native half of the network package.
+        #
+        # The network package (added to ihcHackageSources above) declares
+        # @c-sources: cbits/HsNet.c cbits/cmsg.c@ in its .cabal.  Cabal
+        # compiles these into the package's object archive; for us, we
+        # need a standalone shared library that the FFI dispatcher can
+        # @dlopen@, so that @foreign import ccall "hsnet_getaddrinfo"@
+        # (and its siblings) resolves at run time.
+        #
+        # The derivation uses the already-hsc2hs-processed source root so
+        # that @./configure@ has run and @include/HsNetworkConfig.h@
+        # exists before the C preprocessor sees @#include "HsNetworkConfig.h"@.
+        # We only need the two POSIX c-sources; the Windows ones
+        # (initWinSock.c, winSockErr.c, asyncAccept.c) are not built.
+        #
+        # Output layout: $out/lib/libhsnet.dylib.  The dev shell prepends
+        # $out/lib to DYLD_LIBRARY_PATH so that
+        #   registerLibrary "hsnet"  ⇒  dlopen("libhsnet.dylib")
+        # succeeds without any absolute path.
+        libhsnetDylib = pkgs.runCommand "libhsnet-dylib" {
+          buildInputs = [ pkgs.stdenv.cc ];
+        } ''
+          mkdir -p $out/lib
+
+          net="${ihcSourceRootWithHsc}/network-3.2.8.0"
+          if [ ! -d "$net" ]; then
+            echo "libhsnet: network-3.2.8.0 not found under ihcSourceRootWithHsc" >&2
+            exit 1
+          fi
+          if [ ! -f "$net/include/HsNetworkConfig.h" ]; then
+            echo "libhsnet: include/HsNetworkConfig.h missing — configure must run in ihcSourceRootWithHsc" >&2
+            exit 1
+          fi
+
+          # Use cc(1) from the nix stdenv (clang on darwin).
+          # -fPIC is implicit on darwin but harmless; -shared asks the
+          # wrapper to emit a .dylib.  We pass -undefined dynamic_lookup so
+          # that any symbols referenced by HsNet.c that live elsewhere
+          # (e.g. libc's getaddrinfo) are resolved at load time by dyld
+          # rather than at link time.  The only includes we need are the
+          # package-local include/ directory.
+          cc -fPIC -shared -O \
+             -undefined dynamic_lookup \
+             -I"$net/include" \
+             -o "$out/lib/libhsnet.dylib" \
+             "$net/cbits/HsNet.c" \
+             "$net/cbits/cmsg.c"
+
+          echo "libhsnet: built $out/lib/libhsnet.dylib" >&2
+        '';
       in {
+        # Expose as a package so `nix build .#libhsnet` works for debugging.
+        packages.libhsnet = libhsnetDylib;
         devShells.default = pkgs.mkShell {
           buildInputs = [
             ghc
@@ -270,6 +344,16 @@
             # needed.  We no longer auto-prefetch on shell entry.
             export IHC_CACHE="$HOME/.cache/ihc/sources"
             mkdir -p "$IHC_CACHE"
+
+            # libhsnet.dylib — native cbits for the `network` package.
+            # Expose its directory on DYLD_LIBRARY_PATH (and the Apple
+            # fallback equivalent) so that a later dlopen("libhsnet.dylib")
+            # from the FFI dispatcher can resolve without an absolute path.
+            # IHC_LIBHSNET_DIR is also set so future code can reference the
+            # exact store path directly.
+            export IHC_LIBHSNET_DIR="${libhsnetDylib}/lib"
+            export DYLD_LIBRARY_PATH="$IHC_LIBHSNET_DIR''${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            export DYLD_FALLBACK_LIBRARY_PATH="$IHC_LIBHSNET_DIR''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
           '';
         };
 
