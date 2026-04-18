@@ -1121,8 +1121,23 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     -- shim when Data.ByteString is on the builtin-backed list.
     let synthFromBuiltin n =
             let fqn = lmName targetLm <> BC.pack "." <> n
+                -- Data constructors live in 'conEnv' under their
+                -- BARE name (the scanner in 'scanDataDecls' stores
+                -- @TkConId@ literals — no module prefix).  So a
+                -- qualified REPL request like @M.Nothing@ misses
+                -- the FQN lookup above even though 'baseForImport'
+                -- contains @Data.Maybe@'s @Nothing@ via @conEnv@.
+                -- Bridge to the bare-name lookup, gated on a
+                -- capitalized first char so we never hand out
+                -- unrelated lowercase bindings that share a name.
+                capStart = case BC.uncons n of
+                    Just (c, _) -> c >= 'A' && c <= 'Z'
+                    Nothing     -> False
             in case Map.lookup fqn baseForImport of
                 Just slot -> pure (Just (n, slot))
+                Nothing | capStart
+                        , Just slot <- Map.lookup n conEnv
+                        -> pure (Just (n, slot))
                 Nothing   ->
                     -- Class methods are ambient: they have no single
                     -- owning module key, only the bare method name in
@@ -3302,7 +3317,13 @@ splitQualified bs =
         (tailPart : rest@(_ : _))
             | not (BC.null tailPart)
             , all (not . BC.null) rest
-            , isLower (BC.head tailPart)
+            -- The tail may be a lowercase identifier (qualified
+            -- value, e.g. @M.sort@) OR an uppercase identifier
+            -- (qualified data constructor, e.g. @M.Nothing@).
+            -- Without the uppercase case, qualified constructors
+            -- never reach 'resolveQualified' and fail at eval time
+            -- with "unbound variable `M.Nothing`".
+            , let h = BC.head tailPart in isLower h || isUpper h
             , all (isUpper . BC.head) rest ->
                 Just (BC.intercalate (BC.pack ".") (reverse rest), tailPart)
         _ -> Nothing
