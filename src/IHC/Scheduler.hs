@@ -2458,6 +2458,83 @@ buildFieldAccessorEnv publicFields allFields = do
     let projKeyed = Map.mapKeys fieldProjName projEnv
     pure (Map.union bareEnv projKeyed)
 
+-- | Cache of parsed-header-only results, keyed by module name.
+-- Separate from the full-load 'ModuleRegistry' so that walking the
+-- transitive import graph (to compute instance-scope per Haskell
+-- 2010 §4.3.2) doesn't require paying the full-load cost.
+--
+-- 'Nothing' means we attempted to parse the header and failed
+-- (file missing, unreadable, or parseModuleHeader error) — the
+-- negative result is cached too so repeated walks don't retry.
+type HeaderCache = IORef (Map ModuleName (Maybe ModuleHeader))
+
+newHeaderCache :: IO HeaderCache
+newHeaderCache = newIORef Map.empty
+
+-- | Cheap header-only load: parse just the module header, cache the
+-- result.  Does NOT populate data/foreign/fixity scans, does NOT
+-- install body thunks, does NOT touch the ModuleRegistry.  Use this
+-- to walk the import graph before deciding what bodies to force.
+--
+-- Builtin-backed modules (GHC.Prim, etc.) return an empty header —
+-- they have no source to parse.
+loadModuleHeader
+    :: HeaderCache
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> ModuleName
+    -> IO (Maybe ModuleHeader)
+loadModuleHeader cache searchPath includeMap name = do
+    m <- readIORef cache
+    case Map.lookup name m of
+        Just r  -> pure r
+        Nothing -> do
+            r <- if isBuiltinBackedModule name
+                    then pure (Just emptyHeader)
+                    else do
+                        mp <- try (locateModule searchPath name)
+                                :: IO (Either SomeException FilePath)
+                        case mp of
+                            Left  _    -> pure Nothing
+                            Right path -> do
+                                src0 <- readSourceFile path
+                                let fileDir = takeDirectory path
+                                    incDirs = lookupIncludeDirs includeMap fileDir
+                                src  <- cppSourceWithIncludes incDirs src0
+                                (mH, _) <- parseModuleHeader src startCursor
+                                pure mH
+            modifyIORef' cache (Map.insert name r)
+            pure r
+
+-- | Walk the transitive import closure of a module, using only
+-- header parses.  Returns the set of reachable module names.
+-- Cycle-safe (visited set).
+--
+-- Per Haskell 2010 §4.3.2, an instance declaration is in scope iff
+-- the module containing it is in the transitive import closure of
+-- the current module.  This function computes that closure cheaply
+-- so downstream dispatch can scan only the modules the user's
+-- imports actually bring into scope.
+transitiveImportClosure
+    :: HeaderCache
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> ModuleName
+    -> IO (Set ModuleName)
+transitiveImportClosure cache searchPath includeMap root =
+    go Set.empty [root]
+  where
+    go seen [] = pure seen
+    go seen (m : rest)
+      | Set.member m seen = go seen rest
+      | otherwise = do
+          let seen' = Set.insert m seen
+          mh <- loadModuleHeader cache searchPath includeMap m
+          let deps = case mh of
+                  Just h  -> map impModule (mhImports h)
+                  Nothing -> []
+          go seen' (rest ++ deps)
+
 -- | Locate, read, parse, and register a module. Returns the
 -- 'LoadedModule' (and reuses a cached one on subsequent calls).
 -- Cycles raise 'ImportCycle'.
