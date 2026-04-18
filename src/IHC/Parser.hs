@@ -707,14 +707,21 @@ parseExprNoSig ctx cur0 = do
 
 -- | After @::@ in an expression context, skip tokens until we reach a
 -- boundary that ends the enclosing expression. We stop at @,@, @;@,
--- @)@, @]@, @}@ at depth 0, at keyword @in@ (for let), or at EOF.
+-- @)@, @]@, @}@ at depth 0, at keyword @in@ (for let), at EOF, or at
+-- a token whose column is <= @ctxMinCol@ (so do-block layout
+-- boundaries terminate the annotation like
+-- @let x = 5 :: Int\n    stmt@ → stop at @stmt@, not eat it).
 skipTypeToBinding :: Ctx -> Cursor -> IO Cursor
 skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
   where
+    minCol = ctxMinCol ctx
+    atLayoutBoundary tok b p c =
+        b == 0 && p == 0 && c == 0 && minCol > 0 && tkCol tok <= minCol
     go cur b p c = do
         let (tok, cur') = nextSig ctx cur
         case tkKind tok of
             TkEof -> pure cur
+            _ | atLayoutBoundary tok b p c -> pure cur
             TkRParen | b == 0 && p == 0 && c == 0 -> pure cur   -- don't consume
             TkRBracket | b == 0 && p == 0 && c == 0 -> pure cur
             TkRBrace | b == 0 && p == 0 && c == 0 -> pure cur
