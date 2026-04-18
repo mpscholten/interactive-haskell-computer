@@ -57,7 +57,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf)
-import Control.Monad (forM_, when)
+import Control.Monad (forM_, foldM, when)
 import Data.Maybe (fromMaybe, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
@@ -72,6 +72,8 @@ import IHC.Diagnostics (warnStub)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
     , lookupInstanceMethod, typeTagOf
+    , scanHookRef, sharedClassRegRef, setSharedClassReg
+    , unionInstanceScope, currentInstanceScope
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply)
@@ -364,6 +366,11 @@ loadProgramFromSource searchPath src0 = do
 buildBaseEnv :: IO (Env, ClassRegistry)
 buildBaseEnv = do
     classReg <- newClassRegistry
+    -- Install this as the REPL's shared class registry.  Instances
+    -- registered by subsequent imports are written here so the
+    -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
+    -- instances from the transitive import closure are in scope).
+    setSharedClassReg classReg
     builtins <- builtinEnv classReg
     conEnv   <- buildConEnv Map.empty
     let env0 = Map.union builtins conEnv
@@ -936,30 +943,14 @@ loadImportIntoEnv searchPath imp existingEnv
         preloadMemo <- newPreloadMemo
         preloadForEffectiveExportsMemo preloadMemo registry fullSearchPath
             includeMap targetLm [lmName targetLm]
-        let runUntilStable processed = do
-                regBefore <- readIORef registry
-                let knownNames = Map.keysSet regBefore
-                -- Only preload modules that were added since the previous pass.
-                -- Re-running every loaded module on every iteration causes
-                -- quadratic work on import-heavy modules and can make REPL
-                -- imports appear hung.
-                let newlyLoaded =
-                        [ lm
-                        | (m, Loaded lm) <- Map.toList regBefore
-                        , m `Set.notMember` processed
-                        ]
-                mapM_ (\lm -> do
-                    r <- try (preloadForEffectiveExportsMemo preloadMemo registry
-                                  fullSearchPath includeMap lm [lmName lm])
-                             :: IO (Either SomeException ())
-                    case r of { Right () -> pure (); Left _ -> pure () }
-                    ) newlyLoaded
-                regAfter <- readIORef registry
-                let newNames = Map.keysSet regAfter
-                if newNames == knownNames
-                    then pure ()   -- stable: no new modules loaded
-                    else runUntilStable (Set.union processed newNames)
-        runUntilStable (Set.singleton (lmName targetLm))
+        -- Previously ran a fixed-point loop re-invoking
+        -- preloadForEffectiveExportsMemo until the registry stabilised.
+        -- This cascades unboundedly on dense re-export graphs
+        -- (Network.Socket → 18 re-exports → each re-exports more).
+        -- Remove the fixpoint; rely on demand-driven loads via
+        -- 'discoverInModule' to pull remaining bindings at first use.
+        -- See /Users/marc/.claude/plans/lazy-interpreter-redesign.md.
+        pure ()
         -- Step 3: collect all loaded modules and build the combined env.
         reg0 <- readIORef registry
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
@@ -1035,6 +1026,28 @@ loadImportIntoEnv searchPath imp existingEnv
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
               (zip qualPairs slots)
+        -- Register instance declarations into the REPL's shared class
+        -- registry so dispatchers can see them on subsequent calls.
+        -- (The previous version skipped this step entirely — instances
+        -- were silently dropped for the ImportAll path.)
+        mSharedReg <- readIORef sharedClassRegRef
+        case mSharedReg of
+            Just sharedReg -> do
+                let unionedTypeCtors1 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
+                ct <- buildClassMethodTable loadedModules0
+                mapM_ (\l -> (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors1 ct innerEnv l) `catch` (\(_ :: SomeException) -> pure ())) loadedModules0
+                (registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv loadedModules0)
+                    `catch` (\(_ :: SomeException) -> pure ())
+                (registerDerivedFunctorInstances sharedReg loadedModules0)
+                    `catch` (\(_ :: SomeException) -> pure ())
+            Nothing -> pure ()
+        -- Track transitive import closure for Haskell 2010 §4.3.2
+        -- instance visibility. The dispatcher consults this set on miss.
+        do
+            headerCache <- newHeaderCache
+            closure <- transitiveImportClosure headerCache fullSearchPath includeMap
+                            (impModule imp)
+            unionInstanceScope closure
         -- Merge into the REPL env: prefer existing REPL bindings (shadow).
         let newBindings = Map.union qualEnv aliasEnv
             additions   = Map.difference newBindings existingEnv
@@ -1196,6 +1209,26 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     do { classTable <- buildClassMethodTable loadedModules0; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) loadedModules0 }
     registerClassDefaults registry fullSearchPath includeMap classReg innerEnv loadedModules0
     registerDerivedFunctorInstances classReg loadedModules0
+    -- ALSO mirror instance registrations into the REPL's shared class
+    -- registry so the dispatcher (closed over the shared reg via
+    -- 'sharedClassRegRef') can find them on later dispatch calls.
+    -- Without this, instances registered here into the per-call
+    -- 'classReg' are invisible to the REPL's dispatcher thunks.
+    mSharedReg <- readIORef sharedClassRegRef
+    case mSharedReg of
+        Just sharedReg | sharedReg /= classReg -> do
+            ct <- buildClassMethodTable loadedModules0
+            mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) loadedModules0
+            registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv loadedModules0
+            registerDerivedFunctorInstances sharedReg loadedModules0
+        _ -> pure ()
+    -- Track transitive import closure for Haskell 2010 §4.3.2
+    -- instance visibility. The dispatcher consults this set on miss.
+    do
+        headerCache <- newHeaderCache
+        closure <- transitiveImportClosure headerCache fullSearchPath includeMap
+                        (impModule imp)
+        unionInstanceScope closure
     let additions  = Map.difference aliasEnv existingEnv
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
@@ -1756,24 +1789,45 @@ classMethodDispatcher reg cls methodName = dispatch 4 []
             let tag = typeTagOf av
             if isDispatchableTag tag
                 then do
-                    mMethod <- lookupInstanceMethod reg cls tag methodName
+                    -- First lookup against the dispatcher's own classReg.
+                    mMethod0 <- lookupInstanceMethod reg cls tag methodName
+                    -- Also check the shared classReg (per Haskell 2010
+                    -- §4.3.2, instances from the user's transitive import
+                    -- closure should be visible — they may have been
+                    -- registered by a later import via the shared ref).
+                    mMethodShared <- lookupInSharedReg cls tag methodName
+                    let mMethod = preferMethod mMethod0 mMethodShared
                     case mMethod of
                         Just methodVal
                           | not (isMethodPlaceholder methodVal) ->
                                 applyAll methodVal (reverse (argT : accArgs))
                         _ -> do
-                            -- Dispatchable arg but no matching instance (or the
-                            -- method is a placeholder) — fall back to the
-                            -- class's default body for this method.
-                            mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
-                            case mDef of
-                                Just defVal ->
-                                    applyAll defVal (reverse (argT : accArgs))
-                                _ -> error
-                                    ( "class-method dispatch: no instance of `"
-                                     <> BC.unpack cls
-                                     <> "` for type `" <> BC.unpack tag
-                                     <> "` (method `" <> BC.unpack methodName <> "`)" )
+                            -- Lazy-scan in-scope modules once and retry.
+                            didScan <- lazyInstanceRetry cls tag
+                            mMethod2 <- if didScan
+                                then do
+                                    a <- lookupInstanceMethod reg cls tag methodName
+                                    b <- lookupInSharedReg cls tag methodName
+                                    pure (preferMethod a b)
+                                else pure mMethod
+                            case mMethod2 of
+                                Just methodVal
+                                  | not (isMethodPlaceholder methodVal) ->
+                                        applyAll methodVal (reverse (argT : accArgs))
+                                _ -> do
+                                    -- Dispatchable arg but no matching instance.
+                                    -- Fall back to the class's default body.
+                                    mDef0 <- lookupInstanceMethod reg cls defaultTypeTag methodName
+                                    mDefShared <- lookupInSharedReg cls defaultTypeTag methodName
+                                    let mDef = preferMethod mDef0 mDefShared
+                                    case mDef of
+                                        Just defVal ->
+                                            applyAll defVal (reverse (argT : accArgs))
+                                        _ -> error
+                                            ( "class-method dispatch: no instance of `"
+                                             <> BC.unpack cls
+                                             <> "` for type `" <> BC.unpack tag
+                                             <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else do
                     -- Non-dispatchable (function / unit / primitive
                     -- object): stash and wait for the next arg so the
@@ -1809,6 +1863,52 @@ classMethodDispatcher reg cls methodName = dispatch 4 []
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+-- | Look up a class method in the shared (REPL-level) class registry
+-- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is
+-- installed or if no method is registered under @(cls, tag)@.
+lookupInSharedReg :: ByteString -> ByteString -> ByteString -> IO (Maybe Val)
+lookupInSharedReg cls tag methodName = do
+    mReg <- readIORef sharedClassRegRef
+    case mReg of
+        Just sharedReg -> lookupInstanceMethod sharedReg cls tag methodName
+        Nothing        -> pure Nothing
+
+-- | Given two method lookups (the dispatcher-local and the shared), pick
+-- the first non-placeholder Just. Neither winning means the retry path
+-- has to fire (or we fall through to default/error).
+preferMethod :: Maybe Val -> Maybe Val -> Maybe Val
+preferMethod a b =
+    case a of
+        Just v | not (isMethodPlaceholder v) -> Just v
+        _ -> case b of
+            Just v | not (isMethodPlaceholder v) -> Just v
+            _ -> a
+
+-- | Lazy-scan any in-scope modules that haven't yet been scanned for
+-- instances. Called once per dispatch miss; the 'scannedModulesRef' set
+-- carried in 'scanHookRef''s closure guards against re-scanning. Returns
+-- 'True' if the scan hook was invoked at least once this call (i.e. the
+-- caller should retry the lookup).
+lazyInstanceRetry :: ByteString -> ByteString -> IO Bool
+lazyInstanceRetry _cls _tag = do
+    mHook <- readIORef scanHookRef
+    case mHook of
+        Nothing   -> pure False
+        Just hook -> do
+            scope <- currentInstanceScope
+            -- Each call to hook is idempotent: the hook maintains its
+            -- own 'scanned' set and returns immediately for already-
+            -- scanned modules.  The retry is bounded by the size of the
+            -- current instance scope.
+            let modList = Set.toList scope
+            anyScanned <- foldM (\acc m -> do
+                                    r <- try (hook m) :: IO (Either SomeException ())
+                                    case r of
+                                        Right () -> pure (acc || True)
+                                        Left  _  -> pure acc)
+                                False modList
+            pure anyScanned
 
 -- | Build an Env containing a dispatcher thunk for every method of every
 -- user-defined class visible in any loaded module. Method-name collisions
