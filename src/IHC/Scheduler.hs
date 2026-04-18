@@ -2453,13 +2453,14 @@ lookupIncludeDirs includeMap fileDir =
 -- the Phase 2.17 punchlist documents.
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
-    -- Data.ByteString: source loads but discovery of Show+friends
+    -- Data.ByteString{,.Char8}: source loads but discovery of Show+friends
     -- takes ~9 minutes due to O(big) traversal of GHC.Internal.Show's
     -- transitive closure. Short-circuit until the perf fix lands; the
-    -- common ops (pack/unpack/length/null/empty) are provided as
-    -- builtin bare names (see IHC.Builtins). Shim per CLAUDE.md guidance
+    -- common ops (pack/unpack/length/null/empty/...) are provided as
+    -- FQN-keyed builtins (see IHC.Builtins). Shim per CLAUDE.md guidance
     -- — remove once source-load perf is diagnosed and fixed.
        n == "Data.ByteString"
+    || n == "Data.ByteString.Char8"
     || n == "GHC.Prim"
     -- GHC.Types: wired-in kinds, Constraint, RuntimeRep, Int#, etc.
     -- The compiler synthesises this module; base-4.19 has no GHC/Types.hs.
