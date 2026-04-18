@@ -856,6 +856,14 @@ eqVals reg av bv = case (av, bv) of
     (VCon "False" _, VCon "False" _) -> pure (boolVal True)
     (VCon "True" _, VCon "False" _)  -> pure (boolVal False)
     (VCon "False" _, VCon "True" _)  -> pure (boolVal False)
+    -- Data.ByteString shim (see isBuiltinBackedModule): compare by
+    -- content via the host Eq ByteString, not by ForeignPtr identity.
+    -- Default VCon field-by-field would compare fp1 == fp2 which is
+    -- always False for freshly-allocated buffers with the same bytes.
+    (VCon "BS" _, VCon "BS" _) -> do
+        ba <- bsValToBS av
+        bb <- bsValToBS bv
+        pure (boolVal (ba == bb))
     (VCon n1 ts1, VCon n2 ts2)
         | n1 /= n2  -> pure (boolVal False)
         | otherwise -> do
@@ -904,6 +912,14 @@ ordCmp _reg slot av bv = case (av, bv) of
         pure (boolVal (ptrOrdSlot slot p1 p2))
     (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
         pure (boolVal (foreignPtrOrdSlot slot fp1 fp2))
+    -- Data.ByteString shim (see eqVals): compare by content via the
+    -- host Ord, not structural VCon-field compare (which compares
+    -- ForeignPtr addresses and gives meaningless results).
+    (VCon "BS" _, VCon "BS" _) -> do
+        ba <- bsValToBS av
+        bb <- bsValToBS bv
+        let o = compare ba bb
+        pure (boolVal (ordSlot slot o))
     _ -> do
         let tag = typeTagOf av
         let ordMethodName = case slot of
