@@ -250,6 +250,7 @@ doImport envRef loadedRef importsRef line = do
                             outputStrLn ("Import error: " <> err)
                         Right (newEnv, n)  -> do
                             liftIO (writeIORef envRef newEnv)
+                            liftIO $ modifyIORef' importsRef (\imports -> imports <> [imp])
                             outputStrLn ( "imported "
                                         <> BC.unpack (impModule imp)
                                         <> " ("
