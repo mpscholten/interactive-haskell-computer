@@ -1169,18 +1169,25 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                         , Just slot <- Map.lookup n conEnv
                         -> pure (Just (n, slot))
                 Nothing   ->
-                    -- Class methods are ambient: they have no single
-                    -- owning module key, only the bare method name in
-                    -- 'classMethodEnv'.  If an import requests a class
-                    -- method (e.g. `import qualified Data.Monoid as M`
-                    -- → `M.mempty`), fall back to the bare name here so
-                    -- `M.mempty` resolves to the dispatcher.  Ordinary
-                    -- top-level bindings are keyed under their FQN in
-                    -- 'baseForImport' and are NOT eligible for this
-                    -- fallback.
-                    case Map.lookup n classMethodEnv of
+                    -- Record selectors are synthesized into fieldEnv'
+                    -- rather than exported as source bodies, so an
+                    -- ImportOnly request for a selector like runStateT
+                    -- must be able to surface the prebuilt accessor.
+                    case Map.lookup n fieldEnv' of
                         Just slot -> pure (Just (n, slot))
-                        Nothing   -> pure Nothing
+                        Nothing   ->
+                            -- Class methods are ambient: they have no single
+                            -- owning module key, only the bare method name in
+                            -- 'classMethodEnv'.  If an import requests a class
+                            -- method (e.g. `import qualified Data.Monoid as M`
+                            -- → `M.mempty`), fall back to the bare name here so
+                            -- `M.mempty` resolves to the dispatcher.  Ordinary
+                            -- top-level bindings are keyed under their FQN in
+                            -- 'baseForImport' and are NOT eligible for this
+                            -- fallback.
+                            case Map.lookup n classMethodEnv of
+                                Just slot -> pure (Just (n, slot))
+                                Nothing   -> pure Nothing
     requestedStandard <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
     requestedFromBuiltins <- mapM synthFromBuiltin
         [ n | (n, Nothing) <- zip requested requestedStandard ]

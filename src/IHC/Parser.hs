@@ -1694,6 +1694,9 @@ parseTopPatNoCons ctx cur = do
         TkConId n  -> do
             (qname, cur2) <- readQualConId ctx n tok cur1
             collectArgs ctx (stripQualifier qname) [] cur2
+        TkPrimId n
+            | primIdStartsCon n ->
+                collectArgs ctx n [] cur1
         _          -> parseSubPat ctx cur
 
 collectArgs :: Ctx -> Name -> [Pat] -> Cursor -> IO (Pat, Cursor)
@@ -1739,7 +1742,9 @@ parseSubPat ctx cur = do
                             (sub, curN) <- parseSubPat ctx curP
                             pure (PAs n sub, curN)
                 _    -> pure (PVar n, cur1)
-        TkPrimId n   -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
+        TkPrimId n
+            | primIdStartsCon n -> pure (PCon n [], cur1)
+            | otherwise         -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
         TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
         TkFloat d    -> pure (PLit (LFloat d), cur1)
@@ -1967,6 +1972,12 @@ startsPat TkBang       = True
 startsPat TkLUnbox     = True   -- (# a, b #) unboxed tuple patterns
 startsPat (TkSymOp op) = op == BC.pack "~"   -- lazy/irrefutable ~pat
 startsPat _            = False
+
+primIdStartsCon :: ByteString -> Bool
+primIdStartsCon bs =
+    case BC.uncons bs of
+        Just (c, _) -> c >= 'A' && c <= 'Z'
+        Nothing     -> False
 
 --------------------------------------------------------------------------------
 -- Pratt operator parser

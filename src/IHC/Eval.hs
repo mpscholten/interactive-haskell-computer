@@ -553,6 +553,24 @@ matchPat (PCon "()" []) VUnit = pure (Just [])
 -- but pattern @Proxy@ (nullary) should still match — the payload is
 -- type-level metadata that user code doesn't observe via the ctor.
 matchPat (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
+-- Boxed prim constructors are host-backed wrappers over the interpreter's
+-- primitive runtime values. Pattern matching must therefore treat
+-- @I# x@ / @W# x@ / @W8# x@ as wrappers around 'VInt' and @C# x@ as a
+-- wrapper around 'VChar'; otherwise source bindings like
+-- @new (I# len#) = ...@ never match and libraries such as @text@ fail at
+-- first use after discovery succeeds.
+matchPat (PCon "I#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "W#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "W8#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "C#" [p]) (VChar c) = do
+    t <- newWHNFThunk (VChar c)
+    matchFields [(p, t)] []
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For
@@ -667,6 +685,19 @@ matchPat (PView fn p) v = do
     -- PView into a case expression via desugarViewPat in the scheduler.
     error ("IHC.Eval: PView reached matchPat — view pattern not desugared: "
             <> show fn <> " -> " <> show p)
+
+matchFields :: [(Pat, Thunk)] -> [(Name, Thunk)] -> IO (Maybe [(Name, Thunk)])
+matchFields [] acc = pure (Just (reverse acc))
+matchFields ((PVar nm, t) : rest) acc =
+    matchFields rest ((nm, t) : acc)
+matchFields ((PWild, _) : rest) acc =
+    matchFields rest acc
+matchFields ((pat, t) : rest) acc = do
+    fv <- force t
+    m  <- matchPat pat fv
+    case m of
+        Nothing   -> pure Nothing
+        Just subs -> matchFields rest (reverse subs ++ acc)
 
 --------------------------------------------------------------------------------
 -- apply
