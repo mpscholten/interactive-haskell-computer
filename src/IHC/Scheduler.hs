@@ -1060,6 +1060,40 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames = Map.keysSet earlyBuiltins
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
+    -- Preload direct imports of targetLm so class declarations in
+    -- re-export chains become visible to 'buildClassMethodEnv'.
+    -- Without this, a request like `import qualified Data.Monoid as M`
+    -- + `M.mempty` fails: Data.Monoid re-exports Monoid from
+    -- GHC.Internal.Base, but `discoverInModuleWith` on the method
+    -- name `mempty` never loads GHC.Internal.Base (there's no
+    -- top-level body named `mempty` in any direct import), so the
+    -- class decl isn't scanned and 'classMethodEnv' is empty for
+    -- ambient methods.  Loading direct imports is bounded (one level
+    -- per call) and, per 'isLocalCacheModule', still blocks the bare
+    -- GHC.* cascade.
+    -- BFS-load modules reachable from targetLm's imports, up to a
+    -- bounded total to avoid fan-out in dense graphs like Data.Text.
+    let preloadBudget = 40 :: Int
+    let preloadBFS remaining seenSet frontier
+            | remaining <= 0 = pure ()
+            | null frontier = pure ()
+            | otherwise = do
+                let (thisBatch, rest) = splitAt remaining frontier
+                next <- fmap concat $ mapM (\modName ->
+                    if Set.member modName seenSet
+                      then pure []
+                      else do
+                        r <- try (loadModule registry fullSearchPath includeMap modName)
+                                 :: IO (Either SomeException LoadedModule)
+                        case r of
+                            Right lm' -> pure (map impModule (mhImports (lmHeader lm')))
+                            Left  _   -> pure []) thisBatch
+                let loadedThisPass = length thisBatch
+                    seenSet' = Set.union seenSet (Set.fromList thisBatch)
+                    frontier' = nubBS (rest ++ filter (not . (`Set.member` seenSet')) next)
+                preloadBFS (remaining - loadedThisPass) seenSet' frontier'
+    preloadBFS preloadBudget (Set.singleton (lmName targetLm))
+        (map impModule (mhImports (lmHeader targetLm)))
     -- ImportOnly is the REPL's deferred-name path: keep it targeted.
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
@@ -1089,7 +1123,19 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             let fqn = lmName targetLm <> BC.pack "." <> n
             in case Map.lookup fqn baseForImport of
                 Just slot -> pure (Just (n, slot))
-                Nothing   -> pure Nothing
+                Nothing   ->
+                    -- Class methods are ambient: they have no single
+                    -- owning module key, only the bare method name in
+                    -- 'classMethodEnv'.  If an import requests a class
+                    -- method (e.g. `import qualified Data.Monoid as M`
+                    -- → `M.mempty`), fall back to the bare name here so
+                    -- `M.mempty` resolves to the dispatcher.  Ordinary
+                    -- top-level bindings are keyed under their FQN in
+                    -- 'baseForImport' and are NOT eligible for this
+                    -- fallback.
+                    case Map.lookup n classMethodEnv of
+                        Just slot -> pure (Just (n, slot))
+                        Nothing   -> pure Nothing
     requestedStandard <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
     requestedFromBuiltins <- mapM synthFromBuiltin
         [ n | (n, Nothing) <- zip requested requestedStandard ]
@@ -1306,7 +1352,24 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                   Right () -> pure ()
                   Left  _  -> pure ())
           (Set.toList instMethodFVs)
-    rewrites <- buildImportRewritesForNames registry lm instMethodFVs
+    rewrites0 <- buildImportRewritesForNames registry lm instMethodFVs
+    -- Single-shot retry: some FVs may now resolve thanks to transitive
+    -- loads triggered by the per-FV discoverInModule pass just above.
+    -- For each FV still missing from the rewrite map, try discover
+    -- once more and rebuild.  Bounded: one extra pass, no fixpoint.
+    let unresolvedFVs =
+            [ fv | fv <- Set.toList instMethodFVs, not (Map.member fv rewrites0) ]
+    rewrites <- if null unresolvedFVs
+        then pure rewrites0
+        else do
+            mapM_ (\fv -> do
+                      r <- try (discoverInModule registry searchPath includeMap lm fv)
+                                :: IO (Either SomeException ())
+                      case r of
+                          Right () -> pure ()
+                          Left  _  -> pure ())
+                  unresolvedFVs
+            buildImportRewritesForNames registry lm instMethodFVs
     -- Build a name-keyed method table. When the class declaration is
     -- known, the class's declared method names are canonical for
     -- dispatch. Extra instance bindings are preserved under their own
