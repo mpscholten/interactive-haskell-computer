@@ -1189,6 +1189,12 @@ showValWith reg av = case av of
     VCon "True" _  -> pure "True"
     VCon "False" _ -> pure "False"
     VCon "Proxy" _ -> pure "Proxy"   -- DataKinds payload is invisible in show
+    VCon "BS" _ -> do
+        -- Render a ByteString using Data.ByteString.Char8's show-style
+        -- output: `"..."` with printable ASCII passed through and
+        -- non-printables escaped. Matches the GHC stock instance.
+        bs <- bsValToBS av
+        pure (show bs)
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
         let tag = n
