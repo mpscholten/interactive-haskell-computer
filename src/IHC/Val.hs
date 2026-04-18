@@ -76,15 +76,15 @@ data Val
     | VLabel   !ByteString             -- #name OverloadedLabels value (Phase 3.5)
     -- | Unsaturated class-method dispatcher. Accumulates TypeApplications
     -- type args as it flows through 'ETyApp' nodes, then performs
-    -- multi-key lookup in the 'ClassRegistry' when applied to a value
-    -- argument. The list of 'ByteString' tags is type-arg tags in source
-    -- order (e.g. @setField \@\"name\" \@User \@String@ accumulates
-    -- @[\"name\",\"User\",\"String\"]@ — quotes stripped by the
-    -- normaliser). The 'Thunk -> IO Val' callback does the actual
-    -- lookup+apply at the point the dispatcher is applied to a runtime
-    -- argument; the 'Name' and 'Int' payloads are informational (method
-    -- name + class-slot) kept for error messages.
-    | VClassMethod !Name !Int ![ByteString] !([ByteString] -> Thunk -> IO Val)
+    -- multi-key lookup in the 'ClassRegistry' either when applied to a
+    -- runtime argument or, for nullary methods like @mempty@, when a
+    -- consumer pattern reveals the expected result type tag.
+    | VClassMethod
+        !ByteString
+        !Name
+        ![ByteString]
+        !([ByteString] -> Thunk -> IO Val)
+        !([ByteString] -> ByteString -> IO Val)
 
 -- | Opaque host-side objects surfaced to the interpreter. Not
 -- user-inspectable — programs pass them through primops only
@@ -122,8 +122,8 @@ showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
 showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
 showValForDebug (VLabel name)                = "#" <> BC.unpack name
-showValForDebug (VClassMethod m _ tags _)     =
-    "<classMethod " <> BC.unpack m
+showValForDebug (VClassMethod cls m tags _ _) =
+    "<classMethod " <> BC.unpack cls <> "." <> BC.unpack m
     <> (if null tags then "" else " @" <> show (map BC.unpack tags)) <> ">"
 
 --------------------------------------------------------------------------------

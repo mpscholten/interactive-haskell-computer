@@ -324,6 +324,40 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "10"
         out `shouldContain` "[3,4]"
 
+    it "import Data.Monoid brings mappend into scope" do
+        (code, out, _err) <- runRepl
+            ( "import Data.Monoid\n"
+           <> "mappend\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "imported Data.Monoid (1 names)"
+        out `shouldContain` "<function>"
+
+    it "import Data.Monoid: mappend [1] [2] = [1,2]" do
+        (code, out, _err) <- runRepl
+            ( "import Data.Monoid\n"
+           <> "mappend [1] [2]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "[1,2]"
+
+    it "import qualified Data.Text as T: T.length T.empty = 0" do
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.Text as T\n"
+           <> "T.length T.empty\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "0"
+
+    it "qualified Data.Text and Data.Monoid interoperate" do
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.Text as T\n"
+           <> "import qualified Data.Monoid as M\n"
+           <> "T.length M.mempty\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "0"
+
     it "head \"\" raises an exception but REPL continues (raise# primop)" do
         -- Regression: source-loaded head [] bottoms out into raise#
         -- (via error -> errorCallWithCallStackException -> raise#). The

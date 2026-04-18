@@ -239,8 +239,8 @@ eval env ipm = go
                 -- Multi-key class dispatch: @setField \@\"name\" \@User \@String@
                 -- accumulates type-arg tags onto the dispatcher so the final
                 -- call can look up the instance by composite key.
-                VClassMethod m slot tags fn ->
-                    pure (VClassMethod m slot (tags ++ [normalizeTyTag ty]) fn)
+                VClassMethod cls m tags fn resolveByTag ->
+                    pure (VClassMethod cls m (tags ++ [normalizeTyTag ty]) fn resolveByTag)
                 -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
                 -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
                 -- when a bare VLabel flows through a non-@Proxy@ type
@@ -549,6 +549,103 @@ matchPat (PLit (LChar c)) (VChar d)
 matchPat (PLit (LChar _)) _      = pure Nothing
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
 matchPat (PCon "()" []) VUnit = pure (Just [])
+matchPat pat@(PCon pname _) (VClassMethod _ _ tags _ resolveByTag) = do
+    resolved <- resolveByTag tags pname
+    matchPat pat resolved
+-- Primitive boxing constructors are erased in the evaluator: expression-level
+-- `I#`, `W#`, `W8#`, and `C#` are represented as raw scalars. Pattern matching
+-- must make the same representation transparent so source bindings like
+-- `new (I# len#) = ...` work against an argument that is already a `VInt`.
+matchPat (PCon "I#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon "W#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon "W8#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon "C#" [p]) (VChar c) = do
+    t <- newWHNFThunk (VChar c)
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon "ByteArray" [p]) (VPrimObj (PrimByteArray ref)) = do
+    t <- newWHNFThunk (VPrimObj (PrimByteArray ref))
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
+matchPat (PCon "MutableByteArray" [p]) (VPrimObj (PrimByteArray ref)) = do
+    t <- newWHNFThunk (VPrimObj (PrimByteArray ref))
+    matchFields [(p, t)] []
+  where
+    matchFields [] acc = pure (Just (reverse acc))
+    matchFields ((PVar name, thunk) : rest) acc =
+        matchFields rest ((name, thunk) : acc)
+    matchFields ((PWild, _) : rest) acc =
+        matchFields rest acc
+    matchFields ((pat, thunk) : rest) acc = do
+        fv <- force thunk
+        m  <- matchPat pat fv
+        case m of
+            Nothing   -> pure Nothing
+            Just subs -> matchFields rest (reverse subs ++ acc)
 -- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@
 -- but pattern @Proxy@ (nullary) should still match — the payload is
 -- type-level metadata that user code doesn't observe via the ctor.
@@ -675,7 +772,7 @@ matchPat (PView fn p) v = do
 apply :: Val -> Thunk -> IO Val
 apply (VFun f)                    arg = f arg
 apply (VFunIP _ f)                arg = f Map.empty arg
-apply (VClassMethod _ _ tags go)  arg = go tags arg
+apply (VClassMethod _ _ tags go _)  arg = go tags arg
 apply v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 
@@ -684,7 +781,7 @@ apply v                           _   = error ("IHC.Eval.apply: not a function: 
 applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _         (VFun f)                   arg = f arg
 applyIP callerIPM (VFunIP _ f)               arg = f callerIPM arg
-applyIP _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP _         (VClassMethod _ _ tags go _) arg = go tags arg
 applyIP _         v                          arg  = do
     a <- force arg
     error ("IHC.Eval.applyIP: not a function: "

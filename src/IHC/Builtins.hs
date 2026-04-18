@@ -1332,7 +1332,7 @@ showVal (VCon name thunks)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
-showVal (VClassMethod _ _ _ _) = pure "<function>"
+showVal (VClassMethod _ _ _ _ _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _))      = pure "<IORef>"
 showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"
@@ -1436,7 +1436,7 @@ fromLabelB reg = pure $ VFun $ \a -> do
                     case fromLabelM of
                         VFun _               -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
                         VFunIP _ _           -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
-                        VClassMethod _ _ _ _ -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        VClassMethod _ _ _ _ _ -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
                         v                    -> pure v
                 _ -> pure (VCon "Proxy" [])   -- default: Proxy IsLabel instance
         other -> error ("fromLabel: expected a Label value, got: "
@@ -2752,7 +2752,7 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
 --------------------------------------------------------------------------------
 
 newByteArrayB :: IO Val
-newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
+newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> do
     av <- force a; stv <- force stT
     let n = case av of { VInt i -> fromIntegral i; _ -> 0 }
     ref  <- newIORef (BS.replicate n 0)
@@ -2761,7 +2761,7 @@ newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
     pure (VCon "(#,#)" [stT', baT])
 
 writeWord8ArrayB :: IO Val
-writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \stT -> pure $ VIO $ do
+writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \stT -> do
     av <- force a; bv <- force b; cv <- force c; stv <- force stT
     case av of
         VPrimObj (PrimByteArray ref) ->
@@ -2780,7 +2780,7 @@ writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> p
         _ -> error ("writeWord8Array#: not a MutableByteArray: " <> showValForDebug av)
 
 readWord8ArrayB :: IO Val
-readWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
+readWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> do
     av <- force a; bv <- force b; stv <- force stT
     case av of
         VPrimObj (PrimByteArray ref) ->
@@ -2807,7 +2807,7 @@ indexWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error ("indexWord8Array#: not a MutableByteArray: " <> showValForDebug av)
 
 unsafeFreezeByteArrayB :: IO Val
-unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
+unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> do
     av <- force a; stv <- force stT
     case av of
         VPrimObj (PrimByteArray _) -> do
@@ -2817,7 +2817,7 @@ unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ 
         _ -> error ("unsafeFreezeByteArray#: not a MutableByteArray: " <> showValForDebug av)
 
 getSizeofMutableByteArrayB :: IO Val
-getSizeofMutableByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
+getSizeofMutableByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> do
     av <- force a; stv <- force stT
     case av of
         VPrimObj (PrimByteArray ref) -> do
@@ -4748,4 +4748,3 @@ buildBuiltinTypeableInsts = mapM mkDict prims
             trT <- newWHNFThunk tr
             pure (VCon "Dict_Typeable" [trT])
         pure ("typeableDict_" <> tag, dictT)
-

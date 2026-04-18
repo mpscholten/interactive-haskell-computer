@@ -137,6 +137,11 @@ data LoadedModule = LoadedModule
       -- installed into 'TR.globalRegistry' so the ETyApp path of the
       -- evaluator can reduce type-family applications at runtime.
     , lmTypeFamilies :: !TR.TypeFamilyRegistry
+      -- | Local class declarations keyed by class name, storing the
+      -- method names each @class C where ...@ contributes. This keeps
+      -- export-list handling pure so @C(..)@ can expose subordinate
+      -- methods like @mappend@ without rescanning the source.
+    , lmClassMethods :: !(Map ByteString [ByteString])
       -- | @foreign import ccall@ declarations scanned from this module's
       -- source.  Each entry becomes a host-backed 'Val' in the final env
       -- (see 'registerForeignImports') that dispatches the real C symbol
@@ -273,7 +278,10 @@ loadProgramFromSource searchPath src0 = do
 
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
-    let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
+    let bodyThunkPairs        = zip (map fst qualPairs) slots
+        classMethodThunkPairs = qualifiedClassMethodThunks loadedModules classMethodEnv
+        allThunkPairs         = bodyThunkPairs ++ classMethodThunkPairs
+        qualEnv               = extendEnvMany allThunkPairs base
 
     -- For FQN keys whose bare name (last dot-component) matches a builtin,
     -- point the FQN slot directly at the builtin thunk.  This ensures that
@@ -306,7 +314,7 @@ loadProgramFromSource searchPath src0 = do
     -- Name collisions: last-writer-wins via Map.union right-bias.
     -- Entry-module bindings are inserted LAST so they always shadow
     -- imported aliases.
-    aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
+    aliases <- buildAliases registry fullSearchPath includeMap entry allThunkPairs
     let envWithAliases = Map.union aliases qualEnv
     let env = envWithAliases
 
@@ -520,9 +528,12 @@ loadFileIntoEnv searchPath path existingEnv = do
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules
     -- Tie the knot.
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
-    let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
+    let bodyThunkPairs        = zip (map fst qualPairs) slots
+        classMethodThunkPairs = qualifiedClassMethodThunks loadedModules classMethodEnv
+        allThunkPairs         = bodyThunkPairs ++ classMethodThunkPairs
+        qualEnv               = extendEnvMany allThunkPairs base
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
-    aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
+    aliases <- buildAliases registry fullSearchPath includeMap entry allThunkPairs
     let innerEnv = Map.union aliases qualEnv
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
@@ -638,7 +649,9 @@ effectiveExportsMemo memo registry thunkByKey lm visited = do
 
     exportItem lm' item = case item of
         ExportName n    -> lookupName lm' n
-        ExportType n _  -> lookupName lm' n
+        ExportType n subs ->
+            concat <$> mapM (lookupName lm')
+                (exportTypeValueNames lm' n subs)
         ExportModule m  -> do
             -- Cycle guard.
             if m `elem` visited
@@ -767,10 +780,7 @@ preloadForEffectiveExportsMemo memo registry searchPath includeMap lm visited = 
                     ExportList xs ->
                         [ n
                         | item <- xs
-                        , n <- case item of
-                            ExportName n'   -> [n']
-                            ExportType n' _ -> [n']
-                            ExportModule _  -> []
+                        , n <- exportItemValueNames lm item
                         , n `Set.member` localSet
                         ]
             mapM_ (discoverSafe lm) exportedLocalNames
@@ -778,9 +788,10 @@ preloadForEffectiveExportsMemo memo registry searchPath includeMap lm visited = 
             let namedRe = case mhExports (lmHeader lm) of
                     ExportAll    -> []
                     ExportList xs ->
-                        [ n | ExportName n <- xs
+                        [ n | item <- xs
+                            , n <- exportItemValueNames lm item
                             , n `Set.notMember` localSet
-                            , not (BC.null n) && BC.head n >= 'a' && BC.head n <= 'z'
+                            , not (isLocalClassMethod lm n)
                         ]
             preloadImportsForNamedReexportsMemo memo registry searchPath includeMap
                 lm visited namedRe
@@ -965,19 +976,26 @@ loadImportIntoEnv searchPath imp existingEnv
         let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules0)
             (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
+            unionedTypeCtors0 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
             unionedTFReg = foldr (Map.unionWith (++)) Map.empty
                              (map lmTypeFamilies loadedModules0)
         TR.setGlobalRegistry unionedTFReg
+        classReg  <- newClassRegistry
         conEnv    <- buildConEnv  unionedData
         fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
-        builtins <- builtinEnv =<< newClassRegistry
-        let baseForImport = Map.union builtins (Map.union fieldEnv' conEnv)
+        builtins <- builtinEnv classReg
+        let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
+        classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
+        let baseForImport = Map.union classMethodEnv baseNoClass
         -- Build (qualified-key, Expr) pairs for each loaded module.
         qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
         -- Tie the knot.
         slots <- mapM (\_ -> newIORef BlackHole) qualPairs
-        let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
-            thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+        let bodyThunkPairs = zip (map fst qualPairs) slots
+            classMethodThunkPairs = qualifiedClassMethodThunks loadedModules0 classMethodEnv
+            allThunkPairs = bodyThunkPairs ++ classMethodThunkPairs
+            qualEnv    = extendEnvMany allThunkPairs baseForImport
+            thunkByKey = Map.fromList allThunkPairs
             modPrefix  = lmName targetLm <> BC.pack "."
             qualPrefix = case impAlias imp of
                 Just a  -> a <> BC.pack "."
@@ -1035,6 +1053,13 @@ loadImportIntoEnv searchPath imp existingEnv
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
               (zip qualPairs slots)
+        do { classTable <- buildClassMethodTable loadedModules0
+           ; mapM_ (registerInstancesFrom registry fullSearchPath includeMap
+                        classReg unionedTypeCtors0 classTable innerEnv)
+                   loadedModules0
+           }
+        registerClassDefaults registry fullSearchPath includeMap classReg innerEnv loadedModules0
+        registerDerivedFunctorInstances classReg loadedModules0
         -- Merge into the REPL env: prefer existing REPL bindings (shadow).
         let newBindings = Map.union qualEnv aliasEnv
             additions   = Map.difference newBindings existingEnv
@@ -1060,6 +1085,37 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames = Map.keysSet earlyBuiltins
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
+    bodiesAfterDiscover <- readIORef (lmBodies targetLm)
+    let needsExportFallback n =
+            not (Map.member n bodiesAfterDiscover)
+            && not (isLocalClassMethod targetLm n)
+            && Map.notMember (lmName targetLm <> BC.pack "." <> n) earlyBuiltins
+    when (any needsExportFallback requested) $ do
+        preloadMemo <- newPreloadMemo
+        preloadForEffectiveExportsMemo preloadMemo registry fullSearchPath
+            includeMap targetLm [lmName targetLm]
+        let runUntilStable processed = do
+                regBefore <- readIORef registry
+                let knownNames = Map.keysSet regBefore
+                    newlyLoaded =
+                        [ lm
+                        | (m, Loaded lm) <- Map.toList regBefore
+                        , m `Set.notMember` processed
+                        ]
+                mapM_ (\lm -> do
+                    r <- try (preloadForEffectiveExportsMemo preloadMemo registry
+                                  fullSearchPath includeMap lm [lmName lm])
+                             :: IO (Either SomeException ())
+                    case r of
+                        Right () -> pure ()
+                        Left  _  -> pure ()
+                    ) newlyLoaded
+                regAfter <- readIORef registry
+                let newNames = Map.keysSet regAfter
+                if newNames == knownNames
+                    then pure ()
+                    else runUntilStable (Set.union processed newNames)
+        runUntilStable (Set.singleton (lmName targetLm))
     -- ImportOnly is the REPL's deferred-name path: keep it targeted.
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
@@ -1081,6 +1137,22 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
     slots <- mapM (\_ -> newIORef BlackHole) qualPairs
+    realBodyKeys <- do
+        fmap Set.fromList $ concat <$> mapM (\lm -> do
+            bodies <- readIORef (lmBodies lm)
+            pure
+                [ lmName lm <> BC.pack "." <> n
+                | (n, expr) <- Map.toList bodies
+                , expr /= EVar n
+                ]) loadedModules0
+    let bodyThunkPairs        = zip (map fst qualPairs) slots
+        classMethodThunkPairs = qualifiedClassMethodThunks loadedModules0 classMethodEnv
+        allThunkPairs         = bodyThunkPairs ++ classMethodThunkPairs
+        classMethodKeys       = Set.fromList
+            [ lmName lm <> BC.pack "." <> n
+            | lm <- loadedModules0
+            , n <- localClassMethodNames lm
+            ]
     -- For builtin-backed stubs with no qualPairs, synthesize alias
     -- slots for any requested name whose FQN has a builtin binding.
     -- This makes e.g. `BS.length` resolve to the host `Data.ByteString.length`
@@ -1090,13 +1162,13 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             in case Map.lookup fqn baseForImport of
                 Just slot -> pure (Just (n, slot))
                 Nothing   -> pure Nothing
-    requestedStandard <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
+    requestedStandard <- mapM (resolveRequestedPair targetLm realBodyKeys classMethodKeys allThunkPairs) requested
     requestedFromBuiltins <- mapM synthFromBuiltin
         [ n | (n, Nothing) <- zip requested requestedStandard ]
     let requestedPairs =
             mapMaybe id requestedStandard ++ mapMaybe id requestedFromBuiltins
-    let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
-        thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+    let qualEnv    = extendEnvMany allThunkPairs baseForImport
+        thunkByKey = Map.fromList allThunkPairs
         modPrefix  = lmName targetLm <> BC.pack "."
         qualPrefix = case impAlias imp of
             Just a  -> a <> BC.pack "."
@@ -1111,7 +1183,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             | otherwise =
                 [ (qualPrefix <> n, t) | (n, t) <- requestedPairs ]
         aliasEnv = Map.fromList (bareAliases ++ qualAliases)
-    aliases <- buildAliases registry fullSearchPath includeMap targetLm slots qualPairs
+    aliases <- buildAliases registry fullSearchPath includeMap targetLm allThunkPairs
     rewriteAliasPairs <- concat <$> mapM (rewriteAliases registry thunkByKey (Map.keysSet builtins)) loadedModules0
     let selfAliases =
             [ (n, slot)
@@ -1139,14 +1211,26 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
   where
-    resolveRequestedPair lm qualPairs slots n = do
+    resolveRequestedPair lm realBodyKeys classMethodKeys thunkPairs n = do
         bodies <- readIORef (lmBodies lm)
-        let thunkByKey   = Map.fromList (zip (map fst qualPairs) slots)
+        let thunkByKey   = Map.fromList thunkPairs
             ownKey       = lmName lm <> BC.pack "." <> n
             ownIsLocal   = case Map.lookup n bodies of
                 Just expr -> expr /= EVar n
-                Nothing   -> False
+                Nothing   -> isLocalClassMethod lm n
             suffix       = BC.pack "." <> n
+            realBodySlot =
+                case [ t | (k, t) <- Map.toList thunkByKey
+                         , suffix `isSuffixOf` k
+                         , Set.member k realBodyKeys ] of
+                    (t:_) -> Just t
+                    []    -> Nothing
+            classMethodSlot =
+                case [ t | (k, t) <- Map.toList thunkByKey
+                         , suffix `isSuffixOf` k
+                         , Set.member k classMethodKeys ] of
+                    (t:_) -> Just t
+                    []    -> Nothing
             fallbackSlot =
                 case [ t | (k, t) <- Map.toList thunkByKey
                          , suffix `isSuffixOf` k ] of
@@ -1154,7 +1238,10 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     []    -> Nothing
             slot
                 | ownIsLocal = Map.lookup ownKey thunkByKey
-                | otherwise  = fallbackSlot <|> Map.lookup ownKey thunkByKey
+                | otherwise  = realBodySlot
+                            <|> classMethodSlot
+                            <|> Map.lookup ownKey thunkByKey
+                            <|> fallbackSlot
         pure ((n,) <$> slot)
 
     rewriteAliases registry thunkByKey builtinNames lm = do
@@ -1248,12 +1335,8 @@ type ClassMethodTable = Map ByteString [ByteString]
 -- declarations. If the same class name appears in multiple modules (rare —
 -- usually a re-export), the first one wins.
 buildClassMethodTable :: [LoadedModule] -> IO ClassMethodTable
-buildClassMethodTable loadedModules = do
-    tables <- mapM (\lm -> do
-                        decls <- scanClassDecls (lmSource lm)
-                        pure [ (classClassName d, classMethodNames d) | d <- decls ])
-                   loadedModules
-    pure (Map.fromList (concat tables))
+buildClassMethodTable loadedModules =
+    pure (Map.fromList (concatMap (Map.toList . lmClassMethods) loadedModules))
 
 registerInstancesFrom :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath] -> ClassRegistry -> TypeCtorRegistry -> ClassMethodTable -> Env -> LoadedModule -> IO ()
 registerInstancesFrom registry searchPath includeMap classReg typeCtors classTable env lm = do
@@ -1403,10 +1486,27 @@ collectInstanceMethodFVs lm methods = do
 buildImportRewritesForNames :: ModuleRegistry -> LoadedModule -> Set ByteString -> IO (Map ByteString ByteString)
 buildImportRewritesForNames registry lm needed = do
     reg <- readIORef registry
+    bodiesNow <- readIORef (lmBodies lm)
     let imports = mhImports (lmHeader lm)
+    selfPairs <- if lmIsEntry lm
+        then pure []
+        else do
+            let prefix = lmName lm <> BC.pack "."
+                localBodyPairs =
+                    [ (n, prefix <> n)
+                    | n <- Set.toList needed
+                    , Just expr <- [Map.lookup n bodiesNow]
+                    , expr /= EVar n
+                    ]
+                localClassPairs =
+                    [ (n, prefix <> n)
+                    | n <- Set.toList needed
+                    , isLocalClassMethod lm n
+                    ]
+            pure (localBodyPairs ++ localClassPairs)
     importPairs <- concat <$> mapM (rewritesForImport reg needed) imports
     let filteredImportPairs = filter (\(n, _) -> not (Set.member n ffiBuiltinNames)) importPairs
-    pure (Map.fromList filteredImportPairs)
+    pure (Map.fromList (selfPairs ++ filteredImportPairs))
   where
     rewritesForImport reg needed' imp
         | impModule imp == BC.pack "Prelude" = pure []
@@ -1461,14 +1561,23 @@ buildImportRewritesForNames registry lm needed = do
     instanceDirectPairs reg tm names = do
         bodiesMap <- readIORef (lmBodies tm)
         let prefix = lmName tm <> BC.pack "."
-            localExported =
+            localBodyExported =
                 [ n
                 | n <- names
                 , Just expr <- [Map.lookup n bodiesMap]
                 , expr /= EVar n
                 , exportsNameDirect tm n
                 ]
-            localPairs = [(n, prefix <> n) | n <- localExported]
+            localClassExported =
+                [ n
+                | n <- names
+                , isLocalClassMethod tm n
+                , exportsNameDirect tm n
+                ]
+            localPairs =
+                [ (n, prefix <> n)
+                | n <- nubBS (localBodyExported ++ localClassExported)
+                ]
         namedPairs <- instanceNamedReexportPairs reg tm bodiesMap names
         pure (localPairs ++ namedPairs)
 
@@ -1476,20 +1585,29 @@ buildImportRewritesForNames registry lm needed = do
         case mhExports (lmHeader tm) of
             ExportAll     -> pure []
             ExportList xs -> do
-                let exportedNames = [ n | ExportName n <- xs, n `elem` names ]
+                let exportedNames =
+                        [ n
+                        | item <- xs
+                        , n <- exportItemValueNames tm item
+                        , n `elem` names
+                        ]
                     missingNames  = filter (\n ->
                         case Map.lookup n bodiesMap of
                             Just expr -> expr == EVar n
-                            Nothing   -> True
+                            Nothing   -> not (isLocalClassMethod tm n)
                         ) exportedNames
                 concat <$> mapM (instanceFindInImports reg tm [lmName tm]) missingNames
 
     instanceFindInImports reg tm visited n = do
         let viaImports = mhImports (lmHeader tm)
+            matching = filter (\i -> specAllows (impSpec i) n) viaImports
+            preferred =
+                let unqual = filter (not . impQualified) matching
+                in if null unqual then matching else unqual
             viable = filter (\i ->
                 impModule i /= BC.pack "Prelude" &&
                 impModule i `notElem` visited &&
-                specAllows (impSpec i) n) viaImports
+                specAllows (impSpec i) n) preferred
         go viable
       where
         go []         = pure []
@@ -1497,7 +1615,7 @@ buildImportRewritesForNames registry lm needed = do
             case Map.lookup (impModule imp) reg of
                 Just (Loaded srcLm) -> do
                     srcBodies <- readIORef (lmBodies srcLm)
-                    if Map.member n srcBodies
+                    if Map.member n srcBodies || isLocalClassMethod srcLm n
                         then do
                             let srcPrefix = lmName srcLm <> BC.pack "."
                             pure [(n, srcPrefix <> n)]
@@ -1662,51 +1780,64 @@ defaultTypeTag = BC.pack "<default>"
 -- Remaining arguments (if any) flow through naturally via
 -- the returned VFun's own arity.
 classMethodDispatcher :: ClassRegistry -> ByteString -> ByteString -> Val
-classMethodDispatcher reg cls methodName = dispatch 4 []
+classMethodDispatcher reg cls methodName =
+    VClassMethod cls methodName [] dispatch resolveByTag
   where
+    dispatch :: [ByteString] -> Thunk -> IO Val
+    dispatch tags argT = applyDispatch tags 4 [] argT
+
+    applyDispatch :: [ByteString] -> Int -> [Thunk] -> Thunk -> IO Val
+    applyDispatch tags remaining accArgs argT = do
+        av <- force argT
+        let tag = typeTagOf av
+        if isDispatchableTag tag
+            then do
+                mMethod <- lookupInstanceMethod reg cls tag methodName
+                case mMethod of
+                    Just methodVal
+                      | not (isMethodPlaceholder methodVal) ->
+                            applyAll methodVal (reverse (argT : accArgs))
+                    _ -> do
+                        mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
+                        case mDef of
+                            Just defVal ->
+                                applyAll defVal (reverse (argT : accArgs))
+                            _ -> error
+                                ( "class-method dispatch: no instance of `"
+                                 <> BC.unpack cls
+                                 <> "` for type `" <> BC.unpack tag
+                                 <> "` (method `" <> BC.unpack methodName <> "`)" )
+            else if remaining <= 0
+                then fallback tags accArgs argT
+                else pure (VClassMethod cls methodName tags
+                             (\tags' nextArg -> applyDispatch tags' (remaining - 1) (argT : accArgs) nextArg)
+                             resolveByTag)
+
+    resolveByTag :: [ByteString] -> ByteString -> IO Val
+    resolveByTag tags tag = do
+        mMethod <- lookupInstanceMethod reg cls tag methodName
+        case mMethod of
+            Just methodVal
+              | not (isMethodPlaceholder methodVal) -> applyAll methodVal []
+            _ -> do
+                mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
+                case mDef of
+                    Just defVal -> applyAll defVal []
+                    _ -> error
+                        ( "class-method dispatch: no instance of `"
+                         <> BC.unpack cls
+                         <> "` for type `" <> BC.unpack tag
+                         <> "` (method `" <> BC.unpack methodName <> "`)" )
+
     -- @dispatch remaining accArgs@: try looking up an instance for the
     -- next argument.  If the argument isn't dispatchable (it's a
     -- function or unit), walk past it and retry on the next argument,
     -- up to @arityBudget@ arguments.  This handles Foldable methods
     -- like @foldr :: (a -> b -> b) -> b -> t a -> b@ whose container
     -- argument isn't the first one.
-    dispatch :: Int -> [Thunk] -> Val
-    dispatch remaining accArgs
-        | remaining <= 0 = fallback accArgs
-        | otherwise = VFun $ \argT -> do
-            av <- force argT
-            let tag = typeTagOf av
-            if isDispatchableTag tag
-                then do
-                    mMethod <- lookupInstanceMethod reg cls tag methodName
-                    case mMethod of
-                        Just methodVal
-                          | not (isMethodPlaceholder methodVal) ->
-                                applyAll methodVal (reverse (argT : accArgs))
-                        _ -> do
-                            -- Dispatchable arg but no matching instance (or the
-                            -- method is a placeholder) — fall back to the
-                            -- class's default body for this method.
-                            mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
-                            case mDef of
-                                Just defVal ->
-                                    applyAll defVal (reverse (argT : accArgs))
-                                _ -> error
-                                    ( "class-method dispatch: no instance of `"
-                                     <> BC.unpack cls
-                                     <> "` for type `" <> BC.unpack tag
-                                     <> "` (method `" <> BC.unpack methodName <> "`)" )
-                else do
-                    -- Non-dispatchable (function / unit / primitive
-                    -- object): stash and wait for the next arg so the
-                    -- dispatcher can look at a dispatchable argument
-                    -- later in the application chain.
-                    let v = dispatch (remaining - 1) (argT : accArgs)
-                    pure v
-
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
-    fallback accArgs = VFun $ \finalArgT -> do
+    fallback tags accArgs finalArgT = do
         mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
         case mDef of
             Just defVal ->
@@ -1742,20 +1873,28 @@ buildClassMethodEnv
     -> [LoadedModule]
     -> IO Env
 buildClassMethodEnv classReg existing loadedModules = do
-    decls <- concat <$> mapM (\lm -> scanClassDecls (lmSource lm)) loadedModules
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
-    pairs <- concat <$> mapM buildOne decls
+    pairs <- concat <$> mapM buildOne loadedModules
     let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
     pure (Map.fromList filtered)
   where
-    buildOne (ClassDecl cls methodNames _defaults) =
-        mapM (mkMethodEntry cls) methodNames
+    buildOne lm =
+        concat <$> mapM (\(cls, methodNames) -> mapM (mkMethodEntry cls) methodNames)
+                       (Map.toList (lmClassMethods lm))
     mkMethodEntry cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
         t <- newWHNFThunk v
         pure (methodName, t)
+
+qualifiedClassMethodThunks :: [LoadedModule] -> Env -> [(ByteString, Thunk)]
+qualifiedClassMethodThunks loadedModules classMethodEnv =
+    [ (lmName lm <> BC.pack "." <> methodName, thunk)
+    | lm <- loadedModules
+    , methodName <- localClassMethodNames lm
+    , Just thunk <- [Map.lookup methodName classMethodEnv]
+    ]
 
 -- | After the environment is fully tied, evaluate each class's default
 -- method bodies in that env and register them in the ClassRegistry under
@@ -1850,19 +1989,20 @@ exportBodies registry builtinNames lm = do
     let transform e
             | lmIsEntry lm = e     -- entry keeps bare names; env has aliases
             | otherwise    = rewriteExpr rewrites e
-    pure
-        -- Filter out foreign-alias sentinels inserted by discoverInModule.
-        -- A sentinel is an entry (n, EVar n) meaning "n resolved via import;
-        -- no local body to export".
-        -- For the ENTRY module, sentinels would create self-referential
-        -- thunks (no rewrite applied), so we skip them.
-        -- For NON-ENTRY modules, sentinels are useful: the rewrite pass
-        -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
-        -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
-        [ (keyPrefix <> n, transform e)
-        | (n, e) <- Map.toList bs
-        , not (lmIsEntry lm && e == EVar n)   -- skip sentinels only for entry module
-        ]
+        bodyPairs =
+            -- Filter out foreign-alias sentinels inserted by discoverInModule.
+            -- A sentinel is an entry (n, EVar n) meaning "n resolved via import;
+            -- no local body to export".
+            -- For the ENTRY module, sentinels would create self-referential
+            -- thunks (no rewrite applied), so we skip them.
+            -- For NON-ENTRY modules, sentinels are useful: the rewrite pass
+            -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
+            -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
+            [ (keyPrefix <> n, transform e)
+            | (n, e) <- Map.toList bs
+            , not (lmIsEntry lm && e == EVar n)   -- skip sentinels only for entry module
+            ]
+    pure bodyPairs
 
 -- | Names of builtins that are FFI/primop-backed and should ALWAYS resolve
 -- to the host builtin, never to source definitions. These are excluded from
@@ -1907,10 +2047,16 @@ buildImportRewrites registry lm _builtinNames = do
             -- name was resolved via import. Such names should NOT be
             -- self-rewritten to "Module.n" — they live under their owning
             -- module's prefix in the flat env, not under this module's prefix.
-            pure [ (n, prefix <> n)
-                 | (n, expr) <- Map.toList bodiesNow
-                 , expr /= EVar n   -- skip foreign-alias sentinels
-                 ]
+                localBodyPairs =
+                    [ (n, prefix <> n)
+                    | (n, expr) <- Map.toList bodiesNow
+                    , expr /= EVar n   -- skip foreign-alias sentinels
+                    ]
+                localClassPairs =
+                    [ (n, prefix <> n)
+                    | n <- localClassMethodNames lm
+                    ]
+            pure (localBodyPairs ++ localClassPairs)
     importPairs <- concat <$> mapM (rewritesForImport reg neededNames) imports
     -- Exclude FFI/primop builtins from import rewrites so bare references
     -- resolve to the host builtin rather than chasing source sentinel chains.
@@ -1982,14 +2128,23 @@ buildImportRewrites registry lm _builtinNames = do
         bodiesMap <- readIORef (lmBodies tm)
         let prefix   = lmName tm <> BC.pack "."
             -- Names defined directly in tm and exported.
-            localExported =
+            localBodyExported =
                 [ n
                 | n <- requestedNames
                 , Just expr <- [Map.lookup n bodiesMap]
                 , expr /= EVar n
                 , exportsNameDirect tm n
                 ]
-            localPairs = [(n, prefix <> n) | n <- localExported]
+            localClassExported =
+                [ n
+                | n <- requestedNames
+                , isLocalClassMethod tm n
+                , exportsNameDirect tm n
+                ]
+            localPairs =
+                [ (n, prefix <> n)
+                | n <- nubBS (localBodyExported ++ localClassExported)
+                ]
         -- For ExportName entries not covered by local bodies, follow
         -- tm's own unqualified imports (named re-export chain).
         namedPairs <- namedReexportPairs reg tm bodiesMap requestedNames
@@ -2002,13 +2157,18 @@ buildImportRewrites registry lm _builtinNames = do
         case mhExports (lmHeader tm) of
             ExportAll    -> pure []   -- ExportAll: no explicit name list to iterate
             ExportList xs -> do
-                let exportedNames = [ n | ExportName n <- xs, n `elem` requestedNames ]
+                let exportedNames =
+                        [ n
+                        | item <- xs
+                        , n <- exportItemValueNames tm item
+                        , n `elem` requestedNames
+                        ]
                     -- Names that appear in the export list but are NOT locally defined
                     -- must come from an import (named re-export chain).
                     missingNames  = filter (\n ->
                         case Map.lookup n bodiesMap of
                             Just expr -> expr == EVar n
-                            Nothing   -> True
+                            Nothing   -> not (isLocalClassMethod tm n)
                         ) exportedNames
                 concat <$> mapM (findNameInImports reg tm [lmName tm]) missingNames
 
@@ -2022,10 +2182,14 @@ buildImportRewrites registry lm _builtinNames = do
         -- must consider qualified imports as potential providers when
         -- building rewrite pairs.
         let viaImports = mhImports (lmHeader tm)
+            matching = filter (\i -> specAllows (impSpec i) n) viaImports
+            preferred =
+                let unqual = filter (not . impQualified) matching
+                in if null unqual then matching else unqual
             viable = filter (\i ->
                 impModule i /= BC.pack "Prelude" &&
                 impModule i `notElem` visited &&
-                specAllows (impSpec i) n) viaImports
+                specAllows (impSpec i) n) preferred
         go viable
       where
         go []         = pure []
@@ -2033,7 +2197,7 @@ buildImportRewrites registry lm _builtinNames = do
             case Map.lookup (impModule imp) reg of
                 Just (Loaded srcLm) -> do
                     srcBodies <- readIORef (lmBodies srcLm)
-                    if Map.member n srcBodies
+                    if Map.member n srcBodies || isLocalClassMethod srcLm n
                         then do
                             let srcPrefix = lmName srcLm <> BC.pack "."
                             pure [(n, srcPrefix <> n)]
@@ -2132,12 +2296,11 @@ buildAliases
     -> [FilePath]
     -> Map FilePath [FilePath]  -- ^ include-dirs map (unused here, threaded for API consistency)
     -> LoadedModule
-    -> [Thunk]
-    -> [(ByteString, Expr)]
+    -> [(ByteString, Thunk)]
     -> IO Env
-buildAliases registry _searchPath _includeMap entry slots qualPairs = do
+buildAliases registry _searchPath _includeMap entry thunkPairs = do
     -- Index qualPairs so we can look up "Module.name" -> Thunk fast.
-    let thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+    let thunkByKey = Map.fromList thunkPairs
     -- Build aliases for the entry module's imports.
     let entryImports = mhImports (lmHeader entry)
     entryPairs <- concat <$> mapM (aliasesForImport thunkByKey) entryImports
@@ -2198,17 +2361,21 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
         reg <- readIORef registry
         bodiesMap <- readIORef (lmBodies tm)
         let prefix   = lmName tm <> BC.pack "."
-            allN     = Map.keys bodiesMap
             -- Names defined directly in tm and exported.
-            localExported =
+            localBodyExported =
                 [ n
-                | n <- allN
+                | n <- Map.keys bodiesMap
                 , Just expr <- [Map.lookup n bodiesMap]
                 , expr /= EVar n
                 , exportsNameDirect tm n
                 ]
+            localClassExported =
+                [ n
+                | n <- localClassMethodNames tm
+                , exportsNameDirect tm n
+                ]
             localPairs = [ (n, t)
-                         | n <- localExported
+                         | n <- nubBS (localBodyExported ++ localClassExported)
                          , Just t <- [Map.lookup (prefix <> n) thunkByKey]
                          ]
         -- Also follow ExportName re-exports via tm's imports.
@@ -2221,11 +2388,11 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
         case mhExports (lmHeader tm) of
             ExportAll    -> pure []
             ExportList xs -> do
-                let exportedNames = [ n | ExportName n <- xs ]
+                let exportedNames = concatMap (exportItemValueNames tm) xs
                     missingNames  = filter (\n ->
                         case Map.lookup n bodiesMap of
                             Just expr -> expr == EVar n
-                            Nothing   -> True
+                            Nothing   -> not (isLocalClassMethod tm n)
                         ) exportedNames
                 pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm [lmName tm]) missingNames
                 pure pairs
@@ -2250,7 +2417,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
             case Map.lookup (impModule imp) reg of
                 Just (Loaded srcLm) -> do
                     srcBodies <- readIORef (lmBodies srcLm)
-                    if Map.member n srcBodies
+                    if Map.member n srcBodies || isLocalClassMethod srcLm n
                         then do
                             let srcPrefix = lmName srcLm <> BC.pack "."
                             case Map.lookup (srcPrefix <> n) thunkByKey of
@@ -2535,6 +2702,7 @@ buildEmptyStubModule name = do
         , lmFixity      = defaultFixityTable
         , lmNoFieldSelectors = False
         , lmTypeFamilies     = TR.emptyRegistry
+        , lmClassMethods     = Map.empty
         , lmForeignDecls     = []
         }
 
@@ -2543,6 +2711,7 @@ buildLoadedModule name isEntry header src = do
     known               <- emptyKnownSymbols
     (dataR, fldR, tCtR) <- scanDataDecls src
     tfReg               <- scanTypeFamilyDecls src
+    classDecls          <- scanClassDecls src
     foreigns            <- scanForeignImports src
     bodies              <- newIORef Map.empty
     -- Pre-populate 'lmBodies' with a sentinel @EVar ffiSynthKey@ for
@@ -2570,6 +2739,10 @@ buildLoadedModule name isEntry header src = do
         , lmFixity      = fixity
         , lmNoFieldSelectors = hasNoFieldSelectors src
         , lmTypeFamilies     = tfReg
+        , lmClassMethods     = Map.fromList
+            [ (classClassName decl, classMethodNames decl)
+            | decl <- classDecls
+            ]
         , lmForeignDecls     = foreigns
         }
 
@@ -2939,6 +3112,9 @@ resolveImport registry searchPath includeMap lm name = do
                                             pure (Just ())
                                         else tryImports rest
                                 Nothing
+                                    | isLocalClassMethod targetLm name
+                                    , exportsName targetLm name -> pure (Just ())
+                                Nothing
                                     -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
                                     -- the type's data registry has the field, the export
                                     -- list admits it via `T(..)`. No separate binding; the
@@ -3000,9 +3176,13 @@ resolveImport registry searchPath includeMap lm name = do
                     -- imports too — discovery is already demand-driven per
                     -- name, so there's no broad-load cost.
                     let viaImports = mhImports (lmHeader via)
+                        matching = filter (\i -> specAllows (impSpec i) name) viaImports
+                        preferred =
+                            let unqual = filter (not . impQualified) matching
+                            in if null unqual then matching else unqual
                         filteredImports = filter (\i ->
                             impModule i /= BC.pack "Prelude" &&
-                            specAllows (impSpec i) name) viaImports
+                            specAllows (impSpec i) name) preferred
                     tryViaImports filteredImports depth rest
 
     tryViaImports [] _depth rest = do
@@ -3033,6 +3213,9 @@ resolveImport registry searchPath includeMap lm name = do
                                 discoverInModule registry searchPath includeMap srcLm name
                                 pure (Just ())
                             else tryViaImports moreImps depth rest
+                    Nothing
+                        | isLocalClassMethod srcLm name
+                        , exportsName srcLm name -> pure (Just ())
                     Nothing ->
                         -- srcLm might itself re-export via unqualified imports
                         -- (go one level deeper, decrementing the depth cap).
@@ -3065,6 +3248,9 @@ resolveImport registry searchPath includeMap lm name = do
                                             discoverInModule registry searchPath includeMap srcLm name
                                             pure (Just ())
                                         else tryViaImports moreImps depth rest
+                                Nothing
+                                    | isLocalClassMethod srcLm name
+                                    , exportsName srcLm name -> pure (Just ())
                                 Nothing ->
                                     -- Not defined directly in srcLm; recurse one
                                     -- level deeper if srcLm exports the name via
@@ -3118,6 +3304,9 @@ resolveImport registry searchPath includeMap lm name = do
                                             Right () -> pure (Just ())
                                             Left  _  -> tryReexports visited mods rest
                                     else tryReexports visited mods rest
+                            Nothing
+                                | isLocalClassMethod reLm name
+                                , exportsName reLm name -> pure (Just ())
                             Nothing ->
                                 -- Go one level deeper if reLm itself has module re-exports.
                                 -- Mark modName as visited to prevent cycles.
@@ -3138,6 +3327,35 @@ nubBS = go []
     go seen (x:xs)
         | x `elem` seen = go seen xs
         | otherwise      = x : go (x:seen) xs
+
+localClassMethodNames :: LoadedModule -> [ByteString]
+localClassMethodNames = nubBS . concat . Map.elems . lmClassMethods
+
+isLocalClassMethod :: LoadedModule -> ByteString -> Bool
+isLocalClassMethod lm n = n `elem` localClassMethodNames lm
+
+fieldNamesOfType :: LoadedModule -> ByteString -> [ByteString]
+fieldNamesOfType lm typeHead =
+    let ctorsOfType = Map.findWithDefault [] typeHead (lmTypeCtorReg lm)
+    in [ fieldName
+       | (fieldName, ctorIdxs) <- Map.toList (lmFieldReg lm)
+       , any (\(ctor, _) -> ctor `elem` ctorsOfType) ctorIdxs
+       ]
+
+exportTypeValueNames :: LoadedModule -> ByteString -> Maybe [ByteString] -> [ByteString]
+exportTypeValueNames _  _        Nothing     = []
+exportTypeValueNames lm typeHead (Just [])   =
+    nubBS
+        ( Map.findWithDefault [] typeHead (lmTypeCtorReg lm)
+       ++ fieldNamesOfType lm typeHead
+       ++ Map.findWithDefault [] typeHead (lmClassMethods lm)
+        )
+exportTypeValueNames _  _        (Just subs) = nubBS subs
+
+exportItemValueNames :: LoadedModule -> ExportItem -> [ByteString]
+exportItemValueNames _  (ExportName n)      = [n]
+exportItemValueNames lm (ExportType n subs) = exportTypeValueNames lm n subs
+exportItemValueNames _  (ExportModule _)    = []
 
 -- | Extract any @module Foo@ re-export module names from a module's
 -- export list.  Used by 'resolveImport' to follow re-export chains.
@@ -3160,12 +3378,10 @@ exportsNameDirect lm n = case mhExports (lmHeader lm) of
     ExportAll     -> True
     ExportList xs -> any matchDirect xs
   where
-    tCtors = lmTypeCtorReg lm
-
     matchDirect (ExportName m)            = n == m
     matchDirect (ExportType m Nothing)    = n == m
     matchDirect (ExportType m (Just [])) =
-        n == m || n `elem` Map.findWithDefault [] m tCtors
+        n == m || n `elem` exportTypeValueNames lm m (Just [])
     matchDirect (ExportType m (Just subs)) =
         n == m || n `elem` subs
     matchDirect (ExportModule _) = False
@@ -3187,28 +3403,14 @@ exportsName lm n = case mhExports (lmHeader lm) of
     ExportAll     -> True
     ExportList xs -> any matchExport xs
   where
-    tCtors = lmTypeCtorReg lm
-    fields = lmFieldReg lm  -- field name → [(ctor, idx)]
-
-    -- Is @n@ a record-field accessor for any constructor of @typeHead@?
-    -- Used for the @T(..)@ export form, which implicitly exports every
-    -- field selector of T's constructors (e.g. @Identity(..)@ exports
-    -- @runIdentity@, not just the @Identity@ constructor).
-    isFieldOfType typeHead =
-        let ctorsOfT = Map.findWithDefault [] typeHead tCtors
-        in case Map.lookup n fields of
-            Just ctorIdx -> any (\(c, _) -> c `elem` ctorsOfT) ctorIdx
-            Nothing      -> False
-
     matchExport (ExportName m)            = n == m
     matchExport (ExportType m Nothing)    = n == m
     matchExport (ExportType m (Just [])) =
         -- The `T(..)` form: the type head plus every constructor of T
         -- that the scanner saw in this module's source, plus every
-        -- record-field accessor defined by those constructors.
+        -- record-field accessor and class method subordinate named by it.
         n == m
-        || n `elem` Map.findWithDefault [] m tCtors
-        || isFieldOfType m
+        || n `elem` exportTypeValueNames lm m (Just [])
     matchExport (ExportType m (Just subs)) =
         -- The `T(Ctor1, Ctor2, field1, ...)` form: the type head plus
         -- every explicitly-listed sub-name.
@@ -3536,5 +3738,3 @@ desugarRecordPats fldReg = goExpr
     goPat (PBang p)        = PBang (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit
-
-
