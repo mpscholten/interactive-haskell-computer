@@ -400,8 +400,12 @@ nextToken s c0 =
                     let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
                     in (mkTok (TkInt 0) start end, end)
               | otherwise ->
-                    let end = Cursor p (cLine start) (cCol start + (p - cPos start))
+                    let p'  = skipHashes p
+                        end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
                     in (mkTok (TkInt acc) start end, end)
+        skipHashes p = case peekByte s p of
+            Just 0x23 -> skipHashes (p + 1)   -- '#'
+            _         -> p
 
     lexOct start = go (cPos start + 2) 0
       where
@@ -416,8 +420,12 @@ nextToken s c0 =
                     let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
                     in (mkTok (TkInt 0) start end, end)
               | otherwise ->
-                    let end = Cursor p (cLine start) (cCol start + (p - cPos start))
+                    let p'  = skipHashes p
+                        end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
                     in (mkTok (TkInt acc) start end, end)
+        skipHashes p = case peekByte s p of
+            Just 0x23 -> skipHashes (p + 1)   -- '#'
+            _         -> p
 
     lexIdent isCon start = go (cPos start)
       where

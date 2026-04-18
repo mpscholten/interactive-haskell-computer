@@ -471,11 +471,34 @@ parseBindingsIn src fx (start, end) = do
         case tkKind sepTok of
             TkEq -> do
                 (expr, cur4) <- parseExpr ctx cur3
-                pure (name, params, RhsPlain expr, cur4)
+                (rhs, cur5) <- attachWhere ctx (RhsPlain expr) cur4
+                pure (name, params, rhs, cur5)
             TkBar -> do
                 (branches, cur4) <- parseLetGuardBranches ctx cur3 []
-                pure (name, params, RhsGuards branches, cur4)
+                (rhs, cur5) <- attachWhere ctx (RhsGuards branches) cur4
+                pure (name, params, rhs, cur5)
             _ -> parseErr ctx "expected `=` or `|` in binding" sepTok
+
+    attachWhere ctx rhs cur = do
+        let (peekWhere, curAfterWhere) = nextSig ctx cur
+        case tkKind peekWhere of
+            TkWhere -> do
+                (binds, curEnd) <- parseTrailingWhere ctx curAfterWhere
+                let wrap e = case binds of
+                        [] -> e
+                        bs -> ELet bs e
+                    rhs' = case rhs of
+                        RhsPlain e    -> RhsPlain (wrap e)
+                        RhsGuards ges -> RhsGuards [(wrap g, wrap b) | (g, b) <- ges]
+                pure (rhs', curEnd)
+            _ -> pure (rhs, cur)
+
+    parseTrailingWhere ctx cur0 = do
+        let (firstTok, cur1) = nextSig ctx cur0
+        case tkKind firstTok of
+            TkLBrace -> bracedCursor ctx cur1 []
+            TkEof    -> pure ([], cur0)
+            _        -> layoutCursor ctx (tkCol firstTok) cur0 []
 
     -- | Collect all variable names bound by a pattern (left-to-right order).
     patVars (PVar n)         = [n]
@@ -639,6 +662,31 @@ parseBindingsIn src fx (start, end) = do
                         TkEof    -> pure (reverse acc')
                         _        -> parseErr ctx "expected `;` or `}` in let/where" sep
 
+    bracedCursor ctx cur acc
+        | cPos cur >= ctxEnd ctx = pure (reverse acc, cur)
+        | otherwise = do
+            let (nameTok, _) = nextSig ctx cur
+            let bindCol = tkCol nameTok
+            mSkip <- trySkipWhereSig ctx bindCol cur
+            case mSkip of
+                Just cur' -> do
+                    let (nextTok, curN) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkSemi   -> bracedCursor ctx curN acc
+                        TkRBrace -> pure (reverse acc, curN)
+                        TkEof    -> pure (reverse acc, cur')
+                        _ | cPos cur' < ctxEnd ctx -> bracedCursor ctx cur' acc
+                          | otherwise -> pure (reverse acc, cur')
+                Nothing -> do
+                    (bs, cur') <- parseOne ctx bindCol (length acc) cur
+                    let acc' = reverse bs ++ acc
+                    let (sep, curN) = nextSig ctx cur'
+                    case tkKind sep of
+                        TkSemi   -> bracedCursor ctx curN acc'
+                        TkRBrace -> pure (reverse acc', curN)
+                        TkEof    -> pure (reverse acc', cur')
+                        _        -> parseErr ctx "expected `;` or `}` in let/where" sep
+
     layout ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
@@ -663,6 +711,30 @@ parseBindingsIn src fx (start, end) = do
                                layout ctx bindCol cur' acc'
                           | otherwise ->
                                pure (reverse acc')
+
+    layoutCursor ctx bindCol cur acc
+        | cPos cur >= ctxEnd ctx = pure (reverse acc, cur)
+        | otherwise = do
+            mSkip <- trySkipWhereSig ctx bindCol cur
+            case mSkip of
+                Just cur' -> do
+                    let (nextTok, _) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkEof -> pure (reverse acc, cur')
+                        _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
+                               layoutCursor ctx bindCol cur' acc
+                          | otherwise ->
+                               pure (reverse acc, cur')
+                Nothing -> do
+                    (bs, cur') <- parseOne ctx bindCol (length acc) cur
+                    let acc' = reverse bs ++ acc
+                    let (nextTok, _) = nextSig ctx cur'
+                    case tkKind nextTok of
+                        TkEof -> pure (reverse acc', cur')
+                        _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
+                               layoutCursor ctx bindCol cur' acc'
+                          | otherwise ->
+                               pure (reverse acc', cur')
 
 --------------------------------------------------------------------------------
 -- nextSig with body-end bound

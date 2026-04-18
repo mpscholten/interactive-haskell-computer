@@ -117,7 +117,14 @@ eval env ipm = go
         eval env' ipm body
 
     go (ECase scrut alts) = do
-        v <- go scrut
+        v0 <- go scrut
+        -- Primops like `newByteArray#` return an internal VIO wrapper around
+        -- their unboxed-tuple result. A case expression must force that
+        -- wrapper before matching, but must not eagerly execute source-built
+        -- `IO` / `ST` constructors, which use `VCon`.
+        v <- case v0 of
+            VIO _ -> runIOVal v0
+            _     -> pure v0
         tryAlts v alts
 
     go (EIf c t e) = do
@@ -570,6 +577,15 @@ matchPat (PCon "W8#" [p]) (VInt n) = do
     matchFields [(p, t)] []
 matchPat (PCon "C#" [p]) (VChar c) = do
     t <- newWHNFThunk (VChar c)
+    matchFields [(p, t)] []
+-- Data.Array.Byte lifted wrappers. The interpreter keeps both mutable and
+-- frozen byte arrays as the same host-backed PrimByteArray object, so the
+-- source constructors just expose that underlying primitive value.
+matchPat (PCon "MutableByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+    t <- newWHNFThunk prim
+    matchFields [(p, t)] []
+matchPat (PCon "ByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+    t <- newWHNFThunk prim
     matchFields [(p, t)] []
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
