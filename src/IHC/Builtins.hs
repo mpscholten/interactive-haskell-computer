@@ -285,11 +285,19 @@ builtins reg =
     -- Registered under bare names so qualified-alias fallback
     -- (`BS.pack` → `EVar "pack"`) hits these. Remove when
     -- source-load perf is fixed.
-    , ("Data.ByteString.empty",   bsEmptyB)
-    , ("Data.ByteString.null",    bsNullB)
-    , ("Data.ByteString.length",  bsLengthShimB)
-    , ("Data.ByteString.pack",    bsPackB)
-    , ("Data.ByteString.unpack",  bsUnpackB)
+    , ("Data.ByteString.empty",     bsEmptyB)
+    , ("Data.ByteString.null",      bsNullB)
+    , ("Data.ByteString.length",    bsLengthShimB)
+    , ("Data.ByteString.pack",      bsPackB)
+    , ("Data.ByteString.unpack",    bsUnpackB)
+    , ("Data.ByteString.append",    bsAppendB)
+    , ("Data.ByteString.concat",    bsConcatB)
+    , ("Data.ByteString.take",      bsTakeB)
+    , ("Data.ByteString.drop",      bsDropB)
+    , ("Data.ByteString.singleton", bsSingletonB)
+    , ("Data.ByteString.replicate", bsReplicateB)
+    , ("Data.ByteString.head",      bsHeadB)
+    , ("Data.ByteString.index",     bsIndexB)
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
     -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
@@ -2434,6 +2442,104 @@ bsUnpackB = pure $ VFun $ \a -> do
         mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
     wordsToConsList ws
 
+-- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
+bsValToBS :: Val -> IO BS.ByteString
+bsValToBS v = do
+    (fp, len) <- bsValPayload v
+    withForeignPtr fp $ \ptr ->
+        BS.packCStringLen (castPtr ptr, len)
+
+-- | Build a 'VCon "BS"' from a host ByteString by copying into a fresh ForeignPtr.
+bsFromBS :: BS.ByteString -> IO Val
+bsFromBS bs = do
+    let len = BS.length bs
+    fp <- mallocForeignPtrBytes len
+    withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
+        copyBytes (castPtr dst) (castPtr src) l
+    mkBsVal fp len
+
+bsAppendB :: IO Val
+bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    ba <- bsValToBS av; bb <- bsValToBS bv
+    bsFromBS (BS.append ba bb)
+
+bsConcatB :: IO Val
+bsConcatB = pure $ VFun $ \a -> do
+    av <- force a
+    xs <- valToBsList av
+    bsFromBS (BS.concat xs)
+  where
+    valToBsList (VCon "[]" _)       = pure []
+    valToBsList (VCon ":" [hT, tT]) = do
+        hv <- force hT
+        h  <- bsValToBS hv
+        tv <- force tT
+        (h :) <$> valToBsList tv
+    valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
+
+bsTakeB :: IO Val
+bsTakeB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
+    nv <- force nT; av <- force aT
+    n <- case nv of
+        VInt i -> pure (fromIntegral i :: Int)
+        _      -> error ("BS.take: not an Int: " <> showValForDebug nv)
+    bs <- bsValToBS av
+    bsFromBS (BS.take n bs)
+
+bsDropB :: IO Val
+bsDropB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
+    nv <- force nT; av <- force aT
+    n <- case nv of
+        VInt i -> pure (fromIntegral i :: Int)
+        _      -> error ("BS.drop: not an Int: " <> showValForDebug nv)
+    bs <- bsValToBS av
+    bsFromBS (BS.drop n bs)
+
+bsSingletonB :: IO Val
+bsSingletonB = pure $ VFun $ \wT -> do
+    wv <- force wT
+    w <- case wv of
+        VInt i  -> pure (fromIntegral i :: Word8)
+        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
+        _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
+    bsFromBS (BS.singleton w)
+
+bsReplicateB :: IO Val
+bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
+    nv <- force nT; wv <- force wT
+    n <- case nv of
+        VInt i -> pure (fromIntegral i :: Int)
+        _      -> error ("BS.replicate: first arg not an Int: " <> showValForDebug nv)
+    w <- case wv of
+        VInt i  -> pure (fromIntegral i :: Word8)
+        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
+        _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
+    bsFromBS (BS.replicate n w)
+
+bsHeadB :: IO Val
+bsHeadB = pure $ VFun $ \aT -> do
+    av <- force aT
+    (fp, len) <- bsValPayload av
+    if len <= 0
+        then error "BS.head: empty ByteString"
+        else do
+            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
+            pure (VInt (fromIntegral w))
+
+bsIndexB :: IO Val
+bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
+    av <- force aT; iv <- force iT
+    i <- case iv of
+        VInt n -> pure (fromIntegral n :: Int)
+        _      -> error ("BS.index: not an Int: " <> showValForDebug iv)
+    (fp, len) <- bsValPayload av
+    if i < 0 || i >= len
+        then error ("BS.index: out of bounds: " <> show i <> " vs length " <> show len)
+        else do
+            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
+            pure (VInt (fromIntegral w))
+
 valToWord8List :: Val -> IO [Word8]
 valToWord8List v0 = go v0
   where
@@ -4535,3 +4641,4 @@ buildBuiltinTypeableInsts = mapM mkDict prims
             trT <- newWHNFThunk tr
             pure (VCon "Dict_Typeable" [trT])
         pure ("typeableDict_" <> tag, dictT)
+
