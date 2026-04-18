@@ -518,7 +518,7 @@ scanOneClauseAfterName src = scanOneClauseAfterNameAtCol src 1
 scanOneClauseAfterNameAtCol :: Source -> Int -> Cursor -> IO (Maybe (Clause, Cursor))
 scanOneClauseAfterNameAtCol src minBodyCol curAfterName = do
     let patsStart = cPos (skipTrivia src curAfterName)
-    mEqOrBar <- findEqOrBarBeforeBoundary src minBodyCol curAfterName
+    mEqOrBar <- findEqOrBarOnLine src curAfterName
     case mEqOrBar of
         Nothing -> pure Nothing
         Just (sepTokStart, _cur1) -> do
@@ -534,42 +534,38 @@ scanOneClauseAfterNameAtCol src minBodyCol curAfterName = do
 
 -- | Scan forward from @cur@ collecting tokens until we encounter
 -- either a top-level @=@ or a top-level @|@ (not inside parens or
--- brackets). Unlike the original single-line scanner, this continues
--- across indented continuation lines so guarded clauses like
---
--- @
--- foo x
---   | p x = ...
--- @
---
--- are found correctly even when CPP or layout inserts blank lines
--- between the binder and the first guard. Returns Nothing if we reach
--- the next significant token at column @<= minBodyCol@ before seeing
--- a separator, which means the would-be binding had no RHS.
+-- brackets). Returns the byte offset of that token and the cursor
+-- just past it. Returns Nothing if the line ends or a newline-then-
+-- col-1 boundary appears first (malformed LHS — e.g. a bare binder
+-- with no RHS).
 --
 -- Nested parens/brackets/braces are tracked so an @=@ inside a record
 -- literal (not supported yet, but future-proof) or a @|@ inside a
 -- bracketed expression isn't mistaken for the RHS separator.
-findEqOrBarBeforeBoundary :: Source -> Int -> Cursor -> IO (Maybe (Pos, Cursor))
-findEqOrBarBeforeBoundary src minBodyCol cur0 = go cur0 (0 :: Int) False
+findEqOrBarOnLine :: Source -> Cursor -> IO (Maybe (Pos, Cursor))
+findEqOrBarOnLine src cur0 = go cur0 (0 :: Int)
   where
-    go cur depth afterNewline = do
+    go cur depth = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkEof     -> pure Nothing
             TkEq      | depth == 0 -> pure (Just (tkStart tok, cur'))
             TkBar     | depth == 0 -> pure (Just (tkStart tok, cur'))
-            TkLParen  -> go cur' (depth + 1) False
-            TkLBracket-> go cur' (depth + 1) False
-            TkLBrace  -> go cur' (depth + 1) False
-            TkRParen  -> go cur' (max 0 (depth - 1)) False
-            TkRBracket-> go cur' (max 0 (depth - 1)) False
-            TkRBrace  -> go cur' (max 0 (depth - 1)) False
-            TkNewline -> go cur' depth True
-            _ | afterNewline && depth == 0 && tkCol tok <= minBodyCol ->
-                    pure Nothing
-              | otherwise ->
-                    go cur' depth False
+            TkLParen  -> go cur' (depth + 1)
+            TkLBracket-> go cur' (depth + 1)
+            TkLBrace  -> go cur' (depth + 1)
+            TkRParen  -> go cur' (max 0 (depth - 1))
+            TkRBracket-> go cur' (max 0 (depth - 1))
+            TkRBrace  -> go cur' (max 0 (depth - 1))
+            TkNewline ->
+                -- If the next significant token is at col 1, the LHS
+                -- never got its '=' — malformed. Stop.
+                let (nxt, _) = nextToken src cur' in
+                case tkKind nxt of
+                    TkEof -> pure Nothing
+                    _ | tkCol nxt == 1 -> pure Nothing
+                      | otherwise      -> go cur' depth
+            _ -> go cur' depth
 
 -- | Scan until the end of the current line (or EOF). Used only for
 -- recovering after a malformed LHS; the real body-extent logic is
@@ -1313,9 +1309,7 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkLBracket -> do
                 curAfter <- skipToMatchingRBracket 1 cur'
                 countCtorFields (n + 1) curAfter
-            TkConId _ -> do
-                curAfter <- skipQualifiedTypeHead tok cur'
-                countCtorFields (n + 1) curAfter
+            TkConId _ -> countCtorFields (n + 1) cur'
             TkIdent _ -> countCtorFields (n + 1) cur'
             TkPrimId _ -> countCtorFields (n + 1) cur'
             -- TkBang is a strictness annotation on the *next* field, not a
@@ -1323,20 +1317,6 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkBang    -> countCtorFields n cur'
             -- Unrecognized token stops the field scan gracefully.
             _ -> pure (n, cur)
-
-    skipQualifiedTypeHead :: Token -> Cursor -> IO Cursor
-    skipQualifiedTypeHead lastTok cur0 = do
-        let (dotTok, cur1) = nextToken src cur0
-        case tkKind dotTok of
-            TkDot | tkStart dotTok == tkEnd lastTok ->
-                let (segTok, cur2) = nextToken src cur1 in
-                case tkKind segTok of
-                    TkConId _ | tkStart segTok == tkEnd dotTok ->
-                        skipQualifiedTypeHead segTok cur2
-                    TkIdent _ | tkStart segTok == tkEnd dotTok ->
-                        skipQualifiedTypeHead segTok cur2
-                    _ -> pure cur0
-            _ -> pure cur0
 
     skipToMatchingRParen :: Int -> Cursor -> IO Cursor
     skipToMatchingRParen !depth cur

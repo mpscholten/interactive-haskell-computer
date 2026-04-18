@@ -40,7 +40,7 @@ import Control.Exception (Exception(..), throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (isSpace, isUpper)
+import Data.Char (isSpace)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 
@@ -1694,9 +1694,6 @@ parseTopPatNoCons ctx cur = do
         TkConId n  -> do
             (qname, cur2) <- readQualConId ctx n tok cur1
             collectArgs ctx (stripQualifier qname) [] cur2
-        TkPrimId n
-            | isPrimCtorName n ->
-                collectArgs ctx n [] cur1
         _          -> parseSubPat ctx cur
 
 collectArgs :: Ctx -> Name -> [Pat] -> Cursor -> IO (Pat, Cursor)
@@ -1742,11 +1739,7 @@ parseSubPat ctx cur = do
                             (sub, curN) <- parseSubPat ctx curP
                             pure (PAs n sub, curN)
                 _    -> pure (PVar n, cur1)
-        TkPrimId n
-            | isPrimCtorName n ->
-                pure (PCon n [], cur1)
-            | otherwise ->
-                pure (PVar n, cur1)   -- e.g. state# param in primop binding
+        TkPrimId n   -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
         TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
         TkFloat d    -> pure (PLit (LFloat d), cur1)
@@ -1780,10 +1773,6 @@ parseSubPat ctx cur = do
                 TkFloat d -> pure (PLit (LFloat (negate d)), cur2)
                 _         -> parseErr ctx "expected number after `-` in pattern" n
         _ -> parseErr ctx "expected pattern (Int, String, _, ident, or constructor)" tok
-
-isPrimCtorName :: Name -> Bool
-isPrimCtorName n =
-    not (BC.null n) && isUpper (BC.head n)
 
 -- | Parenthesised pattern: could be a single pattern @(p)@, a tuple
 -- @(p,q,r)@, unit @()@, or a view pattern @(expr -> p)@.
