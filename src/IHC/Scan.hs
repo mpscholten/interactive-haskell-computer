@@ -2615,4 +2615,16 @@ tyConToFFI c _ = case c of
     "Ptr"      -> Just (FFIPtr FFIVoid)
     "FunPtr"   -> Just (FFIFunPtr FFIVoid)
     "ConstPtr" -> Just (FFIPtr FFIVoid)
+    -- Unboxed GHC types that appear in text/bytestring/network foreign
+    -- imports.  GHC's code generator passes a ByteArray# / MutableByteArray#
+    -- as the raw address of the pinned payload, so we marshal them as
+    -- a plain Ptr at the libffi layer.
+    "ByteArray#"         -> Just (FFIPtr FFIVoid)
+    "MutableByteArray#"  -> Just (FFIPtr FFIVoid)
+    "Addr#"              -> Just (FFIPtr FFIVoid)
+    -- CSsize is signed size_t; same width as CSize.  Our FFISize already
+    -- chooses the correct 32/64-bit dispatch, signedness is just how the
+    -- Haskell side interprets the return bits.
+    "CSsize"   -> Just FFISize
+    "CSSize"   -> Just FFISize
     _          -> Nothing

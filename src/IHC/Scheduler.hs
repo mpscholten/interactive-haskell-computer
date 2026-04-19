@@ -371,6 +371,13 @@ buildBaseEnv = do
     -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
     -- instances from the transitive import closure are in scope).
     setSharedClassReg classReg
+    -- Auto-discover per-package cbits dylibs.  The nix build emits one
+    -- @libhs<pkg>-cbits.dylib@ per Hackage package that declares
+    -- @c-sources:@ in its cabal; the path is exported as
+    -- @IHC_CBITS_DIR@.  dlopen every such dylib we find there so that
+    -- @foreign import ccall "_hs_text_measure_off"@ and friends resolve
+    -- via RTLD_DEFAULT without any package-specific hardcoding.
+    FFI.registerCbitsDylibs
     builtins <- builtinEnv classReg
     conEnv   <- buildConEnv Map.empty
     let env0 = Map.union builtins conEnv

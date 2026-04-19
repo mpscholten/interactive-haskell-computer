@@ -251,59 +251,108 @@
         '';
 
         # ────────────────────────────────────────────────────────────────
-        # libhsnet.dylib — native half of the network package.
+        # ihcCbitsRoot — auto-discovered per-package cbits dylibs.
         #
-        # The network package (added to ihcHackageSources above) declares
-        # @c-sources: cbits/HsNet.c cbits/cmsg.c@ in its .cabal.  Cabal
-        # compiles these into the package's object archive; for us, we
-        # need a standalone shared library that the FFI dispatcher can
-        # @dlopen@, so that @foreign import ccall "hsnet_getaddrinfo"@
-        # (and its siblings) resolves at run time.
-        #
-        # The derivation uses the already-hsc2hs-processed source root so
-        # that @./configure@ has run and @include/HsNetworkConfig.h@
-        # exists before the C preprocessor sees @#include "HsNetworkConfig.h"@.
-        # We only need the two POSIX c-sources; the Windows ones
-        # (initWinSock.c, winSockErr.c, asyncAccept.c) are not built.
-        #
-        # Output layout: $out/lib/libhsnet.dylib.  The dev shell prepends
-        # $out/lib to DYLD_LIBRARY_PATH so that
-        #   registerLibrary "hsnet"  ⇒  dlopen("libhsnet.dylib")
-        # succeeds without any absolute path.
-        libhsnetDylib = pkgs.runCommand "libhsnet-dylib" {
+        # Scans every package directory under ihcSourceRootWithHsc for a
+        # cbits/ subdir, discovers every .c source file under it, and
+        # compiles them into @lib<pkg>-cbits.dylib@.  Rather than parsing
+        # cabal's @c-sources:@ (which is tangled in @if arch()@/@os()@
+        # conditionals that vary per package version), we use a simpler
+        # heuristic that works for every package tested so far:
+        #   * Compile every .c under cbits/ individually.
+        #   * Prefer arch-specific variants (cbits/aarch64/foo.c beats
+        #     cbits/foo.c) so symbols aren't defined twice.
+        #   * Skip files whose compile fails (Windows-only helpers,
+        #     flag-gated C++ simdutf, etc.).
+        # Output layout: $out/lib/lib<pkg>-cbits.dylib per package that
+        # produced at least one object file.  Per-package build logs are
+        # kept at $out/lib/<pkg>.err for diagnosis.
+        ihcCbitsRoot = pkgs.runCommand "ihc-cbits-dylibs" {
           buildInputs = [ pkgs.stdenv.cc ];
         } ''
           mkdir -p $out/lib
 
-          net="${ihcSourceRootWithHsc}/network-3.2.8.0"
-          if [ ! -d "$net" ]; then
-            echo "libhsnet: network-3.2.8.0 not found under ihcSourceRootWithHsc" >&2
-            exit 1
-          fi
-          if [ ! -f "$net/include/HsNetworkConfig.h" ]; then
-            echo "libhsnet: include/HsNetworkConfig.h missing — configure must run in ihcSourceRootWithHsc" >&2
-            exit 1
-          fi
+          # GHC headers (HsFFI.h, HsBaseConfig.h, …) live outside the
+          # Hackage tarballs; expose them so package cbits that include
+          # <HsFFI.h> build.
+          ghc_inc=""
+          for d in ${ghcIncludeDirs}; do
+            if [ -d "$d" ]; then ghc_inc="$ghc_inc -I$d"; fi
+          done
+          # Fallback: crawl GHC's own per-package include dirs.
+          for d in ${ghc}/lib/ghc-*/lib/*-ghc-*/*/include; do
+            if [ -d "$d" ]; then ghc_inc="$ghc_inc -I$d"; fi
+          done
 
-          # Use cc(1) from the nix stdenv (clang on darwin).
-          # -fPIC is implicit on darwin but harmless; -shared asks the
-          # wrapper to emit a .dylib.  We pass -undefined dynamic_lookup so
-          # that any symbols referenced by HsNet.c that live elsewhere
-          # (e.g. libc's getaddrinfo) are resolved at load time by dyld
-          # rather than at link time.  The only includes we need are the
-          # package-local include/ directory.
-          cc -fPIC -shared -O \
-             -undefined dynamic_lookup \
-             -I"$net/include" \
-             -o "$out/lib/libhsnet.dylib" \
-             "$net/cbits/HsNet.c" \
-             "$net/cbits/cmsg.c"
+          shopt -s nullglob
+          for pkg_dir in "${ihcSourceRootWithHsc}"/*/; do
+            pkg_dir="''${pkg_dir%/}"
+            pkg=$(basename "$pkg_dir")
+            if [ ! -d "$pkg_dir/cbits" ]; then
+              continue
+            fi
 
-          echo "libhsnet: built $out/lib/libhsnet.dylib" >&2
+            # Package-local -I flags.
+            incs=""
+            [ -d "$pkg_dir/include" ]     && incs="$incs -I$pkg_dir/include"
+            [ -d "$pkg_dir/cbits" ]       && incs="$incs -I$pkg_dir/cbits"
+            [ -d "$pkg_dir/cbits/include" ] && incs="$incs -I$pkg_dir/cbits/include"
+
+            # Discover all .c files under cbits/.  Give arch-specific
+            # variants priority over generic ones (keep aarch64/foo.c,
+            # drop cbits/foo.c if the same basename exists under
+            # aarch64/).
+            tmp_list=$(mktemp)
+            find "$pkg_dir/cbits" -name '*.c' -print > "$tmp_list"
+
+            # Build a basename→path map preferring aarch64/ paths.
+            declare -A chosen
+            while IFS= read -r f; do
+              base=$(basename "$f")
+              if [ -n "''${chosen[$base]:-}" ]; then
+                case "$f" in *aarch64*) chosen[$base]="$f" ;; esac
+              else
+                chosen[$base]="$f"
+              fi
+            done < "$tmp_list"
+            rm "$tmp_list"
+
+            # Compile each selected .c to an object file; collect
+            # successes, skip failures.
+            work=$(mktemp -d)
+            objs=""
+            log="$out/lib/$pkg.err"
+            : > "$log"
+            for f in "''${chosen[@]}"; do
+              obj="$work/$(basename "$f" .c).o"
+              if cc -fPIC -c -O $ghc_inc $incs -o "$obj" "$f" 2>>"$log"; then
+                objs="$objs $obj"
+              else
+                echo "  SKIP $f (see $log)" >> "$log"
+              fi
+            done
+            unset chosen
+
+            if [ -z "$objs" ]; then
+              echo "cbits: SKIPPED $pkg (no compilable .c files; see $log)" >&2
+              continue
+            fi
+
+            out_dylib="$out/lib/lib$pkg-cbits.dylib"
+            if cc -fPIC -shared -O -undefined dynamic_lookup \
+                  -o "$out_dylib" $objs 2>>"$log"; then
+              rm -f "$log"
+              echo "cbits: built $out_dylib" >&2
+            else
+              rm -f "$out_dylib"
+              echo "cbits: LINK FAILED $pkg (see $log)" >&2
+            fi
+          done
         '';
+
       in {
-        # Expose as a package so `nix build .#libhsnet` works for debugging.
-        packages.libhsnet = libhsnetDylib;
+        # Expose as a package so `nix build .#cbits` works for debugging.
+        packages.cbits = ihcCbitsRoot;
         devShells.default = pkgs.mkShell {
           buildInputs = [
             ghc
@@ -351,9 +400,13 @@
             # from the FFI dispatcher can resolve without an absolute path.
             # IHC_LIBHSNET_DIR is also set so future code can reference the
             # exact store path directly.
-            export IHC_LIBHSNET_DIR="${libhsnetDylib}/lib"
-            export DYLD_LIBRARY_PATH="$IHC_LIBHSNET_DIR''${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
-            export DYLD_FALLBACK_LIBRARY_PATH="$IHC_LIBHSNET_DIR''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+            # Auto-discovered per-package cbits dylibs: one
+            # lib<pkg>-cbits.dylib per Hackage package that declares
+            # @c-sources:@ in its cabal.  FFI.registerCbitsDylibs at
+            # interpreter startup dlopens every *.dylib in this dir.
+            export IHC_CBITS_DIR="${ihcCbitsRoot}/lib"
+            export DYLD_LIBRARY_PATH="$IHC_CBITS_DIR''${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+            export DYLD_FALLBACK_LIBRARY_PATH="$IHC_CBITS_DIR''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
           '';
         };
 

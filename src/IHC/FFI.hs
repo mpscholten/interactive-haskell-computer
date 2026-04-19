@@ -31,6 +31,7 @@ module IHC.FFI
     , ForeignDecl(..)
       -- * Symbol resolution
     , registerLibrary
+    , registerCbitsDylibs
     , resolveSymbol
       -- * Dispatch
     , callForeign
@@ -59,6 +60,9 @@ import Foreign.LibFFI
     , retCChar, retCUChar, retPtr, retCString
     )
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
+import System.Directory (doesDirectoryExist, listDirectory)
+import qualified System.Environment as Env
+import System.FilePath ((</>), takeExtension)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified System.Posix.DynamicLinker as DL
 
@@ -144,6 +148,35 @@ symbolCache = unsafePerformIO (newIORef Map.empty)
 -- declared @extra-libraries:@ doesn't abort interpreter startup when a
 -- user hasn't installed the dev package for it — the error only shows
 -- up later when an actual FFI symbol from that library is invoked.
+-- | Auto-discover per-package cbits dylibs.  The nix build emits one
+-- @libhs<pkg>-cbits.dylib@ per Hackage source package that declares
+-- @c-sources:@ in its @.cabal@, and exposes the directory containing
+-- them via the @IHC_CBITS_DIR@ environment variable.  This function
+-- dlopens every @*.dylib@ in that directory at interpreter startup
+-- so that @foreign import ccall@ declarations resolve via
+-- @dlsym(RTLD_DEFAULT, …)@ without any package-specific wiring.
+--
+-- Running outside a dev shell (@IHC_CBITS_DIR@ unset, or directory
+-- absent) is silent — user's code that actually exercises one of the
+-- missing symbols will error at FFI-call time with a clearer message
+-- than a nix derivation complaint would give.
+registerCbitsDylibs :: IO ()
+registerCbitsDylibs = do
+    mDir <- Env.lookupEnv "IHC_CBITS_DIR"
+    case mDir of
+        Nothing  -> pure ()
+        Just dir -> do
+            exists <- doesDirectoryExist dir
+            if not exists
+                then pure ()
+                else do
+                    entries <- listDirectory dir
+                    let dylibs = [ dir </> e
+                                 | e <- entries
+                                 , takeExtension e == ".dylib"
+                                 ]
+                    mapM_ (\p -> registerLibrary (BC.pack p)) dylibs
+
 registerLibrary :: ByteString -> IO ()
 registerLibrary name = do
     opened <- readIORef openLibs
