@@ -1309,14 +1309,37 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkLBracket -> do
                 curAfter <- skipToMatchingRBracket 1 cur'
                 countCtorFields (n + 1) curAfter
-            TkConId _ -> countCtorFields (n + 1) cur'
-            TkIdent _ -> countCtorFields (n + 1) cur'
-            TkPrimId _ -> countCtorFields (n + 1) cur'
+            TkConId _ -> do
+                curAfter <- skipQualifiedTypeTail cur'
+                countCtorFields (n + 1) curAfter
+            TkIdent _ -> do
+                curAfter <- skipQualifiedTypeTail cur'
+                countCtorFields (n + 1) curAfter
+            TkPrimId _ -> do
+                curAfter <- skipQualifiedTypeTail cur'
+                countCtorFields (n + 1) curAfter
             -- TkBang is a strictness annotation on the *next* field, not a
             -- field itself and not a terminator. Skip it and continue.
             TkBang    -> countCtorFields n cur'
             -- Unrecognized token stops the field scan gracefully.
             _ -> pure (n, cur)
+
+    -- Treat a qualified type name like `A.Array` as part of the same field.
+    -- Without this, strict unpacked declarations such as
+    --   Text !A.Array !Int !Int
+    -- under-count at the first `.` and constructors get the wrong arity.
+    skipQualifiedTypeTail :: Cursor -> IO Cursor
+    skipQualifiedTypeTail cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkDot ->
+                let (segTok, cur'') = nextToken src cur'
+                in case tkKind segTok of
+                    TkConId _  -> skipQualifiedTypeTail cur''
+                    TkIdent _  -> skipQualifiedTypeTail cur''
+                    TkPrimId _ -> skipQualifiedTypeTail cur''
+                    _          -> pure cur
+            _ -> pure cur
 
     skipToMatchingRParen :: Int -> Cursor -> IO Cursor
     skipToMatchingRParen !depth cur

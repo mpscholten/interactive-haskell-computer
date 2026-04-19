@@ -556,6 +556,113 @@ loadFileIntoEnv searchPath path existingEnv = do
         newExportedCount = length (filter (`Map.member` additions) exported)
     pure (merged, newExportedCount)
 
+type ExportNamesMemo = IORef (Map ModuleName [ByteString])
+
+newExportNamesMemo :: IO ExportNamesMemo
+newExportNamesMemo = newIORef Map.empty
+
+-- | Enumerate the runtime-visible export names of a module without forcing
+-- any binding bodies. This is the cheap import-time surface used by the
+-- lazy @ImportAll@ path: each returned name gets a placeholder thunk whose
+-- first force materializes the real binding via @ImportOnly@.
+effectiveExportNames
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> [ModuleName]
+    -> IO [ByteString]
+effectiveExportNames registry searchPath includeMap lm visited = do
+    memo <- newExportNamesMemo
+    effectiveExportNamesMemo memo registry searchPath includeMap lm visited
+
+effectiveExportNamesMemo
+    :: ExportNamesMemo
+    -> ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> [ModuleName]
+    -> IO [ByteString]
+effectiveExportNamesMemo memo registry searchPath includeMap lm visited = do
+    cached <- Map.lookup (lmName lm) <$> readIORef memo
+    case cached of
+        Just result -> pure result
+        Nothing -> do
+            result <- compute
+            modifyIORef' memo (Map.insert (lmName lm) result)
+            pure result
+  where
+    compute = case mhExports (lmHeader lm) of
+        ExportAll -> localRuntimeNames lm
+        ExportList items -> nubBS . concat <$> mapM exportItem items
+
+    exportItem item = case item of
+        ExportName n ->
+            pure [visibleExportName n]
+        ExportType ty mbSubs -> do
+            let visibleSubs = maybe [] (map visibleExportName) mbSubs
+            case splitQualified ty of
+                Just (qual, bareTy) -> do
+                    mTarget <- resolveQualified registry searchPath includeMap lm qual
+                    case mTarget of
+                        Just targetLm -> typeLikeRuntimeNames targetLm bareTy visibleSubs
+                        Nothing       -> pure visibleSubs
+                Nothing ->
+                    -- Type heads are not value bindings. The only runtime-visible
+                    -- names from an export-type item are its constructors /
+                    -- fields or class methods when the export names a class.
+                    typeLikeRuntimeNames lm ty visibleSubs
+        ExportModule m
+            | m `elem` visited -> pure []
+            | otherwise -> do
+                reLm <- loadModule registry searchPath includeMap m
+                            `catch` (\(_ :: ModuleNotFound) ->
+                                warnMissingStub m searchPath
+                                    >> buildEmptyStubModule m)
+                effectiveExportNamesMemo memo registry searchPath includeMap reLm
+                    (m : visited)
+
+localRuntimeNames :: LoadedModule -> IO [ByteString]
+localRuntimeNames lm = do
+    topLevelNames <- scanAllTopLevelNames (lmSource lm)
+    classDecls    <- scanClassDecls (lmSource lm)
+    let classMethods = concatMap classMethodNames classDecls
+        ctors        = Map.keys (lmDataReg lm)
+        fields       = Map.keys (lmFieldReg lm)
+        foreignNames = map FFI.fdName (lmForeignDecls lm)
+    pure (nubBS (topLevelNames ++ classMethods ++ ctors ++ fields ++ foreignNames))
+
+visibleExportName :: ByteString -> ByteString
+visibleExportName n =
+    case splitQualified n of
+        Just (_, bare) -> bare
+        Nothing        -> n
+
+typeLikeRuntimeNames :: LoadedModule -> ByteString -> [ByteString] -> IO [ByteString]
+typeLikeRuntimeNames lm ty subs = do
+    classDecls <- scanClassDecls (lmSource lm)
+    let ctorsOfTy = Map.findWithDefault [] ty (lmTypeCtorReg lm)
+        fieldsOfTy =
+            [ field
+            | (field, ctorIdxs) <- Map.toList (lmFieldReg lm)
+            , any (\(ctor, _) -> ctor `elem` ctorsOfTy) ctorIdxs
+            ]
+        classMethods =
+            case [ classMethodNames decl
+                 | decl <- classDecls
+                 , classClassName decl == ty
+                 ] of
+                (methods:_) -> methods
+                []          -> []
+    pure $ case subs of
+        [] -> nubBS (ctorsOfTy ++ fieldsOfTy ++ classMethods)
+        _  -> nubBS
+                [ n
+                | n <- subs
+                , n `elem` ctorsOfTy || n `elem` fieldsOfTy || n `elem` classMethods
+                ]
+
 -- | Enumerate the effective exports of a loaded module as @(bare-name, Slot)@
 -- pairs, walking transitive @ExportModule@ and named @ExportName@ re-exports
 -- recursively.
@@ -861,17 +968,18 @@ preloadImportsForNamedReexportsMemo memo registry searchPath includeMap lm visit
 -- | Load a single import declaration into an existing 'Env', as if the
 -- REPL user typed @import Foo@ at the prompt.
 --
--- For builtin-backed modules (Prelude, Data.List, etc.) the names are
--- already present in the base env — we return the env unchanged with
--- count 0.
+-- Builtin-backed modules install their host-provided bindings directly.
 --
--- For source-backed modules we:
---   1. Load the target module.
---   2. Call 'preloadForEffectiveExports' to force-load all transitively
---      re-exported modules (ExportModule and ExportName chains).
---   3. Build thunks for every loaded module.
---   4. Call 'effectiveExports' to enumerate the full visible name set.
---   5. Merge into @existingEnv@.
+-- Source-backed @ImportOnly@ requests stay targeted: discover just the
+-- requested names, tie the needed env, and register any instances they
+-- pull in.
+--
+-- Source-backed @ImportAll@ / @ImportHiding@ requests are now lazy: we
+-- enumerate the module's effective export NAMES (walking headers and
+-- export lists only), then install one lazy slot per visible name. The
+-- first force of that slot re-enters the targeted @ImportOnly@ path for
+-- the specific name. This avoids parsing the bodies of every exported
+-- binding during @import Data.Map.Strict@-style dense re-export imports.
 --
 -- Qualified imports (@import qualified Foo as F@) expose names under the
 -- alias prefix (@F.name@) only; unqualified imports also add bare names.
@@ -923,137 +1031,46 @@ loadImportIntoEnv searchPath imp existingEnv
             includeMap     = Map.fromList cacheWithIncludes
             fullSearchPath = searchPath ++ cacheDirs
         registry <- newIORef Map.empty
-        -- Step 1: load the target module.
         targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
-        -- Step 2: pre-load every module that will be needed by effectiveExports
-        -- (ExportName re-exports + ExportModule transitive closures).
-        -- This populates the registry and lmBodies IORefs so that Step 4
-        -- can do pure lookups.
-        --
-        -- We run preloadForEffectiveExports to a FIXED POINT: after each pass,
-        -- check whether any new modules were loaded (e.g. forceLoadForReexport
-        -- may have loaded GHC.List while processing Data.List → Data.OldList).
-        -- Those newly loaded modules also need their local names discovered so
-        -- they end up in thunkByKey.  Repeat until the registry stabilises.
-        --
-        -- Share a single preload memo across ALL passes so modules reachable
-        -- via many re-export chains (common case: everything in base reaches
-        -- @GHC.Base@) are preloaded exactly once.  Without sharing, IHP.Prelude
-        -- (19 re-export arms) hangs the loader for many seconds.
-        preloadMemo <- newPreloadMemo
-        preloadForEffectiveExportsMemo preloadMemo registry fullSearchPath
-            includeMap targetLm [lmName targetLm]
-        -- Previously ran a fixed-point loop re-invoking
-        -- preloadForEffectiveExportsMemo until the registry stabilised.
-        -- This cascades unboundedly on dense re-export graphs
-        -- (Network.Socket → 18 re-exports → each re-exports more).
-        -- Remove the fixpoint; rely on demand-driven loads via
-        -- 'discoverInModule' to pull remaining bindings at first use.
-        -- See /Users/marc/.claude/plans/lazy-interpreter-redesign.md.
-        pure ()
-        -- Step 3: collect all loaded modules and build the combined env.
-        reg0 <- readIORef registry
-        let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
-        let unionedData   = foldr Map.union Map.empty (map lmDataReg  loadedModules0)
-            (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
-            unionedTFReg = foldr (Map.unionWith (++)) Map.empty
-                             (map lmTypeFamilies loadedModules0)
-        TR.setGlobalRegistry unionedTFReg
-        conEnv    <- buildConEnv  unionedData
-        fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
-        builtins <- builtinEnv =<< newClassRegistry
-        let baseForImport = Map.union builtins (Map.union fieldEnv' conEnv)
-        -- Build (qualified-key, Expr) pairs for each loaded module.
-        qualPairs <- concat <$> mapM (exportBodies registry (Map.keysSet builtins)) loadedModules0
-        -- Tie the knot.
-        slots <- mapM (\_ -> newIORef BlackHole) qualPairs
-        let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
-            thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
-            modPrefix  = lmName targetLm <> BC.pack "."
+        -- Track transitive import closure for Haskell 2010 §4.3.2
+        -- instance visibility. The dispatcher consults this set on miss.
+        headerCache <- newHeaderCache
+        closure <- transitiveImportClosure headerCache fullSearchPath includeMap
+                        (impModule imp)
+        unionInstanceScope closure
+        exportNames0 <- effectiveExportNames registry fullSearchPath includeMap targetLm
+                            [lmName targetLm]
+        let exportNames = [ n | n <- exportNames0, specAllows (impSpec imp) n ]
             qualPrefix = case impAlias imp of
                 Just a  -> a <> BC.pack "."
                 Nothing
                     | impQualified imp -> lmName targetLm <> BC.pack "."
                     | otherwise        -> BC.empty
-        -- Step 4: enumerate effective exports via transitive re-export walking.
-        effectivePairs0 <- effectiveExports registry thunkByKey targetLm
-                              [lmName targetLm]
-        -- Filter by the import spec (e.g. ImportOnly, ImportHiding).
-        let effectivePairs = [ (n, t) | (n, t) <- effectivePairs0
-                                      , specAllows (impSpec imp) n ]
-        -- Step 5: build bare and qualified alias lists.
-        let bareAliases
+            importOne n = imp { impSpec = ImportOnly [n] }
+            lookupKeys n =
+                nubBS ([ qualPrefix <> n | not (BC.null qualPrefix) ] ++ [n])
+            resolveOne n = newLazyBuiltinThunk $ do
+                (env', _) <- loadImportIntoEnv searchPath (importOne n) existingEnv
+                let mThunk = mapMaybe (`Map.lookup` env') (lookupKeys n)
+                case mThunk of
+                    (t:_) -> force t
+                    []    -> error
+                        ( "loadImportIntoEnv: failed to materialize `"
+                          <> BC.unpack (impModule imp) <> "."
+                          <> BC.unpack n <> "` on demand" )
+        slots <- mapM resolveOne exportNames
+        let exportPairs = zip exportNames slots
+            bareAliases
                 | impQualified imp = []
-                | otherwise        = effectivePairs
+                | otherwise        = exportPairs
             qualAliases
                 | BC.null qualPrefix = []
                 | otherwise =
-                    [ (qualPrefix <> n, t) | (n, t) <- effectivePairs ]
-        let aliasEnv = Map.fromList (bareAliases ++ qualAliases)
-        -- For intra-module self-references (recursive calls, mutual recursion),
-        -- ALL discovered names must be reachable by their bare name inside the
-        -- closure env, regardless of whether the import is qualified.
-        --
-        -- Example: GHC.Base.map contains `map f (x:xs) = f x : map f xs`.
-        -- The recursive `map` must resolve to the same slot.  Without bare
-        -- aliases in innerEnv, qualified imports (where bareAliases = []) would
-        -- leave `map` unbound inside its own body and cause infinite recursion
-        -- or "unbound variable `map`" at runtime.
-        --
-        -- We use effectivePairs (all effective exports of the target) as the
-        -- minimal set.  These cover every name that could appear as a recursive
-        -- call site inside the imported bindings.
-        let selfAliases =
-                [ (n, slot)
-                | (qualKey, slot) <- Map.toList thunkByKey
-                , BC.isPrefixOf modPrefix qualKey
-                , let n = BC.drop (BC.length modPrefix) qualKey
-                ]
-        -- The final env visible to imported bindings: qualEnv + aliases +
-        -- bare-name aliases for ALL effective exports (for recursive closures).
-        -- We also fall back to @existingEnv@ at the bottom of the lookup
-        -- chain so that REPL-level pre-discoveries (e.g. the GHC.Exception
-        -- helpers primed by 'buildBaseEnv') remain reachable from inside
-        -- imported source bindings.  This matters for source-loaded
-        -- @error@: its body references @errorCallWithCallStackException@,
-        -- which @loadImportIntoEnv@'s fresh registry does not resolve on
-        -- its own, but the REPL's pre-primed slot is still valid and
-        -- must remain visible under the fresh import's innerEnv.
-        let innerEnv = Map.union (Map.fromList selfAliases)
-                     $ Map.union (Map.fromList effectivePairs)
-                     $ Map.union aliasEnv
-                     $ Map.union qualEnv existingEnv
-        mapM_ (\((_, rhs), slot) ->
-                   writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
-              (zip qualPairs slots)
-        -- Register instance declarations into the REPL's shared class
-        -- registry so dispatchers can see them on subsequent calls.
-        -- (The previous version skipped this step entirely — instances
-        -- were silently dropped for the ImportAll path.)
-        mSharedReg <- readIORef sharedClassRegRef
-        case mSharedReg of
-            Just sharedReg -> do
-                let unionedTypeCtors1 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
-                ct <- buildClassMethodTable loadedModules0
-                mapM_ (\l -> (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors1 ct innerEnv l) `catch` (\(_ :: SomeException) -> pure ())) loadedModules0
-                (registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv loadedModules0)
-                    `catch` (\(_ :: SomeException) -> pure ())
-                (registerDerivedFunctorInstances sharedReg loadedModules0)
-                    `catch` (\(_ :: SomeException) -> pure ())
-            Nothing -> pure ()
-        -- Track transitive import closure for Haskell 2010 §4.3.2
-        -- instance visibility. The dispatcher consults this set on miss.
-        do
-            headerCache <- newHeaderCache
-            closure <- transitiveImportClosure headerCache fullSearchPath includeMap
-                            (impModule imp)
-            unionInstanceScope closure
-        -- Merge into the REPL env: prefer existing REPL bindings (shadow).
-        let newBindings = Map.union qualEnv aliasEnv
+                    [ (qualPrefix <> n, t) | (n, t) <- exportPairs ]
+            newBindings = Map.fromList (bareAliases ++ qualAliases)
             additions   = Map.difference newBindings existingEnv
             merged      = Map.union existingEnv additions
-            newAliases  = aliasEnv `Map.difference` existingEnv
-        pure (merged, Map.size newAliases)
+        pure (merged, Map.size additions)
 
 loadImportOnlyIntoEnv
     :: [FilePath]
@@ -1152,18 +1169,25 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                         , Just slot <- Map.lookup n conEnv
                         -> pure (Just (n, slot))
                 Nothing   ->
-                    -- Class methods are ambient: they have no single
-                    -- owning module key, only the bare method name in
-                    -- 'classMethodEnv'.  If an import requests a class
-                    -- method (e.g. `import qualified Data.Monoid as M`
-                    -- → `M.mempty`), fall back to the bare name here so
-                    -- `M.mempty` resolves to the dispatcher.  Ordinary
-                    -- top-level bindings are keyed under their FQN in
-                    -- 'baseForImport' and are NOT eligible for this
-                    -- fallback.
-                    case Map.lookup n classMethodEnv of
+                    -- Record selectors are synthesized into fieldEnv'
+                    -- rather than exported as source bodies, so an
+                    -- ImportOnly request for a selector like runStateT
+                    -- must be able to surface the prebuilt accessor.
+                    case Map.lookup n fieldEnv' of
                         Just slot -> pure (Just (n, slot))
-                        Nothing   -> pure Nothing
+                        Nothing   ->
+                            -- Class methods are ambient: they have no single
+                            -- owning module key, only the bare method name in
+                            -- 'classMethodEnv'.  If an import requests a class
+                            -- method (e.g. `import qualified Data.Monoid as M`
+                            -- → `M.mempty`), fall back to the bare name here so
+                            -- `M.mempty` resolves to the dispatcher.  Ordinary
+                            -- top-level bindings are keyed under their FQN in
+                            -- 'baseForImport' and are NOT eligible for this
+                            -- fallback.
+                            case Map.lookup n classMethodEnv of
+                                Just slot -> pure (Just (n, slot))
+                                Nothing   -> pure Nothing
     requestedStandard <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
     requestedFromBuiltins <- mapM synthFromBuiltin
         [ n | (n, Nothing) <- zip requested requestedStandard ]
@@ -3797,5 +3821,3 @@ desugarRecordPats fldReg = goExpr
     goPat (PBang p)        = PBang (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit
-
-

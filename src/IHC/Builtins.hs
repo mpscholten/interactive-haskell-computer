@@ -364,6 +364,8 @@ builtins reg =
     -- Char / numeric conversions
     , ("ord",         ordB)
     , ("chr",         chrB)
+    , ("ord#",        ordB)
+    , ("chr#",        chrB)
     , ("fromIntegral", fromIntegralB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
@@ -404,14 +406,21 @@ builtins reg =
     , ("pokeByteOff",  pokeByteOffB)
     -- Phase 2.8: MutableByteArray# family
     , ("newByteArray#",             newByteArrayB)
+    , ("newPinnedByteArray#",       newPinnedByteArrayB)
     , ("writeWord8Array#",          writeWord8ArrayB)
     , ("readWord8Array#",           readWord8ArrayB)
     , ("indexWord8Array#",          indexWord8ArrayB)
     , ("unsafeFreezeByteArray#",    unsafeFreezeByteArrayB)
     , ("getSizeofMutableByteArray#", getSizeofMutableByteArrayB)
     , ("sizeofByteArray#",          sizeofByteArrayB)
+    , ("resizeMutableByteArray#",   resizeMutableByteArrayB)
+    , ("shrinkMutableByteArray#",   shrinkMutableByteArrayB)
+    , ("setByteArray#",             setByteArrayB)
+    , ("copyMutableByteArray#",     copyMutableByteArrayB)
+    , ("copyByteArray#",            copyByteArrayB)
     , ("copyAddrToByteArray#",      copyAddrToByteArrayB)
     , ("copyByteArrayToAddr#",      copyByteArrayToAddrB)
+    , ("compareByteArrays#",        compareByteArraysB)
     -- Phase 2.8: C memory ops
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
@@ -431,10 +440,27 @@ builtins reg =
     , ("and#",              andHashB)
     , ("xor#",              xorHashB)
     , ("not#",              notHashB)
+    , ("+#",                plusIntHashB)
+    , ("-#",                minusIntHashB)
+    , ("*#",                timesIntHashB)
+    , ("<#",                ltIntHashB)
+    , ("<=#",               leIntHashB)
+    , ("==#",               eqIntHashB)
+    , (">#",                gtIntHashB)
+    , (">=#",               geIntHashB)
+    , ("/=#",               neIntHashB)
     , ("uncheckedShiftL#",  uncheckedShiftLB)
+    , ("uncheckedIShiftL#", uncheckedShiftLB)
     , ("uncheckedShiftRL#", uncheckedShiftRLB)
+    , ("uncheckedIShiftRA#", uncheckedIShiftRAB)
     , ("timesInt2#",        timesInt2B)
     , ("timesWord2#",       timesWord2B)
+    , ("ltChar#",           ltCharHashB)
+    , ("leChar#",           leCharHashB)
+    , ("eqChar#",           eqCharHashB)
+    , ("gtChar#",           gtCharHashB)
+    , ("geChar#",           geCharHashB)
+    , ("neChar#",           neCharHashB)
     -- Phase 2.8: GHC.Exts Word# comparison primops (for containers)
     , ("ltWord#",   ltWordB)
     , ("leWord#",   leWordB)
@@ -784,6 +810,10 @@ compose = pure $ VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
 boolVal :: Bool -> Val
 boolVal True  = VCon "True"  []
 boolVal False = VCon "False" []
+
+primBoolVal :: Bool -> Val
+primBoolVal True  = VInt 1
+primBoolVal False = VInt 0
 
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
@@ -1234,9 +1264,13 @@ showValWith reg av = case av of
         mShowMethod <- lookupInstanceMethod reg "Show" tag "show"
         case mShowMethod of
             Just showMethod -> do
-                aT <- newWHNFThunk av
-                rv <- apply showMethod aT
-                valToString rv
+                shown <- CE.try @SomeException $ do
+                    aT <- newWHNFThunk av
+                    rv <- apply showMethod aT
+                    valToString rv
+                case shown of
+                    Right s -> pure s
+                    Left _  -> showVal av
             _ -> showVal av
     _ -> showVal av
 
@@ -2760,6 +2794,9 @@ newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
     stT' <- newWHNFThunk stv
     pure (VCon "(#,#)" [stT', baT])
 
+newPinnedByteArrayB :: IO Val
+newPinnedByteArrayB = newByteArrayB
+
 writeWord8ArrayB :: IO Val
 writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \stT -> pure $ VIO $ do
     av <- force a; bv <- force b; cv <- force c; stv <- force stT
@@ -2774,8 +2811,7 @@ writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> p
                                 , BS.drop (fromIntegral idx + 1) bs
                                 ]
                     writeIORef ref bs'
-                    stT' <- newWHNFThunk stv
-                    pure (VCon "(#,#)" [stT', stT'])
+                    pure stv
                 _ -> error "writeWord8Array#: bad index/val"
         _ -> error ("writeWord8Array#: not a MutableByteArray: " <> showValForDebug av)
 
@@ -2836,6 +2872,98 @@ sizeofByteArrayB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (BS.length bs)))
         _ -> error ("sizeofByteArray#: not a ByteArray: " <> showValForDebug av)
 
+resizeMutableByteArrayB :: IO Val
+resizeMutableByteArrayB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
+    av <- force a; bv <- force b; stv <- force stT
+    case (av, bv) of
+        (VPrimObj (PrimByteArray ref), VInt n) -> do
+            bs <- readIORef ref
+            let newLen = max 0 (fromIntegral n)
+                oldLen = BS.length bs
+                bs'
+                    | newLen <= oldLen = BS.take newLen bs
+                    | otherwise = bs <> BS.replicate (newLen - oldLen) 0
+            writeIORef ref bs'
+            baT  <- newWHNFThunk av
+            stT' <- newWHNFThunk stv
+            pure (VCon "(#,#)" [stT', baT])
+        _ -> error "resizeMutableByteArray#: bad args"
+
+shrinkMutableByteArrayB :: IO Val
+shrinkMutableByteArrayB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
+    av <- force a; bv <- force b; stv <- force stT
+    case (av, bv) of
+        (VPrimObj (PrimByteArray ref), VInt n) -> do
+            bs <- readIORef ref
+            writeIORef ref (BS.take (max 0 (fromIntegral n)) bs)
+            pure stv
+        _ -> error "shrinkMutableByteArray#: bad args"
+
+setByteArrayB :: IO Val
+setByteArrayB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \stT -> pure $ VIO $ do
+    av <- force a; offV <- force b; lenV <- force c; valV <- force d; stv <- force stT
+    case (av, offV, lenV, valV) of
+        (VPrimObj (PrimByteArray ref), VInt off, VInt len, VInt val) -> do
+            bs <- readIORef ref
+            let start = max 0 (fromIntegral off)
+                count = max 0 (fromIntegral len)
+                fill  = BS.replicate count (fromIntegral val)
+                bs'   = BS.concat
+                    [ BS.take start bs
+                    , fill
+                    , BS.drop (start + count) bs
+                    ]
+            writeIORef ref bs'
+            pure stv
+        _ -> error "setByteArray#: bad args"
+
+copyMutableByteArrayB :: IO Val
+copyMutableByteArrayB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> pure $ VFun $ \stT -> pure $ VIO $ do
+    srcV <- force a; srcOffV <- force b; dstV <- force c
+    dstOffV <- force d; lenV <- force e; stv <- force stT
+    case (srcV, srcOffV, dstV, dstOffV, lenV) of
+        (VPrimObj (PrimByteArray srcRef), VInt srcOff, VPrimObj (PrimByteArray dstRef), VInt dstOff, VInt len) -> do
+            srcBs <- readIORef srcRef
+            dstBs <- readIORef dstRef
+            let srcStart = max 0 (fromIntegral srcOff)
+                dstStart = max 0 (fromIntegral dstOff)
+                count    = max 0 (fromIntegral len)
+                chunk    = BS.take count (BS.drop srcStart srcBs)
+                dstBs'   = BS.concat
+                    [ BS.take dstStart dstBs
+                    , chunk
+                    , BS.drop (dstStart + count) dstBs
+                    ]
+            writeIORef dstRef dstBs'
+            pure stv
+        _ -> error "copyMutableByteArray#: bad args"
+
+copyByteArrayB :: IO Val
+copyByteArrayB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> pure $ VFun $ \stT -> pure $ VIO $ do
+    srcV <- force a; srcOffV <- force b; dstV <- force c
+    dstOffV <- force d; lenV <- force e; stv <- force stT
+    case (srcV, srcOffV, dstV, dstOffV, lenV) of
+        (VPrimObj (PrimByteArray srcRef), VInt srcOff, VPrimObj (PrimByteArray dstRef), VInt dstOff, VInt len) -> do
+            srcBs <- readIORef srcRef
+            dstBs <- readIORef dstRef
+            let srcStart = max 0 (fromIntegral srcOff)
+                dstStart = max 0 (fromIntegral dstOff)
+                count    = max 0 (fromIntegral len)
+                chunk    = BS.take count (BS.drop srcStart srcBs)
+                dstBs'   = BS.concat
+                    [ BS.take dstStart dstBs
+                    , chunk
+                    , BS.drop (dstStart + count) dstBs
+                    ]
+            writeIORef dstRef dstBs'
+            pure stv
+        _ -> error "copyByteArray#: bad args"
+
 copyAddrToByteArrayB :: IO Val
 copyAddrToByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \stT -> pure $ VIO $ do
@@ -2851,8 +2979,7 @@ copyAddrToByteArrayB = pure
                     , BS.drop (fromIntegral dstOff + fromIntegral len) bs
                     ]
             writeIORef ref bs'
-            stT' <- newWHNFThunk stv
-            pure (VCon "(#,#)" [stT', stT'])
+            pure stv
         _ -> error "copyAddrToByteArray#: bad args"
 
 copyByteArrayToAddrB :: IO Val
@@ -2866,9 +2993,26 @@ copyByteArrayToAddrB = pure
             let chunk = BS.take (fromIntegral len) (BS.drop (fromIntegral srcOff) bs)
             BS.useAsCStringLen chunk $ \(src, _n) ->
                 copyBytes (castPtr dst) (castPtr src :: Ptr Word8) (fromIntegral len)
-            stT' <- newWHNFThunk stv
-            pure (VCon "(#,#)" [stT', stT'])
+            pure stv
         _ -> error "copyByteArrayToAddr#: bad args"
+
+compareByteArraysB :: IO Val
+compareByteArraysB = pure
+    $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> do
+    aV <- force a; bV <- force b; cV <- force c; dV <- force d; eV <- force e
+    case (aV, bV, cV, dV, eV) of
+        (VPrimObj (PrimByteArray lhsRef), VInt lhsOff, VPrimObj (PrimByteArray rhsRef), VInt rhsOff, VInt len) -> do
+            lhsBs <- readIORef lhsRef
+            rhsBs <- readIORef rhsRef
+            let count = max 0 (fromIntegral len)
+                lhsChunk = BS.take count (BS.drop (max 0 (fromIntegral lhsOff)) lhsBs)
+                rhsChunk = BS.take count (BS.drop (max 0 (fromIntegral rhsOff)) rhsBs)
+                cmp = case compare lhsChunk rhsChunk of
+                    LT -> -1
+                    EQ -> 0
+                    GT -> 1
+            pure (VInt cmp)
+        _ -> error "compareByteArrays#: bad args"
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: C memory ops
@@ -2980,6 +3124,111 @@ uncheckedShiftRLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VInt (fromIntegral (fromIntegral x `shiftR` fromIntegral n :: Word64)))
         _ -> error ("uncheckedShiftRL#: bad args: " <> showValForDebug av)
 
+uncheckedIShiftRAB :: IO Val
+uncheckedIShiftRAB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt n) -> pure (VInt (x `shiftR` fromIntegral n))
+        _ -> error ("uncheckedIShiftRA#: bad args: " <> showValForDebug av)
+
+plusIntHashB :: IO Val
+plusIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (VInt (x + y))
+        _ -> error ("+#: bad args: " <> showValForDebug av)
+
+minusIntHashB :: IO Val
+minusIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (VInt (x - y))
+        _ -> error ("-#: bad args: " <> showValForDebug av)
+
+timesIntHashB :: IO Val
+timesIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (VInt (x * y))
+        _ -> error ("*#: bad args: " <> showValForDebug av)
+
+ltIntHashB :: IO Val
+ltIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x < y))
+        _ -> error ("<#: bad args: " <> showValForDebug av)
+
+leIntHashB :: IO Val
+leIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x <= y))
+        _ -> error ("<=#: bad args: " <> showValForDebug av)
+
+eqIntHashB :: IO Val
+eqIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x == y))
+        _ -> error ("==#: bad args: " <> showValForDebug av)
+
+gtIntHashB :: IO Val
+gtIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x > y))
+        _ -> error (">#: bad args: " <> showValForDebug av)
+
+geIntHashB :: IO Val
+geIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x >= y))
+        _ -> error (">=#: bad args: " <> showValForDebug av)
+
+neIntHashB :: IO Val
+neIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (x /= y))
+        _ -> error ("/=#: bad args: " <> showValForDebug av)
+
+ltCharHashB :: IO Val
+ltCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av < charPrimOrd bv))
+
+leCharHashB :: IO Val
+leCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av <= charPrimOrd bv))
+
+eqCharHashB :: IO Val
+eqCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av == charPrimOrd bv))
+
+gtCharHashB :: IO Val
+gtCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av > charPrimOrd bv))
+
+geCharHashB :: IO Val
+geCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av >= charPrimOrd bv))
+
+neCharHashB :: IO Val
+neCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force a; bv <- force b
+    pure (primBoolVal (charPrimOrd av /= charPrimOrd bv))
+
+charPrimOrd :: Val -> Int
+charPrimOrd (VChar c) = ord c
+charPrimOrd (VInt n)  = fromIntegral n
+charPrimOrd v         = error ("char primop: bad arg: " <> showValForDebug v)
+
 timesInt2B :: IO Val
 timesInt2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
@@ -3011,35 +3260,35 @@ ltWordB :: IO Val
 ltWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (boolVal ((fromIntegral x :: Word64) < fromIntegral y))
+        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) < fromIntegral y))
         _ -> error "ltWord#: bad args"
 
 leWordB :: IO Val
 leWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (boolVal ((fromIntegral x :: Word64) <= fromIntegral y))
+        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) <= fromIntegral y))
         _ -> error "leWord#: bad args"
 
 eqWordB :: IO Val
 eqWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (boolVal (x == y))
+        (VInt x, VInt y) -> pure (primBoolVal (x == y))
         _ -> error "eqWord#: bad args"
 
 gtWordB :: IO Val
 gtWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (boolVal ((fromIntegral x :: Word64) > fromIntegral y))
+        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) > fromIntegral y))
         _ -> error "gtWord#: bad args"
 
 geWordB :: IO Val
 geWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
     case (av, bv) of
-        (VInt x, VInt y) -> pure (boolVal ((fromIntegral x :: Word64) >= fromIntegral y))
+        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) >= fromIntegral y))
         _ -> error "geWord#: bad args"
 
 minusWordB :: IO Val
@@ -4748,4 +4997,3 @@ buildBuiltinTypeableInsts = mapM mkDict prims
             trT <- newWHNFThunk tr
             pure (VCon "Dict_Typeable" [trT])
         pure ("typeableDict_" <> tag, dictT)
-

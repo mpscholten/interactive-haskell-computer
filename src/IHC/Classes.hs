@@ -28,6 +28,15 @@ module IHC.Classes
     , mkTypeRepApp
     , builtinTypeRep
     , typeRepEq
+      -- * Lazy instance dispatch (Haskell 2010 §4.3.2)
+    , InstanceScopeRef
+    , ScanHook
+    , instanceScopeRef
+    , scanHookRef
+    , sharedClassRegRef
+    , setSharedClassReg
+    , unionInstanceScope
+    , currentInstanceScope
     ) where
 
 import Data.ByteString (ByteString)
@@ -35,6 +44,8 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Set as Set
+import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.Val
@@ -280,3 +291,31 @@ typeTagOf (VPrimObj (PrimMVar _))        = BC.pack "<MVar>"
 typeTagOf (VPrimObj (PrimTVar _))        = BC.pack "<TVar>"
 typeTagOf (VPrimObj (PrimThreadId _))    = BC.pack "<ThreadId>"
 typeTagOf (VLabel _)                     = BC.pack "Label"
+
+--------------------------------------------------------------------------------
+-- Lazy instance dispatch (Haskell 2010 §4.3.2)
+--------------------------------------------------------------------------------
+
+type InstanceScopeRef = IORef (Set ByteString)
+type ScanHook = ByteString -> IO ()
+
+{-# NOINLINE instanceScopeRef #-}
+instanceScopeRef :: InstanceScopeRef
+instanceScopeRef = unsafePerformIO (newIORef Set.empty)
+
+{-# NOINLINE scanHookRef #-}
+scanHookRef :: IORef (Maybe ScanHook)
+scanHookRef = unsafePerformIO (newIORef Nothing)
+
+{-# NOINLINE sharedClassRegRef #-}
+sharedClassRegRef :: IORef (Maybe ClassRegistry)
+sharedClassRegRef = unsafePerformIO (newIORef Nothing)
+
+setSharedClassReg :: ClassRegistry -> IO ()
+setSharedClassReg reg = writeIORef sharedClassRegRef (Just reg)
+
+unionInstanceScope :: Set ByteString -> IO ()
+unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
+
+currentInstanceScope :: IO (Set ByteString)
+currentInstanceScope = readIORef instanceScopeRef

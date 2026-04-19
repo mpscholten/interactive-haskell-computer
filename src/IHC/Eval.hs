@@ -117,7 +117,14 @@ eval env ipm = go
         eval env' ipm body
 
     go (ECase scrut alts) = do
-        v <- go scrut
+        v0 <- go scrut
+        -- Primops like `newByteArray#` return an internal VIO wrapper around
+        -- their unboxed-tuple result. A case expression must force that
+        -- wrapper before matching, but must not eagerly execute source-built
+        -- `IO` / `ST` constructors, which use `VCon`.
+        v <- case v0 of
+            VIO _ -> runIOVal v0
+            _     -> pure v0
         tryAlts v alts
 
     go (EIf c t e) = do
@@ -553,6 +560,33 @@ matchPat (PCon "()" []) VUnit = pure (Just [])
 -- but pattern @Proxy@ (nullary) should still match — the payload is
 -- type-level metadata that user code doesn't observe via the ctor.
 matchPat (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
+-- Boxed prim constructors are host-backed wrappers over the interpreter's
+-- primitive runtime values. Pattern matching must therefore treat
+-- @I# x@ / @W# x@ / @W8# x@ as wrappers around 'VInt' and @C# x@ as a
+-- wrapper around 'VChar'; otherwise source bindings like
+-- @new (I# len#) = ...@ never match and libraries such as @text@ fail at
+-- first use after discovery succeeds.
+matchPat (PCon "I#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "W#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "W8#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields [(p, t)] []
+matchPat (PCon "C#" [p]) (VChar c) = do
+    t <- newWHNFThunk (VChar c)
+    matchFields [(p, t)] []
+-- Data.Array.Byte lifted wrappers. The interpreter keeps both mutable and
+-- frozen byte arrays as the same host-backed PrimByteArray object, so the
+-- source constructors just expose that underlying primitive value.
+matchPat (PCon "MutableByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+    t <- newWHNFThunk prim
+    matchFields [(p, t)] []
+matchPat (PCon "ByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+    t <- newWHNFThunk prim
+    matchFields [(p, t)] []
 matchPat (PCon name pats) (VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For
@@ -667,6 +701,19 @@ matchPat (PView fn p) v = do
     -- PView into a case expression via desugarViewPat in the scheduler.
     error ("IHC.Eval: PView reached matchPat — view pattern not desugared: "
             <> show fn <> " -> " <> show p)
+
+matchFields :: [(Pat, Thunk)] -> [(Name, Thunk)] -> IO (Maybe [(Name, Thunk)])
+matchFields [] acc = pure (Just (reverse acc))
+matchFields ((PVar nm, t) : rest) acc =
+    matchFields rest ((nm, t) : acc)
+matchFields ((PWild, _) : rest) acc =
+    matchFields rest acc
+matchFields ((pat, t) : rest) acc = do
+    fv <- force t
+    m  <- matchPat pat fv
+    case m of
+        Nothing   -> pure Nothing
+        Just subs -> matchFields rest (reverse subs ++ acc)
 
 --------------------------------------------------------------------------------
 -- apply
