@@ -59,11 +59,14 @@ import Foreign.LibFFI
     , retCFloat, retCDouble, retCSize
     , retCChar, retCUChar, retPtr, retCString
     )
+import Foreign.Marshal.Alloc (mallocBytes)
+import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
 import System.Directory (doesDirectoryExist, listDirectory)
 import qualified System.Environment as Env
 import System.FilePath ((</>), takeExtension)
 import System.IO.Unsafe (unsafePerformIO)
+import qualified System.IO
 import qualified System.Posix.DynamicLinker as DL
 
 import IHC.Eval (force)
@@ -209,12 +212,8 @@ resolveSymbol sym = do
   where
     findInLibs = do
         libs <- readIORef openLibs
-        -- Try each registered library, then the process-global default.
-        -- DL.Default translates to dlsym(RTLD_DEFAULT, …) which on Darwin
-        -- walks every library already loaded by the binary (libSystem, any
-        -- -l flags the linker baked in, and anything previously dlopen'd).
         tryEach (map snd libs ++ [DL.Default])
-    tryEach []     = pure Nothing
+    tryEach [] = pure Nothing
     tryEach (h:hs) = do
         r <- try' (DL.dlsym h (BC.unpack sym))
         case r of
@@ -285,6 +284,23 @@ ptrFromVal v = case v of
     VCon "FunPtr" [t]                 -> force t >>= ptrFromVal
     VCon "ForeignPtr" (addrT : _)     -> force addrT >>= ptrFromVal
     VInt 0                            -> pure nullPtr
+    -- ByteArray# / MutableByteArray# passed to C: our PrimByteArray
+    -- wraps a ByteString.  Pin its bytes and hand out a raw pointer.
+    -- The MallocForeignPtr (from the ByteString's slice) keeps the
+    -- payload alive as long as the ByteString reference persists in
+    -- the IORef.  unsafeUseAsCString + unsafePerformIO would allow
+    -- the continuation to exit before the dispatch — instead we copy
+    -- into a malloc buffer so the pointer remains valid past the
+    -- callForeign boundary.  Leaks are acceptable for FFI arg
+    -- marshalling (bounded by the number of actual calls).
+    VPrimObj (PrimByteArray ref)      -> do
+        bs <- readIORef ref
+        p  <- BS.useAsCString bs (\cp -> do
+                 let len = BS.length bs
+                 buf <- mallocBytes len
+                 BS.useAsCString bs (\src -> copyBytes buf src len)
+                 pure (castPtr buf :: Ptr ()))
+        pure p
     _ -> error ("IHC.FFI: expected Ptr/FunPtr, got " <> showValForDebug v)
 
 -- | Pull out a 'ByteString' for 'CString' marshalling.

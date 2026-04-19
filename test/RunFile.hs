@@ -450,7 +450,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runMainWithSiblings
                 "test/Fixtures/Modules/qualified_class_method/Main.hs")
         n   `shouldBe` 0
-        out `shouldBe` "-42\n<function>\n"
+        out `shouldBe` "-42\n9223372036854775807\n"
 
     it "cache fallback: import Control.Monad.State from cached mtl (skip if not cached)" do
         -- Runs end-to-end only when BOTH (a) mtl-2.3.2 is available in

@@ -260,6 +260,8 @@ builtins reg =
     , ("truncate", floatToIntB truncate)
     , ("fromIntegral", fromIntegralB)
     , ("fromInteger",  fromIntegralB)
+    , ("maxBound",     maxBoundB)
+    , ("minBound",     minBoundB)
     , (".",        compose)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
@@ -2295,6 +2297,18 @@ chrB = pure $ VFun $ \a -> do
 
 -- | 'fromIntegral' / 'fromInteger' coercion. Accepts Int or Float/Double;
 -- returns the value unchanged (we have one Int type and one Float type).
+-- | 'maxBound' / 'minBound' — class methods of Bounded.  Nullary, so our
+-- arg-directed dispatcher can't pick an instance without a type hint.
+-- Default to Int bounds, which is what most real-world code wants
+-- (`maxBound :: Int` shows up in text's `length` and many others).
+-- Code that explicitly asks for `maxBound :: Word8` via @TypeApplications@
+-- is handled separately by the @VClassMethod + @T@ path.
+maxBoundB :: IO Val
+maxBoundB = pure (VInt maxBound)
+
+minBoundB :: IO Val
+minBoundB = pure (VInt minBound)
+
 fromIntegralB :: IO Val
 fromIntegralB = pure $ VFun $ \a -> do
     av <- force a
@@ -2302,7 +2316,25 @@ fromIntegralB = pure $ VFun $ \a -> do
         VInt n   -> pure (VInt n)
         VFloat d -> pure (VFloat d)
         VChar c  -> pure (VInt (fromIntegral (ord c)))
+        -- Newtype numeric wrappers we handle by name so we don't eat
+        -- every single-field constructor (ST, Identity, Maybe-Just, …).
+        VCon c [t]
+          | c `elem` numericNewtypeCons -> do
+              inner <- force t
+              case inner of
+                  VInt n   -> pure (VInt n)
+                  VFloat d -> pure (VFloat d)
+                  _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
         _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
+  where
+    numericNewtypeCons =
+        [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
+        , "CShort", "CUShort", "CLLong", "CULLong"
+        , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
+        , "Int8", "Int16", "Int32", "Int64"
+        , "Word", "Word8", "Word16", "Word32", "Word64"
+        , "CFloat", "CDouble"
+        ]
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops

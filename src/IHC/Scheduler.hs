@@ -186,6 +186,11 @@ loadProgram = loadProgramFromSource []
 -- to enumerate them.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
+    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
+    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
+    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
+    -- the nix-built libhs<pkg>-cbits.dylib.
+    FFI.registerCbitsDylibs
     -- Enumerate cached packages once; hs-source-dirs are respected via
     -- parseCabalFile inside cachedPackageSearchPath.
     -- Also collect include-dirs so CPP can find package headers.
