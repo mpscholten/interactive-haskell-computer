@@ -2569,6 +2569,12 @@ tokensToFFIFromKinds = go
     go [TkConId c]            = tyConToFFI c Nothing
     go [TkConId c, TkConId a] = tyConToFFI c (Just (Left a))
     go [TkConId c, TkIdent a] = tyConToFFI c (Just (Right a))
+    -- Unboxed types with MagicHash suffix (ByteArray#, MutableByteArray#,
+    -- Addr#, State#) are lexed as TkPrimId rather than TkConId.  They
+    -- appear in foreign-import signatures (text/bytestring/network use
+    -- ByteArray# extensively).  Route them through tyConToFFI.
+    go [TkPrimId c]           = tyConToFFI c Nothing
+    go (TkPrimId c : _)       = tyConToFFI c Nothing
     -- Ptr-like: @Ptr CChar@ / @Ptr a@ / @Ptr (Ptr a)@. We don't track
     -- the payload precisely — libffi treats every pointer as a pointer.
     go (TkConId "Ptr" : _)       = Just (FFIPtr FFIVoid)

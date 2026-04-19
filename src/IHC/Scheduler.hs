@@ -525,7 +525,9 @@ loadFileIntoEnv searchPath path existingEnv = do
     conEnv    <- buildConEnv  unionedData
     fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
-    let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
+    -- Foreign import dispatchers (see parallel call in loadImportOnlyIntoEnv).
+    ffiEnv    <- buildForeignEnv loadedModules fullSearchPath
+    let baseNoClass = Map.union builtins (Map.union fieldEnv' (Map.union conEnv ffiEnv))
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = Map.union classMethodEnv baseNoClass
     -- Phase 2.11: expand TH splices.
@@ -1146,7 +1148,14 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     conEnv    <- buildConEnv unionedData
     fieldEnv' <- buildFieldAccessorEnv publicFields unionedFields
     builtins  <- builtinEnv classReg
-    let baseNoClass = Map.union builtins (Map.union fieldEnv' conEnv)
+    -- Foreign import dispatcher thunks keyed as @__ffi.Module.name@.
+    -- Required so that bodies referencing `foreign import ccall` names
+    -- (e.g. Data.Text.Internal.Measure's @measure_off@) can be
+    -- dispatched via libffi when forced at eval time.  Without this,
+    -- the sentinel EVar inserted by buildLoadedModule points at a key
+    -- that isn't in the env.
+    ffiEnv   <- buildForeignEnv loadedModules0 fullSearchPath
+    let baseNoClass = Map.union builtins (Map.union fieldEnv' (Map.union conEnv ffiEnv))
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
     let baseForImport = Map.union classMethodEnv baseNoClass
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
@@ -3221,11 +3230,6 @@ resolveImport registry searchPath includeMap lm name = do
                     case mTargetLm of
                         Nothing       -> tryImports rest
                         Just targetLm -> do
-                            -- Foreign imports are pre-populated into lmBodies
-                            -- as `EVar (ffiSynthKey …)` sentinels by
-                            -- buildLoadedModule.  findOrResolveLhs below
-                            -- only sees normal LHS bindings, so check bodies
-                            -- first for the ffi sentinel.
                             tgtBodies <- readIORef (lmBodies targetLm)
                             let ffiKey = ffiSynthKey (lmName targetLm) name
                                 isFfi  = case Map.lookup name tgtBodies of
