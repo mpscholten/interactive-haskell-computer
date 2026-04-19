@@ -97,11 +97,6 @@ defaultCppContext = Map.fromList
     , ("HS_cstringLength_AND_FinalPtr_AVAILABLE", MObj "1")
     , ("HS_unsafeWithForeignPtr_AVAILABLE",       MObj "1")
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
-    -- text's pure-Haskell path: use Haskell implementations of
-    -- `_hs_text_measure_off` etc. from Data.Text.Internal.Measure
-    -- instead of `foreign import ccall` to libHStext's cbits.  We
-    -- can execute the primop-using bodies but have no cbits dylib.
-    , ("PURE_HASKELL",                            MObj "1")
     ]
 
 -- | Hard cap on include nesting depth to prevent infinite recursion.
