@@ -3097,8 +3097,14 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                                 | otherwise -> do
                                     mForeign <- resolveImport registry searchPath includeMap lm name
                                     case mForeign of
-                                        Just () ->
-                                            modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
+                                        Just srcMod ->
+                                            -- Point at the actual providing
+                                            -- module's FQN, not a bare-name
+                                            -- self-reference (which would
+                                            -- self-loop at eval time).
+                                            modifyIORef' (lmBodies lm)
+                                                (Map.insert name
+                                                    (EVar (srcMod <> BC.pack "." <> name)))
                                         Nothing ->
                                             pure ()
                             Just expr0 -> do
@@ -3130,14 +3136,14 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                             -- Not local. Try imports.
                             mForeign <- resolveImport registry searchPath includeMap lm name
                             case mForeign of
-                                Just () ->
-                                    -- Memoize: mark this name as handled in the
-                                    -- current module's bodies so that repeated
-                                    -- calls to discoverInModule for the same
-                                    -- (module, name) pair short-circuit
-                                    -- immediately without re-traversing imports.
-                                    -- EVar name acts as a "foreign alias" sentinel.
-                                    modifyIORef' (lmBodies lm) (Map.insert name (EVar name))
+                                Just srcMod ->
+                                    -- Memoize: point at the actual providing
+                                    -- module's FQN so eval-time lookup goes
+                                    -- through thunkByKey to the real binding
+                                    -- (foreign-import sentinel or source body).
+                                    modifyIORef' (lmBodies lm)
+                                        (Map.insert name
+                                            (EVar (srcMod <> BC.pack "." <> name)))
                                 Nothing ->
                                     -- Assume a builtin; let the evaluator
                                     -- complain if truly missing.
@@ -3175,7 +3181,7 @@ resolveImport
     -> Map FilePath [FilePath]  -- ^ include-dirs map
     -> LoadedModule
     -> ByteString
-    -> IO (Maybe ())
+    -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
     -- Only unqualified (non-qualified-import) imports can provide
     -- unqualified names.
@@ -3215,25 +3221,40 @@ resolveImport registry searchPath includeMap lm name = do
                     case mTargetLm of
                         Nothing       -> tryImports rest
                         Just targetLm -> do
-                            mLhs <- findOrResolveLhs (lmSource targetLm)
-                                                     (lmKnown targetLm) name
-                            case mLhs of
-                                Just _ ->
-                                    if exportsName targetLm name
-                                        then do
-                                            discoverInModule registry searchPath includeMap targetLm name
-                                            pure (Just ())
-                                        else tryImports rest
-                                Nothing
-                                    -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
-                                    -- the type's data registry has the field, the export
-                                    -- list admits it via `T(..)`. No separate binding; the
-                                    -- later-built fieldEnv will synthesize it.
-                                    | Map.member name (lmFieldReg targetLm)
-                                    , exportsName targetLm name -> pure (Just ())
-                                    -- The name isn't defined locally in targetLm.
-                                    | exportsName targetLm name -> followNamedReexport targetLm rest
-                                    | otherwise -> followModuleReexports targetLm rest
+                            -- Foreign imports are pre-populated into lmBodies
+                            -- as `EVar (ffiSynthKey …)` sentinels by
+                            -- buildLoadedModule.  findOrResolveLhs below
+                            -- only sees normal LHS bindings, so check bodies
+                            -- first for the ffi sentinel.
+                            tgtBodies <- readIORef (lmBodies targetLm)
+                            let ffiKey = ffiSynthKey (lmName targetLm) name
+                                isFfi  = case Map.lookup name tgtBodies of
+                                            Just (EVar k) -> k == ffiKey
+                                            _             -> False
+                            if isFfi && exportsName targetLm name
+                              then do
+                                discoverInModule registry searchPath includeMap targetLm name
+                                pure (Just (lmName targetLm))
+                              else do
+                                mLhs <- findOrResolveLhs (lmSource targetLm)
+                                                         (lmKnown targetLm) name
+                                case mLhs of
+                                    Just _ ->
+                                        if exportsName targetLm name
+                                            then do
+                                                discoverInModule registry searchPath includeMap targetLm name
+                                                pure (Just (lmName targetLm))
+                                            else tryImports rest
+                                    Nothing
+                                        -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
+                                        -- the type's data registry has the field, the export
+                                        -- list admits it via `T(..)`. No separate binding; the
+                                        -- later-built fieldEnv will synthesize it.
+                                        | Map.member name (lmFieldReg targetLm)
+                                        , exportsName targetLm name -> pure (Just (lmName targetLm))
+                                        -- The name isn't defined locally in targetLm.
+                                        | exportsName targetLm name -> followNamedReexport targetLm rest
+                                        | otherwise -> followModuleReexports targetLm rest
 
     -- | @targetLm@ exports @name@ by name (ExportName entry) but doesn't
     -- define it locally.  Walk @targetLm@'s own unqualified imports and
@@ -3273,7 +3294,7 @@ resolveImport registry searchPath includeMap lm name = do
                                $ moduleReexports (lmHeader via)
             r <- tryReexports [lmName via] reexportedMods rest
             case r of
-                Just () -> pure (Just ())
+                Just m  -> pure (Just m)
                 Nothing -> do
                     -- Follow the via module's imports.  We include
                     -- QUALIFIED imports as well as unqualified ones because
@@ -3317,27 +3338,21 @@ resolveImport registry searchPath includeMap lm name = do
                         if exportsName srcLm name
                             then do
                                 discoverInModule registry searchPath includeMap srcLm name
-                                pure (Just ())
+                                pure (Just (lmName srcLm))
                             else tryViaImports moreImps depth rest
                     Nothing ->
                         -- srcLm might itself re-export via unqualified imports
                         -- (go one level deeper, decrementing the depth cap).
                         if exportsName srcLm name
                             then followNamedReexportD (depth - 1) srcLm rest >>= \case
-                                    Just () -> pure (Just ())
+                                    Just m  -> pure (Just m)
                                     Nothing -> tryViaImports moreImps depth rest
                             else tryViaImports moreImps depth rest
             _ ->
                 -- Module not yet loaded.
-                -- Block bare GHC.* modules (GHC.Base, GHC.Num, etc.) to avoid
-                -- pulling in unimplemented primops at bulk load time.
-                -- GHC.Internal.* are allowed — they hold the real definitions.
                 if isBlockedGhc
                     then tryViaImports moreImps depth rest
                     else do
-                -- Use a targeted search (findOrResolveLhs) which only parses
-                -- the specific binding, so loading a cache module here is safe
-                -- even for large libraries — we never bulk-parse the whole file.
                     r <- try (loadModule registry searchPath includeMap (impModule imp))
                                 :: IO (Either SomeException LoadedModule)
                     case r of
@@ -3349,15 +3364,12 @@ resolveImport registry searchPath includeMap lm name = do
                                     if exportsName srcLm name
                                         then do
                                             discoverInModule registry searchPath includeMap srcLm name
-                                            pure (Just ())
+                                            pure (Just (lmName srcLm))
                                         else tryViaImports moreImps depth rest
                                 Nothing ->
-                                    -- Not defined directly in srcLm; recurse one
-                                    -- level deeper if srcLm exports the name via
-                                    -- its own imports (limited by depth).
                                     if exportsName srcLm name && depth > 1
                                         then followNamedReexportD (depth - 1) srcLm rest >>= \case
-                                                Just () -> pure (Just ())
+                                                Just m  -> pure (Just m)
                                                 Nothing -> tryViaImports moreImps depth rest
                                         else tryViaImports moreImps depth rest
 
@@ -3401,14 +3413,14 @@ resolveImport registry searchPath includeMap lm name = do
                                     then do
                                         r <- try (discoverInModule registry searchPath includeMap reLm name) :: IO (Either SomeException ())
                                         case r of
-                                            Right () -> pure (Just ())
+                                            Right () -> pure (Just (lmName reLm))
                                             Left  _  -> tryReexports visited mods rest
                                     else tryReexports visited mods rest
                             Nothing ->
                                 -- Go one level deeper if reLm itself has module re-exports.
                                 -- Mark modName as visited to prevent cycles.
                                 followModuleReexportsV (modName : visited) reLm [] >>= \case
-                                    Just ()  -> pure (Just ())
+                                    Just m   -> pure (Just m)
                                     Nothing  -> tryReexports visited mods rest
 
 specAllows :: ImportSpec -> ByteString -> Bool
