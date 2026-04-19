@@ -686,6 +686,21 @@ matchPat (PCon "ST" [p]) (VIO action) = do
             resT <- newWHNFThunk result
             pure (VCon "(#,#)" [stT, resT])
     matchPat p stFn
+-- Pattern-match-driven type-class dispatch: when a class method
+-- dispatcher flows into a position where the pattern expects a
+-- specific constructor, the pattern tells us the type.  Feed the
+-- constructor name as a type tag to the dispatcher; the closure
+-- looks up the instance method for that type (e.g. `mempty :: Text`
+-- for `PCon "Text" _`) and returns the concrete value, which we
+-- then re-match.  This is the backbone of nullary class-method
+-- dispatch (mempty, maxBound, empty, …) in an otherwise
+-- arg-directed runtime.
+matchPat pat@(PCon pname _) (VClassMethod _ _ _ go) = do
+    dummyT <- newWHNFThunk VUnit
+    resolved <- go [pname] dummyT
+    case resolved of
+        VClassMethod{} -> pure Nothing
+        _              -> matchPat pat resolved
 matchPat (PCon pname ppats) v = do
     pure Nothing
 -- Record patterns: should have been desugared to PCon by the scheduler.

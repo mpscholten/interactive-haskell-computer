@@ -1818,8 +1818,33 @@ defaultTypeTag = BC.pack "<default>"
 -- Remaining arguments (if any) flow through naturally via
 -- the returned VFun's own arity.
 classMethodDispatcher :: ClassRegistry -> ByteString -> ByteString -> Val
-classMethodDispatcher reg cls methodName = dispatch 4 []
+classMethodDispatcher reg cls methodName = selfVal
   where
+    -- We knot-tie `selfVal` so the closure can return it as a
+    -- "not dispatched" marker when tag-path lookup misses — matchPat
+    -- in Eval treats a returned VClassMethod as "no match".
+    selfVal = VClassMethod methodName 0 [] $ \tags argT -> case tags of
+        -- Type-tag-driven path: matchPat synthesised a tag from a PCon
+        -- pattern.  Look up the instance method for that type and
+        -- return it WITHOUT applying — the argT we were given is a
+        -- matchPat sentinel (VUnit), not a real class-method arg.
+        -- Nullary methods (mempty, maxBound) return a concrete value
+        -- that matchPat can re-match directly.  Unary+ methods return
+        -- a VFun; matchPat treats that as "no match" and the dispatch
+        -- fails cleanly.
+        (firstTag:_) | isDispatchableTag firstTag -> do
+            mM <- lookupInstanceMethod reg cls firstTag methodName
+            mShared <- lookupInSharedReg cls firstTag methodName
+            case preferMethod mM mShared of
+                Just methodVal
+                  | not (isMethodPlaceholder methodVal) -> pure methodVal
+                _ -> pure selfVal   -- no instance; tell caller "no match"
+        _ -> argDirectedDispatch argT
+    argDirectedDispatch argT0 = do
+        let go = dispatch 4 []
+        case go of
+            VFun f -> f argT0
+            _      -> pure go
     -- @dispatch remaining accArgs@: try looking up an instance for the
     -- next argument.  If the argument isn't dispatchable (it's a
     -- function or unit), walk past it and retry on the next argument,
