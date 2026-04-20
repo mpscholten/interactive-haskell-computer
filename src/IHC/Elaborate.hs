@@ -412,30 +412,123 @@ resolveSynonymHop = expandSyn
 -- 'Type'.  Shares the same grammar as 'IHC.Scan.parseScheme' body
 -- parse.  Returns 'Nothing' on malformed input.
 --
--- NOTE: currently a stub — proper implementation would tokenise the
--- bytes via the lexer and call the same parser used by 'scanTypeSigs'.
--- For MVP we accept simple heads like "Maybe", "Maybe Int", "StateT
--- Int Identity Int" etc.
+-- NOTE: still a partial parser — proper implementation would tokenise
+-- the bytes via the lexer and call the same parser used by
+-- 'scanTypeSigs'.  This hand-rolled variant handles the common
+-- annotations actually seen at REPL prompts and inside fixtures:
+-- bare constructors, applications, list brackets, parens, and
+-- tuples.  Arrows and class contexts are not handled (they're rare
+-- inside a @::@ on an expression).
 parseRawTypeExpr :: ByteString -> Maybe Type
-parseRawTypeExpr bs =
-    let trimmed = BC.dropWhile (== ' ') bs
-        tokens  = BC.words trimmed
-    in case tokens of
-        []      -> Nothing
-        (hd:_)
-            | isUpper (BC.head hd) ->
-                -- Head constructor + optional args.
-                -- For MVP: build left-assoc TyApp with each word.
-                let parts = map (\w ->
-                        if isUpper (BC.head w)
-                            then TyCon w
-                            else TyVar w) tokens
-                in case parts of
-                    []       -> Nothing
-                    (p:ps)   -> Just (foldl TyApp p ps)
-            | otherwise -> Just (TyVar hd)
+parseRawTypeExpr bs = do
+    (t, rest) <- parseT (tokenize (trimSpaces bs))
+    case dropSpacesT rest of
+        [] -> Just t
+        _  -> Just t   -- ignore trailing junk — best effort
   where
+    trimSpaces = BC.dropWhile isSpc
+    isSpc c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+    -- One simple type = list of atoms folded into a TyApp chain.
+    parseT toks = do
+        (a, rest) <- parseAtom toks
+        (as, rest') <- parseAtoms rest
+        pure (foldl TyApp a as, rest')
+
+    parseAtoms toks = case dropSpacesT toks of
+        [] -> Just ([], toks)
+        (TRParen : _)   -> Just ([], toks)
+        (TRBracket : _) -> Just ([], toks)
+        (TComma : _)    -> Just ([], toks)
+        _ -> case parseAtom toks of
+            Nothing -> Just ([], toks)
+            Just (a, rest) -> do
+                (as, rest') <- parseAtoms rest
+                pure (a : as, rest')
+
+    parseAtom toks = case dropSpacesT toks of
+        (TCon n : rest) -> Just (TyCon n, rest)
+        (TVar n : rest) -> Just (TyVar n, rest)
+        (TLBracket : rest) -> do
+            (inner, rest1) <- parseT rest
+            case dropSpacesT rest1 of
+                (TRBracket : rest2) -> Just (TyApp (TyCon (BC.pack "[]")) inner, rest2)
+                _ -> Nothing
+        (TLParen : rest0) ->
+            case dropSpacesT rest0 of
+                (TRParen : rest1) ->
+                    Just (TyCon (BC.pack "()"), rest1)
+                _ -> do
+                    (first, rest1) <- parseT rest0
+                    case dropSpacesT rest1 of
+                        (TRParen : rest2) -> Just (first, rest2)
+                        (TComma : _)      -> parseTupleTail first rest1
+                        _                 -> Nothing
+        _ -> Nothing
+
+    -- After first tuple element, parse remaining comma-separated
+    -- elements and close with ')'.  Builds (,)-style tuple type.
+    parseTupleTail first toks = do
+        (elts, rest) <- goTup [first] toks
+        let n        = length elts
+            tupleCon = TyCon (BC.pack ("(" ++ replicate (n - 1) ',' ++ ")"))
+        Just (foldl TyApp tupleCon elts, rest)
+      where
+        goTup acc toks' = case dropSpacesT toks' of
+            (TComma : rest) -> do
+                (t, rest1) <- parseT rest
+                goTup (acc ++ [t]) rest1
+            (TRParen : rest) -> Just (acc, rest)
+            _ -> Nothing
+
+    dropSpacesT :: [RTok] -> [RTok]
+    dropSpacesT = id   -- tokenizer already strips whitespace
+
+-- | Lightweight tokens for 'parseRawTypeExpr'.
+data RTok
+    = TCon !ByteString
+    | TVar !ByteString
+    | TLParen
+    | TRParen
+    | TLBracket
+    | TRBracket
+    | TComma
+    deriving (Eq, Show)
+
+tokenize :: ByteString -> [RTok]
+tokenize bs
+    | BC.null bs = []
+    | otherwise =
+        let c = BC.head bs
+            rest = BC.tail bs
+        in case c of
+            ' '  -> tokenize rest
+            '\t' -> tokenize rest
+            '\n' -> tokenize rest
+            '('  -> TLParen : tokenize rest
+            ')'  -> TRParen : tokenize rest
+            '['  -> TLBracket : tokenize rest
+            ']'  -> TRBracket : tokenize rest
+            ','  -> TComma : tokenize rest
+            _
+              | isIdentStart c ->
+                    let (ident, rest') = BC.span isIdentChar bs
+                        tok = if isUpper (BC.head ident)
+                                then TCon ident
+                                else TVar ident
+                    in tok : tokenize rest'
+              | otherwise ->
+                    -- Unknown char: skip.  Prior behaviour was to
+                    -- drop entire token stream; being permissive
+                    -- works better for the common "trailing
+                    -- whitespace / operator fragments" case.
+                    tokenize rest
+  where
+    isIdentStart c = isUpper c || isLower c || c == '_'
+    isIdentChar c  = isIdentStart c || (c >= '0' && c <= '9') || c == '\''
+                     || c == '.'
     isUpper c = c >= 'A' && c <= 'Z'
+    isLower c = c >= 'a' && c <= 'z'
 
 -- | Minimal monadic foldM — pure; not used yet.
 foldM :: (Monad m) => (b -> a -> m b) -> b -> [a] -> m b
