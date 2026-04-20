@@ -281,6 +281,7 @@ builtins reg =
     , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("++",       listConcat)
+    , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
     , ("length",   lengthB)
     -- Data.ByteString shims (see isBuiltinBackedModule comment).
@@ -896,8 +897,13 @@ forceInstanceMethod Nothing  = pure Nothing
 forceInstanceMethod (Just v) = do
     r <- try (forceMethodVal v) :: IO (Either SomeException Val)
     case r of
-        Right v' -> pure (Just v')
-        Left  _  -> pure Nothing
+        Right v'
+          | isPlaceholder v' -> pure Nothing   -- treat placeholder as miss
+          | otherwise        -> pure (Just v')
+        Left  _              -> pure Nothing
+  where
+    isPlaceholder (VCon n []) = n == BC.pack "<ihc-method-placeholder>"
+    isPlaceholder _           = False
 
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
 eqVals reg av bv = case (av, bv) of
@@ -1443,6 +1449,38 @@ listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         pure (VCon ":" [h, restT])
     appendVal other _ =
         error ("(++): not a list: " <> showValForDebug other)
+
+-- | @concatMap :: (a -> [b]) -> [a] -> [b]@ — builtin so that our
+-- list-comprehension desugar ('IHC.Parser.parseListComp') and the
+-- @Monad []@ instance body in @GHC.Internal.Base@ ('>>=' via the
+-- list comprehension desugar) don't depend on @concatMap@ being in
+-- the caller's env.  @GHC.Internal.Base@ does not import
+-- @GHC.Internal.List@ (where concatMap is defined in source), so
+-- without a builtin the Monad [] method body throws "unbound" at
+-- force time and the dispatcher falls through to IO.
+concatMapB :: IO Val
+concatMapB = pure $ VFun $ \ft -> pure $ VFun $ \xst -> do
+    f  <- force ft
+    xs <- force xst
+    go f xs
+  where
+    go _ (VCon "[]" _) = pure (VCon "[]" [])
+    go f (VCon ":" [h, t]) = do
+        -- @f h@ is a list; concatenate with recursion on tail.
+        fhv   <- apply f h
+        tv    <- force t
+        rest  <- go f tv
+        append fhv rest
+    go _ other = error ("concatMap: not a list: " <> showValForDebug other)
+
+    append (VCon "[]" _)     ys = pure ys
+    append (VCon ":" [h, t]) ys = do
+        tv    <- force t
+        rest  <- append tv ys
+        restT <- newWHNFThunk rest
+        pure (VCon ":" [h, restT])
+    append other _ =
+        error ("concatMap.append: not a list: " <> showValForDebug other)
 
 -- Phase 3.5: OverloadedLabels ------------------------------------------------
 

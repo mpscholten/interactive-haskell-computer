@@ -238,6 +238,31 @@ loadProgramFromSource searchPath src0 = do
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
+    -- Force-load a small set of core modules that provide fundamental
+    -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
+    -- Either; Show/Eq/Ord for primitives; etc.).  Without this, a
+    -- fixture like @main = print (fmap (+10) [1,2,3])@ never triggers
+    -- loading of @GHC.Internal.Base@ because every FV in its body
+    -- (@print@, @fmap@, numeric ops) short-circuits via the builtin
+    -- name set — and an instance that isn't scanned is an instance
+    -- that won't register.  These modules are cheap to parse and
+    -- their instance decls are needed for dispatch-time lookups to
+    -- succeed.
+    let coreInstanceModules =
+            [ BC.pack "GHC.Internal.Base"
+            , BC.pack "GHC.Internal.Show"
+            , BC.pack "GHC.Internal.Enum"
+            , BC.pack "GHC.Internal.Num"
+            , BC.pack "GHC.Internal.Real"
+            , BC.pack "GHC.Internal.Maybe"
+            ]
+    forM_ coreInstanceModules $ \m -> do
+        r <- try (loadModule registry fullSearchPath includeMap m)
+                :: IO (Either SomeException LoadedModule)
+        case r of
+            Right _ -> pure ()
+            Left  _ -> pure ()   -- best-effort; keep going if a module is absent
+
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
     -- are in the tied env before methods are evaluated. Without this,
