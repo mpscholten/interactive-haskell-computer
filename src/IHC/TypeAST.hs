@@ -1,0 +1,142 @@
+-- | Type AST used by on-demand type inference (see
+-- 'IHC.Elaborate').  Rank-1, single-parameter class constraints only —
+-- enough to resolve ambiguous class dispatches in mtl-style code.
+-- Not intended as a complete surface-Haskell type system.
+module IHC.TypeAST
+    ( Type(..)
+    , Pred(..)
+    , Scheme(..)
+    , Subst
+    , emptySubst
+    , applySubst
+    , applySubstPred
+    , applySubstScheme
+    , composeSubst
+    , freeTyVars
+    , freeTyVarsScheme
+    , tyHead
+    , tyArrowArgs
+    , tyApps
+    , isMonoType
+    ) where
+
+import Data.ByteString (ByteString)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
+
+import IHC.AST (Name)
+
+-- | Types as used by the elaborator.
+data Type
+    = TyVar   !Name             -- ^ type variable: @a@, @s@, @m@
+    | TyCon   !Name             -- ^ type constructor: @Int@, @Maybe@, @StateT@
+    | TyApp   !Type !Type       -- ^ application: @Maybe Int@ = @TyApp (TyCon "Maybe") (TyCon "Int")@
+    | TyArrow !Type !Type       -- ^ function: @Int -> Bool@
+    | TyForall ![Name] ![Pred] !Type
+        -- ^ polymorphic: @forall a. Eq a => a -> Bool@
+    deriving (Eq, Show)
+
+-- | Class constraint: @Monad m@ = @Pred "Monad" (TyVar "m")@.
+-- Multi-parameter constraints (e.g. @MonadState s m@) use 'TyApp' to
+-- group the arguments: @Pred "MonadState" (TyApp (TyVar "s") (TyVar "m"))@
+-- — callers flatten via 'predArgs' when matching instances.
+data Pred = Pred !Name !Type
+    deriving (Eq, Show)
+
+-- | Quantified type.  Used for top-level bindings and class method
+-- signatures.  E.g. @forall s a. Monad (StateT s m) => runStateT ::
+-- StateT s m a -> s -> m (a, s)@.
+data Scheme = Scheme ![Name] ![Pred] !Type
+    deriving (Eq, Show)
+
+-- | Substitution from type variable names to types.  Composed
+-- left-to-right ('composeSubst' s1 s2 applies s1 first, then s2).
+type Subst = Map Name Type
+
+emptySubst :: Subst
+emptySubst = Map.empty
+
+-- | Apply a substitution to a type.  Not idempotent — caller may need
+-- to compose with existing substitution.
+applySubst :: Subst -> Type -> Type
+applySubst s t = case t of
+    TyVar n      -> case Map.lookup n s of
+        Just t' -> applySubst s t'   -- chase: substitutions may map to other vars
+        Nothing -> TyVar n
+    TyCon n      -> TyCon n
+    TyApp a b    -> TyApp (applySubst s a) (applySubst s b)
+    TyArrow a b  -> TyArrow (applySubst s a) (applySubst s b)
+    TyForall vs preds body ->
+        -- Bound variables shadow the substitution.
+        let s' = foldr Map.delete s vs
+        in TyForall vs (map (applySubstPred s') preds) (applySubst s' body)
+
+applySubstPred :: Subst -> Pred -> Pred
+applySubstPred s (Pred cls t) = Pred cls (applySubst s t)
+
+applySubstScheme :: Subst -> Scheme -> Scheme
+applySubstScheme s (Scheme vs preds body) =
+    let s' = foldr Map.delete s vs
+    in Scheme vs (map (applySubstPred s') preds) (applySubst s' body)
+
+-- | Compose two substitutions: @composeSubst s1 s2@ is "apply s1, then s2".
+-- Classical implementation: s2 ∘ s1 = map (applySubst s2) s1 ∪ s2.
+composeSubst :: Subst -> Subst -> Subst
+composeSubst s1 s2 = Map.union (Map.map (applySubst s2) s1) s2
+
+-- | Free type variables appearing in a type.
+freeTyVars :: Type -> Set Name
+freeTyVars t = case t of
+    TyVar n      -> Set.singleton n
+    TyCon _      -> Set.empty
+    TyApp a b    -> Set.union (freeTyVars a) (freeTyVars b)
+    TyArrow a b  -> Set.union (freeTyVars a) (freeTyVars b)
+    TyForall vs preds body ->
+        Set.difference
+            (Set.unions
+                (freeTyVars body : map freeTyVarsPred preds))
+            (Set.fromList vs)
+  where
+    freeTyVarsPred (Pred _ x) = freeTyVars x
+
+freeTyVarsScheme :: Scheme -> Set Name
+freeTyVarsScheme (Scheme vs preds body) =
+    Set.difference
+        (Set.unions (freeTyVars body : map (freeTyVars . predArg) preds))
+        (Set.fromList vs)
+  where
+    predArg (Pred _ x) = x
+
+-- | Leftmost head constructor of a type application chain.  Returns
+-- 'Nothing' if the head is a type variable or an arrow.
+--
+-- > tyHead (Maybe Int)                 = Just "Maybe"
+-- > tyHead (StateT s Identity)         = Just "StateT"
+-- > tyHead (m a)                       = Nothing
+-- > tyHead (a -> b)                    = Nothing
+tyHead :: Type -> Maybe Name
+tyHead = go
+  where
+    go (TyCon n)   = Just n
+    go (TyApp a _) = go a
+    go _           = Nothing
+
+-- | Destructure @a -> b -> ... -> r@ into @([a, b, ...], r)@.
+tyArrowArgs :: Type -> ([Type], Type)
+tyArrowArgs (TyArrow a r) =
+    let (xs, res) = tyArrowArgs r
+    in (a : xs, res)
+tyArrowArgs t = ([], t)
+
+-- | Collect the tail of type-app arguments: @TyApp (TyApp M a) b@ → @(M, [a, b])@.
+tyApps :: Type -> (Type, [Type])
+tyApps = go []
+  where
+    go acc (TyApp a b) = go (b : acc) a
+    go acc t           = (t, acc)
+
+-- | True if the type contains no 'TyVar' nodes (monomorphic).
+isMonoType :: Type -> Bool
+isMonoType t = Set.null (freeTyVars t)
