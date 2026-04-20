@@ -484,15 +484,20 @@ nextToken s c0 =
             Nothing   -> (BS.pack (reverse acc), p)          -- EOF; close loosely
             Just 0x22 -> (BS.pack (reverse acc), p)          -- closing quote
             Just 0x5C ->                                      -- backslash
-                case readEscape s (p + 1) of
-                    Just (c, p') ->
-                        scanStr p' (reverse (encodeCharUtf8 c) ++ acc)
-                    Nothing ->
-                        -- Unrecognized escape: drop the backslash, skip
-                        -- a char to avoid looping. Unterminated on EOF.
-                        case peekByte s (p + 1) of
-                            Just b' -> scanStr (p + 2) (b' : acc)
-                            Nothing -> (BS.pack (reverse acc), p + 1)
+                -- Haskell 2010 §2.6 string gap: @\<whitespace>\@ elides
+                -- both backslashes and the whitespace between them
+                -- (used for multi-line string continuation).
+                case tryStringGap s (p + 1) of
+                    Just p' -> scanStr p' acc
+                    Nothing -> case readEscape s (p + 1) of
+                        Just (c, p') ->
+                            scanStr p' (reverse (encodeCharUtf8 c) ++ acc)
+                        Nothing ->
+                            -- Unrecognized escape: drop the backslash, skip
+                            -- a char to avoid looping. Unterminated on EOF.
+                            case peekByte s (p + 1) of
+                                Just b' -> scanStr (p + 2) (b' : acc)
+                                Nothing -> (BS.pack (reverse acc), p + 1)
             Just b    -> scanStr (p + 1) (b : acc)
 
     -- Starts at the opening single-quote. One logical character, possibly
@@ -799,6 +804,22 @@ encodeCharUtf8 c
 --   * Hex:     @\\xHH...@
 --   * Octal:   @\\oOO...@
 --   * Decimal: @\\123@
+-- | Haskell 2010 §2.6 string gap: after a backslash, if only whitespace
+-- (spaces, tabs, newlines, carriage returns) appears until the next
+-- backslash, the whole gap is elided.  Returns the position after the
+-- closing backslash on match; 'Nothing' means the caller should try
+-- normal escape processing instead.
+tryStringGap :: Source -> Pos -> Maybe Pos
+tryStringGap src p0 = case peekByte src p0 of
+    Just b | isGapWs b -> scan (p0 + 1)
+    _                  -> Nothing
+  where
+    isGapWs b = b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D
+    scan p = case peekByte src p of
+        Just 0x5C       -> Just (p + 1)
+        Just b | isGapWs b -> scan (p + 1)
+        _                  -> Nothing
+
 readEscape :: Source -> Pos -> Maybe (Char, Pos)
 readEscape src p = case peekByte src p of
     Nothing   -> Nothing
