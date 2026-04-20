@@ -714,9 +714,25 @@ hexVal b
 
 isLowerStart :: Word8 -> Bool
 isLowerStart b = (b >= 0x61 && b <= 0x7A) || b == 0x5F    -- a-z or '_'
+              || isUtf8Lead b                             -- Unicode (Greek α, …)
 
 isUpperStart :: Word8 -> Bool
 isUpperStart b = b >= 0x41 && b <= 0x5A                   -- A-Z
+
+-- | Lead byte of a multi-byte UTF-8 sequence.  We accept any non-ASCII
+-- UTF-8 lead as a lowercase identifier start/continuation, matching
+-- the common case of Greek / math letters used in Haskell code (α, β,
+-- π, …).  This is coarser than Haskell 2010's Unicode-aware spec
+-- (which distinguishes uppercase vs lowercase by the code-point's
+-- category), but it unblocks identifiers that were previously
+-- silently rejected.  Upper-case Unicode letters end up as 'TkIdent'
+-- rather than 'TkConId'; acceptable for now.
+isUtf8Lead :: Word8 -> Bool
+isUtf8Lead b = b >= 0xC2 && b <= 0xF4
+
+-- | UTF-8 continuation byte (10xxxxxx).
+isUtf8Cont :: Word8 -> Bool
+isUtf8Cont b = b >= 0x80 && b <= 0xBF
 
 isIdentCont :: Word8 -> Bool
 isIdentCont b =
@@ -725,6 +741,7 @@ isIdentCont b =
     || isDigit b
     || b == 0x27                                           -- '\''
     || b == 0x23                                           -- '#' (MagicHash: I#, runRW#, ByteArray#)
+    || isUtf8Cont b                                        -- inside multi-byte UTF-8
 
 showHex :: Word8 -> String
 showHex b = [hex (fromIntegral b `div` 16), hex (fromIntegral b `mod` 16)]
