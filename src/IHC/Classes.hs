@@ -37,6 +37,11 @@ module IHC.Classes
     , setSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
+      -- * Demand-driven env fallback
+    , EnvFallbackHook
+    , envFallbackRef
+    , setEnvFallback
+    , lookupEnvFallback
     ) where
 
 import Data.ByteString (ByteString)
@@ -280,6 +285,7 @@ typeTagOf (VCon n _)    = n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
+typeTagOf (VLazyMethod _) = BC.pack "<function>"
 typeTagOf (VIO _)       = BC.pack "<IO>"
 typeTagOf (VPrimObj (PrimIORef _))       = BC.pack "<IORef>"
 typeTagOf (VPrimObj (PrimHandle _))      = BC.pack "<Handle>"
@@ -319,3 +325,30 @@ unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
 
 currentInstanceScope :: IO (Set ByteString)
 currentInstanceScope = readIORef instanceScopeRef
+
+--------------------------------------------------------------------------------
+-- Demand-driven env fallback
+--
+-- When a closure's frozen 'Env' is missing a key the body references
+-- (typically a fully-qualified re-export target like
+-- @Data.Text.Internal.empty@ that wasn't yet discovered at env-snapshot
+-- time), 'IHC.Eval.eval' consults this hook before raising "unbound
+-- variable".  The hook is installed by the scheduler/REPL and knows
+-- how to look up a body in the module registry and produce a Thunk
+-- on-demand.  Matches the lazy-scan hook pattern above (Phase-3
+-- precedent, see 'scanHookRef').
+--------------------------------------------------------------------------------
+
+type EnvFallbackHook = ByteString -> IO (Maybe Thunk)
+
+{-# NOINLINE envFallbackRef #-}
+envFallbackRef :: IORef EnvFallbackHook
+envFallbackRef = unsafePerformIO (newIORef (\_ -> pure Nothing))
+
+setEnvFallback :: EnvFallbackHook -> IO ()
+setEnvFallback = writeIORef envFallbackRef
+
+lookupEnvFallback :: ByteString -> IO (Maybe Thunk)
+lookupEnvFallback name = do
+    hook <- readIORef envFallbackRef
+    hook name

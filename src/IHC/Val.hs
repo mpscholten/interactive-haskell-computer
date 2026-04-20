@@ -85,6 +85,14 @@ data Val
     -- argument; the 'Name' and 'Int' payloads are informational (method
     -- name + class-slot) kept for error messages.
     | VClassMethod !Name !Int ![ByteString] !([ByteString] -> Thunk -> IO Val)
+    -- | Unforced instance method body. Produced by 'evalMethodWithLazy'
+    -- during 'registerInstancesFrom' and forced by the class-method
+    -- dispatcher ('classMethodDispatcher') when the method is looked up.
+    -- Deferring the force to dispatch time avoids the env-snapshot bug
+    -- where rewritten FQNs had no slot at registration time because
+    -- 'discoverInModule' hadn't yet populated the target module's
+    -- 'lmBodies'.
+    | VLazyMethod !Thunk
 
 -- | Opaque host-side objects surfaced to the interpreter. Not
 -- user-inspectable — programs pass them through primops only
@@ -125,6 +133,7 @@ showValForDebug (VLabel name)                = "#" <> BC.unpack name
 showValForDebug (VClassMethod m _ tags _)     =
     "<classMethod " <> BC.unpack m
     <> (if null tags then "" else " @" <> show (map BC.unpack tags)) <> ">"
+showValForDebug (VLazyMethod _)               = "<lazyMethod>"
 
 --------------------------------------------------------------------------------
 -- Thunks

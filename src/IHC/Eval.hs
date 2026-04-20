@@ -17,6 +17,7 @@
 module IHC.Eval
     ( eval
     , force
+    , forceMethodVal
     , apply
     , runIOVal
     ) where
@@ -32,13 +33,23 @@ import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 
 import IHC.AST
-import IHC.Classes (normalizeTyTag)
+import IHC.Classes (normalizeTyTag, lookupEnvFallback)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
 --------------------------------------------------------------------------------
 -- force
 --------------------------------------------------------------------------------
+
+-- | Force a 'VLazyMethod' wrapper; pass non-wrapped Vals through.
+-- Instance method bodies are registered lazily (see
+-- 'IHC.Scheduler.evalMethodWithLazy') so the env snapshot they capture
+-- doesn't need every rewrite target resolved at registration time.
+-- Propagates exceptions from 'force' — callers decide whether to
+-- fall back to a placeholder.
+forceMethodVal :: Val -> IO Val
+forceMethodVal (VLazyMethod t) = force t
+forceMethodVal v               = pure v
 
 force :: Thunk -> IO Val
 force t = do
@@ -80,7 +91,17 @@ eval env ipm = go
 
     go (EVar name) = case lookupEnv name env of
         Just t  -> force t
-        Nothing -> error ("IHC.Eval: unbound variable `" <> BC.unpack name <> "`")
+        Nothing -> do
+            -- Demand-driven fallback (Haskell 2010 §4.3.2 scope + lazy
+            -- body eval): a closure's frozen env may be missing a
+            -- fully-qualified name whose body only became visible after
+            -- the env snapshot was taken.  Consult the scheduler-
+            -- installed hook before erroring.
+            mT <- lookupEnvFallback name
+            case mT of
+                Just t  -> force t
+                Nothing -> error ("IHC.Eval: unbound variable `"
+                                  <> BC.unpack name <> "`")
 
     go (EApp f x) = do
         fv  <- go f                            -- function to WHNF

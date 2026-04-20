@@ -62,6 +62,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
+import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
 import IHC.CabalProject
@@ -74,9 +75,10 @@ import IHC.Classes
     , lookupInstanceMethod, typeTagOf
     , scanHookRef, sharedClassRegRef, setSharedClassReg
     , unionInstanceScope, currentInstanceScope
+    , setEnvFallback
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
-import IHC.Eval (force, apply)
+import IHC.Eval (force, apply, forceMethodVal)
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
@@ -186,6 +188,10 @@ loadProgram = loadProgramFromSource []
 -- to enumerate them.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
+    -- Install the demand-driven env fallback for this program run so
+    -- that 'IHC.Eval.eval' can resolve FQN misses via the global
+    -- module catalogue.  See 'installEnvFallbackHook'.
+    installEnvFallbackHook
     -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
     -- buildBaseEnv for the REPL-path counterpart.  Needed so that
     -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
@@ -321,6 +327,9 @@ loadProgramFromSource searchPath src0 = do
                writeIORef slot (Unevaluated (Closure env emptyIPMap rhs)))
           (zip qualPairs slots)
 
+    -- Seed the env-fallback's base env so any 'resolveFallback'-built
+    -- Closure can reach builtins + class dispatchers + constructors.
+    writeIORef envBaseForFallbackRef env
     -- Phase 2.3: scan instance declarations from all loaded modules
     -- and register their method vals into the ClassRegistry. This must
     -- happen AFTER the env is fully tied so instance bodies can see all
@@ -376,6 +385,10 @@ buildBaseEnv = do
     -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
     -- instances from the transitive import closure are in scope).
     setSharedClassReg classReg
+    -- Install the demand-driven env-fallback hook so that
+    -- 'IHC.Eval.eval' can resolve fully-qualified references lazily on
+    -- EVar miss.  See 'installEnvFallbackHook' for the mechanics.
+    installEnvFallbackHook
     -- Auto-discover per-package cbits dylibs.  The nix build emits one
     -- @libhs<pkg>-cbits.dylib@ per Hackage package that declares
     -- @c-sources:@ in its cabal; the path is exported as
@@ -400,6 +413,9 @@ buildBaseEnv = do
     -- running with whatever subset we managed to load.
     env2 <- preDiscoverPreludeConstructors env1
                 `catch` (\(_ :: SomeException) -> pure env1)
+    -- Seed the env-fallback's base env so Closures built by
+    -- 'resolveFallback' can reach builtins + class dispatchers.
+    writeIORef envBaseForFallbackRef env2
     pure (env2, classReg)
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
@@ -1142,6 +1158,12 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
     -- entire ExportAll set before the prompt can return.
+    -- Compute transitive-import closure (H2010 §4.3.2 instance visibility).
+    -- Header-only — cheap — and reused by the scope filter below.
+    headerCacheForClosure <- newHeaderCache
+    closure <- transitiveImportClosure headerCacheForClosure fullSearchPath includeMap
+                    (impModule imp)
+    unionInstanceScope closure
     reg0 <- readIORef registry
     let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
         unionedData    = foldr Map.union Map.empty (map lmDataReg loadedModules0)
@@ -1251,9 +1273,17 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
           (zip qualPairs slots)
-    do { classTable <- buildClassMethodTable loadedModules0; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) loadedModules0 }
-    registerClassDefaults registry fullSearchPath includeMap classReg innerEnv loadedModules0
-    registerDerivedFunctorInstances classReg loadedModules0
+    -- H2010 §4.3.2 scope filter: modules not in the user's import
+    -- closure ('closure' computed above) MUST NOT contribute instances.
+    -- We reuse the same closure for the pre-discovery pass and the
+    -- register-instance calls so both stay in sync.
+    let inUserScope lm' =
+            let n = lmName lm'
+            in Set.member n closure || n == impModule imp
+        instanceScope = filter inUserScope loadedModules0
+    do { classTable <- buildClassMethodTable instanceScope; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) instanceScope }
+    registerClassDefaults registry fullSearchPath includeMap classReg innerEnv instanceScope
+    registerDerivedFunctorInstances classReg instanceScope
     -- ALSO mirror instance registrations into the REPL's shared class
     -- registry so the dispatcher (closed over the shared reg via
     -- 'sharedClassRegRef') can find them on later dispatch calls.
@@ -1262,18 +1292,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     mSharedReg <- readIORef sharedClassRegRef
     case mSharedReg of
         Just sharedReg | sharedReg /= classReg -> do
-            ct <- buildClassMethodTable loadedModules0
-            mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) loadedModules0
-            registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv loadedModules0
-            registerDerivedFunctorInstances sharedReg loadedModules0
+            ct <- buildClassMethodTable instanceScope
+            mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) instanceScope
+            registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv instanceScope
+            registerDerivedFunctorInstances sharedReg instanceScope
         _ -> pure ()
-    -- Track transitive import closure for Haskell 2010 §4.3.2
-    -- instance visibility. The dispatcher consults this set on miss.
-    do
-        headerCache <- newHeaderCache
-        closure <- transitiveImportClosure headerCache fullSearchPath includeMap
-                        (impModule imp)
-        unionInstanceScope closure
     let additions  = Map.difference aliasEnv existingEnv
         merged     = Map.union existingEnv additions
     pure (merged, Map.size additions)
@@ -1463,6 +1486,16 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                           Left  _  -> pure ())
                   unresolvedFVs
             buildImportRewritesForNames registry lm instMethodFVs
+    -- After the per-FV discovery passes above have mutated 'lmBodies' for
+    -- every rewrite target, the target FQNs exist in their owning
+    -- modules' bodies, but the env we'll pass to 'evalMethodWithLazy'
+    -- ('env') was snapshotted earlier (line 1246 in 'loadImportOnlyIntoEnv')
+    -- and has no slot for those FQNs.  Add one slot per rewrite target
+    -- that (a) is an FQN, (b) names a body we've already discovered, and
+    -- (c) isn't already in 'env'.  This is NOT pre-discovery beyond what
+    -- the retry just did — it's materialising env slots for bodies the
+    -- retry already produced.  Knot-tie so an augmented-slot body can
+    -- reference other augmented slots.
     -- Build a name-keyed method table. When the class declaration is
     -- known, the class's declared method names are canonical for
     -- dispatch. Extra instance bindings are preserved under their own
@@ -1471,6 +1504,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- declaration isn't available, keep every method the instance
     -- provided so the legacy fallback still works.
     let methodMap = Map.fromList methods
+        evalMethodIn = evalOneMethodWith env
     methodVals <- case Map.lookup cls classTable of
         Just classMethods -> do
             let classMethodSet = Set.fromList classMethods
@@ -1480,18 +1514,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     , not (Set.member mn classMethodSet)
                     ]
             classEntries <- mapM (\mn -> do
-                    v <- evalOneMethod rewrites mn (Map.lookup mn methodMap)
+                    v <- evalMethodIn rewrites mn (Map.lookup mn methodMap)
                     pure (mn, v))
                 classMethods
             extraEntries <- mapM (\(mn, lhs) -> do
-                    v <- evalOneMethod rewrites mn (Just lhs)
+                    v <- evalMethodIn rewrites mn (Just lhs)
                     pure (mn, v))
                 extraMethods
             pure (Map.fromList (classEntries ++ extraEntries))
         Nothing ->
             Map.fromList <$>
                 mapM (\(mn, lhs) -> do
-                    v <- evalOneMethod rewrites mn (Just lhs)
+                    v <- evalMethodIn rewrites mn (Just lhs)
                     pure (mn, v))
                 methods
     -- Register under the head type name (used by Bool/Int/Char/String
@@ -1507,9 +1541,9 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                   ctors
         Nothing -> pure ()
   where
-    evalOneMethod _rw _mn Nothing = pure methodPlaceholder
-    evalOneMethod rw _mn (Just lhs) = do
-        r <- try (evalMethodWith env lm rw (_mn, lhs)) :: IO (Either SomeException Val)
+    evalOneMethodWith _e _rw _mn Nothing = pure methodPlaceholder
+    evalOneMethodWith e rw _mn (Just lhs) = do
+        r <- try (evalMethodWithLazy e lm rw (_mn, lhs)) :: IO (Either SomeException Val)
         case r of
             Right v -> pure v
             Left  _ -> pure methodPlaceholder
@@ -1535,6 +1569,27 @@ evalMethodWith env lm rewrites (_, lhs) = do
     -- make a thunk and force it immediately.
     t <- newThunk env expr
     force t
+
+-- | Like 'evalMethodWith' but does NOT force the thunk.  Returns a
+-- 'VLazyMethod' wrapper which the class-method dispatcher
+-- ('classMethodDispatcher' -> 'forceMethodVal') forces on demand.
+--
+-- Deferring the force to dispatch time sidesteps the env-snapshot bug:
+-- at registration we may not yet have populated every transitively-
+-- required binding in the caller's env slots, but by the time the
+-- user's expression actually invokes the method, all relevant
+-- 'discoverInModule' work has run (either via the per-FV pre-pass in
+-- 'registerOne' itself, or via later REPL-level discovery), so the
+-- thunk's captured env resolves successfully.
+evalMethodWithLazy :: Env -> LoadedModule -> Map ByteString ByteString -> (ByteString, BindingLhs) -> IO Val
+evalMethodWithLazy env lm rewrites (_, lhs) = do
+    expr0 <- Parser.parseBodyExprWithFixity
+                (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+    let expr1 = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0)
+        expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
+    t <- newThunk env expr
+    pure (VLazyMethod t)
 
 -- | Collect the union of free variables across all method bodies of an
 -- instance.  Used to seed 'buildImportRewritesForNames' with the exact
@@ -1768,7 +1823,14 @@ applyRoleOne classReg fT (FRRec, t) = do
     v <- force t
     case v of
         VCon innerTag _ -> do
-            mInnerFmap <- lookupInstanceMethod classReg (BC.pack "Functor") innerTag (BC.pack "fmap")
+            mInnerFmap0 <- lookupInstanceMethod classReg (BC.pack "Functor") innerTag (BC.pack "fmap")
+            mInnerFmap <- case mInnerFmap0 of
+                Nothing -> pure Nothing
+                Just v' -> do
+                    r <- try (forceMethodVal v') :: IO (Either SomeException Val)
+                    case r of
+                        Right v'' -> pure (Just v'')
+                        Left _    -> pure Nothing
             case mInnerFmap of
                 Just innerFmap -> do
                     stepT <- newWHNFThunk v
@@ -1810,6 +1872,38 @@ shortShow _          = "<other>"
 defaultTypeTag :: ByteString
 defaultTypeTag = BC.pack "<default>"
 
+-- | 'lookupInstanceMethod' + 'forceMethodVal' in one step.  Used by
+-- 'classMethodDispatcher' so a stored 'VLazyMethod' is forced the
+-- moment it's observed by dispatch.  On a parse/eval failure inside
+-- the lazy body, we surface 'methodPlaceholder' so the dispatcher's
+-- existing "fall through to default" path kicks in.
+lookupInstanceMethodForced
+    :: ClassRegistry -> ByteString -> ByteString -> ByteString
+    -> IO (Maybe Val)
+lookupInstanceMethodForced reg cls tag methodName = do
+    mv <- lookupInstanceMethod reg cls tag methodName
+    traverse forceSafely mv
+  where
+    forceSafely v = do
+        r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+        case r of
+            Right v' -> pure v'
+            Left  _  -> pure methodPlaceholder
+
+-- | 'lookupInSharedReg' + 'forceMethodVal'.  Parallel to
+-- 'lookupInstanceMethodForced' for the REPL-level shared registry.
+lookupInSharedRegForced
+    :: ByteString -> ByteString -> ByteString -> IO (Maybe Val)
+lookupInSharedRegForced cls tag methodName = do
+    mv <- lookupInSharedReg cls tag methodName
+    traverse forceSafely mv
+  where
+    forceSafely v = do
+        r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+        case r of
+            Right v' -> pure v'
+            Left  _  -> pure methodPlaceholder
+
 -- | Build a dispatcher Val for a single class method.
 --
 -- @classMethodDispatcher reg cls methodName@ returns a VFun that,
@@ -1833,8 +1927,8 @@ classMethodDispatcher reg cls methodName = selfVal
         -- a VFun; matchPat treats that as "no match" and the dispatch
         -- fails cleanly.
         (firstTag:_) | isDispatchableTag firstTag -> do
-            mM <- lookupInstanceMethod reg cls firstTag methodName
-            mShared <- lookupInSharedReg cls firstTag methodName
+            mM <- lookupInstanceMethodForced reg cls firstTag methodName
+            mShared <- lookupInSharedRegForced cls firstTag methodName
             case preferMethod mM mShared of
                 Just methodVal
                   | not (isMethodPlaceholder methodVal) -> pure methodVal
@@ -1860,12 +1954,12 @@ classMethodDispatcher reg cls methodName = selfVal
             if isDispatchableTag tag
                 then do
                     -- First lookup against the dispatcher's own classReg.
-                    mMethod0 <- lookupInstanceMethod reg cls tag methodName
+                    mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
                     -- Also check the shared classReg (per Haskell 2010
                     -- §4.3.2, instances from the user's transitive import
                     -- closure should be visible — they may have been
                     -- registered by a later import via the shared ref).
-                    mMethodShared <- lookupInSharedReg cls tag methodName
+                    mMethodShared <- lookupInSharedRegForced cls tag methodName
                     let mMethod = preferMethod mMethod0 mMethodShared
                     case mMethod of
                         Just methodVal
@@ -1876,8 +1970,8 @@ classMethodDispatcher reg cls methodName = selfVal
                             didScan <- lazyInstanceRetry cls tag
                             mMethod2 <- if didScan
                                 then do
-                                    a <- lookupInstanceMethod reg cls tag methodName
-                                    b <- lookupInSharedReg cls tag methodName
+                                    a <- lookupInstanceMethodForced reg cls tag methodName
+                                    b <- lookupInSharedRegForced cls tag methodName
                                     pure (preferMethod a b)
                                 else pure mMethod
                             case mMethod2 of
@@ -1887,8 +1981,8 @@ classMethodDispatcher reg cls methodName = selfVal
                                 _ -> do
                                     -- Dispatchable arg but no matching instance.
                                     -- Fall back to the class's default body.
-                                    mDef0 <- lookupInstanceMethod reg cls defaultTypeTag methodName
-                                    mDefShared <- lookupInSharedReg cls defaultTypeTag methodName
+                                    mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                    mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
                                     let mDef = preferMethod mDef0 mDefShared
                                     case mDef of
                                         Just defVal ->
@@ -1909,7 +2003,7 @@ classMethodDispatcher reg cls methodName = selfVal
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
     fallback accArgs = VFun $ \finalArgT -> do
-        mDef <- lookupInstanceMethod reg cls defaultTypeTag methodName
+        mDef <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
         case mDef of
             Just defVal ->
                 applyAll defVal (reverse (finalArgT : accArgs))
@@ -2532,6 +2626,7 @@ loadEntryModule registry src = do
     writeIORef registry (Map.singleton name Loading)
     lm <- buildLoadedModule name True header src
     modifyIORef' registry (Map.insert name (Loaded lm))
+    registerGlobalLoadedModule lm
     pure lm
 
 -- | Inject an implicit @import Prelude@ at the head of @mhImports@ unless:
@@ -2728,6 +2823,7 @@ loadModule registry searchPath includeMap name = do
                 then do
                     lm <- buildEmptyStubModule name
                     modifyIORef' registry (Map.insert name (Loaded lm))
+                    registerGlobalLoadedModule lm
                     pure lm
                 else do
                     path <- locateModule searchPath name
@@ -2743,7 +2839,106 @@ loadModule registry searchPath includeMap name = do
                     modifyIORef' registry (Map.insert name Loading)
                     lm <- buildLoadedModule declared False header src
                     modifyIORef' registry (Map.insert name (Loaded lm))
+                    registerGlobalLoadedModule lm
                     pure lm
+
+-- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
+-- 'IHC.Eval.eval''s demand-driven env fallback: when a closure's frozen
+-- env misses a fully-qualified name, the fallback hook consults this
+-- catalogue to find the owning module's body and materialise a 'Thunk'
+-- on-demand.  Transient per-import 'ModuleRegistry' values that
+-- 'loadImportOnlyIntoEnv' allocates are now ALSO mirrored here so the
+-- REPL can see modules loaded by earlier imports.
+{-# NOINLINE globalLoadedModulesRef #-}
+globalLoadedModulesRef :: IORef (Map ModuleName LoadedModule)
+globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
+
+registerGlobalLoadedModule :: LoadedModule -> IO ()
+registerGlobalLoadedModule lm =
+    modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
+
+-- | Memoised slots produced by the env fallback hook.  Keeps one
+-- 'Thunk' per FQN so successive demand-lookups share evaluation +
+-- memoisation, matching the normal import-driven env layer.
+{-# NOINLINE envFallbackCache #-}
+envFallbackCache :: IORef (Map ByteString Thunk)
+envFallbackCache = unsafePerformIO (newIORef Map.empty)
+
+-- | Install the demand-driven env-fallback hook that 'IHC.Eval.eval'
+-- consults when an 'EVar' lookup misses.  Given a fully-qualified name
+-- like @Data.Text.Internal.empty@, the hook:
+--
+--   * splits it into @(Data.Text.Internal, empty)@,
+--   * looks up the owning module in 'globalLoadedModulesRef' (every
+--     'loadModule' call registers here),
+--   * reads the module's 'lmBodies' to find the body expression,
+--   * wraps it in a 'Closure' using 'envBaseForFallbackRef''s base env
+--     (builtins + class dispatchers + FFI sentinels — NOT the caller's
+--     snapshot, so the fallback is self-consistent regardless of which
+--     import triggered the miss),
+--   * memoises the resulting 'Thunk' in 'envFallbackCache' so repeated
+--     lookups share evaluation.
+--
+-- This replaces the "augment env at registration time" approach with a
+-- truly lazy resolution: no FV pre-discovery walks, no eager
+-- materialisation of bodies the user's expression never touches.
+{-# NOINLINE envBaseForFallbackRef #-}
+envBaseForFallbackRef :: IORef Env
+envBaseForFallbackRef = unsafePerformIO (newIORef Map.empty)
+
+installEnvFallbackHook :: IO ()
+installEnvFallbackHook =
+    setEnvFallback $ \name -> do
+        cache <- readIORef envFallbackCache
+        case Map.lookup name cache of
+            Just t  -> pure (Just t)
+            Nothing -> resolveFallback name
+
+resolveFallback :: ByteString -> IO (Maybe Thunk)
+resolveFallback name = case splitQualified name of
+    Nothing -> pure Nothing
+    Just (modName, bareName) -> do
+        mods <- readIORef globalLoadedModulesRef
+        case Map.lookup modName mods of
+            Nothing    -> pure Nothing
+            Just owner -> do
+                bodies <- readIORef (lmBodies owner)
+                case Map.lookup bareName bodies of
+                    Just expr | expr /= EVar bareName -> do
+                        -- Synthesize a transient registry from the
+                        -- global catalogue so 'buildImportRewrites'
+                        -- can walk the owner's imports to resolve bare
+                        -- references inside the body to FQNs the
+                        -- fallback can then look up recursively.
+                        transientReg <- newIORef
+                            (Map.map Loaded mods)
+                        rw <- buildImportRewrites transientReg owner Set.empty
+                                `catch` (\(_ :: SomeException) -> pure Map.empty)
+                        let expr' = if Map.null rw
+                                      then expr
+                                      else rewriteExpr rw expr
+                        baseEnv <- readIORef envBaseForFallbackRef
+                        -- Augment with constructors + field accessors
+                        -- from ALL globally loaded modules — body may
+                        -- reference constructors (like 'Text') defined
+                        -- in its own module that weren't in the original
+                        -- base env (which predates the user's imports).
+                        let unionedData =
+                                foldr Map.union Map.empty
+                                    (map lmDataReg (Map.elems mods))
+                            (publicFields, unionedFields) =
+                                partitionFieldRegistries (Map.elems mods)
+                        conEnvAll    <- buildConEnv unionedData
+                        fieldEnvAll  <- buildFieldAccessorEnv
+                                            publicFields unionedFields
+                        let richEnv = Map.union baseEnv
+                                        (Map.union conEnvAll fieldEnvAll)
+                        slot    <- newIORef BlackHole
+                        writeIORef slot
+                            (Unevaluated (Closure richEnv emptyIPMap expr'))
+                        modifyIORef' envFallbackCache (Map.insert name slot)
+                        pure (Just slot)
+                    _ -> pure Nothing
 
 -- | Look up the include-dirs for a source file by matching its directory
 -- against the keys of the includeMap.  The file may live inside a

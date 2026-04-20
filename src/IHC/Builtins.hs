@@ -85,7 +85,7 @@ import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
-import IHC.Eval (apply, force)
+import IHC.Eval (apply, force, forceMethodVal)
 import IHC.Scan (DataRegistry, FieldRegistry)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
@@ -886,6 +886,19 @@ neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     pure (boolVal (not (isTruthy r)))
 
 -- | Core equality test on WHNF values.
+-- | Force a 'VLazyMethod' result from 'lookupInstanceMethod', tolerating
+-- parse/eval failures by treating them as "no instance".  Instance method
+-- bodies are registered lazily in the class registry (see
+-- 'IHC.Scheduler.evalMethodWithLazy'); without this force, the builtin
+-- dispatch paths would try to @apply@ the opaque 'VLazyMethod' wrapper.
+forceInstanceMethod :: Maybe Val -> IO (Maybe Val)
+forceInstanceMethod Nothing  = pure Nothing
+forceInstanceMethod (Just v) = do
+    r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+    case r of
+        Right v' -> pure (Just v')
+        Left  _  -> pure Nothing
+
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
 eqVals reg av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (x == y))
@@ -926,7 +939,7 @@ eqVals reg av bv = case (av, bv) of
     _ -> do
         -- Try user-defined instance.
         let tag = typeTagOf av
-        mEqMethod <- lookupInstanceMethod reg "Eq" tag "=="
+        mEqMethod <- lookupInstanceMethod reg "Eq" tag "==" >>= forceInstanceMethod
         case mEqMethod of
             Just eqMethod -> do
                 aT <- newWHNFThunk av
@@ -978,7 +991,7 @@ ordCmp _reg slot av bv = case (av, bv) of
                 3 -> Just (BC.pack ">=")
                 _ -> Nothing
         mMethod <- maybe (pure Nothing)
-                         (lookupInstanceMethod _reg "Ord" tag)
+                         (\mn -> lookupInstanceMethod _reg "Ord" tag mn >>= forceInstanceMethod)
                          ordMethodName
         case mMethod of
             Just method -> do
@@ -1159,7 +1172,7 @@ valOrdering reg av bv = case (av, bv) of
     _ -> do
         -- Try user Ord instance first (compare at slot 4 if present).
         let tag = typeTagOf av
-        mCmpMethod <- lookupInstanceMethod reg "Ord" tag "compare"
+        mCmpMethod <- lookupInstanceMethod reg "Ord" tag "compare" >>= forceInstanceMethod
         case mCmpMethod of
             Just cmpMethod -> do
                 aT <- newWHNFThunk av
@@ -1263,7 +1276,7 @@ showValWith reg av = case av of
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
         let tag = n
-        mShowMethod <- lookupInstanceMethod reg "Show" tag "show"
+        mShowMethod <- lookupInstanceMethod reg "Show" tag "show" >>= forceInstanceMethod
         case mShowMethod of
             Just showMethod -> do
                 shown <- CE.try @SomeException $ do
@@ -1369,6 +1382,7 @@ showVal (VCon name thunks)
 showVal (VFun _)    = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
 showVal (VClassMethod _ _ _ _) = pure "<function>"
+showVal (VLazyMethod _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _))      = pure "<IORef>"
 showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"
@@ -1525,11 +1539,15 @@ lookupUserIsLabel reg lbl = do
             , c >= 'a' && c <= 'z'
             , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
             ]
+    -- Instance method bodies are registered lazily as 'VLazyMethod'
+    -- (see 'IHC.Scheduler.evalMethodWithLazy').  Force the wrapper now
+    -- so the caller ('fromLabelB') can pattern-match against the
+    -- concrete Val (VCon, VFun, etc.) without having to unwrap.
+    let forceFirst [] = pure Nothing
+        forceFirst (ms : _) = fmap Just (forceMethodVal ms)
     case symbolMatches of
-        (ms : _) -> pure (Just ms)
-        []       -> case polymorphicMatches of
-            (ms : _) -> pure (Just ms)
-            []       -> pure Nothing
+        hit@(_ : _) -> forceFirst hit
+        []          -> forceFirst polymorphicMatches
 
 -- DataKinds Tier 1 -------------------------------------------------------------
 
@@ -1825,7 +1843,7 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         _ -> do
             -- Look up Monad instance for this value's type tag.
             let tag = typeTagOf mv
-            mBindMethod <- lookupInstanceMethod reg "Monad" tag ">>="
+            mBindMethod <- lookupInstanceMethod reg "Monad" tag ">>=" >>= forceInstanceMethod
             case mBindMethod of
                 Just bindMethod -> do
                     maT <- newWHNFThunk mv
@@ -1886,7 +1904,7 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
             pure (VCon "ST" [stFunc])
         _ -> do
             let tag = typeTagOf mv
-            mSeqMethod <- lookupInstanceMethod reg "Monad" tag ">>"
+            mSeqMethod <- lookupInstanceMethod reg "Monad" tag ">>" >>= forceInstanceMethod
             case mSeqMethod of
                 Just seqMethod -> do
                     maT <- newWHNFThunk mv
@@ -1937,7 +1955,7 @@ fmapDispatch :: ClassRegistry -> IO Val
 fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     mv <- force mt
     let tag = typeTagOf mv
-    mFmapMethod <- lookupInstanceMethod reg (BC.pack "Functor") tag (BC.pack "fmap")
+    mFmapMethod <- lookupInstanceMethod reg (BC.pack "Functor") tag (BC.pack "fmap") >>= forceInstanceMethod
     case mFmapMethod of
         Just fmapMethod -> do
             -- Re-supply the original thunks; the instance implementation
