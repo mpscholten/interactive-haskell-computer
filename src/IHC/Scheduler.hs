@@ -1624,7 +1624,29 @@ buildImportRewritesForNames registry lm needed = do
     let imports = mhImports (lmHeader lm)
     importPairs <- concat <$> mapM (rewritesForImport reg needed) imports
     let filteredImportPairs = filter (\(n, _) -> not (Set.member n ffiBuiltinNames)) importPairs
-    pure (Map.fromList filteredImportPairs)
+    -- Self-rewrites: instance method bodies reference sibling top-level
+    -- names in the OWNING module under their bare name; rewrite them
+    -- to the module's FQN so the env fallback can resolve them lazily.
+    -- Example: @instance Monad [] where xs >>= f = [y | x <- xs, y <- f x]@
+    -- in GHC.Internal.Base desugars to a body referencing @concatMap@,
+    -- which is a local GHC.Internal.Base binding.  Without this rewrite
+    -- the bare @concatMap@ misses both the caller's env AND the env
+    -- fallback (which refuses bare names for namespace integrity), so
+    -- the method body fails and the dispatcher falls through to IO.
+    selfPairs <- if lmIsEntry lm
+        then pure []
+        else do
+            let prefix = lmName lm <> BC.pack "."
+            allScanned <- scanAllTopLevelNames (lmSource lm)
+                            `catch` (\(_ :: SomeException) -> pure [])
+            pure [ (n, prefix <> n)
+                 | n <- allScanned
+                 , Set.member n needed
+                 ]
+    -- Import pairs take priority over self-rewrites: if a name is both
+    -- locally defined and imported from elsewhere, the import wins
+    -- (GHC semantics).  Map.fromList keeps the last occurrence.
+    pure (Map.fromList (selfPairs ++ filteredImportPairs))
   where
     rewritesForImport reg needed' imp
         | impModule imp == BC.pack "Prelude" = pure []
@@ -2251,15 +2273,31 @@ buildImportRewrites registry lm _builtinNames = do
         then pure []   -- entry module bodies keep bare names
         else do
             let prefix = lmName lm <> BC.pack "."
-            -- Only include REAL local definitions (not foreign-alias sentinels).
-            -- A sentinel is (n, EVar n) inserted by discoverInModule when a
-            -- name was resolved via import. Such names should NOT be
-            -- self-rewritten to "Module.n" — they live under their owning
-            -- module's prefix in the flat env, not under this module's prefix.
-            pure [ (n, prefix <> n)
-                 | (n, expr) <- Map.toList bodiesNow
-                 , expr /= EVar n   -- skip foreign-alias sentinels
-                 ]
+            -- Union two sources:
+            --   (a) bodies already demand-discovered — we know these
+            --       are real local definitions (not foreign-alias
+            --       sentinels, which are (n, EVar n)).
+            --   (b) ALL top-level names scanned from the source —
+            --       needed so instance method bodies that reference
+            --       siblings not yet demand-loaded (e.g. @concatMap@
+            --       referenced by @Monad []@'s @>>=@ body in
+            --       GHC.Internal.Base) can still self-rewrite to the
+            --       FQN.  The demand-driven env fallback then resolves
+            --       the FQN lazily at force time via 'resolveFallback'.
+            let discoveredPairs =
+                    [ (n, prefix <> n)
+                    | (n, expr) <- Map.toList bodiesNow
+                    , expr /= EVar n
+                    ]
+                discoveredNames = Set.fromList (map fst discoveredPairs)
+            allScanned <- scanAllTopLevelNames (lmSource lm)
+                            `catch` (\(_ :: SomeException) -> pure [])
+            let scannedPairs =
+                    [ (n, prefix <> n)
+                    | n <- allScanned
+                    , not (Set.member n discoveredNames)
+                    ]
+            pure (discoveredPairs ++ scannedPairs)
     importPairs <- concat <$> mapM (rewritesForImport reg neededNames) imports
     -- Exclude FFI/primop builtins from import rewrites so bare references
     -- resolve to the host builtin rather than chasing source sentinel chains.
