@@ -2513,6 +2513,7 @@ rewriteExpr rw = go []
         EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
         ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
+        e@ETypedMethod{} -> e   -- elaborator product; no name references to rewrite
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
 
@@ -3978,6 +3979,7 @@ freeVars = goAll []
         EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
         ELabel _        -> []   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
+        ETypedMethod{}  -> []   -- elaborator product; no EVar refs
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.

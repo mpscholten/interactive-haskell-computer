@@ -1139,6 +1139,7 @@ parseDo ctx cur0 = do
             EQuote  _          -> []
             ELabel  _          -> []
             ETyApp e _         -> fv bound e
+            ETypedMethod {}    -> []
 
         fvStmts _     []                  = []
         fvStmts bound (SExpr e   : rest)  = fv bound e ++ fvStmts bound rest

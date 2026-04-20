@@ -434,6 +434,7 @@ expandSplicesInExpr env ipm depth expr
     go (ETyApp e ty) = do
         e' <- go e
         pure (ETyApp e' ty)
+    go (ETypedMethod cls method tag) = pure (ETypedMethod cls method tag)
 
     goAlt (Alt p e) = Alt p <$> go e
 

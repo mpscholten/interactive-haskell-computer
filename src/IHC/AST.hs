@@ -57,6 +57,13 @@ data Expr
     -- pass-through on the inner expression. The type argument is retained
     -- as metadata for future @Typeable@ / dictionary-selection use.
     | ETyApp !Expr !Name
+    -- | Class method resolved by the on-demand elaborator
+    -- ('IHC.Elaborate') to a specific instance.  Three fields:
+    -- class name, method name, resolved instance tag.  Evaluator
+    -- performs a direct 'lookupInstanceMethod' on the class registry
+    -- instead of going through the VClassMethod dispatcher.  Produced
+    -- only by elaboration — parsers never emit this node.
+    | ETypedMethod !Name !Name !Name
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

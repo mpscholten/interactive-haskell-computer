@@ -33,7 +33,7 @@ import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 
 import IHC.AST
-import IHC.Classes (normalizeTyTag, lookupEnvFallback)
+import IHC.Classes (normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -244,6 +244,25 @@ eval env ipm = go
     --       the caller supplies.  This keeps parity with GHC's behaviour
     --       where a call like @symbolVal \@\"email\" undefined@ works.
     --
+    -- | Elaborator-produced class method resolved to a specific
+    -- instance.  Direct registry lookup; no dispatcher.  Emitted only
+    -- by 'IHC.Elaborate' when inference has resolved the method's
+    -- type.  Falls back to an unbound-variable error if the resolved
+    -- (class, tag, method) isn't in the shared class registry —
+    -- that's a bug (elaborator shouldn't emit an unresolvable tag).
+    go (ETypedMethod cls method tag) = do
+        mReg <- readIORef sharedClassRegRef
+        case mReg of
+            Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
+                              <> "(elaborator fired before buildBaseEnv?)")
+            Just reg -> do
+                mMethod <- lookupInstanceMethod reg cls tag method
+                case mMethod of
+                    Just v  -> pure v
+                    Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
+                                    <> BC.unpack cls <> " " <> BC.unpack tag
+                                    <> "` for method `" <> BC.unpack method <> "`")
+
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
         -- Try to reduce the raw type-argument bytes through the
