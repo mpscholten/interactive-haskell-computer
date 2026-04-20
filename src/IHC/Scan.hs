@@ -1972,14 +1972,45 @@ scanInstanceDecls src = go [] startCursor
     -- Helper: after a prefix-form branch fails to match, try infix
     -- form; on success register and continue, otherwise fall back to
     -- advancing past the current token (same recovery as before).
+    -- Collects ALL sibling clauses with the same operator at the same
+    -- bindCol so multi-clause infix methods like
+    --
+    -- > Nothing >>= _ = Nothing
+    -- > Just x  >>= f = f x
+    --
+    -- store both clauses under @(>>=)@ rather than overwriting.
     tryInfixThen acc bindCol cur fallbackCur = do
         mInfix <- tryInfixMethod bindCol cur
         case mInfix of
             Just (opName, clause, curNext) -> do
-                let lhs = BindingLhs [clause]
-                    acc' = Map.insert opName lhs acc
-                scanMethods acc' curNext
+                (moreClauses, curFinal) <-
+                    collectInfixClauses opName bindCol [clause] curNext
+                -- Preserve any earlier prefix-form clause stored under
+                -- the same opName (unusual, but defensive).
+                let existing = case Map.lookup opName acc of
+                                   Just (BindingLhs cs) -> cs
+                                   Nothing              -> []
+                    lhs      = BindingLhs
+                                   (existing ++ reverse moreClauses)
+                    acc'     = Map.insert opName lhs acc
+                scanMethods acc' curFinal
             Nothing -> scanMethods acc fallbackCur
+
+    -- Walk subsequent lines at the same bind-col looking for further
+    -- infix-form clauses sharing the same operator.  Each match is
+    -- accumulated; anything else terminates.
+    collectInfixClauses opName bindCol acc cur = do
+        let (tok, _) = peekSig cur
+        if tkCol tok /= bindCol
+            then pure (acc, cur)
+            else do
+                mInfix <- tryInfixMethod bindCol cur
+                case mInfix of
+                    Just (opName', clause, curNext)
+                        | opName' == opName ->
+                            collectInfixClauses opName bindCol
+                                (clause : acc) curNext
+                    _ -> pure (acc, cur)
 
     -- Detect an infix-form method definition, e.g.:
     --
