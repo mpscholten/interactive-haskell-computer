@@ -1774,10 +1774,24 @@ parseTopPat ctx cur = do
     consTail p cur0 =
         let (tok, cur1) = nextSig ctx cur0 in
         case tkKind tok of
+            -- @:@ is the canonical list cons; keep the dedicated case.
             TkColon -> do
                 (rhs, cur2) <- parseTopPat ctx cur1
                 pure (PCon ":" [p, rhs], cur2)
+            -- Haskell 2010 §4.1.2: any symbolic operator starting with
+            -- @:@ is a constructor operator (e.g. @:|@ for NonEmpty,
+            -- @:*:@ for Generics) and CAN appear as an infix pattern.
+            -- Without this branch, @fmap f (x :| xs) = …@ failed with
+            -- "expected `)` or `,` in pattern" the moment the parser
+            -- walked past @x@ and saw @:|@.
+            TkSymOp op | isConOp op -> do
+                (rhs, cur2) <- parseTopPat ctx cur1
+                pure (PCon op [p, rhs], cur2)
             _ -> pure (p, cur0)
+
+    isConOp bs = case BC.uncons bs of
+        Just (':', _) -> True
+        _             -> False
 
 parseTopPatNoCons :: Ctx -> Cursor -> IO (Pat, Cursor)
 parseTopPatNoCons ctx cur = do

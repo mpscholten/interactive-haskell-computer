@@ -1903,15 +1903,25 @@ scanInstanceDecls src = go [] startCursor
                 case mSkip of
                     Just curAfter -> scanMethods acc curAfter
                     Nothing -> do
-                        mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'
-                        case mClause of
-                            Nothing -> scanMethods acc cur'
-                            Just (clause, curNext) -> do
-                                (moreClauses, curFinal) <-
-                                    collectInstanceClauses name (tkCol tok) [clause] curNext
-                                let lhs  = BindingLhs (reverse moreClauses)
-                                    acc' = Map.insert name lhs acc
-                                scanMethods acc' curFinal
+                        -- Disambiguate prefix vs infix form at the ident:
+                        -- @name pat1 pat2 = body@  (prefix: name is method)
+                        -- @pat1 op pat2 = body@    (infix: op is method; first
+                        --                           ident is a pattern var)
+                        -- If we see a top-level @TkSymOp@ before @=@/@|@,
+                        -- treat as infix (e.g. @xs >>= f = …@ in Monad []).
+                        mOp <- findTopLevelOpBeforeEq src cur
+                        case mOp of
+                            Just _  -> tryInfixThen acc (tkCol tok) cur cur'
+                            Nothing -> do
+                                mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'
+                                case mClause of
+                                    Nothing -> scanMethods acc cur'
+                                    Just (clause, curNext) -> do
+                                        (moreClauses, curFinal) <-
+                                            collectInstanceClauses name (tkCol tok) [clause] curNext
+                                        let lhs  = BindingLhs (reverse moreClauses)
+                                            acc' = Map.insert name lhs acc
+                                        scanMethods acc' curFinal
             -- Phase 3.6: operator methods like @(>>=)@, @(>>)@, @(<>)@, @(+)@.
             -- Pattern: @TkLParen TkSymOp name TkRParen ...@
             TkLParen | tkCol tok > 1 -> do
