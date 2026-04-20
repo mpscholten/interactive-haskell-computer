@@ -992,9 +992,16 @@ parseDo ctx cur0 = do
     layoutStmts stmtCol cur acc = do
         let stmtCtx = ctx { ctxMinCol = stmtCol }
         (s, cur') <- parseStmt stmtCtx cur
-        let (nextTok, _) = nextSig ctx cur'
+        let (nextTok, curAfterSep) = nextSig ctx cur'
         case tkKind nextTok of
             TkEof -> pure (reverse (s : acc), cur')
+            -- Haskell 2010 §2.7 permits an explicit `;` as statement
+            -- separator inside implicit-layout do-blocks, e.g.
+            -- `do stmt1; stmt2`.  Without this branch the layout path
+            -- only accepted stmts at the same starting column, so the
+            -- one-line form `(do putStrLn "a"; pure 1)` stopped after
+            -- the first stmt and the parser saw garbage afterwards.
+            TkSemi -> layoutStmts stmtCol curAfterSep (s : acc)
             -- `where`, `in`, `of`, `then`, `else` are block-ending keywords:
             -- they cannot be the start of a do-statement even when they happen
             -- to appear at the statement column.  This arises in code like:
