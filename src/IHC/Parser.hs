@@ -757,13 +757,26 @@ nextSig ctx cur
 parseExpr :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseExpr ctx cur0 = do
     (e, cur1) <- parseExprNoSig ctx cur0
-    -- Swallow an optional trailing @:: type@ annotation. The value
-    -- survives; the type is discarded (we don't type-check).
+    -- Capture an optional trailing @:: type@ annotation as 'ETyApp'
+    -- metadata.  The evaluator's 'ETyApp' branch accumulates the type
+    -- bytes as a tag on 'VClassMethod', so a nullary class method like
+    -- @pure 42 :: Maybe Int@ gets @"Maybe Int"@ on its tag stack and
+    -- can dispatch to the right instance.  Non-class values treat
+    -- 'ETyApp' as a pass-through (evaluator line 260+).
     let (tok, cur2) = nextSig ctx cur1
     case tkKind tok of
         TkDColon -> do
             cur3 <- skipTypeToBinding ctx cur2
-            pure (e, cur3)
+            let src     = ctxSrc ctx
+                tyBytes = BC.dropWhile isSpace
+                            (BC.reverse
+                                (BC.dropWhile isSpace
+                                    (BC.reverse
+                                        (sliceBytes src (cPos cur2, cPos cur3)))))
+                isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            if BS.null tyBytes
+                then pure (e, cur3)
+                else pure (ETyApp e tyBytes, cur3)
         _ -> pure (e, cur1)
 
 parseExprNoSig :: Ctx -> Cursor -> IO (Expr, Cursor)
