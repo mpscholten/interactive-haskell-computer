@@ -192,6 +192,10 @@ loadProgramFromSource searchPath src0 = do
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
     installEnvFallbackHook
+    cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
+    let fullSearchPath0 = searchPath ++ map fst cacheWithIncludes0
+        includeMap0     = Map.fromList cacheWithIncludes0
+    setGlobalSearchPath fullSearchPath0 includeMap0
     -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
     -- buildBaseEnv for the REPL-path counterpart.  Needed so that
     -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
@@ -389,6 +393,9 @@ buildBaseEnv = do
     -- 'IHC.Eval.eval' can resolve fully-qualified references lazily on
     -- EVar miss.  See 'installEnvFallbackHook' for the mechanics.
     installEnvFallbackHook
+    cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
+    setGlobalSearchPath (map fst cacheWithIncludes0)
+                        (Map.fromList cacheWithIncludes0)
     -- Auto-discover per-package cbits dylibs.  The nix build emits one
     -- @libhs<pkg>-cbits.dylib@ per Hackage package that declares
     -- @c-sources:@ in its cabal; the path is exported as
@@ -2857,6 +2864,23 @@ registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm =
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
 
+-- | Global search path + include-map captured at setup time so the env
+-- fallback hook can trigger 'discoverInModule' for FQNs whose bodies
+-- haven't been demand-loaded yet.  Populated by 'buildBaseEnv' and
+-- 'loadProgramFromSource'.
+{-# NOINLINE globalSearchPathRef #-}
+globalSearchPathRef :: IORef [FilePath]
+globalSearchPathRef = unsafePerformIO (newIORef [])
+
+{-# NOINLINE globalIncludeMapRef #-}
+globalIncludeMapRef :: IORef (Map FilePath [FilePath])
+globalIncludeMapRef = unsafePerformIO (newIORef Map.empty)
+
+setGlobalSearchPath :: [FilePath] -> Map FilePath [FilePath] -> IO ()
+setGlobalSearchPath sp im = do
+    writeIORef globalSearchPathRef sp
+    writeIORef globalIncludeMapRef im
+
 -- | Memoised slots produced by the env fallback hook.  Keeps one
 -- 'Thunk' per FQN so successive demand-lookups share evaluation +
 -- memoisation, matching the normal import-driven env layer.
@@ -2895,50 +2919,79 @@ installEnvFallbackHook =
             Nothing -> resolveFallback name
 
 resolveFallback :: ByteString -> IO (Maybe Thunk)
-resolveFallback name = case splitQualified name of
-    Nothing -> pure Nothing
-    Just (modName, bareName) -> do
-        mods <- readIORef globalLoadedModulesRef
-        case Map.lookup modName mods of
-            Nothing    -> pure Nothing
-            Just owner -> do
-                bodies <- readIORef (lmBodies owner)
-                case Map.lookup bareName bodies of
-                    Just expr | expr /= EVar bareName -> do
-                        -- Synthesize a transient registry from the
-                        -- global catalogue so 'buildImportRewrites'
-                        -- can walk the owner's imports to resolve bare
-                        -- references inside the body to FQNs the
-                        -- fallback can then look up recursively.
-                        transientReg <- newIORef
-                            (Map.map Loaded mods)
-                        rw <- buildImportRewrites transientReg owner Set.empty
-                                `catch` (\(_ :: SomeException) -> pure Map.empty)
-                        let expr' = if Map.null rw
-                                      then expr
-                                      else rewriteExpr rw expr
-                        baseEnv <- readIORef envBaseForFallbackRef
-                        -- Augment with constructors + field accessors
-                        -- from ALL globally loaded modules — body may
-                        -- reference constructors (like 'Text') defined
-                        -- in its own module that weren't in the original
-                        -- base env (which predates the user's imports).
-                        let unionedData =
-                                foldr Map.union Map.empty
-                                    (map lmDataReg (Map.elems mods))
-                            (publicFields, unionedFields) =
-                                partitionFieldRegistries (Map.elems mods)
-                        conEnvAll    <- buildConEnv unionedData
-                        fieldEnvAll  <- buildFieldAccessorEnv
-                                            publicFields unionedFields
-                        let richEnv = Map.union baseEnv
-                                        (Map.union conEnvAll fieldEnvAll)
-                        slot    <- newIORef BlackHole
-                        writeIORef slot
-                            (Unevaluated (Closure richEnv emptyIPMap expr'))
-                        modifyIORef' envFallbackCache (Map.insert name slot)
-                        pure (Just slot)
-                    _ -> pure Nothing
+resolveFallback name = do
+    mods <- readIORef globalLoadedModulesRef
+    case splitQualified name of
+        Nothing -> pure Nothing   -- bare names must stay in caller's env (namespace integrity)
+        Just (modName, bareName) ->
+            case Map.lookup modName mods of
+                Nothing    -> pure Nothing
+                Just owner -> do
+                    -- If the body isn't yet in 'lmBodies', trigger a
+                    -- demand-discovery pass for this single name and
+                    -- refresh 'mods'.  This turns the fallback into a
+                    -- genuinely lazy resolver: any FQN that CAN be
+                    -- discovered in its owning module is discovered
+                    -- exactly when the evaluator first references it.
+                    bodies0 <- readIORef (lmBodies owner)
+                    mods' <- case Map.lookup bareName bodies0 of
+                        Just expr | expr /= EVar bareName -> pure mods
+                        _ -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            _ <- try (discoverInModule transientReg
+                                        searchPath includeMap owner bareName)
+                                    :: IO (Either SomeException ())
+                            -- discoverInModule may have loaded new modules
+                            -- into the transient reg; merge them into the
+                            -- global catalogue so subsequent fallbacks see
+                            -- them.
+                            reg <- readIORef transientReg
+                            let newMods = Map.fromList
+                                    [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                            modifyIORef' globalLoadedModulesRef
+                                (Map.union newMods)
+                            readIORef globalLoadedModulesRef
+                    buildSlotFromOwner mods' owner bareName
+  where
+    buildSlotFromOwner mods owner bareName = do
+        bodies <- readIORef (lmBodies owner)
+        case Map.lookup bareName bodies of
+            Just expr | expr /= EVar bareName -> do
+                -- Synthesize a transient registry from the global
+                -- catalogue so 'buildImportRewrites' can walk the
+                -- owner's imports to resolve bare references inside
+                -- the body to FQNs the fallback can then look up
+                -- recursively.
+                transientReg <- newIORef (Map.map Loaded mods)
+                rw <- buildImportRewrites transientReg owner Set.empty
+                        `catch` (\(_ :: SomeException) -> pure Map.empty)
+                let expr' = if Map.null rw
+                              then expr
+                              else rewriteExpr rw expr
+                baseEnv <- readIORef envBaseForFallbackRef
+                -- Augment with constructors + field accessors from
+                -- ALL globally loaded modules — body may reference
+                -- constructors (like 'Text') defined in its own
+                -- module that weren't in the original base env
+                -- (which predates the user's imports).
+                let unionedData =
+                        foldr Map.union Map.empty
+                            (map lmDataReg (Map.elems mods))
+                    (publicFields, unionedFields) =
+                        partitionFieldRegistries (Map.elems mods)
+                conEnvAll   <- buildConEnv unionedData
+                fieldEnvAll <- buildFieldAccessorEnv
+                                    publicFields unionedFields
+                let richEnv = Map.union baseEnv
+                                (Map.union conEnvAll fieldEnvAll)
+                slot <- newIORef BlackHole
+                writeIORef slot
+                    (Unevaluated (Closure richEnv emptyIPMap expr'))
+                modifyIORef' envFallbackCache (Map.insert name slot)
+                pure (Just slot)
+            _ -> pure Nothing
 
 -- | Look up the include-dirs for a source file by matching its directory
 -- against the keys of the includeMap.  The file may live inside a
