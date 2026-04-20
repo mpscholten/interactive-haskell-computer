@@ -87,6 +87,7 @@ import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
+import qualified IHC.TypeAST
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -146,6 +147,14 @@ data LoadedModule = LoadedModule
       -- (see 'registerForeignImports') that dispatches the real C symbol
       -- via libffi at call time.  Populated by 'scanForeignImports'.
     , lmForeignDecls :: ![FFI.ForeignDecl]
+      -- | Top-level type signatures scanned from this module's source.
+      -- Used by 'IHC.Elaborate' for on-demand type inference when class
+      -- dispatch hits ambiguity.  Populated by 'scanTypeSigs'.
+    , lmTypeSigs    :: !(Map ByteString IHC.TypeAST.Scheme)
+      -- | Top-level type synonyms (@type Name args = RHS@).  Used for
+      -- one-hop expansion before unification.  Populated by
+      -- 'scanTypeSynonyms'.
+    , lmTypeSynonyms :: !(Map ByteString (Int, IHC.TypeAST.Type))
     }
 
 data ModuleState
@@ -2924,8 +2933,28 @@ globalLoadedModulesRef :: IORef (Map ModuleName LoadedModule)
 globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
-registerGlobalLoadedModule lm =
+registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
+    -- Mirror per-module type sigs + synonyms into the flat global
+    -- registries used by 'IHC.Elaborate'.  Last-writer-wins for name
+    -- collisions across modules (rare in practice — sigs are
+    -- module-scoped in source).
+    modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
+    modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
+
+-- | Global union of every loaded module's top-level type signatures.
+-- Consulted by 'IHC.Elaborate' to discover an argument position's
+-- expected type when a class dispatch hits ambiguity.
+{-# NOINLINE globalTypeSigsRef #-}
+globalTypeSigsRef :: IORef (Map ByteString IHC.TypeAST.Scheme)
+globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Global union of type synonym declarations (@type Name args = RHS@).
+-- One-hop expansion is enough for the target cases (e.g. @State s =
+-- StateT s Identity@); multi-level chains defer.
+{-# NOINLINE globalTypeSynonymsRef #-}
+globalTypeSynonymsRef :: IORef (Map ByteString (Int, IHC.TypeAST.Type))
+globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 
 -- | Global search path + include-map captured at setup time so the env
 -- fallback hook can trigger 'discoverInModule' for FQNs whose bodies
@@ -3172,6 +3201,8 @@ buildEmptyStubModule name = do
         , lmNoFieldSelectors = False
         , lmTypeFamilies     = TR.emptyRegistry
         , lmForeignDecls     = []
+        , lmTypeSigs         = Map.empty
+        , lmTypeSynonyms     = Map.empty
         }
 
 buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedModule
@@ -3180,6 +3211,8 @@ buildLoadedModule name isEntry header src = do
     (dataR, fldR, tCtR) <- scanDataDecls src
     tfReg               <- scanTypeFamilyDecls src
     foreigns            <- scanForeignImports src
+    sigs                <- scanTypeSigs src
+    synonyms            <- scanTypeSynonyms src
     bodies              <- newIORef Map.empty
     -- Pre-populate 'lmBodies' with a sentinel @EVar ffiSynthKey@ for
     -- every scanned 'foreign import ccall' decl.  discoverInModule will
@@ -3207,6 +3240,8 @@ buildLoadedModule name isEntry header src = do
         , lmNoFieldSelectors = hasNoFieldSelectors src
         , lmTypeFamilies     = tfReg
         , lmForeignDecls     = foreigns
+        , lmTypeSigs         = Map.fromList sigs
+        , lmTypeSynonyms     = Map.fromList synonyms
         }
 
 -- | Synthetic env key under which a foreign import's dispatch 'Val' is

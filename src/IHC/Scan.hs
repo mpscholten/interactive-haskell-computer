@@ -51,6 +51,9 @@ module IHC.Scan
     , scanTypeFamilyDecls
       -- * Foreign imports (generic @foreign import ccall@ dispatcher, Phase 4)
     , scanForeignImports
+      -- * Top-level type signatures + synonyms (for on-demand elaboration)
+    , scanTypeSigs
+    , scanTypeSynonyms
     ) where
 
 import Data.ByteString (ByteString)
@@ -63,10 +66,12 @@ import Control.Monad (when)
 import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
+import IHC.AST (Name)
 import IHC.Classes (normalizeTyTag)
 import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
+import IHC.TypeAST (Type(..), Pred(..), Scheme(..))
 import qualified IHC.TypeReduce as TR
 
 -- | What we know about a top-level name.
@@ -2748,3 +2753,390 @@ tyConToFFI c _ = case c of
     "CSsize"   -> Just FFISize
     "CSSize"   -> Just FFISize
     _          -> Nothing
+
+--------------------------------------------------------------------------------
+-- Top-level type signatures and type synonyms
+--
+-- Used by 'IHC.Elaborate' for on-demand type inference.  MVP grammar:
+--
+--   sig        ::= name [',' name]* '::' scheme
+--   scheme     ::= ['forall' vars '.'] [context '=>'] type
+--   context    ::= pred | '(' pred [',' pred]* ')'
+--   pred       ::= ConId atom+            -- Monad m, MonadState s m
+--   type       ::= typeApp ('->' type)?
+--   typeApp    ::= typeAtom typeAtom*
+--   typeAtom   ::= ConId | Ident | '(' type [',' type]* ')' | '[' type ']'
+--                | '()' | '(' ')'
+--
+--   synonym    ::= 'type' ConId var* '=' type
+--
+-- Not implemented: GADT-style sigs, type families in sigs, rank-N,
+-- kind annotations, '{-# ... #-}' pragma handling inside sigs.
+--
+-- All parsing is tolerant: on failure we return 'Nothing' and move on
+-- so a malformed sig for ONE binding never blocks discovery.
+--------------------------------------------------------------------------------
+
+-- | Flat token representation local to the sig/synonym parser.
+data TTok
+    = TTCon   !ByteString
+    | TTVar   !ByteString
+    | TTArrow
+    | TTDArrow
+    | TTLParen
+    | TTRParen
+    | TTLBracket
+    | TTRBracket
+    | TTComma
+    | TTDot
+    | TTForall
+    | TTUnderscore
+    | TTSymOp !ByteString   -- infix type op like ':.' (kept as-is; we don't resolve)
+    deriving (Eq, Show)
+
+tokenToTT :: Token -> Maybe TTok
+tokenToTT t = case tkKind t of
+    TkConId n       -> Just (TTCon n)
+    TkIdent n       -> Just (TTVar n)
+    TkArrow         -> Just TTArrow
+    TkDArrow        -> Just TTDArrow
+    TkLParen        -> Just TTLParen
+    TkRParen        -> Just TTRParen
+    TkLBracket      -> Just TTLBracket
+    TkRBracket      -> Just TTRBracket
+    TkComma         -> Just TTComma
+    TkDot           -> Just TTDot
+    TkForall        -> Just TTForall
+    TkUnderscore    -> Just TTUnderscore
+    TkSymOp n       -> Just (TTSymOp n)
+    _               -> Nothing
+
+-- | Scan tokens of a type expression until a stop condition.  Returns
+-- the accumulated tokens + the cursor past them.  Stops at EOF, at
+-- the next column-1 token (next top-level decl), or at a bracketed
+-- open such as @{@ that starts a where-block.
+collectTypeTokens :: Source -> Cursor -> IO ([TTok], Cursor)
+collectTypeTokens src = go []
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc, cur)
+            TkNewline -> go acc cur'
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline
+                -> pure (reverse acc, cur)
+            _ -> case tokenToTT tok of
+                Just tt -> go (tt : acc) cur'
+                Nothing -> pure (reverse acc, cur)
+
+-- | Parse a token stream into a 'Scheme'.  Returns 'Nothing' on any
+-- malformation; callers skip the binding and move on.
+parseScheme :: [TTok] -> Maybe Scheme
+parseScheme toks0 = do
+    let (vars, toks1) = consumeForall toks0
+    (preds, toks2) <- Just (consumeContext toks1)
+    body <- parseType toks2
+    let allVars = if null vars
+                    then collectTypeVars body preds
+                    else vars
+    Just (Scheme allVars preds body)
+  where
+    -- forall a b c.  →  (["a","b","c"], rest)
+    consumeForall (TTForall : rest) =
+        let (vs, afterDot) = takeVars [] rest
+        in (vs, afterDot)
+    consumeForall rest = ([], rest)
+
+    takeVars acc (TTVar n : rest)     = takeVars (n : acc) rest
+    takeVars acc (TTDot    : rest)    = (reverse acc, rest)
+    takeVars acc rest                 = (reverse acc, rest)   -- malformed; proceed
+
+    -- Find @=>@ at depth 0.  Everything before is context.
+    consumeContext toks =
+        case splitDArrowDepth0 toks of
+            Nothing           -> ([], toks)
+            Just (ctxToks, rest) ->
+                let preds = parseContext ctxToks
+                in (preds, rest)
+
+parseContext :: [TTok] -> [Pred]
+parseContext [] = []
+parseContext toks = case toks of
+    (TTLParen : _) -> parseParenContext toks
+    _              -> case parsePred toks of
+                          Just p  -> [p]
+                          Nothing -> []
+
+parseParenContext :: [TTok] -> [Pred]
+parseParenContext toks = case toks of
+    (TTLParen : inner) ->
+        let (body, _after) = splitRParenDepth0 inner
+            segments = splitCommaDepth0 body
+        in [p | seg <- segments, Just p <- [parsePred seg]]
+    _ -> []
+
+parsePred :: [TTok] -> Maybe Pred
+parsePred toks = case toks of
+    (TTCon cls : rest) -> do
+        argTys <- parseTypeArgsList rest
+        -- Combine args into a single Type via left-assoc application.
+        -- Multi-param classes (MonadState s m) become
+        -- @TyApp (TyApp (TyCon "MonadState") (TyVar "s")) (TyVar "m")@
+        -- — no: we represent multi-param classes as Pred Name Type with
+        -- Type being the LAST argument, and encode upper args via
+        -- the outer Type.  For MVP, single-arg constraint; multi-arg
+        -- stored as the list folded into a right-nested TyApp (bestow
+        -- the elaborator reads all of Type's leaves).
+        case argTys of
+            []      -> Nothing
+            [t]     -> Just (Pred cls t)
+            (t:ts)  -> Just (Pred cls (foldl TyApp t ts))
+    _ -> Nothing
+
+-- | Parse a type expression.  Splits on top-level @->@ first
+-- (right-associative).
+parseType :: [TTok] -> Maybe Type
+parseType toks = case splitArrowDepth0 toks of
+    Just (lhs, rhs) -> do
+        l <- parseTypeApp lhs
+        r <- parseType rhs
+        Just (TyArrow l r)
+    Nothing -> parseTypeApp toks
+
+parseTypeApp :: [TTok] -> Maybe Type
+parseTypeApp toks = do
+    atoms <- parseTypeAtoms toks
+    case atoms of
+        []     -> Nothing
+        (a:as) -> Just (foldl TyApp a as)
+
+-- | Parse consecutive type atoms until the token stream is exhausted.
+parseTypeAtoms :: [TTok] -> Maybe [Type]
+parseTypeAtoms [] = Just []
+parseTypeAtoms toks = do
+    (atom, rest) <- parseAtom toks
+    atoms <- parseTypeAtoms rest
+    Just (atom : atoms)
+
+parseAtom :: [TTok] -> Maybe (Type, [TTok])
+parseAtom toks = case toks of
+    (TTCon n : rest)      -> Just (TyCon n, rest)
+    (TTVar n : rest)      -> Just (TyVar n, rest)
+    (TTUnderscore : rest) -> Just (TyVar (BC.pack "_"), rest)
+    (TTLParen : inner)    -> parseParenAtom inner
+    (TTLBracket : inner)  -> parseListAtom inner
+    _                     -> Nothing
+
+-- | @(type)@ — one element → drop parens.
+-- @(type, type, …)@ — tuple → @(,)@ type constructor application.
+-- @()@ — unit → @TyCon "()"@.
+parseParenAtom :: [TTok] -> Maybe (Type, [TTok])
+parseParenAtom (TTRParen : rest) = Just (TyCon (BC.pack "()"), rest)
+parseParenAtom inner = do
+    let (body, afterRP) = splitRParenDepth0 inner
+    let segments = splitCommaDepth0 body
+    case segments of
+        [seg] -> do
+            t <- parseType seg
+            Just (t, afterRP)
+        many -> do
+            ts <- mapM parseType many
+            let n = length ts
+                tupleCon = TyCon (BC.pack ("(" ++ replicate (n - 1) ',' ++ ")"))
+            Just (foldl TyApp tupleCon ts, afterRP)
+
+-- | @[type]@ — list type @[] type@.
+parseListAtom :: [TTok] -> Maybe (Type, [TTok])
+parseListAtom inner = do
+    let (body, afterRB) = splitRBracketDepth0 inner
+    t <- parseType body
+    Just (TyApp (TyCon (BC.pack "[]")) t, afterRB)
+
+-- | Split tokens on the first top-level @->@.  Returns Nothing if
+-- none is present.
+splitArrowDepth0 :: [TTok] -> Maybe ([TTok], [TTok])
+splitArrowDepth0 = go [] 0
+  where
+    go _   _ [] = Nothing
+    go acc 0 (TTArrow : rest) = Just (reverse acc, rest)
+    go acc d (t : rest) = case t of
+        TTLParen   -> go (t : acc) (d + 1) rest
+        TTRParen   -> go (t : acc) (d - 1) rest
+        TTLBracket -> go (t : acc) (d + 1) rest
+        TTRBracket -> go (t : acc) (d - 1) rest
+        _          -> go (t : acc) d rest
+
+splitDArrowDepth0 :: [TTok] -> Maybe ([TTok], [TTok])
+splitDArrowDepth0 = go [] 0
+  where
+    go _   _ [] = Nothing
+    go acc 0 (TTDArrow : rest) = Just (reverse acc, rest)
+    go acc d (t : rest) = case t of
+        TTLParen   -> go (t : acc) (d + 1) rest
+        TTRParen   -> go (t : acc) (d - 1) rest
+        TTLBracket -> go (t : acc) (d + 1) rest
+        TTRBracket -> go (t : acc) (d - 1) rest
+        _          -> go (t : acc) d rest
+
+splitRParenDepth0 :: [TTok] -> ([TTok], [TTok])
+splitRParenDepth0 = go [] 1
+  where
+    go acc _ [] = (reverse acc, [])
+    go acc 1 (TTRParen : rest) = (reverse acc, rest)
+    go acc d (t : rest) = case t of
+        TTLParen   -> go (t : acc) (d + 1) rest
+        TTRParen   -> go (t : acc) (d - 1) rest
+        _          -> go (t : acc) d rest
+
+splitRBracketDepth0 :: [TTok] -> ([TTok], [TTok])
+splitRBracketDepth0 = go [] 1
+  where
+    go acc _ [] = (reverse acc, [])
+    go acc 1 (TTRBracket : rest) = (reverse acc, rest)
+    go acc d (t : rest) = case t of
+        TTLBracket -> go (t : acc) (d + 1) rest
+        TTRBracket -> go (t : acc) (d - 1) rest
+        _          -> go (t : acc) d rest
+
+splitCommaDepth0 :: [TTok] -> [[TTok]]
+splitCommaDepth0 = go [] 0 []
+  where
+    go cur _ acc [] = reverse (reverse cur : acc)
+    go cur 0 acc (TTComma : rest) = go [] 0 (reverse cur : acc) rest
+    go cur d acc (t : rest) = case t of
+        TTLParen   -> go (t : cur) (d + 1) acc rest
+        TTRParen   -> go (t : cur) (d - 1) acc rest
+        TTLBracket -> go (t : cur) (d + 1) acc rest
+        TTRBracket -> go (t : cur) (d - 1) acc rest
+        _          -> go (t : cur) d acc rest
+
+-- | Parse a list of space-separated type atoms (used for class args
+-- in predicates like @MonadState s m@).
+parseTypeArgsList :: [TTok] -> Maybe [Type]
+parseTypeArgsList toks = do
+    atoms <- parseTypeAtoms toks
+    Just atoms
+
+-- | Collect free type variables appearing in a type + predicates.
+-- Used when the sig omits an explicit @forall@ so we still quantify
+-- over the variables (Haskell 2010 implicit quantification).
+collectTypeVars :: Type -> [Pred] -> [Name]
+collectTypeVars body preds =
+    let collect t = case t of
+            TyVar n      -> [n]
+            TyCon _      -> []
+            TyApp a b    -> collect a ++ collect b
+            TyArrow a b  -> collect a ++ collect b
+            TyForall _ _ _ -> []   -- don't descend into nested foralls
+        fromPreds = concatMap (\(Pred _ a) -> collect a) preds
+        fromBody  = collect body
+        -- De-dup preserving order.
+        uniq = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
+    in uniq (fromBody ++ fromPreds)
+
+--------------------------------------------------------------------------------
+-- Public scanners
+--------------------------------------------------------------------------------
+
+-- | Walk a module's source, collecting every top-level @name :: Type@
+-- signature (and comma-separated multi-name variants like
+-- @a, b :: Int@).  Malformed sigs are silently skipped.
+scanTypeSigs :: Source -> IO [(ByteString, Scheme)]
+scanTypeSigs src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkNewline -> go acc cur'
+            TkIdent name | tkCol tok == 1 -> do
+                -- Collect additional comma-separated names, e.g.
+                -- @a, b :: Int@ → sigs for a + b.
+                (names, curAfterNames) <- collectMoreSigNames src [name] cur'
+                let (dcolon, curAfterDC) = nextToken src curAfterNames
+                case tkKind dcolon of
+                    TkDColon -> do
+                        (typeToks, curAfterType) <- collectTypeTokens src curAfterDC
+                        case parseScheme typeToks of
+                            Just scheme ->
+                                go (map (\n -> (n, scheme)) names ++ acc) curAfterType
+                            Nothing -> go acc curAfterType
+                    _ -> go acc cur'
+            TkLParen | tkCol tok == 1 -> do
+                -- Operator signature: @(<>) :: ...@
+                case peekOperatorSig src cur' of
+                    Just (opName, curAfterClose) -> do
+                        let (dcolon, curAfterDC) = nextToken src curAfterClose
+                        case tkKind dcolon of
+                            TkDColon -> do
+                                (typeToks, curAfterType) <- collectTypeTokens src curAfterDC
+                                case parseScheme typeToks of
+                                    Just scheme -> go ((opName, scheme) : acc) curAfterType
+                                    Nothing     -> go acc curAfterType
+                            _ -> go acc cur'
+                    Nothing -> go acc cur'
+            _ -> go acc cur'
+
+collectMoreSigNames :: Source -> [ByteString] -> Cursor -> IO ([ByteString], Cursor)
+collectMoreSigNames src acc cur = do
+    let (tok, cur') = nextToken src cur
+    case tkKind tok of
+        TkComma -> do
+            let (tok2, cur2) = nextToken src cur'
+            case tkKind tok2 of
+                TkIdent n -> collectMoreSigNames src (n : acc) cur2
+                _         -> pure (reverse acc, cur)
+        _ -> pure (reverse acc, cur)
+
+-- | Match @(op) :: ...@ — operator-name type sig.
+peekOperatorSig :: Source -> Cursor -> Maybe (ByteString, Cursor)
+peekOperatorSig src cur =
+    let (tok, cur') = nextToken src cur in
+    case tkKind tok of
+        TkSymOp op ->
+            let (tok2, cur2) = nextToken src cur' in
+            case tkKind tok2 of
+                TkRParen -> Just (op, cur2)
+                _        -> Nothing
+        _ -> Nothing
+
+-- | Walk a module's source, collecting every top-level type synonym
+-- declaration: @type Name v1 v2 … = RHS@.  Returns @(name, (arity,
+-- rhs))@ pairs.  We DO NOT apply the RHS substitution here; the
+-- elaborator does one-hop expansion when it encounters the name in a
+-- type.  Type families, data types, and newtypes are skipped.
+scanTypeSynonyms :: Source -> IO [(ByteString, (Int, Type))]
+scanTypeSynonyms src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkNewline -> go acc cur'
+            TkTypeKw | tkCol tok == 1 -> do
+                -- 'type' keyword — could be synonym, family, or instance.
+                let (nameTok, curAfterName) = nextToken src cur'
+                case tkKind nameTok of
+                    TkConId synName -> do
+                        -- Collect type variables, then '='.
+                        (argVars, curAfterVars) <- collectTypeVarsList src curAfterName
+                        let (eqTok, curAfterEq) = nextToken src curAfterVars
+                        case tkKind eqTok of
+                            TkEq -> do
+                                (typeToks, curAfterType) <- collectTypeTokens src curAfterEq
+                                case parseType typeToks of
+                                    Just rhs ->
+                                        go ((synName, (length argVars, rhs)) : acc) curAfterType
+                                    Nothing -> go acc curAfterType
+                            _ -> go acc cur'   -- type family / instance / etc.
+                    _ -> go acc cur'
+            _ -> go acc cur'
+
+collectTypeVarsList :: Source -> Cursor -> IO ([ByteString], Cursor)
+collectTypeVarsList src cur0 = go [] cur0
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkIdent n -> go (n : acc) cur'
+            _         -> pure (reverse acc, cur)
