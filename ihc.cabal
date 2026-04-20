@@ -37,6 +37,7 @@ library
       , IHC.Cpp
       , IHC.Diagnostics
       , IHC.Driver
+      , IHC.Elaborate
       , IHC.Eval
       , IHC.FFI
       , IHC.Lexer
