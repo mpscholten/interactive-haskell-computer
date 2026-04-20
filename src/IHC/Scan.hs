@@ -1937,8 +1937,12 @@ scanInstanceDecls src = go [] startCursor
                                                 let lhs  = BindingLhs [clause]
                                                     acc' = Map.insert opName lhs acc
                                                 scanMethods acc' curNext
-                            _ -> scanMethods acc cur'
-                    _ -> scanMethods acc cur'
+                            -- `(pat ...)` introducing an infix method: e.g.
+                            -- @(MySum a) <> (MySum b) = ...@ — opens with
+                            -- `(` but the next non-close token is ident, not
+                            -- an operator.  Fall through to the infix scan.
+                            _ -> tryInfixThen acc (tkCol tok) cur cur'
+                    _ -> tryInfixThen acc (tkCol tok) cur cur'
             -- Phase 3.2: skip associated-type declarations inside instance bodies.
             -- 'type Elem [] = ()' appears inside 'instance C T where' blocks.
             -- We use findLineEnd to skip only the current line so we don't
@@ -1949,7 +1953,76 @@ scanInstanceDecls src = go [] startCursor
                 in scanMethods acc curNext
             -- Stop when we hit a new column-1 token (next top-level decl).
             _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (Map.toList acc)
+              -- Infix method form: @pat1 <> pat2 = body@ — the first
+              -- token isn't an identifier or @(opname)@, so the prefix
+              -- branches above don't match.  Scan forward to find a
+              -- top-level symbolic operator before @=@ and register the
+              -- clause under that operator name.  LHS patterns span
+              -- from the start of the line (cur) up to @=@.
+              | tkCol tok > 1 -> do
+                  mInfix <- tryInfixMethod (tkCol tok) cur
+                  case mInfix of
+                      Just (opName, clause, curNext) -> do
+                          let lhs = BindingLhs [clause]
+                              acc' = Map.insert opName lhs acc
+                          scanMethods acc' curNext
+                      Nothing -> scanMethods acc cur'
               | otherwise -> scanMethods acc cur'
+
+    -- Helper: after a prefix-form branch fails to match, try infix
+    -- form; on success register and continue, otherwise fall back to
+    -- advancing past the current token (same recovery as before).
+    tryInfixThen acc bindCol cur fallbackCur = do
+        mInfix <- tryInfixMethod bindCol cur
+        case mInfix of
+            Just (opName, clause, curNext) -> do
+                let lhs = BindingLhs [clause]
+                    acc' = Map.insert opName lhs acc
+                scanMethods acc' curNext
+            Nothing -> scanMethods acc fallbackCur
+
+    -- Detect an infix-form method definition, e.g.:
+    --
+    -- > instance Semigroup MySum where
+    -- >     (MySum a) <> (MySum b) = MySum (a + b)
+    --
+    -- The prefix branches above don't see @(<>)@ directly because the
+    -- first token is @(@ starting a pattern, not an operator parens.
+    -- Scan forward past balanced parens/brackets up to @=@ or @|@,
+    -- returning the first depth-0 @TkSymOp@ as the method name.
+    tryInfixMethod bindCol cur0 = do
+        mOp <- findTopLevelOpBeforeEq src cur0
+        case mOp of
+            Nothing -> pure Nothing
+            Just opName -> do
+                mClause <- scanOneClauseAfterNameAtCol src bindCol cur0
+                case mClause of
+                    Nothing -> pure Nothing
+                    Just (clause, curNext) ->
+                        pure (Just (opName, clause, curNext))
+
+    findTopLevelOpBeforeEq s cur0 = go cur0 (0 :: Int)
+      where
+        go cur depth = do
+            let (tok, cur') = nextToken s cur
+            case tkKind tok of
+                TkEof                    -> pure Nothing
+                TkEq      | depth == 0   -> pure Nothing
+                TkBar     | depth == 0   -> pure Nothing
+                TkSymOp op | depth == 0  -> pure (Just op)
+                TkLParen                 -> go cur' (depth + 1)
+                TkLBracket               -> go cur' (depth + 1)
+                TkLBrace                 -> go cur' (depth + 1)
+                TkRParen                 -> go cur' (max 0 (depth - 1))
+                TkRBracket               -> go cur' (max 0 (depth - 1))
+                TkRBrace                 -> go cur' (max 0 (depth - 1))
+                TkNewline                ->
+                    let (nxt, _) = nextToken s cur' in
+                    case tkKind nxt of
+                        TkEof            -> pure Nothing
+                        _ | tkCol nxt == 1 -> pure Nothing
+                          | otherwise    -> go cur' depth
+                _                        -> go cur' depth
 
     collectInstanceClauses name bindCol acc cur = do
         let (tok, curAfter) = peekSig cur
