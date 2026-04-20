@@ -76,6 +76,8 @@ import IHC.Classes
     , scanHookRef, sharedClassRegRef, setSharedClassReg
     , unionInstanceScope, currentInstanceScope
     , setEnvFallback
+    , setCoreInstanceLoadHook
+    , setClassMethodFallback
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal)
@@ -231,6 +233,12 @@ loadProgramFromSource searchPath src0 = do
     -- Install as the shared reg so the ETypedMethod evaluator path +
     -- on-demand elaborator can consult it at runtime.
     setSharedClassReg classReg
+    -- Fallback: if 'resolveTypedMethod' can't resolve (cls, tag, method)
+    -- it consults this hook to get a value-directed dispatcher, so
+    -- ambiguous type annotations don't hard-error when the tag points
+    -- at an instance we haven't loaded (e.g. @return 42 :: ST s Int@).
+    setClassMethodFallback (\cls method ->
+        pure (Just (classMethodDispatcher classReg cls method)))
     -- Seed the type-sig registry with canonical class method sigs
     -- (pure, return, mempty, minBound, maxBound).
     seedBuiltinClassMethodSigs
@@ -466,7 +474,81 @@ buildBaseEnv = do
     -- Seed the env-fallback's base env so Closures built by
     -- 'resolveFallback' can reach builtins + class dispatchers.
     writeIORef envBaseForFallbackRef env2
+    -- Install the core-instance load hook: on the first elaborator
+    -- lookup miss ('IHC.Eval.resolveTypedMethod'), force-load
+    -- GHC.Internal.Base / Maybe / … so their Applicative / Monad /
+    -- Functor dicts are in the registry.  One-shot (guarded by an
+    -- IORef flag); later calls are free.  Kept out of startup so the
+    -- bare REPL prompt stays fast for users who never use type
+    -- annotations.
+    installCoreInstanceLoadHook classReg env2
+    -- Install the class-method fallback: if resolveTypedMethod can't
+    -- find an instance even after loading core dicts, return the
+    -- dispatcher so value-directed lookup can still run.
+    setClassMethodFallback (\cls method ->
+        pure (Just (classMethodDispatcher classReg cls method)))
     pure (env2, classReg)
+
+-- | Install a one-shot hook that force-loads core instance modules
+-- (@GHC.Internal.Base@ and friends) and registers their instance
+-- dictionaries.  Keeps REPL startup fast: the modules aren't touched
+-- until the elaborator's 'IHC.Eval.resolveTypedMethod' hits its first
+-- lookup miss (e.g. @pure 42 :: Maybe Int@ at the bare prompt).  The
+-- hook captures the REPL's 'ClassRegistry' so the registrations land in
+-- the same reg the dispatcher reads.  After the first successful call
+-- the flag is flipped and further invocations short-circuit.
+installCoreInstanceLoadHook :: ClassRegistry -> Env -> IO ()
+installCoreInstanceLoadHook classReg baseEnv = do
+    doneRef <- newIORef False
+    let hook = do
+            done <- readIORef doneRef
+            if done
+              then pure ()
+              else do
+                  writeIORef doneRef True
+                  r <- try (loadCoreInstanceModules classReg baseEnv)
+                          :: IO (Either SomeException ())
+                  case r of
+                      Right () -> pure ()
+                      Left  _  -> pure ()   -- best-effort
+    setCoreInstanceLoadHook hook
+
+-- | Force-load the canonical set of "instance-bearing" modules and
+-- register the instances they declare.  Called at most once per REPL
+-- session via 'installCoreInstanceLoadHook'.
+loadCoreInstanceModules :: ClassRegistry -> Env -> IO ()
+loadCoreInstanceModules classReg baseEnv = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs      = map fst cacheWithIncludes
+        includeMap     = Map.fromList cacheWithIncludes
+        fullSearchPath = cacheDirs
+        coreModules =
+            [ BC.pack "GHC.Internal.Base"
+            , BC.pack "GHC.Internal.Maybe"
+            , BC.pack "GHC.Internal.Data.Either"
+            ]
+    registry <- newIORef Map.empty
+    loaded <- mapM
+        (\m -> do
+            r <- try (loadModule registry fullSearchPath includeMap m)
+                     :: IO (Either SomeException LoadedModule)
+            case r of
+                Right lm -> pure (Just lm)
+                Left  _  -> pure Nothing)
+        coreModules
+    let lms = [lm | Just lm <- loaded]
+    unionInstanceScope (Set.fromList (map lmName lms))
+    classTable <- buildClassMethodTable lms
+    let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg lms)
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap
+                                 classReg tyCtors classTable baseEnv) lms
+    -- Also mirror into the shared reg (matches the loadImport path).
+    mSharedReg <- readIORef sharedClassRegRef
+    case mSharedReg of
+        Just sharedReg | sharedReg /= classReg ->
+            mapM_ (registerInstancesFrom registry fullSearchPath includeMap
+                                         sharedReg tyCtors classTable baseEnv) lms
+        _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
 -- @SomeException@, @displayException@ from @GHC.Internal.Exception@

@@ -35,7 +35,7 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef)
+import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.TypeAST as TA
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
@@ -63,16 +63,38 @@ forceMethodVal v               = pure v
 -- Applicative.pure).
 resolveTypedMethod :: ClassRegistry -> Name -> Name -> Name -> IO Val
 resolveTypedMethod reg cls method tag = do
-    mMethod <- lookupInstanceMethod reg cls tag method
-    resolved <- case mMethod of
-        Just v | not (isPlaceholder v) -> pure (Just v)
-        _ -> tryFallbacks (fallbackList cls method)
+    resolved <- tryResolve
     case resolved of
         Just v  -> forceMethodVal v
-        Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
-                        <> BC.unpack cls <> " " <> BC.unpack tag
-                        <> "` for method `" <> BC.unpack method <> "`")
+        Nothing -> do
+            -- First-miss retry: the REPL doesn't pre-load core instance
+            -- dicts (keeps startup latency low). The hook force-loads
+            -- GHC.Internal.Base / Maybe / … once per session; subsequent
+            -- calls are free.
+            triggerCoreInstanceLoad
+            resolved2 <- tryResolve
+            case resolved2 of
+                Just v  -> forceMethodVal v
+                Nothing -> do
+                    -- Still no match: fall back to the existing value-
+                    -- directed dispatcher.  This keeps behaviour
+                    -- equivalent to pre-elaborator semantics when the
+                    -- resolved tag points at an instance we haven't
+                    -- loaded (e.g. @Monad (ST s)@: we don't force-load
+                    -- @GHC.Internal.ST@ on startup).
+                    mFallback <- lookupClassMethodFallback cls method
+                    case mFallback of
+                        Just v  -> forceMethodVal v
+                        Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
+                                        <> BC.unpack cls <> " " <> BC.unpack tag
+                                        <> "` for method `" <> BC.unpack method <> "`")
   where
+    tryResolve = do
+        mMethod <- lookupInstanceMethod reg cls tag method
+        case mMethod of
+            Just v | not (isPlaceholder v) -> pure (Just v)
+            _ -> tryFallbacks (fallbackList cls method)
+
     isPlaceholder (VCon n []) =
         n == BC.pack "<ihc-method-placeholder>"
     isPlaceholder _ = False

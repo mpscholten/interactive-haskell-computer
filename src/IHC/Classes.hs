@@ -42,6 +42,14 @@ module IHC.Classes
     , envFallbackRef
     , setEnvFallback
     , lookupEnvFallback
+      -- * Core-instance load hook
+    , coreInstanceLoadHookRef
+    , setCoreInstanceLoadHook
+    , triggerCoreInstanceLoad
+      -- * Class-method dispatcher fallback
+    , classMethodFallbackRef
+    , setClassMethodFallback
+    , lookupClassMethodFallback
     ) where
 
 import Data.ByteString (ByteString)
@@ -352,3 +360,54 @@ lookupEnvFallback :: ByteString -> IO (Maybe Thunk)
 lookupEnvFallback name = do
     hook <- readIORef envFallbackRef
     hook name
+
+--------------------------------------------------------------------------------
+-- Class-method dispatcher fallback
+--
+-- When the elaborator's 'IHC.Eval.resolveTypedMethod' can't find an
+-- instance for its resolved tag — typically because the instance lives
+-- in a module the REPL never demand-loaded (e.g. @instance Monad (ST s)@
+-- lives in @GHC.Internal.ST@, which the core-instance-load hook doesn't
+-- pull in) — we fall back to the existing value-directed dispatcher.
+-- This hook returns a 'VClassMethod' that performs runtime tag-based
+-- lookup against the shared registry, mirroring the behaviour classes
+-- had before the elaborator existed.
+--------------------------------------------------------------------------------
+
+{-# NOINLINE classMethodFallbackRef #-}
+classMethodFallbackRef :: IORef (ByteString -> ByteString -> IO (Maybe Val))
+classMethodFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+
+setClassMethodFallback :: (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
+setClassMethodFallback = writeIORef classMethodFallbackRef
+
+lookupClassMethodFallback :: ByteString -> ByteString -> IO (Maybe Val)
+lookupClassMethodFallback cls method = do
+    hook <- readIORef classMethodFallbackRef
+    hook cls method
+
+--------------------------------------------------------------------------------
+-- Core-instance load hook
+--
+-- One-shot trigger for force-loading GHC.Internal.Base and friends so
+-- their Applicative/Monad/Functor instance dicts are in the registry.
+-- Bare REPL startup skips this (keeps prompt latency low); the elaborator's
+-- 'resolveTypedMethod' fires it only when a type-annotation-driven
+-- lookup misses (e.g. @pure 42 :: Maybe Int@ before any explicit import).
+--
+-- Installed by 'buildBaseEnv'; invoked by 'IHC.Eval.resolveTypedMethod'.
+-- The hook itself maintains its own "already-loaded" flag so subsequent
+-- calls are free (no re-scan).
+--------------------------------------------------------------------------------
+
+{-# NOINLINE coreInstanceLoadHookRef #-}
+coreInstanceLoadHookRef :: IORef (IO ())
+coreInstanceLoadHookRef = unsafePerformIO (newIORef (pure ()))
+
+setCoreInstanceLoadHook :: IO () -> IO ()
+setCoreInstanceLoadHook = writeIORef coreInstanceLoadHookRef
+
+triggerCoreInstanceLoad :: IO ()
+triggerCoreInstanceLoad = do
+    hook <- readIORef coreInstanceLoadHookRef
+    hook

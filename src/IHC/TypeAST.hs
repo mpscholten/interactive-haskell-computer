@@ -58,20 +58,26 @@ type Subst = Map Name Type
 emptySubst :: Subst
 emptySubst = Map.empty
 
--- | Apply a substitution to a type.  Not idempotent — caller may need
--- to compose with existing substitution.
+-- | Apply a substitution to a type.  Cycle-safe via a "visited" set:
+-- even a malformed cyclic substitution (@a → b@, @b → a@) terminates
+-- by refusing to chase a TyVar that's already on the chain.
 applySubst :: Subst -> Type -> Type
-applySubst s t = case t of
-    TyVar n      -> case Map.lookup n s of
-        Just t' -> applySubst s t'   -- chase: substitutions may map to other vars
-        Nothing -> TyVar n
+applySubst = applySubstVisited Set.empty
+
+applySubstVisited :: Set Name -> Subst -> Type -> Type
+applySubstVisited visited s t = case t of
+    TyVar n
+      | Set.member n visited -> TyVar n   -- break cycle
+      | otherwise -> case Map.lookup n s of
+          Just t' -> applySubstVisited (Set.insert n visited) s t'
+          Nothing -> TyVar n
     TyCon n      -> TyCon n
-    TyApp a b    -> TyApp (applySubst s a) (applySubst s b)
-    TyArrow a b  -> TyArrow (applySubst s a) (applySubst s b)
+    TyApp a b    -> TyApp (applySubstVisited visited s a) (applySubstVisited visited s b)
+    TyArrow a b  -> TyArrow (applySubstVisited visited s a) (applySubstVisited visited s b)
     TyForall vs preds body ->
         -- Bound variables shadow the substitution.
         let s' = foldr Map.delete s vs
-        in TyForall vs (map (applySubstPred s') preds) (applySubst s' body)
+        in TyForall vs (map (applySubstPred s') preds) (applySubstVisited visited s' body)
 
 applySubstPred :: Subst -> Pred -> Pred
 applySubstPred s (Pred cls t) = Pred cls (applySubst s t)
