@@ -303,21 +303,56 @@ elaborateLet ienv bs body = do
                            (preds ++ accP) rest preRest
     inferBinds _ _ _ _ _ _ = pure ([], [], emptySubst)
 
--- | Do-block: fold via the monad's '>>=' / '>>' / 'pure'.  For MVP we
--- treat the do-block opaquely (fresh tyvar) — actual method dispatch
--- during evaluation happens through the usual dispatcher path, so
--- elaboration on the outer context constrains things.  Sub-expressions
--- are still walked for local class method resolution.
+-- | Do-block: walk each statement and elaborate sub-expressions for
+-- class-method rewrites.  The do-block's outer type stays a fresh
+-- tyvar — a full bidirectional elaborator (pushing the enclosing
+-- expected-type into each stmt to force @m@ in @m s -> s -> (a, s)@)
+-- is out of MVP scope.  This partial pass still handles common cases
+-- like @do { x <- getLine; putStrLn (... :: String) }@ where the
+-- ambiguity is localised to a single sub-expression.
 elaborateDo :: InferEnv -> [Stmt] -> IO (Expr, Type, [Pred], Subst)
 elaborateDo ienv stmts = do
-    -- Walk statements for side effects (recursive elaboration); do-block
-    -- type gets a fresh tyvar at the outer level.
-    (stmts', preds, sub) <- foldM' emptySubst [] (ienv, stmts)
+    (stmts', preds, sub) <- goStmts ienv emptySubst [] [] stmts
     t <- TyVar <$> freshVar (ieFresh ienv)
     pure (EDo stmts', t, preds, sub)
   where
-    foldM' sub accP (_, []) = pure (reverse accP, [], sub)   -- shouldn't hit — return above
-    foldM' _ _ _ = pure ([], [], emptySubst)   -- placeholder
+    goStmts _ sub accS accP [] = pure (reverse accS, reverse accP, sub)
+    goStmts ie sub accS accP (s : rest) = do
+        (s', ie', preds, sub') <- goStmt ie sub s
+        goStmts ie' sub' (s' : accS) (preds ++ accP) rest
+
+    goStmt :: InferEnv -> Subst -> Stmt -> IO (Stmt, InferEnv, [Pred], Subst)
+    goStmt ie sub stmt = case stmt of
+        SExpr e -> do
+            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
+            pure (SExpr e', ie, preds, composeSubst sub s')
+        SBind name e -> do
+            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
+            -- Add `name` to locals with a fresh tyvar — we don't
+            -- unify the bind's result type with `m a` yet (MVP).
+            fresh <- TyVar <$> freshVar (ieFresh ie)
+            let ie' = ie { ieLocals = Map.insert name
+                                          (Scheme [] [] fresh)
+                                          (ieLocals ie) }
+            pure (SBind name e', ie', preds, composeSubst sub s')
+        SLet bs -> do
+            -- Elaborate each binding's RHS; add names to locals.
+            (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
+            pure (SLet bs', ie', preds, composeSubst sub s')
+        SImplicitLet bs -> do
+            (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
+            pure (SImplicitLet bs', ie', preds, composeSubst sub s')
+
+    goLet :: InferEnv -> [(Name, Expr)] -> IO ([(Name, Expr)], InferEnv, [Pred], Subst)
+    goLet ie bs = goL ie emptySubst [] [] bs
+      where
+        goL ie' sub accB accP [] = pure (reverse accB, ie', accP, sub)
+        goL ie' sub accB accP ((n, rhs) : rest) = do
+            (rhs', t, preds, s') <- elaborateExpr (applySubstIenv sub ie') rhs
+            let ie'' = ie' { ieLocals = Map.insert n (Scheme [] [] t)
+                                                     (ieLocals ie') }
+            goL ie'' (composeSubst sub s') ((n, rhs') : accB)
+                 (preds ++ accP) rest
 
 -- | After unification, walk the expression replacing each
 -- 'ETypedMethod's placeholder tag (a type-variable name) with the
