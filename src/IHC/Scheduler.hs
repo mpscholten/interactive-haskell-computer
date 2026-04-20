@@ -88,6 +88,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeAST
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -227,6 +228,12 @@ loadProgramFromSource searchPath src0 = do
 
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
+    -- Install as the shared reg so the ETypedMethod evaluator path +
+    -- on-demand elaborator can consult it at runtime.
+    setSharedClassReg classReg
+    -- Seed the type-sig registry with canonical class method sigs
+    -- (pure, return, mempty, minBound, maxBound).
+    seedBuiltinClassMethodSigs
 
     -- Pre-build the builtin name set so the discovery loop can short-
     -- circuit names that are provided by IHC.Builtins and never need to
@@ -423,6 +430,8 @@ buildBaseEnv = do
     -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
     -- instances from the transitive import closure are in scope).
     setSharedClassReg classReg
+    -- Seed canonical class method sigs (pure/return/mempty/...).
+    seedBuiltinClassMethodSigs
     -- Install the demand-driven env-fallback hook so that
     -- 'IHC.Eval.eval' can resolve fully-qualified references lazily on
     -- EVar miss.  See 'installEnvFallbackHook' for the mechanics.
@@ -2943,19 +2952,9 @@ registerGlobalLoadedModule lm = do
     modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
 
--- | Global union of every loaded module's top-level type signatures.
--- Consulted by 'IHC.Elaborate' to discover an argument position's
--- expected type when a class dispatch hits ambiguity.
-{-# NOINLINE globalTypeSigsRef #-}
-globalTypeSigsRef :: IORef (Map ByteString IHC.TypeAST.Scheme)
-globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
-
--- | Global union of type synonym declarations (@type Name args = RHS@).
--- One-hop expansion is enough for the target cases (e.g. @State s =
--- StateT s Identity@); multi-level chains defer.
-{-# NOINLINE globalTypeSynonymsRef #-}
-globalTypeSynonymsRef :: IORef (Map ByteString (Int, IHC.TypeAST.Type))
-globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
+-- (moved to IHC.TypeGlobals so both scheduler + evaluator can reach
+-- them without a cycle.  Imported via 'globalTypeSigsRef' and
+-- 'globalTypeSynonymsRef' at module head.)
 
 -- | Global search path + include-map captured at setup time so the env
 -- fallback hook can trigger 'discoverInModule' for FQNs whose bodies

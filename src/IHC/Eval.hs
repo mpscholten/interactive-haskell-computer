@@ -32,8 +32,13 @@ import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
 
+import Control.Exception (try, SomeException)
+
 import IHC.AST
-import IHC.Classes (normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef)
+import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef)
+import qualified IHC.Elaborate as Elab
+import qualified IHC.TypeAST as TA
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -50,6 +55,45 @@ import IHC.Val
 forceMethodVal :: Val -> IO Val
 forceMethodVal (VLazyMethod t) = force t
 forceMethodVal v               = pure v
+
+-- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
+-- method in the class registry; if the instance registered a
+-- 'methodPlaceholder' (class default with no per-instance override),
+-- falls back to a known-equivalent method (e.g. Monad.return →
+-- Applicative.pure).
+resolveTypedMethod :: ClassRegistry -> Name -> Name -> Name -> IO Val
+resolveTypedMethod reg cls method tag = do
+    mMethod <- lookupInstanceMethod reg cls tag method
+    resolved <- case mMethod of
+        Just v | not (isPlaceholder v) -> pure (Just v)
+        _ -> tryFallbacks (fallbackList cls method)
+    case resolved of
+        Just v  -> forceMethodVal v
+        Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
+                        <> BC.unpack cls <> " " <> BC.unpack tag
+                        <> "` for method `" <> BC.unpack method <> "`")
+  where
+    isPlaceholder (VCon n []) =
+        n == BC.pack "<ihc-method-placeholder>"
+    isPlaceholder _ = False
+
+    tryFallbacks [] = pure Nothing
+    tryFallbacks ((c, m) : rest) = do
+        v <- lookupInstanceMethod reg c tag m
+        case v of
+            Just vv | not (isPlaceholder vv) -> pure (Just vv)
+            _ -> tryFallbacks rest
+
+    -- Known equalities between class methods — used when an instance
+    -- relies on the class's default body instead of providing a
+    -- per-instance override.  Mapped to the class/method that DOES
+    -- have a concrete body.
+    fallbackList c m
+      | c == BC.pack "Monad", m == BC.pack "return" =
+            [(BC.pack "Applicative", BC.pack "pure")]
+      | c == BC.pack "Monad", m == BC.pack "(>>)"   =
+            [(BC.pack "Applicative", BC.pack "(*>)")]
+      | otherwise = []
 
 force :: Thunk -> IO Val
 force t = do
@@ -255,13 +299,7 @@ eval env ipm = go
         case mReg of
             Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
                               <> "(elaborator fired before buildBaseEnv?)")
-            Just reg -> do
-                mMethod <- lookupInstanceMethod reg cls tag method
-                case mMethod of
-                    Just v  -> pure v
-                    Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
-                                    <> BC.unpack cls <> " " <> BC.unpack tag
-                                    <> "` for method `" <> BC.unpack method <> "`")
+            Just reg -> resolveTypedMethod reg cls method tag
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -275,7 +313,37 @@ eval env ipm = go
         let ty = case TR.reduceTypeExpr reg ty0 of
                      Just reduced -> reduced
                      Nothing      -> ty0
-        goTyApp e ty
+        -- Trigger on-demand elaboration: if the annotation parses to a
+        -- concrete type AND the shared class registry is installed,
+        -- run inference on @e@ with expected type @ty@.  The elaborator
+        -- may rewrite ambiguous class method EVars into ETypedMethod
+        -- nodes; we then evaluate the rewritten expression.  On failure
+        -- (or if inference doesn't change anything) we fall through to
+        -- the original 'goTyApp' path — preserving all existing
+        -- value-directed dispatch behaviour.
+        mElab <- tryElaborateTyAnn e ty
+        case mElab of
+            Just e' -> goTyApp e' ty
+            Nothing -> goTyApp e ty
+
+    -- | Helper: try to elaborate @e@ under the annotation @ty@.
+    -- Returns 'Just' if elaboration rewrote something; 'Nothing'
+    -- otherwise.
+    tryElaborateTyAnn e ty = do
+        mReg <- readIORef sharedClassRegRef
+        case mReg of
+            Nothing -> pure Nothing
+            Just classReg -> case Elab.parseRawTypeExpr ty of
+                Nothing -> pure Nothing
+                Just annTy -> do
+                    sigs <- readIORef globalTypeSigsRef
+                    syns <- readIORef globalTypeSynonymsRef
+                    r <- try (Elab.elaborate classReg sigs syns
+                                (Elab.ExpectType annTy) e)
+                           :: IO (Either SomeException (Expr, TA.Type))
+                    case r of
+                        Right (e', _) | e' /= e -> pure (Just e')
+                        _                       -> pure Nothing
 
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)

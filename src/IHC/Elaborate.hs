@@ -214,6 +214,13 @@ elaborateExpr ienv expr = case expr of
 
 -- | Handle an 'EVar' — look up signature, instantiate fresh vars,
 -- collect class constraints.
+--
+-- Class-method detection: when a signature has exactly one class pred
+-- whose argument is a single type variable that also appears in the
+-- body type, treat the EVar as a class method dispatch site.  Emit an
+-- 'ETypedMethod' node with the fresh tyvar as a placeholder tag —
+-- 'applyMethodSubst' replaces the tag with the resolved head
+-- constructor after unification.
 elaborateVar :: InferEnv -> Name -> IO (Expr, Type, [Pred], Subst)
 elaborateVar ienv name =
     case Map.lookup name (ieLocals ienv) of
@@ -223,13 +230,34 @@ elaborateVar ienv name =
         Nothing -> case Map.lookup name (ieSigs ienv) of
             Just sch -> do
                 (preds, ty) <- instantiate (ieFresh ienv) sch
-                pure (EVar name, ty, preds, emptySubst)
+                case classMethodHint name preds ty of
+                    Just (cls, paramVar) ->
+                        -- Emit ETypedMethod with placeholder tag.
+                        -- The tag is the fresh tyvar's name;
+                        -- 'applyMethodSubst' resolves it later.
+                        pure ( ETypedMethod cls name paramVar
+                             , ty
+                             , preds
+                             , emptySubst
+                             )
+                    Nothing ->
+                        pure (EVar name, ty, preds, emptySubst)
             Nothing ->
                 -- No signature available.  Return a fresh tyvar — the
                 -- enclosing context may still succeed if this var
                 -- doesn't participate in class dispatch.
                 do fresh <- TyVar <$> freshVar (ieFresh ienv)
                    pure (EVar name, fresh, [], emptySubst)
+
+-- | If the signature has a single-parameter class constraint whose
+-- argument is a plain type variable that also appears in the body
+-- type, return @(className, tyVarName)@ — the info needed to emit
+-- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
+classMethodHint :: Name -> [Pred] -> Type -> Maybe (Name, Name)
+classMethodHint _methodName preds body = case preds of
+    [Pred cls (TyVar v)]
+      | Set.member v (freeTyVars body) -> Just (cls, v)
+    _ -> Nothing
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)
@@ -291,12 +319,48 @@ elaborateDo ienv stmts = do
     foldM' sub accP (_, []) = pure (reverse accP, [], sub)   -- shouldn't hit — return above
     foldM' _ _ _ = pure ([], [], emptySubst)   -- placeholder
 
--- | After unification, rewrite any 'EVar' inside the expression that
--- refers to a class method and whose (class, method) is resolvable via
--- the substitution's bindings.  This is where ambiguous dispatch gets
--- replaced by 'ETypedMethod'.
+-- | After unification, walk the expression replacing each
+-- 'ETypedMethod's placeholder tag (a type-variable name) with the
+-- resolved head constructor.  If the tag can't be resolved — the
+-- class parameter is genuinely ambiguous after inference — we leave
+-- the placeholder in place; the evaluator's 'ETypedMethod' case will
+-- then throw a clear "no instance" error via
+-- 'IHC.Eval.lookupInstanceMethod'.
 applyMethodSubst :: Subst -> Expr -> Expr
-applyMethodSubst _ e = e   -- MVP: no rewrites yet; elaborator extension point.
+applyMethodSubst sub = go
+  where
+    resolveTag :: Name -> Name
+    resolveTag tag = case Map.lookup tag sub of
+        Just ty -> case tyHead (applySubst sub ty) of
+            Just h  -> h
+            Nothing -> tag   -- still a tyvar or arrow; eval will error
+        Nothing -> tag        -- tag is already a concrete head (direct rewrite)
+
+    go e = case e of
+        ETypedMethod cls method tag ->
+            ETypedMethod cls method (resolveTag tag)
+        EApp f x     -> EApp (go f) (go x)
+        ELam n body  -> ELam n (go body)
+        ELet bs body -> ELet [(n, go b) | (n, b) <- bs] (go body)
+        ECase s as   -> ECase (go s) [Alt p (go e') | Alt p e' <- as]
+        EIf c t b    -> EIf (go c) (go t) (go b)
+        EDo stmts    -> EDo (map goStmt stmts)
+        ENeg inner   -> ENeg (go inner)
+        ETuple es    -> ETuple (map go es)
+        ERecordCon n fs -> ERecordCon n [(nm, go v) | (nm, v) <- fs]
+        ERecordUpdate inner fs ->
+            ERecordUpdate (go inner) [(nm, go v) | (nm, v) <- fs]
+        ESplice inner -> ESplice (go inner)
+        EQuote inner  -> EQuote (go inner)
+        ETyApp inner ty -> ETyApp (go inner) ty
+        EImplicitLet bs body ->
+            EImplicitLet [(n, go b) | (n, b) <- bs] (go body)
+        _ -> e
+
+    goStmt (SExpr e)         = SExpr (go e)
+    goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Apply a substitution to the local-var types in an inference env.
 applySubstIenv :: Subst -> InferEnv -> InferEnv
