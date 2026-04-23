@@ -398,6 +398,13 @@ loadProgramFromSource searchPath src0 = do
     -- @instance Functor T where ...@ already in the registry (the
     -- registrar skips types that already have a Functor dict).
     registerDerivedFunctorInstances classReg loadedModules
+    -- Same policy for @deriving Enum@ / @deriving Bounded@ on
+    -- all-nullary sum types. Warp's 'RequestHeaderIndex' enum relies
+    -- on this — @requestMaxIndex = fromEnum (maxBound :: RequestHeaderIndex)@
+    -- silently returns a VClassMethod otherwise, making the IndexedHeader
+    -- array's upper bound wrong and causing downstream loops/Nothings.
+    registerDerivedEnumInstances    classReg loadedModules
+    registerDerivedBoundedInstances classReg loadedModules
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -700,6 +707,8 @@ loadFileIntoEnv searchPath path existingEnv = do
     do { classTable <- buildClassMethodTable loadedModules; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable innerEnv) loadedModules }
     registerClassDefaults registry fullSearchPath includeMap classReg innerEnv loadedModules
     registerDerivedFunctorInstances classReg loadedModules
+    registerDerivedEnumInstances    classReg loadedModules
+    registerDerivedBoundedInstances classReg loadedModules
     -- If the file has no `main` binding, inject `main = ()` so that the
     -- REPL user can type `main` without getting "unbound variable main".
     -- This matches the old :load behaviour and keeps the no_main regression
@@ -1416,6 +1425,8 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     do { classTable <- buildClassMethodTable instanceScope; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) instanceScope }
     registerClassDefaults registry fullSearchPath includeMap classReg innerEnv instanceScope
     registerDerivedFunctorInstances classReg instanceScope
+    registerDerivedEnumInstances    classReg instanceScope
+    registerDerivedBoundedInstances classReg instanceScope
     -- ALSO mirror instance registrations into the REPL's shared class
     -- registry so the dispatcher (closed over the shared reg via
     -- 'sharedClassRegRef') can find them on later dispatch calls.
@@ -1428,6 +1439,8 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) instanceScope
             registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv instanceScope
             registerDerivedFunctorInstances sharedReg instanceScope
+            registerDerivedEnumInstances    sharedReg instanceScope
+            registerDerivedBoundedInstances sharedReg instanceScope
         _ -> pure ()
     let additions  = Map.difference aliasEnv existingEnv
         merged     = Map.union existingEnv additions
@@ -1915,7 +1928,8 @@ registerDerivedFunctorInstances classReg loadedModules = do
   where
     oneModule lm = do
         decls <- scanFunctorDerivings (lmSource lm)
-        mapM_ (registerOneFunctor classReg) decls
+        let hits = filter (elem (BC.pack "Functor") . fdDerivClasses) decls
+        mapM_ (registerOneFunctor classReg) hits
 
 -- | Register one 'FunctorDerivDecl' as a Functor instance in the
 -- registry. The instance's only method is @fmap@, built by
@@ -2001,6 +2015,131 @@ shortShow (VFloat _) = "VFloat"
 shortShow (VChar _)  = "VChar"
 shortShow (VStr _)   = "VStr"
 shortShow _          = "<other>"
+
+--------------------------------------------------------------------------------
+-- Derived 'Enum' / 'Bounded' instance synthesis
+--
+-- For @data T = C1 | C2 | ... | Cn deriving (Enum, Bounded)@ (all
+-- constructors nullary — the only shape GHC allows for stock Enum/Bounded
+-- on sum types), we synthesize instance dictionaries that match the
+-- semantics in GHC.Internal.Enum:
+--
+--   * @fromEnum Ci = i-1@  (0-indexed in source order)
+--   * @toEnum i   = C(i+1)@
+--   * @minBound   = C1@
+--   * @maxBound   = Cn@
+--
+-- Registration mirrors 'registerDerivedFunctorInstances' — the instance
+-- table is keyed both under the type name @T@ (for type-annotation
+-- dispatch like @maxBound :: T@) and under each constructor name (so a
+-- value-directed dispatch @fromEnum someCtor@ finds the table via
+-- 'typeTagOf' → ctor-name lookup).
+--------------------------------------------------------------------------------
+
+-- | Synthesise derived @Enum@ instances for every data decl whose
+-- deriving clause lists @Enum@ and whose constructors are all nullary.
+-- Types that don't match both predicates are skipped silently.
+registerDerivedEnumInstances :: ClassRegistry -> [LoadedModule] -> IO ()
+registerDerivedEnumInstances classReg loadedModules =
+    mapM_ oneModule loadedModules
+  where
+    oneModule lm = do
+        decls <- scanFunctorDerivings (lmSource lm)
+        let hits =
+                [ (fdTyName d, [fcName c | c <- fdCtors d])
+                | d <- decls
+                , elem (BC.pack "Enum") (fdDerivClasses d)
+                , all (null . fcRoles) (fdCtors d)      -- all-nullary
+                , not (null (fdCtors d))                -- at least one ctor
+                ]
+        mapM_ (registerOneEnum classReg) hits
+
+-- | Synthesise derived @Bounded@ instances for every data decl whose
+-- deriving clause lists @Bounded@ and whose constructors are all nullary.
+registerDerivedBoundedInstances :: ClassRegistry -> [LoadedModule] -> IO ()
+registerDerivedBoundedInstances classReg loadedModules =
+    mapM_ oneModule loadedModules
+  where
+    oneModule lm = do
+        decls <- scanFunctorDerivings (lmSource lm)
+        let hits =
+                [ (fdTyName d, [fcName c | c <- fdCtors d])
+                | d <- decls
+                , elem (BC.pack "Bounded") (fdDerivClasses d)
+                , all (null . fcRoles) (fdCtors d)
+                , not (null (fdCtors d))
+                ]
+        mapM_ (registerOneBounded classReg) hits
+
+registerOneEnum :: ClassRegistry -> (ByteString, [ByteString]) -> IO ()
+registerOneEnum classReg (tyName, ctors) = do
+    let enumCls    = BC.pack "Enum"
+        fromEnumV  = synthFromEnumForCtors ctors
+        toEnumV    = synthToEnumForCtors   ctors
+        methods    = Map.fromList
+                        [ (BC.pack "fromEnum", fromEnumV)
+                        , (BC.pack "toEnum",   toEnumV)
+                        ]
+    existing <- lookupInstance classReg enumCls tyName
+    case existing of
+        Just _  -> pure ()
+        Nothing -> do
+            registerInstance classReg enumCls tyName methods
+            mapM_ (\c -> registerInstance classReg enumCls c methods) ctors
+
+registerOneBounded :: ClassRegistry -> (ByteString, [ByteString]) -> IO ()
+registerOneBounded classReg (tyName, ctors) = do
+    let boundedCls = BC.pack "Bounded"
+        firstCtor  = head ctors
+        lastCtor   = last ctors
+        minBoundV  = VCon firstCtor []
+        maxBoundV  = VCon lastCtor  []
+        methods    = Map.fromList
+                        [ (BC.pack "minBound", minBoundV)
+                        , (BC.pack "maxBound", maxBoundV)
+                        ]
+    existing <- lookupInstance classReg boundedCls tyName
+    case existing of
+        Just _  -> pure ()
+        Nothing -> do
+            registerInstance classReg boundedCls tyName methods
+            mapM_ (\c -> registerInstance classReg boundedCls c methods) ctors
+
+-- | Build the @fromEnum@ Val for a derived-Enum sum type.
+-- @fromEnum v@ forces @v@ to a 'VCon', locates its constructor name in
+-- the ctor list, and returns the 0-based index as a 'VInt'.
+synthFromEnumForCtors :: [ByteString] -> Val
+synthFromEnumForCtors ctors = VFun $ \t -> do
+    v <- force t
+    case v of
+        VCon n _ -> case indexOf n ctors 0 of
+            Just i  -> pure (VInt (fromIntegral i))
+            Nothing -> error ("derived fromEnum: unknown ctor "
+                              <> BC.unpack n)
+        _ -> error ("derived fromEnum: expected constructor, got "
+                    <> shortShow v)
+  where
+    indexOf _ []       _ = Nothing
+    indexOf x (c : cs) i
+        | x == c    = Just i
+        | otherwise = indexOf x cs (i + 1)
+
+-- | Build the @toEnum@ Val for a derived-Enum sum type.
+-- @toEnum i@ forces @i@ to a 'VInt' and returns the @i@-th constructor
+-- as a nullary 'VCon'. Out-of-range indices raise a runtime error
+-- matching GHC's semantics.
+synthToEnumForCtors :: [ByteString] -> Val
+synthToEnumForCtors ctors = VFun $ \t -> do
+    v <- force t
+    case v of
+        VInt i ->
+            let idx = fromIntegral i
+            in if idx >= 0 && idx < length ctors
+                 then pure (VCon (ctors !! idx) [])
+                 else error ("derived toEnum: index "
+                             <> show i <> " out of range")
+        _ -> error ("derived toEnum: expected Int, got "
+                    <> shortShow v)
 
 --------------------------------------------------------------------------------
 -- User-defined class method dispatchers

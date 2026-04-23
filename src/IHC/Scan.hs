@@ -1405,10 +1405,13 @@ data FunctorCtor = FunctorCtor
 
 -- | One @data T tv1 ... tvN = ... deriving (... Functor ...)@ decl with
 -- the per-constructor field-role information needed to synthesize
--- @fmap@.
+-- @fmap@. Also records the full set of class names mentioned in the
+-- deriving clause so other derivings (Enum, Bounded, ...) can reuse
+-- the scanner output.
 data FunctorDerivDecl = FunctorDerivDecl
-    { fdTyName :: !ByteString
-    , fdCtors  :: ![FunctorCtor]
+    { fdTyName       :: !ByteString
+    , fdCtors        :: ![FunctorCtor]
+    , fdDerivClasses :: ![ByteString]
     } deriving (Eq, Show)
 
 -- | Scan the whole source for top-level @data@ / @newtype@ declarations
@@ -1439,9 +1442,12 @@ scanFunctorDerivings src = go [] startCursor
             Just (tyName, tyvars, curAfterEq) -> do
                 (ctors, curAfterCtors) <- parseFunctorCtors tyvars curAfterEq
                 derivClasses <- peekDerivingClause curAfterCtors
-                if elem (BC.pack "Functor") derivClasses
-                    then go (FunctorDerivDecl tyName ctors : acc) curAfterCtors
-                    else go acc curAfterCtors
+                -- We always record the decl (even with no deriving clause);
+                -- downstream registrars filter on the 'fdDerivClasses' field
+                -- they care about. The per-field 'FunctorFieldRole's are
+                -- only meaningful when 'Functor' is in the list, but they
+                -- don't harm other synthesizers (Enum, Bounded, ...).
+                go (FunctorDerivDecl tyName ctors derivClasses : acc) curAfterCtors
 
     -- Parse the LHS of a data/newtype decl up to the first '=' at depth 0.
     -- Returns (typeName, [tyvarName], cursorAfterEq) if it looks like a
