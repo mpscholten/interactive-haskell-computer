@@ -1772,6 +1772,14 @@ data InstanceDecl = InstanceDecl
     , instMethods   :: ![(ByteString, BindingLhs)]
     } deriving (Eq, Show)
 
+-- | Result of peeking inside a parenthesised type-arg in an instance
+-- head.  See 'classifyParen' in 'scanInstanceDecls'.
+data ParenKind
+    = ParenCtor  !ByteString   -- ^ @(T ...)@: @T@ is the head constructor.
+    | ParenTuple !Int          -- ^ @(t1, t2, ..., tN)@: tuple head of arity N.
+    | ParenSkip                -- ^ tyvars / punctuation only — no useful head.
+    deriving (Eq, Show)
+
 -- | Scan the whole source for top-level @instance@ declarations and
 -- return each one as an 'InstanceDecl'. The method bodies are recorded
 -- as 'Clause' byte-spans (same format as 'findBinding') so the caller
@@ -1859,7 +1867,20 @@ scanInstanceDecls src = go [] startCursor
                     curAfter <- skipParens 1 cur'
                     let acc' = case mCls of
                             Nothing -> acc  -- still pre-class; ignore
-                            Just _  -> BC.pack "(,)" : acc
+                            Just _  ->
+                                -- Distinguish @(T ...)@ (a parenthesised
+                                -- type head like @Applicative (ST s)@)
+                                -- from @(t1, t2, ...)@ (tuple head).  Prefer
+                                -- a TkConId at depth 1 — that's the real
+                                -- head.  Fall back to @"(,)"@ otherwise to
+                                -- preserve the pre-fix behaviour for tuple
+                                -- heads like @instance Functor ((,) a)@.
+                                case classifyParen cur' of
+                                    ParenCtor n  -> normalize n : acc
+                                    ParenTuple n ->
+                                        BC.pack ("(" <> replicate (n - 1) ',' <> ")")
+                                            : acc
+                                    ParenSkip    -> BC.pack "(,)" : acc
                     scanHead curAfter mCls acc' seenArrow
                 TkLBracket -> do
                     curAfter <- skipBrackets 1 cur'
@@ -1884,6 +1905,40 @@ scanInstanceDecls src = go [] startCursor
                 TkRParen -> skipParens (d - 1) cur'
                 TkEof    -> pure cur'
                 _        -> skipParens d cur'
+
+    -- Peek inside a just-opened paren group (cursor points at the first
+    -- token AFTER the '(') to decide whether it's a parenthesised type
+    -- head (@(ST s)@), a tuple head (@(a, b)@), or something uninteresting
+    -- (only tyvars / punctuation — e.g. @(a)@ in @instance C (a) where@).
+    --
+    -- We walk at depth 1 only, bailing at the matching ')'.  If we see a
+    -- ',' at depth 1 before anything else meaningful, it's a tuple — we
+    -- keep counting commas to decide the arity.  If we see a @TkConId@
+    -- first, that's the head.  Otherwise we skip.
+    classifyParen :: Cursor -> ParenKind
+    classifyParen = walk 1 Nothing 1
+      where
+        walk !_ (Just n) !_ _ | False = ParenCtor n   -- dead; pattern below
+        walk !d mCon !arity cur
+            | d <= 0 = maybe ParenSkip ParenCtor mCon
+            | otherwise =
+                let (tok, cur') = nextToken src cur in
+                case tkKind tok of
+                    TkEof            -> maybe ParenSkip ParenCtor mCon
+                    TkRParen
+                        | d == 1     -> maybe (if arity > 1
+                                                 then ParenTuple arity
+                                                 else ParenSkip)
+                                              ParenCtor mCon
+                        | otherwise  -> walk (d - 1) mCon arity cur'
+                    TkLParen         -> walk (d + 1) mCon arity cur'
+                    TkComma
+                        | d == 1     -> walk d mCon (arity + 1) cur'
+                        | otherwise  -> walk d mCon arity cur'
+                    TkConId n
+                        | Nothing <- mCon -> walk d (Just n) arity cur'
+                        | otherwise       -> walk d mCon arity cur'
+                    _                -> walk d mCon arity cur'
 
     skipBrackets :: Int -> Cursor -> IO Cursor
     skipBrackets !d cur
