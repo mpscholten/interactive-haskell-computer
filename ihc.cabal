@@ -134,6 +134,7 @@ test-suite ihc-test
       , NorthStarTest
       , ReplTest
       , RunFile
+      , Unsupported
     build-depends:
         base
       , ihc
