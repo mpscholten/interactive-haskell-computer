@@ -17,6 +17,7 @@ module IHC.Builtins
 
 import Control.Concurrent
     ( forkIO, killThread, myThreadId, threadDelay
+    , threadWaitRead, threadWaitWrite
     )
 import Control.Concurrent.MVar
     ( MVar, newMVar, newEmptyMVar, takeMVar, putMVar, readMVar
@@ -781,6 +782,16 @@ builtins reg =
     , ("GHC.Conc.closeFdWith", closeFdWithB)
     , ("GHC.Internal.Conc.IO.closeFdWith", closeFdWithB)
     , ("GHC.Internal.Event.Thread.closeFdWith", closeFdWithB)
+    -- threadWaitRead / threadWaitWrite: delegate to host RTS.  Needed by
+    -- Network.Socket's async I/O path and warp's connection handling.
+    , ("threadWaitRead",  threadWaitReadB)
+    , ("GHC.Conc.threadWaitRead", threadWaitReadB)
+    , ("GHC.Conc.IO.threadWaitRead", threadWaitReadB)
+    , ("GHC.Internal.Conc.IO.threadWaitRead", threadWaitReadB)
+    , ("threadWaitWrite", threadWaitWriteB)
+    , ("GHC.Conc.threadWaitWrite", threadWaitWriteB)
+    , ("GHC.Conc.IO.threadWaitWrite", threadWaitWriteB)
+    , ("GHC.Internal.Conc.IO.threadWaitWrite", threadWaitWriteB)
     -- IHC does not run GHC's RTS event manager.  Source modules such as
     -- auto-update branch on this probe; returning Nothing selects their
     -- ordinary threadDelay/forkIO implementation instead of the event-manager
@@ -5133,6 +5144,35 @@ closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do
             _ <- runIOVal r
             pure VUnit)
         (\(LoopException _) -> pure VUnit)
+
+-- | @threadWaitRead :: Fd -> IO ()@ — delegate to host RTS.
+threadWaitReadB :: IO Val
+threadWaitReadB = pure $ VFun $ \fdT -> pure $ VIO $ do
+    n <- fdArgToInt fdT "threadWaitRead"
+    threadWaitRead (fromIntegral n)
+    pure VUnit
+
+-- | @threadWaitWrite :: Fd -> IO ()@ — delegate to host RTS.
+threadWaitWriteB :: IO Val
+threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
+    n <- fdArgToInt fdT "threadWaitWrite"
+    threadWaitWrite (fromIntegral n)
+    pure VUnit
+
+-- | Unwrap a @Fd@-like argument to its underlying @Int@.  Accepts the
+-- common shapes the source @System.Posix.Types.Fd@ newtype can take
+-- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
+fdArgToInt :: Thunk -> String -> IO Int64
+fdArgToInt t primName = do
+    v <- force t
+    case v of
+        VInt n          -> pure n
+        VCon _ [inner] -> do
+            iv <- force inner
+            case iv of
+                VInt n -> pure n
+                _ -> error (primName <> ": Fd payload not VInt: " <> showValForDebug iv)
+        _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
 
 getSystemEventManagerB :: IO Val
 getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
