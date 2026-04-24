@@ -132,6 +132,12 @@ data TokenKind
     | TkOQuoteP               -- ^ @[p|@ — pattern bracket open
     | TkOQuoteTy              -- ^ @[||@ — typed expression bracket open
     | TkCQuoteTy              -- ^ @||]@ — typed expression bracket close
+    -- | @[name|@ opening token for a named QuasiQuoter (IHP's
+    -- @[hsx|…|]@, @[i|…|]@, @[trimming|…|]@ etc.).  The payload carries
+    -- the QQ name so the parser can route to the right expansion (or,
+    -- until TH QQ expansion is real, treat the body as opaque).  Body
+    -- ends at the next @|]@ (same @TkCQuote@ close as TH brackets).
+    | TkQQOpen !ByteString    -- ^ @[name|@ QuasiQuoter open
     | TkNewline               -- ^ one or more newlines; bumps layout
     | TkEof
     deriving (Eq, Show)
@@ -557,16 +563,21 @@ nextToken s c0 =
             Just b | isIdentCont b -> go (p + 1)
             _      -> p
 
-    -- | Disambiguate '[' — emit a TemplateHaskellQuotes open-bracket token
-    -- when followed by a quote-form prefix, otherwise plain TkLBracket.
+    -- | Disambiguate '[' — emit a TemplateHaskellQuotes open-bracket
+    -- or a QuasiQuote open when followed by the right shape, otherwise
+    -- plain TkLBracket.
     --
     -- Recognised forms (GHC spec):
-    --   [|   or  [e|   → TkOQuote   (expression bracket)
-    --   [d|           → TkOQuoteD  (declaration bracket)
-    --   [t|           → TkOQuoteT  (type bracket)
-    --   [p|           → TkOQuoteP  (pattern bracket)
-    --   [||  or  [e|| → TkOQuoteTy (typed expression bracket)
-    --   anything else → TkLBracket
+    --   [|   or  [e|    → TkOQuote      (expression bracket)
+    --   [||  or  [e||   → TkOQuoteTy    (typed expression bracket)
+    --   [d|             → TkOQuoteD     (declaration bracket)
+    --   [t|             → TkOQuoteT     (type bracket)
+    --   [p|             → TkOQuoteP     (pattern bracket)
+    --   [name|          → TkQQOpen name (QuasiQuoter; name a lowercase
+    --                                    identifier longer than one
+    --                                    char, e.g. @[hsx|…|]@, @[i|…|]@,
+    --                                    @[trimming|…|]@, @[sql|…|]@)
+    --   anything else   → TkLBracket
     lexLBracket start =
         let p1 = cPos start + 1   -- byte just after '['
         in case peekByte s p1 of
@@ -578,36 +589,60 @@ nextToken s c0 =
                     _ ->                                    -- '[|'
                         let c' = step (step start)
                         in (mkTok TkOQuote start c', c')
-            Just 0x65 ->                                    -- '[e...'
-                case peekByte s (p1 + 1) of
-                    Just 0x7C ->                            -- '[e|'
-                        case peekByte s (p1 + 2) of
-                            Just 0x7C ->                    -- '[e||' typed
-                                let c' = step (step (step (step start)))
-                                in (mkTok TkOQuoteTy start c', c')
-                            _ ->                            -- '[e|'
-                                let c' = step (step (step start))
-                                in (mkTok TkOQuote start c', c')
-                    _ -> (mkTok TkLBracket start (step start), step start)
-            Just 0x64 ->                                    -- '[d...'
-                case peekByte s (p1 + 1) of
-                    Just 0x7C ->                            -- '[d|'
-                        let c' = step (step (step start))
-                        in (mkTok TkOQuoteD start c', c')
-                    _ -> (mkTok TkLBracket start (step start), step start)
-            Just 0x74 ->                                    -- '[t...'
-                case peekByte s (p1 + 1) of
-                    Just 0x7C ->                            -- '[t|'
-                        let c' = step (step (step start))
-                        in (mkTok TkOQuoteT start c', c')
-                    _ -> (mkTok TkLBracket start (step start), step start)
-            Just 0x70 ->                                    -- '[p...'
-                case peekByte s (p1 + 1) of
-                    Just 0x7C ->                            -- '[p|'
-                        let c' = step (step (step start))
-                        in (mkTok TkOQuoteP start c', c')
-                    _ -> (mkTok TkLBracket start (step start), step start)
+            Just b | isLowerStart b -> lexLBracketIdent start b
             _ -> (mkTok TkLBracket start (step start), step start)
+
+    -- Handle '[name' — read the full lowercase identifier and decide
+    -- between the TH short forms (e/d/t/p), a QuasiQuote ([name|), or
+    -- a plain list start.
+    lexLBracketIdent start firstByte =
+        let p1     = cPos start + 1
+            nameEnd = runIdent p1
+            bs     = sliceBytes s (p1, nameEnd)
+        in case peekByte s nameEnd of
+            Just 0x7C ->
+                -- [name|    — check for TH shorthand or QQ.
+                case peekByte s (nameEnd + 1) of
+                    Just 0x7C | bs == BC.pack "e" ->
+                        -- [e||  typed expression bracket
+                        let c' = advanceBy (nameEnd + 2) start
+                        in (mkTok TkOQuoteTy start c', c')
+                    _ | bs == BC.pack "e" ->
+                        -- [e|   expression bracket
+                        let c' = advanceBy (nameEnd + 1) start
+                        in (mkTok TkOQuote start c', c')
+                      | bs == BC.pack "d" ->
+                        -- [d|   declaration bracket
+                        let c' = advanceBy (nameEnd + 1) start
+                        in (mkTok TkOQuoteD start c', c')
+                      | bs == BC.pack "t" ->
+                        -- [t|   type bracket
+                        let c' = advanceBy (nameEnd + 1) start
+                        in (mkTok TkOQuoteT start c', c')
+                      | bs == BC.pack "p" ->
+                        -- [p|   pattern bracket
+                        let c' = advanceBy (nameEnd + 1) start
+                        in (mkTok TkOQuoteP start c', c')
+                      | otherwise ->
+                        -- [hsx|, [i|, [trimming|, [sql|, …
+                        let c' = advanceBy (nameEnd + 1) start
+                        in (mkTok (TkQQOpen bs) start c', c')
+            _ ->
+                -- No trailing '|' — a bare '[' followed by a lowercase
+                -- identifier; parse as a list expression.  We use
+                -- firstByte only to keep the GHC compiler quiet about
+                -- an otherwise-unused parameter.
+                let _ = firstByte
+                in (mkTok TkLBracket start (step start), step start)
+      where
+        runIdent p = case peekByte s p of
+            Just b | isIdentCont b -> runIdent (p + 1)
+            _                      -> p
+        -- Advance a cursor from `start` to `targetPos` without crossing
+        -- newlines (QQ names are always on one line after '[').
+        advanceBy targetPos c0 =
+            let delta = targetPos - cPos c0
+            in Cursor targetPos (cLine c0) (cCol c0 + delta)
 
     keywordOr bs = case bs of
         "if"        -> TkIf
