@@ -3632,32 +3632,62 @@ loadModule registry searchPath includeMap name = do
         Just (Loaded lm) -> pure lm
         Just Loading     -> throwIO (ImportCycle name)
         Nothing -> do
-            -- GHC.*, System.IO.Unsafe, Foreign.*, Data.Bits, etc. are
-            -- intercepted as empty stubs because their names are provided
-            -- directly by the builtin environment. Trying to parse their
-            -- GHC-internal source would fail.
             if isBuiltinBackedModule name
                 then do
-                    lm <- buildEmptyStubModule name
-                    modifyIORef' registry (Map.insert name (Loaded lm))
-                    registerGlobalLoadedModule lm
-                    pure lm
+                    globalMods <- readIORef globalLoadedModulesRef
+                    case Map.lookup name globalMods of
+                        Just lm -> do
+                            modifyIORef' registry (Map.insert name (Loaded lm))
+                            pure lm
+                        Nothing -> do
+                            lm <- buildEmptyStubModule name
+                            modifyIORef' registry (Map.insert name (Loaded lm))
+                            registerGlobalLoadedModule lm
+                            pure lm
                 else do
                     path <- locateModule searchPath name
-                    src0 <- readSourceFile path
-                    -- Look up the package's include-dirs by matching the
-                    -- file's directory against the includeMap.
-                    let fileDir    = takeDirectory path
-                        incDirs    = lookupIncludeDirs includeMap fileDir
-                    src  <- cppSourceWithIncludes incDirs src0
-                    (mHeader, _) <- parseModuleHeader src startCursor
-                    let header = fromMaybe emptyHeader mHeader
-                        declared = fromMaybe name (mhName header)
-                    modifyIORef' registry (Map.insert name Loading)
-                    lm <- buildLoadedModule declared False header src
-                    modifyIORef' registry (Map.insert name (Loaded lm))
-                    registerGlobalLoadedModule lm
-                    pure lm
+                    globalMods <- readIORef globalLoadedModulesRef
+                    case Map.lookup name globalMods of
+                        Just lm
+                          | not (lmIsEntry lm)
+                          , srcName (lmSource lm) == path -> do
+                              modifyIORef' registry (Map.insert name (Loaded lm))
+                              -- A previous run's discovery populated
+                              -- 'lmBodies' with sentinel 'EVar
+                              -- "Target.name"' entries for re-exports,
+                              -- and also called 'loadModule' on
+                              -- @Target@ as a side effect via
+                              -- 'resolveImport'.  Serving the cached
+                              -- module skips that side effect, so the
+                              -- referenced modules would be missing
+                              -- from this run's registry and their
+                              -- bindings wouldn't end up in the final
+                              -- env — yielding eval-time unbound
+                              -- variables like
+                              -- @GHC.Internal.Data.OldList.sort@.  Walk
+                              -- the cached bodies, extract every module
+                              -- prefix, and 'loadModule' each to
+                              -- rebuild the transitive closure in the
+                              -- per-run registry.  'loadModule' is
+                              -- idempotent (it short-circuits on
+                              -- per-run hits) and recursively triggers
+                              -- hydration for any cached module it
+                              -- pulls in.
+                              hydrateTransitiveImports registry searchPath includeMap lm
+                              pure lm
+                        _ -> do
+                            src0 <- readSourceFile path
+                            let fileDir    = takeDirectory path
+                                incDirs    = lookupIncludeDirs includeMap fileDir
+                            src  <- cppSourceWithIncludes incDirs src0
+                            (mHeader, _) <- parseModuleHeader src startCursor
+                            let header = fromMaybe emptyHeader mHeader
+                                declared = fromMaybe name (mhName header)
+                            modifyIORef' registry (Map.insert name Loading)
+                            lm <- buildLoadedModule declared False header src
+                            modifyIORef' registry (Map.insert name (Loaded lm))
+                            registerGlobalLoadedModule lm
+                            pure lm
 
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
 -- 'IHC.Eval.eval''s demand-driven env fallback: when a closure's frozen
@@ -3679,6 +3709,46 @@ registerGlobalLoadedModule lm = do
     -- module-scoped in source).
     modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
+
+-- | Ensure every module referenced by a cached 'LoadedModule''s bodies
+-- is present in the per-run registry.  See the comment at the cache-hit
+-- branch of 'loadModule' for motivation: serving a parsed 'LoadedModule'
+-- from the cross-run cache skips the 'resolveImport' side-effect that
+-- originally populated the per-run registry with all transitively
+-- referenced modules.
+--
+-- Walks every body in 'lmBodies', collects all qualified names (those
+-- that split into @(Module, bareName)@ via 'splitQualified'), and calls
+-- 'loadModule' for each unique module prefix.  'loadModule' is
+-- idempotent against the per-run registry and recursively calls this
+-- function for any cached module it serves, so the fixed point is
+-- reached without an explicit loop here.
+--
+-- Failures to locate referenced modules are swallowed: the original
+-- discovery pass tolerated missing optional modules the same way
+-- (see the @try@ at the force-load of core modules in
+-- 'loadProgramFromSource'), and a missing transitive dep only matters
+-- if this run's code actually references that binding — in which case
+-- the evaluator will still report a clean unbound-variable error
+-- rather than this helper short-circuiting.
+hydrateTransitiveImports
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> IO ()
+hydrateTransitiveImports registry searchPath includeMap lm = do
+    bodies <- readIORef (lmBodies lm)
+    let refs = Set.fromList
+            [ modName
+            | expr <- Map.elems bodies
+            , fv <- freeVars expr
+            , Just (modName, _) <- [splitQualified fv]
+            ]
+    forM_ (Set.toList refs) $ \m -> do
+        _ <- try (loadModule registry searchPath includeMap m)
+                :: IO (Either SomeException LoadedModule)
+        pure ()
 
 -- (moved to IHC.TypeGlobals so both scheduler + evaluator can reach
 -- them without a cycle.  Imported via 'globalTypeSigsRef' and
