@@ -105,6 +105,15 @@ data PrimObj
     | PrimPtr        !(Ptr Word8)
     | PrimByteArray  !(IORef ByteString)   -- mutable byte array backed by ByteString
     | PrimRealWorld                        -- zero-size phantom token
+    -- Boxed mutable/frozen array, the runtime backing for
+    -- @MutableArray# s a@ and @Array# a@.  We share one representation
+    -- because @unsafeFreezeArray#@ is zero-cost in GHC — it just
+    -- relabels the tag.  The 'IntMap' is dense-ish (populated by
+    -- @newArray#@ with the same initial thunk at every index) and
+    -- updated in place by @writeArray#@.  Length is tracked
+    -- separately because callers that only read a slice don't care
+    -- about the underlying map size.
+    | PrimBoxedArray !Int !(IORef (Map Int Thunk))
     -- Phase 2.10a: concurrency primitives backed by host GHC RTS.
     | PrimMVar     !(MVar Val)
     | PrimTVar     !(TVar Val)
@@ -125,6 +134,8 @@ showValForDebug (VPrimObj (PrimHandle _))     = "<Handle>"
 showValForDebug (VPrimObj (PrimForeignPtr _)) = "<ForeignPtr>"
 showValForDebug (VPrimObj (PrimPtr _))        = "<Ptr>"
 showValForDebug (VPrimObj (PrimByteArray _))  = "<MutableByteArray>"
+showValForDebug (VPrimObj (PrimBoxedArray n _)) =
+    "<BoxedArray len=" <> show n <> ">"
 showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
 showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"

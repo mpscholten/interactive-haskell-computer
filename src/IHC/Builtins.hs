@@ -424,6 +424,19 @@ builtins reg =
     , ("copyAddrToByteArray#",      copyAddrToByteArrayB)
     , ("copyByteArrayToAddr#",      copyByteArrayToAddrB)
     , ("compareByteArrays#",        compareByteArraysB)
+    -- Boxed MutableArray# / Array# family (GHC.Internal.Arr,
+    -- Data.Array.ST).  Enough to source-interpret
+    -- `newSTArray` / `readSTArray` / `writeSTArray` /
+    -- `unsafeFreezeSTArray`.
+    , ("newArray#",                 newBoxedArrayB)
+    , ("writeArray#",               writeBoxedArrayB)
+    , ("readArray#",                readBoxedArrayB)
+    , ("indexArray#",               indexBoxedArrayB)
+    , ("unsafeFreezeArray#",        unsafeFreezeBoxedArrayB)
+    , ("unsafeThawArray#",          unsafeThawBoxedArrayB)
+    , ("sizeofArray#",              sizeofBoxedArrayB)
+    , ("sizeofMutableArray#",       sizeofBoxedArrayB)
+    , ("sameMutableArray#",         sameMutableBoxedArrayB)
     -- Phase 2.8: C memory ops
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
@@ -1395,6 +1408,7 @@ showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"
 showVal (VPrimObj (PrimForeignPtr _))  = pure "<ForeignPtr>"
 showVal (VPrimObj (PrimPtr _))         = pure "<Ptr>"
 showVal (VPrimObj (PrimByteArray _))   = pure "<MutableByteArray>"
+showVal (VPrimObj (PrimBoxedArray _ _)) = pure "<BoxedArray>"
 showVal (VPrimObj PrimRealWorld)       = pure "<RealWorld#>"
 showVal (VPrimObj (PrimMVar _))        = pure "<MVar>"
 showVal (VPrimObj (PrimTVar _))        = pure "<TVar>"
@@ -3101,6 +3115,105 @@ compareByteArraysB = pure
                     GT -> 1
             pure (VInt cmp)
         _ -> error "compareByteArrays#: bad args"
+
+--------------------------------------------------------------------------------
+-- Boxed MutableArray# / Array# family.  Storage is an 'IORef (Map Int
+-- Thunk)' — dense enough that index lookup is O(log n) and writes are
+-- constant-work per call.  Enough machinery to let GHC.Internal.Arr's
+-- source compile to working STArray / Array values, which is what the
+-- IndexedHeader / warp request-indexing path depends on.
+--------------------------------------------------------------------------------
+
+-- | @newArray# :: Int# -> a -> State# s -> (# State# s, MutableArray# s a #)@
+-- Populate every slot with the same initial thunk.
+newBoxedArrayB :: IO Val
+newBoxedArrayB = pure $ VFun $ \nT -> pure $ VFun $ \initT -> pure $ VFun $ \stT -> pure $ VIO $ do
+    nv <- force nT; stv <- force stT
+    let n = case nv of { VInt i -> fromIntegral i; _ -> 0 } :: Int
+    let entries = [ (i, initT) | i <- [0 .. max 0 (n - 1)] ]
+    ref  <- newIORef (Map.fromList entries)
+    baT  <- newWHNFThunk (VPrimObj (PrimBoxedArray n ref))
+    stT' <- newWHNFThunk stv
+    pure (VCon "(#,#)" [stT', baT])
+
+-- | @writeArray# :: MutableArray# s a -> Int# -> a -> State# s -> State# s@
+writeBoxedArrayB :: IO Val
+writeBoxedArrayB = pure $ VFun $ \arrT -> pure $ VFun $ \iT ->
+    pure $ VFun $ \vT -> pure $ VFun $ \stT -> pure $ VIO $ do
+    arrv <- force arrT; iv <- force iT; stv <- force stT
+    case (arrv, iv) of
+        (VPrimObj (PrimBoxedArray _ ref), VInt i) -> do
+            modifyIORef' ref (Map.insert (fromIntegral i) vT)
+            pure stv
+        _ -> error ("writeArray#: bad args: " <> showValForDebug arrv)
+
+-- | @readArray# :: MutableArray# s a -> Int# -> State# s -> (# State# s, a #)@
+readBoxedArrayB :: IO Val
+readBoxedArrayB = pure $ VFun $ \arrT -> pure $ VFun $ \iT -> pure $ VFun $ \stT -> pure $ VIO $ do
+    arrv <- force arrT; iv <- force iT; stv <- force stT
+    case (arrv, iv) of
+        (VPrimObj (PrimBoxedArray _ ref), VInt i) -> do
+            m <- readIORef ref
+            let elT = case Map.lookup (fromIntegral i) m of
+                    Just t  -> t
+                    Nothing -> error ("readArray#: index " <> show i
+                                      <> " out of range")
+            stT' <- newWHNFThunk stv
+            pure (VCon "(#,#)" [stT', elT])
+        _ -> error ("readArray#: bad args: " <> showValForDebug arrv)
+
+-- | @indexArray# :: Array# a -> Int# -> (# a #)@.  Unary unboxed tuple —
+-- the conventional representation for lazy-index lookup.
+indexBoxedArrayB :: IO Val
+indexBoxedArrayB = pure $ VFun $ \arrT -> pure $ VFun $ \iT -> do
+    arrv <- force arrT; iv <- force iT
+    case (arrv, iv) of
+        (VPrimObj (PrimBoxedArray _ ref), VInt i) -> do
+            m <- readIORef ref
+            case Map.lookup (fromIntegral i) m of
+                Just t  -> do
+                    v <- force t
+                    pure v
+                Nothing -> error ("indexArray#: index " <> show i
+                                  <> " out of range")
+        _ -> error ("indexArray#: bad args: " <> showValForDebug arrv)
+
+-- | @unsafeFreezeArray# :: MutableArray# s a -> State# s -> (# State# s, Array# a #)@
+-- Zero-cost: we return the same PrimBoxedArray — the tag is all that
+-- distinguishes mutable from frozen at the interpreter level.
+unsafeFreezeBoxedArrayB :: IO Val
+unsafeFreezeBoxedArrayB = pure $ VFun $ \arrT -> pure $ VFun $ \stT -> pure $ VIO $ do
+    arrv <- force arrT; stv <- force stT
+    case arrv of
+        VPrimObj (PrimBoxedArray _ _) -> do
+            aT   <- newWHNFThunk arrv
+            stT' <- newWHNFThunk stv
+            pure (VCon "(#,#)" [stT', aT])
+        _ -> error ("unsafeFreezeArray#: bad arg: " <> showValForDebug arrv)
+
+-- | @unsafeThawArray# :: Array# a -> State# s -> (# State# s, MutableArray# s a #)@
+unsafeThawBoxedArrayB :: IO Val
+unsafeThawBoxedArrayB = unsafeFreezeBoxedArrayB
+
+-- | @sizeofArray# :: Array# a -> Int#@ and
+--   @sizeofMutableArray# :: MutableArray# s a -> Int#@
+sizeofBoxedArrayB :: IO Val
+sizeofBoxedArrayB = pure $ VFun $ \arrT -> do
+    arrv <- force arrT
+    case arrv of
+        VPrimObj (PrimBoxedArray n _) -> pure (VInt (fromIntegral n))
+        _ -> error ("sizeofArray#: bad arg: " <> showValForDebug arrv)
+
+-- | @sameMutableArray# :: MutableArray# s a -> MutableArray# s a -> Int#@
+-- Returns 1# if the two arrays share the same underlying storage.
+sameMutableBoxedArrayB :: IO Val
+sameMutableBoxedArrayB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
+    av <- force aT; bv <- force bT
+    case (av, bv) of
+        (VPrimObj (PrimBoxedArray _ r1), VPrimObj (PrimBoxedArray _ r2))
+            | r1 == r2  -> pure (VInt 1)
+            | otherwise -> pure (VInt 0)
+        _ -> pure (VInt 0)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: C memory ops
