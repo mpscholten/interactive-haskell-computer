@@ -2286,18 +2286,33 @@ classMethodDispatcher reg cls methodName = selfVal
                                                 applyAll methodVal (reverse (argT : accArgs))
                                         _ -> do
                                             -- Dispatchable arg but no matching instance.
-                                            -- Fall back to the class's default body.
-                                            mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                            mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                            let mDef = preferMethod mDef0 mDefShared
-                                            case mDef of
-                                                Just defVal ->
-                                                    applyAll defVal (reverse (argT : accArgs))
-                                                _ -> error
-                                                    ( "class-method dispatch: no instance of `"
-                                                     <> BC.unpack cls
-                                                     <> "` for type `" <> BC.unpack tag
-                                                     <> "` (method `" <> BC.unpack methodName <> "`)" )
+                                            -- MPTC last-ditch: when the class param isn't
+                                            -- visible in the args (classic case: @newArray
+                                            -- :: MArray a e m => (i, i) -> e -> m (a i e)@
+                                            -- — @a@ only appears in the RESULT), arg-based
+                                            -- dispatch can't distinguish @MArray STArray@
+                                            -- from @MArray IOArray@.  Without type
+                                            -- inference, we pick a canonical instance for
+                                            -- known MPTCs that keeps the ST-array path
+                                            -- working for warp.
+                                            mPicked <- tryMptcHint cls methodName
+                                            case mPicked of
+                                                Just methodVal
+                                                  | not (isMethodPlaceholder methodVal) ->
+                                                        applyAll methodVal (reverse (argT : accArgs))
+                                                _ -> do
+                                                    -- Fall back to the class's default body.
+                                                    mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                                    mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                                    let mDef = preferMethod mDef0 mDefShared
+                                                    case mDef of
+                                                        Just defVal ->
+                                                            applyAll defVal (reverse (argT : accArgs))
+                                                        _ -> error
+                                                            ( "class-method dispatch: no instance of `"
+                                                             <> BC.unpack cls
+                                                             <> "` for type `" <> BC.unpack tag
+                                                             <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else do
                     -- Non-dispatchable (function / unit / primitive
                     -- object): stash and wait for the next arg so the
@@ -2333,6 +2348,29 @@ classMethodDispatcher reg cls methodName = selfVal
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+    -- MPTC hint: for classes where the class param isn't visible in
+    -- the value args (only in the result), we can't arg-dispatch.
+    -- Here we hand-pick the canonical instance for known cases:
+    --
+    --   * @MArray@ — the creation methods (@newArray@, @newArray_@,
+    --     @unsafeNewArray_@) take bounds + initial value; neither
+    --     reveals the array type.  Default to @STArray@ since the
+    --     warp / HTTP / container code paths all use ST-based mutable
+    --     arrays; IO-based mutable arrays pass their array Val as the
+    --     first argument of later methods (@unsafeRead@, @unsafeWrite@)
+    --     and hit the regular dispatcher.
+    --
+    -- Extend this as we discover other MPTCs where arg-based dispatch
+    -- isn't enough (e.g. @MonadReader@, @MonadWriter@, ...).
+    tryMptcHint :: ByteString -> ByteString -> IO (Maybe Val)
+    tryMptcHint c m
+        | c == BC.pack "MArray"
+        , m `elem` [BC.pack "newArray", BC.pack "newArray_", BC.pack "unsafeNewArray_"] = do
+            mLocal  <- lookupInstanceMethodForced reg c (BC.pack "STArray") m
+            mShared <- lookupInSharedRegForced c (BC.pack "STArray") m
+            pure (preferMethod mLocal mShared)
+        | otherwise = pure Nothing
 
     -- See use-site in 'dispatch'.  When a tuple-tagged argument misses
     -- all lookup paths, peek at the first inner thunk's type tag and
