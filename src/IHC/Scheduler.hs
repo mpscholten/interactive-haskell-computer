@@ -90,7 +90,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeAST
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, seedBuiltinClassMethodSigs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -2666,6 +2666,13 @@ buildClassMethodEnv
     -> IO Env
 buildClassMethodEnv classReg existing loadedModules = do
     decls <- concat <$> mapM (\lm -> scanClassDecls (lmSource lm)) loadedModules
+    -- Publish every declared method name so the elaborator's
+    -- 'classMethodHint' can distinguish real class methods from
+    -- top-level bindings that merely happen to have a single-pred
+    -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
+    let allMethodNames = Set.fromList
+            [ m | ClassDecl _ ms _ <- decls, m <- ms ]
+    modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
@@ -4257,6 +4264,25 @@ lookupIncludeDirs includeMap fileDir =
 -- source (GHC.Base, GHC.IO, Prelude, System.IO, Foreign.*, etc.).
 -- Those are now source-loaded, exposing gaps in the interpreter that
 -- the Phase 2.17 punchlist documents.
+-- | Narrow re-export shims in @base@ that our demand-driven import
+-- walker needs to look through.  These bare @GHC.X@ modules are
+-- normally blocked during re-export chasing (to avoid pulling in
+-- @GHC.Base@'s big transitive subgraph), but they're actually thin
+-- wrappers over the corresponding @GHC.Internal.X@ module — no heavier
+-- than loading the internal target directly.  Skipping them means e.g.
+-- @Data.Array (bounds)@ / @Data.IORef (newIORef)@ fail as "unbound"
+-- when accessed lazily.
+isAllowedTargetedGhc :: ModuleName -> Bool
+isAllowedTargetedGhc n =
+       n == BC.pack "GHC.Arr"
+    || n == BC.pack "GHC.IORef"
+    || n == BC.pack "GHC.STRef"
+    || n == BC.pack "GHC.ST"
+    || n == BC.pack "GHC.List"
+    || n == BC.pack "GHC.MVar"
+    || n == BC.pack "GHC.Exception"
+    || n == BC.pack "GHC.Ix"
+
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
        n == "GHC.Prim"
@@ -4994,6 +5020,7 @@ resolveImport registry searchPath includeMap lm name = do
         reg <- readIORef registry
         let isBlockedGhc = ("GHC." `BC.isPrefixOf` impModule imp || impModule imp == "GHC")
                         && not ("GHC.Internal." `BC.isPrefixOf` impModule imp)
+                        && not (isAllowedTargetedGhc (impModule imp))
         case Map.lookup (impModule imp) reg of
             Just (Loaded srcLm) -> do
                 mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
