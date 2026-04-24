@@ -5593,8 +5593,19 @@ desugarRecordCons fldReg = go
             fallback = Alt PWild
                          (EApp (EVar "error")
                                (ELit (LStr "record update: unknown constructor")))
+            -- If none of the updated field names are in the FieldRegistry
+            -- (neither locally nor in any loaded module), we cannot desugar
+            -- this update — emit a runtime 'error' rather than silently
+            -- discarding the update (which would make the bug invisible).
+            missingFieldsErr =
+                let names = BC.intercalate (BC.pack ", ")
+                              [ fname | (fname, _) <- updatesG ]
+                in EApp (EVar "error")
+                        (ELit (LStr (BC.pack "record update: field(s) "
+                                  <> names
+                                  <> BC.pack " not in registry")))
         in if null alts
-               then go baseExpr   -- no registry info; best effort: return original
+               then missingFieldsErr
                else ECase scrut (alts ++ [fallback])
 
     -- Recurse into all sub-expressions.
