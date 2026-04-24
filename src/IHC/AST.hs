@@ -64,6 +64,10 @@ data Expr
     -- instead of going through the VClassMethod dispatcher.  Produced
     -- only by elaboration — parsers never emit this node.
     | ETypedMethod !Name !Name !Name
+    -- | Internal sentinel used by guarded case alternatives. If an
+    -- alternative pattern matches but its guards fail, evaluation should
+    -- continue with the next alternative.
+    | EGuardFail
     deriving (Eq, Show)
 
 -- | A single statement inside a do-block.

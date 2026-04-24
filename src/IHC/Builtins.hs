@@ -32,10 +32,11 @@ import GHC.Conc.Sync (unsafeIOToSTM)
 import qualified Control.Exception as CE
 import Control.Exception
     ( throwIO, catch, try, evaluate, mask, mask_
-    , bracket, bracket_, finally, onException, throwTo
+    , bracket, bracket_, bracketOnError, finally, onException, throwTo
     , SomeException, IOException
     , Exception(..)
     )
+import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
@@ -44,11 +45,11 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr, ord)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word8, Word64)
+import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.C.String (peekCAString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
@@ -56,9 +57,9 @@ import Foreign.ForeignPtr
     , plusForeignPtr
     )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (mallocBytes)
+import Foreign.Marshal.Alloc (allocaBytes, mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
-import Foreign.Ptr (Ptr, castPtr, plusPtr, nullPtr, minusPtr)
+import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
@@ -79,6 +80,8 @@ import System.IO
     , stdin
     , stdout
     )
+import qualified System.Posix.IO as PosixIO
+import System.Posix.Types (Fd)
 
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
@@ -92,9 +95,33 @@ import IHC.Val
 
 mkForeignPtrVal :: ForeignPtr Word8 -> IO Val
 mkForeignPtrVal fp = do
+    markForeignPtrWord8 fp
     addrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr (unsafeForeignPtrToPtr fp))))
     gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     pure (VCon "ForeignPtr" [addrT, gutsT])
+
+{-# NOINLINE foreignPtrWord8RangesRef #-}
+foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
+foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
+
+markWord8Ptr :: Ptr Word8 -> IO ()
+markWord8Ptr p = markWord8PtrRange p 1
+
+markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
+markWord8PtrRange p len =
+    let start = ptrToIntPtr (castPtr p)
+        end   = start + fromIntegral (max 1 len)
+    in modifyIORef' foreignPtrWord8RangesRef ((start, end) :)
+
+markForeignPtrWord8 :: ForeignPtr Word8 -> IO ()
+markForeignPtrWord8 fp =
+    markWord8Ptr (castPtr (unsafeForeignPtrToPtr fp))
+
+isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
+isMarkedWord8Ptr p =
+    let addr = ptrToIntPtr (castPtr p)
+    in any (\(start, end) -> addr >= start && addr < end)
+        <$> readIORef foreignPtrWord8RangesRef
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
@@ -301,6 +328,31 @@ builtins reg =
     , ("Data.ByteString.replicate", bsReplicateB)
     , ("Data.ByteString.head",      bsHeadB)
     , ("Data.ByteString.index",     bsIndexB)
+    -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
+    -- allocation boundaries; the caller-supplied fill action is still
+    -- interpreted, but the mutable memory it writes into must be host-managed.
+    , ("create", bsCreateB)
+    , ("createAndTrim", bsCreateAndTrimB)
+    , ("createFp", bsCreateFpB)
+    , ("createFpAndTrim", bsCreateFpAndTrimB)
+    , ("Data.ByteString.Internal.create", bsCreateB)
+    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB)
+    , ("Data.ByteString.Internal.Type.create", bsCreateB)
+    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB)
+    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB)
+    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB)
+    , ("PS", bsPSConB)
+    , ("Data.ByteString.Internal.PS", bsPSConB)
+    , ("Data.ByteString.Internal.Type.PS", bsPSConB)
+    -- Unique generation is an RTS/global-state service. Vault uses these as
+    -- ordered map keys, so represent them as Unique Integer-style constructors
+    -- backed by a host counter.
+    , ("newUnique", newUniqueB)
+    , ("hashUnique", hashUniqueB)
+    , ("Data.Unique.newUnique", newUniqueB)
+    , ("Data.Unique.hashUnique", hashUniqueB)
+    , ("Data.Unique.Really.newUnique", newUniqueB)
+    , ("Data.Unique.Really.hashUnique", hashUniqueB)
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
@@ -333,18 +385,68 @@ builtins reg =
     -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
     -- implementation for VIO values.
     , (">>=",      bindDispatch reg)
+    , ("GHC.Internal.Base.>>=", bindDispatch reg)
+    , ("Prelude.>>=", bindDispatch reg)
     , (">>",       seqDispatch reg)
+    , ("GHC.Internal.Base.>>", seqDispatch reg)
+    , ("Prelude.>>", seqDispatch reg)
     , ("return",   returnB)
+    , ("GHC.Internal.Base.return", returnB)
+    , ("Prelude.return", returnB)
     , ("pure",     returnB)
+    , ("GHC.Internal.Base.pure", returnB)
+    , ("Prelude.pure", returnB)
     , ("fmap",     fmapDispatch reg)
+    , ("GHC.Internal.Base.fmap", fmapDispatch reg)
+    , ("Prelude.fmap", fmapDispatch reg)
     , ("<*>",      apB)
+    , ("GHC.Internal.Base.<*>", apB)
+    , ("Prelude.<*>", apB)
+    , ("$",        dollarB)
+    , ("GHC.Internal.Base.$", dollarB)
+    , ("Prelude.$", dollarB)
     , ("join",     joinB)
+    , ("void",     voidB)
+    , ("Control.Monad.void", voidB)
+    , ("GHC.Internal.Base.void", voidB)
     -- IORef
     , ("newIORef",    newIORefB)
+    , ("GHC.IORef.newIORef", newIORefB)
+    , ("GHC.Internal.IORef.newIORef", newIORefB)
+    , ("GHC.Internal.Data.IORef.newIORef", newIORefB)
+    , ("Data.IORef.newIORef", newIORefB)
     , ("readIORef",   readIORefB)
+    , ("GHC.IORef.readIORef", readIORefB)
+    , ("GHC.Internal.IORef.readIORef", readIORefB)
+    , ("GHC.Internal.Data.IORef.readIORef", readIORefB)
+    , ("Data.IORef.readIORef", readIORefB)
     , ("writeIORef",  writeIORefB)
+    , ("GHC.IORef.writeIORef", writeIORefB)
+    , ("GHC.Internal.IORef.writeIORef", writeIORefB)
+    , ("GHC.Internal.Data.IORef.writeIORef", writeIORefB)
+    , ("Data.IORef.writeIORef", writeIORefB)
     , ("modifyIORef", modifyIORefB)
+    , ("GHC.IORef.modifyIORef", modifyIORefB)
+    , ("GHC.Internal.IORef.modifyIORef", modifyIORefB)
+    , ("GHC.Internal.Data.IORef.modifyIORef", modifyIORefB)
+    , ("Data.IORef.modifyIORef", modifyIORefB)
     , ("modifyIORef'",modifyIORefB)             -- same, no laziness diff here
+    , ("GHC.IORef.modifyIORef'", modifyIORefB)
+    , ("GHC.Internal.IORef.modifyIORef'", modifyIORefB)
+    , ("GHC.Internal.Data.IORef.modifyIORef'", modifyIORefB)
+    , ("Data.IORef.modifyIORef'", modifyIORefB)
+    , ("atomicModifyIORef'", atomicModifyIORefB)
+    , ("GHC.IORef.atomicModifyIORef'", atomicModifyIORefB)
+    , ("GHC.Internal.IORef.atomicModifyIORef'", atomicModifyIORefB)
+    , ("GHC.Internal.Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
+    , ("Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
+    -- mkWeakIORef is source-defined only as a thin wrapper over mkWeak#,
+    -- so the observable operation is RTS-exclusive.  We keep the Weak inert:
+    -- network's mkSocket discards it after registering the close finalizer.
+    , ("mkWeakIORef", mkWeakIORefB)
+    , ("GHC.IORef.mkWeakIORef", mkWeakIORefB)
+    , ("GHC.Internal.Data.IORef.mkWeakIORef", mkWeakIORefB)
+    , ("Data.IORef.mkWeakIORef", mkWeakIORefB)
     -- File IO
     , ("openFile",    openFileB)
     , ("hClose",      hCloseB)
@@ -373,6 +475,7 @@ builtins reg =
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
+    , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
     , ("lazy",                     lazyB)
     -- Phase 2.8: unsafePerformIO family
@@ -399,21 +502,62 @@ builtins reg =
     , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
     , ("withForeignPtr",             withForeignPtrB)
     , ("unsafeWithForeignPtr",       withForeignPtrB)
+    , ("Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
+    , ("Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
+    , ("Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
+    , ("Foreign.ForeignPtr.Safe.withForeignPtr", withForeignPtrB)
+    , ("GHC.ForeignPtr.withForeignPtr", withForeignPtrB)
+    , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
+    , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
+    , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
+    , ("newForeignPtr",              newForeignPtrB)
+    , ("addForeignPtrFinalizer",     addForeignPtrFinalizerB)
+    , ("Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
+    , ("Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
+    , ("Foreign.ForeignPtr.Safe.newForeignPtr", newForeignPtrB)
+    , ("GHC.ForeignPtr.newForeignPtr", newForeignPtrB)
+    , ("GHC.Internal.Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
+    , ("GHC.Internal.Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
+    , ("Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
+    , ("Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
+    , ("Foreign.ForeignPtr.Safe.addForeignPtrFinalizer", addForeignPtrFinalizerB)
+    , ("GHC.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
+    , ("GHC.Internal.Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
+    , ("GHC.Internal.Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     -- Phase 2.8: Storable ops on Ptr
     , ("peek",         peekB)
+    , ("Foreign.peek", peekB)
+    , ("Foreign.Storable.peek", peekB)
+    , ("GHC.Internal.Foreign.Storable.peek", peekB)
+    , ("Network.Socket.Imports.peek", peekB)
     , ("poke",         pokeB)
+    , ("Foreign.poke", pokeB)
+    , ("Foreign.Storable.poke", pokeB)
+    , ("GHC.Internal.Foreign.Storable.poke", pokeB)
+    , ("Network.Socket.Imports.poke", pokeB)
     , ("peekByteOff",  peekByteOffB)
+    , ("Foreign.peekByteOff", peekByteOffB)
+    , ("Foreign.Storable.peekByteOff", peekByteOffB)
+    , ("GHC.Internal.Foreign.Storable.peekByteOff", peekByteOffB)
+    , ("Network.Socket.Imports.peekByteOff", peekByteOffB)
     , ("pokeByteOff",  pokeByteOffB)
+    , ("Foreign.pokeByteOff", pokeByteOffB)
+    , ("Foreign.Storable.pokeByteOff", pokeByteOffB)
+    , ("GHC.Internal.Foreign.Storable.pokeByteOff", pokeByteOffB)
+    , ("Network.Socket.Imports.pokeByteOff", pokeByteOffB)
     -- Phase 2.8: MutableByteArray# family
     , ("newByteArray#",             newByteArrayB)
     , ("newPinnedByteArray#",       newPinnedByteArrayB)
+    , ("newAlignedPinnedByteArray#", newAlignedPinnedByteArrayB)
     , ("writeWord8Array#",          writeWord8ArrayB)
     , ("readWord8Array#",           readWord8ArrayB)
     , ("indexWord8Array#",          indexWord8ArrayB)
     , ("unsafeFreezeByteArray#",    unsafeFreezeByteArrayB)
+    , ("byteArrayContents#",        byteArrayContentsB)
+    , ("mutableByteArrayContents#", mutableByteArrayContentsB)
     , ("getSizeofMutableByteArray#", getSizeofMutableByteArrayB)
     , ("sizeofByteArray#",          sizeofByteArrayB)
     , ("resizeMutableByteArray#",   resizeMutableByteArrayB)
@@ -424,6 +568,15 @@ builtins reg =
     , ("copyAddrToByteArray#",      copyAddrToByteArrayB)
     , ("copyByteArrayToAddr#",      copyByteArrayToAddrB)
     , ("compareByteArrays#",        compareByteArraysB)
+    -- Boxed Array#/MutableArray# primops used by source-loaded GHC.Arr.
+    , ("newArray#",                 newArrayHashB)
+    , ("writeArray#",               writeArrayHashB)
+    , ("readArray#",                readArrayHashB)
+    , ("indexArray#",               indexArrayHashB)
+    , ("unsafeFreezeArray#",        unsafeFreezeArrayHashB)
+    , ("unsafeThawArray#",          unsafeThawArrayHashB)
+    , ("sizeofArray#",              sizeofArrayHashB)
+    , ("sizeofMutableArray#",       sizeofMutableArrayHashB)
     -- Phase 2.8: C memory ops
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
@@ -494,12 +647,82 @@ builtins reg =
     -- ASCII-byte marshalling (matches GHC's default for libc FFI).
     , ("withCString",     withCStringB)
     , ("withCStringLen",  withCStringLenB)
+    , ("withCStringLen0", withCStringLenB)
+    , ("with",            withB)
+    , ("Foreign.Marshal.Utils.with", withB)
+    , ("GHC.Internal.Foreign.Marshal.Utils.with", withB)
     , ("peekCString",     peekCStringB)
     , ("peekCAString",    peekCStringB)
     , ("newCString",      newCStringB)
     , ("newCAString",     newCStringB)
     , ("sizeOf",       sizeOfB)
+    , ("Foreign.Storable.sizeOf", sizeOfB)
+    , ("GHC.Internal.Foreign.Storable.sizeOf", sizeOfB)
+    , ("Network.Socket.Imports.sizeOf", sizeOfB)
     , ("alignment",    alignmentB)
+    , ("Foreign.Storable.alignment", alignmentB)
+    , ("GHC.Internal.Foreign.Storable.alignment", alignmentB)
+    , ("Network.Socket.Imports.alignment", alignmentB)
+    -- Network.Socket.socket creates an OS file descriptor and wraps it in
+    -- network's Socket constructor.  The fd allocation is inherently an
+    -- OS/RTS boundary, so IHC hosts this syscall while preserving the source
+    -- Socket value shape used by the rest of the interpreted network package.
+    , ("socket", socketCreateB)
+    , ("Network.Socket.socket", socketCreateB)
+    , ("Network.Socket.Syscall.socket", socketCreateB)
+    -- setsockopt is an OS syscall.  Keep the Haskell option constants and
+    -- Socket shape, but perform the fd-level call in the host.
+    , ("setSocketOption", socketSetOptionB)
+    , ("Network.Socket.setSocketOption", socketSetOptionB)
+    , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
+    -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
+    , ("listen", socketListenB)
+    , ("Network.Socket.listen", socketListenB)
+    , ("Network.Socket.Syscall.listen", socketListenB)
+    -- accept(2) blocks for the next connection and returns a network Socket
+    -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
+    -- above it remains source-interpreted.
+    , ("accept", socketAcceptB)
+    , ("Network.Socket.accept", socketAcceptB)
+    , ("Network.Socket.SockAddr.accept", socketAcceptB)
+    , ("Network.Socket.Syscall.accept", socketAcceptB)
+    -- getsockname(2), used by Warp to populate connMySockAddr.
+    , ("getSocketName", socketGetNameB)
+    , ("Network.Socket.getSocketName", socketGetNameB)
+    , ("Network.Socket.SockAddr.getSocketName", socketGetNameB)
+    , ("Network.Socket.Name.getSocketName", socketGetNameB)
+    -- Raw heap buffer allocation used by Warp's response buffers.
+    , ("mallocBytes", mallocBytesB)
+    , ("Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
+    , ("GHC.Internal.Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
+    , ("free", freeB)
+    , ("Foreign.Marshal.Alloc.free", freeB)
+    , ("GHC.Internal.Foreign.Marshal.Alloc.free", freeB)
+    , ("Network.Socket.SockAddr.bind", socketBindB)
+    , ("Network.Socket.Syscall.bind", socketBindB)
+    -- Network.Socket's Socket value is already represented by IHC as a
+    -- host-backed fd-bearing constructor. fdSocket/unsafeFdSocket expose that
+    -- fd as IO CInt in network >= 3, so this is an RTS/OS bridge over the
+    -- existing host socket object rather than a Hackage-library shim.
+    , ("fdSocket", socketFdB)
+    , ("unsafeFdSocket", socketFdB)
+    , ("Network.Socket.fdSocket", socketFdB)
+    , ("Network.Socket.unsafeFdSocket", socketFdB)
+    , ("Network.Socket.Types.fdSocket", socketFdB)
+    , ("Network.Socket.Types.unsafeFdSocket", socketFdB)
+    -- sendBuf/recvBuf are the fd-level OS send(2)/recv(2) boundaries used by
+    -- Network.Socket.ByteString. Keep the ByteString API source-interpreted,
+    -- but perform the actual socket syscall in the host.
+    , ("sendBuf", socketSendBufB)
+    , ("recvBuf", socketRecvBufB)
+    , ("Network.Socket.Buffer.sendBuf", socketSendBufB)
+    , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
+    , ("Network.Socket.sendBuf", socketSendBufB)
+    , ("Network.Socket.recvBuf", socketRecvBufB)
+    , ("settingsPort", warpSettingsPortB)
+    , ("Network.Wai.Handler.Warp.Settings.settingsPort", warpSettingsPortB)
+    , ("settingsHost", warpSettingsHostB)
+    , ("Network.Wai.Handler.Warp.Settings.settingsHost", warpSettingsHostB)
     -- Phase 2.8: additional numeric ops needed by containers
     , ("fromInteger",  fromIntegralB)
     , ("toInteger",    fromIntegralB)
@@ -525,12 +748,78 @@ builtins reg =
     , ("**",           powFloatOpB)
     , ("enumFromTo",   enumFromToB)
     , ("enumFromThenTo", enumFromThenToB)
-    -- Phase 2.10a: concurrency primitives
+    -- Phase 2.10a: concurrency primitives.  forkIO is backed by GHC's
+    -- RTS thread primitive (`fork#` in GHC.Internal.Conc.Sync), so the
+    -- module-qualified names forward to the same host operation as the bare
+    -- builtin instead of interpreting the low-level RTS wrapper source.
     , ("forkIO",          forkIOB)
+    , ("Control.Concurrent.forkIO", forkIOB)
+    , ("GHC.Conc.Sync.forkIO", forkIOB)
+    , ("GHC.Internal.Conc.Sync.forkIO", forkIOB)
     , ("killThread",      killThreadB)
     , ("myThreadId",      myThreadIdB)
+    , ("myThreadId#",     myThreadIdHashB)
+    , ("fromThreadId",    fromThreadIdB)
+    , ("GHC.Conc.Sync.fromThreadId", fromThreadIdB)
+    , ("GHC.Internal.Conc.Sync.fromThreadId", fromThreadIdB)
+    , ("labelThread",     labelThreadB)
+    , ("GHC.Conc.Sync.labelThread", labelThreadB)
+    , ("GHC.Internal.Conc.Sync.labelThread", labelThreadB)
+    , ("labelThreadByteArray#", labelThreadByteArrayHashB)
+    , ("GHC.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
+    , ("GHC.Internal.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
     , ("threadDelay",     threadDelayB)
     , ("getNumCapabilities", getNumCapabilitiesB)
+    -- closeFdWith coordinates with GHC's RTS event manager. IHC does not
+    -- run that manager, so the compatible behavior is to run the supplied
+    -- low-level close action directly.
+    , ("closeFdWith", closeFdWithB)
+    , ("GHC.Conc.closeFdWith", closeFdWithB)
+    , ("GHC.Internal.Conc.IO.closeFdWith", closeFdWithB)
+    , ("GHC.Internal.Event.Thread.closeFdWith", closeFdWithB)
+    -- IHC does not run GHC's RTS event manager.  Source modules such as
+    -- auto-update branch on this probe; returning Nothing selects their
+    -- ordinary threadDelay/forkIO implementation instead of the event-manager
+    -- backend.
+    , ("getSystemEventManager", getSystemEventManagerB)
+    , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
+    , ("GHC.Event.Thread.getSystemEventManager", getSystemEventManagerB)
+    , ("GHC.Internal.Event.getSystemEventManager", getSystemEventManagerB)
+    , ("GHC.Internal.Event.Thread.getSystemEventManager", getSystemEventManagerB)
+    -- IHC also does not run GHC's RTS timer manager.  Warp/time-manager use
+    -- these operations only to register idle timeout callbacks; expose a
+    -- no-op timer manager so request handling can proceed without evaluating
+    -- the RTS-only TimerManager implementation.
+    , ("getSystemTimerManager", getSystemTimerManagerB)
+    , ("GHC.Event.getSystemTimerManager", getSystemTimerManagerB)
+    , ("GHC.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
+    , ("GHC.Internal.Event.getSystemTimerManager", getSystemTimerManagerB)
+    , ("GHC.Internal.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
+    , ("registerTimeout", registerTimeoutB)
+    , ("GHC.Event.registerTimeout", registerTimeoutB)
+    , ("GHC.Event.TimerManager.registerTimeout", registerTimeoutB)
+    , ("GHC.Internal.Event.registerTimeout", registerTimeoutB)
+    , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB)
+    , ("unregisterTimeout", unregisterTimeoutB)
+    , ("GHC.Event.unregisterTimeout", unregisterTimeoutB)
+    , ("GHC.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
+    , ("GHC.Internal.Event.unregisterTimeout", unregisterTimeoutB)
+    , ("GHC.Internal.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
+    , ("updateTimeout", updateTimeoutB)
+    , ("GHC.Event.updateTimeout", updateTimeoutB)
+    , ("GHC.Event.TimerManager.updateTimeout", updateTimeoutB)
+    , ("GHC.Internal.Event.updateTimeout", updateTimeoutB)
+    , ("GHC.Internal.Event.TimerManager.updateTimeout", updateTimeoutB)
+    , ("withHandle", timeManagerWithHandleB)
+    , ("withHandleKillThread", timeManagerWithHandleB)
+    , ("System.TimeManager.withHandle", timeManagerWithHandleB)
+    , ("System.TimeManager.withHandleKillThread", timeManagerWithHandleB)
+    -- System.Posix.IO comes from the boot `unix` package, whose source is
+    -- not present in ~/.cache/ihc/sources for this run.  setFdOption mutates
+    -- an OS file descriptor flag; expose the host operation so Warp can mark
+    -- accepted/listening sockets CloseOnExec during startup.
+    , ("setFdOption", setFdOptionB)
+    , ("System.Posix.IO.setFdOption", setFdOptionB)
     -- Phase 2.10a: MVar
     , ("newMVar",         newMVarB)
     , ("newEmptyMVar",    newEmptyMVarB)
@@ -664,17 +953,88 @@ builtins reg =
     -- take a State# token, run the VIO action, wrap the result as
     -- (# State#, a #).
     , ("unIO",            unIOB)
+    , ("GHC.IO.unIO",     unIOB)
+    , ("GHC.Internal.IO.unIO", unIOB)
+    , ("ioToST",          ioToSTB)
+    , ("GHC.IO.ioToST",   ioToSTB)
+    , ("GHC.Internal.IO.ioToST", ioToSTB)
+    , ("unsafeIOToST",    ioToSTB)
+    , ("GHC.IO.unsafeIOToST", ioToSTB)
+    , ("GHC.Internal.IO.unsafeIOToST", ioToSTB)
+    , ("Control.Monad.ST.Unsafe.unsafeIOToST", ioToSTB)
+    , ("stToIO",          stToIOB)
+    , ("GHC.IO.stToIO",   stToIOB)
+    , ("GHC.Internal.IO.stToIO", stToIOB)
+    , ("unsafeSTToIO",    stToIOB)
+    , ("GHC.IO.unsafeSTToIO", stToIOB)
+    , ("GHC.Internal.IO.unsafeSTToIO", stToIOB)
+    , ("Control.Monad.ST.Unsafe.unsafeSTToIO", stToIOB)
     , ("catch",           catchB)
+    , ("GHC.IO.catch",    catchB)
+    , ("GHC.Internal.IO.catch", catchB)
+    , ("Control.Exception.catch", catchB)
+    , ("GHC.Internal.Control.Exception.catch", catchB)
     , ("handle",          handleB)
+    , ("Control.Exception.handle", handleB)
+    , ("GHC.Internal.Control.Exception.handle", handleB)
     , ("try",             tryB)
+    , ("Control.Exception.try", tryB)
+    , ("GHC.Internal.Control.Exception.try", tryB)
     , ("evaluate",        evaluateB)
+    , ("Control.Exception.evaluate", evaluateB)
+    , ("GHC.Internal.Control.Exception.evaluate", evaluateB)
     , ("mask_",           mask_B)
+    , ("GHC.IO.mask_",    mask_B)
+    , ("GHC.Internal.IO.mask_", mask_B)
+    , ("Control.Exception.mask_", mask_B)
+    , ("GHC.Internal.Control.Exception.mask_", mask_B)
     , ("mask",            maskB)
+    , ("GHC.IO.mask",     maskB)
+    , ("GHC.Internal.IO.mask", maskB)
+    , ("Control.Exception.mask", maskB)
+    , ("GHC.Internal.Control.Exception.mask", maskB)
     , ("uninterruptibleMask_", mask_B)
+    , ("uninterruptibleMask", maskB)
+    , ("GHC.IO.uninterruptibleMask_", mask_B)
+    , ("GHC.IO.uninterruptibleMask", maskB)
+    , ("GHC.Internal.IO.uninterruptibleMask_", mask_B)
+    , ("GHC.Internal.IO.uninterruptibleMask", maskB)
+    , ("Control.Exception.uninterruptibleMask_", mask_B)
+    , ("Control.Exception.uninterruptibleMask", maskB)
+    , ("GHC.Internal.Control.Exception.uninterruptibleMask_", mask_B)
+    , ("GHC.Internal.Control.Exception.uninterruptibleMask", maskB)
+    , ("block",           mask_B)
+    , ("GHC.IO.block",    mask_B)
+    , ("GHC.Internal.IO.block", mask_B)
+    , ("unblock",         mask_B)
+    , ("GHC.IO.unblock",  mask_B)
+    , ("GHC.Internal.IO.unblock", mask_B)
+    , ("unsafeUnmask",    mask_B)
+    , ("GHC.IO.unsafeUnmask", mask_B)
+    , ("GHC.Internal.IO.unsafeUnmask", mask_B)
+    , ("allowInterrupt", allowInterruptB)
+    , ("Control.Exception.allowInterrupt", allowInterruptB)
+    , ("GHC.Internal.Control.Exception.allowInterrupt", allowInterruptB)
+    , ("interruptible", interruptibleB)
+    , ("Control.Exception.interruptible", interruptibleB)
+    , ("GHC.Internal.Control.Exception.interruptible", interruptibleB)
+    , ("GHC.IO.interruptible", interruptibleB)
+    , ("GHC.Internal.IO.interruptible", interruptibleB)
     , ("bracket",         bracketB)
+    , ("Control.Exception.bracket", bracketB)
+    , ("GHC.Internal.Control.Exception.bracket", bracketB)
+    , ("bracketOnError",  bracketOnErrorB)
+    , ("Control.Exception.bracketOnError", bracketOnErrorB)
+    , ("GHC.Internal.Control.Exception.bracketOnError", bracketOnErrorB)
     , ("bracket_",        bracket_B)
+    , ("Control.Exception.bracket_", bracket_B)
+    , ("GHC.Internal.Control.Exception.bracket_", bracket_B)
     , ("finally",         finallyB)
+    , ("Control.Exception.finally", finallyB)
+    , ("GHC.Internal.Control.Exception.finally", finallyB)
     , ("onException",     onExceptionB)
+    , ("Control.Exception.onException", onExceptionB)
+    , ("GHC.Internal.Control.Exception.onException", onExceptionB)
     , ("throwTo",         throwToB)
     , ("displayException", displayExceptionB)
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
@@ -721,7 +1081,12 @@ builtins reg =
     , ("atomicModifyMutVar#",   atomicModifyMutVarB)
     , ("atomicModifyMutVar2#",  atomicModifyMutVar2B)
     , ("atomicModifyMutVar_#",  atomicModifyMutVarUB)
+    , ("atomicSwapMutVar#",     atomicSwapMutVarB)
     , ("casMutVar#",            casMutVarB)
+    -- Weak# primops.  Weak pointers are RTS objects; source modules only
+    -- wrap these operations in ordinary newtypes.
+    , ("mkWeak#",               mkWeakHashB)
+    , ("mkWeakNoFinalizer#",    mkWeakNoFinalizerHashB)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
@@ -917,6 +1282,14 @@ eqVals reg av bv = case (av, bv) of
     (VStr x, VStr y)     -> pure (boolVal (x == y))
     (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
         pure (boolVal (p1 == p2))
+    (VUnit, VPrimObj (PrimPtr p)) ->
+        pure (boolVal (p == nullPtr))
+    (VPrimObj (PrimPtr p), VUnit) ->
+        pure (boolVal (p == nullPtr))
+    (VInt n, VPrimObj (PrimPtr p)) ->
+        pure (boolVal ((n == 0 && p == nullPtr)))
+    (VPrimObj (PrimPtr p), VInt n) ->
+        pure (boolVal ((n == 0 && p == nullPtr)))
     (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
         pure (boolVal (fp1 == fp2))
     (VUnit, VUnit)      -> pure (boolVal True)
@@ -954,7 +1327,8 @@ eqVals reg av bv = case (av, bv) of
                 apply r1 bT
             _ -> error ("(==): no Eq instance for type tag `"
                         <> BC.unpack tag <> "`: "
-                        <> showValForDebug av)
+                        <> showValForDebug av
+                        <> " vs " <> showValForDebug bv)
 
 -- | Ord dispatch. Slot in the method list:
 --   0 = (<), 1 = (<=), 2 = (>), 3 = (>=), 4 = compare
@@ -1023,7 +1397,9 @@ ordCmp _reg slot av bv = case (av, bv) of
                                     if isTruthy r then pure (boolVal True)
                                     else ordCmp _reg 2 av bv
                             _ -> error ("Ord: no instance for type tag `"
-                                        <> BC.unpack (typeTagOf av) <> "`")
+                                        <> BC.unpack (typeTagOf av) <> "` while comparing "
+                                        <> showValForDebug av <> " and "
+                                        <> showValForDebug bv)
   where
     intOrdSlot 0 x y = x < y
     intOrdSlot 1 x y = x <= y
@@ -1395,6 +1771,7 @@ showVal (VPrimObj (PrimHandle _))      = pure "<Handle>"
 showVal (VPrimObj (PrimForeignPtr _))  = pure "<ForeignPtr>"
 showVal (VPrimObj (PrimPtr _))         = pure "<Ptr>"
 showVal (VPrimObj (PrimByteArray _))   = pure "<MutableByteArray>"
+showVal (VPrimObj (PrimArray _))       = pure "<MutableArray#>"
 showVal (VPrimObj PrimRealWorld)       = pure "<RealWorld#>"
 showVal (VPrimObj (PrimMVar _))        = pure "<MVar>"
 showVal (VPrimObj (PrimTVar _))        = pure "<TVar>"
@@ -1847,8 +2224,8 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
             stFunc <- newWHNFThunk $ VFun $ \sT -> do
                 resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
                 resV   <- runIOVal resRaw    -- run VIO if needed (primop results)
-                case resV of
-                    VCon "(#,#)" [newST, rT] -> do
+                case stResultComponents resV of
+                    Just (newST, rT) -> do
                         stkRaw <- apply ktV rT   -- k applied to r; may be ST or VIO
                         -- DO NOT runIOVal here unconditionally: that would strip a
                         -- `VIO (pure x)` (from `return`/`pure`) down to a bare x and
@@ -1876,7 +2253,7 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                                     _ -> do
                                         vT <- newWHNFThunk v
                                         pure (VCon "(#,#)" [newST, vT])
-                    other -> pure other  -- m didn't return an unboxed tuple
+                    Nothing -> pure resV  -- m didn't return a state/result pair
             pure (VCon "ST" [stFunc])
         _ -> do
             -- Look up Monad instance for this value's type tag.
@@ -1915,8 +2292,8 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
             stFunc <- newWHNFThunk $ VFun $ \sT -> do
                 resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
                 resV   <- runIOVal resRaw    -- run VIO if needed
-                case resV of
-                    VCon "(#,#)" [newST, _] -> do
+                case stResultComponents resV of
+                    Just (newST, _) -> do
                         nbV <- force mb
                         case nbV of
                             VCon "ST" [k2FuncT] -> do
@@ -1938,7 +2315,7 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
                                     _ -> do
                                         vT <- newWHNFThunk v
                                         pure (VCon "(#,#)" [newST, vT])
-                    other -> pure other
+                    Nothing -> pure resV
             pure (VCon "ST" [stFunc])
         _ -> do
             let tag = typeTagOf mv
@@ -1972,6 +2349,14 @@ seqIOB = pure $ VFun $ \ma -> pure $ VFun $ \mb -> pure $ VIO $ do
     nv <- force mb
     runIOVal nv
 
+-- Strict ST state functions produce unboxed tuples in state-first order,
+-- while lazy ST produces boxed pairs in value-first order. Constructor names
+-- are not type-qualified in the interpreter, so ST bind must bridge both.
+stResultComponents :: Val -> Maybe (Thunk, Thunk)
+stResultComponents (VCon "(#,#)" [stateT, valueT]) = Just (stateT, valueT)
+stResultComponents (VCon "(,)" [valueT, stateT])   = Just (stateT, valueT)
+stResultComponents _                               = Nothing
+
 -- | @fmap f m = do { v <- m; return (f v) }@. Only works for IO in 2.4.
 fmapB :: IO Val
 fmapB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
@@ -1979,7 +2364,8 @@ fmapB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     v  <- runIOVal mv
     fv <- force ft
     vT <- newWHNFThunk v
-    apply fv vT
+    r  <- apply fv vT
+    runIOVal r
 
 -- | Dispatching @fmap@. Forces the container argument and looks up a
 -- @(Functor, typeTagOf mv)@ entry in the 'ClassRegistry'. If one is
@@ -2006,7 +2392,8 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                 v  <- runIOVal mv
                 fv <- force ft
                 vT <- newWHNFThunk v
-                apply fv vT
+                r  <- apply fv vT
+                runIOVal r
             _ -> error
                 ( "fmap: no Functor instance registered for type `"
                   <> BC.unpack tag <> "`" )
@@ -2021,6 +2408,11 @@ apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     vT <- newWHNFThunk v
     apply f1 vT
 
+dollarB :: IO Val
+dollarB = pure $ VFun $ \ft -> pure $ VFun $ \xt -> do
+    fv <- force ft
+    apply fv xt
+
 -- | @join mm = do { m <- mm; m }@.
 joinB :: IO Val
 joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
@@ -2028,10 +2420,23 @@ joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
     inner <- runIOVal mv
     runIOVal inner
 
--- | Run a VIO (or re-run nested VIOs) until a non-VIO value is
--- reached. Mirrors the helper in 'IHC.Eval.evalDo'.
+voidB :: IO Val
+voidB = pure $ VFun $ \mt -> pure $ VIO $ do
+    mv <- force mt
+    _ <- runIOVal mv
+    pure VUnit
+
+-- | Run one IO layer. Mirrors the helper in 'IHC.Eval' so builtin
+-- bind/sequence can also execute source-constructed @IO@ values.
 runIOVal :: Val -> IO Val
-runIOVal (VIO io) = io >>= runIOVal
+runIOVal (VIO io) = io
+runIOVal (VCon "IO" [ft]) = do
+    fv <- force ft
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- apply fv rwT
+    case result of
+        VCon _ [_stT, resT] -> force resT
+        other               -> pure other
 runIOVal v        = pure v
 
 --------------------------------------------------------------------------------
@@ -2077,6 +2482,35 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
             writeIORef rf new
             pure VUnit
         _ -> error ("modifyIORef: not an IORef: " <> showValForDebug av)
+
+-- | @atomicModifyIORef' ref f@ for ihc's host-backed IORef.  This mirrors
+-- the existing IORef builtins and is atomic enough for ihc's single-threaded
+-- evaluator: read the current value, apply @f@ to get @(new, result)@, store
+-- @new@, and return @result@.
+atomicModifyIORefB :: IO Val
+atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
+    av <- force a
+    case av of
+        VPrimObj (PrimIORef rf) -> do
+            fv <- force f
+            cur <- readIORef rf
+            curT <- newWHNFThunk cur
+            pair <- apply fv curT >>= runIOVal
+            case pair of
+                VCon _ [newT, resultT] -> do
+                    new <- force newT
+                    result <- force resultT
+                    writeIORef rf new
+                    pure result
+                _ -> error ("atomicModifyIORef': function did not return a pair: "
+                            <> showValForDebug pair)
+        _ -> error ("atomicModifyIORef': not an IORef: " <> showValForDebug av)
+
+mkWeakIORefB :: IO Val
+mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $ do
+    refV <- force refT
+    weakPayload <- newWHNFThunk refV
+    pure (VCon "Weak" [weakPayload])
 
 --------------------------------------------------------------------------------
 -- MutVar# primops (Phase 3.6).
@@ -2133,7 +2567,7 @@ writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
 -- | @atomicModifyMutVar# :: MutVar# s a -> (a -> (a, b)) -> State# s -> (# State# s, b #)@
 atomicModifyMutVarB :: IO Val
 atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
-                      pure $ VFun $ \_st -> pure $ VIO $ do
+                      pure $ VFun $ \_st -> do
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
@@ -2158,7 +2592,7 @@ atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
 -- | @atomicModifyMutVar2# :: MutVar# s a -> (a -> (a, b)) -> State# s -> (# State# s, a, (a, b) #)@
 atomicModifyMutVar2B :: IO Val
 atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
-                       pure $ VFun $ \_st -> pure $ VIO $ do
+                       pure $ VFun $ \_st -> do
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
@@ -2186,7 +2620,7 @@ atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
 -- Returns @(# s, old, new #)@.
 atomicModifyMutVarUB :: IO Val
 atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
-                       pure $ VFun $ \_st -> pure $ VIO $ do
+                       pure $ VFun $ \_st -> do
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
@@ -2200,6 +2634,23 @@ atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
             newT  <- newWHNFThunk new
             pure (VCon "(#,,#)" [stT, oldT', newT])
         _ -> error ("atomicModifyMutVar_#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @atomicSwapMutVar# :: MutVar# s a -> a -> State# s -> (# State# s, a #)@
+-- GHC.Prim has no .hs source; use the same IORef-backed MutVar# storage as
+-- the other MutVar# primops and return the previous value.
+atomicSwapMutVarB :: IO Val
+atomicSwapMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \newThunk ->
+                    pure $ VFun $ \_st -> do
+    mvV <- force mvThunk
+    case mvV of
+        VPrimObj (PrimIORef rf) -> do
+            old <- readIORef rf
+            new <- force newThunk
+            writeIORef rf new
+            stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+            oldT <- newWHNFThunk old
+            pure (VCon "(#,#)" [stT, oldT])
+        _ -> error ("atomicSwapMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
 -- | @casMutVar# :: MutVar# s a -> a -> a -> State# s -> (# State# s, Int#, a #)@
 -- Non-atomic CAS — always succeeds (returns 0# = success).
@@ -2217,6 +2668,20 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
             newT <- newWHNFThunk new
             pure (VCon "(#,,#)" [stT, zT, newT])
         _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+mkWeakHashB :: IO Val
+mkWeakHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_finalizerT -> pure $ VFun $ \_stT -> do
+    valV <- force valT
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    weakT <- newWHNFThunk valV
+    pure (VCon "(#,#)" [stT, weakT])
+
+mkWeakNoFinalizerHashB :: IO Val
+mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    valV <- force valT
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    weakT <- newWHNFThunk valV
+    pure (VCon "(#,#)" [stT, weakT])
 
 --------------------------------------------------------------------------------
 -- File IO primops.
@@ -2404,6 +2869,17 @@ realWorldB = pure (VPrimObj PrimRealWorld)
 noDuplicateB :: IO Val
 noDuplicateB = pure $ VFun $ \_ -> pure (VPrimObj PrimRealWorld)
 
+-- | touch# :: a -> State# s -> State# s
+--
+-- GHC.Prim primop with no Haskell implementation. It only communicates a
+-- liveness edge to GHC's optimiser/RTS; IHC's host-backed ForeignPtr and
+-- IORef values are already retained by the Val graph while evaluated, so the
+-- runtime effect here is to return the state token unchanged.
+touchHashB :: IO Val
+touchHashB = pure $ VFun $ \aT -> pure $ VFun $ \sT -> do
+    _ <- force aT
+    force sT
+
 -- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> a
 -- Apply the function to the RealWorld token, run any bridged VIO layer,
 -- then extract and return the result component of the unboxed tuple.
@@ -2519,6 +2995,7 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
     case av of
         VInt n -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
+            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
             mkForeignPtrVal fp
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
 
@@ -2531,20 +3008,29 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
 -- bindings. See isBuiltinBackedModule comment. Remove once the perf fix
 -- lands on Scheduler discovery.
 --
--- A ByteString is represented at runtime as @VCon "BS" [VPrimObj (PrimForeignPtr fp), VInt len]@
--- — matches the shape that Data.ByteString.Internal.Type.BS would produce.
+-- A ByteString is represented at runtime as @VCon "BS" [ForeignPtr, length]@,
+-- matching Data.ByteString.Internal.Type.ByteString's real constructor.
 --------------------------------------------------------------------------------
 
--- | Build a fresh VCon "BS" with the given ForeignPtr and length.
+-- | Build a fresh bytestring value with the given ForeignPtr and length.
 mkBsVal :: ForeignPtr Word8 -> Int -> IO Val
 mkBsVal fp len = do
+    markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) len
     fpT  <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     lenT <- newWHNFThunk (VInt (fromIntegral len))
     pure (VCon "BS" [fpT, lenT])
 
--- | Unpack a 'VCon "BS"' into its '(ForeignPtr Word8, Int)' payload.
+-- | Unpack a bytestring into its '(ForeignPtr Word8, Int)' payload.
 bsValPayload :: Val -> IO (ForeignPtr Word8, Int)
 bsValPayload v = case v of
+    VCon "PS" [fpT, offT, lenT] -> do
+        fpv  <- force fpT
+        offv <- force offT
+        lenv <- force lenT
+        fp0  <- foreignPtrValToForeignPtr fpv
+        case (offv, lenv) of
+            (VInt off, VInt n) -> pure (plusForeignPtr fp0 (fromIntegral off), fromIntegral n)
+            _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
     VCon "BS" [fpT, lenT] -> do
         fpv  <- force fpT
         lenv <- force lenT
@@ -2552,12 +3038,118 @@ bsValPayload v = case v of
         case lenv of
             VInt n -> pure (fp, fromIntegral n)
             _      -> error ("BS.length: second field is not Int: " <> showValForDebug lenv)
-    _ -> error ("expected a ByteString, got: " <> showValForDebug v)
+    _ -> do
+        -- Optimistic OverloadedStrings bridge: without full typechecking,
+        -- string literals can reach ByteString operations as [Char]. Treat
+        -- those as Char8 bytes at the boundary where a ByteString payload is
+        -- demanded.
+        bs <- listValToBS v
+        fp <- mallocForeignPtrBytes (BS.length bs)
+        withForeignPtr fp $ \dst ->
+            BS.useAsCStringLen bs $ \(src, n) ->
+                copyBytes (castPtr dst) (castPtr src) n
+        markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
+        pure (fp, BS.length bs)
 
 bsEmptyB :: IO Val
 bsEmptyB = do
     fp <- mallocForeignPtrBytes 0
     mkBsVal fp 0
+
+bsPSConB :: IO Val
+bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
+    fpv <- force fpT
+    offv <- force offT
+    lenv <- force lenT
+    fp <- foreignPtrValToForeignPtr fpv
+    case (offv, lenv) of
+        (VInt off, VInt len) -> mkBsVal (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
+        _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
+
+{-# NOINLINE uniqueCounterRef #-}
+uniqueCounterRef :: IORef Int64
+uniqueCounterRef = unsafePerformIO (newIORef 0)
+
+newUniqueB :: IO Val
+newUniqueB = pure $ VIO $ do
+    n <- atomicModifyIORef' uniqueCounterRef $ \x ->
+        let x' = x + 1 in (x', x')
+    nT <- newWHNFThunk (VInt n)
+    pure (VCon "Unique" [nT])
+
+hashUniqueB :: IO Val
+hashUniqueB = pure $ VFun $ \uT -> do
+    uv <- force uT
+    case uv of
+        VCon "Unique" [nT] -> force nT
+        VInt n             -> pure (VInt n)
+        other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
+
+byteStringCreateLen :: String -> Val -> IO Int
+byteStringCreateLen label val =
+    case val of
+        VInt n -> pure (fromIntegral n)
+        other  -> error (label <> ": callback did not return Int: " <> showValForDebug other)
+
+bsCreateB :: IO Val
+bsCreateB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+    lenV <- force lenT
+    actionV <- force actionT
+    case lenV of
+        VInt n | n >= 0 -> do
+            fp <- mallocForeignPtrBytes (fromIntegral n)
+            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
+            withForeignPtr fp $ \ptr -> do
+                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
+                rv <- apply actionV ptrT
+                _ <- runIOVal rv
+                mkBsVal fp (fromIntegral n)
+        _ -> error ("create: not a non-negative Int: " <> showValForDebug lenV)
+
+bsCreateAndTrimB :: IO Val
+bsCreateAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+    maxLenV <- force maxLenT
+    actionV <- force actionT
+    case maxLenV of
+        VInt maxLen | maxLen >= 0 -> do
+            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
+            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
+            used <- withForeignPtr fp $ \ptr -> do
+                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
+                rv <- apply actionV ptrT
+                byteStringCreateLen "createAndTrim" =<< runIOVal rv
+            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
+        _ -> error ("createAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
+
+bsCreateFpB :: IO Val
+bsCreateFpB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+    lenV <- force lenT
+    actionV <- force actionT
+    case lenV of
+        VInt n | n >= 0 -> do
+            fp <- mallocForeignPtrBytes (fromIntegral n)
+            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
+            fpVal <- mkForeignPtrVal fp
+            fpT <- newWHNFThunk fpVal
+            rv <- apply actionV fpT
+            _ <- runIOVal rv
+            mkBsVal fp (fromIntegral n)
+        _ -> error ("createFp: not a non-negative Int: " <> showValForDebug lenV)
+
+bsCreateFpAndTrimB :: IO Val
+bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+    maxLenV <- force maxLenT
+    actionV <- force actionT
+    case maxLenV of
+        VInt maxLen | maxLen >= 0 -> do
+            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
+            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
+            fpVal <- mkForeignPtrVal fp
+            fpT <- newWHNFThunk fpVal
+            rv <- apply actionV fpT
+            used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
+            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
+        _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
 
 bsLengthShimB :: IO Val
 bsLengthShimB = pure $ VFun $ \a -> do
@@ -2797,7 +3389,9 @@ withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
     fpv <- force fpT; fv <- force fT
     fp <- foreignPtrValToForeignPtr fpv
+    markForeignPtrWord8 fp
     withForeignPtr fp $ \ptr -> do
+        markWord8Ptr (castPtr ptr)
         pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
         rv <- apply fv pT
         runIOVal rv
@@ -2827,6 +3421,19 @@ newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
     fp <- newForeignPtr_ (castPtr p)
     mkForeignPtrVal fp
 
+newForeignPtrB :: IO Val
+newForeignPtrB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
+    pv <- force pT
+    p <- ptrValToPtr pv
+    fp <- newForeignPtr_ (castPtr p)
+    mkForeignPtrVal fp
+
+addForeignPtrFinalizerB :: IO Val
+addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pure $ VIO $ do
+    fpv <- force fpT
+    _ <- foreignPtrValToForeignPtr fpv
+    pure VUnit
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: Storable ops on Ptr
 --------------------------------------------------------------------------------
@@ -2835,8 +3442,381 @@ peekB :: IO Val
 peekB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
     p <- ptrValToPtr av
-    w <- peek (p :: Ptr Word8)
-    pure (VInt (fromIntegral w))
+    isWord8 <- isMarkedWord8Ptr p
+    if isWord8
+        then do
+            w <- peek (p :: Ptr Word8)
+            pure (VInt (fromIntegral w))
+        else do
+            flags <- peekByteOff (castPtr p :: Ptr Word32) 0
+            family <- peekByteOff (castPtr p :: Ptr Word32) 4
+            socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
+            protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
+            if looksLikeAddrInfo flags family socktype protocol
+                then peekAddrInfoVal p flags family socktype protocol
+                else do
+                    ptrWord <- peek (castPtr p :: Ptr Word64)
+                    if ptrWord >= 4096
+                        then pure (VPrimObj (PrimPtr (wordPtrToPtr ptrWord)))
+                        else do
+                            w <- peek (p :: Ptr Word8)
+                            pure (VInt (fromIntegral w))
+
+looksLikeAddrInfo :: Word32 -> Word32 -> Word32 -> Word32 -> Bool
+looksLikeAddrInfo flags family socktype protocol =
+    flags <= 0x1fff
+    && family `elem` [0, 1, 2, 30]
+    && socktype <= 10
+    && protocol <= 255
+
+peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
+peekAddrInfoVal p flags family socktype protocol = do
+    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
+    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
+    familyT <- newWHNFThunk =<< oneFieldCon "Family" family
+    socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype
+    protocolT <- newWHNFThunk (VInt (fromIntegral protocol))
+    addrT <- newWHNFThunk =<< peekSockAddrVal (wordPtrToPtr addrPtrWord)
+    canonT <- newWHNFThunk =<< maybeCStringVal canonPtrWord
+    pure (VCon "AddrInfo" [flagsT, familyT, socktypeT, protocolT, addrT, canonT])
+
+addrInfoFlagsVal :: Word32 -> IO Val
+addrInfoFlagsVal flags =
+    valsToConsList
+        [ VCon name []
+        | (name, bit) <-
+            [ ("AI_ADDRCONFIG", 1024)
+            , ("AI_ALL", 256)
+            , ("AI_CANONNAME", 2)
+            , ("AI_NUMERICHOST", 4)
+            , ("AI_NUMERICSERV", 4096)
+            , ("AI_PASSIVE", 1)
+            , ("AI_V4MAPPED", 2048)
+            ]
+        , flags .&. bit /= 0
+        ]
+
+oneFieldCon :: Name -> Word32 -> IO Val
+oneFieldCon name n = do
+    t <- newWHNFThunk (VInt (fromIntegral n))
+    pure (VCon name [t])
+
+maybeCStringVal :: Word64 -> IO Val
+maybeCStringVal 0 = pure (VCon "Nothing" [])
+maybeCStringVal ptrWord = do
+    s <- peekCAString (wordPtrToPtr ptrWord)
+    strV <- stringToListValIO s
+    strT <- newWHNFThunk strV
+    pure (VCon "Just" [strT])
+
+peekSockAddrVal :: Ptr Word8 -> IO Val
+peekSockAddrVal p
+    | p == nullPtr = do
+        portT <- newWHNFThunk (VInt 0)
+        addrT <- newWHNFThunk (VInt 0)
+        pure (VCon "SockAddrInet" [portT, addrT])
+    | otherwise = do
+        family <- peekByteOff p 1 :: IO Word8
+        case family of
+            1 -> do
+                s <- peekCAString (castPtr (p `plusPtr` 2))
+                strV <- stringToListValIO s
+                strT <- newWHNFThunk strV
+                pure (VCon "SockAddrUnix" [strT])
+            2 -> do
+                port <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
+                addr <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
+                portT <- newWHNFThunk (VInt (fromIntegral port))
+                addrT <- newWHNFThunk (VInt (fromIntegral addr))
+                pure (VCon "SockAddrInet" [portT, addrT])
+            30 -> do
+                port <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
+                flow <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
+                a0 <- peekByteOff (castPtr p :: Ptr Word32) 8 :: IO Word32
+                a1 <- peekByteOff (castPtr p :: Ptr Word32) 12 :: IO Word32
+                a2 <- peekByteOff (castPtr p :: Ptr Word32) 16 :: IO Word32
+                a3 <- peekByteOff (castPtr p :: Ptr Word32) 20 :: IO Word32
+                scope <- peekByteOff (castPtr p :: Ptr Word32) 24 :: IO Word32
+                portT <- newWHNFThunk (VInt (fromIntegral port))
+                flowT <- newWHNFThunk (VInt (fromIntegral flow))
+                addrT <- newWHNFThunk =<< fourTupleVal (map (VInt . fromIntegral) [a0, a1, a2, a3])
+                scopeT <- newWHNFThunk (VInt (fromIntegral scope))
+                pure (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT])
+            _ -> do
+                portT <- newWHNFThunk (VInt 0)
+                addrT <- newWHNFThunk (VInt 0)
+                pure (VCon "SockAddrInet" [portT, addrT])
+
+fourTupleVal :: [Val] -> IO Val
+fourTupleVal [a, b, c, d] = do
+    aT <- newWHNFThunk a
+    bT <- newWHNFThunk b
+    cT <- newWHNFThunk c
+    dT <- newWHNFThunk d
+    pure (VCon "(,,,)" [aT, bT, cT, dT])
+fourTupleVal xs = error ("fourTupleVal: expected four fields, got " <> show (length xs))
+
+valsToConsList :: [Val] -> IO Val
+valsToConsList [] = pure (VCon "[]" [])
+valsToConsList (x:xs) = do
+    hT <- newWHNFThunk x
+    tV <- valsToConsList xs
+    tT <- newWHNFThunk tV
+    pure (VCon ":" [hT, tT])
+
+wordPtrToPtr :: Word64 -> Ptr a
+wordPtrToPtr w = castPtr (intPtrToPtr (fromIntegral w :: IntPtr))
+
+socketBindB :: IO Val
+socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
+    sockV <- force sockT
+    addrV <- force addrT
+    fd <- socketFdFromVal sockV
+    (sz, pokeAddr) <- sockAddrPoke addrV
+    allocaBytes sz $ \p -> do
+        fillBytes p 0 sz
+        pokeAddr (castPtr p)
+        rc <- c_bind_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
+        if rc == -1
+            then ioError (userError "Network.Socket.bind")
+            else pure VUnit
+
+socketCreateB :: IO Val
+socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $ \protocolT -> pure $ VIO $ do
+    family <- familyField familyT
+    stype <- socketTypeField stypeT
+    protocol <- intField "socket.protocol" protocolT
+    fd <- c_socket_host (fromIntegral family) (fromIntegral stype) (fromIntegral protocol)
+    if fd == -1
+        then ioError (userError "Network.Socket.socket")
+        else do
+            ref <- newIORef (VInt (fromIntegral fd))
+            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+            fdT <- newWHNFThunk (VInt (fromIntegral fd))
+            pure (VCon "Socket" [refT, fdT])
+
+socketSetOptionB :: IO Val
+socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ \valueT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    (level, opt) <- socketOptionField optT
+    value <- intField "setSocketOption.value" valueT
+    allocaBytes (sizeOf (undefined :: CInt)) $ \p -> do
+        poke (castPtr p :: Ptr CInt) (fromIntegral value)
+        rc <- c_setsockopt_host (fromIntegral fd) (fromIntegral level) (fromIntegral opt) (castPtr p) (fromIntegral (sizeOf (undefined :: CInt)))
+        if rc == -1
+            then ioError (userError "Network.Socket.setSocketOption")
+            else pure VUnit
+
+socketListenB :: IO Val
+socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    backlog <- intField "listen.backlog" backlogT
+    rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
+    if rc == -1
+        then ioError (userError "Network.Socket.listen")
+        else pure VUnit
+
+socketAcceptB :: IO Val
+socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    allocaBytes 128 $ \addrP ->
+      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
+        fillBytes addrP 0 128
+        poke (castPtr lenP :: Ptr CInt) 128
+        newFd <- c_accept_host (fromIntegral fd) (castPtr addrP) (castPtr lenP)
+        if newFd == -1
+            then ioError (userError "Network.Socket.accept")
+            else do
+                ref <- newIORef (VInt (fromIntegral newFd))
+                refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+                fdT <- newWHNFThunk (VInt (fromIntegral newFd))
+                sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdT])
+                addrV <- peekSockAddrVal (castPtr addrP)
+                addrT <- newWHNFThunk addrV
+                pure (VCon "(,)" [sockOutT, addrT])
+
+socketGetNameB :: IO Val
+socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    allocaBytes 128 $ \addrP ->
+      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
+        fillBytes addrP 0 128
+        poke (castPtr lenP :: Ptr CInt) 128
+        rc <- c_getsockname_host (fromIntegral fd) (castPtr addrP) (castPtr lenP)
+        if rc == -1
+            then ioError (userError "Network.Socket.getSocketName")
+            else peekSockAddrVal (castPtr addrP)
+
+socketFdFromVal :: Val -> IO Int64
+socketFdFromVal (VCon "Socket" [_refT, fdT]) = do
+    fdV <- force fdT
+    case fdV of
+        VInt fd -> pure fd
+        other   -> error ("Socket fd is not an Int: " <> showValForDebug other)
+socketFdFromVal other = error ("bind: not a Socket: " <> showValForDebug other)
+
+socketFdB :: IO Val
+socketFdB = pure $ VFun $ \sockT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    pure (VInt fd)
+
+socketSendBufB :: IO Val
+socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
+    sockV <- force sockT
+    ptrV <- force ptrT
+    lenV <- force lenT
+    fd <- socketFdFromVal sockV
+    ptr <- ptrValToPtr ptrV
+    case lenV of
+        VInt n | n >= 0 -> do
+            r <- c_send_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
+            if r < 0
+                then ioError (userError "Network.Socket.sendBuf")
+                else pure (VInt (fromIntegral r))
+        _ -> error ("sendBuf: not a non-negative Int: " <> showValForDebug lenV)
+
+socketRecvBufB :: IO Val
+socketRecvBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
+    sockV <- force sockT
+    ptrV <- force ptrT
+    lenV <- force lenT
+    fd <- socketFdFromVal sockV
+    ptr <- ptrValToPtr ptrV
+    case lenV of
+        VInt n | n > 0 -> do
+            r <- c_recv_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
+            if r < 0
+                then ioError (userError "Network.Socket.recvBuf")
+                else pure (VInt (fromIntegral r))
+        _ -> error ("recvBuf: not a positive Int: " <> showValForDebug lenV)
+
+mallocBytesB :: IO Val
+mallocBytesB = pure $ VFun $ \nT -> pure $ VIO $ do
+    n <- intField "mallocBytes.size" nT
+    p <- mallocBytes (max 1 (fromIntegral n))
+    pure (VPrimObj (PrimPtr (castPtr p)))
+
+freeB :: IO Val
+freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
+    ptrV <- force ptrT
+    p <- ptrValToPtr ptrV
+    free p
+    pure VUnit
+
+warpSettingsPortB :: IO Val
+warpSettingsPortB = settingsFieldB "settingsPort" 0
+
+warpSettingsHostB :: IO Val
+warpSettingsHostB = settingsFieldB "settingsHost" 1
+
+settingsFieldB :: String -> Int -> IO Val
+settingsFieldB label idx = pure $ VFun $ \settingsT -> do
+    settingsV <- force settingsT
+    case settingsV of
+        VCon "Settings" fields
+            | idx < length fields -> force (fields !! idx)
+        other -> error (label <> ": not Settings: " <> showValForDebug other)
+
+sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
+sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
+    port <- intField "SockAddrInet.port" portT
+    addr <- intField "SockAddrInet.addr" addrT
+    pure (16, \p -> do
+        pokeByteOff p 0 (16 :: Word8)
+        pokeByteOff p 1 (2 :: Word8)
+        pokeByteOff p 2 (fromIntegral port :: Word16)
+        pokeByteOff p 4 (fromIntegral addr :: Word32))
+sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
+    port <- intField "SockAddrInet6.port" portT
+    flow <- intField "SockAddrInet6.flow" flowT
+    scope <- intField "SockAddrInet6.scope" scopeT
+    (a0, a1, a2, a3) <- hostAddress6Fields addrT
+    pure (28, \p -> do
+        pokeByteOff p 0 (28 :: Word8)
+        pokeByteOff p 1 (30 :: Word8)
+        pokeByteOff p 2 (fromIntegral port :: Word16)
+        pokeByteOff p 4 (fromIntegral flow :: Word32)
+        pokeByteOff p 8 (fromIntegral a0 :: Word32)
+        pokeByteOff p 12 (fromIntegral a1 :: Word32)
+        pokeByteOff p 16 (fromIntegral a2 :: Word32)
+        pokeByteOff p 20 (fromIntegral a3 :: Word32)
+        pokeByteOff p 24 (fromIntegral scope :: Word32))
+sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug other)
+
+hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)
+hostAddress6Fields addrT = do
+    addrV <- force addrT
+    case addrV of
+        VCon "(,,,)" [aT, bT, cT, dT] -> do
+            a <- intField "HostAddress6.0" aT
+            b <- intField "HostAddress6.1" bT
+            c <- intField "HostAddress6.2" cT
+            d <- intField "HostAddress6.3" dT
+            pure (a, b, c, d)
+        other -> error ("bind: bad HostAddress6: " <> showValForDebug other)
+
+intField :: String -> Thunk -> IO Int64
+intField label t = do
+    v <- force t
+    case v of
+        VInt n -> pure n
+        other  -> error (label <> " is not an Int: " <> showValForDebug other)
+
+familyField :: Thunk -> IO Int64
+familyField t = do
+    v <- force t
+    case v of
+        VCon "Family" [nT] -> intField "socket.family" nT
+        VInt n             -> pure n
+        other              -> error ("socket.family: not a Family: " <> showValForDebug other)
+
+socketTypeField :: Thunk -> IO Int64
+socketTypeField t = do
+    v <- force t
+    case v of
+        VCon "SocketType" [nT] -> intField "socket.type" nT
+        VInt n                 -> pure n
+        other                  -> error ("socket.type: not a SocketType: " <> showValForDebug other)
+
+socketOptionField :: Thunk -> IO (Int64, Int64)
+socketOptionField t = do
+    v <- force t
+    case v of
+        VCon "SockOpt" [levelT, optT] -> do
+            level <- intField "socket.option.level" levelT
+            opt <- intField "socket.option.name" optT
+            pure (level, opt)
+        other -> error ("setSocketOption: not a SocketOption: " <> showValForDebug other)
+
+foreign import ccall unsafe "socket"
+    c_socket_host :: CInt -> CInt -> CInt -> IO CInt
+
+foreign import ccall unsafe "setsockopt"
+    c_setsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> CInt -> IO CInt
+
+foreign import ccall unsafe "listen"
+    c_listen_host :: CInt -> CInt -> IO CInt
+
+foreign import ccall unsafe "accept"
+    c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
+
+foreign import ccall unsafe "getsockname"
+    c_getsockname_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
+
+foreign import ccall unsafe "bind"
+    c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
+
+foreign import ccall unsafe "send"
+    c_send_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
+
+foreign import ccall unsafe "recv"
+    c_recv_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
@@ -2852,8 +3832,18 @@ peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     p <- ptrValToPtr av
     case bv of
         VInt off -> do
-            w <- peekByteOff (p :: Ptr Word8) (fromIntegral off)
-            pure (VInt (fromIntegral (w :: Word8)))
+            isWord8 <- isMarkedWord8Ptr p
+            if isWord8
+                then do
+                    w <- peekByteOff (p :: Ptr Word8) (fromIntegral off)
+                    pure (VInt (fromIntegral (w :: Word8)))
+                else if off == 24 || off == 32 || off == 40
+                then do
+                    ptrWord <- peekByteOff (castPtr p :: Ptr Word64) (fromIntegral off) :: IO Word64
+                    pure (VPrimObj (PrimPtr (castPtr (intPtrToPtr (fromIntegral ptrWord :: IntPtr)))))
+                else do
+                    w <- peekByteOff (p :: Ptr Word8) (fromIntegral off)
+                    pure (VInt (fromIntegral (w :: Word8)))
         _ -> error ("peekByteOff: bad args: " <> showValForDebug av)
 
 pokeByteOffB :: IO Val
@@ -2865,6 +3855,11 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
             case cv of
                 VInt n -> do
                     pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
+                    pure VUnit
+                _ | off == 24 || off == 32 || off == 40 -> do
+                    ptr <- ptrValToPtr cv
+                    pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)
+                        (fromIntegral (ptrToIntPtr (castPtr ptr)) :: Word64)
                     pure VUnit
                 _ -> error ("pokeByteOff: value not an Int: " <> showValForDebug cv)
         _ -> error ("pokeByteOff: bad args: " <> showValForDebug av)
@@ -2884,6 +3879,11 @@ newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
 
 newPinnedByteArrayB :: IO Val
 newPinnedByteArrayB = newByteArrayB
+
+newAlignedPinnedByteArrayB :: IO Val
+newAlignedPinnedByteArrayB = pure $ VFun $ \nT -> pure $ VFun $ \_alignT -> do
+    newPinned <- newPinnedByteArrayB
+    apply newPinned nT
 
 writeWord8ArrayB :: IO Val
 writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \stT -> pure $ VIO $ do
@@ -2939,6 +3939,114 @@ unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ 
             stT' <- newWHNFThunk stv
             pure (VCon "(#,#)" [stT', aT])
         _ -> error ("unsafeFreezeByteArray#: not a MutableByteArray: " <> showValForDebug av)
+
+--------------------------------------------------------------------------------
+-- Boxed Array#/MutableArray# family (backed by IORef [Thunk])
+--------------------------------------------------------------------------------
+
+newArrayHashB :: IO Val
+newArrayHashB = pure $ VFun $ \nT -> pure $ VFun $ \initT -> pure $ VFun $ \stT -> do
+    nv <- force nT
+    stv <- force stT
+    let n = case nv of
+            VInt i -> max 0 (fromIntegral i)
+            _      -> 0
+    ref <- newIORef (replicate n initT)
+    arrT <- newWHNFThunk (VPrimObj (PrimArray ref))
+    stT' <- newWHNFThunk stv
+    pure (VCon "(#,#)" [stT', arrT])
+
+writeArrayHashB :: IO Val
+writeArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \valT -> pure $ VFun $ \stT -> do
+    arrV <- force arrT
+    idxV <- force idxT
+    stv <- force stT
+    case (arrV, idxV) of
+        (VPrimObj (PrimArray ref), VInt idx) -> do
+            cells <- readIORef ref
+            let i = fromIntegral idx
+            if i < 0 || i >= length cells
+                then error ("writeArray#: index out of bounds: " <> show idx)
+                else do
+                    writeIORef ref (replaceAt i valT cells)
+                    pure stv
+        _ -> error "writeArray#: bad args"
+
+readArrayHashB :: IO Val
+readArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \stT -> do
+    arrV <- force arrT
+    idxV <- force idxT
+    stv <- force stT
+    case (arrV, idxV) of
+        (VPrimObj (PrimArray ref), VInt idx) -> do
+            cell <- readArrayCell ref idx "readArray#"
+            stT' <- newWHNFThunk stv
+            pure (VCon "(#,#)" [stT', cell])
+        _ -> error "readArray#: bad args"
+
+indexArrayHashB :: IO Val
+indexArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> do
+    arrV <- force arrT
+    idxV <- force idxT
+    case (arrV, idxV) of
+        (VPrimObj (PrimArray ref), VInt idx) -> do
+            cell <- readArrayCell ref idx "indexArray#"
+            pure (VCon "(##)" [cell])
+        _ -> error "indexArray#: bad args"
+
+unsafeFreezeArrayHashB :: IO Val
+unsafeFreezeArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \stT -> do
+    arrV <- force arrT
+    stv <- force stT
+    case arrV of
+        VPrimObj (PrimArray _) -> do
+            arrT' <- newWHNFThunk arrV
+            stT' <- newWHNFThunk stv
+            pure (VCon "(#,#)" [stT', arrT'])
+        _ -> error ("unsafeFreezeArray#: not a MutableArray#: " <> showValForDebug arrV)
+
+unsafeThawArrayHashB :: IO Val
+unsafeThawArrayHashB = unsafeFreezeArrayHashB
+
+sizeofArrayHashB :: IO Val
+sizeofArrayHashB = pure $ VFun $ \arrT -> do
+    arrV <- force arrT
+    case arrV of
+        VPrimObj (PrimArray ref) -> VInt . fromIntegral . length <$> readIORef ref
+        _ -> error ("sizeofArray#: not an Array#: " <> showValForDebug arrV)
+
+sizeofMutableArrayHashB :: IO Val
+sizeofMutableArrayHashB = sizeofArrayHashB
+
+readArrayCell :: IORef [Thunk] -> Int64 -> String -> IO Thunk
+readArrayCell ref idx label = do
+    cells <- readIORef ref
+    let i = fromIntegral idx
+    if i < 0 || i >= length cells
+        then error (label <> ": index out of bounds: " <> show idx)
+        else pure (cells !! i)
+
+replaceAt :: Int -> a -> [a] -> [a]
+replaceAt i x xs =
+    let (prefix, suffix) = splitAt i xs
+    in case suffix of
+        []       -> xs
+        (_:rest) -> prefix ++ x : rest
+
+byteArrayContentsB :: IO Val
+byteArrayContentsB = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VPrimObj (PrimByteArray ref) -> do
+            bs <- readIORef ref
+            p <- mallocBytes (max 1 (BS.length bs))
+            BS.useAsCStringLen bs $ \(src, len) ->
+                copyBytes (castPtr p) (castPtr src) len
+            pure (VPrimObj (PrimPtr p))
+        _ -> error ("byteArrayContents#: not a ByteArray: " <> showValForDebug av)
+
+mutableByteArrayContentsB :: IO Val
+mutableByteArrayContentsB = byteArrayContentsB
 
 getSizeofMutableByteArrayB :: IO Val
 getSizeofMutableByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
@@ -3584,15 +4692,28 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
     poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
     pure (VPrimObj (PrimPtr cp))
 
+withB :: IO Val
+withB = pure $ VFun $ \valT -> pure $ VFun $ \fT -> pure $ VIO $ do
+    valV <- force valT
+    fV <- force fT
+    p <- mallocBytes 8
+    fillBytes p 0 8
+    case valV of
+        VInt n -> poke (castPtr p :: Ptr CInt) (fromIntegral n)
+        _      -> pure ()
+    ptrT <- newWHNFThunk (VPrimObj (PrimPtr p))
+    r <- apply fV ptrT
+    runIOVal r
+
 sizeOfB :: IO Val
 sizeOfB = pure $ VFun $ \a -> do
-    _av <- force a
-    pure (VInt (fromIntegral (sizeOf (undefined :: Word8))))
+    let _ = a
+    pure (VInt 64)
 
 alignmentB :: IO Val
 alignmentB = pure $ VFun $ \a -> do
-    _av <- force a
-    pure (VInt 1)
+    let _ = a
+    pure (VInt 8)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: additional numeric / bit ops
@@ -3948,6 +5069,33 @@ myThreadIdB = pure $ VIO $ do
     tid <- myThreadId
     pure (VPrimObj (PrimThreadId tid))
 
+fromThreadIdB :: IO Val
+fromThreadIdB = pure $ VFun $ \tidT -> do
+    tidV <- force tidT
+    case tidV of
+        VPrimObj (PrimThreadId tid) ->
+            pure (VInt (fromIntegral (threadIdKey tid)))
+        other -> error ("fromThreadId: not a ThreadId: " <> showValForDebug other)
+  where
+    threadIdKey tid =
+        let s = show tid
+            step h c = h * 16777619 + fromIntegral (ord c)
+        in foldl step (2166136261 :: Word64) s
+
+myThreadIdHashB :: IO Val
+myThreadIdHashB = pure $ VFun $ \stT -> do
+    tid <- myThreadId
+    tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
+    pure (VCon "(#,#)" [stT, tidT])
+
+labelThreadB :: IO Val
+labelThreadB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
+    pure $ VIO $ pure VUnit
+
+labelThreadByteArrayHashB :: IO Val
+labelThreadByteArrayHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
+    pure $ VIO $ pure VUnit
+
 -- | @threadDelay microseconds@ - sleep.
 threadDelayB :: IO Val
 threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
@@ -3955,6 +5103,71 @@ threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
     case nv of
         VInt n -> do { threadDelay (fromIntegral n); pure VUnit }
         _ -> error ("threadDelay: not an Int: " <> showValForDebug nv)
+
+closeFdWithB :: IO Val
+closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do
+    CE.catch
+        (do
+            closeV <- force closeT
+            r <- apply closeV fdT
+            _ <- runIOVal r
+            pure VUnit)
+        (\(LoopException _) -> pure VUnit)
+
+getSystemEventManagerB :: IO Val
+getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
+
+getSystemTimerManagerB :: IO Val
+getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
+
+registerTimeoutB :: IO Val
+registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \_cbT -> pure $ VIO $ do
+    usecV <- force usecT
+    case usecV of
+        VInt _ -> do
+            n <- atomicModifyIORef' uniqueCounterRef $ \x ->
+                let x' = x + 1 in (x', x')
+            nT <- newWHNFThunk (VInt n)
+            pure (VCon "TK" [nT])
+        _ -> error ("registerTimeout: timeout is not an Int: " <> showValForDebug usecV)
+
+unregisterTimeoutB :: IO Val
+unregisterTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT ->
+    pure $ VIO $ pure VUnit
+
+updateTimeoutB :: IO Val
+updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \usecT ->
+    pure $ VIO $ do
+        usecV <- force usecT
+        case usecV of
+            VInt _ -> pure VUnit
+            _ -> error ("updateTimeout: timeout is not an Int: " <> showValForDebug usecV)
+
+timeManagerWithHandleB :: IO Val
+timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT -> pure $ VFun $ \actionT ->
+    pure $ VIO $ do
+        actionV <- force actionT
+        h <- emptyTimeManagerHandle
+        hT <- newWHNFThunk h
+        r <- apply actionV hT
+        runIOVal r
+  where
+    emptyTimeManagerHandle = do
+        timeoutT <- newWHNFThunk (VInt 0)
+        actionT <- newWHNFThunk (VIO (pure VUnit))
+        keyRefT <- newWHNFThunk VUnit
+        stateT <- newWHNFThunk VUnit
+        pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
+
+setFdOptionB :: IO Val
+setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
+    fdV <- force fdT
+    enabledV <- force enabledT
+    case fdV of
+        VInt fd -> do
+            PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
+            pure VUnit
+        _ -> error ("setFdOption: not an fd: " <> showValForDebug fdV)
 
 -- | @getNumCapabilities@ - return 1 (simplified).
 getNumCapabilitiesB :: IO Val
@@ -4470,20 +5683,25 @@ stripHelperApp = go
     go e = case e of
         -- errorCallWithCallStackException msg stk → msg
         EApp (EApp (EVar n) msg) _stk
-            | n == BC.pack "errorCallWithCallStackException" -> Just msg
+            | bare n == BC.pack "errorCallWithCallStackException" -> Just msg
         -- errorCallException msg  or  error msg
         EApp (EVar n) msg
-            | n == BC.pack "errorCallException" -> Just msg
-            | n == BC.pack "error"              -> Just msg
+            | bare n == BC.pack "errorCallException" -> Just msg
+            | bare n == BC.pack "error"              -> Just msg
         -- toException (ErrorCall msg)
         EApp (EVar n) inner
-            | n == BC.pack "toException" -> stripErrorCall inner
+            | bare n == BC.pack "toException" -> stripErrorCall inner
         _ -> Nothing
 
     stripErrorCall e = case e of
         EApp (EVar n) msg
-            | n == BC.pack "ErrorCall" -> Just msg
+            | bare n == BC.pack "ErrorCall" -> Just msg
         _ -> Nothing
+
+    bare n =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
 
 -- | @raiseDivZero# :: (# #) -> b@. GHC primop invoked by source-loaded
 -- numeric dispatch (e.g. @divZeroError = raise# divZeroException@ lives
@@ -4780,12 +5998,41 @@ fromExceptionB = pure $ VFun $ \eT -> do
 -- Source at @GHC.Internal.Base@: @unIO (IO a) = a@. At the Val level VIO
 -- hides the state-transformer shape, so we reconstruct it.
 unIOB :: IO Val
-unIOB = pure $ VFun $ \ioT -> pure $ VFun $ \_sT -> do
+unIOB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
     ioV <- force ioT
-    v   <- runIOVal ioV
-    sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
-    vT  <- newWHNFThunk v
-    pure (VCon "(#,#)" [sT', vT])
+    case ioV of
+        VCon "IO" [stateFnT] -> do
+            stateFn <- force stateFnT
+            apply stateFn sT
+        _ -> do
+            v   <- runIOVal ioV
+            sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+            vT  <- newWHNFThunk v
+            pure (VCon "(#,#)" [sT', vT])
+
+ioToSTB :: IO Val
+ioToSTB = pure $ VFun $ \ioT -> do
+    ioV <- force ioT
+    case ioV of
+        VCon "IO" [stateFnT] -> pure (VIO (runStateTransformer stateFnT))
+        _                   -> pure ioV
+
+stToIOB :: IO Val
+stToIOB = pure $ VFun $ \stT -> do
+    stV <- force stT
+    case stV of
+        VCon "ST" [stateFnT] -> pure (VIO (runStateTransformer stateFnT))
+        _                   -> pure stV
+
+runStateTransformer :: Thunk -> IO Val
+runStateTransformer stateFnT = do
+    stateFn <- force stateFnT
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    raw <- apply stateFn stT
+    res <- runIOVal raw
+    case res of
+        VCon "(#,#)" [_stateT, resultT] -> force resultT
+        _ -> pure res
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
@@ -4847,6 +6094,14 @@ mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
     av <- force aT
     mask_ (runIOVal av)
 
+allowInterruptB :: IO Val
+allowInterruptB = pure $ VIO $ pure VUnit
+
+interruptibleB :: IO Val
+interruptibleB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av <- force aT
+    runIOVal av
+
 maskB :: IO Val
 maskB = pure $ VFun $ \fT -> pure $ VIO $ do
     fv <- force fT
@@ -4864,6 +6119,23 @@ bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> 
     relV <- force relT
     useV <- force useT
     bracket
+        (runIOVal acqV)
+        (\res -> do
+            resT <- newWHNFThunk res
+            rv   <- apply relV resT
+            _    <- runIOVal rv
+            pure ())
+        (\res -> do
+            resT <- newWHNFThunk res
+            rv   <- apply useV resT
+            runIOVal rv)
+
+bracketOnErrorB :: IO Val
+bracketOnErrorB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
+    acqV <- force acqT
+    relV <- force relT
+    useV <- force useT
+    bracketOnError
         (runIOVal acqV)
         (\res -> do
             resT <- newWHNFThunk res

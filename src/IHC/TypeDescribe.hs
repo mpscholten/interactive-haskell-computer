@@ -47,6 +47,7 @@ describeType = go
     go (VPrimObj (PrimForeignPtr _)) = pure "ForeignPtr Word8"
     go (VPrimObj (PrimPtr _))        = pure "Ptr Word8"
     go (VPrimObj (PrimByteArray _))  = pure "ByteArray"
+    go (VPrimObj (PrimArray _))      = pure "Array# a"
     go (VPrimObj PrimRealWorld)      = pure "RealWorld#"
     go (VPrimObj (PrimMVar _))       = pure "MVar a"
     go (VPrimObj (PrimTVar _))       = pure "TVar a"

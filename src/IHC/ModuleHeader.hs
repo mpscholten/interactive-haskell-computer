@@ -238,45 +238,40 @@ parseExportList src cur0 = go [] cur0
                             _ -> go (ExportType n Nothing : acc) cur1
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
-            -- Parenthesised operator export: @(++)@, @(@?=@)@, etc.
+            -- Parenthesised operator export: @(++)@, @(!)@, @(@?=@), etc.
             -- Peek inside the parens to extract the operator name so
             -- that 'exportsName' can match it.  Only a single token is
             -- expected inside; anything more complex is skipped safely.
             TkLParen -> do
                 let (inner, cur2) = nextSigTok src cur1
-                case tkKind inner of
-                    -- Symbolic or built-in operator: extract its name.
-                    TkSymOp op -> do
+                case operatorTokenName (tkKind inner) of
+                    Just op -> do
                         -- Consume the closing paren if present.
                         let (close, cur3) = nextSigTok src cur2
                         case tkKind close of
                             TkRParen -> go (ExportName op : acc) cur3
                             _        -> go (ExportName op : acc) cur2
-                    TkColon -> do
-                        let (close, cur3) = nextSigTok src cur2
-                        case tkKind close of
-                            TkRParen -> go (ExportName ":" : acc) cur3
-                            _        -> go (ExportName ":" : acc) cur2
-                    -- '@'-prefixed operator: @?=, @=?, etc.
-                    -- '@' is TkAt (not isOpChar), so @?= is TkAt + TkSymOp "?=".
-                    -- Reconstruct the full operator name by prepending "@".
-                    TkAt -> do
-                        let (rest, cur3) = nextSigTok src cur2
-                        let fullOp = case tkKind rest of
-                                TkSymOp suf -> BC.pack "@" <> suf
-                                _           -> BC.pack "@"
-                        let curAfterOp = case tkKind rest of
-                                TkSymOp _ -> cur3
-                                _         -> cur2
-                        let (close, cur4) = nextSigTok src curAfterOp
-                        case tkKind close of
-                            TkRParen -> go (ExportName fullOp : acc) cur4
-                            _        -> go (ExportName fullOp : acc) curAfterOp
-                    -- Anything else (e.g. section or complex form): skip
-                    -- the whole group and continue.
-                    _ -> do
-                        curSkip <- skipToCloseParen src cur1 1
-                        go acc curSkip
+                    Nothing -> case tkKind inner of
+                        -- '@'-prefixed operator: @?=, @=?, etc.
+                        -- '@' is TkAt (not isOpChar), so @?= is TkAt + TkSymOp "?=".
+                        -- Reconstruct the full operator name by prepending "@".
+                        TkAt -> do
+                            let (rest, cur3) = nextSigTok src cur2
+                            let fullOp = case tkKind rest of
+                                    TkSymOp suf -> BC.pack "@" <> suf
+                                    _           -> BC.pack "@"
+                            let curAfterOp = case tkKind rest of
+                                    TkSymOp _ -> cur3
+                                    _         -> cur2
+                            let (close, cur4) = nextSigTok src curAfterOp
+                            case tkKind close of
+                                TkRParen -> go (ExportName fullOp : acc) cur4
+                                _        -> go (ExportName fullOp : acc) curAfterOp
+                        -- Anything else (e.g. section or complex form): skip
+                        -- the whole group and continue.
+                        _ -> do
+                            curSkip <- skipToCloseParen src cur1 1
+                            go acc curSkip
             _        -> pure (ExportList (reverse acc), cur)
 
     parseExportSubs s c0 = loop [] c0
@@ -415,39 +410,34 @@ parseImportList src cur0 = go [] cur0
                         -- Unknown — skip until we see TkRParen at depth 0.
                         curSkip <- skipToCloseParen src cur1 1
                         go acc curSkip
-            -- Operator import: `(++)`, `(.&.)`, `(@?=)`, etc.
+            -- Operator import: `(++)`, `(!)`, `(.&.)`, `(@?=)`, etc.
             -- Extract the operator name from the (op) group so that
             -- specAllows can match it during resolveImport.
             TkLParen -> do
                 let (inner, cur2) = nextSigTok src cur1
-                case tkKind inner of
-                    TkSymOp op -> do
+                case operatorTokenName (tkKind inner) of
+                    Just op -> do
                         let (close, cur3) = nextSigTok src cur2
                         let cur' = case tkKind close of
                                 TkRParen -> cur3
                                 _        -> cur2
                         go (op : acc) cur'
-                    TkColon -> do
-                        let (close, cur3) = nextSigTok src cur2
-                        let cur' = case tkKind close of
-                                TkRParen -> cur3
-                                _        -> cur2
-                        go (":" : acc) cur'
-                    -- '@'-prefixed operator: (@?=), (@=?), etc.
-                    TkAt -> do
-                        let (rest, cur3) = nextSigTok src cur2
-                        let (fullOp, curAfterOp) = case tkKind rest of
-                                TkSymOp suf -> (BC.pack "@" <> suf, cur3)
-                                _           -> (BC.pack "@", cur2)
-                        let (close, cur4) = nextSigTok src curAfterOp
-                        let cur' = case tkKind close of
-                                TkRParen -> cur4
-                                _        -> curAfterOp
-                        go (fullOp : acc) cur'
-                    -- Unknown/complex inner form: skip whole group.
-                    _ -> do
-                        curSkip <- skipToCloseParen src cur1 1
-                        go acc curSkip
+                    Nothing -> case tkKind inner of
+                        -- '@'-prefixed operator: (@?=), (@=?), etc.
+                        TkAt -> do
+                            let (rest, cur3) = nextSigTok src cur2
+                            let (fullOp, curAfterOp) = case tkKind rest of
+                                    TkSymOp suf -> (BC.pack "@" <> suf, cur3)
+                                    _           -> (BC.pack "@", cur2)
+                            let (close, cur4) = nextSigTok src curAfterOp
+                            let cur' = case tkKind close of
+                                    TkRParen -> cur4
+                                    _        -> curAfterOp
+                            go (fullOp : acc) cur'
+                        -- Unknown/complex inner form: skip whole group.
+                        _ -> do
+                            curSkip <- skipToCloseParen src cur1 1
+                            go acc curSkip
             _        -> pure (reverse acc, cur)
 
     -- After a name, check for a `(..)` or `(sub, sub)` tail, and skip it.
@@ -458,6 +448,27 @@ parseImportList src cur0 = go [] cur0
                 curClose <- skipToCloseParen src curP 1
                 go (n : acc) curClose
             _ -> go (n : acc) cur
+
+operatorTokenName :: TokenKind -> Maybe ByteString
+operatorTokenName = \case
+    TkPlus     -> Just (BC.pack "+")
+    TkPlusPlus -> Just (BC.pack "++")
+    TkMinus    -> Just (BC.pack "-")
+    TkStar     -> Just (BC.pack "*")
+    TkEqEq     -> Just (BC.pack "==")
+    TkNeq      -> Just (BC.pack "/=")
+    TkLt       -> Just (BC.pack "<")
+    TkLe       -> Just (BC.pack "<=")
+    TkGt       -> Just (BC.pack ">")
+    TkGe       -> Just (BC.pack ">=")
+    TkAnd      -> Just (BC.pack "&&")
+    TkOr       -> Just (BC.pack "||")
+    TkColon    -> Just (BC.pack ":")
+    TkDot      -> Just (BC.pack ".")
+    TkBang     -> Just (BC.pack "!")
+    TkDollar   -> Just (BC.pack "$")
+    TkSymOp n  -> Just n
+    _          -> Nothing
 
 -- | Fast-forward through a balanced paren group. @depth@ is already 1.
 skipToCloseParen :: Source -> Cursor -> Int -> IO Cursor

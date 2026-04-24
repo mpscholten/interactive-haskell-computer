@@ -38,7 +38,9 @@ module IHC.Scan
     , FunctorFieldRole(..)
     , FunctorCtor(..)
     , FunctorDerivDecl(..)
+    , SimpleDerivDecl(..)
     , scanFunctorDerivings
+    , scanSimpleDerivings
       -- * Instance declarations
     , InstanceDecl(..)
     , scanInstanceDecls
@@ -112,6 +114,23 @@ markCompiled :: KnownSymbols -> ByteString -> Ptr () -> IO ()
 markCompiled ref name ptr =
     modifyIORef' ref (\(m, c) -> (Map.insert name (Compiled ptr) m, c))
 
+patternKeyword :: ByteString
+patternKeyword = BC.pack "pattern"
+
+-- | Read the exported name from a top-level @pattern Name ...@ declaration.
+-- The lexer treats @pattern@ as a plain identifier, so the normal binding
+-- scanner would otherwise cache a binding named "pattern" and miss the real
+-- runtime name.  We only materialize the simple constructor/identifier form
+-- used by packages like @network@; actual pattern matching semantics are still
+-- handled later by the ordinary parser/evaluator pipeline.
+readPatternSynName :: Source -> Cursor -> Maybe (ByteString, Cursor)
+readPatternSynName src curAfterPattern =
+    let (nameTok, curAfterName) = nextToken src curAfterPattern
+    in case tkKind nameTok of
+        TkConId n  -> Just (n, curAfterName)
+        TkIdent n  -> Just (n, curAfterName)
+        _          -> Nothing
+
 -- | Scan the entire source file and return the names of all top-level
 -- value bindings (column-1 lowercase identifiers with an @=@ or guards).
 -- Type signatures, data declarations, and class/instance declarations are
@@ -126,6 +145,8 @@ scanAllTopLevelNames src = go [] startCursor
             TkEof     -> pure (reverse acc)
             TkNewline -> go acc cur'
             TkIdent name
+                | tkCol tok == 1 && name == patternKeyword ->
+                    handleTopPattern acc tok cur'
                 | tkCol tok == 1 -> do
                     -- Check if this is an infix binding: `arg \`op\` arg = ...`,
                     -- `arg @op arg = ...`, or `arg |> arg = ...`. If so, report
@@ -152,6 +173,20 @@ scanAllTopLevelNames src = go [] startCursor
             -- not value bindings and must not be reported as names.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
+    
+    handleTopPattern acc startTok cur =
+        case readPatternSynName src cur of
+            Nothing -> go acc cur
+            Just (patName, curAfterName) -> do
+                mClause <- scanOneClauseAfterName src curAfterName
+                case mClause of
+                    Nothing ->
+                        let eolPos = findLineEnd src (cPos cur)
+                            curLineEnd = Cursor eolPos (tkLine startTok) 1
+                        in go acc curLineEnd
+                    Just (_, curAfter) -> do
+                        let acc' = if patName `elem` acc then acc else patName : acc
+                        go acc' curAfter
 
 -- | Phase 2.13: find every top-level splice @$( ... )@ and return the
 -- byte span of the INNER expression (between the @(@ and matching @)@).
@@ -285,7 +320,9 @@ peekInfixOp src cur =
         -- (ident, paren-wrapped pattern, literal, etc.) — otherwise this is
         -- not an infix-op binding LHS.
         _ | Just opName <- tokenOpNameBS (tkKind t1)
-          , opName /= "-"    -- leading minus in `f (- 1) = ...` patterns etc.
+          , opName /= "-"
+          , opName /= "~"    -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
+                             -- leading minus in `f (- 1) = ...` patterns etc.
                              -- already never matches here since col-1 ident
                              -- already consumed; keeping the exception is a
                              -- no-op safeguard.
@@ -321,6 +358,7 @@ tokenOpNameBS = \case
     TkOr       -> Just (BC.pack "||")
     TkColon    -> Just (BC.pack ":")
     TkDot      -> Just (BC.pack ".")
+    TkBang     -> Just (BC.pack "!")
     TkDollar   -> Just (BC.pack "$")
     TkSymOp n  -> Just n
     _          -> Nothing
@@ -366,6 +404,8 @@ findBinding src ref target = do
                 pure Nothing
             TkNewline -> go acc cur'
             TkIdent name
+                | tkCol tok == 1 && name == patternKeyword ->
+                    handleTopPattern acc tok cur'
                 | tkCol tok == 1 -> handleTopIdent acc name tok cur'
                 | otherwise      -> go acc cur'
             -- Prefix-form operator binding: @(|>) x f = ...@
@@ -378,6 +418,26 @@ findBinding src ref target = do
             -- type synonym declarations so they are never mistaken for bindings.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
+
+    -- Found @pattern Name ...@ at column 1.  A type signature
+    -- (@pattern Name :: T@) has no clause and is skipped; the later value
+    -- equation (@pattern Name = rhs@ or @pattern Name x = rhs@) is cached under
+    -- @Name@ as an ordinary binding.
+    handleTopPattern acc startTok cur =
+        case readPatternSynName src cur of
+            Nothing -> skipBadBinding acc startTok cur
+            Just (patName, curAfterName) -> do
+                mClause <- scanOneClauseAfterName src curAfterName
+                case mClause of
+                    Nothing -> skipBadBinding acc startTok curAfterName
+                    Just (clause, curAfter) -> do
+                        let lhs  = BindingLhs [clause]
+                            acc' = Map.insert patName (SpanOnly lhs) acc
+                        if patName == target
+                            then do
+                                writeIORef ref (acc', curAfter)
+                                pure (Just lhs)
+                            else go acc' curAfter
 
     -- Found `(op) ...` at column 1. Scan this clause, then collect any
     -- follow-on clauses that refer to the same op — either in prefix
@@ -616,9 +676,21 @@ findBodyEndAtCol s minCol = scanBody
         Just 0x09 -> checkNext (q + 1) lastNl (col + 1)   -- treat tab as +1
         Just 0x0A -> checkNext (q + 1) q 1                -- blank line
         Just 0x0D -> checkNext (q + 1) q 1
+        Just 0x7B
+            | Just 0x2D <- peekByte s (q + 1)
+            , Just 0x23 <- peekByte s (q + 2)
+            -> scanBody (skipPragma (q + 3))
         Just _
             | col <= minCol -> lastNl                     -- sibling / top-level
             | otherwise     -> scanBody q                 -- deeper indent
+
+    skipPragma p = case peekByte s p of
+        Nothing -> p
+        Just 0x23
+            | Just 0x2D <- peekByte s (p + 1)
+            , Just 0x7D <- peekByte s (p + 2)
+            -> p + 3
+        Just _ -> skipPragma (p + 1)
 
 --------------------------------------------------------------------------------
 -- Phase 3.2 + 3.4: type family / type instance skip helper
@@ -1192,50 +1264,122 @@ scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
             TkForall -> do
                 curAfterDot <- skipForallBinders cur'
                 collectCtors tyName cIdx (dReg, fReg) curAfterDot
+            TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
+            TkLParen -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
+            TkLBracket -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
+            -- Constructors with MagicHash suffixes, e.g. lazy ST's
+            -- `data State s = S# (State# s)`, lex as TkPrimId rather
+            -- than TkConId. They are ordinary source constructors.
+            TkPrimId name | primIdStartsCon name -> do
+                let skipNls c0 =
+                        let (t, c1) = nextToken src c0
+                        in case tkKind t of
+                            TkNewline -> skipNls c1
+                            _         -> (t, c1)
+                    (peek, curAfterPeek) = skipNls cur'
+                (arity, fields, curN) <- case tkKind peek of
+                    TkLBrace ->
+                        collectRecordFields 0 [] curAfterPeek
+                    _ -> do
+                        (n, curN') <- countCtorFields 0 cur'
+                        pure (n, [], curN')
+                let dReg' = Map.insert name (tyName, arity, cIdx) dReg
+                    fReg' = foldr
+                        (\(fieldName, idx) acc ->
+                            Map.insertWith (++) fieldName [(name, idx)] acc)
+                        fReg
+                        fields
+                finishCtor dReg' fReg' curN
             TkConId name -> do
-                -- Check if this ConId is a class constraint (existential form).
-                -- If we eventually hit '=>' before any '|' or col-1, it was a
-                -- constraint context; skip it and restart collectCtors.
-                isConstraint <- checkIfConstraint cur'
-                if isConstraint
-                    then do
-                        -- Skip through the constraint(s) and '=>'.
-                        curAfterArrow <- skipConstraintContext cur'
-                        collectCtors tyName cIdx (dReg, fReg) curAfterArrow
-                    else do
-                        -- Peek ahead: if '{' follows (possibly after
-                        -- one or more newlines), it is record syntax.
-                        -- GHC allows:
-                        --   data T = C
-                        --       { f1 :: ... }
-                        -- so newlines between the ctor name and '{'
-                        -- must not prevent record-syntax detection.
-                        let skipNls c0 =
-                                let (t, c1) = nextToken src c0
-                                in case tkKind t of
-                                    TkNewline -> skipNls c1
-                                    _         -> (t, c1)
-                            (peek, curAfterPeek) = skipNls cur'
-                        (arity, fields, curN) <- case tkKind peek of
-                            TkLBrace ->
-                                collectRecordFields 0 [] curAfterPeek
-                            _ -> do
-                                (n, curN') <- countCtorFields 0 cur'
-                                pure (n, [], curN')
-                        let dReg' = Map.insert name (tyName, arity, cIdx) dReg
-                            fReg' = foldr
-                                (\(fieldName, idx) acc ->
-                                    Map.insertWith (++) fieldName [(name, idx)] acc)
-                                fReg
-                                fields
-                        -- After fields, check for '|' (more ctors) or decl end.
-                        let (sep, curSep) = nextToken src curN
-                        case tkKind sep of
-                            TkBar     -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
-                            TkNewline -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
-                            _         -> pure ((dReg', fReg'), curN)
+                mInfix <- tryInfixCtor tyName cIdx dReg tok cur'
+                case mInfix of
+                    Just (dReg', curN) -> finishCtor dReg' fReg curN
+                    Nothing -> do
+                        -- Check if this ConId is a class constraint (existential form).
+                        -- If we eventually hit '=>' before any '|' or col-1, it was a
+                        -- constraint context; skip it and restart collectCtors.
+                        isConstraint <- checkIfConstraint cur'
+                        if isConstraint
+                            then do
+                                -- Skip through the constraint(s) and '=>'.
+                                curAfterArrow <- skipConstraintContext cur'
+                                collectCtors tyName cIdx (dReg, fReg) curAfterArrow
+                            else do
+                                -- Peek ahead: if '{' follows (possibly after
+                                -- one or more newlines), it is record syntax.
+                                -- GHC allows:
+                                --   data T = C
+                                --       { f1 :: ... }
+                                -- so newlines between the ctor name and '{'
+                                -- must not prevent record-syntax detection.
+                                let skipNls c0 =
+                                        let (t, c1) = nextToken src c0
+                                        in case tkKind t of
+                                            TkNewline -> skipNls c1
+                                            _         -> (t, c1)
+                                    (peek, curAfterPeek) = skipNls cur'
+                                (arity, fields, curN) <- case tkKind peek of
+                                    TkLBrace ->
+                                        collectRecordFields 0 [] curAfterPeek
+                                    _ -> do
+                                        (n, curN') <- countCtorFields 0 cur'
+                                        pure (n, [], curN')
+                                let dReg' = Map.insert name (tyName, arity, cIdx) dReg
+                                    fReg' = foldr
+                                        (\(fieldName, idx) acc ->
+                                            Map.insertWith (++) fieldName [(name, idx)] acc)
+                                        fReg
+                                        fields
+                                finishCtor dReg' fReg' curN
             -- Missing constructor (malformed) or decl ended.
             _ -> pure ((dReg, fReg), cur)
+
+      where
+        primIdStartsCon bs =
+            case BC.uncons bs of
+                Just (c, _) -> c >= 'A' && c <= 'Z'
+                Nothing     -> False
+
+        finishCtor dReg' fReg' curN = do
+            let (sep, curSep) = nextToken src curN
+            case tkKind sep of
+                TkBar     -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
+                TkNewline -> collectCtors tyName (cIdx + 1) (dReg', fReg') curSep
+                _         -> pure ((dReg', fReg'), curN)
+
+        collectInfixCtor ty cIdx' regs tok0 curAfterTok = do
+            mInfix <- tryInfixCtor ty cIdx' (fst regs) tok0 curAfterTok
+            case mInfix of
+                Just (dReg', curN) -> finishCtor dReg' (snd regs) curN
+                Nothing            -> pure (regs, cur)
+
+    -- Handle infix data-constructor declarations such as:
+    --   data NonEmpty a = a :| [a]
+    -- A symbolic constructor starts with ':', and infix constructors are
+    -- always binary, so we skip exactly the left and right field atoms.
+    tryInfixCtor tyName cIdx dReg firstTok curAfterFirst = do
+        curAfterLhs <- skipCtorFieldAtom firstTok curAfterFirst
+        let (opTok, curAfterOp) = nextToken src curAfterLhs
+        case tkKind opTok of
+            TkSymOp op | isConSym op -> do
+                let (rhsTok, curAfterRhsTok) = nextToken src curAfterOp
+                curAfterRhs <- skipCtorFieldAtom rhsTok curAfterRhsTok
+                pure (Just (Map.insert op (tyName, 2, cIdx) dReg, curAfterRhs))
+            _ -> pure Nothing
+
+    isConSym op = not (BC.null op) && BC.head op == ':'
+
+    skipCtorFieldAtom tok curAfterTok =
+        case tkKind tok of
+            TkLParen -> skipToMatchingRParen 1 curAfterTok
+            TkLBracket -> skipToMatchingRBracket 1 curAfterTok
+            TkConId _ -> skipQualifiedTypeTail curAfterTok
+            TkIdent _ -> skipQualifiedTypeTail curAfterTok
+            TkPrimId _ -> skipQualifiedTypeTail curAfterTok
+            TkBang -> do
+                let (nextTok, curAfterNext) = nextToken src curAfterTok
+                skipCtorFieldAtom nextTok curAfterNext
+            _ -> pure curAfterTok
 
     -- Parse a record-syntax field list after the opening '{'.
     -- Returns (arity, [(fieldName, index)], cursorAfterClosingBrace).
@@ -1410,6 +1554,88 @@ data FunctorDerivDecl = FunctorDerivDecl
     { fdTyName :: !ByteString
     , fdCtors  :: ![FunctorCtor]
     } deriving (Eq, Show)
+
+-- | One data/newtype declaration with the classes mentioned in its deriving
+-- clause. Used for small stock-derived dictionaries whose implementation only
+-- needs constructor order, e.g. nullary Enum/Bounded.
+data SimpleDerivDecl = SimpleDerivDecl
+    { sdTyName  :: !ByteString
+    , sdClasses :: ![ByteString]
+    } deriving (Eq, Show)
+
+scanSimpleDerivings :: Source -> IO [SimpleDerivDecl]
+scanSimpleDerivings src = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkData    | tkCol tok == 1 -> handle acc cur'
+            TkNewtype | tkCol tok == 1 -> handle acc cur'
+            _ -> go acc cur'
+
+    handle acc cur0 =
+        case peekTypeName cur0 of
+            Nothing -> go acc cur0
+            Just tyName -> do
+                (classes, curAfter) <- findDeriving cur0
+                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded"]) classes
+                if null wanted
+                    then go acc curAfter
+                    else go (SimpleDerivDecl tyName wanted : acc) curAfter
+
+    peekTypeName cur0 = loop cur0
+      where
+        loop cur =
+            let (tok, cur') = nextToken src cur
+            in case tkKind tok of
+                TkEof     -> Nothing
+                TkConId n -> Just n
+                TkNewline -> loop cur'
+                TkLParen  -> loop (skipParensPure 1 cur')
+                _         -> loop cur'
+
+    findDeriving cur0 = loop cur0
+      where
+        loop cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof -> pure ([], cur')
+                TkDeriving -> do
+                    classes <- scanClasses cur'
+                    pure (classes, cur')
+                TkNewline -> loop cur'
+                _ | tkCol tok == 1 -> pure ([], cur)
+                _ -> loop cur'
+
+    scanClasses cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure []
+            TkIdent s | s == BC.pack "stock"
+                     || s == BC.pack "anyclass" -> scanClasses cur'
+            TkNewtype -> scanClasses cur'
+            TkLParen  -> collectClassList [] cur'
+            TkConId c -> pure [c]
+            _         -> pure []
+
+    collectClassList !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkRParen  -> pure (reverse acc)
+            TkConId c -> collectClassList (c : acc) cur'
+            _         -> collectClassList acc cur'
+
+    skipParensPure d cur
+        | d <= 0    = cur
+        | otherwise =
+            let (tok, cur') = nextToken src cur
+            in case tkKind tok of
+                TkEof    -> cur
+                TkLParen -> skipParensPure (d + 1) cur'
+                TkRParen -> skipParensPure (d - 1) cur'
+                _        -> skipParensPure d cur'
 
 -- | Scan the whole source for top-level @data@ / @newtype@ declarations
 -- that carry @deriving Functor@ (in any position of the deriving list,
@@ -1826,7 +2052,9 @@ scanInstanceDecls src = go [] startCursor
                 TkConId n ->
                     case mCls of
                         Nothing -> scanHead cur' (Just n) acc seenArrow
-                        Just _  -> scanHead cur' mCls (normalize n : acc) seenArrow
+                        Just _  -> do
+                            let (tag, curAfter) = qualifiedConHead n cur'
+                            scanHead curAfter mCls (normalize tag : acc) seenArrow
                 TkStr s | isJust mCls ->
                     -- DataKinds Symbol literal used as a type arg, e.g.
                     -- @instance SetField "name" ...@. Store the string
@@ -1850,10 +2078,10 @@ scanInstanceDecls src = go [] startCursor
                     -- skip.
                     scanHead cur' mCls acc seenArrow
                 TkLParen -> do
-                    curAfter <- skipParens 1 cur'
+                    (inner, curAfter) <- collectParens 1 [] cur'
                     let acc' = case mCls of
                             Nothing -> acc  -- still pre-class; ignore
-                            Just _  -> BC.pack "(,)" : acc
+                            Just _  -> maybe acc (: acc) (parenHeadTag inner)
                     scanHead curAfter mCls acc' seenArrow
                 TkLBracket -> do
                     curAfter <- skipBrackets 1 cur'
@@ -1878,6 +2106,65 @@ scanInstanceDecls src = go [] startCursor
                 TkRParen -> skipParens (d - 1) cur'
                 TkEof    -> pure cur'
                 _        -> skipParens d cur'
+
+    collectParens :: Int -> [TokenKind] -> Cursor -> IO ([TokenKind], Cursor)
+    collectParens !d !acc cur
+        | d <= 0    = pure (reverse acc, cur)
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLParen -> collectParens (d + 1) (TkLParen : acc) cur'
+                TkRParen
+                    | d == 1    -> pure (reverse acc, cur')
+                    | otherwise -> collectParens (d - 1) (TkRParen : acc) cur'
+                TkEof -> pure (reverse acc, cur')
+                k     -> collectParens d (k : acc) cur'
+
+    parenHeadTag :: [TokenKind] -> Maybe ByteString
+    parenHeadTag toks =
+        case topLevelCommaCount toks of
+            n | n > 0 -> Just (BC.pack ("(" <> replicate n ',' <> ")"))
+            _ -> case dropNoise toks of
+                (TkConId n : rest) -> Just (normalizeTyTag (qualifiedConHeadTokens n rest))
+                (TkIdent n : _)    -> Just (normalizeTyTag n)
+                _                  -> Nothing
+
+    qualifiedConHead :: ByteString -> Cursor -> (ByteString, Cursor)
+    qualifiedConHead first cur =
+        let (tok, cur') = nextToken src cur
+        in case tkKind tok of
+            TkDot ->
+                let (tok2, cur2) = nextToken src cur'
+                in case tkKind tok2 of
+                    TkConId n ->
+                        let (rest, cur3) = qualifiedConHead n cur2
+                        in (first <> BC.pack "." <> rest, cur3)
+                    _         -> (first, cur)
+            _ -> (first, cur)
+
+    qualifiedConHeadTokens :: ByteString -> [TokenKind] -> ByteString
+    qualifiedConHeadTokens first toks =
+        case toks of
+            (TkDot : TkConId n : rest) ->
+                first <> BC.pack "." <> qualifiedConHeadTokens n rest
+            _                          -> first
+
+    topLevelCommaCount :: [TokenKind] -> Int
+    topLevelCommaCount = go 0 0
+      where
+        go !_ !n [] = n
+        go !d !n (k:ks) = case k of
+            TkLParen   -> go (d + 1) n ks
+            TkLBracket -> go (d + 1) n ks
+            TkRParen   -> go (max 0 (d - 1)) n ks
+            TkRBracket -> go (max 0 (d - 1)) n ks
+            TkComma | d == 0 -> go d (n + 1) ks
+            _ -> go d n ks
+
+    dropNoise :: [TokenKind] -> [TokenKind]
+    dropNoise = filter (\case
+        TkNewline -> False
+        _         -> True)
 
     skipBrackets :: Int -> Cursor -> IO Cursor
     skipBrackets !d cur
@@ -2612,10 +2899,10 @@ parseForeignType src cur0 = do
                 splitArrows cur' [] (reverse groupAcc : groups)
             TkLParen -> do
                 (inner, cur'') <- consumeBalanced cur' 1 [tok]
-                splitArrows cur'' (inner ++ groupAcc) groups
+                splitArrows cur'' (reverse inner ++ groupAcc) groups
             TkLBracket -> do
                 (inner, cur'') <- consumeBalanced cur' 1 [tok]
-                splitArrows cur'' (inner ++ groupAcc) groups
+                splitArrows cur'' (reverse inner ++ groupAcc) groups
             -- Stop at unknown top-level tokens (e.g. '=', ',', ';') that
             -- can't be part of a type.
             TkEq    -> pure (pushIfNonEmpty (reverse groupAcc) groups, cur)
@@ -2647,13 +2934,13 @@ parseForeignType src cur0 = do
 
     -- Recognise @IO T@ as the tail marker.  Anything else is pure.
     tailToFFI :: [Token] -> Maybe (FFIType, Bool)
-    tailToFFI toks = case map tkKind (dropParens toks) of
-        (TkConId "IO" : rest) ->
-            case tokensToFFIFromKinds rest of
-                Just t  -> Just (t, True)
+    tailToFFI toks = case dropParens toks of
+        (t : rest) | tkKind t == TkConId "IO" ->
+            case tokensToFFI rest of
+                Just t' -> Just (t', True)
                 Nothing -> Just (FFIVoid, True)      -- @IO ()@ round-trip
-        _ -> do
-            t <- tokensToFFIFromKinds (map tkKind (dropParens toks))
+        toks' -> do
+            t <- tokensToFFI toks'
             Just (t, False)
 
     tokensToFFI :: [Token] -> Maybe FFIType
@@ -3092,13 +3379,13 @@ collectMoreSigNames src acc cur = do
 peekOperatorSig :: Source -> Cursor -> Maybe (ByteString, Cursor)
 peekOperatorSig src cur =
     let (tok, cur') = nextToken src cur in
-    case tkKind tok of
-        TkSymOp op ->
+    case tokenOpNameBS (tkKind tok) of
+        Just op ->
             let (tok2, cur2) = nextToken src cur' in
             case tkKind tok2 of
                 TkRParen -> Just (op, cur2)
                 _        -> Nothing
-        _ -> Nothing
+        Nothing -> Nothing
 
 -- | Walk a module's source, collecting every top-level type synonym
 -- declaration: @type Name v1 v2 … = RHS@.  Returns @(name, (arity,

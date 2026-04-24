@@ -203,22 +203,29 @@ resolveSymbol sym = do
     case Map.lookup sym cache of
         Just p  -> pure (Just p)
         Nothing -> do
-            mPtr <- findInLibs
+            mPtr <- findInLibs (symbolAlias sym)
             case mPtr of
-                Just p  -> do
-                    modifyIORef' symbolCache (Map.insert sym p)
-                    pure (Just p)
-                Nothing -> pure Nothing
+              Just p  -> do
+                  modifyIORef' symbolCache (Map.insert sym p)
+                  pure (Just p)
+              Nothing -> pure Nothing
   where
-    findInLibs = do
+    symbolAlias s =
+        Map.findWithDefault s s (Map.fromList
+            [ ("hsnet_getaddrinfo",  "getaddrinfo")
+            , ("hsnet_freeaddrinfo", "freeaddrinfo")
+            , ("hsnet_getnameinfo",  "getnameinfo")
+            ])
+
+    findInLibs lookupSym = do
         libs <- readIORef openLibs
-        tryEach (map snd libs ++ [DL.Default])
-    tryEach [] = pure Nothing
-    tryEach (h:hs) = do
-        r <- try' (DL.dlsym h (BC.unpack sym))
+        tryEach lookupSym (map snd libs ++ [DL.Default])
+    tryEach _ [] = pure Nothing
+    tryEach lookupSym (h:hs) = do
+        r <- try' (DL.dlsym h (BC.unpack lookupSym))
         case r of
             Right p | p /= nullFunPtr -> pure (Just p)
-            _                         -> tryEach hs
+            _                         -> tryEach lookupSym hs
 
     try' :: IO a -> IO (Either SomeException a)
     try' io = (Right <$> io) `catch` (pure . Left)
@@ -254,9 +261,17 @@ valToArg ty v = case ty of
     FFIVoid   -> throwIO (userError "IHC.FFI: void cannot appear as an argument")
     FFIPtr _      -> do p <- ptrFromVal v; pure (argPtr p)
     FFIFunPtr _   -> do p <- ptrFromVal v; pure (argPtr p)
-    FFICString    -> do
-        bs <- byteStringFromVal v
-        pure (argConstByteString bs)
+    FFICString    -> case v of
+        VPrimObj (PrimPtr _) -> do
+            p <- ptrFromVal v
+            pure (argPtr p)
+        VCon "Ptr" [_] -> do
+            p <- ptrFromVal v
+            pure (argPtr p)
+        VInt 0 -> pure (argPtr nullPtr)
+        _ -> do
+            bs <- byteStringFromVal v
+            pure (argConstByteString bs)
 
 asInt :: Val -> Int64
 asInt (VInt n)    = n
@@ -311,10 +326,6 @@ byteStringFromVal v = case v of
     -- Build the byte stream by walking the list.
     VCon "[]" _   -> pure BS.empty
     VCon ":" _    -> consListToBS v
-    -- A raw Ptr to an existing NUL-terminated C string — let libffi pass
-    -- it straight through via argPtr.  We do NOT copy out the bytes here;
-    -- the caller decided to hand us a pointer, so honour that.
-    VPrimObj (PrimPtr _) -> BS.empty <$ error "IHC.FFI: Ptr passed where CString expected — wrap with withCString manually"
     _ -> error ("IHC.FFI: expected String/CString, got " <> showValForDebug v)
   where
     consListToBS :: Val -> IO BS.ByteString

@@ -104,6 +104,7 @@ data PrimObj
     | PrimForeignPtr !(ForeignPtr Word8)
     | PrimPtr        !(Ptr Word8)
     | PrimByteArray  !(IORef ByteString)   -- mutable byte array backed by ByteString
+    | PrimArray      !(IORef [Thunk])       -- boxed Array#/MutableArray# cells
     | PrimRealWorld                        -- zero-size phantom token
     -- Phase 2.10a: concurrency primitives backed by host GHC RTS.
     | PrimMVar     !(MVar Val)
@@ -125,6 +126,7 @@ showValForDebug (VPrimObj (PrimHandle _))     = "<Handle>"
 showValForDebug (VPrimObj (PrimForeignPtr _)) = "<ForeignPtr>"
 showValForDebug (VPrimObj (PrimPtr _))        = "<Ptr>"
 showValForDebug (VPrimObj (PrimByteArray _))  = "<MutableByteArray>"
+showValForDebug (VPrimObj (PrimArray _))      = "<MutableArray#>"
 showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
 showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
@@ -144,7 +146,7 @@ type Thunk = IORef ThunkState
 data ThunkState
     = Unevaluated !Closure
     | Evaluated   !Val
-    | BlackHole                         -- entered, not yet returned
+    | BlackHole  !String                -- entered, not yet returned
     -- | Lazy-init for builtins: a host @IO Val@ action that produces the
     -- builtin's value on first force. Used by 'IHC.Builtins.builtinEnv'
     -- so startup doesn't pay the cost of materialising every primop,
@@ -211,7 +213,7 @@ lookupEnv = Map.lookup
 -- Runtime failures
 --------------------------------------------------------------------------------
 
-data LoopException = LoopException deriving Show
+data LoopException = LoopException String deriving Show
 instance Exception LoopException
 
 newtype PatternMatchFail = PatternMatchFail String deriving Show

@@ -184,7 +184,7 @@ typeRepListEq _ _ = pure False
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
-forceThunkState BlackHole = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 type MethodTable = Map ByteString Val
@@ -300,6 +300,7 @@ typeTagOf (VPrimObj (PrimHandle _))      = BC.pack "<Handle>"
 typeTagOf (VPrimObj (PrimForeignPtr _))  = BC.pack "<ForeignPtr>"
 typeTagOf (VPrimObj (PrimPtr _))         = BC.pack "<Ptr>"
 typeTagOf (VPrimObj (PrimByteArray _))   = BC.pack "<MutableByteArray>"
+typeTagOf (VPrimObj (PrimArray _))       = BC.pack "<MutableArray#>"
 typeTagOf (VPrimObj PrimRealWorld)       = BC.pack "<RealWorld#>"
 typeTagOf (VPrimObj (PrimMVar _))        = BC.pack "<MVar>"
 typeTagOf (VPrimObj (PrimTVar _))        = BC.pack "<TVar>"

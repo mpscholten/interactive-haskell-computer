@@ -84,6 +84,8 @@ defaultCppContext :: CppContext
 defaultCppContext = Map.fromList
     [ ("__GLASGOW_HASKELL__", MObj "910")
     , ("MIN_VERSION_base",    MFun ["ma","mi","pa"] "1")
+    , ("MIN_VERSION_network", MFun ["ma","mi","pa"] "1")
+    , ("MIN_VERSION_unix",    MFun ["ma","mi","pa"] "1")
     -- Architecture: we target macOS aarch64 (Apple Silicon).
     -- aarch64_HOST_ARCH is the GHC CPP convention for arm64 targets.
     -- __ARM_FEATURE_UNALIGNED reflects Apple Silicon's unaligned-access

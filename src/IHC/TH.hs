@@ -435,6 +435,7 @@ expandSplicesInExpr env ipm depth expr
         e' <- go e
         pure (ETyApp e' ty)
     go (ETypedMethod cls method tag) = pure (ETypedMethod cls method tag)
+    go EGuardFail = pure EGuardFail
 
     goAlt (Alt p e) = Alt p <$> go e
 
@@ -886,4 +887,3 @@ thDecToBinding dec = case dec of
             _ -> throwTH "LitP: unsupported literal"
     decodePat v =
         throwTH ("thDecToBinding: unsupported pattern " <> showValForDebug v)
-
