@@ -797,9 +797,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         case result of
             Right _ -> expectationFailure "expected a ParseError but the file succeeded"
             Left err -> do
-                -- displayException must format as  path:LINE:COL
+                -- displayException must format as  path:LINE:COL using
+                -- the absolute file line (not a span-relative line), so the
+                -- pointer in parse_error_position_XFAIL.hs lands on line 4
+                -- (`       in x`) where the parser expected `=`.
                 let msg = displayException err
-                msg `shouldSatisfy` (":2:" `isInfixOf`)
+                msg `shouldSatisfy` (":4:" `isInfixOf`)
                 msg `shouldSatisfy` ("parse error at" `isInfixOf`)
 
     --------------------------------------------------------------------
