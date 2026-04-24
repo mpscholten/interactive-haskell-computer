@@ -178,6 +178,14 @@ skipTrivia s = goSp
         Just _    -> goLineComment (bump c)
 
     -- | Pragma: skip until @#-}@ then loop back to goSp.
+    --
+    -- Every @{-# ... #-}@ pragma is consumed as whitespace; the lexer
+    -- never inspects its payload.  Pragmas IHC actually reacts to
+    -- (e.g. @NoImplicitPrelude@, @NoFieldSelectors@) are picked up by a
+    -- cheap substring probe over the raw source bytes in
+    -- "IHC.Scheduler".  @LANGUAGE Strict@ / @LANGUAGE StrictData@ are
+    -- intentionally no-ops — IHC is a lazy evaluator and does not
+    -- enforce strictness even for explicit bang-annotated patterns.
     goPragma c = case peekByte s (cPos c) of
         Nothing -> c
         Just 0x23                                  -- '#'
