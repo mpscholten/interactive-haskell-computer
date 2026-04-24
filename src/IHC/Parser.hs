@@ -843,9 +843,9 @@ parseExprNoSig ctx cur0 = do
 
 -- | After @::@ in an expression context, skip tokens until we reach a
 -- boundary that ends the enclosing expression. We stop at @,@, @;@,
--- @)@, @]@, @}@ at depth 0, at keyword @in@ (for let), at EOF, or at
--- a token whose column is <= @ctxMinCol@ (so do-block layout
--- boundaries terminate the annotation like
+-- @)@, @]@, @}@ at depth 0, at keywords @in@ / @of@ / @then@ / @else@,
+-- at EOF, or at a token whose column is <= @ctxMinCol@ (so do-block
+-- layout boundaries terminate the annotation like
 -- @let x = 5 :: Int\n    stmt@ → stop at @stmt@, not eat it).
 skipTypeToBinding :: Ctx -> Cursor -> IO Cursor
 skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
@@ -862,6 +862,9 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkRBracket | b == 0 && p == 0 && c == 0 -> pure cur
             TkRBrace | b == 0 && p == 0 && c == 0 -> pure cur
             TkComma | b == 0 && p == 0 && c == 0 -> pure cur
+            TkOf    | b == 0 && p == 0 && c == 0 -> pure cur   -- `case e :: T of …`
+            TkThen  | b == 0 && p == 0 && c == 0 -> pure cur
+            TkElse  | b == 0 && p == 0 && c == 0 -> pure cur
             TkSemi  | b == 0 && p == 0 && c == 0 -> pure cur
             TkIn    | b == 0 && p == 0 && c == 0 -> pure cur
             TkEq    | b == 0 && p == 0 && c == 0 -> pure cur
@@ -1066,6 +1069,15 @@ parseDo ctx cur0 = do
             -- where `where` sits at the same indentation level as the stmts.
             TkWhere | tkCol nextTok == stmtCol -> pure (reverse acc', cur')
             TkIn    | tkCol nextTok == stmtCol -> pure (reverse acc', cur')
+            -- Closing brackets at the enclosing stmt column end the
+            -- do-block layout (they belong to the surrounding
+            -- expression, not the do).  This mirrors how a
+            -- @(\x -> do { stmt1\n    stmt2\n}) arg@ ends the do at
+            -- the @}@ even when the brace sits at the stmt column.
+            TkRParen   -> pure (reverse acc', cur')
+            TkRBracket -> pure (reverse acc', cur')
+            TkRBrace   -> pure (reverse acc', cur')
+            TkComma    -> pure (reverse acc', cur')
             _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' acc'
               | otherwise                -> pure (reverse acc', cur')
 
@@ -1814,10 +1826,20 @@ parseImplicitLet ctx cur0 = do
     layoutIPBinds bindCol cur acc = do
         (item, cur') <- parseOneIPBind bindCol cur
         let acc' = item : acc
-            (peek, _) = nextSig ctx cur'
+            (peek, curAfterPeek) = nextSig ctx cur'
         case tkKind peek of
-            TkIn  -> pure (reverse acc', cur')
-            TkEof -> pure (reverse acc', cur')
+            TkIn   -> pure (reverse acc', cur')
+            TkEof  -> pure (reverse acc', cur')
+            -- @let ?x = e ;@ with a stray explicit `;` separator before
+            -- `in` (as in @let ?ctx = frozen; in body@) — eat the `;`
+            -- and stop if @in@ follows immediately, otherwise continue
+            -- (another `?ref` binding may follow).
+            TkSemi ->
+                let (after, _) = nextSig ctx curAfterPeek in
+                case tkKind after of
+                    TkIn  -> pure (reverse acc', curAfterPeek)
+                    TkEof -> pure (reverse acc', curAfterPeek)
+                    _     -> layoutIPBinds bindCol curAfterPeek acc'
             TkImplicitRef _ | tkCol peek == bindCol ->
                 layoutIPBinds bindCol cur' acc'
             _ -> pure (reverse acc', cur')
@@ -1832,7 +1854,11 @@ parseImplicitLet ctx cur0 = do
 
 parseCase :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseCase ctx cur0 = do
-    (scrut, curS) <- parseApp ctx cur0
+    -- Full expression as scrutinee so @case x $ y of …@ and
+    -- @case (e :: T) of …@ with bare @e :: T@ work.  parseExpr's
+    -- trailing-sig pass consumes the optional @:: T@ as ETyApp
+    -- metadata and stops at the @of@ keyword.
+    (scrut, curS) <- parseExpr ctx cur0
     let (ofTok, curO) = nextSig ctx curS
     case tkKind ofTok of
         TkOf -> pure ()
@@ -1844,15 +1870,18 @@ parseCase ctx cur0 = do
     pure (buildCaseExpr scrut alts, curEnd)
 
 -- | An alt body captured from parsing — either a plain @-> expr@ or a
--- list of guard clauses @| g1 -> e1 | g2 -> e2 …@.  Both forms may then
--- be wrapped in an optional where-clause that's already folded in.
+-- list of guard clauses @| g1 -> e1 | g2 -> e2 …@ where each @g@ is a
+-- comma-separated list of 'Guard' (bool or pattern @p <- expr@).  Both
+-- forms may be wrapped in a where-clause that's already folded in.
 data AltBody
     = AltBodyExpr !Expr
-    | AltBodyGuards ![(Expr, Expr)]
+    | AltBodyGuards ![([Guard], Expr)]
 
 -- | Assemble a case expression from its scrutinee and parsed alts,
 -- desugaring any guarded alts so a failed guard falls through to the
 -- next alt.  Fast path: if no alt has guards, emit a plain 'ECase'.
+-- Guarded alts reuse the shared 'guardChain'/'guardStep' desugaring
+-- already used by top-level function-clause guards.
 buildCaseExpr :: Expr -> [(Pat, AltBody)] -> Expr
 buildCaseExpr scrut alts
     | all (isPlain . snd) alts =
@@ -1867,7 +1896,9 @@ buildCaseExpr scrut alts
             go (i, (pat, altBody)) tailE =
                 let kName = BC.pack "$casek" <> BC.pack (show (i :: Int))
                     kVar  = EVar kName
-                    body  = guardsAsIfElse altBody kVar
+                    body  = case altBody of
+                        AltBodyExpr e       -> e
+                        AltBodyGuards gs    -> guardChain gs kVar
                 in ELet [(kName, tailE)]
                         (ECase scrutE
                             [ Alt pat body
@@ -1878,11 +1909,6 @@ buildCaseExpr scrut alts
   where
     isPlain (AltBodyExpr _) = True
     isPlain _               = False
-
-    guardsAsIfElse (AltBodyExpr e)         _           = e
-    guardsAsIfElse (AltBodyGuards [])      fallthrough = fallthrough
-    guardsAsIfElse (AltBodyGuards ((g, e):gs)) fallthrough =
-        EIf g e (guardsAsIfElse (AltBodyGuards gs) fallthrough)
 
 bracedAlts :: Ctx -> Cursor -> [(Pat, AltBody)] -> IO ([(Pat, AltBody)], Cursor)
 bracedAlts ctx cur acc = do
@@ -1897,9 +1923,14 @@ layoutAlts :: Ctx -> Int -> Cursor -> [(Pat, AltBody)] -> IO ([(Pat, AltBody)], 
 layoutAlts ctx altCol cur acc = do
     let altCtx = ctx { ctxMinCol = altCol }
     (alt, cur') <- parseAlt ctx altCtx cur
-    let (nextTok, _) = nextSig ctx cur'
+    let (nextTok, curAfterSep) = nextSig ctx cur'
     case tkKind nextTok of
         TkEof -> pure (reverse (alt : acc), cur')
+        -- Explicit @;@ separator between alts (Haskell 2010 §2.7):
+        -- @case x of p1 -> e1; p2 -> e2@ is valid without braces.
+        -- IHP's inline @\b -> case …readInt b of Just (n, "") -> …;
+        -- _ -> Nothing@ form relies on this.
+        TkSemi -> layoutAlts ctx altCol curAfterSep (alt : acc)
         _ | tkCol nextTok == altCol ->
               layoutAlts ctx altCol cur' (alt : acc)
           | otherwise ->
@@ -1918,7 +1949,9 @@ parseAlt ctx altCtx cur = do
             (e, curE) <- parseExpr altCtx cur2
             pure (AltBodyExpr e, curE)
         TkBar -> do
-            (branches, curE) <- parseCaseGuardBranches altCtx cur1 []
+            -- sepTok consumed the leading `|`; parseAltGuardBranches
+            -- starts reading the guard list directly.
+            (branches, curE) <- parseAltGuardBranches altCtx cur2 []
             pure (AltBodyGuards branches, curE)
         _    -> parseErr ctx "expected `->` in case alternative" sepTok
     -- Optional @where@ clause attached to this case alternative.
@@ -1940,32 +1973,9 @@ parseAlt ctx altCtx cur = do
     wrapAltBodyLet bs (AltBodyGuards gs)      =
         AltBodyGuards [(g, ELet bs e) | (g, e) <- gs]
 
--- | Parse @| guard -> expr [| guard -> expr …]@ after a case-alt
--- pattern.  @curBefore@ points AT the first @|@ (not past it) so the
--- loop can consume it uniformly.  Stops when the next token is not @|@
--- at a column consistent with the guards' starting column.
-parseCaseGuardBranches
-    :: Ctx -> Cursor -> [(Expr, Expr)] -> IO ([(Expr, Expr)], Cursor)
-parseCaseGuardBranches ctx cur acc = do
-    let (barTok, curAfterBar) = nextSig ctx cur
-    case tkKind barTok of
-        TkBar -> do
-            (g, curG)  <- parseExpr ctx curAfterBar
-            let (arrTok, curA) = nextSig ctx curG
-            case tkKind arrTok of
-                TkArrow -> pure ()
-                _       -> parseErr ctx "expected `->` after case guard" arrTok
-            (e, curE) <- parseExpr ctx curA
-            let acc' = (g, e) : acc
-            -- Peek: is there another `|` continuation?  If so, the
-            -- token column must be >= the enclosing alt's min column.
-            let (peek, _) = nextSig ctx curE
-            case tkKind peek of
-                TkBar | tkCol peek > ctxMinCol ctx ->
-                    parseCaseGuardBranches ctx curE acc'
-                _ -> pure (reverse acc', curE)
-        _ -> pure (reverse acc, cur)
-
+-- | Parse @| guard -> expr [| guard -> expr …]@ branches after a
+-- case-alt pattern.  Each @guard@ is a comma-separated list of bool
+-- guards or pattern guards (@p <- expr@); delegated to 'parseGuardList'.
 parseAltGuardBranches :: Ctx -> Cursor -> [([Guard], Expr)] -> IO ([([Guard], Expr)], Cursor)
 parseAltGuardBranches ctx cur acc = do
     (gs, cur1) <- parseGuardList ctx cur
@@ -2289,7 +2299,12 @@ parseListPat ctx cur = do
     case tkKind tok of
         TkRBracket -> pure (PCon "[]" [], cur1)
         _ -> do
-            (first, cur2) <- parseSubPat ctx cur
+            -- Use parseTopPatNoCons so constructor-applied list elements
+            -- like @[PG.Only result]@ parse as @PCon "PG.Only" [result]@
+            -- instead of stopping at the bare @PG.Only@.  We skip the
+            -- infix `:` tail that 'parseTopPat' would append — list
+            -- literals don't nest `:` between commas.
+            (first, cur2) <- parseTopPatNoCons ctx cur
             gatherListPat ctx [first] cur2
 
 gatherListPat :: Ctx -> [Pat] -> Cursor -> IO (Pat, Cursor)
@@ -2297,7 +2312,7 @@ gatherListPat ctx acc cur = do
     let (tok, cur1) = nextSig ctx cur
     case tkKind tok of
         TkComma -> do
-            (p, cur2) <- parseSubPat ctx cur1
+            (p, cur2) <- parseTopPatNoCons ctx cur1
             gatherListPat ctx (p : acc) cur2
         TkRBracket ->
             let build []     = PCon "[]" []
@@ -2444,13 +2459,23 @@ parseBinOp ctx minBp cur0 = do
 -- For backticks, name is the bare function name; for symbolic ops, the
 -- bytes of the operator.
 --
--- The `ctxMinCol` check is conservative: we still require operator
--- continuation at the same indentation level or deeper, otherwise the
--- operator belongs to the outer construct.
+-- The @ctxMinCol@ check: operators strictly BEFORE the enclosing layout
+-- column belong to the outer construct.  Operators at or deeper than
+-- the layout column continue the current expression — in particular a
+-- @|>@ pipeline formatted as
+--
+-- > do
+-- >   x
+-- >   |> f
+-- >   |> g
+--
+-- starts each @|>@ at the statement column, and Haskell treats those as
+-- continuation of the preceding expression (even though @|>@ sits at
+-- the same column as a fresh statement would).
 peekOp :: Ctx -> Cursor -> Maybe (Name, Assoc, Int, Cursor)
 peekOp ctx cur =
     let (tok, cur') = nextSig ctx cur in
-    if ctxMinCol ctx > 0 && tkCol tok <= ctxMinCol ctx
+    if ctxMinCol ctx > 0 && tkCol tok < ctxMinCol ctx
         then Nothing
         else case tkKind tok of
             TkBacktick ->
@@ -2577,10 +2602,37 @@ parseApp ctx cur0 = do
             TkLBrace | isRecordUpdateBrace ctx cur' -> do
                     (fields, curEnd) <- parseRecordUpdateFields ctx cur' []
                     loop (ERecordUpdate fn fields) curEnd
+            -- BlockArguments (IHP default-extension): @do@, @case@,
+            -- @let … in …@, @if … then … else …@, and lambdas can
+            -- serve as function arguments without parens.  We consume
+            -- one of these block-forms as a single atom argument.
+            -- Column gate still applies so a `do` on a less-indented
+            -- line doesn't get stolen from the enclosing construct.
+            _ | isBlockArgStart (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
+                    (arg, curA) <- parseBlockArg ctx cur
+                    loop (EApp fn arg) curA
             _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseAtomPostfix ctx cur
                     loop (EApp fn arg) curA
               | otherwise -> pure (fn, cur)
+
+    isBlockArgStart k = case k of
+        TkDo        -> True
+        TkCase      -> True
+        TkIf        -> True
+        TkLet       -> True
+        TkBackslash -> True
+        _           -> False
+
+    parseBlockArg c cur = do
+        let (tok, cur1) = nextSig c cur
+        case tkKind tok of
+            TkDo        -> parseDo     c cur1
+            TkCase      -> parseCase   c cur1
+            TkIf        -> parseIf     c cur1
+            TkLet       -> parseLet    c cur1
+            TkBackslash -> parseLambda c cur1
+            _           -> parseAtomPostfix c cur
 
 -- | Parse an atom plus postfix forms that bind tighter than function
 -- application. In particular, @f x{a=b}@ must parse as @f (x{a=b})@,
@@ -2812,6 +2864,20 @@ parseAtom ctx cur0 = do
         TkOQuoteT  -> skipQuoteBody ctx cur1 TkCQuote
         TkOQuoteP  -> skipQuoteBody ctx cur1 TkCQuote
         TkOQuoteTy -> skipQuoteBody ctx cur1 TkCQuoteTy
+        -- [name| ... |] — QuasiQuoter.  Without real TH QQ expansion we
+        -- scan the body as opaque bytes (tracking brace/paren/bracket
+        -- depth so nested @[foo|...|]@ work) up to the closing @|]@
+        -- and emit a placeholder @error "unexpanded QQ: name"@.  This
+        -- keeps parsing moving past HSX/interpolate/etc. blocks so the
+        -- surrounding module loads; if the placeholder is ever forced
+        -- at runtime the error message points at the missing expansion.
+        TkQQOpen qqName -> do
+            curEnd <- skipQQBody ctx cur1
+            let placeholder =
+                    EApp (EVar "error")
+                         (stringToConsList
+                             ("unexpanded QuasiQuoter [" ++ BC.unpack qqName ++ "|…|]"))
+            pure (placeholder, curEnd)
         TkEof -> parseErr ctx "unexpected end of input" tok
         _ -> parseErr ctx "unexpected token" tok
   where
@@ -3378,10 +3444,12 @@ parseQual ctx cur0 = do
     let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
         TkLet -> do
-            -- For now, @let@ qualifiers are rare; fall through to
-            -- treating the rest of the line as a guard expression.
-            (e, curE) <- parseExpr ctx cur0
-            pure (QGuard e, curE)
+            -- @let@ qualifier inside a list comprehension: collect all
+            -- same-column name-bindings and stop at the enclosing `,`
+            -- or `]` of the comprehension.  No `in` keyword follows —
+            -- that's the key difference from a normal `let … in …`.
+            (binds, curE) <- parseLetQualBinds ctx cur1
+            pure (QLet binds, curE)
         _ -> do
             -- Try pattern <- expr first; else treat as guard.
             mGen <- tryGen ctx cur0
@@ -3390,6 +3458,48 @@ parseQual ctx cur0 = do
                 Nothing -> do
                     (e, curE) <- parseExpr ctx cur0
                     pure (QGuard e, curE)
+
+-- | Parse the bindings of a @let@ qualifier inside a list
+-- comprehension.  Bindings are collected by layout: the first binding
+-- establishes a column, each additional binding at that column is
+-- accumulated, and the loop ends at `,`/`]` (the enclosing list-comp
+-- separators) or EOF.  RHS expressions use @ctxMinCol = bindCol@ so
+-- the expression parser stops at a same-column sibling binding.
+parseLetQualBinds :: Ctx -> Cursor -> IO ([Bind], Cursor)
+parseLetQualBinds ctx cur0 = do
+    let (firstTok, _) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkEof      -> pure ([], cur0)
+        TkComma    -> pure ([], cur0)
+        TkRBracket -> pure ([], cur0)
+        _ -> do
+            let bindCol = tkCol firstTok
+            loop bindCol cur0 []
+  where
+    loop bindCol cur acc = do
+        (bind, cur') <- parseOneQualBind bindCol cur
+        let acc' = bind : acc
+            (peek, _) = nextSig ctx cur'
+        case tkKind peek of
+            TkComma    -> pure (reverse acc', cur')
+            TkRBracket -> pure (reverse acc', cur')
+            TkEof      -> pure (reverse acc', cur')
+            _ | tkCol peek == bindCol -> loop bindCol cur' acc'
+              | otherwise             -> pure (reverse acc', cur')
+
+    parseOneQualBind bindCol cur = do
+        let (nameTok, cur1) = nextSig ctx cur
+            rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
+        case tkKind nameTok of
+            TkIdent n -> do
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (sepTok, cur3) = nextSig ctx cur2
+                case tkKind sepTok of
+                    TkEq -> do
+                        (e, cur4) <- parseExpr rhsCtx cur3
+                        pure ((n, wrapParams params e), cur4)
+                    _ -> parseErr ctx "expected `=` in list-comp let-binding" sepTok
+            _ -> parseErr ctx "expected identifier in list-comp let-binding" nameTok
 
 -- | Try to parse @pat <- expr@.  Returns Nothing if the input doesn't
 -- match (we'll then fall back to parsing it as a guard expression).
@@ -3434,6 +3544,67 @@ skipQuoteBody ctx cur0 closeTk = go cur0 (0 :: Int)
             TkLBrace   -> go cur' (depth + 1)
             TkRBrace   -> go cur' (max 0 (depth - 1))
             _          -> go cur' depth
+
+-- | Skip past the body of a QuasiQuoter @[name|…|]@ at the BYTE level
+-- (rather than the token level) because QQ bodies can contain
+-- arbitrary characters (HTML in HSX, SQL, interpolated text) that do
+-- not tokenise cleanly as Haskell.  Tracks nesting of inner
+-- @[name|…|]@ forms so nested HSX fragments work.  Returns the cursor
+-- just past the matching @|]@.
+skipQQBody :: Ctx -> Cursor -> IO Cursor
+skipQQBody ctx cur0 = pure (go cur0 (1 :: Int))
+  where
+    src = ctxSrc ctx
+
+    -- Walk forward one byte, bumping line/col.
+    step1 c = case peekByte src (cPos c) of
+        Just 0x0A -> Cursor (cPos c + 1) (cLine c + 1) 1
+        _         -> Cursor (cPos c + 1) (cLine c)     (cCol c + 1)
+
+    -- Walk forward by N bytes (no newlines expected in the N chars).
+    stepN n c = Cursor (cPos c + n) (cLine c) (cCol c + n)
+
+    -- @depth@ counts open QQs we've entered but not closed.  Start at 1
+    -- because the caller has just consumed the @[name|@ opener.
+    go c !depth
+        | depth == 0                      = c
+        | otherwise = case peekByte src (cPos c) of
+            Nothing -> c   -- EOF: bail, parser will error downstream if needed
+            -- @|]@ closes one QQ layer.
+            Just 0x7C | peekByte src (cPos c + 1) == Just 0x5D ->
+                go (stepN 2 c) (depth - 1)
+            -- @[name|@ opens a nested QQ.
+            Just 0x5B ->
+                case matchNestedQQ (cPos c + 1) of
+                    Just endPos ->
+                        go (stepN (endPos - cPos c) c) (depth + 1)
+                    Nothing -> go (step1 c) depth
+            _ -> go (step1 c) depth
+
+    -- Detect a nested QQ opener at byte position @p@ (which is the byte
+    -- after a @[@).  Returns the position just past the @|@ of
+    -- @[name|@, or Nothing if this bracket isn't a QQ.
+    matchNestedQQ p = do
+        firstByte <- peekByte src p
+        if isLowerStartByte firstByte
+            then
+                let end = runIdent p
+                in case peekByte src end of
+                    Just 0x7C -> Just (end + 1)   -- [name|
+                    _         -> Nothing
+            else Nothing
+
+    runIdent p = case peekByte src p of
+        Just b | isIdentContByte b -> runIdent (p + 1)
+        _                          -> p
+
+    isLowerStartByte b = (b >= 0x61 && b <= 0x7A) || b == 0x5F   -- a..z or _
+    isIdentContByte b =
+           (b >= 0x61 && b <= 0x7A)       -- a..z
+        || (b >= 0x41 && b <= 0x5A)       -- A..Z
+        || (b >= 0x30 && b <= 0x39)       -- 0..9
+        || b == 0x5F                      -- _
+        || b == 0x27                      -- '
 
 -- | Fast-forward through a balanced bracket group, returning the cursor
 -- just past the matching @]@. Used only for list-comprehensions and
