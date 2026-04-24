@@ -4069,7 +4069,24 @@ resolveFallback rt name = do
 
     tryBaseBareSlot bareName = do
         baseEnv <- readIORef (rtEnvFallbackBase rt)
-        pure (Map.lookup bareName baseEnv)
+        case Map.lookup bareName baseEnv of
+            Nothing   -> pure Nothing
+            Just slot -> do
+                -- An ImportOnly alias for a data constructor is stored in
+                -- the entry env as @bareName -> thunk whose body is
+                -- @EVar "Mod.bareName"@. When the fallback for the
+                -- qualified FQN walks this path, returning the alias would
+                -- create a self-loop: the caller is already forcing that
+                -- very slot.  Reject BlackHoled and explicitly self-
+                -- referential slots so the fallback continues on to
+                -- 'tryConstructorSlot' / 'tryFieldSlot' instead.  See the
+                -- GHC.Internal.Arr.Array repro in the unit #5 fix.
+                st <- readIORef slot
+                case st of
+                    BlackHole _ -> pure Nothing
+                    Unevaluated (Closure _ _ _ (EVar target))
+                        | target == name -> pure Nothing
+                    _ -> pure (Just slot)
 
     tryGlobalFieldSlot mods bareName = do
         let loaded = Map.elems mods
