@@ -144,4 +144,8 @@ test-suite ihc-test
       , filepath
       , hspec            >= 2.10
       , process          >= 1.6
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
+    -- Tests run sequentially under hspec.  Pin the RTS to a single
+    -- capability so parallel GC doesn't spin on every core while the
+    -- actual workload is single-threaded.  The user-facing interpreter
+    -- binary (exe:ihc) still gets -N.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M4G"
