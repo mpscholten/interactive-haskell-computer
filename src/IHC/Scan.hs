@@ -326,6 +326,11 @@ peekInfixOp src cur =
                              -- already never matches here since col-1 ident
                              -- already consumed; keeping the exception is a
                              -- no-op safeguard.
+          , opName /= "!"    -- bang-pattern/strict marker in `f !x = ...`,
+                             -- and also `arr ! i` array-index at expression
+                             -- position (the RHS of a do-stmt, let, etc.).
+                             -- Misclassifying `main = do ... arr ! i ...` as an
+                             -- infix-LHS drops the real `main` clause.
           -> let (t2, _) = peekSigTokFrom src c1
              in case tkKind t2 of
                  TkIdent _    -> Just opName
