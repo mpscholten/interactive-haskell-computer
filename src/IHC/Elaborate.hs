@@ -28,9 +28,12 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
+import System.IO.Unsafe (unsafePerformIO)
+
 import IHC.AST
 import IHC.Classes (ClassRegistry, lookupInstance)
 import IHC.TypeAST
+import IHC.TypeGlobals (globalClassMethodNamesRef)
 import IHC.TypeUnify
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
@@ -254,10 +257,25 @@ elaborateVar ienv name =
 -- type, return @(className, tyVarName)@ — the info needed to emit
 -- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
 classMethodHint :: Name -> [Pred] -> Type -> Maybe (Name, Name)
-classMethodHint _methodName preds body = case preds of
+classMethodHint methodName preds body = case preds of
     [Pred cls (TyVar v)]
-      | Set.member v (freeTyVars body) -> Just (cls, v)
+      | Set.member v (freeTyVars body)
+      , isActualClassMethod methodName ->
+            Just (cls, v)
     _ -> Nothing
+
+-- | Is @name@ actually a method declared inside some @class C where
+-- ... :: ...@ block?  Consulted so we don't false-positive plain
+-- top-level functions whose sigs happen to fit the "one class
+-- constraint whose tyvar appears in the body" shape (@array :: Ix i =>
+-- ...@, @length :: Foldable t => ...@'s sibling helpers, etc.).
+--
+-- Uses 'unsafePerformIO' because 'classMethodHint' is pure at the
+-- call-site.  The referenced 'IORef' is write-once-mostly (populated by
+-- the scheduler at program start) and reads are safe to be reordered.
+isActualClassMethod :: Name -> Bool
+isActualClassMethod name =
+    name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)

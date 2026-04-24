@@ -8,6 +8,7 @@
 module IHC.TypeGlobals
     ( globalTypeSigsRef
     , globalTypeSynonymsRef
+    , globalClassMethodNamesRef
     , seedBuiltinClassMethodSigs
     ) where
 
@@ -16,6 +17,8 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
@@ -36,6 +39,18 @@ globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
 globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
 globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 
+-- | Names that actually appear as methods in a @class C where m1 ::
+-- ..., m2 :: ...@ declaration somewhere in the loaded modules.
+-- Populated by the scheduler from 'scanClassDecls' output.  Consulted
+-- by 'IHC.Elaborate.classMethodHint' to reject false positives:
+-- top-level bindings like @array :: Ix i => (i, i) -> [(i, e)] -> Array
+-- i e@ have the shape of a class method (single-pred constrained
+-- tyvar in the body) but AREN'T class methods — treating them as such
+-- routes 'array 42 ...' through the wrong dispatcher.
+{-# NOINLINE globalClassMethodNamesRef #-}
+globalClassMethodNamesRef :: IORef (Set ByteString)
+globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
+
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
 -- picks up sigs at column 1; class method sigs live INSIDE class
@@ -45,6 +60,10 @@ globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 -- class's type parameter; this seed is a temporary shortcut.  Called
 -- at REPL / program start so the elaborator has something to
 -- instantiate for @pure@, @return@, etc.
+--
+-- Also seeds 'globalClassMethodNamesRef' with the same names so the
+-- elaborator's @classMethodHint@ recognises them as actual class
+-- methods even before @scanClassDecls@ is run for the loaded modules.
 seedBuiltinClassMethodSigs :: IO ()
 seedBuiltinClassMethodSigs = do
     let a = BC.pack "a"
@@ -79,3 +98,10 @@ seedBuiltinClassMethodSigs = do
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]
+    modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList
+        [ BC.pack "pure"
+        , BC.pack "return"
+        , BC.pack "mempty"
+        , BC.pack "minBound"
+        , BC.pack "maxBound"
+        ]

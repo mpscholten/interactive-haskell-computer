@@ -90,7 +90,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeAST
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, seedBuiltinClassMethodSigs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -2272,19 +2272,37 @@ classMethodDispatcher reg cls methodName = selfVal
                                   | not (isMethodPlaceholder methodVal) ->
                                         applyAll methodVal (reverse (argT : accArgs))
                                 _ -> do
-                                    -- Dispatchable arg but no matching instance.
-                                    -- Fall back to the class's default body.
-                                    mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                    mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                    let mDef = preferMethod mDef0 mDefShared
-                                    case mDef of
-                                        Just defVal ->
-                                            applyAll defVal (reverse (argT : accArgs))
-                                        _ -> error
-                                            ( "class-method dispatch: no instance of `"
-                                             <> BC.unpack cls
-                                             <> "` for type `" <> BC.unpack tag
-                                             <> "` (method `" <> BC.unpack methodName <> "`)" )
+                                    -- Tuple-arg fallback: for methods like
+                                    -- @rangeSize :: Ix i => (i, i) -> Int@
+                                    -- the argument's surface type is
+                                    -- @(i, i)@ but the class param is
+                                    -- @i@.  GHC infers the class param
+                                    -- from the tuple's element type; we
+                                    -- can't, so when the tuple tag has no
+                                    -- instance, fall back to the first
+                                    -- element's type tag.  This only kicks
+                                    -- in when the outer lookup already
+                                    -- missed, so it can't shadow a
+                                    -- genuine tuple instance.
+                                    mMethodElem <- tryInnerElemDispatch av
+                                    case mMethodElem of
+                                        Just methodVal
+                                          | not (isMethodPlaceholder methodVal) ->
+                                                applyAll methodVal (reverse (argT : accArgs))
+                                        _ -> do
+                                            -- Dispatchable arg but no matching instance.
+                                            -- Fall back to the class's default body.
+                                            mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                            mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                            let mDef = preferMethod mDef0 mDefShared
+                                            case mDef of
+                                                Just defVal ->
+                                                    applyAll defVal (reverse (argT : accArgs))
+                                                _ -> error
+                                                    ( "class-method dispatch: no instance of `"
+                                                     <> BC.unpack cls
+                                                     <> "` for type `" <> BC.unpack tag
+                                                     <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else do
                     -- Non-dispatchable (function / unit / primitive
                     -- object): stash and wait for the next arg so the
@@ -2320,6 +2338,29 @@ classMethodDispatcher reg cls methodName = selfVal
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+    -- See use-site in 'dispatch'.  When a tuple-tagged argument misses
+    -- all lookup paths, peek at the first inner thunk's type tag and
+    -- try an instance under that.  This is the @Ix i => (i, i)@
+    -- workaround for our lack of full type inference: the class param
+    -- is @i@ but the surface argument is a pair of @i@s.  List-tagged
+    -- arguments get the same treatment so @Foldable []@ methods that
+    -- are really @t a -> …@ can dispatch on the element type when
+    -- needed.
+    tryInnerElemDispatch :: Val -> IO (Maybe Val)
+    tryInnerElemDispatch (VCon con (t : _))
+        | con == BC.pack "(,)"
+       || con == BC.pack "(,,)"
+       || con == BC.pack "(,,,)" = do
+            innerV <- force t
+            let innerTag = typeTagOf innerV
+            if isDispatchableTag innerTag
+                then do
+                    mLocal  <- lookupInstanceMethodForced reg cls innerTag methodName
+                    mShared <- lookupInSharedRegForced cls innerTag methodName
+                    pure (preferMethod mLocal mShared)
+                else pure Nothing
+    tryInnerElemDispatch _ = pure Nothing
 
 -- | Look up a class method in the shared (REPL-level) class registry
 -- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is
@@ -2378,6 +2419,13 @@ buildClassMethodEnv
     -> IO Env
 buildClassMethodEnv classReg existing loadedModules = do
     decls <- concat <$> mapM (\lm -> scanClassDecls (lmSource lm)) loadedModules
+    -- Publish every declared method name so the elaborator's
+    -- 'classMethodHint' can distinguish real class methods from
+    -- top-level bindings that merely happen to have a single-pred
+    -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
+    let allMethodNames = Set.fromList
+            [ m | ClassDecl _ ms _ <- decls, m <- ms ]
+    modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
