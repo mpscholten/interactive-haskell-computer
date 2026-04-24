@@ -3380,6 +3380,24 @@ lookupIncludeDirs includeMap fileDir =
 -- source (GHC.Base, GHC.IO, Prelude, System.IO, Foreign.*, etc.).
 -- Those are now source-loaded, exposing gaps in the interpreter that
 -- the Phase 2.17 punchlist documents.
+-- | Narrow re-export shims in @base@ that our demand-driven import walker
+-- needs to look through.  These are bare @GHC.X@ modules (normally
+-- blocked during re-export chasing to avoid pulling in @GHC.Base@'s
+-- transitive subgraph) that are actually thin wrappers over the
+-- corresponding @GHC.Internal.X@ module — no heavy transitive cost, but
+-- skipping them means @Data.Array (bounds)@ / @Data.IORef (newIORef)@
+-- etc. never find their target definitions.
+isAllowedTargetedGhc :: ModuleName -> Bool
+isAllowedTargetedGhc n =
+       n == BC.pack "GHC.Arr"
+    || n == BC.pack "GHC.IORef"
+    || n == BC.pack "GHC.STRef"
+    || n == BC.pack "GHC.ST"
+    || n == BC.pack "GHC.List"
+    || n == BC.pack "GHC.MVar"
+    || n == BC.pack "GHC.Exception"
+    || n == BC.pack "GHC.Ix"
+
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
     -- Data.ByteString{,.Char8}: source loads but discovery of Show+friends
@@ -3974,6 +3992,7 @@ resolveImport registry searchPath includeMap lm name = do
         reg <- readIORef registry
         let isBlockedGhc = ("GHC." `BC.isPrefixOf` impModule imp || impModule imp == "GHC")
                         && not ("GHC.Internal." `BC.isPrefixOf` impModule imp)
+                        && not (isAllowedTargetedGhc (impModule imp))
         case Map.lookup (impModule imp) reg of
             Just (Loaded srcLm) -> do
                 mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
