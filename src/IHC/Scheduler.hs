@@ -2246,46 +2246,41 @@ classMethodDispatcher reg cls methodName = selfVal
             let tag = typeTagOf av
             if isDispatchableTag tag
                 then do
-                    -- First lookup against the dispatcher's own classReg.
-                    mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
-                    -- Also check the shared classReg (per Haskell 2010
-                    -- §4.3.2, instances from the user's transitive import
-                    -- closure should be visible — they may have been
-                    -- registered by a later import via the shared ref).
-                    mMethodShared <- lookupInSharedRegForced cls tag methodName
-                    let mMethod = preferMethod mMethod0 mMethodShared
-                    case mMethod of
+                    -- For methods whose first arg is a pair @(a, a)@
+                    -- — @range :: Ix i => (a, a) -> [a]@ etc. — the
+                    -- class param is the *element* type, not the outer
+                    -- tuple type.  GHC resolves this via type inference;
+                    -- we don't have that, so we peek at the inner type
+                    -- tag first.  Only prefer the inner dispatch when an
+                    -- instance actually exists for that element type;
+                    -- otherwise fall through to the normal outer-tag
+                    -- dispatch so honest @Ix (a, b)@ / @Eq (a, b)@
+                    -- instances still win when the user really does
+                    -- treat pairs as indices.
+                    mInner <- tryInnerElemDispatch av
+                    case mInner of
                         Just methodVal
                           | not (isMethodPlaceholder methodVal) ->
                                 applyAll methodVal (reverse (argT : accArgs))
                         _ -> do
-                            -- Lazy-scan in-scope modules once and retry.
-                            didScan <- lazyInstanceRetry cls tag
-                            mMethod2 <- if didScan
-                                then do
-                                    a <- lookupInstanceMethodForced reg cls tag methodName
-                                    b <- lookupInSharedRegForced cls tag methodName
-                                    pure (preferMethod a b)
-                                else pure mMethod
-                            case mMethod2 of
+                            -- First lookup against the dispatcher's own classReg.
+                            mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
+                            mMethodShared <- lookupInSharedRegForced cls tag methodName
+                            let mMethod = preferMethod mMethod0 mMethodShared
+                            case mMethod of
                                 Just methodVal
                                   | not (isMethodPlaceholder methodVal) ->
                                         applyAll methodVal (reverse (argT : accArgs))
                                 _ -> do
-                                    -- Tuple-arg fallback: for methods like
-                                    -- @rangeSize :: Ix i => (i, i) -> Int@
-                                    -- the argument's surface type is
-                                    -- @(i, i)@ but the class param is
-                                    -- @i@.  GHC infers the class param
-                                    -- from the tuple's element type; we
-                                    -- can't, so when the tuple tag has no
-                                    -- instance, fall back to the first
-                                    -- element's type tag.  This only kicks
-                                    -- in when the outer lookup already
-                                    -- missed, so it can't shadow a
-                                    -- genuine tuple instance.
-                                    mMethodElem <- tryInnerElemDispatch av
-                                    case mMethodElem of
+                                    -- Lazy-scan in-scope modules once and retry.
+                                    didScan <- lazyInstanceRetry cls tag
+                                    mMethod2 <- if didScan
+                                        then do
+                                            a <- lookupInstanceMethodForced reg cls tag methodName
+                                            b <- lookupInSharedRegForced cls tag methodName
+                                            pure (preferMethod a b)
+                                        else pure mMethod
+                                    case mMethod2 of
                                         Just methodVal
                                           | not (isMethodPlaceholder methodVal) ->
                                                 applyAll methodVal (reverse (argT : accArgs))

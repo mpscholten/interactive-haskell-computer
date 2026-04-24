@@ -369,6 +369,10 @@ builtins reg =
     , ("chr",         chrB)
     , ("ord#",        ordB)
     , ("chr#",        chrB)
+    -- isTrue# :: Int# -> Bool.  Projects a 1#/0# unboxed-Int encoding of
+    -- a comparison primop result into a regular Bool.  Our Int# is
+    -- VInt, so it's a plain @/= 0@.
+    , ("isTrue#",     isTrueHashB)
     , ("fromIntegral", fromIntegralB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
@@ -2364,6 +2368,17 @@ chrB = pure $ VFun $ \a -> do
     case av of
         VInt n -> pure (VChar (chr (fromIntegral n)))
         _ -> error ("chr: not an Int: " <> showValForDebug av)
+
+-- | @isTrue# :: Int# -> Bool@.  The result of @==#@ / @<#@ / @>#@ etc.
+-- is an @Int#@ with the convention that @1#@ = True and @0#@ = False.
+-- @isTrue#@ is how Haskell-level code observes that bit.
+isTrueHashB :: IO Val
+isTrueHashB = pure $ VFun $ \a -> do
+    av <- force a
+    case av of
+        VInt 0 -> pure (VCon (BC.pack "False") [])
+        VInt _ -> pure (VCon (BC.pack "True")  [])
+        _      -> error ("isTrue#: not an Int: " <> showValForDebug av)
 
 -- | 'fromIntegral' / 'fromInteger' coercion. Accepts Int or Float/Double;
 -- returns the value unchanged (we have one Int type and one Float type).
