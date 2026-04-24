@@ -8,6 +8,7 @@
 module IHC.TypeGlobals
     ( globalTypeSigsRef
     , globalTypeSynonymsRef
+    , globalClassMethodNamesRef
     , seedBuiltinClassMethodSigs
     ) where
 
@@ -16,6 +17,8 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
@@ -35,6 +38,21 @@ globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
 {-# NOINLINE globalTypeSynonymsRef #-}
 globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
 globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Names that really appear as methods in a @class C where m1 :: ...@
+-- declaration somewhere in the loaded modules.  Populated by the
+-- scheduler's @buildClassMethodEnv@ and consulted by
+-- @IHC.Elaborate.classMethodHint@.
+--
+-- Without this, @classMethodHint@ would treat any top-level binding
+-- with a one-class-pred signature whose tyvar appears in the body as a
+-- class method — which catches honest functions like
+-- @array :: Ix i => (i, i) -> [(i, e)] -> Array i e@ and routes calls
+-- to them through the class dispatcher ("no instance of Ix for type
+-- `(,)`").
+{-# NOINLINE globalClassMethodNamesRef #-}
+globalClassMethodNamesRef :: IORef (Set ByteString)
+globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
@@ -79,3 +97,13 @@ seedBuiltinClassMethodSigs = do
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]
+    -- Mirror the seed names into the class-method whitelist so the
+    -- elaborator recognises them as actual class methods even before
+    -- @scanClassDecls@ runs for the user's modules.
+    modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList
+        [ BC.pack "pure"
+        , BC.pack "return"
+        , BC.pack "mempty"
+        , BC.pack "minBound"
+        , BC.pack "maxBound"
+        ]
