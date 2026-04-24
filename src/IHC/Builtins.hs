@@ -2983,7 +2983,12 @@ plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     case (av, bv) of
         (VPrimObj (PrimPtr p), VInt n) ->
             pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-        (VPrimObj (PrimForeignPtr _), VInt _) -> pure av
+        -- A ForeignPtr flowing through plusPtr must advance by @n@
+        -- bytes just like a raw Ptr would; dropping @n@ silently
+        -- breaks callers that derive subsequent reads off the
+        -- offset pointer (memchr/memcmp/peek).
+        (VPrimObj (PrimForeignPtr fp), VInt n) ->
+            pure (VPrimObj (PrimForeignPtr (plusForeignPtr fp (fromIntegral n))))
         _ -> error ("plusPtr: bad args: " <> showValForDebug av)
 
 minusPtrB :: IO Val
