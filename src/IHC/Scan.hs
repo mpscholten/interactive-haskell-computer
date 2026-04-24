@@ -2348,6 +2348,30 @@ scanInstanceDecls src = go [] startCursor
                 TkEq      | depth == 0   -> pure Nothing
                 TkBar     | depth == 0   -> pure Nothing
                 TkSymOp op | depth == 0  -> pure (Just op)
+                -- Dedicated-op tokens the lexer carves out (==, /=, <, <=,
+                -- >, >=, &&, ||, +, ++, *, :, $) are unambiguously infix
+                -- binary operators when seen at depth 0 between two LHS
+                -- patterns, so treat them as method names too. Without
+                -- this, infix instance methods whose operator is a
+                -- dedicated token — e.g. @Eq@'s @==@ — never register,
+                -- and the scanner falls back to mis-identifying a later
+                -- @TkIdent@ inside a record pattern as the method.
+                -- We intentionally skip TkMinus / TkBang / TkDot because
+                -- those can appear in prefix position (negative literal,
+                -- bang pattern, qualified name).
+                TkEqEq    | depth == 0 -> pure (Just (BC.pack "=="))
+                TkNeq     | depth == 0 -> pure (Just (BC.pack "/="))
+                TkLt      | depth == 0 -> pure (Just (BC.pack "<"))
+                TkLe      | depth == 0 -> pure (Just (BC.pack "<="))
+                TkGt      | depth == 0 -> pure (Just (BC.pack ">"))
+                TkGe      | depth == 0 -> pure (Just (BC.pack ">="))
+                TkAnd     | depth == 0 -> pure (Just (BC.pack "&&"))
+                TkOr      | depth == 0 -> pure (Just (BC.pack "||"))
+                TkPlus    | depth == 0 -> pure (Just (BC.pack "+"))
+                TkPlusPlus| depth == 0 -> pure (Just (BC.pack "++"))
+                TkStar    | depth == 0 -> pure (Just (BC.pack "*"))
+                TkColon   | depth == 0 -> pure (Just (BC.pack ":"))
+                TkDollar  | depth == 0 -> pure (Just (BC.pack "$"))
                 TkLParen                 -> go cur' (depth + 1)
                 TkLBracket               -> go cur' (depth + 1)
                 TkLBrace                 -> go cur' (depth + 1)
