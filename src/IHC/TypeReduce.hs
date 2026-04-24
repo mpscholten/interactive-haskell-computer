@@ -46,8 +46,7 @@ module IHC.TypeReduce
     , addClosedEquations
       -- * Reduction
     , reduceTypeExpr
-      -- * Global registry (used by the symbolVal / natVal path)
-    , globalRegistry
+      -- * Registry accessors (used by the symbolVal / natVal path)
     , setGlobalRegistry
     , getGlobalRegistry
       -- * Exposed for tests
@@ -63,7 +62,6 @@ import Data.Char (isDigit, isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import System.IO.Unsafe (unsafePerformIO)
 
 --------------------------------------------------------------------------------
 -- Registry
@@ -547,22 +545,18 @@ substitute env = go
 --------------------------------------------------------------------------------
 -- Global registry
 --
--- We stash the TF registry in an IORef so the symbolVal / natVal
--- builtins (which are plain @IO Val@ functions with no Env parameter)
--- can reach it.  Scheduler installs the fully-merged registry once per
--- program load; REPL sessions overwrite with every :l.
+-- The TF registry now lives on 'IHC.Runtime.IHCRuntime' as
+-- 'rtTypeFamilyReg'.  Scheduler installs the fully-merged registry
+-- once per program load; REPL sessions overwrite with every :l.
 --
--- Using 'unsafePerformIO' here follows the same pattern as
--- IHC.Classes's ClassRegistry-hook — see 'Classes.hs'.
+-- These thin accessors let callers project the registry ref without
+-- importing 'IHC.Runtime' directly (that would drag in the whole
+-- interpreter-state module graph).
 --------------------------------------------------------------------------------
 
-{-# NOINLINE globalRegistry #-}
-globalRegistry :: IORef TypeFamilyRegistry
-globalRegistry = unsafePerformIO (newIORef Map.empty)
+setGlobalRegistry :: IORef TypeFamilyRegistry -> TypeFamilyRegistry -> IO ()
+setGlobalRegistry = writeIORef
 
-setGlobalRegistry :: TypeFamilyRegistry -> IO ()
-setGlobalRegistry = writeIORef globalRegistry
-
-getGlobalRegistry :: IO TypeFamilyRegistry
-getGlobalRegistry = readIORef globalRegistry
+getGlobalRegistry :: IORef TypeFamilyRegistry -> IO TypeFamilyRegistry
+getGlobalRegistry = readIORef
 

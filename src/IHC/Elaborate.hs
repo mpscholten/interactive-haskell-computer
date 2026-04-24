@@ -27,13 +27,11 @@ import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-
-import System.IO.Unsafe (unsafePerformIO)
+import Data.Set (Set)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, lookupInstance)
 import IHC.TypeAST
-import IHC.TypeGlobals (globalClassMethodNamesRef)
 import IHC.TypeUnify
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
@@ -60,11 +58,12 @@ data Expected
 -- mutable state — pure-ish, though 'TypeSigs' and 'ClassReg' are read
 -- via IORefs at the top level.
 data InferEnv = InferEnv
-    { ieFresh    :: !FreshSource
-    , ieSigs     :: !(Map ByteString Scheme)
-    , ieSynonyms :: !(Map ByteString (Int, Type))
-    , ieClassReg :: !ClassRegistry
-    , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
+    { ieFresh           :: !FreshSource
+    , ieSigs            :: !(Map ByteString Scheme)
+    , ieSynonyms        :: !(Map ByteString (Int, Type))
+    , ieClassReg        :: !ClassRegistry
+    , ieClassMethodNames:: !(Set Name)    -- read from 'rtClassMethodNames'
+    , ieLocals          :: !(Map Name Scheme)   -- lambda-bound + let-bound
     }
 
 -- | Top-level entry point.  Elaborate a sub-expression under an
@@ -77,17 +76,19 @@ elaborate
     :: ClassRegistry
     -> Map ByteString Scheme
     -> Map ByteString (Int, Type)
+    -> Set Name                          -- ^ class method names whitelist
     -> Expected
     -> Expr
     -> IO (Expr, Type)
-elaborate classReg sigs synonyms expected e = do
+elaborate classReg sigs synonyms classMethodNames expected e = do
     fresh <- newFreshSource
     let ienv = InferEnv
-            { ieFresh    = fresh
-            , ieSigs     = sigs
-            , ieSynonyms = synonyms
-            , ieClassReg = classReg
-            , ieLocals   = Map.empty
+            { ieFresh            = fresh
+            , ieSigs             = sigs
+            , ieSynonyms         = synonyms
+            , ieClassReg         = classReg
+            , ieClassMethodNames = classMethodNames
+            , ieLocals           = Map.empty
             }
     (e', t, _preds, sub) <- elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
@@ -233,7 +234,7 @@ elaborateVar ienv name =
         Nothing -> case Map.lookup name (ieSigs ienv) of
             Just sch -> do
                 (preds, ty) <- instantiate (ieFresh ienv) sch
-                case classMethodHint name preds ty of
+                case classMethodHint (ieClassMethodNames ienv) name preds ty of
                     Just (cls, paramVar) ->
                         -- Emit ETypedMethod with placeholder tag.
                         -- The tag is the fresh tyvar's name;
@@ -256,26 +257,13 @@ elaborateVar ienv name =
 -- argument is a plain type variable that also appears in the body
 -- type, return @(className, tyVarName)@ — the info needed to emit
 -- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
-classMethodHint :: Name -> [Pred] -> Type -> Maybe (Name, Name)
-classMethodHint methodName preds body = case preds of
+classMethodHint :: Set Name -> Name -> [Pred] -> Type -> Maybe (Name, Name)
+classMethodHint classMethodNames methodName preds body = case preds of
     [Pred cls (TyVar v)]
       | Set.member v (freeTyVars body)
-      , isActualClassMethod methodName ->
+      , Set.member methodName classMethodNames ->
             Just (cls, v)
     _ -> Nothing
-
--- | Is @name@ actually declared as a method inside some @class C where
--- ... :: ...@ block?  Consulted so we don't route honest top-level
--- functions whose sigs happen to fit the "one class constraint whose
--- tyvar appears in the body" shape (@array :: Ix i => (i, i) -> [(i,
--- e)] -> Array i e@) through the class dispatcher.
---
--- 'unsafePerformIO' is safe because the referenced 'IORef' is
--- write-once-mostly (populated by the scheduler at program start) and
--- reads are commutative.
-isActualClassMethod :: Name -> Bool
-isActualClassMethod name =
-    name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)

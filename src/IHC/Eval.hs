@@ -37,10 +37,10 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback)
+import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, triggerCoreInstanceLoad, lookupClassMethodFallback)
+import IHC.Runtime (IHCRuntime(..))
 import qualified IHC.Elaborate as Elab
 import qualified IHC.TypeAST as TA
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -63,8 +63,8 @@ forceMethodVal v               = pure v
 -- 'methodPlaceholder' (class default with no per-instance override),
 -- falls back to a known-equivalent method (e.g. Monad.return →
 -- Applicative.pure).
-resolveTypedMethod :: ClassRegistry -> Name -> Name -> Name -> IO Val
-resolveTypedMethod reg cls method tag = do
+resolveTypedMethod :: IHCRuntime -> Name -> Name -> Name -> IO Val
+resolveTypedMethod rt cls method tag = do
     resolved <- tryResolve
     case resolved of
         Just v  -> forceMethodVal v
@@ -73,7 +73,7 @@ resolveTypedMethod reg cls method tag = do
             -- dicts (keeps startup latency low). The hook force-loads
             -- GHC.Internal.Base / Maybe / … once per session; subsequent
             -- calls are free.
-            triggerCoreInstanceLoad
+            triggerCoreInstanceLoad rt
             resolved2 <- tryResolve
             case resolved2 of
                 Just v  -> forceMethodVal v
@@ -84,13 +84,14 @@ resolveTypedMethod reg cls method tag = do
                     -- resolved tag points at an instance we haven't
                     -- loaded (e.g. @Monad (ST s)@: we don't force-load
                     -- @GHC.Internal.ST@ on startup).
-                    mFallback <- lookupClassMethodFallback cls method
+                    mFallback <- lookupClassMethodFallback rt cls method
                     case mFallback of
                         Just v  -> forceMethodVal v
                         Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
                                         <> BC.unpack cls <> " " <> BC.unpack tag
                                         <> "` for method `" <> BC.unpack method <> "`")
   where
+    reg = rtClassReg rt
     tryResolve = do
         mMethod <- lookupInstanceMethod reg cls tag method
         case mMethod of
@@ -125,9 +126,9 @@ force t = do
     case st of
         Evaluated v -> pure v
         BlackHole msg -> throwIO (LoopException msg)
-        Unevaluated (Closure env ipm expr) -> do
+        Unevaluated (Closure rt env ipm expr) -> do
             writeIORef t (BlackHole (take 500 (show expr)))
-            v <- eval env ipm expr
+            v <- eval rt env ipm expr
             writeIORef t (Evaluated v)
             pure v
         -- Lazy-init builtin: run the host @IO Val@ action exactly once,
@@ -144,8 +145,8 @@ force t = do
 -- eval
 --------------------------------------------------------------------------------
 
-eval :: Env -> ImplicitParamMap -> Expr -> IO Val
-eval env ipm = go
+eval :: IHCRuntime -> Env -> ImplicitParamMap -> Expr -> IO Val
+eval rt env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
     go (ELit (LFloat d)) = pure (VFloat d)
@@ -166,7 +167,7 @@ eval env ipm = go
             -- fully-qualified name whose body only became visible after
             -- the env snapshot was taken.  Consult the scheduler-
             -- installed hook before erroring.
-            mT <- lookupEnvFallback name
+            mT <- lookupEnvFallback rt name
             case mT of
                 Just t  -> force t
                 Nothing -> error ("IHC.Eval: unbound variable `"
@@ -174,7 +175,7 @@ eval env ipm = go
 
     go (EApp f x) = do
         fv  <- go f                            -- function to WHNF
-        xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
+        xt  <- newThunkIP rt env ipm x            -- argument stays a thunk (lazy)
         case fv of
             VPrimObj _ -> do
                 a <- force xt
@@ -188,7 +189,7 @@ eval env ipm = go
         -- (lexical binding) takes priority over the caller's map.
         pure $ VFunIP ipm $ \callerIPM argThunk ->
             let mergedIPM = Map.union ipm callerIPM
-            in eval (extendEnv name argThunk env) mergedIPM body
+            in eval rt (extendEnv name argThunk env) mergedIPM body
 
     go (ELet binds body) = do
         -- Recursive group: pre-allocate a thunk per binding holding a
@@ -202,9 +203,9 @@ eval env ipm = go
         let names  = map fst binds
             env'   = extendEnvMany (zip names slots) env
         mapM_ (\((_, rhs), slot) ->
-                   writeIORef slot (Unevaluated (Closure env' ipm rhs)))
+                   writeIORef slot (Unevaluated (Closure rt env' ipm rhs)))
               (zip binds slots)
-        eval env' ipm body
+        eval rt env' ipm body
 
     go (ECase scrut alts) = do
         v0 <- go scrut
@@ -241,10 +242,10 @@ eval env ipm = go
         -- Build the right tuple constructor name for this arity.
         let arity = length es
             name  = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
-        thunks <- mapM (newThunkIP env ipm) es
+        thunks <- mapM (newThunkIP rt env ipm) es
         pure (VCon name thunks)
 
-    go (EDo stmts) = evalDo env ipm stmts
+    go (EDo stmts) = evalDo rt env ipm stmts
 
     -- Phase 3.6: Implicit parameter reference.
     -- Look up ?name in the current ImplicitParamMap. Miss -> runtime error.
@@ -262,14 +263,14 @@ eval env ipm = go
             ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
                           (zip names slots)
         mapM_ (\((_, rhs), slot) ->
-                   writeIORef slot (Unevaluated (Closure env ipm rhs)))
+                   writeIORef slot (Unevaluated (Closure rt env ipm rhs)))
               (zip binds slots)
-        eval env ipm' body
+        eval rt env ipm' body
 
     -- Record construction: Con { f1 = e1, f2 = e2, ... }
     -- We ignore field names and build a positional VCon.
     go (ERecordCon name fields) = do
-        thunks <- mapM (\(_, e) -> newThunkIP env ipm e) fields
+        thunks <- mapM (\(_, e) -> newThunkIP rt env ipm e) fields
         pure (VCon name thunks)
 
     -- RecordWildCards construction: ERecordWild should be desugared by the
@@ -321,12 +322,8 @@ eval env ipm = go
     -- type.  Falls back to an unbound-variable error if the resolved
     -- (class, tag, method) isn't in the shared class registry —
     -- that's a bug (elaborator shouldn't emit an unresolvable tag).
-    go (ETypedMethod cls method tag) = do
-        mReg <- readIORef sharedClassRegRef
-        case mReg of
-            Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
-                              <> "(elaborator fired before buildBaseEnv?)")
-            Just reg -> resolveTypedMethod reg cls method tag
+    go (ETypedMethod cls method tag) =
+        resolveTypedMethod rt cls method tag
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -336,7 +333,7 @@ eval env ipm = go
         -- for type-family applications (e.g. @GetTableName User@) we
         -- replace it with the reduced bytes (e.g. @"users"@) so the
         -- downstream DataKinds extractors see the literal directly.
-        reg <- TR.getGlobalRegistry
+        reg <- TR.getGlobalRegistry (rtTypeFamilyReg rt)
         let ty = case TR.reduceTypeExpr reg ty0 of
                      Just reduced -> reduced
                      Nothing      -> ty0
@@ -362,41 +359,37 @@ eval env ipm = go
             EVar method
                 | method == BC.pack "maxBound"
                || method == BC.pack "minBound" -> do
-                    mReg <- readIORef sharedClassRegRef
-                    case mReg of
+                    let classReg = rtClassReg rt
+                        tag = normalizeTyTag ty
+                    mv <- lookupInstanceMethod classReg
+                            (BC.pack "Bounded") tag method
+                    case mv of
                         Nothing -> pure Nothing
-                        Just classReg -> do
-                            let tag = normalizeTyTag ty
-                            mv <- lookupInstanceMethod classReg
-                                    (BC.pack "Bounded") tag method
-                            case mv of
-                                Nothing -> pure Nothing
-                                Just v -> do
-                                    r <- try (forceMethodVal v)
-                                            :: IO (Either SomeException Val)
-                                    case r of
-                                        Right v' -> pure (Just v')
-                                        Left _   -> pure Nothing
+                        Just v -> do
+                            r <- try (forceMethodVal v)
+                                    :: IO (Either SomeException Val)
+                            case r of
+                                Right v' -> pure (Just v')
+                                Left _   -> pure Nothing
             _ -> pure Nothing
 
     -- | Helper: try to elaborate @e@ under the annotation @ty@.
     -- Returns 'Just' if elaboration rewrote something; 'Nothing'
     -- otherwise.
     tryElaborateTyAnn e ty = do
-        mReg <- readIORef sharedClassRegRef
-        case mReg of
+        let classReg = rtClassReg rt
+        case Elab.parseRawTypeExpr ty of
             Nothing -> pure Nothing
-            Just classReg -> case Elab.parseRawTypeExpr ty of
-                Nothing -> pure Nothing
-                Just annTy -> do
-                    sigs <- readIORef globalTypeSigsRef
-                    syns <- readIORef globalTypeSynonymsRef
-                    r <- try (Elab.elaborate classReg sigs syns
-                                (Elab.ExpectType annTy) e)
-                           :: IO (Either SomeException (Expr, TA.Type))
-                    case r of
-                        Right (e', _) | e' /= e -> pure (Just e')
-                        _                       -> pure Nothing
+            Just annTy -> do
+                sigs <- readIORef (rtTypeSigs rt)
+                syns <- readIORef (rtTypeSynonyms rt)
+                cmNames <- readIORef (rtClassMethodNames rt)
+                r <- try (Elab.elaborate classReg sigs syns cmNames
+                            (Elab.ExpectType annTy) e)
+                       :: IO (Either SomeException (Expr, TA.Type))
+                case r of
+                    Right (e', _) | e' /= e -> pure (Just e')
+                    _                       -> pure Nothing
 
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
@@ -451,7 +444,7 @@ eval env ipm = go
             m <- matchPat pat v
             case m of
                 Just bindings -> do
-                    r <- try (eval (extendEnvMany bindings env) ipm body)
+                    r <- try (eval rt (extendEnvMany bindings env) ipm body)
                            :: IO (Either PatternMatchFail Val)
                     case r of
                         Right result -> pure result
@@ -1057,48 +1050,48 @@ applyIP _         v                          arg  = do
 --                      recurse.
 --------------------------------------------------------------------------------
 
-evalDo :: Env -> ImplicitParamMap -> [Stmt] -> IO Val
-evalDo _   _   []              = pure (VIO (pure VUnit))
-evalDo env ipm [SExpr e]       = eval env ipm e
-evalDo env ipm [SBind _ e]     =
+evalDo :: IHCRuntime -> Env -> ImplicitParamMap -> [Stmt] -> IO Val
+evalDo _  _   _   []              = pure (VIO (pure VUnit))
+evalDo rt env ipm [SExpr e]       = eval rt env ipm e
+evalDo rt env ipm [SBind _ e]     =
     -- Haskell forbids a do-block to end in a bind statement, but be
     -- defensive: evaluate the action and return its value directly.
-    eval env ipm e
-evalDo _   _   [SLet _]        = pure (VIO (pure VUnit))
-evalDo env ipm (SExpr e : rest) =
+    eval rt env ipm e
+evalDo _  _   _   [SLet _]        = pure (VIO (pure VUnit))
+evalDo rt env ipm (SExpr e : rest) =
     pure $ VIO $ do
-        mv <- eval env ipm e
+        mv <- eval rt env ipm e
         _  <- runIOVal mv                   -- run and discard
-        restV <- evalDo env ipm rest
+        restV <- evalDo rt env ipm rest
         runIOVal restV
-evalDo env ipm (SBind name e : rest) =
+evalDo rt env ipm (SBind name e : rest) =
     pure $ VIO $ do
-        mv <- eval env ipm e
+        mv <- eval rt env ipm e
         v  <- runIOVal mv
         vT <- newWHNFThunk v
         let env' = extendEnv name vT env
-        restV <- evalDo env' ipm rest
+        restV <- evalDo rt env' ipm rest
         runIOVal restV
-evalDo env ipm (SLet bs : rest) = do
+evalDo rt env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
     slots <- mapM (\_ -> newIORef (BlackHole "<do-let-placeholder>")) bs
     let names = map fst bs
         env'  = extendEnvMany (zip names slots) env
     mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure env' ipm rhs)))
+               writeIORef slot (Unevaluated (Closure rt env' ipm rhs)))
           (zip bs slots)
-    evalDo env' ipm rest
-evalDo _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
-evalDo env ipm (SImplicitLet bs : rest) = do
+    evalDo rt env' ipm rest
+evalDo _  _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
+evalDo rt env ipm (SImplicitLet bs : rest) = do
     slots <- mapM (\_ -> newIORef (BlackHole "<do-implicit-let-placeholder>")) bs
     let names = map fst bs
         ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
                       (zip names slots)
     mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure env ipm rhs)))
+               writeIORef slot (Unevaluated (Closure rt env ipm rhs)))
           (zip bs slots)
-    evalDo env ipm' rest
+    evalDo rt env ipm' rest
 
 -- | Force one 'IO' layer to execute its suspended action. Any other value
 -- is returned as-is (treated as a "pure" IO result -- shouldn't happen

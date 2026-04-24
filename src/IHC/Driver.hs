@@ -27,6 +27,7 @@ import IHC.CabalProject
 import IHC.Diagnostics (warnStub)
 import IHC.Eval (force)
 import IHC.PackageStore (acquire, buildSearchEnv)
+import IHC.Runtime (newIHCRuntime)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source
 import IHC.Val (Val(..))
@@ -119,7 +120,8 @@ runWithSearchPath searchPath src =
         ExitFailure n -> pure n
   where
     runImpl = do
-        (_env, mainT) <- loadProgramFromSource searchPath src
+        rt            <- newIHCRuntime
+        (_env, mainT) <- loadProgramFromSource rt searchPath src
         v             <- force mainT
         final         <- runIO v
         case final of

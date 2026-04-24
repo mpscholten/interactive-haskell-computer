@@ -1,58 +1,26 @@
--- | Global IORef-backed registries for top-level type signatures and
--- type synonyms.  Populated by the scheduler each time a module is
--- loaded; consulted by 'IHC.Elaborate' for on-demand type inference.
+-- | Type inference state — type signatures, type synonyms, and the
+-- set of declared class method names.
 --
--- Split into its own module so both the scheduler (which populates)
--- and the evaluator (which triggers inference) can access the refs
--- without introducing a cycle.
+-- These previously lived in three top-level 'unsafePerformIO' IORef
+-- CAFs so the scheduler (which populates them as modules load) and
+-- the evaluator/elaborator (which consult them) could share state
+-- without a compile-time module cycle.
+--
+-- The CAFs are gone.  The three refs now live on 'IHC.Runtime.IHCRuntime'
+-- (fields 'rtTypeSigs', 'rtTypeSynonyms', 'rtClassMethodNames'); this
+-- module exposes a single helper to seed the canonical class-method
+-- signatures.
 module IHC.TypeGlobals
-    ( globalTypeSigsRef
-    , globalTypeSynonymsRef
-    , globalClassMethodNamesRef
-    , seedBuiltinClassMethodSigs
+    ( seedBuiltinClassMethodSigs
     ) where
 
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
 import qualified Data.Set as Set
-import System.IO.Unsafe (unsafePerformIO)
 
+import IHC.Runtime (IHCRuntime(..))
 import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
-
--- | Flat union of every loaded module's top-level type signatures.
--- Used by 'IHC.Elaborate' to look up a binding's type when inference
--- needs it.  Last-writer-wins on name collisions across modules
--- (uncommon in practice — sigs are module-scoped in source).
-{-# NOINLINE globalTypeSigsRef #-}
-globalTypeSigsRef :: IORef (Map ByteString Scheme)
-globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
-
--- | Flat union of type synonym declarations (@type Name v1 v2 … =
--- RHS@).  One-hop expansion is all the elaborator does today:
--- @State s a@ → @StateT s Identity a@ is expanded once during
--- unification.  Multi-level chains would need a fixed-point pass.
-{-# NOINLINE globalTypeSynonymsRef #-}
-globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
-globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
-
--- | Names that really appear as methods in a @class C where m1 :: ...@
--- declaration somewhere in the loaded modules.  Populated by the
--- scheduler's @buildClassMethodEnv@ and consulted by
--- @IHC.Elaborate.classMethodHint@.
---
--- Without this, @classMethodHint@ would treat any top-level binding
--- with a one-class-pred signature whose tyvar appears in the body as a
--- class method — which catches honest functions like
--- @array :: Ix i => (i, i) -> [(i, e)] -> Array i e@ and routes calls
--- to them through the class dispatcher ("no instance of Ix for type
--- `(,)`").
-{-# NOINLINE globalClassMethodNamesRef #-}
-globalClassMethodNamesRef :: IORef (Set ByteString)
-globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
@@ -63,8 +31,8 @@ globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
 -- class's type parameter; this seed is a temporary shortcut.  Called
 -- at REPL / program start so the elaborator has something to
 -- instantiate for @pure@, @return@, etc.
-seedBuiltinClassMethodSigs :: IO ()
-seedBuiltinClassMethodSigs = do
+seedBuiltinClassMethodSigs :: IHCRuntime -> IO ()
+seedBuiltinClassMethodSigs rt = do
     let a = BC.pack "a"
         f = BC.pack "f"
         m = BC.pack "m"
@@ -86,7 +54,7 @@ seedBuiltinClassMethodSigs = do
                     (TyVar a)
         -- maxBound :: Bounded a => a
         maxBoundSig = minBoundSig
-    modifyIORef' globalTypeSigsRef $ \s ->
+    modifyIORef' (rtTypeSigs rt) $ \s ->
         Map.unions
             [ Map.fromList
                 [ (BC.pack "pure",     pureSig)
@@ -100,7 +68,7 @@ seedBuiltinClassMethodSigs = do
     -- Mirror the seed names into the class-method whitelist so the
     -- elaborator recognises them as actual class methods even before
     -- @scanClassDecls@ runs for the user's modules.
-    modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList
+    modifyIORef' (rtClassMethodNames rt) $ Set.union $ Set.fromList
         [ BC.pack "pure"
         , BC.pack "return"
         , BC.pack "mempty"

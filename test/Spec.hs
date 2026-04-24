@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified Coverage
 import qualified JitSmoke
+import qualified MultiRuntime
 import qualified NorthStarTest
 import qualified ReplTest
 import qualified RunFile
@@ -12,6 +13,7 @@ import qualified Unsupported
 
 main :: IO ()
 main = hspec do
+    MultiRuntime.spec
     JitSmoke.spec
     RunFile.spec
     CabalLoader.spec

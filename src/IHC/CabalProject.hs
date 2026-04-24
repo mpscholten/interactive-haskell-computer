@@ -44,20 +44,12 @@ import Control.Exception (Exception, throwIO, try, SomeException, evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef
-    ( IORef
-    , atomicModifyIORef'
-    , newIORef
-    , readIORef
-    , writeIORef
-    )
 import Data.List (isPrefixOf, isSuffixOf, maximumBy, sortBy)
 import Data.Ord (Down(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Time.Clock.POSIX (POSIXTime, utcTimeToPOSIXSeconds)
-import GHC.IO (unsafePerformIO)
 import System.Directory
     ( createDirectoryIfMissing
     , doesDirectoryExist
@@ -561,27 +553,15 @@ dedupPreserveOrder = go []
 -- dirs is ~1ms, vs reading and hashing hundreds of KB of .cabal data.
 --------------------------------------------------------------------------------
 
--- | Process-wide memo for 'cachedPackageSearchPathWithIncludes'.
---
--- 'Nothing' = not yet computed.  'Just pairs' = computed, reuse
--- verbatim.  Thread-safe via 'atomicModifyIORef''.
-searchPathMemoRef :: IORef (Maybe [(FilePath, [FilePath])])
-searchPathMemoRef = unsafePerformIO (newIORef Nothing)
-{-# NOINLINE searchPathMemoRef #-}
-
--- | In-process memo for 'cachedPackageTable'.  Session-scoped, never
--- expires during a run; computed lazily on first request.
-packageTableMemoRef :: IORef (Maybe PackageTable)
-packageTableMemoRef = unsafePerformIO (newIORef Nothing)
-{-# NOINLINE packageTableMemoRef #-}
-
--- | Clear the in-process search-path memo.  Exposed for tests that
--- mutate the underlying directories and expect a fresh read.  Not
--- currently wired up; kept as a private helper for future use.
-_resetSearchPathMemo :: IO ()
-_resetSearchPathMemo = do
-    writeIORef searchPathMemoRef Nothing
-    writeIORef packageTableMemoRef Nothing
+-- The in-process memo CAFs for search-path and package-table results
+-- were removed as part of the broader push to keep interpreter state in
+-- 'IHC.Runtime.IHCRuntime' rather than 'unsafePerformIO' globals.  Both
+-- functions still short-circuit via the on-disk cache at
+-- @~\/.cache\/ihc\/search-path.cache@ when the fingerprint matches, so
+-- the cold-start cost is unchanged; only the warm in-memory memo is
+-- gone.  The extra disk-cache check on each call is a few ms at most.
+-- A per-runtime memo on 'IHCRuntime' can be re-added if that overhead
+-- shows up in profiling.
 
 -- | Fingerprint summarising the state of the source directories the
 -- search path depends on.  Two fingerprints agreeing means "nothing
@@ -795,20 +775,16 @@ cachedPackageSearchPath = map fst <$> cachedPackageSearchPathWithIncludes
 -- names across sources.
 type PackageTable = [(FilePath, PackageInfo)]
 
--- | Cached 'PackageTable'.  Session-scoped; computed lazily by walking
--- every source root once.  Subsequent calls are O(1).
+-- | Build the 'PackageTable' by walking every source root.
+--
+-- Previously kept a process-wide in-memory memo; that CAF was removed
+-- in favour of computing on demand.  Callers that need per-runtime
+-- caching can hold the result themselves.
 cachedPackageTable :: IO PackageTable
 cachedPackageTable = do
-    memo <- readIORef packageTableMemoRef
-    case memo of
-        Just t  -> pure t
-        Nothing -> do
-            fresh <- computePackageTableFresh
-            _     <- evaluate (length fresh)
-            atomicModifyIORef' packageTableMemoRef $ \cur ->
-                case cur of
-                    Just existing -> (Just existing, existing)
-                    Nothing       -> (Just fresh, fresh)
+    fresh <- computePackageTableFresh
+    _     <- evaluate (length fresh)
+    pure fresh
 
 computePackageTableFresh :: IO PackageTable
 computePackageTableFresh = do
@@ -940,43 +916,31 @@ scopedSearchDirs table (Just owner) mQual =
 -- Priority order matches 'cachedPackageSearchPath':
 -- nix-pinned → user cache → cabal tarball cache.
 --
--- Caching strategy (see the "Cache-wide search path" section header
--- above for rationale):
+-- Caching: consults the on-disk cache at
+-- @~\/.cache\/ihc\/search-path.cache@ keyed by a cheap mtime
+-- fingerprint of the source roots and their immediate children, so the
+-- slow path (parsing every .cabal file) only runs when the cache misses
+-- or is stale.  The on-disk cache survives across ihc invocations.
 --
---   1. In-process memo: the first call does the work, subsequent calls
---      reuse the result via 'searchPathMemoRef'.
---   2. On-disk cache at @~\/.cache\/ihc\/search-path.cache@ keyed by a
---      cheap mtime fingerprint of the source roots and their immediate
---      children.  Survives across ihc invocations.
+-- The in-process memo CAF this wrapper used to install was removed in
+-- favour of per-runtime state on 'IHC.Runtime.IHCRuntime'; if a caller
+-- needs warm-memory caching across multiple scheduler calls, it should
+-- hold the result itself.
 cachedPackageSearchPathWithIncludes :: IO [(FilePath, [FilePath])]
 cachedPackageSearchPathWithIncludes = do
-    memo <- readIORef searchPathMemoRef
-    case memo of
-        Just pairs -> pure pairs
-        Nothing    -> computeAndStore
-  where
-    computeAndStore = do
-        -- Compute the fingerprint *before* touching the slow path so we
-        -- can decide whether to reuse the on-disk cache.
-        fp <- computeSearchPathFingerprint
-        mDisk <- tryLoadOnDiskCache fp
-        pairs <- case mDisk of
-            Just cached -> pure cached
-            Nothing     -> do
-                fresh <- computeSearchPathFresh
-                -- Force the list spine so subsequent readers never
-                -- trigger the slow path lazily.
-                _     <- evaluate (length fresh)
-                writeOnDiskCache fp fresh
-                pure fresh
-        -- Install the memo.  We use atomicModifyIORef' so a racing
-        -- second caller doesn't end up with a different list.  The
-        -- race is harmless correctness-wise (both branches produce
-        -- the same result); the atomic CAS just avoids redundant work.
-        atomicModifyIORef' searchPathMemoRef $ \cur ->
-            case cur of
-                Just existing -> (Just existing, existing)
-                Nothing       -> (Just pairs, pairs)
+    -- Compute the fingerprint *before* touching the slow path so we
+    -- can decide whether to reuse the on-disk cache.
+    fp <- computeSearchPathFingerprint
+    mDisk <- tryLoadOnDiskCache fp
+    case mDisk of
+        Just cached -> pure cached
+        Nothing     -> do
+            fresh <- computeSearchPathFresh
+            -- Force the list spine so subsequent readers never
+            -- trigger the slow path lazily.
+            _     <- evaluate (length fresh)
+            writeOnDiskCache fp fresh
+            pure fresh
 
 -- | The "slow path" used on cold cache: actually walk every source
 -- directory and parse every .cabal file.  Kept as a separate function

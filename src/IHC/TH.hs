@@ -28,7 +28,6 @@ module IHC.TH
     -- * Phase 2.13: top-level splice decl decoder
     , thDecsToBindings
     , thExpandSpliceDecl
-    , resetNewNameCounter
     ) where
 
 import Control.Exception (throwIO, Exception)
@@ -37,9 +36,9 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Int (Int64)
-import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Eval (eval, force)
+import IHC.Runtime (IHCRuntime(..))
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -381,17 +380,17 @@ stringToConsList (c:cs) = EApp (EApp (EVar ":") (ELit (LChar c))) (stringToConsL
 
 -- | Walk an 'Expr' and expand every 'ESplice' in place.
 -- Hard-caps at depth 16 to prevent infinite splice loops.
-expandSplicesInExpr :: Env -> ImplicitParamMap -> Int -> Expr -> IO Expr
-expandSplicesInExpr env ipm depth expr
+expandSplicesInExpr :: IHCRuntime -> Env -> ImplicitParamMap -> Int -> Expr -> IO Expr
+expandSplicesInExpr rt env ipm depth expr
     | depth > 16 = throwTH "splice expansion exceeded depth limit 16"
     | otherwise  = go expr
   where
-    recur = expandSplicesInExpr env ipm (depth + 1)
+    recur = expandSplicesInExpr rt env ipm (depth + 1)
 
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval env ipm innerExpanded
+        thVal <- eval rt env ipm innerExpanded
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -518,8 +517,8 @@ exprToVal _ =
 
 -- | (name, IO Val) pairs for all TH-related builtins.
 -- Registers under both short and fully-qualified paths.
-thBuiltinPairs :: [(ByteString, IO Val)]
-thBuiltinPairs =
+thBuiltinPairs :: IHCRuntime -> [(ByteString, IO Val)]
+thBuiltinPairs rt =
     [ ("lift",                                liftBuiltin)
     , ("TH.lift",                             liftBuiltin)
     , ("Language.Haskell.TH.lift",            liftBuiltin)
@@ -529,9 +528,9 @@ thBuiltinPairs =
     , ("mkName",                              mkNameBuiltin)
     , ("Language.Haskell.TH.mkName",          mkNameBuiltin)
     , ("Language.Haskell.TH.Syntax.mkName",   mkNameBuiltin)
-    , ("newName",                             newNameBuiltin)
-    , ("Language.Haskell.TH.newName",         newNameBuiltin)
-    , ("Language.Haskell.TH.Syntax.newName",  newNameBuiltin)
+    , ("newName",                             newNameBuiltin rt)
+    , ("Language.Haskell.TH.newName",         newNameBuiltin rt)
+    , ("Language.Haskell.TH.Syntax.newName",  newNameBuiltin rt)
     , ("runQ",                                runQBuiltin)
     , ("Language.Haskell.TH.runQ",            runQBuiltin)
     , ("Language.Haskell.TH.Syntax.runQ",     runQBuiltin)
@@ -679,15 +678,6 @@ thConstructorPairs =
 -- expects.
 --------------------------------------------------------------------------------
 
--- | Global counter for 'newName'. Reset once per load via
--- 'resetNewNameCounter'.
-{-# NOINLINE newNameCounterRef #-}
-newNameCounterRef :: IORef Int
-newNameCounterRef = unsafePerformIO (newIORef 0)
-
-resetNewNameCounter :: IO ()
-resetNewNameCounter = writeIORef newNameCounterRef 0
-
 -- | @mkName :: String -> Name@.  Returns @VCon "Name" [VStr bytes]@.
 mkNameBuiltin :: IO Val
 mkNameBuiltin = pure $ VFun $ \argT -> do
@@ -696,13 +686,15 @@ mkNameBuiltin = pure $ VFun $ \argT -> do
     bsT <- newWHNFThunk (VStr bs)
     pure (VCon "Name" [bsT])
 
--- | @newName :: String -> Q Name@.  Gensym by appending @_N@.
-newNameBuiltin :: IO Val
-newNameBuiltin = pure $ VFun $ \argT -> do
+-- | @newName :: String -> Q Name@.  Gensym by appending @_N@.  The
+-- counter lives on the 'IHCRuntime', so multi-instance interpreters
+-- don't cross-talk on uniqueness.
+newNameBuiltin :: IHCRuntime -> IO Val
+newNameBuiltin rt = pure $ VFun $ \argT -> do
     v <- force argT
     base <- valToBytes v
     pure $ VIO $ do
-        n <- atomicModifyIORef' newNameCounterRef (\c -> (c + 1, c))
+        n <- atomicModifyIORef' (rtNewNameCounter rt) (\c -> (c + 1, c))
         let unique = base <> BC.pack ("_" <> show n)
         uT <- newWHNFThunk (VStr unique)
         pure (VCon "Name" [uT])
@@ -763,9 +755,9 @@ valToBytes v = do
 
 -- | Evaluate a top-level splice expression and decode its result into
 -- a list of @(name, body)@ top-level bindings.
-thExpandSpliceDecl :: Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
-thExpandSpliceDecl env ipm spliceExpr = do
-    v0 <- eval env ipm spliceExpr
+thExpandSpliceDecl :: IHCRuntime -> Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
+thExpandSpliceDecl rt env ipm spliceExpr = do
+    v0 <- eval rt env ipm spliceExpr
     decsVal <- unwrapQ v0
     thDecsToBindings decsVal
 

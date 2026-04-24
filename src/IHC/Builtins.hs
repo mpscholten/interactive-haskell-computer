@@ -63,7 +63,6 @@ import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPt
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
-import System.IO.Unsafe (unsafePerformIO)
 import System.IO
     ( BufferMode(..)
     , Handle
@@ -84,6 +83,7 @@ import qualified System.Posix.IO as PosixIO
 import System.Posix.Types (Fd)
 
 import IHC.AST  (Name, Expr(..))
+import IHC.Runtime (IHCRuntime(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
@@ -93,35 +93,35 @@ import IHC.Scan (DataRegistry, FieldRegistry)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
 
-mkForeignPtrVal :: ForeignPtr Word8 -> IO Val
-mkForeignPtrVal fp = do
-    markForeignPtrWord8 fp
+mkForeignPtrVal :: IHCRuntime -> ForeignPtr Word8 -> IO Val
+mkForeignPtrVal rt fp = do
+    markForeignPtrWord8 rt fp
     addrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr (unsafeForeignPtrToPtr fp))))
     gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     pure (VCon "ForeignPtr" [addrT, gutsT])
 
-{-# NOINLINE foreignPtrWord8RangesRef #-}
-foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
-foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
+-- | Record a @ptr..(ptr + len)@ range as "originated as a ForeignPtr
+-- Word8" in 'rtForeignPtrRanges'.  Later 'isMarkedWord8Ptr' checks
+-- consult this list to decide whether a bare 'Ptr' can be safely
+-- interpreted as the raw payload of a 'ByteString'.
+markWord8Ptr :: IHCRuntime -> Ptr Word8 -> IO ()
+markWord8Ptr rt p = markWord8PtrRange rt p 1
 
-markWord8Ptr :: Ptr Word8 -> IO ()
-markWord8Ptr p = markWord8PtrRange p 1
-
-markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
-markWord8PtrRange p len =
+markWord8PtrRange :: IHCRuntime -> Ptr Word8 -> Int -> IO ()
+markWord8PtrRange rt p len =
     let start = ptrToIntPtr (castPtr p)
         end   = start + fromIntegral (max 1 len)
-    in modifyIORef' foreignPtrWord8RangesRef ((start, end) :)
+    in modifyIORef' (rtForeignPtrRanges rt) ((start, end) :)
 
-markForeignPtrWord8 :: ForeignPtr Word8 -> IO ()
-markForeignPtrWord8 fp =
-    markWord8Ptr (castPtr (unsafeForeignPtrToPtr fp))
+markForeignPtrWord8 :: IHCRuntime -> ForeignPtr Word8 -> IO ()
+markForeignPtrWord8 rt fp =
+    markWord8Ptr rt (castPtr (unsafeForeignPtrToPtr fp))
 
-isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
-isMarkedWord8Ptr p =
+isMarkedWord8Ptr :: IHCRuntime -> Ptr Word8 -> IO Bool
+isMarkedWord8Ptr rt p =
     let addr = ptrToIntPtr (castPtr p)
     in any (\(start, end) -> addr >= start && addr < end)
-        <$> readIORef foreignPtrWord8RangesRef
+        <$> readIORef (rtForeignPtrRanges rt)
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
@@ -154,15 +154,15 @@ foreignPtrValToForeignPtr other = error ("expected ForeignPtr: " <> showValForDe
 --
 -- The 'ClassRegistry' is threaded in so dispatch operations like @==@
 -- and @show@ can look up user-defined instances at runtime.
-builtinEnv :: ClassRegistry -> IO Env
-builtinEnv reg = do
+builtinEnv :: IHCRuntime -> ClassRegistry -> IO Env
+builtinEnv rt reg = do
     -- Lazy-init the bulk of the builtin table: a hello-world program only
     -- touches a handful of these (putStrLn, show, …), yet eager allocation
     -- used to spend ~60-80ms on IORef + VFun allocation per startup. We now
     -- store each entry as a 'LazyBuiltin' thunk that runs the host 'IO Val'
     -- action on first force (see 'IHC.Val.ThunkState' and 'IHC.Eval.force').
     pairs <- mapM (\(n, mkV) -> do { t <- newLazyBuiltinThunk mkV; pure (n, t) })
-                  (builtins reg)
+                  (builtins rt reg)
     -- Arity-0 ctor thunks (VCon name []) are already tiny constant values,
     -- so we keep them eager — deferring wouldn't save anything meaningful
     -- and many of these (True/False/[]/LT/…) are on virtually every hot
@@ -262,8 +262,8 @@ builtinEnv reg = do
             VPrimObj (PrimPtr p) -> pure (VPrimObj (PrimPtr p))
             _                   -> pure (VCon "Ptr" [addrT])  -- fallback
 
-builtins :: ClassRegistry -> [(Name, IO Val)]
-builtins reg =
+builtins :: IHCRuntime -> ClassRegistry -> [(Name, IO Val)]
+builtins rt reg =
     -- Arithmetic (TODO 2.6: replace with Num class dispatch)
     [ ("+",        binOpNum (+) (+))
     , ("-",        binOpNum (-) (-))
@@ -276,8 +276,8 @@ builtins reg =
     , ("signum",   unaryOpNum signum signum)
     , ("succ",     unaryOpNum (+1) (+1))
     , ("pred",     unaryOpNum (subtract 1) (subtract 1))
-    , ("min",      minDispatch reg)
-    , ("max",      maxDispatch reg)
+    , ("min",      minDispatch rt reg)
+    , ("max",      maxDispatch rt reg)
     , ("gcd",      binOpInt gcd)
     , ("subtract", binOpNum (\a b -> b - a) (\a b -> b - a))
     , ("sqrt",     unaryOpFloat sqrt)
@@ -293,13 +293,13 @@ builtins reg =
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
-    , ("==",       eqDispatch reg)
-    , ("/=",       neqDispatch reg)
-    , ("<",        ordDispatch reg 0)
-    , ("<=",       ordDispatch reg 1)
-    , (">",        ordDispatch reg 2)
-    , (">=",       ordDispatch reg 3)
-    , ("compare",  compareDispatch reg)
+    , ("==",       eqDispatch rt reg)
+    , ("/=",       neqDispatch rt reg)
+    , ("<",        ordDispatch rt reg 0)
+    , ("<=",       ordDispatch rt reg 1)
+    , (">",        ordDispatch rt reg 2)
+    , (">=",       ordDispatch rt reg 3)
+    , ("compare",  compareDispatch rt reg)
     , ("even",     evenB)
     , ("odd",      oddB)
     , ("not",      notB)
@@ -309,67 +309,67 @@ builtins reg =
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("++",       listConcat)
     , ("concatMap", concatMapB)
-    , ("show",     showDispatch reg)
+    , ("show",     showDispatch rt reg)
     , ("length",   lengthB)
     -- Data.ByteString shims (see isBuiltinBackedModule comment).
     -- Registered under bare names so qualified-alias fallback
     -- (`BS.pack` → `EVar "pack"`) hits these. Remove when
     -- source-load perf is fixed.
-    , ("Data.ByteString.empty",     bsEmptyB)
-    , ("Data.ByteString.null",      bsNullB)
-    , ("Data.ByteString.length",    bsLengthShimB)
-    , ("Data.ByteString.pack",      bsPackB)
-    , ("Data.ByteString.unpack",    bsUnpackB)
-    , ("Data.ByteString.append",    bsAppendB)
-    , ("Data.ByteString.concat",    bsConcatB)
-    , ("Data.ByteString.take",      bsTakeB)
-    , ("Data.ByteString.drop",      bsDropB)
-    , ("Data.ByteString.singleton", bsSingletonB)
-    , ("Data.ByteString.replicate", bsReplicateB)
-    , ("Data.ByteString.head",      bsHeadB)
-    , ("Data.ByteString.index",     bsIndexB)
+    , ("Data.ByteString.empty",     bsEmptyB rt)
+    , ("Data.ByteString.null",      bsNullB rt)
+    , ("Data.ByteString.length",    bsLengthShimB rt)
+    , ("Data.ByteString.pack",      bsPackB rt)
+    , ("Data.ByteString.unpack",    bsUnpackB rt)
+    , ("Data.ByteString.append",    bsAppendB rt)
+    , ("Data.ByteString.concat",    bsConcatB rt)
+    , ("Data.ByteString.take",      bsTakeB rt)
+    , ("Data.ByteString.drop",      bsDropB rt)
+    , ("Data.ByteString.singleton", bsSingletonB rt)
+    , ("Data.ByteString.replicate", bsReplicateB rt)
+    , ("Data.ByteString.head",      bsHeadB rt)
+    , ("Data.ByteString.index",     bsIndexB rt)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
     -- allocation boundaries; the caller-supplied fill action is still
     -- interpreted, but the mutable memory it writes into must be host-managed.
-    , ("create", bsCreateB)
-    , ("createAndTrim", bsCreateAndTrimB)
-    , ("createFp", bsCreateFpB)
-    , ("createFpAndTrim", bsCreateFpAndTrimB)
-    , ("Data.ByteString.Internal.create", bsCreateB)
-    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.create", bsCreateB)
-    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB)
-    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB)
-    , ("PS", bsPSConB)
-    , ("Data.ByteString.Internal.PS", bsPSConB)
-    , ("Data.ByteString.Internal.Type.PS", bsPSConB)
+    , ("create", bsCreateB rt)
+    , ("createAndTrim", bsCreateAndTrimB rt)
+    , ("createFp", bsCreateFpB rt)
+    , ("createFpAndTrim", bsCreateFpAndTrimB rt)
+    , ("Data.ByteString.Internal.create", bsCreateB rt)
+    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB rt)
+    , ("Data.ByteString.Internal.Type.create", bsCreateB rt)
+    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB rt)
+    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB rt)
+    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB rt)
+    , ("PS", bsPSConB rt)
+    , ("Data.ByteString.Internal.PS", bsPSConB rt)
+    , ("Data.ByteString.Internal.Type.PS", bsPSConB rt)
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
-    , ("newUnique", newUniqueB)
+    , ("newUnique", newUniqueB rt)
     , ("hashUnique", hashUniqueB)
-    , ("Data.Unique.newUnique", newUniqueB)
+    , ("Data.Unique.newUnique", newUniqueB rt)
     , ("Data.Unique.hashUnique", hashUniqueB)
-    , ("Data.Unique.Really.newUnique", newUniqueB)
+    , ("Data.Unique.Really.newUnique", newUniqueB rt)
     , ("Data.Unique.Really.hashUnique", hashUniqueB)
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
-    , ("Data.ByteString.Char8.empty",     bsEmptyB)
-    , ("Data.ByteString.Char8.null",      bsNullB)
-    , ("Data.ByteString.Char8.length",    bsLengthShimB)
-    , ("Data.ByteString.Char8.pack",      bs8PackB)
-    , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
-    , ("Data.ByteString.Char8.append",    bsAppendB)
-    , ("Data.ByteString.Char8.concat",    bsConcatB)
-    , ("Data.ByteString.Char8.take",      bsTakeB)
-    , ("Data.ByteString.Char8.drop",      bsDropB)
-    , ("Data.ByteString.Char8.singleton", bs8SingletonB)
-    , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
-    , ("Data.ByteString.Char8.head",      bs8HeadB)
-    , ("Data.ByteString.Char8.index",     bs8IndexB)
-    , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
+    , ("Data.ByteString.Char8.empty",     bsEmptyB rt)
+    , ("Data.ByteString.Char8.null",      bsNullB rt)
+    , ("Data.ByteString.Char8.length",    bsLengthShimB rt)
+    , ("Data.ByteString.Char8.pack",      bs8PackB rt)
+    , ("Data.ByteString.Char8.unpack",    bs8UnpackB rt)
+    , ("Data.ByteString.Char8.append",    bsAppendB rt)
+    , ("Data.ByteString.Char8.concat",    bsConcatB rt)
+    , ("Data.ByteString.Char8.take",      bsTakeB rt)
+    , ("Data.ByteString.Char8.drop",      bsDropB rt)
+    , ("Data.ByteString.Char8.singleton", bs8SingletonB rt)
+    , ("Data.ByteString.Char8.replicate", bs8ReplicateB rt)
+    , ("Data.ByteString.Char8.head",      bs8HeadB rt)
+    , ("Data.ByteString.Char8.index",     bs8IndexB rt)
+    , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB rt)
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
     -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
@@ -378,7 +378,7 @@ builtins reg =
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
-    , ("print",    printDispatch reg)
+    , ("print",    printDispatch rt reg)
     , ("putChar",  putCharB)
     , ("getLine",  getLineB)
     -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
@@ -387,9 +387,9 @@ builtins reg =
     , (">>=",      bindDispatch reg)
     , ("GHC.Internal.Base.>>=", bindDispatch reg)
     , ("Prelude.>>=", bindDispatch reg)
-    , (">>",       seqDispatch reg)
-    , ("GHC.Internal.Base.>>", seqDispatch reg)
-    , ("Prelude.>>", seqDispatch reg)
+    , (">>",       seqDispatch rt reg)
+    , ("GHC.Internal.Base.>>", seqDispatch rt reg)
+    , ("Prelude.>>", seqDispatch rt reg)
     , ("return",   returnB)
     , ("GHC.Internal.Base.return", returnB)
     , ("Prelude.return", returnB)
@@ -502,29 +502,29 @@ builtins reg =
     , ("nullPtr",   nullPtrB)
     , ("castPtr",   castPtrB)
     -- Phase 2.8: ForeignPtr
-    , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB)
-    , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
-    , ("withForeignPtr",             withForeignPtrB)
-    , ("unsafeWithForeignPtr",       withForeignPtrB)
-    , ("Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.withForeignPtr", withForeignPtrB)
-    , ("GHC.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("plusForeignPtr",             plusForeignPtrB)
+    , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB rt)
+    , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB rt)
+    , ("withForeignPtr",             withForeignPtrB rt)
+    , ("unsafeWithForeignPtr",       withForeignPtrB rt)
+    , ("Foreign.ForeignPtr.withForeignPtr", withForeignPtrB rt)
+    , ("Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB rt)
+    , ("Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB rt)
+    , ("Foreign.ForeignPtr.Safe.withForeignPtr", withForeignPtrB rt)
+    , ("GHC.ForeignPtr.withForeignPtr", withForeignPtrB rt)
+    , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB rt)
+    , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB rt)
+    , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB rt)
+    , ("plusForeignPtr",             plusForeignPtrB rt)
     , ("touchForeignPtr",            touchForeignPtrB)
-    , ("newForeignPtr_",             newForeignPtr_B)
-    , ("newForeignPtr",              newForeignPtrB)
+    , ("newForeignPtr_",             newForeignPtr_B rt)
+    , ("newForeignPtr",              newForeignPtrB rt)
     , ("addForeignPtrFinalizer",     addForeignPtrFinalizerB)
-    , ("Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.newForeignPtr", newForeignPtrB)
-    , ("GHC.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
+    , ("Foreign.ForeignPtr.newForeignPtr", newForeignPtrB rt)
+    , ("Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB rt)
+    , ("Foreign.ForeignPtr.Safe.newForeignPtr", newForeignPtrB rt)
+    , ("GHC.ForeignPtr.newForeignPtr", newForeignPtrB rt)
+    , ("GHC.Internal.Foreign.ForeignPtr.newForeignPtr", newForeignPtrB rt)
+    , ("GHC.Internal.Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB rt)
     , ("Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Safe.addForeignPtrFinalizer", addForeignPtrFinalizerB)
@@ -532,21 +532,21 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     -- Phase 2.8: Storable ops on Ptr
-    , ("peek",         peekB)
-    , ("Foreign.peek", peekB)
-    , ("Foreign.Storable.peek", peekB)
-    , ("GHC.Internal.Foreign.Storable.peek", peekB)
-    , ("Network.Socket.Imports.peek", peekB)
+    , ("peek",         peekB rt)
+    , ("Foreign.peek", peekB rt)
+    , ("Foreign.Storable.peek", peekB rt)
+    , ("GHC.Internal.Foreign.Storable.peek", peekB rt)
+    , ("Network.Socket.Imports.peek", peekB rt)
     , ("poke",         pokeB)
     , ("Foreign.poke", pokeB)
     , ("Foreign.Storable.poke", pokeB)
     , ("GHC.Internal.Foreign.Storable.poke", pokeB)
     , ("Network.Socket.Imports.poke", pokeB)
-    , ("peekByteOff",  peekByteOffB)
-    , ("Foreign.peekByteOff", peekByteOffB)
-    , ("Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("GHC.Internal.Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("Network.Socket.Imports.peekByteOff", peekByteOffB)
+    , ("peekByteOff",  peekByteOffB rt)
+    , ("Foreign.peekByteOff", peekByteOffB rt)
+    , ("Foreign.Storable.peekByteOff", peekByteOffB rt)
+    , ("GHC.Internal.Foreign.Storable.peekByteOff", peekByteOffB rt)
+    , ("Network.Socket.Imports.peekByteOff", peekByteOffB rt)
     , ("pokeByteOff",  pokeByteOffB)
     , ("Foreign.pokeByteOff", pokeByteOffB)
     , ("Foreign.Storable.pokeByteOff", pokeByteOffB)
@@ -799,11 +799,11 @@ builtins reg =
     , ("GHC.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
-    , ("registerTimeout", registerTimeoutB)
-    , ("GHC.Event.registerTimeout", registerTimeoutB)
-    , ("GHC.Event.TimerManager.registerTimeout", registerTimeoutB)
-    , ("GHC.Internal.Event.registerTimeout", registerTimeoutB)
-    , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB)
+    , ("registerTimeout", registerTimeoutB rt)
+    , ("GHC.Event.registerTimeout", registerTimeoutB rt)
+    , ("GHC.Event.TimerManager.registerTimeout", registerTimeoutB rt)
+    , ("GHC.Internal.Event.registerTimeout", registerTimeoutB rt)
+    , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB rt)
     , ("unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Event.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
@@ -1092,7 +1092,7 @@ builtins reg =
     , ("mkWeak#",               mkWeakHashB)
     , ("mkWeakNoFinalizer#",    mkWeakNoFinalizerHashB)
     -- Phase 2.11: TH Lift builtins.
-    ] ++ thBuiltinPairs
+    ] ++ thBuiltinPairs rt
 
 --------------------------------------------------------------------------------
 -- Builders
@@ -1241,18 +1241,18 @@ orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 -- | Eq dispatch: look up "==" method from the class registry.
 -- Method slot 0 = (==), slot 1 = (/=).
-eqDispatch :: ClassRegistry -> IO Val
-eqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+eqDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+eqDispatch rt reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    eqVals reg av bv
+    eqVals rt reg av bv
 
 -- | /= dispatch.
-neqDispatch :: ClassRegistry -> IO Val
-neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+neqDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+neqDispatch rt reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    r <- eqVals reg av bv
+    r <- eqVals rt reg av bv
     pure (boolVal (not (isTruthy r)))
 
 -- | Core equality test on WHNF values.
@@ -1274,8 +1274,8 @@ forceInstanceMethod (Just v) = do
     isPlaceholder (VCon n []) = n == BC.pack "<ihc-method-placeholder>"
     isPlaceholder _           = False
 
-eqVals :: ClassRegistry -> Val -> Val -> IO Val
-eqVals reg av bv = case (av, bv) of
+eqVals :: IHCRuntime -> ClassRegistry -> Val -> Val -> IO Val
+eqVals rt reg av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (x == y))
     (VFloat x, VFloat y) -> pure (boolVal (x == y))
     (VInt x, VFloat y)   -> pure (boolVal (fromIntegral x == y))
@@ -1306,8 +1306,8 @@ eqVals reg av bv = case (av, bv) of
     -- Default VCon field-by-field would compare fp1 == fp2 which is
     -- always False for freshly-allocated buffers with the same bytes.
     (VCon "BS" _, VCon "BS" _) -> do
-        ba <- bsValToBS av
-        bb <- bsValToBS bv
+        ba <- bsValToBS rt av
+        bb <- bsValToBS rt bv
         pure (boolVal (ba == bb))
     (VCon n1 ts1, VCon n2 ts2)
         | n1 /= n2  -> pure (boolVal False)
@@ -1316,7 +1316,7 @@ eqVals reg av bv = case (av, bv) of
             results <- mapM (\(t1, t2) -> do
                 v1 <- force t1
                 v2 <- force t2
-                eqVals reg v1 v2)
+                eqVals rt reg v1 v2)
                 (zip ts1 ts2)
             pure (boolVal (all isTruthy results))
     _ -> do
@@ -1338,14 +1338,14 @@ eqVals reg av bv = case (av, bv) of
 --   0 = (<), 1 = (<=), 2 = (>), 3 = (>=), 4 = compare
 -- We implement all four directly for builtin types and use
 -- registry lookup for user-defined types.
-ordDispatch :: ClassRegistry -> Int -> IO Val
-ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+ordDispatch :: IHCRuntime -> ClassRegistry -> Int -> IO Val
+ordDispatch rt reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    ordCmp reg slot av bv
+    ordCmp rt reg slot av bv
 
-ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
-ordCmp _reg slot av bv = case (av, bv) of
+ordCmp :: IHCRuntime -> ClassRegistry -> Int -> Val -> Val -> IO Val
+ordCmp rt _reg slot av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (intOrdSlot slot x y))
     (VFloat x, VFloat y) -> pure (boolVal (dblOrdSlot slot x y))
     (VInt x, VFloat y)   -> pure (boolVal (dblOrdSlot slot (fromIntegral x) y))
@@ -1362,8 +1362,8 @@ ordCmp _reg slot av bv = case (av, bv) of
     -- host Ord, not structural VCon-field compare (which compares
     -- ForeignPtr addresses and gives meaningless results).
     (VCon "BS" _, VCon "BS" _) -> do
-        ba <- bsValToBS av
-        bb <- bsValToBS bv
+        ba <- bsValToBS rt av
+        bb <- bsValToBS rt bv
         let o = compare ba bb
         pure (boolVal (ordSlot slot o))
     _ -> do
@@ -1388,18 +1388,18 @@ ordCmp _reg slot av bv = case (av, bv) of
                 -- fallback: if both values are VCon, derive an Ord by
                 -- comparing constructor identity first, then fields
                 -- left-to-right. This mirrors 'eqVals' for Eq.
-                mOrd <- structuralOrdering _reg av bv
+                mOrd <- structuralOrdering rt _reg av bv
                 case mOrd of
                     Just o  -> pure (boolVal (ordSlot slot o))
                     Nothing ->
                         -- Fall back to Eq for <= and >=
                         case slot of
-                            1 -> do r <- eqVals _reg av bv
+                            1 -> do r <- eqVals rt _reg av bv
                                     if isTruthy r then pure (boolVal True)
-                                    else ordCmp _reg 0 av bv
-                            3 -> do r <- eqVals _reg av bv
+                                    else ordCmp rt _reg 0 av bv
+                            3 -> do r <- eqVals rt _reg av bv
                                     if isTruthy r then pure (boolVal True)
-                                    else ordCmp _reg 2 av bv
+                                    else ordCmp rt _reg 2 av bv
                             _ -> error ("Ord: no instance for type tag `"
                                         <> BC.unpack (typeTagOf av) <> "` while comparing "
                                         <> showValForDebug av <> " and "
@@ -1459,23 +1459,19 @@ ordCmp _reg slot av bv = case (av, bv) of
 -- once per module load and read many times per comparison; races
 -- aren't a concern because the scheduler only rebuilds the env
 -- single-threaded.
-{-# NOINLINE ctorIndexRegistry #-}
-ctorIndexRegistry :: IORef (Map.Map ByteString (ByteString, Int))
-ctorIndexRegistry = unsafePerformIO (newIORef Map.empty)
-
 -- | Merge the @(typeName, declIndex)@ entries from a 'DataRegistry'
--- into the global 'ctorIndexRegistry'. Arity is intentionally dropped
--- here — the index registry only cares about ordering.
-populateCtorIndex :: DataRegistry -> IO ()
-populateCtorIndex reg =
-    modifyIORef' ctorIndexRegistry $ \m ->
+-- into 'rtCtorIndex'. Arity is intentionally dropped here — the index
+-- registry only cares about ordering.
+populateCtorIndex :: IHCRuntime -> DataRegistry -> IO ()
+populateCtorIndex rt reg =
+    modifyIORef' (rtCtorIndex rt) $ \m ->
         Map.union m (Map.map (\(tyName, _arity, idx) -> (tyName, idx)) reg)
 
--- | Look up a constructor's @(typeName, declIndex)@ in the global
+-- | Look up a constructor's @(typeName, declIndex)@ in the per-run
 -- registry. Built-in constructors (list, Bool, tuples, Unit) aren't
 -- recorded there — structural ordering handles them explicitly.
-lookupCtorIndex :: ByteString -> IO (Maybe (ByteString, Int))
-lookupCtorIndex name = Map.lookup name <$> readIORef ctorIndexRegistry
+lookupCtorIndex :: IHCRuntime -> ByteString -> IO (Maybe (ByteString, Int))
+lookupCtorIndex rt name = Map.lookup name <$> readIORef (rtCtorIndex rt)
 
 -- | Structural Ord fallback for VCon values.
 --
@@ -1495,8 +1491,8 @@ lookupCtorIndex name = Map.lookup name <$> readIORef ctorIndexRegistry
 --      to lexicographic comparison of the constructor name. This is a
 --      best-effort last resort; correct programs shouldn't compare
 --      values of unrelated types.
-structuralOrdering :: ClassRegistry -> Val -> Val -> IO (Maybe Ordering)
-structuralOrdering reg av bv = case (av, bv) of
+structuralOrdering :: IHCRuntime -> ClassRegistry -> Val -> Val -> IO (Maybe Ordering)
+structuralOrdering rt reg av bv = case (av, bv) of
     (VUnit, VUnit) -> pure (Just EQ)
     -- Bool is declared `data Bool = False | True` so False < True.
     (VCon "False" _, VCon "False" _) -> pure (Just EQ)
@@ -1515,8 +1511,8 @@ structuralOrdering reg av bv = case (av, bv) of
         | otherwise -> do
             -- Different constructors: prefer the declaration-index
             -- registry so user-derived Ord matches GHC semantics.
-            mIdx1 <- lookupCtorIndex n1
-            mIdx2 <- lookupCtorIndex n2
+            mIdx1 <- lookupCtorIndex rt n1
+            mIdx2 <- lookupCtorIndex rt n2
             case (mIdx1, mIdx2) of
                 (Just (ty1, i1), Just (ty2, i2)) | ty1 == ty2 ->
                     pure (Just (compare i1 i2))
@@ -1534,7 +1530,7 @@ structuralOrdering reg av bv = case (av, bv) of
         -- Recurse through the full Ord dispatch (user instances +
         -- structural fallback) rather than structuralOrdering directly,
         -- so primitive fields (Int, Char, etc.) hit their fast paths.
-        mo <- valOrdering reg v1 v2
+        mo <- valOrdering rt reg v1 v2
         case mo of
             EQ -> compareFields r1 r2
             o  -> pure o
@@ -1543,8 +1539,8 @@ structuralOrdering reg av bv = case (av, bv) of
 -- | Run the full Ord dispatch and distil the result into a host
 -- 'Ordering'. Used by 'structuralOrdering' and 'compareDispatch' so
 -- every code path shares the same ordering logic.
-valOrdering :: ClassRegistry -> Val -> Val -> IO Ordering
-valOrdering reg av bv = case (av, bv) of
+valOrdering :: IHCRuntime -> ClassRegistry -> Val -> Val -> IO Ordering
+valOrdering rt reg av bv = case (av, bv) of
     (VInt x,   VInt y)   -> pure (compare x y)
     (VFloat x, VFloat y) -> pure (compare x y)
     (VInt x,   VFloat y) -> pure (compare (fromIntegral x :: Double) y)
@@ -1567,15 +1563,15 @@ valOrdering reg av bv = case (av, bv) of
                 cv <- apply r1 bT
                 pure (orderingFromVCon cv)
             _ -> do
-                mo <- structuralOrdering reg av bv
+                mo <- structuralOrdering rt reg av bv
                 case mo of
                     Just o  -> pure o
                     Nothing -> do
                         -- Last resort: use slot-0 (<) and Eq to triangulate.
-                        lt <- ordCmp reg 0 av bv
+                        lt <- ordCmp rt reg 0 av bv
                         if isTruthy lt then pure LT
                         else do
-                            eq <- eqVals reg av bv
+                            eq <- eqVals rt reg av bv
                             if isTruthy eq then pure EQ else pure GT
   where
     orderingFromVCon (VCon "LT" _) = LT
@@ -1590,11 +1586,11 @@ valOrdering reg av bv = case (av, bv) of
 -- Shared path with ordCmp via 'valOrdering', so user-defined ADTs
 -- (including 'deriving Ord') pick up the same structural fallback
 -- that drives @<@, @<=@, @>@, @>=@.
-compareDispatch :: ClassRegistry -> IO Val
-compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+compareDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+compareDispatch rt reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    o  <- valOrdering reg av bv
+    o  <- valOrdering rt reg av bv
     pure (VCon (orderingName o) [])
   where
     orderingName LT = "LT"
@@ -1605,37 +1601,37 @@ compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- @compare x y /= GT@, otherwise @y@. Works for every type 'ordCmp'
 -- supports (numeric, primitive, and any VCon via the structural
 -- fallback), not just numbers.
-minDispatch :: ClassRegistry -> IO Val
-minDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+minDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+minDispatch rt reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    o  <- valOrdering reg av bv
+    o  <- valOrdering rt reg av bv
     case o of
         GT -> pure bv
         _  -> pure av
 
 -- | @max x y@ dispatched through 'valOrdering'. Counterpart to
 -- 'minDispatch'.
-maxDispatch :: ClassRegistry -> IO Val
-maxDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+maxDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+maxDispatch rt reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a
     bv <- force b
-    o  <- valOrdering reg av bv
+    o  <- valOrdering rt reg av bv
     case o of
         LT -> pure bv
         _  -> pure av
 
 -- | Show dispatch: look up "show" in the Show class registry.
 -- Slot 0 = show. Falls back to built-in showVal for base types.
-showDispatch :: ClassRegistry -> IO Val
-showDispatch reg = pure $ VFun $ \a -> do
+showDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+showDispatch rt reg = pure $ VFun $ \a -> do
     av <- force a
-    s  <- showValWith reg av
+    s  <- showValWith rt reg av
     stringToListValIO s
 
 -- | Show a value, consulting the ClassRegistry for user-defined Show.
-showValWith :: ClassRegistry -> Val -> IO String
-showValWith reg av = case av of
+showValWith :: IHCRuntime -> ClassRegistry -> Val -> IO String
+showValWith rt reg av = case av of
     VLabel name -> pure ("#" <> BC.unpack name)   -- Phase 3.5: #name
     VInt _    -> showVal av
     VFloat _  -> showVal av
@@ -1648,7 +1644,7 @@ showValWith reg av = case av of
         if cl then showVal av
         else do
             xs <- forceList av
-            parts <- mapM (showValWith reg) xs
+            parts <- mapM (showValWith rt reg) xs
             pure ("[" <> intercalate "," parts <> "]")
     VCon "True" _  -> pure "True"
     VCon "False" _ -> pure "False"
@@ -1657,7 +1653,7 @@ showValWith reg av = case av of
         -- Render a ByteString using Data.ByteString.Char8's show-style
         -- output: `"..."` with printable ASCII passed through and
         -- non-printables escaped. Matches the GHC stock instance.
-        bs <- bsValToBS av
+        bs <- bsValToBS rt av
         pure (show bs)
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
@@ -2155,10 +2151,10 @@ putStrB = pure $ VFun $ \a -> pure $ VIO $ do
 
 -- printB replaced by printDispatch in Phase 2.3
 
-printDispatch :: ClassRegistry -> IO Val
-printDispatch reg = pure $ VFun $ \a -> pure $ VIO $ do
+printDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+printDispatch rt reg = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
-    s  <- showValWith reg av
+    s  <- showValWith rt reg av
     putStrLn s
     hFlush stdout
     pure VUnit
@@ -2279,8 +2275,8 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                         runIOVal r
 
 -- | @m >> n@ = run m (discarding result), then run n.
-seqDispatch :: ClassRegistry -> IO Val
-seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
+seqDispatch :: IHCRuntime -> ClassRegistry -> IO Val
+seqDispatch _rt reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
     mv <- force ma
     case mv of
         VIO _ -> pure $ VIO $ do
@@ -3009,14 +3005,14 @@ castPtrB = pure $ VFun $ \a -> force a
 -- Phase 2.8: ForeignPtr
 --------------------------------------------------------------------------------
 
-mallocForeignPtrBytesB :: IO Val
-mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
+mallocForeignPtrBytesB :: IHCRuntime -> IO Val
+mallocForeignPtrBytesB rt = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
     case av of
         VInt n -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            mkForeignPtrVal fp
+            markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
+            mkForeignPtrVal rt fp
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
@@ -3033,16 +3029,16 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
 --------------------------------------------------------------------------------
 
 -- | Build a fresh bytestring value with the given ForeignPtr and length.
-mkBsVal :: ForeignPtr Word8 -> Int -> IO Val
-mkBsVal fp len = do
-    markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) len
+mkBsVal :: IHCRuntime -> ForeignPtr Word8 -> Int -> IO Val
+mkBsVal rt fp len = do
+    markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) len
     fpT  <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     lenT <- newWHNFThunk (VInt (fromIntegral len))
     pure (VCon "BS" [fpT, lenT])
 
 -- | Unpack a bytestring into its '(ForeignPtr Word8, Int)' payload.
-bsValPayload :: Val -> IO (ForeignPtr Word8, Int)
-bsValPayload v = case v of
+bsValPayload :: IHCRuntime -> Val -> IO (ForeignPtr Word8, Int)
+bsValPayload rt v = case v of
     VCon "PS" [fpT, offT, lenT] -> do
         fpv  <- force fpT
         offv <- force offT
@@ -3068,31 +3064,27 @@ bsValPayload v = case v of
         withForeignPtr fp $ \dst ->
             BS.useAsCStringLen bs $ \(src, n) ->
                 copyBytes (castPtr dst) (castPtr src) n
-        markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
+        markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
         pure (fp, BS.length bs)
 
-bsEmptyB :: IO Val
-bsEmptyB = do
+bsEmptyB :: IHCRuntime -> IO Val
+bsEmptyB rt = do
     fp <- mallocForeignPtrBytes 0
-    mkBsVal fp 0
+    mkBsVal rt fp 0
 
-bsPSConB :: IO Val
-bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
+bsPSConB :: IHCRuntime -> IO Val
+bsPSConB rt = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
     fpv <- force fpT
     offv <- force offT
     lenv <- force lenT
     fp <- foreignPtrValToForeignPtr fpv
     case (offv, lenv) of
-        (VInt off, VInt len) -> mkBsVal (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
+        (VInt off, VInt len) -> mkBsVal rt (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
         _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
 
-{-# NOINLINE uniqueCounterRef #-}
-uniqueCounterRef :: IORef Int64
-uniqueCounterRef = unsafePerformIO (newIORef 0)
-
-newUniqueB :: IO Val
-newUniqueB = pure $ VIO $ do
-    n <- atomicModifyIORef' uniqueCounterRef $ \x ->
+newUniqueB :: IHCRuntime -> IO Val
+newUniqueB rt = pure $ VIO $ do
+    n <- atomicModifyIORef' (rtUniqueCounter rt) $ \x ->
         let x' = x + 1 in (x', x')
     nT <- newWHNFThunk (VInt n)
     pure (VCon "Unique" [nT])
@@ -3111,80 +3103,80 @@ byteStringCreateLen label val =
         VInt n -> pure (fromIntegral n)
         other  -> error (label <> ": callback did not return Int: " <> showValForDebug other)
 
-bsCreateB :: IO Val
-bsCreateB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+bsCreateB :: IHCRuntime -> IO Val
+bsCreateB rt = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
     lenV <- force lenT
     actionV <- force actionT
     case lenV of
         VInt n | n >= 0 -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
+            markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
             withForeignPtr fp $ \ptr -> do
                 ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
                 rv <- apply actionV ptrT
                 _ <- runIOVal rv
-                mkBsVal fp (fromIntegral n)
+                mkBsVal rt fp (fromIntegral n)
         _ -> error ("create: not a non-negative Int: " <> showValForDebug lenV)
 
-bsCreateAndTrimB :: IO Val
-bsCreateAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+bsCreateAndTrimB :: IHCRuntime -> IO Val
+bsCreateAndTrimB rt = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
     maxLenV <- force maxLenT
     actionV <- force actionT
     case maxLenV of
         VInt maxLen | maxLen >= 0 -> do
             fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
+            markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
             used <- withForeignPtr fp $ \ptr -> do
                 ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
                 rv <- apply actionV ptrT
                 byteStringCreateLen "createAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
+            mkBsVal rt fp (min (fromIntegral maxLen) (max 0 used))
         _ -> error ("createAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
 
-bsCreateFpB :: IO Val
-bsCreateFpB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+bsCreateFpB :: IHCRuntime -> IO Val
+bsCreateFpB rt = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
     lenV <- force lenT
     actionV <- force actionT
     case lenV of
         VInt n | n >= 0 -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            fpVal <- mkForeignPtrVal fp
+            markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
+            fpVal <- mkForeignPtrVal rt fp
             fpT <- newWHNFThunk fpVal
             rv <- apply actionV fpT
             _ <- runIOVal rv
-            mkBsVal fp (fromIntegral n)
+            mkBsVal rt fp (fromIntegral n)
         _ -> error ("createFp: not a non-negative Int: " <> showValForDebug lenV)
 
-bsCreateFpAndTrimB :: IO Val
-bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
+bsCreateFpAndTrimB :: IHCRuntime -> IO Val
+bsCreateFpAndTrimB rt = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
     maxLenV <- force maxLenT
     actionV <- force actionT
     case maxLenV of
         VInt maxLen | maxLen >= 0 -> do
             fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            fpVal <- mkForeignPtrVal fp
+            markWord8PtrRange rt (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
+            fpVal <- mkForeignPtrVal rt fp
             fpT <- newWHNFThunk fpVal
             rv <- apply actionV fpT
             used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
+            mkBsVal rt fp (min (fromIntegral maxLen) (max 0 used))
         _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
 
-bsLengthShimB :: IO Val
-bsLengthShimB = pure $ VFun $ \a -> do
+bsLengthShimB :: IHCRuntime -> IO Val
+bsLengthShimB rt = pure $ VFun $ \a -> do
     av <- force a
-    (_, len) <- bsValPayload av
+    (_, len) <- bsValPayload rt av
     pure (VInt (fromIntegral len))
 
-bsNullB :: IO Val
-bsNullB = pure $ VFun $ \a -> do
+bsNullB :: IHCRuntime -> IO Val
+bsNullB rt = pure $ VFun $ \a -> do
     av <- force a
-    (_, len) <- bsValPayload av
+    (_, len) <- bsValPayload rt av
     pure (VCon (if len == 0 then "True" else "False") [])
 
-bsPackB :: IO Val
-bsPackB = pure $ VFun $ \a -> do
+bsPackB :: IHCRuntime -> IO Val
+bsPackB rt = pure $ VFun $ \a -> do
     av <- force a
     ws <- valToWord8List av
     let len = length ws
@@ -3194,7 +3186,7 @@ bsPackB = pure $ VFun $ \a -> do
         withForeignPtr newfp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
             copyBytes (castPtr dst) (castPtr src) l
         pure newfp
-    mkBsVal fp len
+    mkBsVal rt fp len
 
 -- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
 -- and forces the payload. Also accepts `Identity { runIdentity = x }`
@@ -3207,79 +3199,79 @@ runIdentityB = pure $ VFun $ \a -> do
         other -> error ("runIdentity: expected Identity wrapper, got "
                          <> showValForDebug other)
 
-bsUnpackB :: IO Val
-bsUnpackB = pure $ VFun $ \a -> do
+bsUnpackB :: IHCRuntime -> IO Val
+bsUnpackB rt = pure $ VFun $ \a -> do
     av <- force a
-    (fp, len) <- bsValPayload av
+    (fp, len) <- bsValPayload rt av
     ws <- withForeignPtr fp $ \ptr ->
         mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
     wordsToConsList ws
 
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
-bsValToBS :: Val -> IO BS.ByteString
-bsValToBS v = do
-    (fp, len) <- bsValPayload v
+bsValToBS :: IHCRuntime -> Val -> IO BS.ByteString
+bsValToBS rt v = do
+    (fp, len) <- bsValPayload rt v
     withForeignPtr fp $ \ptr ->
         BS.packCStringLen (castPtr ptr, len)
 
 -- | Build a 'VCon "BS"' from a host ByteString by copying into a fresh ForeignPtr.
-bsFromBS :: BS.ByteString -> IO Val
-bsFromBS bs = do
+bsFromBS :: IHCRuntime -> BS.ByteString -> IO Val
+bsFromBS rt bs = do
     let len = BS.length bs
     fp <- mallocForeignPtrBytes len
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
-    mkBsVal fp len
+    mkBsVal rt fp len
 
-bsAppendB :: IO Val
-bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+bsAppendB :: IHCRuntime -> IO Val
+bsAppendB rt = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force a; bv <- force b
-    ba <- bsValToBS av; bb <- bsValToBS bv
-    bsFromBS (BS.append ba bb)
+    ba <- bsValToBS rt av; bb <- bsValToBS rt bv
+    bsFromBS rt (BS.append ba bb)
 
-bsConcatB :: IO Val
-bsConcatB = pure $ VFun $ \a -> do
+bsConcatB :: IHCRuntime -> IO Val
+bsConcatB rt = pure $ VFun $ \a -> do
     av <- force a
     xs <- valToBsList av
-    bsFromBS (BS.concat xs)
+    bsFromBS rt (BS.concat xs)
   where
     valToBsList (VCon "[]" _)       = pure []
     valToBsList (VCon ":" [hT, tT]) = do
         hv <- force hT
-        h  <- bsValToBS hv
+        h  <- bsValToBS rt hv
         tv <- force tT
         (h :) <$> valToBsList tv
     valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
 
-bsTakeB :: IO Val
-bsTakeB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
+bsTakeB :: IHCRuntime -> IO Val
+bsTakeB rt = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
     nv <- force nT; av <- force aT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
         _      -> error ("BS.take: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.take n bs)
+    bs <- bsValToBS rt av
+    bsFromBS rt (BS.take n bs)
 
-bsDropB :: IO Val
-bsDropB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
+bsDropB :: IHCRuntime -> IO Val
+bsDropB rt = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
     nv <- force nT; av <- force aT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
         _      -> error ("BS.drop: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.drop n bs)
+    bs <- bsValToBS rt av
+    bsFromBS rt (BS.drop n bs)
 
-bsSingletonB :: IO Val
-bsSingletonB = pure $ VFun $ \wT -> do
+bsSingletonB :: IHCRuntime -> IO Val
+bsSingletonB rt = pure $ VFun $ \wT -> do
     wv <- force wT
     w <- case wv of
         VInt i  -> pure (fromIntegral i :: Word8)
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
         _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
-    bsFromBS (BS.singleton w)
+    bsFromBS rt (BS.singleton w)
 
-bsReplicateB :: IO Val
-bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
+bsReplicateB :: IHCRuntime -> IO Val
+bsReplicateB rt = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
     nv <- force nT; wv <- force wT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
@@ -3288,25 +3280,25 @@ bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
         VInt i  -> pure (fromIntegral i :: Word8)
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
         _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
-    bsFromBS (BS.replicate n w)
+    bsFromBS rt (BS.replicate n w)
 
-bsHeadB :: IO Val
-bsHeadB = pure $ VFun $ \aT -> do
+bsHeadB :: IHCRuntime -> IO Val
+bsHeadB rt = pure $ VFun $ \aT -> do
     av <- force aT
-    (fp, len) <- bsValPayload av
+    (fp, len) <- bsValPayload rt av
     if len <= 0
         then error "BS.head: empty ByteString"
         else do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
             pure (VInt (fromIntegral w))
 
-bsIndexB :: IO Val
-bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
+bsIndexB :: IHCRuntime -> IO Val
+bsIndexB rt = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
     av <- force aT; iv <- force iT
     i <- case iv of
         VInt n -> pure (fromIntegral n :: Int)
         _      -> error ("BS.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
+    (fp, len) <- bsValPayload rt av
     if i < 0 || i >= len
         then error ("BS.index: out of bounds: " <> show i <> " vs length " <> show len)
         else do
@@ -3315,31 +3307,31 @@ bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
 
 -- | Data.ByteString.Char8.pack — same runtime value as BS.pack but
 -- input is a String ([Char]) with each Char lowered to a Word8 byte.
-bs8PackB :: IO Val
-bs8PackB = pure $ VFun $ \a -> do
+bs8PackB :: IHCRuntime -> IO Val
+bs8PackB rt = pure $ VFun $ \a -> do
     av <- force a
     s  <- valToString av
-    bsFromBS (BC.pack s)
+    bsFromBS rt (BC.pack s)
 
 -- | Data.ByteString.Char8.unpack — BS → String by reading each byte
 -- as the corresponding Char (not UTF-8 decoded).
-bs8UnpackB :: IO Val
-bs8UnpackB = pure $ VFun $ \a -> do
+bs8UnpackB :: IHCRuntime -> IO Val
+bs8UnpackB rt = pure $ VFun $ \a -> do
     av <- force a
-    bs <- bsValToBS av
+    bs <- bsValToBS rt av
     stringToListValIO (BC.unpack bs)
 
-bs8SingletonB :: IO Val
-bs8SingletonB = pure $ VFun $ \cT -> do
+bs8SingletonB :: IHCRuntime -> IO Val
+bs8SingletonB rt = pure $ VFun $ \cT -> do
     cv <- force cT
     c <- case cv of
         VChar ch -> pure ch
         VInt  n  -> pure (toEnum (fromIntegral n))
         _        -> error ("BS.Char8.singleton: not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.singleton c)
+    bsFromBS rt (BC.singleton c)
 
-bs8ReplicateB :: IO Val
-bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
+bs8ReplicateB :: IHCRuntime -> IO Val
+bs8ReplicateB rt = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
     nv <- force nT; cv <- force cT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
@@ -3348,35 +3340,35 @@ bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
         VChar ch -> pure ch
         VInt  i  -> pure (toEnum (fromIntegral i))
         _        -> error ("BS.Char8.replicate: second arg not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.replicate n c)
+    bsFromBS rt (BC.replicate n c)
 
-bs8HeadB :: IO Val
-bs8HeadB = pure $ VFun $ \aT -> do
+bs8HeadB :: IHCRuntime -> IO Val
+bs8HeadB rt = pure $ VFun $ \aT -> do
     av <- force aT
-    (fp, len) <- bsValPayload av
+    (fp, len) <- bsValPayload rt av
     if len <= 0
         then error "BS.Char8.head: empty ByteString"
         else do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
             pure (VChar (toEnum (fromIntegral w)))
 
-bs8IndexB :: IO Val
-bs8IndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
+bs8IndexB :: IHCRuntime -> IO Val
+bs8IndexB rt = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
     av <- force aT; iv <- force iT
     i <- case iv of
         VInt n -> pure (fromIntegral n :: Int)
         _      -> error ("BS.Char8.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
+    (fp, len) <- bsValPayload rt av
     if i < 0 || i >= len
         then error ("BS.Char8.index: out of bounds: " <> show i <> " vs length " <> show len)
         else do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
             pure (VChar (toEnum (fromIntegral w)))
 
-bs8PutStrLnB :: IO Val
-bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
+bs8PutStrLnB :: IHCRuntime -> IO Val
+bs8PutStrLnB rt = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
-    bs <- bsValToBS av
+    bs <- bsValToBS rt av
     BC.putStrLn bs
     hFlush stdout
     pure VUnit
@@ -3405,26 +3397,26 @@ wordsToConsList (w:ws) = do
     tT <- newWHNFThunk tV
     pure (VCon ":" [hT, tT])
 
-withForeignPtrB :: IO Val
-withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
+withForeignPtrB :: IHCRuntime -> IO Val
+withForeignPtrB rt = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
     fpv <- force fpT; fv <- force fT
     fp <- foreignPtrValToForeignPtr fpv
-    markForeignPtrWord8 fp
+    markForeignPtrWord8 rt fp
     withForeignPtr fp $ \ptr -> do
-        markWord8Ptr (castPtr ptr)
+        markWord8Ptr rt (castPtr ptr)
         pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
         rv <- apply fv pT
         runIOVal rv
 
-plusForeignPtrB :: IO Val
-plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
+plusForeignPtrB :: IHCRuntime -> IO Val
+plusForeignPtrB rt = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
     fpv <- force fpT; nv <- force nT
     case (fpv, nv) of
         -- ForeignPtr is RTS-backed and has no pure-Haskell storage model in IHC,
         -- so this builtin must preserve the host pointer offset exactly.
         (_, VInt n) -> do
             fp <- foreignPtrValToForeignPtr fpv
-            mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
+            mkForeignPtrVal rt (plusForeignPtr fp (fromIntegral n))
         _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
 
 touchForeignPtrB :: IO Val
@@ -3434,19 +3426,19 @@ touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
     touchForeignPtr fp
     pure VUnit
 
-newForeignPtr_B :: IO Val
-newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
+newForeignPtr_B :: IHCRuntime -> IO Val
+newForeignPtr_B rt = pure $ VFun $ \pT -> pure $ VIO $ do
     pv <- force pT
     p <- ptrValToPtr pv
     fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
+    mkForeignPtrVal rt fp
 
-newForeignPtrB :: IO Val
-newForeignPtrB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
+newForeignPtrB :: IHCRuntime -> IO Val
+newForeignPtrB rt = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
     pv <- force pT
     p <- ptrValToPtr pv
     fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
+    mkForeignPtrVal rt fp
 
 addForeignPtrFinalizerB :: IO Val
 addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pure $ VIO $ do
@@ -3458,11 +3450,11 @@ addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pu
 -- Phase 2.8: Storable ops on Ptr
 --------------------------------------------------------------------------------
 
-peekB :: IO Val
-peekB = pure $ VFun $ \a -> pure $ VIO $ do
+peekB :: IHCRuntime -> IO Val
+peekB rt = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
     p <- ptrValToPtr av
-    isWord8 <- isMarkedWord8Ptr p
+    isWord8 <- isMarkedWord8Ptr rt p
     if isWord8
         then do
             w <- peek (p :: Ptr Word8)
@@ -3846,13 +3838,13 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
         VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
         _ -> error ("poke: value not an Int: " <> showValForDebug bv)
 
-peekByteOffB :: IO Val
-peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
+peekByteOffB :: IHCRuntime -> IO Val
+peekByteOffB rt = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a; bv <- force b
     p <- ptrValToPtr av
     case bv of
         VInt off -> do
-            isWord8 <- isMarkedWord8Ptr p
+            isWord8 <- isMarkedWord8Ptr rt p
             if isWord8
                 then do
                     w <- peekByteOff (p :: Ptr Word8) (fromIntegral off)
@@ -4973,11 +4965,11 @@ appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 -- argument thunks, then produce @VCon name args@ at saturation.
 --
 -- The argument thunks are stored unevaluated — a 'VCon' field is lazy.
-buildConEnv :: DataRegistry -> IO Env
-buildConEnv reg = do
-    -- Populate the global ctor-index map as a side effect so
+buildConEnv :: IHCRuntime -> DataRegistry -> IO Env
+buildConEnv rt reg = do
+    -- Populate the per-run ctor-index map as a side effect so
     -- 'structuralOrdering' can derive Ord by declaration order.
-    populateCtorIndex reg
+    populateCtorIndex rt reg
     pairs <- mapM mkBinding (Map.toList reg)
     pure (extendEnvMany pairs emptyEnv)
   where
@@ -5140,12 +5132,12 @@ getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
 
-registerTimeoutB :: IO Val
-registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \_cbT -> pure $ VIO $ do
+registerTimeoutB :: IHCRuntime -> IO Val
+registerTimeoutB rt = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \_cbT -> pure $ VIO $ do
     usecV <- force usecT
     case usecV of
         VInt _ -> do
-            n <- atomicModifyIORef' uniqueCounterRef $ \x ->
+            n <- atomicModifyIORef' (rtUniqueCounter rt) $ \x ->
                 let x' = x + 1 in (x', x')
             nT <- newWHNFThunk (VInt n)
             pure (VCon "TK" [nT])
@@ -5668,11 +5660,11 @@ tryShortcutMessage :: Thunk -> IO (Maybe (ByteString, Thunk))
 tryShortcutMessage t = do
     state <- readIORef t
     case state of
-        Unevaluated (Closure env ipm expr) ->
+        Unevaluated (Closure rt env ipm expr) ->
             case stripHelperApp expr of
                 Just msgExpr -> do
                     r <- CE.try @SomeException (do
-                        msgT <- newThunkIP env ipm msgExpr
+                        msgT <- newThunkIP rt env ipm msgExpr
                         v    <- force msgT
                         pure (v, msgT))
                     case r of

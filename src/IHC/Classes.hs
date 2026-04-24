@@ -33,21 +33,17 @@ module IHC.Classes
     , ScanHook
     , instanceScopeRef
     , scanHookRef
-    , sharedClassRegRef
     , setSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
       -- * Demand-driven env fallback
     , EnvFallbackHook
-    , envFallbackRef
     , setEnvFallback
     , lookupEnvFallback
       -- * Core-instance load hook
-    , coreInstanceLoadHookRef
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
       -- * Class-method dispatcher fallback
-    , classMethodFallbackRef
     , setClassMethodFallback
     , lookupClassMethodFallback
     ) where
@@ -61,6 +57,8 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
+import IHC.ClassesTypes
+import IHC.Runtime (IHCRuntime(..))
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -187,21 +185,6 @@ forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
-type MethodTable = Map ByteString Val
-
--- | The global class registry. Maps @(ClassName, [TypeTag])@ to a
--- method-name/value table.
---
--- The tag list supports multi-parameter type classes (MPTC) where an
--- instance is identified by several types — e.g. @instance SetField
--- \"name\" User String where ...@ registers under
--- @(\"SetField\", [\"name\", \"User\", \"String\"])@. Single-parameter
--- classes use a 1-element list for their tag.
-type ClassRegistry = IORef (Map (ByteString, [ByteString]) MethodTable)
-
-newClassRegistry :: IO ClassRegistry
-newClassRegistry = newIORef Map.empty
-
 -- | Register a dict (method table) for a single-tag @(class, type-tag)@
 -- pair. Overwrites any previously registered instance (last write wins).
 --
@@ -253,28 +236,6 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
 --   * @(Maybe Int)@                   → @Maybe Int@ (parens stripped)
 --   * @42@       (a @Nat@ literal)   → @42@
 --   * @\'x\'@    (a @Char@ literal)   → @x@
-normalizeTyTag :: ByteString -> ByteString
-normalizeTyTag bs0 = stripQuotes (trimSpace (stripParens bs0))
-  where
-    trimSpace s =
-        BC.dropWhile isSpace (BC.reverse (BC.dropWhile isSpace (BC.reverse s)))
-    isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
-
-    stripParens s
-        | BC.length s >= 2
-        , BC.head s == '('
-        , BC.last s == ')'    = stripParens (trimSpace (BC.init (BC.tail s)))
-        | otherwise           = s
-
-    stripQuotes s
-        | BC.length s >= 2
-        , BC.head s == '"'
-        , BC.last s == '"'    = BC.init (BC.tail s)
-        | BC.length s >= 2
-        , BC.head s == '\''
-        , BC.last s == '\''   = BC.init (BC.tail s)
-        | otherwise           = s
-
 -- | Return a stable string tag for the runtime type of a value.
 -- Used by dispatch builtins to find the right class instance.
 typeTagOf :: Val -> ByteString
@@ -308,32 +269,40 @@ typeTagOf (VPrimObj (PrimThreadId _))    = BC.pack "<ThreadId>"
 typeTagOf (VLabel _)                     = BC.pack "Label"
 
 --------------------------------------------------------------------------------
--- Lazy instance dispatch (Haskell 2010 §4.3.2)
+-- Per-run class state
+--
+-- Previously six top-level 'unsafePerformIO' CAFs:
+--   * instanceScopeRef, scanHookRef, sharedClassRegRef
+--   * envFallbackRef, classMethodFallbackRef, coreInstanceLoadHookRef
+-- Each has been moved into 'IHC.Runtime.IHCRuntime'; the helpers here
+-- are now thin wrappers that take an 'IHCRuntime' and project the
+-- matching 'IORef'.  This lets two interpreter instances in the same
+-- process dispatch class methods without stomping on each other.
 --------------------------------------------------------------------------------
 
-type InstanceScopeRef = IORef (Set ByteString)
-type ScanHook = ByteString -> IO ()
+-- Getter: return the per-run instance scope ref.  Exported for the
+-- REPL / scheduler which want the bare ref (not the wrapped
+-- 'Set ByteString' value).  Implemented as a function taking 'rt' so
+-- that this module doesn't need to import 'IHC.Runtime' — see the
+-- '.hs-boot' cycle note in 'IHC.Val'.
+instanceScopeRef :: IHCRuntime -> IORef (Set ByteString)
+instanceScopeRef = rtInstanceScope
 
-{-# NOINLINE instanceScopeRef #-}
-instanceScopeRef :: InstanceScopeRef
-instanceScopeRef = unsafePerformIO (newIORef Set.empty)
+scanHookRef :: IHCRuntime -> IORef (Maybe ScanHook)
+scanHookRef = rtScanHook
 
-{-# NOINLINE scanHookRef #-}
-scanHookRef :: IORef (Maybe ScanHook)
-scanHookRef = unsafePerformIO (newIORef Nothing)
+setSharedClassReg :: IHCRuntime -> ClassRegistry -> IO ()
+setSharedClassReg _ _ = pure ()
+-- ^ No-op: 'IHCRuntime' always has a 'ClassRegistry' as 'rtClassReg',
+-- so there's nothing to install.  Kept for backward compatibility with
+-- existing call sites; will be removed once those migrate to
+-- 'rtClassReg' directly.
 
-{-# NOINLINE sharedClassRegRef #-}
-sharedClassRegRef :: IORef (Maybe ClassRegistry)
-sharedClassRegRef = unsafePerformIO (newIORef Nothing)
+unionInstanceScope :: IHCRuntime -> Set ByteString -> IO ()
+unionInstanceScope rt ms = modifyIORef' (rtInstanceScope rt) (Set.union ms)
 
-setSharedClassReg :: ClassRegistry -> IO ()
-setSharedClassReg reg = writeIORef sharedClassRegRef (Just reg)
-
-unionInstanceScope :: Set ByteString -> IO ()
-unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
-
-currentInstanceScope :: IO (Set ByteString)
-currentInstanceScope = readIORef instanceScopeRef
+currentInstanceScope :: IHCRuntime -> IO (Set ByteString)
+currentInstanceScope rt = readIORef (rtInstanceScope rt)
 
 --------------------------------------------------------------------------------
 -- Demand-driven env fallback
@@ -344,22 +313,15 @@ currentInstanceScope = readIORef instanceScopeRef
 -- time), 'IHC.Eval.eval' consults this hook before raising "unbound
 -- variable".  The hook is installed by the scheduler/REPL and knows
 -- how to look up a body in the module registry and produce a Thunk
--- on-demand.  Matches the lazy-scan hook pattern above (Phase-3
--- precedent, see 'scanHookRef').
+-- on-demand.
 --------------------------------------------------------------------------------
 
-type EnvFallbackHook = ByteString -> IO (Maybe Thunk)
+setEnvFallback :: IHCRuntime -> EnvFallbackHook -> IO ()
+setEnvFallback rt = writeIORef (rtEnvFallback rt)
 
-{-# NOINLINE envFallbackRef #-}
-envFallbackRef :: IORef EnvFallbackHook
-envFallbackRef = unsafePerformIO (newIORef (\_ -> pure Nothing))
-
-setEnvFallback :: EnvFallbackHook -> IO ()
-setEnvFallback = writeIORef envFallbackRef
-
-lookupEnvFallback :: ByteString -> IO (Maybe Thunk)
-lookupEnvFallback name = do
-    hook <- readIORef envFallbackRef
+lookupEnvFallback :: IHCRuntime -> ByteString -> IO (Maybe Thunk)
+lookupEnvFallback rt name = do
+    hook <- readIORef (rtEnvFallback rt)
     hook name
 
 --------------------------------------------------------------------------------
@@ -375,16 +337,12 @@ lookupEnvFallback name = do
 -- had before the elaborator existed.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE classMethodFallbackRef #-}
-classMethodFallbackRef :: IORef (ByteString -> ByteString -> IO (Maybe Val))
-classMethodFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+setClassMethodFallback :: IHCRuntime -> (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
+setClassMethodFallback rt = writeIORef (rtClassMethodFallback rt)
 
-setClassMethodFallback :: (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
-setClassMethodFallback = writeIORef classMethodFallbackRef
-
-lookupClassMethodFallback :: ByteString -> ByteString -> IO (Maybe Val)
-lookupClassMethodFallback cls method = do
-    hook <- readIORef classMethodFallbackRef
+lookupClassMethodFallback :: IHCRuntime -> ByteString -> ByteString -> IO (Maybe Val)
+lookupClassMethodFallback rt cls method = do
+    hook <- readIORef (rtClassMethodFallback rt)
     hook cls method
 
 --------------------------------------------------------------------------------
@@ -401,14 +359,10 @@ lookupClassMethodFallback cls method = do
 -- calls are free (no re-scan).
 --------------------------------------------------------------------------------
 
-{-# NOINLINE coreInstanceLoadHookRef #-}
-coreInstanceLoadHookRef :: IORef (IO ())
-coreInstanceLoadHookRef = unsafePerformIO (newIORef (pure ()))
+setCoreInstanceLoadHook :: IHCRuntime -> IO () -> IO ()
+setCoreInstanceLoadHook rt = writeIORef (rtCoreInstanceLoad rt)
 
-setCoreInstanceLoadHook :: IO () -> IO ()
-setCoreInstanceLoadHook = writeIORef coreInstanceLoadHookRef
-
-triggerCoreInstanceLoad :: IO ()
-triggerCoreInstanceLoad = do
-    hook <- readIORef coreInstanceLoadHookRef
+triggerCoreInstanceLoad :: IHCRuntime -> IO ()
+triggerCoreInstanceLoad rt = do
+    hook <- readIORef (rtCoreInstanceLoad rt)
     hook
