@@ -142,7 +142,7 @@ doTypeOf :: IORef Env -> IORef [FilePath] -> IORef [ImportDecl] -> String -> Inp
 doTypeOf _      _         _          ""   = outputStrLn "Usage: :t EXPR"
 doTypeOf envRef loadedRef importsRef expr = do
     env <- liftIO (readIORef envRef)
-    src <- liftIO (mkSource "<repl:t>" (BC.pack expr))
+    let src = mkSource "<repl:t>" (BC.pack expr)
     r <- liftIO (try (parseExprOnly src defaultFixityTable)
                     :: IO (Either SomeException Expr))
     case r of
@@ -232,7 +232,7 @@ doLoadFile path existingEnv = do
 -- its exported bindings), and merges the result into the session env.
 doImport :: IORef Env -> IORef [FilePath] -> IORef [ImportDecl] -> String -> InputT IO ()
 doImport envRef loadedRef importsRef line = do
-    src <- liftIO (mkSource "<repl>" (BC.pack line))
+    let src = mkSource "<repl>" (BC.pack line)
     mDecl <- liftIO (parseSingleImport src)
     case mDecl of
         Nothing -> outputStrLn ("Import parse error: " <> show line)
@@ -295,7 +295,7 @@ syntheticModule decl = BC.pack ("module IhcRepl where\n" <> decl <> "\n")
 -- 'buildConEnv', and merge the result into the REPL env.
 doDataDecl :: IORef Env -> IORef FieldRegistry -> String -> InputT IO ()
 doDataDecl envRef fieldRegRef line = do
-    src <- liftIO (mkSource "<repl>" (syntheticModule line))
+    let src = mkSource "<repl>" (syntheticModule line)
     r <- liftIO (tryDataDecl envRef fieldRegRef src line)
     case r of
         Left err -> outputStrLn ("Error: " <> err)
@@ -355,7 +355,7 @@ doTypeDecl line =
 --     is registered for a given type.
 doClassDecl :: IORef Env -> ClassRegistry -> String -> InputT IO ()
 doClassDecl envRef classReg line = do
-    src <- liftIO (mkSource "<repl>" (syntheticModule line))
+    let src = mkSource "<repl>" (syntheticModule line)
     r <- liftIO (tryClassDecl envRef classReg src)
     case r of
         Left  err -> outputStrLn ("Error: " <> err)
@@ -444,7 +444,7 @@ doInstanceDecl envRef classReg line = do
 
 tryInstanceDecl :: IORef Env -> ClassRegistry -> String -> IO (Either String String)
 tryInstanceDecl envRef classReg line = do
-    src <- mkSource "<repl>" (syntheticModule line)
+    let src = mkSource "<repl>" (syntheticModule line)
     r <- (try (scanInstanceDecls src) :: IO (Either SomeException [InstanceDecl]))
     case r of
         Left err -> pure (Left (show err))
@@ -493,8 +493,7 @@ evalLine :: IORef Env -> ClassRegistry -> IORef [FilePath] -> IORef [ImportDecl]
 evalLine envRef classReg loadedRef importsRef fieldRegRef input = do
     env <- liftIO (readIORef envRef)
     fldReg <- liftIO (readIORef fieldRegRef)
-    bindMatch <- liftIO (sessionBindName input)
-    case bindMatch of
+    case sessionBindName input of
         Just (name, rhs) -> do
             r <- liftIO (tryEvalSessionBind loadedRef importsRef fldReg env name rhs)
             case r of
@@ -522,10 +521,9 @@ evalLine envRef classReg loadedRef importsRef fieldRegRef input = do
 -- over @<-@ tokens inside nested @do@-blocks, list comprehensions,
 -- etc. The LHS must be exactly one identifier token (we do not yet
 -- support destructuring patterns at the REPL).
-sessionBindName :: String -> IO (Maybe (String, String))
-sessionBindName input = do
-    src <- mkSource "<repl:bind>" (BC.pack input)
-    pure $ case findTopLevelLArrow src of
+sessionBindName :: String -> Maybe (String, String)
+sessionBindName input =
+    case findTopLevelLArrow src of
         Nothing -> Nothing
         Just arrowStart ->
             let lhsTxt = take arrowStart input
@@ -534,6 +532,7 @@ sessionBindName input = do
                 [nm@(c:_)] | isLowerStart c -> Just (nm, rhsTxt)
                 _                           -> Nothing
   where
+    src = mkSource "<repl:bind>" (BC.pack input)
     isLowerStart c = (c >= 'a' && c <= 'z') || c == '_'
 
 -- | Walk the token stream of @src@ looking for a 'TkLArrow' at bracket
@@ -563,7 +562,7 @@ findTopLevelLArrow src = go (0 :: Int) startCursor
 -- as a @Left@ — the caller prints it and the REPL keeps going.
 tryEvalSessionBind :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> String -> String -> IO (Either String Env)
 tryEvalSessionBind loadedRef importsRef fldReg env name rhs = do
-    src <- mkSource "<repl>" (BC.pack rhs)
+    let src = mkSource "<repl>" (BC.pack rhs)
     r <- try (parseExprOnly src defaultFixityTable)
             :: IO (Either SomeException Expr)
     case r of
@@ -623,8 +622,8 @@ tryEvalLetDecl loadedRef importsRef fldReg env name input = do
     -- Strip the leading "let " and wrap in a synthetic module so that
     -- findBinding can locate the top-level declaration at column 1.
     let decl = dropLetPrefix input
+        src  = mkSource "<repl>" (syntheticModule decl)
         key  = BC.pack name
-    src <- mkSource "<repl>" (syntheticModule decl)
     r <- try (parseLetBinding src key)
             :: IO (Either SomeException Expr)
     case r of
@@ -662,7 +661,7 @@ parseLetBinding src name = do
 
 tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> ClassRegistry -> String -> IO (Either String ())
 tryEvalExpr loadedRef importsRef fldReg env classReg input = do
-    src <- mkSource "<repl>" (BC.pack input)
+    let src = mkSource "<repl>" (BC.pack input)
     r <- try (parseExprOnly src defaultFixityTable)
             :: IO (Either SomeException Expr)
     case r of

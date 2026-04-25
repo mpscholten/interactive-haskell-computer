@@ -31,6 +31,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import Data.Word (Word8)
+import System.IO.Unsafe (unsafePerformIO)
 
 type Pos = Int           -- ^ byte offset into the source
 type Span = (Pos, Pos)   -- ^ half-open [start, end)
@@ -76,17 +77,25 @@ data Source = Source
 -- One linear scan over @bs@ builds the line-start table; all subsequent
 -- 'offsetToPos' calls pay only O(log n).
 --
--- Allocates a fresh per-Source scan cache 'IORef' via plain 'newIORef'.
--- This must run in 'IO' rather than via 'unsafePerformIO' because GHC's
--- optimiser is free to share the result of an 'unsafePerformIO (newIORef
--- ...)' call across calls whose arguments don't appear in the result type
--- — which silently fused all scan caches together and made every cache
--- read return the FIRST source's scan output regardless of which Source
--- was queried.
-mkSource :: FilePath -> ByteString -> IO Source
-mkSource name bs = do
-    cache <- ScanCacheBox <$> newIORef Map.empty
-    pure (Source name bs (buildLineStarts bs) cache)
+-- Uses 'unsafePerformIO' to attach a fresh empty cache 'IORef' to the
+-- Source: 'Source' is otherwise an immutable value type and we want
+-- callers to keep treating it as such, but per-Source memoisation needs
+-- mutable state under the hood. The 'IORef' is uniquely allocated per
+-- 'mkSource' call (NOINLINE on the helper to keep CSE from sharing one
+-- ref across distinct sources).
+mkSource :: FilePath -> ByteString -> Source
+mkSource name bs = Source name bs (buildLineStarts bs) (mkFreshScanCache name bs)
+
+-- | Allocate a fresh empty scan cache. The (name, bs) cookie is taken
+-- so GHC can't CSE this call across distinct 'mkSource' invocations —
+-- without the cookie, the 'unsafePerformIO' would be eligible to share
+-- a single 'IORef' across every 'Source' the program ever allocates,
+-- which would silently fuse otherwise-independent scan caches together.
+-- NOINLINE belt-and-braces.
+mkFreshScanCache :: FilePath -> ByteString -> ScanCacheBox
+mkFreshScanCache !_name !_bs =
+    unsafePerformIO (ScanCacheBox <$> newIORef Map.empty)
+{-# NOINLINE mkFreshScanCache #-}
 
 -- | Scan @bs@ once and return the byte offset of the first byte on each
 -- line.  Line 1 always starts at offset 0.
@@ -100,11 +109,11 @@ buildLineStarts bs = 0 : go 0
       | otherwise             = go (i + 1)
 
 readSourceFile :: FilePath -> IO Source
-readSourceFile path = BS.readFile path >>= mkSource path
+readSourceFile path = mkSource path <$> BS.readFile path
 
 -- | Replace the byte content of a 'Source', recomputing the line-start table.
 -- Use this instead of record-update on 'srcBytes' so 'offsetToPos' stays valid.
-withBytes :: Source -> ByteString -> IO Source
+withBytes :: Source -> ByteString -> Source
 withBytes s bs = mkSource (srcName s) bs
 
 atEnd :: Source -> Pos -> Bool
