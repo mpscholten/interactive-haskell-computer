@@ -329,6 +329,25 @@ loadProgramFromSource searchPath src0 = do
                     chaseLocals (Set.union seen (Set.fromList newLocals))
     chaseLocals Set.empty
 
+    -- Force-load every module the entry source imports.  Without this,
+    -- @import M (T(..))@ where the user only uses some constructor of T
+    -- never triggers a 'loadModule' call for M (the qualified-FQN
+    -- discovery path needs a @M.foo@ shape; bare ctor refs go through
+    -- the bare-name fallback which only scans modules already in the
+    -- registry).  Result: @TextNode@ from `data Node = Node | TextNode`
+    -- exported from M reads as 'unbound variable' even though both
+    -- @import M (Node(..))@ and the source-level data decl are
+    -- correct.  Eager-load every import after entry-module discovery so
+    -- the global module catalogue is populated before any FV lookup.
+    -- Errors are swallowed (best-effort) — a missing dependency should
+    -- surface as an unbound-variable error at use site, not abort the
+    -- whole load.
+    let entryImports = map impModule (mhImports (lmHeader entry))
+    forM_ entryImports $ \m -> do
+        _ <- try (loadModule registry fullSearchPath includeMap m)
+                :: IO (Either SomeException LoadedModule)
+        pure ()
+
     -- Force-load a small set of core modules that provide fundamental
     -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
     -- Either; Show/Eq/Ord for primitives; etc.).  Without this, a
