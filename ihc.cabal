@@ -122,6 +122,16 @@ executable ihc-parse-probe
       , ihc
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
 
+executable probe-hsx
+    import:           warnings, lang
+    hs-source-dirs:   probe
+    main-is:          HsxProbe.hs
+    build-depends:
+        base
+      , bytestring
+      , ihc
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
+
 test-suite ihc-test
     import:           warnings, lang
     type:             exitcode-stdio-1.0
