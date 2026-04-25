@@ -88,7 +88,7 @@ data TokenKind
     | TkModule                -- ^ keyword @module@
     | TkImport                -- ^ keyword @import@
     | TkQualified             -- ^ keyword @qualified@
-    | TkAs                    -- ^ keyword @as@
+    -- No TkAs: 'as' is a soft keyword, see @keywordOr@ below.
     | TkHiding                -- ^ keyword @hiding@
     | TkNewtype               -- ^ keyword @newtype@
     | TkTypeKw                -- ^ keyword @type@
