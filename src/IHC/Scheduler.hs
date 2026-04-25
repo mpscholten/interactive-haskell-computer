@@ -4065,28 +4065,88 @@ resolveFallback name = do
                         case mImportedField of
                             Just slot -> pure (Just slot)
                             Nothing -> do
-                                searchPath <- readIORef globalSearchPathRef
-                                includeMap <- readIORef globalIncludeMapRef
-                                transientReg <- newIORef (Map.map Loaded mods)
-                                let ownerName = fromMaybe (BC.pack "Prelude")
-                                        (preludeDirectOwner bareName)
-                                loaded <- try (loadModule transientReg searchPath includeMap ownerName)
-                                            :: IO (Either SomeException LoadedModule)
-                                case loaded of
-                                    Left _ -> pure Nothing
-                                    Right preludeLm -> do
-                                        _ <- try (discoverInModule transientReg
-                                                    searchPath includeMap preludeLm bareName)
-                                                :: IO (Either SomeException ())
-                                        reg <- readIORef transientReg
-                                        let newMods = Map.fromList
-                                                [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                        modifyIORef' globalLoadedModulesRef
-                                            (Map.union newMods)
-                                        mods' <- readIORef globalLoadedModulesRef
-                                        buildSlotFromOwner mods'
-                                            (Map.findWithDefault preludeLm ownerName mods')
-                                            bareName
+                                -- Last-resort: scan EVERY loaded module's
+                                -- 'lmBodies' for an exact-name match.  This
+                                -- handles the case where a binding's body
+                                -- references a same-module helper without
+                                -- qualification, e.g. streaming-commons's
+                                -- @bindPortTCP p s = … bindPortGen NS.Stream
+                                -- p s@: when warp imports @bindPortTCP@,
+                                -- IHC builds a closure whose env is the
+                                -- user's program scope, but the body's free
+                                -- variable @bindPortGen@ lives in
+                                -- Data.Streaming.Network.lmBodies.  Scanning
+                                -- all loaded modules surfaces it.  First
+                                -- match wins; on the off-chance two modules
+                                -- export the same bare name, the older one
+                                -- (alphabetically earlier in the Map) is
+                                -- preferred — same precedence Haskell would
+                                -- give if both were imported unqualified.
+                                mAny <- tryAnyModuleBareSlot mods bareName
+                                case mAny of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> do
+                                        searchPath <- readIORef globalSearchPathRef
+                                        includeMap <- readIORef globalIncludeMapRef
+                                        transientReg <- newIORef (Map.map Loaded mods)
+                                        let ownerName = fromMaybe (BC.pack "Prelude")
+                                                (preludeDirectOwner bareName)
+                                        loaded <- try (loadModule transientReg searchPath includeMap ownerName)
+                                                    :: IO (Either SomeException LoadedModule)
+                                        case loaded of
+                                            Left _ -> pure Nothing
+                                            Right preludeLm -> do
+                                                _ <- try (discoverInModule transientReg
+                                                            searchPath includeMap preludeLm bareName)
+                                                        :: IO (Either SomeException ())
+                                                reg <- readIORef transientReg
+                                                let newMods = Map.fromList
+                                                        [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                                                modifyIORef' globalLoadedModulesRef
+                                                    (Map.union newMods)
+                                                mods' <- readIORef globalLoadedModulesRef
+                                                buildSlotFromOwner mods'
+                                                    (Map.findWithDefault preludeLm ownerName mods')
+                                                    bareName
+
+    -- | Scan every loaded module's 'lmBodies' for @bareName@.  Returns
+    -- the first slot found (Map.toList order = ascending module name).
+    -- If the body isn't materialised yet but the source contains a
+    -- top-level binding for @bareName@, trigger 'discoverInModule' to
+    -- force it into the cache; THEN return the slot.  This covers the
+    -- streaming-commons @bindPortTCP@/@bindPortGen@ pattern: warp
+    -- imports @bindPortTCP@, IHC discovers its body INTO the user's
+    -- main module (which is correct for the closure env), but the
+    -- body's free variable @bindPortGen@ — a same-DSN-module helper —
+    -- never gets discovered into DSN.lmBodies.  Probe LHS via
+    -- 'findOrResolveLhs' (cheap source scan) and only commit to
+    -- discovery on a match.
+    tryAnyModuleBareSlot mods bareName = go (Map.toList mods)
+      where
+        go [] = pure Nothing
+        go ((_, owner) : rest) = do
+            bodies <- readIORef (lmBodies owner)
+            if Map.member bareName bodies
+                then buildSlotFromOwner mods owner bareName
+                else do
+                    -- Source-level probe: is bareName even defined as a
+                    -- top-level binding in this module?  Cheap check
+                    -- before committing to discovery.
+                    mLhs <- findOrResolveLhs (lmSource owner) (lmKnown owner) bareName
+                    case mLhs of
+                        Just _ -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            _ <- try (discoverInModule transientReg
+                                        searchPath includeMap owner bareName)
+                                    :: IO (Either SomeException ())
+                            -- Re-read after discovery to confirm it landed.
+                            bodies' <- readIORef (lmBodies owner)
+                            if Map.member bareName bodies'
+                                then buildSlotFromOwner mods owner bareName
+                                else go rest
+                        Nothing -> go rest
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
