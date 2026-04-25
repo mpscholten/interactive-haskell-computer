@@ -19,6 +19,8 @@ nix develop -c cabal run exe:ihc -- run examples/<name>/Main.hs
 | [record_dot](record_dot/) | `OverloadedRecordDot`: `p.pName`, chained `p.pAddr.addrCity` access |
 | [type_classes](type_classes/) | Custom `instance Show` and `instance Eq` for a user-defined `Color` type |
 | [async_ping](async_ping/) | `forkIO` + `MVar` ping-pong between two threads; demonstrates Phase 2.10a concurrency |
+| [hsx_hello](hsx_hello/) | **Expected-fail target.** `[hsx|<h1>Hello world</h1>|]` rendering via `IHP.HSX.QQ` + `Text.Blaze.Html.Renderer.String`. Errors today — wired as expected-fail in `RunFile.hs` until HSX quasi-quoting lands. |
+| [blaze_hello](blaze_hello/) | **Expected-fail target.** `Text.Blaze.Html5` hello-world without the HSX QuasiQuoter. Errors today on blaze-markup's record accessor — wired as expected-fail in `RunFile.hs`. |
 
 ## Known limitations (as of writing)
 

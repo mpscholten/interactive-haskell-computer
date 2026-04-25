@@ -1073,3 +1073,48 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 msg `shouldNotSatisfy`
                     (\m -> "unbound variable `errorCallWithCallStackException`"
                            `isInfixOf` m)
+
+    --------------------------------------------------------------------
+    -- HSX + Blaze hello-world smoke fixtures (expected-fail).
+    --
+    -- These record the target for the HSX rendering milestone. Both
+    -- examples throw today; the tests assert the current error
+    -- messages so the suite stays green and the errors changing
+    -- signals real progress. Graduate to positive expectations once
+    -- rendering works end-to-end.
+    --------------------------------------------------------------------
+    it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
+        -- Today `[hsx|<h1>...</h1>|]` is not expanded by the parser, so
+        -- the RHS of `main` fails to scan, `main` is dropped, and the
+        -- scheduler reports no `main` in module Main. When HSX
+        -- quasi-quoting is implemented the error will change —
+        -- retarget this assertion (or graduate the fixture) at that
+        -- point.
+        r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while HSX quasi-quoting \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "no `main` binding in module Main" `isInfixOf` m)
+
+    it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
+        -- Today the blaze-html renderer hits a record-accessor gap
+        -- while walking the HTML AST, bailing with "record accessor
+        -- `getString`: constructor `:` has no such field". That's the
+        -- symptom of a deeper source-loading gap in blaze-markup's
+        -- StaticString / ChoiceString handling. When the blaze
+        -- rendering path is supported the error will change —
+        -- retarget this assertion (or graduate the fixture) at that
+        -- point.
+        r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while blaze rendering \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "record accessor `getString`" `isInfixOf` m)
