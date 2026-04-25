@@ -2472,10 +2472,28 @@ parseBinOp ctx minBp cur0 = do
 -- starts each @|>@ at the statement column, and Haskell treats those as
 -- continuation of the preceding expression (even though @|>@ sits at
 -- the same column as a fresh statement would).
+--
+-- Exception: tokens that ALSO start patterns (@!@, @~@) at exactly the
+-- layout column are sibling pattern-bindings, not operator continuations.
+-- E.g. in a where-block:
+--
+-- > foo = bar
+-- >   where
+-- >     !x = 10
+-- >     !y = 20
+--
+-- the @!@ of @!y@ sits at the bind column and must terminate the @10@
+-- expression rather than be consumed as @10 ! y@.
 peekOp :: Ctx -> Cursor -> Maybe (Name, Assoc, Int, Cursor)
 peekOp ctx cur =
-    let (tok, cur') = nextSig ctx cur in
-    if ctxMinCol ctx > 0 && tkCol tok < ctxMinCol ctx
+    let (tok, cur') = nextSig ctx cur
+        col         = tkCol tok
+        minCol      = ctxMinCol ctx
+        beforeLayout = minCol > 0 && col < minCol
+        atLayoutAndPatternStart =
+            minCol > 0 && col == minCol && isPatternStartOp (tkKind tok)
+    in
+    if beforeLayout || atLayoutAndPatternStart
         then Nothing
         else case tkKind tok of
             TkBacktick ->
@@ -2554,6 +2572,15 @@ tokenOpName = \case
     TkDollar   -> Just "$"
     TkSymOp n  -> Just n
     _          -> Nothing
+
+-- | True iff this token can start a pattern (and therefore a sibling
+-- pattern-binding when it appears at the layout column). Used by
+-- 'peekOp' to refuse to swallow an @!x@ / @~y@ at exactly the bind
+-- column as an infix operator continuation.
+isPatternStartOp :: TokenKind -> Bool
+isPatternStartOp TkBang        = True
+isPatternStartOp (TkSymOp op)  = op == BC.pack "~"
+isPatternStartOp _             = False
 
 --------------------------------------------------------------------------------
 -- Unary (leading `-`) + application layer
