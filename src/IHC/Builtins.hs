@@ -51,14 +51,14 @@ import Data.Int (Int64)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64)
-import Foreign.C.String (peekCAString)
+import Foreign.C.String (peekCAString, withCString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
     , newForeignPtr_
     , plusForeignPtr
     )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (allocaBytes, mallocBytes, free)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
@@ -762,6 +762,13 @@ builtins reg =
     , ("addrCanonName",  addrInfoFieldB "addrCanonName" 5)
     , ("Network.Socket.addrCanonName", addrInfoFieldB "addrCanonName" 5)
     , ("Network.Socket.Info.addrCanonName", addrInfoFieldB "addrCanonName" 5)
+    -- Network.Socket.getAddrInfo: host @getaddrinfo(3)@.  warp's listen
+    -- pipeline calls it through streaming-commons' bindPortGenEx.  We
+    -- ignore hints (NULL) for now — the OS gives back a TCP-stream-
+    -- compatible list anyway, which is all warp examines.
+    , ("getAddrInfo",     getAddrInfoB)
+    , ("Network.Socket.getAddrInfo", getAddrInfoB)
+    , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
     -- Phase 2.8: additional numeric ops needed by containers
     , ("fromInteger",  fromIntegralB)
     , ("toInteger",    fromIntegralB)
@@ -3555,6 +3562,66 @@ peekAddrInfoVal p flags family socktype protocol = do
     canonT <- newWHNFThunk =<< maybeCStringVal canonPtrWord
     pure (VCon "AddrInfo" [flagsT, familyT, socktypeT, protocolT, addrT, canonT])
 
+-- | Read a single @struct addrinfo@ at @p@ and return a 'Val'.  Used by
+-- 'getAddrInfoB' when walking the linked list returned by
+-- @getaddrinfo(3)@.
+peekFullAddrInfoVal :: Ptr Word8 -> IO Val
+peekFullAddrInfoVal p = do
+    flags    <- peekByteOff (castPtr p :: Ptr Word32) 0
+    family   <- peekByteOff (castPtr p :: Ptr Word32) 4
+    socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
+    protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
+    peekAddrInfoVal p flags family socktype protocol
+
+-- | @getAddrInfo :: Maybe AddrInfo -> Maybe HostName -> Maybe ServiceName
+-- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@; ignores
+-- the @hints@ argument for now (passes NULL) — warp/streaming-commons
+-- pass hints with @addrFlags=[AI_PASSIVE], addrSocketType=Stream@ which
+-- the OS uses to filter, but for the warp-listen case the default
+-- result list is already TCP-stream-suitable.  Walks the linked list
+-- via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64 layout) and
+-- materialises each entry as a 'VCon "AddrInfo"' before
+-- @freeaddrinfo@-ing the chain.
+getAddrInfoB :: IO Val
+getAddrInfoB = pure $ VFun $ \_hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
+    hostV <- force hostT
+    serviceV <- force serviceT
+    withMaybeCString hostV $ \hostP ->
+        withMaybeCString serviceV $ \serviceP ->
+            alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
+                rc <- c_getaddrinfo_host hostP serviceP nullPtr resPP
+                if rc /= 0
+                    then ioError (userError ("getaddrinfo: returned " ++ show rc))
+                    else do
+                        firstP <- peek resPP
+                        if firstP == nullPtr
+                            then pure (VCon "[]" [])
+                            else do
+                                lst <- walkAddrInfo firstP
+                                c_freeaddrinfo_host firstP
+                                pure lst
+  where
+    walkAddrInfo :: Ptr Word8 -> IO Val
+    walkAddrInfo p = do
+        v <- peekFullAddrInfoVal p
+        nextWord <- peekByteOff (castPtr p :: Ptr Word64) 40
+        let nextP = wordPtrToPtr nextWord
+        rest <- if nextP == nullPtr
+                    then pure (VCon "[]" [])
+                    else walkAddrInfo nextP
+        hd <- newWHNFThunk v
+        tl <- newWHNFThunk rest
+        pure (VCon ":" [hd, tl])
+
+    withMaybeCString :: Val -> (Ptr Word8 -> IO a) -> IO a
+    withMaybeCString v action = case v of
+        VCon "Nothing" []   -> action nullPtr
+        VCon "Just" [innerT] -> do
+            inner <- force innerT
+            s <- valToString inner
+            withCString s (action . castPtr)
+        other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
+
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
     valsToConsList
@@ -3919,6 +3986,12 @@ foreign import ccall unsafe "send"
 
 foreign import ccall unsafe "recv"
     c_recv_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
+
+foreign import ccall unsafe "getaddrinfo"
+    c_getaddrinfo_host :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Ptr (Ptr Word8) -> IO CInt
+
+foreign import ccall unsafe "freeaddrinfo"
+    c_freeaddrinfo_host :: Ptr Word8 -> IO ()
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
