@@ -61,3 +61,41 @@ Already partially present for top-level RHS guards. **Fix: thread guard support 
 | Record-destructure lambda param `\Con { f } ->` | **1 day** | 2 |
 
 **The first two items (`?x.field` + type-sig-skip) are 1-2 day slices each and together would clear ~15 of the 20 broken files.** The remaining items (record-update, qualified constructors, multi-bind let) are individually 2-3 day slices but collectively require ~1 week. None are multi-week undertakings given the existing parser infrastructure.
+
+---
+
+## HSX rendering
+
+Rendering `[hsx|<h1>Hello world</h1>|]` end-to-end (quasi-quote → evaluated → HTML string) exposes a distinct set of blockers that do **not** overlap with the parser buckets above. These are the concrete gaps, in the order they surface during a first-run attempt. Sentinel test: `examples/hsx_hello/Main.hs` (see also — shipped by a parallel unit).
+
+### 1. QuasiQuote parser emits a placeholder, not a call
+
+`src/IHC/Parser.hs:2867–2880` (the `TkQQOpen qqName` branch): the body bytes are scanned opaquely via `skipQQBody`, and the AST node emitted is `EApp (EVar "error") (stringToConsList "unexpanded QuasiQuoter [name|…|]")`. Any HSX use site therefore evaluates to a runtime `error` — the QQ never reaches the evaluator as a real expression. Replacing this with proper dispatch is the first mandatory step. (A parallel unit in this batch is working on that — cross-reference it if landed, but this catalog entry stands alone.)
+
+### 2. No QuasiQuoter registry / dispatch
+
+Even with the parser fix, nothing in the evaluator maps the captured `qqName` (e.g. `"hsx"`) back to the `IHP.HSX.QQ.hsx` `QuasiQuoter` value and calls its `quoteExp :: String -> Q Exp`. `src/IHC/TH.hs` (889 lines) holds all the existing TH machinery — `thExpToExpr`, `expandSplicesInExpr`, `thDecsToBindings` — but has no `quoteExp`/`QuasiQuoter` support (`Grep` for `quoteExp|QuasiQuoter|qqName` in `TH.hs` returns zero matches). The dispatch layer needs to: (a) parse the body as whatever syntax the QQ accepts, (b) drive the QQ's `quoteExp` through the Q monad, (c) hand the resulting `TH.Exp` to `thExpToExpr` to materialize an `IHC.AST.Expr`, (d) splice it in place of the QQ node. Estimated shape: new exports in `IHC.TH` plus a hook in the scheduler's `expandSplicesInModule` pass.
+
+### 3. Package sources must be cached
+
+`ihp-hsx`, `blaze-html`, `blaze-markup`, `blaze-builder`, `megaparsec`, `string-conversions` — none of these have bespoke host-side shims (and per the project policy in `CLAUDE.md` "Builtin modules: minimum surface only" they **must not**). All six must be materialized under `~/.cache/ihc/sources/<pkg>-<version>/` so `Scan`/`Source` can pick them up. A parallel unit in this batch ships the fetch script — until it runs, source-interpretation of the HSX pipeline cannot start.
+
+### 4. TH / QQ language gaps (high level)
+
+HSX's `quoteExp` is a non-trivial use of the TH API: it calls `parseHsx`, builds `Exp` trees with `AppE`, `VarE`, `ConE`, `LitE`, `ListE`, `TupE`, uses `newName`, and threads everything through the `Q` monad. `IHC.TH` today only supports the Lift-splice subset (see the module header comment at `src/IHC/TH.hs:1–21`: "NOT in scope: `[| |]` quotation, reify, Q IO, declaration/type splices"). The full catalog of TH surface HSX requires is documented in `docs/HSX-TH-NEEDS.md` (see also — shipped by a parallel unit). Key items expected there: `Q` monad beyond Lift, `newName` / name freshening, `QuasiQuoter` record type, nested bracket support.
+
+### 5. Class dispatch
+
+Runtime rendering exercises at minimum: `Text.Blaze.ToMarkup` (instances for `String`, `Text`, `Html`, `Int`, …), `Text.Blaze.ToValue` (for attribute values), and the internal `Text.Blaze.Internal.Markup` monoid machinery. Class-dispatch in `src/IHC/Eval.hs` (`VClassMethod` at lines 410, 946, 1024, 1033 — constructor, pattern-match guard, and the two `apply`/`applyIP` branches) already handles polymorphic dispatch via the `tags` list, but every new instance from blaze must be registered via the existing class registry. Expect "no instance for ToMarkup <T>" errors until each blaze instance is source-loaded.
+
+### 6. Renderer primops
+
+`Text.Blaze.Html.Renderer.String.renderHtml` lives in blaze-html source and, in principle, needs no host primop — it's ordinary Haskell over the `Markup` tree. In practice it delegates to `Data.ByteString.Builder` primitives (`Builder`, `toLazyByteString`, UTF-8 encoders) whose primop coverage in IHC is **unverified**; first-run will likely reveal missing `GHC.Prim`-backed builder ops. Mark as **unverified — needs first-run debugging** before committing to a fix size.
+
+### 7. Sentinel test
+
+`examples/hsx_hello/Main.hs` (see also — shipped by a parallel unit) drives `[hsx|<h1>Hello world</h1>|]` through `renderHtml` and prints the result. Green = full pipeline working; red points at whichever of 1–6 above fails first.
+
+### Ordering
+
+1, 2, and 3 are hard prerequisites — nothing downstream can be exercised without them. 4 depends on 2. 5 and 6 are first-runnable only after 1–4 land. None of the HSX blockers overlap with the parser buckets above.
