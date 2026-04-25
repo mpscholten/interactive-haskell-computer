@@ -64,8 +64,6 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
-import Data.Dynamic (Dynamic, fromDynamic, toDyn)
-import Data.Typeable (Typeable)
 import Control.Monad (when)
 import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
@@ -133,64 +131,13 @@ readPatternSynName src curAfterPattern =
         TkIdent n  -> Just (n, curAfterName)
         _          -> Nothing
 
--- | O(n) byte-level keyword presence check. Used as a cheap early-out
--- for scan functions so they can skip the full tokenizer pass on
--- sources that obviously can't contain a match — matters a lot for
--- huge auto-generated modules (e.g. the 3.2 MB
--- @GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory@) whose
--- single-line string literal otherwise forces every scan function
--- to walk megabytes of bytes looking for its target keyword.
---
--- BS.isInfixOf uses bytestring's SIMD memmem path: O(n) with zero
--- Haskell-side allocation. False positives (the keyword appearing
--- inside a string or comment) just fall through to the slow path.
-hasKeyword :: Source -> ByteString -> Bool
-hasKeyword src kw = BS.isInfixOf kw (srcBytes src)
-{-# INLINE hasKeyword #-}
-
--- | Like 'hasKeyword' but succeeds if any of several keywords is present.
-hasAnyKeyword :: Source -> [ByteString] -> Bool
-hasAnyKeyword src = any (hasKeyword src)
-{-# INLINE hasAnyKeyword #-}
-
--- | Memoise a scan result on the per-'Source' cache. Each callsite in
--- 'IHC.Scheduler' invokes most of the @scanFooDecls@ functions 5–10
--- times per loaded module across different code paths; without
--- memoisation each call re-tokenises the entire source. Caching at the
--- 'Source' level means the second-and-later callers pay an O(1) hit
--- (single 'Map' lookup), and because the cache 'IORef' lives inside the
--- 'Source' it can never collide between distinct 'Source' values that
--- happen to share a 'srcName' (e.g. multiple @<repl>@ inputs).
---
--- The @tag@ string distinguishes scan functions from each other; pick
--- a unique constant per scan. Result type must be 'Typeable' (the
--- standard derived instance suffices for everything we cache).
-memoiseScan
-    :: Typeable a
-    => String       -- ^ unique tag per scan function
-    -> Source
-    -> IO a         -- ^ the uncached scan; runs only on cache miss
-    -> IO a
-memoiseScan tag src compute = do
-    mHit <- readScanCache (srcScanCache src) tag
-    case mHit >>= fromDynamic of
-        Just hit -> pure hit
-        Nothing  -> do
-            result <- compute
-            writeScanCache (srcScanCache src) tag (toDyn result)
-            pure result
-{-# INLINE memoiseScan #-}
-
 -- | Scan the entire source file and return the names of all top-level
 -- value bindings (column-1 lowercase identifiers with an @=@ or guards).
 -- Type signatures, data declarations, and class/instance declarations are
 -- skipped.  This is used by the REPL import machinery to enumerate every
 -- exported name before demand-driving their bodies.
 scanAllTopLevelNames :: Source -> IO [ByteString]
-scanAllTopLevelNames src = memoiseScan "topLevelNames" src (scanAllTopLevelNamesRaw src)
-
-scanAllTopLevelNamesRaw :: Source -> IO [ByteString]
-scanAllTopLevelNamesRaw src = go [] startCursor
+scanAllTopLevelNames src = go [] startCursor
   where
     go acc cur = do
         let (tok, cur') = nextToken src cur
@@ -246,13 +193,7 @@ scanAllTopLevelNamesRaw src = go [] startCursor
 -- The splice token @$(@ must appear at column 1.  Nested parens inside
 -- the splice body are tracked so the scan finds the right terminator.
 scanTopLevelSplices :: Source -> IO [Span]
-scanTopLevelSplices src = memoiseScan "topLevelSplices" src (scanTopLevelSplicesRaw src)
-
-scanTopLevelSplicesRaw :: Source -> IO [Span]
-scanTopLevelSplicesRaw src
-    -- TH splices begin with `$(` or `[|` (or `[e|` / `[d|` / `[t|` / `[p|`).
-    | not (hasAnyKeyword src [BC.pack "$(", BC.pack "[|"]) = pure []
-    | otherwise = go [] startCursor
+scanTopLevelSplices src = go [] startCursor
   where
     go acc cur = do
         let (tok, cur') = nextToken src cur
@@ -804,12 +745,7 @@ skipTypeDecl src cur0 =
 -- F args = rhs@ decls.  Returns a merged 'TR.TypeFamilyRegistry' ready
 -- to hand off to 'TR.reduceTypeExpr' at runtime.
 scanTypeFamilyDecls :: Source -> IO TR.TypeFamilyRegistry
-scanTypeFamilyDecls src = memoiseScan "typeFamily" src (scanTypeFamilyDeclsRaw src)
-
-scanTypeFamilyDeclsRaw :: Source -> IO TR.TypeFamilyRegistry
-scanTypeFamilyDeclsRaw src
-    | not (hasKeyword src (BC.pack "family")) = pure TR.emptyRegistry
-    | otherwise = go TR.emptyRegistry startCursor
+scanTypeFamilyDecls src = go TR.emptyRegistry startCursor
   where
     go !reg cur = do
         let (tok, cur') = nextToken src cur
@@ -1115,13 +1051,7 @@ type TypeCtorRegistry = Map ByteString [ByteString]
 -- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
 scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
-scanDataDecls src = memoiseScan "dataDecls" src (scanDataDeclsRaw src)
-
-scanDataDeclsRaw :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
-scanDataDeclsRaw src
-    | not (hasAnyKeyword src [BC.pack "data", BC.pack "newtype"])
-        = pure (Map.empty, Map.empty, Map.empty)
-    | otherwise = go Map.empty Map.empty Map.empty startCursor
+scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
   where
     go !dReg !fReg !tReg cur = do
         let (tok, cur') = nextToken src cur
@@ -1640,12 +1570,7 @@ data SimpleDerivDecl = SimpleDerivDecl
     } deriving (Eq, Show)
 
 scanSimpleDerivings :: Source -> IO [SimpleDerivDecl]
-scanSimpleDerivings src = memoiseScan "simpleDerivings" src (scanSimpleDerivingsRaw src)
-
-scanSimpleDerivingsRaw :: Source -> IO [SimpleDerivDecl]
-scanSimpleDerivingsRaw src
-    | not (hasKeyword src (BC.pack "deriving")) = pure []
-    | otherwise = go [] startCursor
+scanSimpleDerivings src = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -1728,12 +1653,7 @@ scanSimpleDerivingsRaw src
 -- scanner can't determine the type's name or tyvars, the declaration is
 -- also skipped (no entry in the result list).
 scanFunctorDerivings :: Source -> IO [FunctorDerivDecl]
-scanFunctorDerivings src = memoiseScan "functorDerivings" src (scanFunctorDerivingsRaw src)
-
-scanFunctorDerivingsRaw :: Source -> IO [FunctorDerivDecl]
-scanFunctorDerivingsRaw src
-    | not (hasKeyword src (BC.pack "deriving")) = pure []
-    | otherwise = go [] startCursor
+scanFunctorDerivings src = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -2094,12 +2014,7 @@ data InstanceDecl = InstanceDecl
 -- name and walk for the first upper-or-lower identifier that follows a
 -- constraint arrow or is the head type.
 scanInstanceDecls :: Source -> IO [InstanceDecl]
-scanInstanceDecls src = memoiseScan "instanceDecls" src (scanInstanceDeclsRaw src)
-
-scanInstanceDeclsRaw :: Source -> IO [InstanceDecl]
-scanInstanceDeclsRaw src
-    | not (hasKeyword src (BC.pack "instance")) = pure []
-    | otherwise = go [] startCursor
+scanInstanceDecls src = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -2570,13 +2485,26 @@ data ClassDecl = ClassDecl
 -- Method names are returned in alphabetical order so positional slot
 -- dispatch matches 'scanInstanceDecls' (which uses @Map.toList@).
 scanClassDecls :: Source -> IO [ClassDecl]
-scanClassDecls src = memoiseScan "classDecls" src (scanClassDeclsRaw src)
-
-scanClassDeclsRaw :: Source -> IO [ClassDecl]
-scanClassDeclsRaw src
-    | not (hasKeyword src (BC.pack "class")) = pure []
+scanClassDecls src
+    -- Fast path: if the source contains no 'class' keyword byte-pattern
+    -- at all, there can be no class declarations — skip the expensive
+    -- tokenizer pass. Matters a lot for huge auto-generated modules
+    -- like GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory whose
+    -- multi-megabyte single-line string literals otherwise force the
+    -- lexer to materialise the whole payload. The byte scan is O(n)
+    -- with SIMD-accelerated ByteString primitives and zero allocation.
+    --
+    -- False positives (e.g. the literal text "class" appearing inside
+    -- a string or comment) just fall through to the normal path and
+    -- the tokenizer confirms there's no real class-at-col-1.
+    --
+    -- Verified 3000-4000x speedup on Unicode tables; the bang_pattern
+    -- fixture suite went from hanging >3 min to completing in seconds.
+    | not (BS.isInfixOf classKw (srcBytes src)) = pure []
     | otherwise = go [] startCursor
   where
+    classKw = BC.pack "class"
+
     go !acc cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
@@ -2874,12 +2802,7 @@ scanClassDeclsRaw src
 -- not an error here because some Hackage modules use CPP to conditionally
 -- gate imports, and we'd rather lose that one symbol than abort the load.
 scanForeignImports :: Source -> IO [ForeignDecl]
-scanForeignImports src = memoiseScan "foreignImports" src (scanForeignImportsRaw src)
-
-scanForeignImportsRaw :: Source -> IO [ForeignDecl]
-scanForeignImportsRaw src
-    | not (hasKeyword src (BC.pack "foreign")) = pure []
-    | otherwise = pure (reverse (loop [] startCursor))
+scanForeignImports src = pure (reverse (loop [] startCursor))
   where
     loop :: [ForeignDecl] -> Cursor -> [ForeignDecl]
     loop acc cur =
@@ -3454,12 +3377,7 @@ collectTypeVars body preds =
 -- signature (and comma-separated multi-name variants like
 -- @a, b :: Int@).  Malformed sigs are silently skipped.
 scanTypeSigs :: Source -> IO [(ByteString, Scheme)]
-scanTypeSigs src = memoiseScan "typeSigs" src (scanTypeSigsRaw src)
-
-scanTypeSigsRaw :: Source -> IO [(ByteString, Scheme)]
-scanTypeSigsRaw src
-    | not (hasKeyword src (BC.pack "::")) = pure []
-    | otherwise = go [] startCursor
+scanTypeSigs src = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -3523,12 +3441,7 @@ peekOperatorSig src cur =
 -- elaborator does one-hop expansion when it encounters the name in a
 -- type.  Type families, data types, and newtypes are skipped.
 scanTypeSynonyms :: Source -> IO [(ByteString, (Int, Type))]
-scanTypeSynonyms src = memoiseScan "typeSynonyms" src (scanTypeSynonymsRaw src)
-
-scanTypeSynonymsRaw :: Source -> IO [(ByteString, (Int, Type))]
-scanTypeSynonymsRaw src
-    | not (hasKeyword src (BC.pack "type")) = pure []
-    | otherwise = go [] startCursor
+scanTypeSynonyms src = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur

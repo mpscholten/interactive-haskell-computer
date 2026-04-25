@@ -47,12 +47,8 @@ data TokenKind
     | TkConId !ByteString     -- ^ uppercase-start identifier
     | TkInt   !Integer        -- ^ integer literal (decimal, @0x...@ hex, @0o...@ octal)
     | TkFloat !Double         -- ^ floating-point literal (e.g. @1.5@, @1e9@, @1.5e-3@)
-    | TkStr   ByteString      -- ^ @\"...\"@ string literal (contents after
-                              --   basic \\n \\t \\\\ \\\" escapes).
-                              --   Field is intentionally LAZY so scanners
-                              --   that only need the token KIND don't pay
-                              --   the cost of decoding multi-megabyte
-                              --   string literals — see 'lexString'.
+    | TkStr   !ByteString     -- ^ @\"...\"@ string literal (contents after
+                              --   basic \\n \\t \\\\ \\\" escapes)
     | TkChar  !Char           -- ^ @\'c\'@ character literal
     | TkTick                  -- ^ promoted-list/tuple tick — the bare @\'@
                               --   when followed by @[@, @(@, or @{@. The
@@ -491,54 +487,32 @@ nextToken s c0 =
     -- parser will surface a clearer error if needed. UTF-8 bytes are
     -- preserved as-is so multi-byte characters round-trip through the
     -- byte-oriented TkStr payload.
-    -- Two-phase lex: cheap forward scan to find the end position, plus a
-    -- lazy thunk that decodes the payload bytes on demand. This matters
-    -- a LOT for auto-generated modules with multi-megabyte single-line
-    -- string literals (e.g. the 3.2 MB
-    -- "GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory.bitmap#"
-    -- table) — scanners that only inspect @tkKind tok@ via @TkStr _@ pay
-    -- nothing for the 3M-element decoded payload. The 'TkStr' constructor
-    -- field is lazy specifically so this thunk survives without forcing.
     lexString openCur =
         let openP = cPos openCur + 1 in      -- past the opening quote
-        let endP  = findStrEnd openP in
-        let end   = Cursor (endP + 1) (cLine openCur)
-                           (cCol openCur + (endP + 1 - cPos openCur)) in
-        let bs    = scanStrBytes openP [] in -- lazy; only forced on demand
-        (mkTok (TkStr bs) openCur end, end)
+        let (bs, endP) = scanStr openP [] in
+        let end = Cursor (endP + 1) (cLine openCur)
+                         (cCol openCur + (endP + 1 - cPos openCur))
+        in (mkTok (TkStr bs) openCur end, end)
       where
-        -- Phase 1: walk the bytes until the closing quote / EOF without
-        -- allocating. Same escape shapes as the decoder — '\\"' inside a
-        -- string mustn't terminate early.
-        findStrEnd p = case peekByte s p of
-            Nothing   -> p                         -- EOF; close loosely
-            Just 0x22 -> p                         -- closing quote
-            Just 0x5C -> case tryStringGap s (p + 1) of
-                Just p' -> findStrEnd p'
-                Nothing -> case readEscape s (p + 1) of
-                    Just (_c, p') -> findStrEnd p'
-                    Nothing       -> case peekByte s (p + 1) of
-                        Just _  -> findStrEnd (p + 2)
-                        Nothing -> p + 1
-            Just _    -> findStrEnd (p + 1)
-
-        -- Phase 2: build the decoded payload. Same shape as the original
-        -- scanner; kept as a separate function so it stays lazy relative
-        -- to lexString's caller.
-        scanStrBytes p acc = case peekByte s p of
-            Nothing   -> BS.pack (reverse acc)
-            Just 0x22 -> BS.pack (reverse acc)
-            Just 0x5C ->
+        scanStr p acc = case peekByte s p of
+            Nothing   -> (BS.pack (reverse acc), p)          -- EOF; close loosely
+            Just 0x22 -> (BS.pack (reverse acc), p)          -- closing quote
+            Just 0x5C ->                                      -- backslash
+                -- Haskell 2010 §2.6 string gap: @\<whitespace>\@ elides
+                -- both backslashes and the whitespace between them
+                -- (used for multi-line string continuation).
                 case tryStringGap s (p + 1) of
-                    Just p' -> scanStrBytes p' acc
+                    Just p' -> scanStr p' acc
                     Nothing -> case readEscape s (p + 1) of
                         Just (c, p') ->
-                            scanStrBytes p' (reverse (encodeCharUtf8 c) ++ acc)
+                            scanStr p' (reverse (encodeCharUtf8 c) ++ acc)
                         Nothing ->
+                            -- Unrecognized escape: drop the backslash, skip
+                            -- a char to avoid looping. Unterminated on EOF.
                             case peekByte s (p + 1) of
-                                Just b' -> scanStrBytes (p + 2) (b' : acc)
-                                Nothing -> BS.pack (reverse acc)
-            Just b    -> scanStrBytes (p + 1) (b : acc)
+                                Just b' -> scanStr (p + 2) (b' : acc)
+                                Nothing -> (BS.pack (reverse acc), p + 1)
+            Just b    -> scanStr (p + 1) (b : acc)
 
     -- Starts at the opening single-quote. One logical character, possibly
     -- escaped or a multi-byte UTF-8 code point, followed by a closing

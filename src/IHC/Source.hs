@@ -19,47 +19,14 @@ module IHC.Source
     , lineCol
     , offsetToPos
     , withBytes
-    , ScanCacheBox
-    , readScanCache
-    , writeScanCache
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Dynamic (Dynamic)
-import qualified Data.Map.Strict as Map
-import Data.Map.Strict (Map)
-import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
 import Data.Word (Word8)
-import System.IO.Unsafe (unsafePerformIO)
 
 type Pos = Int           -- ^ byte offset into the source
 type Span = (Pos, Pos)   -- ^ half-open [start, end)
-
--- | Per-'Source' memoisation slot for scan results. The 'IHC.Scan' module
--- stores its uncached scan output here on the first call so that repeat
--- callers (Scheduler.hs invokes each scanFooDecls 5–10 times per loaded
--- module) pay no repeat lex cost. Keyed by an arbitrary string tag chosen
--- by the scan function; the value is a 'Dynamic' so we don't have to
--- enumerate every concrete result type in this module.
---
--- Per-'Source' (not global): two distinct 'Source' values, even if they
--- happen to share a 'srcName' (e.g. multiple @<repl>@ inputs), get
--- distinct 'IORef's, so a cache hit on one never leaks into the other.
-newtype ScanCacheBox = ScanCacheBox (IORef (Map String Dynamic))
-
--- | Look up a previously-cached scan result for this source.
-readScanCache :: ScanCacheBox -> String -> IO (Maybe Dynamic)
-readScanCache (ScanCacheBox ref) tag = Map.lookup tag <$> readIORef ref
-{-# INLINE readScanCache #-}
-
--- | Insert/overwrite a scan result. 'atomicModifyIORef'' so concurrent
--- scans of the same source don't lose entries; double-compute on a race
--- is harmless (scan results are pure in the source bytes).
-writeScanCache :: ScanCacheBox -> String -> Dynamic -> IO ()
-writeScanCache (ScanCacheBox ref) tag v =
-    atomicModifyIORef' ref (\m -> (Map.insert tag v m, ()))
-{-# INLINE writeScanCache #-}
 
 data Source = Source
     { srcName      :: !FilePath
@@ -67,35 +34,13 @@ data Source = Source
     -- | Byte offsets of the first byte of each line, 0-indexed.
     -- @srcLineStarts !! 0 == 0@ always.  Computed once in 'mkSource'.
     , srcLineStarts :: ![Int]
-    -- | Memoisation slot for scan results. Each 'mkSource' call gets a
-    -- fresh 'IORef' so cache entries are scoped to this exact 'Source'
-    -- value.
-    , srcScanCache :: ScanCacheBox
     }
 
 -- | Build a 'Source' from a file path and its raw bytes.
 -- One linear scan over @bs@ builds the line-start table; all subsequent
 -- 'offsetToPos' calls pay only O(log n).
---
--- Uses 'unsafePerformIO' to attach a fresh empty cache 'IORef' to the
--- Source: 'Source' is otherwise an immutable value type and we want
--- callers to keep treating it as such, but per-Source memoisation needs
--- mutable state under the hood. The 'IORef' is uniquely allocated per
--- 'mkSource' call (NOINLINE on the helper to keep CSE from sharing one
--- ref across distinct sources).
 mkSource :: FilePath -> ByteString -> Source
-mkSource name bs = Source name bs (buildLineStarts bs) (mkFreshScanCache name bs)
-
--- | Allocate a fresh empty scan cache. The (name, bs) cookie is taken
--- so GHC can't CSE this call across distinct 'mkSource' invocations —
--- without the cookie, the 'unsafePerformIO' would be eligible to share
--- a single 'IORef' across every 'Source' the program ever allocates,
--- which would silently fuse otherwise-independent scan caches together.
--- NOINLINE belt-and-braces.
-mkFreshScanCache :: FilePath -> ByteString -> ScanCacheBox
-mkFreshScanCache !_name !_bs =
-    unsafePerformIO (ScanCacheBox <$> newIORef Map.empty)
-{-# NOINLINE mkFreshScanCache #-}
+mkSource name bs = Source name bs (buildLineStarts bs)
 
 -- | Scan @bs@ once and return the byte offset of the first byte on each
 -- line.  Line 1 always starts at offset 0.
