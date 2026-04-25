@@ -4114,20 +4114,7 @@ resolveFallback name = do
                                 case mCtor of
                                   Just slot -> pure (Just slot)
                                   Nothing -> do
-                                   -- For names that have a known Prelude
-                                   -- owner (filter, map, length, …), skip
-                                   -- the broad bare-name fallback —
-                                   -- otherwise an unrelated module that
-                                   -- happens to export the same name (most
-                                   -- notably @Data.ByteString.filter@,
-                                   -- which is for ByteString not lists)
-                                   -- gets picked up first when warp's path
-                                   -- transitively loads bytestring.  Let
-                                   -- those flow straight to
-                                   -- 'preludeDirectOwner' below.
-                                   mAny <- case preludeDirectOwner bareName of
-                                       Just _  -> pure Nothing
-                                       Nothing -> tryAnyModuleBareSlot mods bareName
+                                   mAny <- tryAnyModuleBareSlot mods bareName
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
@@ -4154,19 +4141,29 @@ resolveFallback name = do
                                                     (Map.findWithDefault preludeLm ownerName mods')
                                                     bareName
 
-    -- | Scan every loaded module's 'lmBodies' for @bareName@.  Returns
-    -- the first slot found (Map.toList order = ascending module name).
-    -- If the body isn't materialised yet but the source contains a
-    -- top-level binding for @bareName@, trigger 'discoverInModule' to
-    -- force it into the cache; THEN return the slot.  This covers the
-    -- streaming-commons @bindPortTCP@/@bindPortGen@ pattern: warp
-    -- imports @bindPortTCP@, IHC discovers its body INTO the user's
-    -- main module (which is correct for the closure env), but the
-    -- body's free variable @bindPortGen@ — a same-DSN-module helper —
-    -- never gets discovered into DSN.lmBodies.  Probe LHS via
+    -- | Scan every loaded module's 'lmBodies' for @bareName@.  If the
+    -- body isn't materialised yet but the source contains a top-level
+    -- binding for @bareName@, trigger 'discoverInModule' to force it
+    -- into the cache.  This covers the streaming-commons
+    -- @bindPortTCP@ / @bindPortGen@ pattern: warp imports
+    -- @bindPortTCP@, IHC discovers its body INTO the user's main
+    -- module, but the body's free variable @bindPortGen@ — a
+    -- same-DSN-module helper — never gets discovered into
+    -- DSN.lmBodies.
+    --
+    -- Walks modules in priority order: Prelude-derived first (GHC.*,
+    -- Prelude, Data.List, Data.Maybe, Data.Either), then everything
+    -- else.  Otherwise, when warp's path eagerly loads
+    -- @Data.ByteString@ before @GHC.List@ (alphabetical Map ordering),
+    -- a bare @filter@ binds to @Data.ByteString.filter@ and crashes
+    -- with a non-exhaustive @PCon BS@ pattern when the caller passes
+    -- a non-ByteString list.  This is the same "Prelude scope wins
+    -- for unqualified names" rule that GHC's import resolver bakes
+    -- in via 'import Prelude' being implicit.  Probe LHS via
     -- 'findOrResolveLhs' (cheap source scan) and only commit to
     -- discovery on a match.
-    tryAnyModuleBareSlot mods bareName = go (Map.toList mods)
+    tryAnyModuleBareSlot mods bareName =
+        go (sortOn (preludePriority . fst) (Map.toList mods))
       where
         go [] = pure Nothing
         go ((_, owner) : rest) = do
@@ -4221,27 +4218,28 @@ resolveFallback name = do
             pure (buildLam name (left - 1) (t : acc))
 
     preludeDirectOwner bareName
-        -- Pin common Prelude list functions to GHC.List so that an
-        -- unrelated import (e.g. Data.ByteString) which exports the
-        -- same name doesn't get picked up first by the broad bare-name
-        -- fallback when warp's path transitively loads bytestring.
-        -- Without this, @filter (\\x -> NS.addrFamily x /= NS.AF_INET6)
-        -- addrs@ in streaming-commons mis-dispatches to
-        -- @Data.ByteString.filter :: (Word8 -> Bool) -> ByteString ->
-        -- ByteString@ on a @[AddrInfo]@ list, then crashes with a
-        -- non-exhaustive @PCon BS [pIn, l]@ pattern match.
-        | bareName `elem`
-            [ "elem", "filter", "map", "length", "take", "drop"
-            , "head", "tail", "init", "last", "null", "reverse"
-            , "concat", "concatMap", "zip", "zipWith", "unzip"
-            , "replicate", "repeat", "iterate", "foldr", "foldl"
-            , "foldr1", "foldl1", "any", "all", "and", "or"
-            , "sum", "product", "maximum", "minimum", "lookup"
-            , "splitAt", "span", "break", "dropWhile", "takeWhile"
-            , "notElem", "cycle"
-            ] = Just (BC.pack "GHC.List")
+        | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         | otherwise = Nothing
+
+    -- | Priority key for ordering modules during bare-name lookup.
+    -- Lower values are tried first.  Prelude-derived modules
+    -- (everything Prelude re-exports through, plus Prelude itself)
+    -- win over arbitrary same-bare-name modules — same rule GHC's
+    -- import resolver bakes in via implicit @import Prelude@.
+    preludePriority :: ModuleName -> Int
+    preludePriority m
+        | m == BC.pack "Prelude"          = 0
+        | BC.pack "GHC.Internal." `BC.isPrefixOf` m = 1
+        | BC.pack "GHC."          `BC.isPrefixOf` m = 2
+        | m == BC.pack "Data.List"        = 3
+        | m == BC.pack "Data.Maybe"       = 3
+        | m == BC.pack "Data.Either"      = 3
+        | m == BC.pack "Data.Tuple"       = 3
+        | m == BC.pack "Data.Char"        = 3
+        | m == BC.pack "Control.Monad"    = 3
+        | m == BC.pack "System.IO"        = 3
+        | otherwise                       = 100
 
     registerSharedDerivedEnumBounded loaded = do
         mReg <- readIORef sharedClassRegRef
