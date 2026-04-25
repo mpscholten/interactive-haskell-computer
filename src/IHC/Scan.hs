@@ -69,8 +69,8 @@ import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
 import IHC.AST (Name)
-import IHC.ClassesTypes (normalizeTyTag)
-import IHC.FFITypes (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
+import IHC.Classes (normalizeTyTag)
+import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
 import IHC.TypeAST (Type(..), Pred(..), Scheme(..))

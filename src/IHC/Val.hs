@@ -50,7 +50,6 @@ import Foreign.Ptr (Ptr)
 import System.IO (Handle)
 
 import IHC.AST (Expr, Name)
-import {-# SOURCE #-} IHC.Runtime (IHCRuntime)
 
 --------------------------------------------------------------------------------
 -- Values
@@ -171,19 +170,16 @@ extendIPMap = Map.insert
 lookupIPMap :: Name -> ImplicitParamMap -> Maybe Thunk
 lookupIPMap = Map.lookup
 
--- | A closure captures the per-run 'IHCRuntime', the regular
--- environment, and the implicit-param map at the point of its creation
--- (lexical scoping for the last two).  The runtime is carried through
--- so 'IHC.Eval.force' can resume evaluation without threading
--- 'IHCRuntime' as a separate argument through every 'force' call site.
-data Closure = Closure !IHCRuntime !Env !ImplicitParamMap !Expr
+-- | A closure captures both the regular environment and the implicit-param
+-- map at the point of its creation (lexical scoping for both).
+data Closure = Closure !Env !ImplicitParamMap !Expr
 
-newThunk :: IHCRuntime -> Env -> Expr -> IO Thunk
-newThunk rt env expr = newIORef (Unevaluated (Closure rt env emptyIPMap expr))
+newThunk :: Env -> Expr -> IO Thunk
+newThunk env expr = newIORef (Unevaluated (Closure env emptyIPMap expr))
 
 -- | Like 'newThunk' but also captures the current implicit-param map.
-newThunkIP :: IHCRuntime -> Env -> ImplicitParamMap -> Expr -> IO Thunk
-newThunkIP rt env ipm expr = newIORef (Unevaluated (Closure rt env ipm expr))
+newThunkIP :: Env -> ImplicitParamMap -> Expr -> IO Thunk
+newThunkIP env ipm expr = newIORef (Unevaluated (Closure env ipm expr))
 
 newWHNFThunk :: Val -> IO Thunk
 newWHNFThunk v = newIORef (Evaluated v)

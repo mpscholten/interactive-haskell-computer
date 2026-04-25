@@ -49,6 +49,7 @@ import Data.IORef
     , atomicModifyIORef'
     , newIORef
     , readIORef
+    , writeIORef
     )
 import Data.List (isPrefixOf, isSuffixOf, maximumBy, sortBy)
 import Data.Ord (Down(..))
@@ -564,26 +565,23 @@ dedupPreserveOrder = go []
 --
 -- 'Nothing' = not yet computed.  'Just pairs' = computed, reuse
 -- verbatim.  Thread-safe via 'atomicModifyIORef''.
---
--- Process-scoped (CAF) by design: the search-path results reflect
--- filesystem state (the contents of @~\/.cache\/ihc\/sources\/@ and the
--- nix bundle) which is shared across multiple 'IHCRuntime' instances
--- in the same process.  Same justification as 'IHC.FFI.openLibs' /
--- 'IHC.FFI.symbolCache' which were also kept as CAFs through the
--- runtime-threading refactor.  Without this memo, every scheduler call
--- (8 sites in 'loadProgramFromSource' alone) re-runs the disk-cache
--- fingerprint + decode pass — measurably slow on caches with many
--- packages.
 searchPathMemoRef :: IORef (Maybe [(FilePath, [FilePath])])
 searchPathMemoRef = unsafePerformIO (newIORef Nothing)
 {-# NOINLINE searchPathMemoRef #-}
 
--- | In-process memo for 'cachedPackageTable'.  Same process-scoped
--- rationale as 'searchPathMemoRef': the package table is a function of
--- the source directories on disk, not of any interpreter run's state.
+-- | In-process memo for 'cachedPackageTable'.  Session-scoped, never
+-- expires during a run; computed lazily on first request.
 packageTableMemoRef :: IORef (Maybe PackageTable)
 packageTableMemoRef = unsafePerformIO (newIORef Nothing)
 {-# NOINLINE packageTableMemoRef #-}
+
+-- | Clear the in-process search-path memo.  Exposed for tests that
+-- mutate the underlying directories and expect a fresh read.  Not
+-- currently wired up; kept as a private helper for future use.
+_resetSearchPathMemo :: IO ()
+_resetSearchPathMemo = do
+    writeIORef searchPathMemoRef Nothing
+    writeIORef packageTableMemoRef Nothing
 
 -- | Fingerprint summarising the state of the source directories the
 -- search path depends on.  Two fingerprints agreeing means "nothing
@@ -797,10 +795,8 @@ cachedPackageSearchPath = map fst <$> cachedPackageSearchPathWithIncludes
 -- names across sources.
 type PackageTable = [(FilePath, PackageInfo)]
 
--- | Cached 'PackageTable'.  Process-scoped; computed lazily by walking
--- every source root once.  Subsequent calls are O(1).  See
--- 'packageTableMemoRef' for why this is process-scoped (filesystem
--- state, not interpreter state).
+-- | Cached 'PackageTable'.  Session-scoped; computed lazily by walking
+-- every source root once.  Subsequent calls are O(1).
 cachedPackageTable :: IO PackageTable
 cachedPackageTable = do
     memo <- readIORef packageTableMemoRef

@@ -14,7 +14,6 @@ import IHC.Driver
 import IHC.Eval (force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (BindingLhs(..), emptyKnownSymbols, findBinding)
-import IHC.Runtime (newIHCRuntime)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (readSourceFile)
 import IHC.Val (Val(..))
@@ -26,9 +25,8 @@ import IHC.Val (Val(..))
 -- use this helper directly.
 runFileWithSearch :: [FilePath] -> FilePath -> IO Int
 runFileWithSearch searchPath path = do
-    rt  <- newIHCRuntime
     src <- readSourceFile path
-    (_env, mainT) <- loadProgramFromSource rt searchPath src
+    (_env, mainT) <- loadProgramFromSource searchPath src
     v             <- force mainT
     final         <- runIO v
     case final of

@@ -34,20 +34,17 @@ library
       , IHC.Builtins
       , IHC.CabalProject
       , IHC.Classes
-      , IHC.ClassesTypes
       , IHC.Cpp
       , IHC.Diagnostics
       , IHC.Driver
       , IHC.Elaborate
       , IHC.Eval
       , IHC.FFI
-      , IHC.FFITypes
       , IHC.Lexer
       , IHC.ModuleHeader
       , IHC.PackageStore
       , IHC.Parser
       , IHC.Repl
-      , IHC.Runtime
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
@@ -134,7 +131,6 @@ test-suite ihc-test
         CabalLoader
       , Coverage
       , JitSmoke
-      , MultiRuntime
       , NorthStarTest
       , ReplTest
       , RunFile

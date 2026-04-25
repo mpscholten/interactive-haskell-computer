@@ -50,9 +50,11 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.List (isSuffixOf)
 import System.Environment (lookupEnv)
 import System.FilePath (takeDirectory, splitDrive, (</>))
+import System.IO.Unsafe (unsafePerformIO)
 
 -- | A macro body: either a simple replacement text, or a function-like
 -- macro with parameter names and a replacement template containing
@@ -103,25 +105,31 @@ defaultCppContext = Map.fromList
 maxIncludeDepth :: Int
 maxIncludeDepth = 16
 
--- | Return the list of GHC global include directories.
---
--- Reads the @IHC_GHC_INCLUDE_DIRS@ environment variable (colon-separated)
--- on every call.  These directories hold headers like @MachDeps.h@,
--- @HsFFI.h@, @HsBaseConfig.h@ that are part of the installed GHC but
--- are not shipped in Hackage source tarballs.
---
--- The env var is set once at process start and never mutated, so reading
--- it afresh each time is cheap (~microseconds) and avoids the
--- process-wide 'IORef' cache this function used to carry.  That CAF was
--- removed alongside the broader push to keep interpreter state in
--- 'IHC.Runtime.IHCRuntime' rather than top-level 'unsafePerformIO'.
+-- | GHC's global include directories, read once from the
+-- @IHC_GHC_INCLUDE_DIRS@ environment variable (colon-separated).  These
+-- contain headers like @MachDeps.h@, @HsFFI.h@, @HsBaseConfig.h@ that are
+-- part of the installed GHC but are not shipped in Hackage source tarballs.
+-- Populated lazily on first use via 'unsafePerformIO'; safe because the
+-- environment variable is read-only after process start.
+{-# NOINLINE ghcGlobalIncludeDirsRef #-}
+ghcGlobalIncludeDirsRef :: IORef (Maybe [FilePath])
+ghcGlobalIncludeDirsRef = unsafePerformIO (newIORef Nothing)
+
+-- | Return the list of GHC global include directories, reading the env var
+-- the first time this function is called.
 getGhcGlobalIncludeDirs :: IO [FilePath]
 getGhcGlobalIncludeDirs = do
-    mEnv <- lookupEnv "IHC_GHC_INCLUDE_DIRS"
-    pure $ case mEnv of
-        Nothing  -> []
-        Just ""  -> []
-        Just val -> splitOnColon val
+    cached <- readIORef ghcGlobalIncludeDirsRef
+    case cached of
+        Just dirs -> pure dirs
+        Nothing   -> do
+            mEnv <- lookupEnv "IHC_GHC_INCLUDE_DIRS"
+            let dirs = case mEnv of
+                    Nothing  -> []
+                    Just ""  -> []
+                    Just val -> splitOnColon val
+            atomicWriteIORef ghcGlobalIncludeDirsRef (Just dirs)
+            pure dirs
   where
     splitOnColon :: String -> [FilePath]
     splitOnColon ""  = []
