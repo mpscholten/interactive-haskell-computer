@@ -2805,6 +2805,7 @@ startsAtom TkOQuoteD       = True  -- Phase 2.12: [d| (silently skipped)
 startsAtom TkOQuoteT       = True  -- Phase 2.12: [t| (silently skipped)
 startsAtom TkOQuoteP       = True  -- Phase 2.12: [p| (silently skipped)
 startsAtom TkOQuoteTy      = True  -- Phase 2.12: [|| (silently skipped)
+startsAtom TkQQOpen{}      = True  -- [hsx|…|] etc. — QuasiQuoter is a valid argument
 startsAtom _               = False
 
 --------------------------------------------------------------------------------

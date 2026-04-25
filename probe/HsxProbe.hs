@@ -178,7 +178,7 @@ reportBinding src fx ks name = do
             case eExpr of
                 Left ex -> hPutStrLn stderr $
                     "  (skip " <> BC.unpack name <> ": parse failed — "
-                               <> take 80 (show ex) <> ")"
+                               <> show ex <> ")"
                 Right expr ->
                     mapM_ (reportNode name) (exprSubtrees expr)
 
