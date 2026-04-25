@@ -1084,12 +1084,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- Today `[hsx|<h1>...</h1>|]` is not expanded by the parser, so
-        -- the RHS of `main` fails to scan, `main` is dropped, and the
-        -- scheduler reports no `main` in module Main. When HSX
-        -- quasi-quoting is implemented the error will change —
-        -- retarget this assertion (or graduate the fixture) at that
-        -- point.
+        -- Parser + Source-cache fixes have advanced the failure: the
+        -- module now parses and main is loaded, but the QQ-dispatch
+        -- path can't find the `QuasiQuoter` data constructor (its
+        -- record selectors haven't reached the env yet).  Retarget
+        -- this assertion when the next blocker falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1098,7 +1097,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "no `main` binding in module Main" `isInfixOf` m)
+                    (\m -> "unbound variable `QuasiQuoter`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- Today the blaze-html renderer hits a record-accessor gap
