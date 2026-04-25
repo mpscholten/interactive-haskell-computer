@@ -141,6 +141,7 @@ exprSubtrees e = e : case e of
     ERecordUpdate x fs        -> exprSubtrees x ++ concatMap (exprSubtrees . snd) fs
     ESplice x                 -> exprSubtrees x
     EQuote x                  -> exprSubtrees x
+    EQuasiQuote{}             -> []
     ELabel{}                  -> []
     ETyApp x _                -> exprSubtrees x
     ETypedMethod{}            -> []
