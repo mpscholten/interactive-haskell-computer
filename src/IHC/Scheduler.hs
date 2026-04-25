@@ -3852,24 +3852,96 @@ installEnvFallbackHook =
 
 resolveFallback :: ByteString -> IO (Maybe Thunk)
 resolveFallback name
+    -- warp's modules use a fixed set of qualified aliases.  When env
+    -- binding for an alias-qualified name fails, the demand-driven env
+    -- fallback lands here.  Each rewrite redirects an alias to its
+    -- canonical module-qualified form.  Two shapes show up: literal
+    -- @<Alias>.<name>@ (no module prefix) and module-qualified
+    -- @<owner>.<Alias>.<name>@; per-symbol rewrites use suffix
+    -- matching, prefix rewrites cover the literal form.
+    --
+    -- @import qualified Network.Wai.Handler.Warp.FdCache as F@
     | BC.pack ".F.setFileCloseOnExec" `isSuffixOf` name =
         resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.setFileCloseOnExec")
     | BC.pack ".F.withFdCache" `isSuffixOf` name =
         resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.withFdCache")
+    | BC.pack ".F.Fd" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.Fd")
+    | BC.pack ".F.Refresh" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.Refresh")
+    -- @import qualified Network.Wai.Handler.Warp.Date as D@
     | BC.pack ".D.withDateCache" `isSuffixOf` name =
         resolveFallback (BC.pack "Network.Wai.Handler.Warp.Date.withDateCache")
+    | BC.pack ".D.GMTDate" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.Date.GMTDate")
+    -- @import qualified Network.Wai.Handler.Warp.FileInfoCache as I@
+    -- (Note: @I@ is reused in other warp files for Data.IORef and
+    -- Data.IntMap.Strict, so we cannot prefix-rewrite — only the
+    -- specific FileInfoCache symbols below are safe.)
     | BC.pack ".I.withFileInfoCache" `isSuffixOf` name =
         resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.withFileInfoCache")
+    | BC.pack ".I.FileInfo" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.FileInfo")
+    | BC.pack ".I.fileInfoDate" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoDate")
+    | BC.pack ".I.fileInfoSize" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoSize")
+    | BC.pack ".I.fileInfoTime" `isSuffixOf` name =
+        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoTime")
+    -- @import qualified Control.Exception as E@.  Pre-existing
+    -- @bracket@ / @bracketOnError@ rewrites strip to bare names (those
+    -- are re-exported through the Prelude path).  Other E.* names are
+    -- not in Prelude, so we redirect to fully-qualified
+    -- @Control.Exception.<name>@.
     | BC.pack ".E.bracketOnError" `isSuffixOf` name =
         resolveFallback (BC.pack "bracketOnError")
     | BC.pack ".E.bracket" `isSuffixOf` name =
         resolveFallback (BC.pack "bracket")
+    | BC.pack ".E.try" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.try")
+    | BC.pack ".E.catch" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.catch")
+    | BC.pack ".E.handle" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.handle")
+    | BC.pack ".E.handleJust" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.handleJust")
+    | BC.pack ".E.finally" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.finally")
+    | BC.pack ".E.throwIO" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.throwIO")
+    | BC.pack ".E.toException" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.toException")
+    | BC.pack ".E.mask_" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.mask_")
+    | BC.pack ".E.allowInterrupt" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.allowInterrupt")
+    | BC.pack ".E.SomeException" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.SomeException")
+    | BC.pack ".E.IOException" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.IOException")
+    | BC.pack ".E.ErrorCall" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.ErrorCall")
+    | BC.pack ".E.Exception" `isSuffixOf` name =
+        resolveFallback (BC.pack "Control.Exception.Exception")
+    -- @import qualified System.TimeManager as T@.  Note: warp's
+    -- Settings.hs uses @T@ for Data.Text instead, so we cannot
+    -- prefix-rewrite — per-symbol only.
     | BC.pack ".T.initialize" `isSuffixOf` name =
         resolveFallback (BC.pack "System.TimeManager.initialize")
     | BC.pack ".T.stopManager" `isSuffixOf` name =
         resolveFallback (BC.pack "System.TimeManager.stopManager")
     | BC.pack ".T.withHandleKillThread" `isSuffixOf` name =
         resolveFallback (BC.pack "System.TimeManager.withHandleKillThread")
+    | BC.pack ".T.tickle" `isSuffixOf` name =
+        resolveFallback (BC.pack "System.TimeManager.tickle")
+    | BC.pack ".T.pause" `isSuffixOf` name =
+        resolveFallback (BC.pack "System.TimeManager.pause")
+    | BC.pack ".T.resume" `isSuffixOf` name =
+        resolveFallback (BC.pack "System.TimeManager.resume")
+    | BC.pack ".T.Handle" `isSuffixOf` name =
+        resolveFallback (BC.pack "System.TimeManager.Handle")
+    | BC.pack ".T.Manager" `isSuffixOf` name =
+        resolveFallback (BC.pack "System.TimeManager.Manager")
     -- streaming-commons aliases @import qualified Network.Socket as NS@
     -- and uses the alias for accessors / constructors / actions on AddrInfo
     -- (NS.addrFamily, NS.addrSocketType, NS.addrProtocol, …) plus bind /
@@ -3880,6 +3952,26 @@ resolveFallback name
     -- 'IHC.Builtins' (or interpreted from Network.Socket source).
     | BC.pack "NS." `BC.isPrefixOf` name =
         resolveFallback (BC.pack "Network.Socket." `BC.append` BC.drop 3 name)
+    -- @import qualified Network.Socket.ByteString as Sock@ in warp's
+    -- Run.hs / SendFile paths (only Sock.sendAll / Sock.sendMany used).
+    | BC.pack "Sock." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Network.Socket.ByteString." `BC.append` BC.drop 5 name)
+    -- @import qualified Control.Concurrent as Conc@ — only Conc.yield
+    -- and Conc.Sync are referenced, but Conc is unique to warp's Run.hs.
+    | BC.pack "Conc." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Control.Concurrent." `BC.append` BC.drop 5 name)
+    -- @import qualified Data.Vault.Lazy as Vault@ — used by warp's
+    -- HTTP1.hs / HTTP2/Request.hs and Settings.hs for vault keys.
+    | BC.pack "Vault." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Data.Vault.Lazy." `BC.append` BC.drop 6 name)
+    -- @import qualified Data.ByteString.Builder as BB@ — used in
+    -- warp's HTTP1 path for response body construction.
+    | BC.pack "BB." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Data.ByteString.Builder." `BC.append` BC.drop 3 name)
+    -- @import qualified Data.CaseInsensitive as CI@ — used for
+    -- case-insensitive HTTP header keys.
+    | BC.pack "CI." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
 resolveFallback name = do
     mods <- readIORef globalLoadedModulesRef
     case splitQualified name
