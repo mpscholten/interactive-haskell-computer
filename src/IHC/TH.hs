@@ -430,6 +430,8 @@ expandSplicesInExpr env ipm depth expr
     -- Phase 2.12: EQuote is a leaf in the splice-expansion pass.
     -- Its body is NOT expanded (it's a quotation, not a splice).
     go (EQuote e) = pure (EQuote e)
+    -- QuasiQuoter body stays opaque here; expansion happens at eval time.
+    go (EQuasiQuote n b) = pure (EQuasiQuote n b)
     -- Value-level @T: recurse into the inner expression; the type arg is opaque.
     go (ETyApp e ty) = do
         e' <- go e
