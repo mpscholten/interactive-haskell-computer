@@ -13,6 +13,7 @@ module IHC.Builtins
     , buildConEnv
     , buildFieldEnv
     , showValWith
+    , stringToListValIO
     ) where
 
 import Control.Concurrent

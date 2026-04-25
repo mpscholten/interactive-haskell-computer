@@ -64,7 +64,7 @@ import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
-import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
+import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO)
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
@@ -2463,37 +2463,41 @@ classMethodDispatcher reg cls methodName = selfVal
                               | not (isMethodPlaceholder methodVal) ->
                                     applyAll methodVal (reverse (argT : accArgs))
                             _ -> do
-                            -- Lazy-scan in-scope modules once and retry.
-                              didScan <- lazyInstanceRetry cls tag
-                              mMethod2 <- if didScan
-                                  then do
-                                      a <- lookupInstanceMethodForced reg cls tag methodName
-                                      b <- lookupInSharedRegForced cls tag methodName
-                                      pure (preferMethod a b)
-                                  else pure mMethod
-                              case mMethod2 of
-                                  Just methodVal
-                                    | not (isMethodPlaceholder methodVal) ->
-                                          applyAll methodVal (reverse (argT : accArgs))
-                                  _ -> do
-                                      mResult <- resultPolymorphicMethod
-                                      case mResult of
-                                          Just resultVal ->
-                                              applyAll resultVal (reverse (argT : accArgs))
-                                          Nothing -> do
-                                              -- Dispatchable arg but no matching instance.
-                                              -- Fall back to the class's default body.
-                                              mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                              mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                              let mDef = preferMethod mDef0 mDefShared
-                                              case mDef of
-                                                  Just defVal ->
-                                                      applyAll defVal (reverse (argT : accArgs))
-                                                  _ -> error
-                                                      ( "class-method dispatch: no instance of `"
-                                                       <> BC.unpack cls
-                                                       <> "` for type `" <> BC.unpack tag
-                                                       <> "` (method `" <> BC.unpack methodName <> "`)" )
+                              mHost <- hostShowFallback reg cls tag methodName av
+                              case mHost of
+                                Just hostVal -> pure hostVal
+                                Nothing -> do
+                                  -- Lazy-scan in-scope modules once and retry.
+                                  didScan <- lazyInstanceRetry cls tag
+                                  mMethod2 <- if didScan
+                                      then do
+                                          a <- lookupInstanceMethodForced reg cls tag methodName
+                                          b <- lookupInSharedRegForced cls tag methodName
+                                          pure (preferMethod a b)
+                                      else pure mMethod
+                                  case mMethod2 of
+                                      Just methodVal
+                                        | not (isMethodPlaceholder methodVal) ->
+                                              applyAll methodVal (reverse (argT : accArgs))
+                                      _ -> do
+                                          mResult <- resultPolymorphicMethod
+                                          case mResult of
+                                              Just resultVal ->
+                                                  applyAll resultVal (reverse (argT : accArgs))
+                                              Nothing -> do
+                                                  -- Dispatchable arg but no matching instance.
+                                                  -- Fall back to the class's default body.
+                                                  mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                                  mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                                  let mDef = preferMethod mDef0 mDefShared
+                                                  case mDef of
+                                                      Just defVal ->
+                                                          applyAll defVal (reverse (argT : accArgs))
+                                                      _ -> error
+                                                          ( "class-method dispatch: no instance of `"
+                                                           <> BC.unpack cls
+                                                           <> "` for type `" <> BC.unpack tag
+                                                           <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else do
                     -- Non-dispatchable (function / unit / primitive
                     -- object): stash and wait for the next arg so the
@@ -2653,6 +2657,46 @@ classMethodDispatcher reg cls methodName = selfVal
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+-- | Host-backed fallback for @Show.show@ on primitive types.
+--
+-- Source-loaded @instance Show Int@ overrides @showsPrec@ with
+-- @showSignedInt@, whose body uses primop patterns @(I# n)@ that the
+-- parser doesn't yet handle.  The instance method ends up registered
+-- as 'methodPlaceholder', so the dispatcher falls through to the
+-- class default body @show x = showsPrec 0 x ""@, which itself
+-- dispatches @showsPrec.Int@ → also placeholder → its default @showsPrec
+-- _ x s = show x ++ s@ → calls @show x@ → infinite loop.
+--
+-- For primitive types where 'IHC.Builtins.showValWith' already has a
+-- correct implementation, short-circuit to that instead of letting the
+-- placeholder/default chain run.  Only fires for @Show.show@ — other
+-- methods (showsPrec, showList) keep their normal dispatch so user
+-- overrides still work.
+hostShowFallback
+    :: ClassRegistry
+    -> ByteString    -- ^ class
+    -> ByteString    -- ^ type tag
+    -> ByteString    -- ^ method name
+    -> Val           -- ^ already-forced argument value
+    -> IO (Maybe Val)
+hostShowFallback reg cls tag methodName av
+    | cls == BC.pack "Show"
+    , methodName == BC.pack "show"
+    , isHostShowable tag = do
+        s <- showValWith reg av
+        Just <$> stringToListValIO s
+    | otherwise = pure Nothing
+  where
+    isHostShowable t =
+        t == BC.pack "Int" || t == BC.pack "Integer" ||
+        t == BC.pack "Float" || t == BC.pack "Double" ||
+        t == BC.pack "Char" || t == BC.pack "Bool" ||
+        t == BC.pack "Word" ||
+        t == BC.pack "Int8" || t == BC.pack "Int16" ||
+        t == BC.pack "Int32" || t == BC.pack "Int64" ||
+        t == BC.pack "Word8" || t == BC.pack "Word16" ||
+        t == BC.pack "Word32" || t == BC.pack "Word64"
 
 -- | Look up a class method in the shared (REPL-level) class registry
 -- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is

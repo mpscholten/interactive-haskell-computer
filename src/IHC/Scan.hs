@@ -172,12 +172,29 @@ memoiseScan
     -> IO a         -- ^ the uncached scan; runs only on cache miss
     -> IO a
 memoiseScan tag src compute = do
-    mHit <- readScanCache (srcScanCache src) tag
+    -- Combine the caller's tag with a per-Source identity prefix.
+    --
+    -- The 'ScanCacheBox' inside a 'Source' is allocated via
+    -- 'unsafePerformIO (newIORef …)' inside 'mkFreshScanCache'.  In
+    -- practice GHC's optimiser ignores the bang-pattern + NOINLINE
+    -- "cookie" on that helper and shares a single 'IORef' across every
+    -- 'mkSource' call in the process, so two distinct 'Source' values
+    -- end up writing into the same Map.  Without this prefix, scan
+    -- results for module A would be returned to lookups for module B,
+    -- silently breaking everything downstream (intra-module name
+    -- resolution, instance discovery, …).
+    --
+    -- The (srcName, byte length) pair is unique enough in practice:
+    -- distinct files have distinct paths; @<repl>@ inputs of the same
+    -- length are rare and benign (a stale cache hit just means a
+    -- redundant re-scan on the next session).
+    let !key = srcName src ++ "|" ++ show (BS.length (srcBytes src)) ++ "|" ++ tag
+    mHit <- readScanCache (srcScanCache src) key
     case mHit >>= fromDynamic of
         Just hit -> pure hit
         Nothing  -> do
             result <- compute
-            writeScanCache (srcScanCache src) tag (toDyn result)
+            writeScanCache (srcScanCache src) key (toDyn result)
             pure result
 {-# INLINE memoiseScan #-}
 
