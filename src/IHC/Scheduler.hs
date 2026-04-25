@@ -132,7 +132,11 @@ cppSource = cppSourceWithIncludes []
 cppSourceWithIncludes :: [FilePath] -> Source -> IO Source
 cppSourceWithIncludes includeDirs src = do
     bs' <- cppPreprocessWithIncludes includeDirs defaultCppContext (srcName src) (srcBytes src)
-    pure (src { srcBytes = bs' })
+    -- Use 'withBytes' rather than record-updating @srcBytes@: it
+    -- recomputes the line-start table for the post-CPP byte string AND
+    -- allocates a fresh per-Source scan cache so any pre-CPP scan
+    -- results don't leak into post-CPP lookups.
+    pure (withBytes src bs')
 
 --------------------------------------------------------------------------------
 -- Module registry types
