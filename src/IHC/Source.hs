@@ -36,16 +36,18 @@ import System.IO.Unsafe (unsafePerformIO)
 type Pos = Int           -- ^ byte offset into the source
 type Span = (Pos, Pos)   -- ^ half-open [start, end)
 
--- | Per-'Source' memoisation slot for scan results. The 'IHC.Scan'
--- module stores its uncached scan output here on the first call so that
--- repeat callers (Scheduler.hs invokes each scanFooDecls 5–10 times per
--- loaded module) pay no repeat lex cost.  Keyed by an arbitrary string
--- tag chosen by the scan function; the value is a 'Dynamic' so we don't
--- have to enumerate every concrete result type in this module.
+-- | Memoisation slot for scan results. The 'IHC.Scan' module stores
+-- its uncached scan output here on the first call so that repeat
+-- callers (Scheduler.hs invokes each scanFooDecls 5–10 times per
+-- loaded module) pay no repeat lex cost.  Keyed by an arbitrary
+-- string tag chosen by the scan function; the value is a 'Dynamic'
+-- so we don't have to enumerate every concrete result type in this
+-- module.
 --
--- Per-'Source' (not global): two distinct 'Source' values, even if they
--- happen to share a 'srcName' (e.g. multiple @<repl>@ inputs), get
--- distinct 'IORef's, so a cache hit on one never leaks into the other.
+-- Content-addressable: two 'Source' values built from the same byte
+-- content share one 'IORef' (see 'mkFreshScanCache').  Sound because
+-- scan results are pure functions of the bytes; necessary because
+-- the Scheduler builds many 'Source' values over the same files.
 newtype ScanCacheBox = ScanCacheBox (IORef (Map String Dynamic))
 
 readScanCache :: ScanCacheBox -> String -> IO (Maybe Dynamic)
@@ -63,9 +65,9 @@ data Source = Source
     -- | Byte offsets of the first byte of each line, 0-indexed.
     -- @srcLineStarts !! 0 == 0@ always.  Computed once in 'mkSource'.
     , srcLineStarts :: ![Int]
-    -- | Memoisation slot for scan results.  Each 'mkSource' call gets
-    -- a fresh 'IORef' so cache entries are scoped to this exact
-    -- 'Source' value — see 'mkFreshScanCache'.
+    -- | Memoisation slot for scan results.  Content-addressable: two
+    -- 'mkSource' calls with the same bytes share one 'IORef'.  See
+    -- 'mkFreshScanCache'.
     , srcScanCache :: ScanCacheBox
     }
 
@@ -79,16 +81,43 @@ data Source = Source
 mkSource :: FilePath -> ByteString -> Source
 mkSource name bs = Source name bs (buildLineStarts bs) (mkFreshScanCache name bs)
 
--- | Allocate a fresh empty scan cache.  The (name, bs) cookie is taken
--- so GHC can't CSE this call across distinct 'mkSource' invocations —
--- without the cookie, the 'unsafePerformIO' would be eligible to share
--- a single 'IORef' across every 'Source' the program ever allocates,
--- silently fusing otherwise-independent scan caches together.  NOINLINE
--- belt-and-braces.
+-- | Allocate a scan cache for a 'Source'.
+--
+-- This is a CONTENT-ADDRESSABLE cache: two 'mkSource' calls with the
+-- same byte content share the same underlying 'IORef'.  Sound because
+-- all cached values are pure functions of the bytes (the @tag@ is the
+-- only other input, scoped inside the inner Map), and necessary
+-- because the Scheduler builds many 'Source' values over the same
+-- files (entry-module probe, header parse, discovery pass, REPL load,
+-- etc.) — without sharing, each scan would pay the full lex cost per
+-- Source instead of once per file.
+--
+-- The previous design tried to give every 'Source' its own 'IORef'
+-- via @unsafePerformIO (newIORef Map.empty)@ inside the function
+-- body, with a @(name, bs)@ "cookie" of strict bang patterns intended
+-- to defeat GHC's CSE.  That doesn't actually work: the body has no
+-- free variables, so GHC is entitled to float it out as a top-level
+-- CAF and every call shared one 'IORef'.  That made
+-- 'scanAllTopLevelNames' (and friends) return the FIRST source's
+-- result for every subsequent call — a correctness bug masquerading
+-- as a speedup.  We side-step both problems by keying off the bytes
+-- themselves.
 mkFreshScanCache :: FilePath -> ByteString -> ScanCacheBox
-mkFreshScanCache !_name !_bs =
-    unsafePerformIO (ScanCacheBox <$> newIORef Map.empty)
+mkFreshScanCache _name bs = unsafePerformIO $ do
+    m <- readIORef globalScanCacheRegistry
+    case Map.lookup bs m of
+        Just ref -> pure (ScanCacheBox ref)
+        Nothing -> do
+            ref <- newIORef Map.empty
+            atomicModifyIORef' globalScanCacheRegistry
+                (\m' -> case Map.lookup bs m' of
+                    Just existing -> (m', ScanCacheBox existing)
+                    Nothing       -> (Map.insert bs ref m', ScanCacheBox ref))
 {-# NOINLINE mkFreshScanCache #-}
+
+{-# NOINLINE globalScanCacheRegistry #-}
+globalScanCacheRegistry :: IORef (Map ByteString (IORef (Map String Dynamic)))
+globalScanCacheRegistry = unsafePerformIO (newIORef Map.empty)
 
 -- | Scan @bs@ once and return the byte offset of the first byte on each
 -- line.  Line 1 always starts at offset 0.
