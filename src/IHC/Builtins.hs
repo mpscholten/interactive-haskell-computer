@@ -728,6 +728,16 @@ builtins reg =
     , ("Network.Wai.Handler.Warp.Settings.settingsPort", warpSettingsPortB)
     , ("settingsHost", warpSettingsHostB)
     , ("Network.Wai.Handler.Warp.Settings.settingsHost", warpSettingsHostB)
+    , ("settingsTimeout", warpSettingsTimeoutB)
+    , ("Network.Wai.Handler.Warp.Settings.settingsTimeout", warpSettingsTimeoutB)
+    , ("settingsFdCacheDuration", warpSettingsFdCacheDurationB)
+    , ( "Network.Wai.Handler.Warp.Settings.settingsFdCacheDuration"
+      , warpSettingsFdCacheDurationB
+      )
+    , ("settingsFileInfoCacheDuration", warpSettingsFileInfoCacheDurationB)
+    , ( "Network.Wai.Handler.Warp.Settings.settingsFileInfoCacheDuration"
+      , warpSettingsFileInfoCacheDurationB
+      )
     -- Network.Socket AddrInfo record-field accessors.  The host backing
     -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
     -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
@@ -853,6 +863,15 @@ builtins reg =
     , ("withHandleKillThread", timeManagerWithHandleB)
     , ("System.TimeManager.withHandle", timeManagerWithHandleB)
     , ("System.TimeManager.withHandleKillThread", timeManagerWithHandleB)
+    -- @System.TimeManager.initialize@ / @stopManager@ are RTS-tied helpers
+    -- (their upstream definitions just box / unbox a 'Manager Int' since the
+    -- timeout work itself is delegated to the GHC RTS timer manager).  IHC
+    -- skips that backend entirely, so the bare-name and qualified bindings
+    -- both resolve to no-op host shims that keep warp's @withII@ happy.
+    , ("initialize", timeManagerInitializeB)
+    , ("System.TimeManager.initialize", timeManagerInitializeB)
+    , ("stopManager", timeManagerStopManagerB)
+    , ("System.TimeManager.stopManager", timeManagerStopManagerB)
     -- System.Posix.IO comes from the boot `unix` package, whose source is
     -- not present in ~/.cache/ihc/sources for this run.  setFdOption mutates
     -- an OS file descriptor flag; expose the host operation so Warp can mark
@@ -3770,6 +3789,22 @@ warpSettingsPortB = settingsFieldB "settingsPort" 0
 warpSettingsHostB :: IO Val
 warpSettingsHostB = settingsFieldB "settingsHost" 1
 
+-- warp's @Settings@ record field order (see
+-- ~/.cache/ihc/sources/warp-3.4.12/Network/Wai/Handler/Warp/Settings.hs):
+-- 0 settingsPort, 1 settingsHost, 2 settingsOnException,
+-- 3 settingsOnExceptionResponse, 4 settingsOnOpen, 5 settingsOnClose,
+-- 6 settingsTimeout, 7 settingsManager, 8 settingsFdCacheDuration,
+-- 9 settingsFileInfoCacheDuration, ...
+warpSettingsTimeoutB :: IO Val
+warpSettingsTimeoutB = settingsFieldB "settingsTimeout" 6
+
+warpSettingsFdCacheDurationB :: IO Val
+warpSettingsFdCacheDurationB = settingsFieldB "settingsFdCacheDuration" 8
+
+warpSettingsFileInfoCacheDurationB :: IO Val
+warpSettingsFileInfoCacheDurationB =
+    settingsFieldB "settingsFileInfoCacheDuration" 9
+
 settingsFieldB :: String -> Int -> IO Val
 settingsFieldB label idx = pure $ VFun $ \settingsT -> do
     settingsV <- force settingsT
@@ -5254,6 +5289,28 @@ timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT 
         keyRefT <- newWHNFThunk VUnit
         stateT <- newWHNFThunk VUnit
         pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
+
+-- | @System.TimeManager.initialize :: Int -> IO Manager@.  Upstream's
+-- implementation since time-manager 0.3.0 is just @pure . Manager . max 0@,
+-- since timeouts are implemented via the GHC RTS timer manager.  IHC does
+-- not run the RTS timer manager either, so we mirror the same behaviour:
+-- box the (clamped) timeout value into a @Manager@ constructor and hand it
+-- back. 'timeManagerWithHandleB' / 'timeManagerStopManagerB' do not look at
+-- the payload, so any well-formed @VCon "Manager" [VInt n]@ is fine.
+timeManagerInitializeB :: IO Val
+timeManagerInitializeB = pure $ VFun $ \timeoutT -> pure $ VIO $ do
+    timeoutV <- force timeoutT
+    case timeoutV of
+        VInt n -> do
+            nT <- newWHNFThunk (VInt (max 0 n))
+            pure (VCon "Manager" [nT])
+        other -> error ("System.TimeManager.initialize: not an Int: " <> showValForDebug other)
+
+-- | @System.TimeManager.stopManager :: Manager -> IO ()@.  Upstream marked
+-- this as deprecated in 0.3.0 and now defines it as @\\_ -> pure ()@; we do
+-- the same.
+timeManagerStopManagerB :: IO Val
+timeManagerStopManagerB = pure $ VFun $ \_mgrT -> pure $ VIO $ pure VUnit
 
 setFdOptionB :: IO Val
 setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
