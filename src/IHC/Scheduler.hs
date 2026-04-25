@@ -4512,14 +4512,33 @@ buildForeignEnv lms searchPath = do
 -- packages no module in the current run has imported (harmless, and
 -- the @dlopen@ cost for extras a program doesn't use is negligible).
 registerPackageExtras :: [LoadedModule] -> [FilePath] -> IO ()
-registerPackageExtras _lms _searchPath = do
-    table <- cachedPackageTable
-    let libs = Set.toList (Set.fromList
-                   [ lib
-                   | (_, info) <- table
-                   , lib       <- pkgExtraLibs info
-                   ])
-    mapM_ FFI.registerLibrary libs
+registerPackageExtras lms _searchPath
+    -- Fast path: if no loaded module declares any 'foreign import' the
+    -- whole purpose of this function (making host-side symbols
+    -- discoverable for the FFI dispatcher) is moot.  On a cold cache,
+    -- enumerating every package's @extra-libraries:@ stanza takes ~190 ms
+    -- (cabal-file parsing dominates) — pure overhead for FFI-free
+    -- programs.  Even with the on-disk fingerprint cache and the
+    -- in-process CAF memo restored in 7eb5037, this remains the single
+    -- biggest non-FFI startup cost: 'cachedPackageTable' on a warm cache
+    -- is still tens of ms, and we hit it once per 'loadProgramFromSource'.
+    --
+    -- 'lmForeignDecls' is populated by 'scanForeignImports', which has a
+    -- byte-level early-out for sources that don't contain the literal
+    -- string @\"foreign\"@, so 'all (null . lmForeignDecls)' is itself
+    -- O(modules) cheap byte-scans for FFI-free runs.
+    --
+    -- bang_pattern_acc fixture (4 lines, 14 loaded modules, 0 foreign
+    -- decls): trims another ~150 ms off total runtime.
+    | all (null . lmForeignDecls) lms = pure ()
+    | otherwise = do
+        table <- cachedPackageTable
+        let libs = Set.toList (Set.fromList
+                       [ lib
+                       | (_, info) <- table
+                       , lib       <- pkgExtraLibs info
+                       ])
+        mapM_ FFI.registerLibrary libs
 
 emptyHeader :: ModuleHeader
 emptyHeader = ModuleHeader Nothing ExportAll []
