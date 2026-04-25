@@ -345,6 +345,15 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Num"
             , BC.pack "GHC.Internal.Real"
             , BC.pack "GHC.Internal.Maybe"
+            -- Language.Haskell.TH.Quote declares 'data QuasiQuoter = QuasiQuoter
+            -- { quoteExp, quotePat, quoteType, quoteDec }'.  QuasiQuoter-providing
+            -- libraries like ihp-hsx record-construct values like
+            -- @hsx = customHsx (HsxSettings…)@ where @customHsx@'s body is
+            -- @QuasiQuoter { quoteExp = … }@.  Without this force-load the
+            -- demand-driven loader doesn't visit TH.Quote so the constructor
+            -- isn't registered, and the record-construction emits 'EVar
+            -- "QuasiQuoter"' which is unbound.
+            , BC.pack "Language.Haskell.TH.Quote"
             ]
     forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
@@ -574,9 +583,16 @@ buildBaseEnv = do
     -- running with whatever subset we managed to load.
     env2 <- preDiscoverPreludeConstructors env1
                 `catch` (\(_ :: SomeException) -> pure env1)
+    -- Pre-discover 'QuasiQuoter' from Language.Haskell.TH.Quote so
+    -- libraries like ihp-hsx can build their @hsx :: QuasiQuoter@
+    -- record-construction without the user having to explicitly
+    -- import the TH module.  See 'preDiscoverTHQuoteConstructors'
+    -- for why this matters for QQ dispatch.
+    env3 <- preDiscoverTHQuoteConstructors env2
+                `catch` (\(_ :: SomeException) -> pure env2)
     -- Seed the env-fallback's base env so Closures built by
     -- 'resolveFallback' can reach builtins + class dispatchers.
-    writeIORef envBaseForFallbackRef env2
+    writeIORef envBaseForFallbackRef env3
     -- Install the core-instance load hook: on the first elaborator
     -- lookup miss ('IHC.Eval.resolveTypedMethod'), force-load
     -- GHC.Internal.Base / Maybe / … so their Applicative / Monad /
@@ -584,7 +600,7 @@ buildBaseEnv = do
     -- IORef flag); later calls are free.  Kept out of startup so the
     -- bare REPL prompt stays fast for users who never use type
     -- annotations.
-    installCoreInstanceLoadHook classReg env2
+    installCoreInstanceLoadHook classReg env3
     -- Install the class-method fallback: if resolveTypedMethod can't
     -- find an instance even after loading core dicts, return the
     -- dispatcher so value-directed lookup can still run.
@@ -595,7 +611,7 @@ buildBaseEnv = do
     -- 'Expr' to evaluate.  Lives in 'IHC.TH' which already depends on
     -- 'IHC.Eval'; the hook breaks the would-be cycle.
     setThExpToExpr thExpToExpr
-    pure (env2, classReg)
+    pure (env3, classReg)
 
 -- | Install a one-shot hook that force-loads core instance modules
 -- (@GHC.Internal.Base@ and friends) and registers their instance
@@ -727,6 +743,44 @@ preDiscoverPreludeConstructors env0 = do
         case r of
             Right lm -> pure (lmDataReg lm)
             Left  _  -> pure Map.empty
+
+-- | Source-load 'Language.Haskell.TH.Quote' so its 'QuasiQuoter' record
+-- type — the data constructor + the four field accessors @quoteExp@ /
+-- @quotePat@ / @quoteType@ / @quoteDec@ — are available in env without
+-- the user's program needing an explicit @import@.
+--
+-- Why pre-load: a 'QuasiQuoter'-providing library like @ihp-hsx@ has
+-- @hsx :: QuasiQuoter@ defined as @customHsx (HsxSettings…)@; the body
+-- of @customHsx@ is a record-construction
+-- @QuasiQuoter { quoteExp = …, quotePat = …, … }@.  When the evaluator
+-- reaches that 'ERecordCon' it does @EVar "QuasiQuoter"@ to look up
+-- the constructor.  Without this pre-load the demand loader hasn't
+-- visited @Language.Haskell.TH.Quote@ yet so the constructor is
+-- unbound, killing every @[hsx|…|]@ / @[sql|…|]@ / etc.
+--
+-- Mirrors 'preDiscoverPreludeConstructors' but ALSO seeds the field
+-- accessors via 'buildFieldAccessorEnv' since 'QuasiQuoter' has named
+-- record fields.
+preDiscoverTHQuoteConstructors :: Env -> IO Env
+preDiscoverTHQuoteConstructors env0 = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs  = map fst cacheWithIncludes
+        includeMap = Map.fromList cacheWithIncludes
+    registry <- newIORef Map.empty
+    let modName = BC.pack "Language.Haskell.TH.Quote"
+    r <- try (loadModule registry cacheDirs includeMap modName)
+            :: IO (Either SomeException LoadedModule)
+    case r of
+        Left  _  -> pure env0   -- best-effort: missing cache shouldn't break startup
+        Right lm -> do
+            let dataReg = lmDataReg lm
+                fieldReg = lmFieldReg lm
+            conEnv <- buildConEnv dataReg
+            -- Treat the module's full field registry as both "public"
+            -- and "all" — there's only one module in scope here, so
+            -- there's no public/private distinction to draw.
+            fieldEnv <- buildFieldAccessorEnv [lm] fieldReg fieldReg
+            pure (Map.union env0 (Map.union conEnv fieldEnv))
 
 -- | Load a .hs file for the REPL's @:l@ command and bring its exported
 -- names into scope UNQUALIFIED, matching ghci semantics.
@@ -4441,8 +4495,14 @@ isBuiltinBackedModule n =
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
     -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
-    -- builtins for splice execution.  The package is not in the base cache.
-    || "Language.Haskell.TH" `BC.isPrefixOf` n
+    -- builtins for splice execution.  Most submodules are stubbed because
+    -- their content is replaced by IHC.TH's synthetic primops.
+    -- HOWEVER: 'Language.Haskell.TH.Quote' is a small pure module that
+    -- declares 'data QuasiQuoter = QuasiQuoter { quoteExp, … }'.  The
+    -- QQ-dispatch path needs that constructor (record-construction in
+    -- ihp-hsx etc.) and it has no primops backing it — interpret it
+    -- from source.
+    || ("Language.Haskell.TH" `BC.isPrefixOf` n && n /= BC.pack "Language.Haskell.TH.Quote")
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
