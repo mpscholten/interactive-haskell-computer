@@ -1102,14 +1102,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                     (\m -> "unbound variable `TH.location`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
-        -- Today the blaze-html renderer hits a record-accessor gap
-        -- while walking the HTML AST, bailing with "record accessor
-        -- `getString`: constructor `:` has no such field". That's the
-        -- symptom of a deeper source-loading gap in blaze-markup's
-        -- StaticString / ChoiceString handling. When the blaze
-        -- rendering path is supported the error will change —
-        -- retarget this assertion (or graduate the fixture) at that
-        -- point.
+        -- The 'getString' record-accessor failure has been bridged
+        -- via an OverloadedStrings-style fallback in 'buildFieldEnv':
+        -- when the accessor sees a [Char] cons-list where it expected
+        -- a 'StaticString', it synthesises the appending closure
+        -- @(s ++)@ that the IsString instance would have produced.
+        -- That advances rendering past the StaticString boundary; the
+        -- next blocker is in the chunk-concatenation path
+        -- ('concatMap: not a list: ...').  Retarget when that one
+        -- falls.
         r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1118,4 +1119,4 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "record accessor `getString`" `isInfixOf` m)
+                    (\m -> "concatMap: not a list" `isInfixOf` m)

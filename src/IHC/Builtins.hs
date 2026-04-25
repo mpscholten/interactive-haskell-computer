@@ -5098,15 +5098,80 @@ buildFieldEnv reg = do
                              <> "` has only " <> show (length args)
                              <> " fields, index " <> show idx
                              <> " out of range"))
-                    Nothing ->
-                        throwIO (userError
-                            ("record accessor `" <> BC.unpack fieldName
-                             <> "`: constructor `" <> BC.unpack conName
-                             <> "` has no such field"))
+                    Nothing -> tryIsStringFallback fieldName clauses v conName
             _ ->
                 throwIO (userError
                     ("record accessor `" <> BC.unpack fieldName
                      <> "` applied to non-constructor value"))
+
+    -- Optimistic OverloadedStrings bridge for record accessors.
+    --
+    -- Source-loaded blaze-html declares @h1 = Parent "h1" "<h1" "</h1>"@
+    -- where 'Parent' expects 'StaticString' arguments.  IHC keeps the
+    -- literal "h1" as a [Char] cons list (no type-driven 'IsString'
+    -- elaboration), so the slot holds a list when 'renderString' later
+    -- projects 'getString' out of it.
+    --
+    -- Mirror the existing 'IHC.Eval.charListToByteStringVal' bridge:
+    -- when the accessor sees a [Char] where it expected a record, do
+    -- the 'IsString.fromString' conversion at the accessor boundary.
+    --
+    -- We only know how to synthesise a small set of record types whose
+    -- 'IsString' instance has a fixed shape.  Currently:
+    --   * 'StaticString' — first field 'getString :: String -> String'
+    --     is the appending closure @(s ++)@; the other two fields
+    --     (UTF-8 bytes, lazy 'Text') aren't reached by blaze's
+    --     'renderString' but we still need a thunk that won't crash if
+    --     forced; we make those a 'VLazyMethod' that errors with a
+    --     helpful diagnostic.
+    --
+    -- Other accessor failures fall through to the original error.
+    tryIsStringFallback fieldName clauses v conName
+        | isCharConsList v
+        , Just resultVal <- synthesiseFromCharList fieldName clauses v
+        = resultVal
+    tryIsStringFallback fieldName _clauses _v conName =
+        throwIO (userError
+            ("record accessor `" <> BC.unpack fieldName
+             <> "`: constructor `" <> BC.unpack conName
+             <> "` has no such field"))
+
+    -- Per-record synthesis table.  Returns 'Just (IO Val)' if the field
+    -- + target-constructor pair is one we know how to materialise from
+    -- a [Char] without going through real instance dispatch.
+    synthesiseFromCharList fieldName clauses listVal
+        | any ((BC.pack "StaticString" ==) . fst) clauses
+        , fieldName == BC.pack "getString"
+        = Just (pure (charListAppender listVal))
+        | otherwise = Nothing
+
+    -- @(listVal ++)@: a 'VFun' that, given another list, returns
+    -- @listVal ++ that@.  Built by walking 'listVal' once and chaining
+    -- cons cells.  Mirrors the runtime shape of 'StaticString's
+    -- 'getString' field for an 'IsString.fromString'-converted literal.
+    charListAppender :: Val -> Val
+    charListAppender listVal = VFun $ \tailT ->
+        appendCharList listVal tailT
+
+    -- Drive 'listVal' to its '[]' tail, prepending each cons cell onto
+    -- the supplied tail thunk.  Returns the result as a fully-forced
+    -- cons chain of 'VChar's.  Only used by 'charListAppender'.
+    appendCharList (VCon "[]" []) tailT = force tailT
+    appendCharList (VCon ":" [hT, restT]) tailT = do
+        restV  <- force restT
+        rest'  <- appendCharList restV tailT
+        rest'T <- newWHNFThunk rest'
+        pure (VCon ":" [hT, rest'T])
+    appendCharList other _ =
+        throwIO (userError
+            ("appendCharList: not a [Char] cons list: " <> showValForDebug other))
+
+    -- A VCon is a [Char] cons list iff it's [] or (h:t).  We don't
+    -- force the tail — accepting list-shaped values whose head is
+    -- char is sufficient for the OverloadedStrings pattern.
+    isCharConsList (VCon "[]" []) = True
+    isCharConsList (VCon ":"  [_, _]) = True
+    isCharConsList _ = False
 
 --------------------------------------------------------------------------------
 -- Phase 2.10a: concurrency - thread primitives
