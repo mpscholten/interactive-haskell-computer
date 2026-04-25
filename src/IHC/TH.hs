@@ -540,6 +540,10 @@ thBuiltinPairs =
     , ("reify",                               reifyBuiltin)
     , ("Language.Haskell.TH.reify",           reifyBuiltin)
     , ("Language.Haskell.TH.Syntax.reify",    reifyBuiltin)
+    , ("location",                            locationBuiltin)
+    , ("TH.location",                         locationBuiltin)
+    , ("Language.Haskell.TH.location",        locationBuiltin)
+    , ("Language.Haskell.TH.Syntax.location", locationBuiltin)
     ]
     -- Phase 2.13: TH AST constructors.  These have no Haskell source in
     -- our cache (the template-haskell package isn't source-loaded) and
@@ -716,6 +720,35 @@ runQBuiltin = pure $ VFun $ \argT -> do
     case v of
         VIO _ -> pure v
         other -> pure (VIO (pure other))
+
+-- | @location :: Q Loc@.  Returns a stub 'Loc' with empty filename /
+-- package / module / start / end.  Used by libraries like ihp-hsx for
+-- source-position metadata in error messages — the precise values
+-- don't matter for evaluation, only that the call returns a 'Loc'-shaped
+-- 'VCon' rather than crashing.
+--
+-- 'Loc' from Language.Haskell.TH.Syntax has 5 fields:
+--   loc_filename :: String
+--   loc_package  :: String
+--   loc_module   :: String
+--   loc_start    :: CharPos  (= (Int, Int))
+--   loc_end      :: CharPos
+locationBuiltin :: IO Val
+locationBuiltin = pure $ VIO $ do
+    filenameT <- newWHNFThunk =<< charListVal "<ihc-no-source-loc>"
+    packageT  <- newWHNFThunk =<< charListVal "<ihc>"
+    moduleT   <- newWHNFThunk =<< charListVal "<ihc>"
+    zeroT     <- newWHNFThunk (VInt 0)
+    posT      <- newWHNFThunk (VCon "(,)" [zeroT, zeroT])
+    pure (VCon "Loc" [filenameT, packageT, moduleT, posT, posT])
+  where
+    charListVal :: String -> IO Val
+    charListVal []     = pure (VCon "[]" [])
+    charListVal (c:cs) = do
+        cT <- newWHNFThunk (VChar c)
+        rest <- charListVal cs
+        restT <- newWHNFThunk rest
+        pure (VCon ":" [cT, restT])
 
 -- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
 reifyBuiltin :: IO Val

@@ -1084,13 +1084,13 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- Allowing 'Language.Haskell.TH.Quote' to load from source
-        -- (instead of being stubbed by 'isBuiltinBackedModule') gets
-        -- the 'QuasiQuoter' constructor into the env, so the QQ-dispatch
-        -- path now successfully constructs the QuasiQuoter record.
-        -- Next blocker: 'TH.location' (a TH primop ihp-hsx uses for
-        -- source-position metadata) is still unbound.  Retarget this
-        -- assertion when that one falls.
+        -- Adding a 'TH.location' stub (returns a dummy 'Loc' shape)
+        -- gets ihp-hsx's quoteHsxExpression past the source-position
+        -- metadata it uses for error messages.  Next blocker:
+        -- 'Megaparsec.SourcePos' is unbound — ihp-hsx's parser uses
+        -- megaparsec, and IHC's qualifier-rewrite for the imported
+        -- 'Text.Megaparsec as Megaparsec' alias isn't yet pulling in
+        -- the SourcePos constructor.  Retarget when that one falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1099,7 +1099,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "unbound variable `TH.location`" `isInfixOf` m)
+                    (\m -> "unbound variable `Megaparsec.SourcePos`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- The 'getString' record-accessor failure has been bridged
