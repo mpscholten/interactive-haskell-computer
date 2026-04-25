@@ -50,6 +50,11 @@ module IHC.Classes
     , classMethodFallbackRef
     , setClassMethodFallback
     , lookupClassMethodFallback
+      -- * TH Exp -> Expr decoder hook
+    , ThExpToExprHook
+    , thExpToExprRef
+    , setThExpToExpr
+    , runThExpToExpr
     ) where
 
 import Data.ByteString (ByteString)
@@ -61,6 +66,7 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
+import IHC.AST (Expr)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -412,3 +418,28 @@ triggerCoreInstanceLoad :: IO ()
 triggerCoreInstanceLoad = do
     hook <- readIORef coreInstanceLoadHookRef
     hook
+
+--------------------------------------------------------------------------------
+-- TH Exp -> Expr decoder hook
+--
+-- QuasiQuoter dispatch ('EQuasiQuote' in the AST) has to decode the TH
+-- 'Exp' value returned by @quoteExp@ back into an 'Expr'.  That decoder
+-- lives in 'IHC.TH' (which already imports 'IHC.Eval'), so we break the
+-- cycle via this hook: TH installs it at module load time, 'IHC.Eval'
+-- reads through it.
+--------------------------------------------------------------------------------
+
+type ThExpToExprHook = Val -> IO Expr
+
+{-# NOINLINE thExpToExprRef #-}
+thExpToExprRef :: IORef ThExpToExprHook
+thExpToExprRef = unsafePerformIO (newIORef (\_ ->
+    error "IHC.Classes: thExpToExpr hook not installed"))
+
+setThExpToExpr :: ThExpToExprHook -> IO ()
+setThExpToExpr = writeIORef thExpToExprRef
+
+runThExpToExpr :: Val -> IO Expr
+runThExpToExpr v = do
+    hook <- readIORef thExpToExprRef
+    hook v

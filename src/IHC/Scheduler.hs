@@ -78,6 +78,7 @@ import IHC.Classes
     , setEnvFallback
     , setCoreInstanceLoadHook
     , setClassMethodFallback
+    , setThExpToExpr
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal)
@@ -88,7 +89,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
@@ -585,6 +586,11 @@ buildBaseEnv = do
     -- dispatcher so value-directed lookup can still run.
     setClassMethodFallback (\cls method ->
         pure (Just (classMethodDispatcher classReg cls method)))
+    -- Install the TH Exp -> Expr decoder so that QuasiQuoter dispatch
+    -- in 'IHC.Eval' can convert the Val produced by @quoteExp@ into an
+    -- 'Expr' to evaluate.  Lives in 'IHC.TH' which already depends on
+    -- 'IHC.Eval'; the hook breaks the would-be cycle.
+    setThExpToExpr thExpToExpr
     pure (env2, classReg)
 
 -- | Install a one-shot hook that force-loads core instance modules
@@ -3209,6 +3215,12 @@ rewriteExpr rw = go []
             in EImplicitLet bs' (go bound' e)
         ESplice inner   -> ESplice (go bound inner)
         EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
+        -- QuasiQuoter: rewrite the QQ function name like any free EVar;
+        -- the body bytes are opaque.
+        EQuasiQuote n b
+            | n `elem` bound            -> EQuasiQuote n b
+            | Just q <- Map.lookup n rw -> EQuasiQuote q b
+            | otherwise                 -> EQuasiQuote n b
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
         ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
         e@ETypedMethod{} -> e   -- elaborator product; no name references to rewrite
@@ -5365,6 +5377,11 @@ freeVars = goAll []
             in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
         ESplice inner   -> goAll bound inner
         EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        -- QuasiQuoter: the QQ function name is a free var that must be
+        -- discovered so the dispatch sees the imported QuasiQuoter value.
+        EQuasiQuote n _
+            | n `elem` bound -> []
+            | otherwise      -> [n]
         ELabel _        -> []   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
         ETypedMethod{}  -> []   -- elaborator product; no EVar refs
@@ -5418,6 +5435,7 @@ needsRecordFields = goExpr
         EImplicitLet bs e -> any (goExpr . snd) bs || goExpr e
         ESplice e    -> goExpr e
         EQuote _     -> False
+        EQuasiQuote{} -> False   -- QQ body is opaque bytes, no record syntax to descend into
         ELabel _     -> False
         ETyApp e _   -> goExpr e
         ETypedMethod{} -> False
@@ -5488,6 +5506,11 @@ discoveryFreeVars = go []
             in go (names ++ bound) e
         ESplice inner  -> go bound inner
         EQuote _       -> []
+        -- QuasiQuoter: make the QQ fn name a discovery free var so the
+        -- scheduler pre-loads the defining module before eval fires.
+        EQuasiQuote n _
+            | n `elem` bound -> []
+            | otherwise      -> [n]
         ELabel _       -> []
         ETyApp inner _ -> go bound inner
         ETypedMethod{} -> []
