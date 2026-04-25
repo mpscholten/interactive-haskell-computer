@@ -3857,28 +3857,81 @@ resolveFallback rt name = do
                         case mImportedField of
                             Just slot -> pure (Just slot)
                             Nothing -> do
-                                searchPath <- readIORef (rtSearchPath rt)
-                                includeMap <- readIORef (rtIncludeMap rt)
-                                transientReg <- newIORef (Map.map Loaded mods)
-                                let ownerName = fromMaybe (BC.pack "Prelude")
-                                        (preludeDirectOwner bareName)
-                                loaded <- try (loadModule rt transientReg searchPath includeMap ownerName)
-                                            :: IO (Either SomeException LoadedModule)
-                                case loaded of
-                                    Left _ -> pure Nothing
-                                    Right preludeLm -> do
-                                        _ <- try (discoverInModule rt transientReg
-                                                    searchPath includeMap preludeLm bareName)
-                                                :: IO (Either SomeException ())
-                                        reg <- readIORef transientReg
-                                        let newMods = Map.fromList
-                                                [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                        modifyIORef' (rtLoadedModules rt)
-                                            (Map.union newMods)
-                                        mods' <- readIORef (rtLoadedModules rt)
-                                        buildSlotFromOwner mods'
-                                            (Map.findWithDefault preludeLm ownerName mods')
-                                            bareName
+                                -- Bindings defined in the entry module are
+                                -- normally pulled in by 'discoverInModuleWith'
+                                -- starting from "main". But discoveryFreeVars
+                                -- doesn't chase function arguments at general
+                                -- application sites (only at strict-control
+                                -- ones), so e.g. `main = print foo` never
+                                -- walks `foo` eagerly. Catch that case here
+                                -- before falling through to Prelude.
+                                mEntry <- tryEntryModuleBinding mods bareName
+                                case mEntry of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> noEntryLoadPrelude bareName mods
+
+    noEntryLoadPrelude bareName mods = do
+        searchPath <- readIORef (rtSearchPath rt)
+        includeMap <- readIORef (rtIncludeMap rt)
+        transientReg <- newIORef (Map.map Loaded mods)
+        let ownerName = fromMaybe (BC.pack "Prelude")
+                (preludeDirectOwner bareName)
+        loaded <- try (loadModule rt transientReg searchPath includeMap ownerName)
+                    :: IO (Either SomeException LoadedModule)
+        case loaded of
+            Left _ -> pure Nothing
+            Right preludeLm -> do
+                _ <- try (discoverInModule rt transientReg
+                            searchPath includeMap preludeLm bareName)
+                        :: IO (Either SomeException ())
+                reg <- readIORef transientReg
+                let newMods = Map.fromList
+                        [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                modifyIORef' (rtLoadedModules rt)
+                    (Map.union newMods)
+                mods' <- readIORef (rtLoadedModules rt)
+                buildSlotFromOwner mods'
+                    (Map.findWithDefault preludeLm ownerName mods')
+                    bareName
+
+    -- | Try to resolve @bareName@ as a top-level binding defined in the
+    -- entry module's source.  Without this, @main = print foo@ where
+    -- @foo = 42@ is in the same file fails with @unbound variable foo@:
+    -- 'discoveryFreeVars' doesn't chase function arguments outside
+    -- strict-control ops, and the rest of 'resolveBarePrelude' only
+    -- searches host builtins / record fields / Prelude.
+    --
+    -- Skip class methods (the entry module may define one inside an
+    -- @instance C T where m = …@ block, and 'findOrResolveLhs' will
+    -- match that clause as if it were a top-level binding — leading
+    -- to a self-referential slot when @m@ is used at runtime).  Class
+    -- methods dispatch through 'resolveTypedMethod' /
+    -- 'classMethodDispatcher', not through bare-name lookup.
+    tryEntryModuleBinding mods bareName = do
+        classMethodNames <- readIORef (rtClassMethodNames rt)
+        if Set.member bareName classMethodNames
+            then pure Nothing
+            else case [ lm | lm <- Map.elems mods, lmIsEntry lm ] of
+                entry : _ -> do
+                    mLhs <- findOrResolveLhs (lmSource entry) (lmKnown entry) bareName
+                    case mLhs of
+                        Nothing -> pure Nothing
+                        Just _  -> do
+                            searchPath <- readIORef (rtSearchPath rt)
+                            includeMap <- readIORef (rtIncludeMap rt)
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            _ <- try (discoverInModule rt transientReg
+                                        searchPath includeMap entry bareName)
+                                    :: IO (Either SomeException ())
+                            reg <- readIORef transientReg
+                            let newMods = Map.fromList
+                                    [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                            modifyIORef' (rtLoadedModules rt) (Map.union newMods)
+                            mods' <- readIORef (rtLoadedModules rt)
+                            buildSlotFromOwner mods'
+                                (Map.findWithDefault entry (lmName entry) mods')
+                                bareName
+                [] -> pure Nothing
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
