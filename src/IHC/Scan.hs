@@ -117,6 +117,26 @@ markCompiled ref name ptr =
 patternKeyword :: ByteString
 patternKeyword = BC.pack "pattern"
 
+-- | O(n) byte-level keyword presence check. Used as a cheap early-out
+-- for scan functions so they can skip the full tokenizer pass on
+-- sources that obviously can't contain a match — matters a lot for
+-- huge auto-generated modules (e.g. the 3.2 MB
+-- @GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory@) whose
+-- single-line string literal otherwise forces every scan function
+-- to walk megabytes of bytes looking for its target keyword.
+--
+-- 'BS.isInfixOf' uses bytestring's SIMD memmem path: O(n) with zero
+-- Haskell-side allocation. False positives (the keyword appearing
+-- inside a string or comment) just fall through to the slow path.
+hasKeyword :: Source -> ByteString -> Bool
+hasKeyword src kw = BS.isInfixOf kw (srcBytes src)
+{-# INLINE hasKeyword #-}
+
+-- | Like 'hasKeyword' but succeeds if any of several keywords is present.
+hasAnyKeyword :: Source -> [ByteString] -> Bool
+hasAnyKeyword src = any (hasKeyword src)
+{-# INLINE hasAnyKeyword #-}
+
 -- | Read the exported name from a top-level @pattern Name ...@ declaration.
 -- The lexer treats @pattern@ as a plain identifier, so the normal binding
 -- scanner would otherwise cache a binding named "pattern" and miss the real
@@ -193,7 +213,10 @@ scanAllTopLevelNames src = go [] startCursor
 -- The splice token @$(@ must appear at column 1.  Nested parens inside
 -- the splice body are tracked so the scan finds the right terminator.
 scanTopLevelSplices :: Source -> IO [Span]
-scanTopLevelSplices src = go [] startCursor
+scanTopLevelSplices src
+    -- TH splices begin with `$(` or `[|` (or `[e|` / `[d|` / `[t|` / `[p|`).
+    | not (hasAnyKeyword src [BC.pack "$(", BC.pack "[|"]) = pure []
+    | otherwise = go [] startCursor
   where
     go acc cur = do
         let (tok, cur') = nextToken src cur
@@ -745,7 +768,9 @@ skipTypeDecl src cur0 =
 -- F args = rhs@ decls.  Returns a merged 'TR.TypeFamilyRegistry' ready
 -- to hand off to 'TR.reduceTypeExpr' at runtime.
 scanTypeFamilyDecls :: Source -> IO TR.TypeFamilyRegistry
-scanTypeFamilyDecls src = go TR.emptyRegistry startCursor
+scanTypeFamilyDecls src
+    | not (hasKeyword src (BC.pack "family")) = pure TR.emptyRegistry
+    | otherwise = go TR.emptyRegistry startCursor
   where
     go !reg cur = do
         let (tok, cur') = nextToken src cur
@@ -1051,7 +1076,10 @@ type TypeCtorRegistry = Map ByteString [ByteString]
 -- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
 scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
-scanDataDecls src = go Map.empty Map.empty Map.empty startCursor
+scanDataDecls src
+    | not (hasAnyKeyword src [BC.pack "data", BC.pack "newtype"])
+        = pure (Map.empty, Map.empty, Map.empty)
+    | otherwise = go Map.empty Map.empty Map.empty startCursor
   where
     go !dReg !fReg !tReg cur = do
         let (tok, cur') = nextToken src cur
@@ -1570,7 +1598,9 @@ data SimpleDerivDecl = SimpleDerivDecl
     } deriving (Eq, Show)
 
 scanSimpleDerivings :: Source -> IO [SimpleDerivDecl]
-scanSimpleDerivings src = go [] startCursor
+scanSimpleDerivings src
+    | not (hasKeyword src (BC.pack "deriving")) = pure []
+    | otherwise = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -1653,7 +1683,9 @@ scanSimpleDerivings src = go [] startCursor
 -- scanner can't determine the type's name or tyvars, the declaration is
 -- also skipped (no entry in the result list).
 scanFunctorDerivings :: Source -> IO [FunctorDerivDecl]
-scanFunctorDerivings src = go [] startCursor
+scanFunctorDerivings src
+    | not (hasKeyword src (BC.pack "deriving")) = pure []
+    | otherwise = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -2014,7 +2046,9 @@ data InstanceDecl = InstanceDecl
 -- name and walk for the first upper-or-lower identifier that follows a
 -- constraint arrow or is the head type.
 scanInstanceDecls :: Source -> IO [InstanceDecl]
-scanInstanceDecls src = go [] startCursor
+scanInstanceDecls src
+    | not (hasKeyword src (BC.pack "instance")) = pure []
+    | otherwise = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -2486,25 +2520,9 @@ data ClassDecl = ClassDecl
 -- dispatch matches 'scanInstanceDecls' (which uses @Map.toList@).
 scanClassDecls :: Source -> IO [ClassDecl]
 scanClassDecls src
-    -- Fast path: if the source contains no 'class' keyword byte-pattern
-    -- at all, there can be no class declarations — skip the expensive
-    -- tokenizer pass. Matters a lot for huge auto-generated modules
-    -- like GHC.Unicode.Internal.Char.UnicodeData.GeneralCategory whose
-    -- multi-megabyte single-line string literals otherwise force the
-    -- lexer to materialise the whole payload. The byte scan is O(n)
-    -- with SIMD-accelerated ByteString primitives and zero allocation.
-    --
-    -- False positives (e.g. the literal text "class" appearing inside
-    -- a string or comment) just fall through to the normal path and
-    -- the tokenizer confirms there's no real class-at-col-1.
-    --
-    -- Verified 3000-4000x speedup on Unicode tables; the bang_pattern
-    -- fixture suite went from hanging >3 min to completing in seconds.
-    | not (BS.isInfixOf classKw (srcBytes src)) = pure []
+    | not (hasKeyword src (BC.pack "class")) = pure []
     | otherwise = go [] startCursor
   where
-    classKw = BC.pack "class"
-
     go !acc cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
@@ -2802,7 +2820,9 @@ scanClassDecls src
 -- not an error here because some Hackage modules use CPP to conditionally
 -- gate imports, and we'd rather lose that one symbol than abort the load.
 scanForeignImports :: Source -> IO [ForeignDecl]
-scanForeignImports src = pure (reverse (loop [] startCursor))
+scanForeignImports src
+    | not (hasKeyword src (BC.pack "foreign")) = pure []
+    | otherwise = pure (reverse (loop [] startCursor))
   where
     loop :: [ForeignDecl] -> Cursor -> [ForeignDecl]
     loop acc cur =
@@ -3377,7 +3397,9 @@ collectTypeVars body preds =
 -- signature (and comma-separated multi-name variants like
 -- @a, b :: Int@).  Malformed sigs are silently skipped.
 scanTypeSigs :: Source -> IO [(ByteString, Scheme)]
-scanTypeSigs src = go [] startCursor
+scanTypeSigs src
+    | not (hasKeyword src (BC.pack "::")) = pure []
+    | otherwise = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
@@ -3441,7 +3463,9 @@ peekOperatorSig src cur =
 -- elaborator does one-hop expansion when it encounters the name in a
 -- type.  Type families, data types, and newtypes are skipped.
 scanTypeSynonyms :: Source -> IO [(ByteString, (Int, Type))]
-scanTypeSynonyms src = go [] startCursor
+scanTypeSynonyms src
+    | not (hasKeyword src (BC.pack "type")) = pure []
+    | otherwise = go [] startCursor
   where
     go !acc cur = do
         let (tok, cur') = nextToken src cur
