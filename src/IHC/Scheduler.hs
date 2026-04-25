@@ -3835,6 +3835,16 @@ resolveFallback name
         resolveFallback (BC.pack "System.TimeManager.stopManager")
     | BC.pack ".T.withHandleKillThread" `isSuffixOf` name =
         resolveFallback (BC.pack "System.TimeManager.withHandleKillThread")
+    -- streaming-commons aliases @import qualified Network.Socket as NS@
+    -- and uses the alias for accessors / constructors / actions on AddrInfo
+    -- (NS.addrFamily, NS.addrSocketType, NS.addrProtocol, …) plus bind /
+    -- accept / etc.  warp's hello-world reaches Data.Streaming.Network's
+    -- @bindPortGenEx@ which fans out to ~33 NS.* references.  Rather than
+    -- enumerate each one, rewrite any @NS.<bareName>@ → the canonical
+    -- @Network.Socket.<bareName>@ qualified form, which is registered in
+    -- 'IHC.Builtins' (or interpreted from Network.Socket source).
+    | BC.pack "NS." `BC.isPrefixOf` name =
+        resolveFallback (BC.pack "Network.Socket." `BC.append` BC.drop 3 name)
 resolveFallback name = do
     mods <- readIORef globalLoadedModulesRef
     case splitQualified name
