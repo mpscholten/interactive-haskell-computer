@@ -666,26 +666,8 @@ parseBindingsIn src fx (start, end) = do
     -- and skipped, or @Nothing@ if this is a regular value binding.
     -- @bindCol@ is the binding column; the type body ends when a token
     -- at column @<= bindCol@ is seen.
-    trySkipWhereSig ctx bindCol cur = do
-        let (tok1, cur1) = nextSig ctx cur
-        case tkKind tok1 of
-            TkIdent _ ->
-                -- Could be start of a sig: peek for ',' or '::'
-                let skipNames c = do
-                        let (t, c') = nextSig ctx c
-                        case tkKind t of
-                            TkComma ->
-                                -- multi-name sig: a, b, c :: T
-                                let (t2, c2) = nextSig ctx c' in
-                                case tkKind t2 of
-                                    TkIdent _ -> skipNames c2
-                                    _         -> pure Nothing  -- parse error, fall through
-                            TkDColon -> do
-                                curAfter <- skipTypeSigBody ctx bindCol c'
-                                pure (Just curAfter)
-                            _ -> pure Nothing   -- not a sig, let parseOne handle it
-                in skipNames cur1
-            _ -> pure Nothing
+    trySkipWhereSig ctx bindCol =
+        trySkipSigWith ctx (skipTypeSigBody ctx bindCol)
 
     braced ctx cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
@@ -693,12 +675,16 @@ parseBindingsIn src fx (start, end) = do
             let (nameTok, _) = nextSig ctx cur
             -- Peek the bind column from the current position.
             let bindCol = tkCol nameTok
-            mSkip <- trySkipWhereSig ctx bindCol cur
+            -- In an explicitly braced @where { … }@, sigs and bindings are
+            -- delimited by @;@/@}@, not by indentation, so use the
+            -- braced-aware sig skipper (stops at @;@ or @}@) instead of the
+            -- column-aware one used in layout mode.
+            mSkip <- trySkipBracedSig ctx cur
             case mSkip of
                 Just cur' -> do
-                    let (nextTok, _) = nextSig ctx cur'
+                    let (nextTok, curN) = nextSig ctx cur'
                     case tkKind nextTok of
-                        TkSemi   -> braced ctx cur' acc
+                        TkSemi   -> braced ctx curN acc
                         TkRBrace -> pure (reverse acc)
                         TkEof    -> pure (reverse acc)
                         _ | cPos cur' < ctxEnd ctx -> braced ctx cur' acc
@@ -718,7 +704,9 @@ parseBindingsIn src fx (start, end) = do
         | otherwise = do
             let (nameTok, _) = nextSig ctx cur
             let bindCol = tkCol nameTok
-            mSkip <- trySkipWhereSig ctx bindCol cur
+            -- See note in 'braced' above: braced where-blocks use @;@/@}@
+            -- delimiters, so the sig skipper terminates on those.
+            mSkip <- trySkipBracedSig ctx cur
             case mSkip of
                 Just cur' -> do
                     let (nextTok, curN) = nextSig ctx cur'
@@ -899,6 +887,62 @@ skipTypeSigBody ctx bindCol cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkLBracket -> go cur' (b + 1) p c
             TkLBrace   -> go cur' b p (c + 1)
             _          -> go cur' b p c
+
+-- | Skip the body of a @name :: type@ signature inside an explicitly braced
+-- let/where block (@let { x :: T; x = e }@ / @where { x :: T; x = e }@).
+-- Called after consuming @::@.  Stops when it sees @;@ or @}@ at depth 0,
+-- or EOF.  Used by 'bracedLetBinds' and 'bracedBinds'; the layout-mode
+-- variants use 'skipTypeSigBody' which is column-aware instead.
+skipTypeSigBodyBraced :: Ctx -> Cursor -> IO Cursor
+skipTypeSigBodyBraced ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+  where
+    go cur b p c = do
+        let (tok, cur') = nextSig ctx cur
+        case tkKind tok of
+            TkEof -> pure cur
+            TkSemi   | b == 0 && p == 0 && c == 0 -> pure cur
+            TkRBrace | c == 0 && b == 0 && p == 0 -> pure cur  -- closes the block
+            TkRParen | p > 0    -> go cur' b (p - 1) c
+            TkRParen            -> pure cur
+            TkRBracket | b > 0  -> go cur' (b - 1) p c
+            TkRBracket          -> pure cur
+            TkRBrace | c > 0    -> go cur' b p (c - 1)
+            TkLParen   -> go cur' b (p + 1) c
+            TkLBracket -> go cur' (b + 1) p c
+            TkLBrace   -> go cur' b p (c + 1)
+            _          -> go cur' b p c
+
+-- | Detect a @name[, name]* :: type@ signature starting at @cur@ in a
+-- braced let/where block.  Returns @Just curAfter@ (positioned just before
+-- the @;@ or @}@ that terminates the sig) if a sig was found, otherwise
+-- @Nothing@.  Used by 'bracedLetBinds' and 'bracedBinds'.
+trySkipBracedSig :: Ctx -> Cursor -> IO (Maybe Cursor)
+trySkipBracedSig ctx = trySkipSigWith ctx (skipTypeSigBodyBraced ctx)
+
+-- | Shared @name[, name]* ::@ scanner used by every variant of the
+-- "this looks like a signature, not a value binding" check
+-- ('trySkipBracedSig' and the layout-mode locals
+-- 'trySkipWhereSig' / 'trySkipLetSig' / 'trySkipDoLetSig' wrap this).
+-- The caller supplies the body skipper to invoke once @::@ is consumed —
+-- column-aware ('skipTypeSigBody') in layout mode, brace-aware
+-- ('skipTypeSigBodyBraced') in @{ … }@ mode.
+trySkipSigWith :: Ctx -> (Cursor -> IO Cursor) -> Cursor -> IO (Maybe Cursor)
+trySkipSigWith ctx skipBody cur = do
+    let (tok1, cur1) = nextSig ctx cur
+    case tkKind tok1 of
+        TkIdent _ ->
+            let skipNames c = do
+                    let (t, c') = nextSig ctx c
+                    case tkKind t of
+                        TkComma ->
+                            let (t2, c2) = nextSig ctx c' in
+                            case tkKind t2 of
+                                TkIdent _ -> skipNames c2
+                                _         -> pure Nothing
+                        TkDColon -> Just <$> skipBody c'
+                        _ -> pure Nothing
+            in skipNames cur1
+        _ -> pure Nothing
 
 -- | Multi-way if: @if | g -> e | g -> e ...@. Assumes @if@ already
 -- consumed. Desugars to a nested 'EIf'. Standard @if c then t else e@
@@ -1396,24 +1440,7 @@ parseDoLet ctx cur0 = do
     -- | Try to detect and skip a type sig @name[, name]* :: type@ at the
     -- current position. Returns @Just curAfter@ on success, @Nothing@ if
     -- this looks like a value binding.
-    trySkipDoLetSig bindCol cur = do
-        let (tok1, cur1) = nextSig ctx cur
-        case tkKind tok1 of
-            TkIdent _ ->
-                let skipNames c = do
-                        let (t, c') = nextSig ctx c
-                        case tkKind t of
-                            TkComma ->
-                                let (t2, c2) = nextSig ctx c' in
-                                case tkKind t2 of
-                                    TkIdent _ -> skipNames c2
-                                    _         -> pure Nothing
-                            TkDColon -> do
-                                curAfter <- skipTypeSigBody ctx bindCol c'
-                                pure (Just curAfter)
-                            _ -> pure Nothing
-                in skipNames cur1
-            _ -> pure Nothing
+    trySkipDoLetSig bindCol = trySkipSigWith ctx (skipTypeSigBody ctx bindCol)
 
     -- | Collect every variable bound by a pattern (left-to-right order).
     doLetPatVars (PVar n)        = [n]
@@ -1518,17 +1545,29 @@ parseDoLet ctx cur0 = do
                       | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
 
     bracedBinds cur acc = do
-        let (nameTok, _) = nextSig ctx cur
-        case tkKind nameTok of
-            k | startsPat k, not (isIdent k) -> do
-                (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
-                let (sep, curN) = nextSig ctx cur4
-                    acc' = reverse patBinds ++ acc
+        -- Skip a @name :: type@ signature line; the interpreter delays
+        -- type-checking, so the sig is a no-op.  Recognised inside
+        -- @do { let { … } … }@.
+        mSkip <- trySkipBracedSig ctx cur
+        case mSkip of
+            Just cur' -> do
+                let (sep, curN) = nextSig ctx cur'
                 case tkKind sep of
-                    TkSemi   -> bracedBinds curN acc'
-                    TkRBrace -> pure (reverse acc', curN)
+                    TkSemi   -> bracedBinds curN acc
+                    TkRBrace -> pure (reverse acc, curN)
                     _        -> parseErr ctx "expected `;` or `}` in let-block" sep
-            _ -> bracedIdentBind cur acc
+            Nothing -> do
+                let (nameTok, _) = nextSig ctx cur
+                case tkKind nameTok of
+                    k | startsPat k, not (isIdent k) -> do
+                        (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                        let (sep, curN) = nextSig ctx cur4
+                            acc' = reverse patBinds ++ acc
+                        case tkKind sep of
+                            TkSemi   -> bracedBinds curN acc'
+                            TkRBrace -> pure (reverse acc', curN)
+                            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+                    _ -> bracedIdentBind cur acc
 
     isIdent (TkIdent _) = True
     isIdent _           = False
@@ -1663,24 +1702,7 @@ parseLet ctx cur0 = do
     -- | Check whether the current position starts a type signature line
     -- @name[, name]* :: type@. If so, skip the sig body and return @Just curAfter@.
     -- Otherwise return @Nothing@ (caller should parse it as a value binding).
-    trySkipLetSig bindCol cur = do
-        let (tok1, cur1) = nextSig ctx cur
-        case tkKind tok1 of
-            TkIdent _ ->
-                let skipNames c = do
-                        let (t, c') = nextSig ctx c
-                        case tkKind t of
-                            TkComma ->
-                                let (t2, c2) = nextSig ctx c' in
-                                case tkKind t2 of
-                                    TkIdent _ -> skipNames c2
-                                    _         -> pure Nothing
-                            TkDColon -> do
-                                curAfter <- skipTypeSigBody ctx bindCol c'
-                                pure (Just curAfter)
-                            _ -> pure Nothing   -- not a sig
-                in skipNames cur1
-            _ -> pure Nothing
+    trySkipLetSig bindCol = trySkipSigWith ctx (skipTypeSigBody ctx bindCol)
 
     -- Parse one let-binding (name + params + = or | guards + body).
     -- @bindCol@ is the column at which every binding in the enclosing let-block
@@ -1768,21 +1790,32 @@ parseLet ctx cur0 = do
                       | otherwise -> pure (reverse acc', cur')
 
     bracedLetBinds cur acc = do
-        let (nameTok, cur1) = nextSig ctx cur
-        name <- case tkKind nameTok of
-            TkIdent n -> pure n
-            _         -> parseErr ctx "expected identifier in let-binding" nameTok
-        (params, cur2) <- collectLetParams ctx cur1 []
-        let (eqTok, cur3) = nextSig ctx cur2
-        case tkKind eqTok of
-            TkEq -> pure ()
-            _    -> parseErr ctx "expected `=` in let-binding" eqTok
-        (e, cur4) <- parseExpr ctx cur3
-        let (sep, curN) = nextSig ctx cur4
-        case tkKind sep of
-            TkSemi   -> bracedLetBinds curN ((name, wrapParams params e) : acc)
-            TkRBrace -> pure (reverse ((name, wrapParams params e) : acc), curN)
-            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+        -- Skip a @name :: type@ signature line (no-op for the interpreter,
+        -- which delays type-checking).  Recognised inside @let { … }@.
+        mSkip <- trySkipBracedSig ctx cur
+        case mSkip of
+            Just cur' -> do
+                let (sep, curN) = nextSig ctx cur'
+                case tkKind sep of
+                    TkSemi   -> bracedLetBinds curN acc
+                    TkRBrace -> pure (reverse acc, curN)
+                    _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+            Nothing -> do
+                let (nameTok, cur1) = nextSig ctx cur
+                name <- case tkKind nameTok of
+                    TkIdent n -> pure n
+                    _         -> parseErr ctx "expected identifier in let-binding" nameTok
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (eqTok, cur3) = nextSig ctx cur2
+                case tkKind eqTok of
+                    TkEq -> pure ()
+                    _    -> parseErr ctx "expected `=` in let-binding" eqTok
+                (e, cur4) <- parseExpr ctx cur3
+                let (sep, curN) = nextSig ctx cur4
+                case tkKind sep of
+                    TkSemi   -> bracedLetBinds curN ((name, wrapParams params e) : acc)
+                    TkRBrace -> pure (reverse ((name, wrapParams params e) : acc), curN)
+                    _        -> parseErr ctx "expected `;` or `}` in let-block" sep
 
 -- | Parse @let ?x = e; ?y = f in body@ — one or more implicit-param
 -- bindings followed by @in body@. Produces 'EImplicitLet'.
