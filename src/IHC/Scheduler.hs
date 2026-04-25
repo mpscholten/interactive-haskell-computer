@@ -4084,8 +4084,21 @@ resolveFallback name = do
                                 -- give if both were imported unqualified.
                                 mAny <- tryAnyModuleBareSlot mods bareName
                                 case mAny of
-                                    Just slot -> pure (Just slot)
-                                    Nothing -> do
+                                  Just slot -> pure (Just slot)
+                                  Nothing -> do
+                                    -- Also scan every loaded module's
+                                    -- 'lmDataReg' so cross-module
+                                    -- @data T = … | TextNode … | …@
+                                    -- constructors resolve when
+                                    -- `import M (T(..))` brings them
+                                    -- in.  Same precedence rule as
+                                    -- 'tryAnyModuleBareSlot' (first
+                                    -- match wins, ascending module
+                                    -- name).
+                                    mCtor <- tryAnyModuleCtorSlot mods bareName
+                                    case mCtor of
+                                      Just slot -> pure (Just slot)
+                                      Nothing -> do
                                         searchPath <- readIORef globalSearchPathRef
                                         includeMap <- readIORef globalIncludeMapRef
                                         transientReg <- newIORef (Map.map Loaded mods)
@@ -4147,6 +4160,33 @@ resolveFallback name = do
                                 then buildSlotFromOwner mods owner bareName
                                 else go rest
                         Nothing -> go rest
+
+    -- | Scan every loaded module's 'lmDataReg' for a constructor named
+    -- @bareName@.  When @import M (T(..))@ brings constructors into
+    -- scope, the scheduler unions all 'lmDataReg's into a process-wide
+    -- 'conEnv' at fresh-evaluation time — but lazily-loaded modules
+    -- whose ctors only appear AFTER 'conEnv' was built (and any
+    -- constructors used in eval contexts that didn't refresh 'conEnv')
+    -- still need a fallback path.  Build a one-off 'Thunk' that
+    -- materialises the same 'VCon' / 'VFun' chain that 'buildConEnv'
+    -- would have created for the constructor.
+    tryAnyModuleCtorSlot mods bareName = go (Map.toList mods)
+      where
+        go [] = pure Nothing
+        go ((_, owner) : rest) =
+            case Map.lookup bareName (lmDataReg owner) of
+                Just (_tyName, arity, _idx) -> do
+                    slot <- mkCtorSlot bareName arity
+                    pure (Just slot)
+                Nothing -> go rest
+
+        mkCtorSlot name 0 = newWHNFThunk (VCon name [])
+        mkCtorSlot name arity =
+            newLazyBuiltinThunk (pure (buildLam name arity []))
+
+        buildLam name 0 acc = VCon name (reverse acc)
+        buildLam name left acc = VFun $ \t ->
+            pure (buildLam name (left - 1) (t : acc))
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
