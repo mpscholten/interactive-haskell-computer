@@ -4082,23 +4082,23 @@ resolveFallback name = do
                                 -- (alphabetically earlier in the Map) is
                                 -- preferred — same precedence Haskell would
                                 -- give if both were imported unqualified.
-                                mAny <- tryAnyModuleBareSlot mods bareName
-                                case mAny of
+                                -- Constructors first: 'tryAnyModuleBareSlot'
+                                -- can spuriously match a constructor name
+                                -- via 'findOrResolveLhs' (it sees @TextNode
+                                -- !Text@ in a data decl and parses it as a
+                                -- binding LHS), then trigger
+                                -- 'discoverInModule' which produces a
+                                -- bogus slot.  Constructors live in
+                                -- 'lmDataReg' which is the authoritative
+                                -- source — check there first.
+                                mCtor <- tryAnyModuleCtorSlot mods bareName
+                                case mCtor of
                                   Just slot -> pure (Just slot)
                                   Nothing -> do
-                                    -- Also scan every loaded module's
-                                    -- 'lmDataReg' so cross-module
-                                    -- @data T = … | TextNode … | …@
-                                    -- constructors resolve when
-                                    -- `import M (T(..))` brings them
-                                    -- in.  Same precedence rule as
-                                    -- 'tryAnyModuleBareSlot' (first
-                                    -- match wins, ascending module
-                                    -- name).
-                                    mCtor <- tryAnyModuleCtorSlot mods bareName
-                                    case mCtor of
-                                      Just slot -> pure (Just slot)
-                                      Nothing -> do
+                                   mAny <- tryAnyModuleBareSlot mods bareName
+                                   case mAny of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> do
                                         searchPath <- readIORef globalSearchPathRef
                                         includeMap <- readIORef globalIncludeMapRef
                                         transientReg <- newIORef (Map.map Loaded mods)
