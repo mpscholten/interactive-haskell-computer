@@ -424,6 +424,19 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hi\n"
 
+    it "module: cross-module record update — defaultSettings { port = 8080 } where Settings is imported" do
+        -- Regression for the Warp dry-run bug where 'rec { field = val }'
+        -- on an imported record type silently exited 0 before subsequent
+        -- IO actions could run, because the desugar saw an empty local
+        -- 'FieldRegistry' and dropped the update.  Fixed end-to-end by
+        -- 'visibleFieldRegistry' (imported fields visible at desugar)
+        -- plus the loud runtime-error fallback added in 88384cb.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/warp_record_update_xmod/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "before\n8080\nafter\n"
+
     it "module: PackageImports `import \"base\" Data.List (sort)` parses + runs" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/Modules/package_import.hs")
