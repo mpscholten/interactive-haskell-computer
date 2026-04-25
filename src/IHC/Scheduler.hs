@@ -291,6 +291,41 @@ loadProgramFromSource searchPath src0 = do
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
+    -- Discover transitively-referenced ENTRY-MODULE bindings.
+    -- 'discoveryFreeVars' deliberately doesn't descend into function
+    -- arguments (to keep implicit-Prelude tractable for programs that
+    -- only reach builtin names), so a binding like
+    -- @main = print (sumStrict 0 [1..10])@ never reports @sumStrict@
+    -- as a free var even though it must be discovered.  Walk the
+    -- entry module's discovered bodies with the *deep* 'freeVars'
+    -- iterator, and discover any free var that is itself a top-level
+    -- binding in the entry source (cheap: bounded by entry-module
+    -- size).  Repeat to a fixed point so transitive references like
+    -- @sumStrict@ → @helper@ → @inner@ all resolve.  Names not
+    -- defined in the entry source are left to the existing fallback
+    -- chain (builtins, imports, Prelude); we only chase locals.
+    entryTopLevels <- Set.fromList <$> scanAllTopLevelNames (lmSource entry)
+    let discoverEntryLocal n =
+            discoverInModuleWith earlyBuiltinNames registry fullSearchPath
+                                 includeMap entry n
+                `catch` (\(_ :: SomeException) -> pure ())
+        chaseLocals seen = do
+            bodies <- readIORef (lmBodies entry)
+            let allFvs = Set.fromList
+                    [ fv
+                    | expr <- Map.elems bodies
+                    , fv   <- freeVars expr
+                    ]
+                newLocals = Set.toList
+                    (Set.intersection entryTopLevels allFvs
+                       `Set.difference` (seen `Set.union` Map.keysSet bodies))
+            case newLocals of
+                [] -> pure ()
+                _  -> do
+                    mapM_ discoverEntryLocal newLocals
+                    chaseLocals (Set.union seen (Set.fromList newLocals))
+    chaseLocals Set.empty
+
     -- Force-load a small set of core modules that provide fundamental
     -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
     -- Either; Show/Eq/Ord for primitives; etc.).  Without this, a
