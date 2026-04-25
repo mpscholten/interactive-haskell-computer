@@ -62,6 +62,9 @@ import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
+import System.IO (stderr, hPutStrLn, hFlush)
+import qualified System.Environment
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
@@ -88,6 +91,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
+import Data.Dynamic (toDyn, fromDynamic)
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
@@ -230,35 +234,42 @@ loadProgram = loadProgramFromSource []
 -- @~\/.cache\/ihc\/sources\/@ (including @mtl@, @transformers@,
 -- @splitmix@, @random@, etc.) are available without the caller having
 -- to enumerate them.
+-- | Optional stage-time profiler. Setting @IHC_STAGE_TIME=1@ in the
+-- environment prints elapsed wall time for each major load-pipeline
+-- stage to stderr — diagnostic only; off-cost is one 'lookupEnv' per
+-- stage (~10 µs total).
+stageTimer :: String -> IO a -> IO a
+stageTimer label act = do
+    enabled <- maybe False (const True) <$> System.Environment.lookupEnv "IHC_STAGE_TIME"
+    if not enabled then act else do
+        t0 <- getCurrentTime
+        r  <- act
+        t1 <- getCurrentTime
+        hPutStrLn stderr ("[stage " <> label <> "] "
+                          <> show (diffUTCTime t1 t0))
+        hFlush stderr
+        pure r
+
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
-    installEnvFallbackHook
-    cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
+    stageTimer "installEnvFallbackHook" installEnvFallbackHook
+    cacheWithIncludes0 <- stageTimer "cachedPackageSearchPathWithIncludes#1"
+        cachedPackageSearchPathWithIncludes
     let fullSearchPath0 = searchPath ++ map fst cacheWithIncludes0
         includeMap0     = Map.fromList cacheWithIncludes0
     setGlobalSearchPath fullSearchPath0 includeMap0
-    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
-    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
-    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
-    -- the nix-built libhs<pkg>-cbits.dylib.
-    FFI.registerCbitsDylibs
-    -- Enumerate cached packages once; hs-source-dirs are respected via
-    -- parseCabalFile inside cachedPackageSearchPath.
-    -- Also collect include-dirs so CPP can find package headers.
-    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    stageTimer "registerCbitsDylibs" FFI.registerCbitsDylibs
+    cacheWithIncludes <- stageTimer "cachedPackageSearchPathWithIncludes#2"
+        cachedPackageSearchPathWithIncludes
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = searchPath ++ cacheDirs
 
     registry <- newIORef Map.empty
-
-    -- Phase 2.6: run CPP on the entry module's bytes before anything
-    -- else touches them. Directive-free files short-circuit and are
-    -- returned unchanged.
-    src <- cppSource src0
+    src <- stageTimer "cppSource" (cppSource src0)
 
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
@@ -282,17 +293,14 @@ loadProgramFromSource searchPath src0 = do
     -- Prelude walk that eagerly loads much of base/ghc-internal — slow
     -- and semantically pointless, because the evaluator resolves to the
     -- builtin anyway.
-    earlyBuiltins <- builtinEnv classReg
+    earlyBuiltins <- stageTimer "builtinEnv#1" (builtinEnv classReg)
     let earlyBuiltinNames = Map.keysSet earlyBuiltins
 
-    -- Load the entry module. Its name is what the `module X where`
-    -- header declares (or "Main" as a default). We always register it
-    -- as the entry module so its bindings stay unqualified.
-    entry <- loadEntryModule registry src
+    entry <- stageTimer "loadEntryModule" (loadEntryModule registry src)
     let entryName = lmName entry
 
-    -- Drive discovery from `main`.
-    discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
+    stageTimer "discoverMain" $
+        discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
     -- Discover transitively-referenced ENTRY-MODULE bindings.
     -- 'discoveryFreeVars' deliberately doesn't descend into function
@@ -327,7 +335,7 @@ loadProgramFromSource searchPath src0 = do
                 _  -> do
                     mapM_ discoverEntryLocal newLocals
                     chaseLocals (Set.union seen (Set.fromList newLocals))
-    chaseLocals Set.empty
+    stageTimer "chaseLocals" (chaseLocals Set.empty)
 
     -- Force-load every module the entry source imports.  Without this,
     -- @import M (T(..))@ where the user only uses some constructor of T
@@ -343,7 +351,7 @@ loadProgramFromSource searchPath src0 = do
     -- surface as an unbound-variable error at use site, not abort the
     -- whole load.
     let entryImports = map impModule (mhImports (lmHeader entry))
-    forM_ entryImports $ \m -> do
+    stageTimer "loadEntryImports" $ forM_ entryImports $ \m -> do
         _ <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         pure ()
@@ -367,7 +375,7 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Real"
             , BC.pack "GHC.Internal.Maybe"
             ]
-    forM_ coreInstanceModules $ \m -> do
+    stageTimer "loadCoreInstanceModules" $ forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         case r of
@@ -379,7 +387,8 @@ loadProgramFromSource searchPath src0 = do
     -- are in the tied env before methods are evaluated. Without this,
     -- `class Foo a where m x = helper x` with `helper` at top-level
     -- would fail with 'unbound variable `helper`' at dispatch time.
-    discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
+    stageTimer "discoverClassAndInstanceFreeVars" $
+        discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
 
     -- Collect every loaded module.
     reg <- readIORef registry
@@ -398,13 +407,11 @@ loadProgramFromSource searchPath src0 = do
         unionedTFReg = foldr (Map.unionWith (++)) Map.empty
                          (map lmTypeFamilies loadedModules)
     TR.setGlobalRegistry unionedTFReg
-    conEnv   <- buildConEnv  unionedData
-    fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
-    builtins <- builtinEnv classReg
-    -- Install a thunk per scanned @foreign import ccall@ declaration
-    -- under a synthetic @__ffi.Module.name@ key. Module bodies reach
-    -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
-    ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
+    conEnv   <- stageTimer "buildConEnv" (buildConEnv unionedData)
+    fieldEnv <- stageTimer "buildFieldAccessorEnv"
+        (buildFieldAccessorEnv loadedModules publicFields unionedFields)
+    builtins <- stageTimer "builtinEnv#2" (builtinEnv classReg)
+    ffiEnv   <- stageTimer "buildForeignEnv" (buildForeignEnv loadedModules fullSearchPath)
     let baseNoClass = Map.union builtins (Map.union fieldEnv (Map.union conEnv ffiEnv))
     -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
     -- scanClassDecls). For every `class C a where m :: ...` declaration in
@@ -412,17 +419,15 @@ loadProgramFromSource searchPath src0 = do
     -- `(C, typeTagOf firstArg)` in the ClassRegistry and applies the
     -- selected instance method. Names that collide with built-in
     -- dispatchers (e.g. show/==/compare) are skipped.
-    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
+    classMethodEnv <- stageTimer "buildClassMethodEnv"
+        (buildClassMethodEnv classReg baseNoClass loadedModules)
     let base = Map.union classMethodEnv baseNoClass
 
-    -- Phase 2.11: expand TH splices in every loaded module's bodies.
-    -- Run AFTER all modules are discovered (so imports are resolved) but
-    -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
-    -- contains all builtins including the 'lift' function.
-    mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
+    stageTimer "expandSplicesInModule" $
+        mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
-    -- Build (fully-qualified-name, Expr) pairs for every loaded body.
-    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
+    qualPairs <- stageTimer "exportBodies" $
+        concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
 
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
@@ -1686,7 +1691,9 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
             -- Pre-discover free vars of the splice expr in the module
             -- so same-module helpers like `mySplice` get parsed into
             -- lmBodies before we wrap and evaluate.
-            let fvs = freeVars spliceExpr
+            -- Dedupe to avoid quadratic blowup when the splice
+            -- references the same name many times.
+            let fvs = Set.toList (Set.fromList (freeVars spliceExpr))
             mapM_ (\fv -> do
                     r <- try (discoverInModule registry searchPath includeMap lm fv)
                              :: IO (Either SomeException ())
@@ -4869,11 +4876,9 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
     mapM_ discoverOne loadedModules
   where
     discoverOne lm = do
-        -- Instance method bodies.
         instDecls  <- scanInstanceDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs) | InstanceDecl _ _ _ ms <- instDecls, (n, lhs) <- ms ]
-        -- Class default-method bodies.
         classDecls <- scanClassDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs)
@@ -4881,13 +4886,42 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
               , (n, lhs) <- Map.toList defs
               ]
 
-    discoverMethods lm (_, lhs) = do
-        r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
-                     (lhsClauses lhs))
-                :: IO (Either SomeException Expr)
-        case r of
-            Left _     -> pure ()
-            Right expr -> mapM_ (discoverFree lm) (freeVars expr)
+    discoverMethods lm (methodName, lhs) = do
+        fvs <- methodFreeVars lm methodName lhs
+        -- 'freeVars' is set-based and dedupes itself, so 'fvs' is
+        -- already deduplicated.  Iterate it directly.
+        mapM_ (discoverFree lm) fvs
+
+    -- Cache parsed method-body free-vars per (source-content, method,
+    -- first-clause-byte-span).  Without this, every program load
+    -- re-parses every class/instance method body of every loaded
+    -- module just to compute its free-var set: ~80 method bodies for
+    -- GHC.Internal.Ix alone, ~300+ across the core instance modules.
+    -- The parse is pure in the (Source, FixityTable, [Clause]) tuple
+    -- and cache keys reduce to (Source-content, methodName,
+    -- firstClauseStart) since clause spans uniquely identify the
+    -- definition site within a source.  Fixity is stable per loaded
+    -- module so it's covered by the Source identity.
+    methodFreeVars lm methodName lhs = do
+        let key = case lhsClauses lhs of
+                (Clause (a, _b) _ : _) -> "methodFvs:"
+                                          <> BC.unpack methodName
+                                          <> ":" <> show a
+                _                      -> "methodFvs:"
+                                          <> BC.unpack methodName
+                                          <> ":?"
+        mHit <- readScanCache (srcScanCache (lmSource lm)) key
+        case mHit >>= fromDynamic of
+            Just (fvs :: [ByteString]) -> pure fvs
+            Nothing -> do
+                r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
+                             (lhsClauses lhs))
+                        :: IO (Either SomeException Expr)
+                let fvs = case r of
+                        Left _     -> []
+                        Right expr -> freeVars expr
+                writeScanCache (srcScanCache (lmSource lm)) key (toDyn fvs)
+                pure fvs
 
     discoverFree lm name = do
         r <- try (discoverInModule registry searchPath includeMap lm name)
@@ -5636,56 +5670,65 @@ findOrResolveLhs src known name = do
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
 -- The scheduler uses this list to drive demand-driven discovery.
+--
+-- Result is deduplicated and the @bound@ set is tracked as a 'Set'
+-- (not a list), so 'Set.member' shadow lookups are O(log n) instead
+-- of O(n).  For long method bodies (e.g. 'GHC.Internal.Ix.range') the
+-- previous list-based implementation produced 80+ entries that were
+-- mostly duplicates of the same handful of names; deduplicating at
+-- the source eliminates the quadratic blowup downstream.
 freeVars :: Expr -> [ByteString]
-freeVars = goAll []
+freeVars = Set.toList . goAll Set.empty
   where
-    goAll bound = \case
+    goAll :: Set ByteString -> Expr -> Set ByteString
+    goAll !bound = \case
         EVar n
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELit _      -> []
-        EApp f x    -> goAll bound f ++ goAll bound x
-        ELam n e    -> goAll (n : bound) e
+            | Set.member n bound -> Set.empty
+            | otherwise          -> Set.singleton n
+        ELit _      -> Set.empty
+        EApp f x    -> goAll bound f `Set.union` goAll bound x
+        ELam n e    -> goAll (Set.insert n bound) e
         ELet bs e   ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-               ++ goAll bound' e
-        ECase s as  -> goAll bound s ++ concatMap (goAlt bound) as
-        EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
+            let bound' = Set.union (Set.fromList (map fst bs)) bound
+            in Set.unions (map (goAll bound' . snd) bs)
+               `Set.union` goAll bound' e
+        ECase s as  -> goAll bound s `Set.union` Set.unions (map (goAlt bound) as)
+        EIf c t e   -> goAll bound c `Set.union` goAll bound t `Set.union` goAll bound e
         EDo stmts   -> goStmts bound stmts
         ENeg e      -> goAll bound e
-        ETuple es   -> concatMap (goAll bound) es
-        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
-        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
-        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
-        EImplicitRef _  -> []
+        ETuple es   -> Set.unions (map (goAll bound) es)
+        ERecordCon _ fields -> Set.unions (map (goAll bound . snd) fields)
+        ERecordWild _   -> Set.empty   -- fields resolved by scheduler
+        ERecordUpdate e fields ->
+            goAll bound e `Set.union`
+              Set.unions (map (goAll bound . snd) fields)
+        EImplicitRef _  -> Set.empty
         EImplicitLet bs e ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
+            let bound' = Set.union (Set.fromList (map fst bs)) bound
+            in Set.unions (map (goAll bound' . snd) bs) `Set.union`
+               goAll bound' e
         ESplice inner   -> goAll bound inner
-        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
-        ELabel _        -> []   -- Phase 3.5: labels have no free variables
-        ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
-        ETypedMethod{}  -> []   -- elaborator product; no EVar refs
-        EGuardFail      -> []
+        EQuote _        -> Set.empty
+        ELabel _        -> Set.empty
+        ETyApp inner _  -> goAll bound inner
+        ETypedMethod{}  -> Set.empty
+        EGuardFail      -> Set.empty
 
-    -- A do-block introduces bindings left-to-right; each SBind/SLet
-    -- extends the bound set for subsequent stmts.
-    goStmts _     []                  = []
-    goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
-    goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
+    goStmts _     []                  = Set.empty
+    goStmts bound (SExpr e   : rest)  =
+        goAll bound e `Set.union` goStmts bound rest
+    goStmts bound (SBind n e : rest)  =
+        goAll bound e `Set.union` goStmts (Set.insert n bound) rest
     goStmts bound (SLet bs   : rest)  =
-        let names  = map fst bs
-            bound' = names ++ bound
-        in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-           ++ goStmts bound' rest
+        let bound' = Set.union (Set.fromList (map fst bs)) bound
+        in Set.unions (map (goAll bound' . snd) bs) `Set.union`
+           goStmts bound' rest
     goStmts bound (SImplicitLet bs : rest) =
-        concatMap (\(_, rhs) -> goAll bound rhs) bs
-           ++ goStmts bound rest
+        Set.unions (map (goAll bound . snd) bs) `Set.union`
+        goStmts bound rest
 
-    goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
+    goAlt bound (Alt p e) =
+        goAll (Set.union (Set.fromList (patBound p)) bound) e
 
     patBound :: Pat -> [ByteString]
     patBound (PVar n)            = [n]
@@ -5694,7 +5737,7 @@ freeVars = goAll []
     patBound (PBang p)           = patBound p
     patBound (PTuple ps)         = concatMap patBound ps
     patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
-    patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
+    patBound (PRecordWild _)     = []  -- resolved later
     patBound (PView _ p)         = patBound p
     patBound _                   = []
 
