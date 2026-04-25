@@ -4114,7 +4114,20 @@ resolveFallback name = do
                                 case mCtor of
                                   Just slot -> pure (Just slot)
                                   Nothing -> do
-                                   mAny <- tryAnyModuleBareSlot mods bareName
+                                   -- For names that have a known Prelude
+                                   -- owner (filter, map, length, …), skip
+                                   -- the broad bare-name fallback —
+                                   -- otherwise an unrelated module that
+                                   -- happens to export the same name (most
+                                   -- notably @Data.ByteString.filter@,
+                                   -- which is for ByteString not lists)
+                                   -- gets picked up first when warp's path
+                                   -- transitively loads bytestring.  Let
+                                   -- those flow straight to
+                                   -- 'preludeDirectOwner' below.
+                                   mAny <- case preludeDirectOwner bareName of
+                                       Just _  -> pure Nothing
+                                       Nothing -> tryAnyModuleBareSlot mods bareName
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
@@ -4208,7 +4221,25 @@ resolveFallback name = do
             pure (buildLam name (left - 1) (t : acc))
 
     preludeDirectOwner bareName
-        | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
+        -- Pin common Prelude list functions to GHC.List so that an
+        -- unrelated import (e.g. Data.ByteString) which exports the
+        -- same name doesn't get picked up first by the broad bare-name
+        -- fallback when warp's path transitively loads bytestring.
+        -- Without this, @filter (\\x -> NS.addrFamily x /= NS.AF_INET6)
+        -- addrs@ in streaming-commons mis-dispatches to
+        -- @Data.ByteString.filter :: (Word8 -> Bool) -> ByteString ->
+        -- ByteString@ on a @[AddrInfo]@ list, then crashes with a
+        -- non-exhaustive @PCon BS [pIn, l]@ pattern match.
+        | bareName `elem`
+            [ "elem", "filter", "map", "length", "take", "drop"
+            , "head", "tail", "init", "last", "null", "reverse"
+            , "concat", "concatMap", "zip", "zipWith", "unzip"
+            , "replicate", "repeat", "iterate", "foldr", "foldl"
+            , "foldr1", "foldl1", "any", "all", "and", "or"
+            , "sum", "product", "maximum", "minimum", "lookup"
+            , "splitAt", "span", "break", "dropWhile", "takeWhile"
+            , "notElem", "cycle"
+            ] = Just (BC.pack "GHC.List")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         | otherwise = Nothing
 
