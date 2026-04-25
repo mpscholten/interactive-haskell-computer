@@ -137,7 +137,7 @@ cppSourceWithIncludes includeDirs src = do
     -- recomputes the line-start table for the post-CPP byte string AND
     -- allocates a fresh per-Source scan cache so any pre-CPP scan
     -- results don't leak into post-CPP lookups.
-    pure (withBytes src bs')
+    withBytes src bs'
 
 --------------------------------------------------------------------------------
 -- Module registry types
@@ -1665,7 +1665,7 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
         | end <= start = pure []
         | otherwise = do
             let innerBytes = sliceBytes (lmSource lm) sp
-                src = mkSource ("<splice:" <> srcName (lmSource lm) <> ">") innerBytes
+            src <- mkSource ("<splice:" <> srcName (lmSource lm) <> ">") innerBytes
             spliceExpr <- Parser.parseExprOnly src (lmFixity lm)
             -- Pre-discover free vars of the splice expr in the module
             -- so same-module helpers like `mySplice` get parsed into
@@ -4423,7 +4423,7 @@ buildEmptyStubModule :: ModuleName -> IO LoadedModule
 buildEmptyStubModule name = do
     known  <- emptyKnownSymbols
     bodies <- newIORef Map.empty
-    let src = mkSource (BC.unpack name) ""
+    src <- mkSource (BC.unpack name) ""
     pure LoadedModule
         { lmName        = name
         , lmHeader      = ModuleHeader (Just name) ExportAll []

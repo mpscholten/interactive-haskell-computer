@@ -48,12 +48,12 @@ data FileResult = FileResult
 probeFile :: FilePath -> IO FileResult
 probeFile path = do
     raw <- BC.readFile path
-    let src0 = mkSource path raw
+    src0 <- mkSource path raw
     -- CPP preprocess (best-effort; on error keep raw source)
     ebs <- try (cppPreprocessWithIncludes [] defaultCppContext path raw)
                 :: IO (Either SomeException ByteString)
-    let src = case ebs of
-                Left _  -> src0
+    src <- case ebs of
+                Left _  -> pure src0
                 Right b -> mkSource path b
 
     -- Scan top-level names
