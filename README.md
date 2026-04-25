@@ -35,6 +35,7 @@ Remaining slices (rough order):
 - 2.11 — `Lift`-splice TH (subset of full TH)
 - 2.12 — tasty/QuickCheck/optparse-applicative source-load + end-to-end run (no shims; same rule as 2.10b)
 - 2.13 — ⭐ bytestring test suite (north-star)
+- 2.14 — **HSX hello-world milestone**: interpret `[hsx|<h1>Hello world</h1>|]` end-to-end (lex → `EQuasiQuote` → `IHP.HSX.QQ.hsx.quoteExp` → TH `Exp` → `IHC.AST.Expr` → `renderHtml`). Foundation phase in progress — caches populated, smoke fixture, parser wiring, docs in `docs/HSX-PATH.md`.
 - 2.16 — **cold-start latency benchmark** vs `ghci :load` + `cabal run` on a real IHP project. Hypothesis: we win on first-request-served time because we skip type checking, Core pipeline, linking, and load sources on demand rather than eagerly.
 - 3.1 — **full Template Haskell**: `[|…|]` quotation, `$(…)` AST-returning splices, `Q` IO, `reify`. Required by `aeson-th`, `lens` `makeLenses`, `persistent` TH — anything IHP uses heavily.
 - 3.2 — **type families** (open, closed, associated). Required by `servant`, effect libs, `singletons`, some IHP generated code.
