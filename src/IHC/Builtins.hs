@@ -728,6 +728,30 @@ builtins reg =
     , ("Network.Wai.Handler.Warp.Settings.settingsPort", warpSettingsPortB)
     , ("settingsHost", warpSettingsHostB)
     , ("Network.Wai.Handler.Warp.Settings.settingsHost", warpSettingsHostB)
+    -- Network.Socket AddrInfo record-field accessors.  The host backing
+    -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
+    -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
+    -- 'Network.Wai.Handler.Warp.Run' calls @NS.addrFamily@ etc. on the
+    -- result, so each accessor needs a builtin that pulls the
+    -- corresponding field index.
+    , ("addrFlags",      addrInfoFieldB "addrFlags" 0)
+    , ("Network.Socket.addrFlags", addrInfoFieldB "addrFlags" 0)
+    , ("Network.Socket.Info.addrFlags", addrInfoFieldB "addrFlags" 0)
+    , ("addrFamily",     addrInfoFieldB "addrFamily" 1)
+    , ("Network.Socket.addrFamily", addrInfoFieldB "addrFamily" 1)
+    , ("Network.Socket.Info.addrFamily", addrInfoFieldB "addrFamily" 1)
+    , ("addrSocketType", addrInfoFieldB "addrSocketType" 2)
+    , ("Network.Socket.addrSocketType", addrInfoFieldB "addrSocketType" 2)
+    , ("Network.Socket.Info.addrSocketType", addrInfoFieldB "addrSocketType" 2)
+    , ("addrProtocol",   addrInfoFieldB "addrProtocol" 3)
+    , ("Network.Socket.addrProtocol", addrInfoFieldB "addrProtocol" 3)
+    , ("Network.Socket.Info.addrProtocol", addrInfoFieldB "addrProtocol" 3)
+    , ("addrAddress",    addrInfoFieldB "addrAddress" 4)
+    , ("Network.Socket.addrAddress", addrInfoFieldB "addrAddress" 4)
+    , ("Network.Socket.Info.addrAddress", addrInfoFieldB "addrAddress" 4)
+    , ("addrCanonName",  addrInfoFieldB "addrCanonName" 5)
+    , ("Network.Socket.addrCanonName", addrInfoFieldB "addrCanonName" 5)
+    , ("Network.Socket.Info.addrCanonName", addrInfoFieldB "addrCanonName" 5)
     -- Phase 2.8: additional numeric ops needed by containers
     , ("fromInteger",  fromIntegralB)
     , ("toInteger",    fromIntegralB)
@@ -3753,6 +3777,18 @@ settingsFieldB label idx = pure $ VFun $ \settingsT -> do
         VCon "Settings" fields
             | idx < length fields -> force (fields !! idx)
         other -> error (label <> ": not Settings: " <> showValForDebug other)
+
+-- | Generic field accessor for the host-built @VCon "AddrInfo" [flags,
+-- family, socktype, protocol, addr, canonName]@ value.  Used to back
+-- @addrFamily@ / @addrAddress@ / etc. when warp's source code accesses
+-- record fields on a host-constructed AddrInfo.
+addrInfoFieldB :: String -> Int -> IO Val
+addrInfoFieldB label idx = pure $ VFun $ \aiT -> do
+    aiV <- force aiT
+    case aiV of
+        VCon "AddrInfo" fields
+            | idx < length fields -> force (fields !! idx)
+        other -> error (label <> ": not AddrInfo: " <> showValForDebug other)
 
 sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
 sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
