@@ -445,9 +445,48 @@ parseImportList src cur0 = go [] cur0
         let (peek, curP) = nextSigTok src cur
         case tkKind peek of
             TkLParen -> do
-                curClose <- skipToCloseParen src curP 1
-                go (n : acc) curClose
+                -- @Type(..)@ or @Type(Ctor1, Ctor2)@ in an import list:
+                -- previously we just fast-forwarded through the paren
+                -- group, dropping every constructor name on the floor.
+                -- Now: parse the contents as well.
+                --
+                --   * For an explicit list @Type(Ctor1, Ctor2)@, every
+                --     identifier becomes its own entry in the import list
+                --     so 'specAllows' will accept @Ctor1@ etc.
+                --   * For @Type(..)@ we have no way to enumerate the
+                --     constructors at parse time (the owning module
+                --     isn't loaded yet), so we leave a sentinel
+                --     @"$dotdot:<Type>"@ that 'specAllows' (and the
+                --     entry-env builder) recognise to mean "any
+                --     constructor of @Type@".
+                (subs, curEnd) <- parseSubNames src curP
+                go (concat [n : subs, acc]) curEnd
             _ -> go (n : acc) cur
+
+    -- Parse the contents of a @(...)@ trailing a name in an import list.
+    -- Returns the list of inner names (or sentinels for @(..)@) and the
+    -- cursor just past the closing paren.  Already AT the @(@.
+    parseSubNames :: Source -> Cursor -> IO ([ByteString], Cursor)
+    parseSubNames s cur0 = sub [] cur0
+      where
+        sub acc cur = do
+            let (tok, cur1) = nextSigTok s cur
+            case tkKind tok of
+                TkRParen -> pure (reverse acc, cur1)
+                TkComma  -> sub acc cur1
+                TkConId nm -> sub (nm : acc) cur1
+                TkIdent nm -> sub (nm : acc) cur1
+                TkPrimId nm -> sub (nm : acc) cur1
+                TkDot -> do
+                    -- @..@ — promote to wildcard sentinel.  Two TkDot
+                    -- tokens land here back-to-back; consume the
+                    -- second.
+                    let (tok2, cur2) = nextSigTok s cur1
+                    case tkKind tok2 of
+                        TkDot -> sub (BC.pack "$dotdot" : acc) cur2
+                        _     -> sub acc cur1
+                TkEof -> pure (reverse acc, cur1)
+                _     -> sub acc cur1
 
 operatorTokenName :: TokenKind -> Maybe ByteString
 operatorTokenName = \case

@@ -5410,7 +5410,15 @@ resolveImport registry searchPath includeMap lm name = do
 
 specAllows :: ImportSpec -> ByteString -> Bool
 specAllows ImportAll         _ = True
-specAllows (ImportOnly ns)   n = n `elem` ns
+specAllows (ImportOnly ns)   n =
+    -- The literal-name match handles ordinary
+    -- @import M (foo, bar)@.  The @$dotdot@ sentinel comes from
+    -- @import M (T(..))@: we couldn't enumerate T's constructors at
+    -- parse time (M wasn't loaded yet), so we left a wildcard.  Any
+    -- constructor name passes once the wildcard is present — the
+    -- normal cross-module ctor resolution path then picks it up.
+    n `elem` ns
+        || BC.pack "$dotdot" `elem` ns
 specAllows (ImportHiding ns) n = n `notElem` ns
 
 -- | Remove duplicate 'ByteString' elements from a list, preserving order.
