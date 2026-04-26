@@ -2132,10 +2132,24 @@ scanInstanceDeclsRaw src
         -- Collect tokens up to `where`.
         (mClassName, tyArgs, curWhere) <- parseInstanceHead cur0
         case (mClassName, tyArgs) of
-            (Just cls, (firstTyp : _)) -> do
+            (Just cls, _ : _) -> do
                 methods <- parseInstanceBody curWhere
+                -- Pick the head type for single-tag registration.  For a
+                -- MPTC instance like @MonadParsec e s (ParsecT e s m)@
+                -- the literal first arg is the type variable @e@, which
+                -- isn't dispatchable — fall through to the first
+                -- capitalised arg (a real type constructor) so the
+                -- value-directed dispatcher can find the instance under
+                -- a meaningful key.
+                let firstTyp = case filter isUpperHead tyArgs of
+                                   (h : _) -> h
+                                   []      -> head tyArgs
                 pure (Just (InstanceDecl cls firstTyp tyArgs methods))
             _ -> pure Nothing
+      where
+        isUpperHead bs = case BC.uncons bs of
+            Just (c, _) -> c >= 'A' && c <= 'Z'
+            Nothing     -> False
 
     -- Parse: [context =>] ClassName TyHead1 TyHead2 ... where
     -- We grab the first TkConId (after any constraint @=>@) as class

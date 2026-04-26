@@ -1084,12 +1084,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- Reading sub-library hs-source-dirs from the cabal file gets
-        -- ihp-hsx's parser sub-library (containing IHP.HSX.Parser, the
-        -- actual megaparsec-based HSX parser) on the search path, so
-        -- 'parseHsx' resolves.  Next blocker: 'MonadParsec' class
-        -- dispatch picks the wrong instance ('Just' from Maybe) for
-        -- the 'takeWhileP' method.  Retarget when that one falls.
+        -- MonadParsec class dispatch now works: instance scan picks the
+        -- first capitalised type from MPTC heads (so 'MonadParsec e s
+        -- (ParsecT e s m)' registers under 'ParsecT' instead of the
+        -- type variable 'e'), force-loading Text.Megaparsec.Internal
+        -- gets the ParsecT instance into the registry before
+        -- registerInstancesFrom runs, and the dispatcher's
+        -- result-polymorphic fallback for MonadParsec methods routes
+        -- arg-directed misses to the ParsecT tag.  Next blocker:
+        -- 'unParser' record-accessor applied to non-VCon (probably
+        -- the megaparsec parser body needs an additional dispatch /
+        -- elaboration step). Retarget when that falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1098,7 +1103,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "no instance of `MonadParsec`" `isInfixOf` m)
+                    (\m -> "record accessor `unParser`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- The 'getString' record-accessor failure has been bridged
