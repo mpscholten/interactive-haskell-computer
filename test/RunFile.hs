@@ -1084,17 +1084,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- MonadParsec class dispatch now works: instance scan picks the
-        -- first capitalised type from MPTC heads (so 'MonadParsec e s
-        -- (ParsecT e s m)' registers under 'ParsecT' instead of the
-        -- type variable 'e'), force-loading Text.Megaparsec.Internal
-        -- gets the ParsecT instance into the registry before
-        -- registerInstancesFrom runs, and the dispatcher's
-        -- result-polymorphic fallback for MonadParsec methods routes
-        -- arg-directed misses to the ParsecT tag.  Next blocker:
-        -- 'unParser' record-accessor applied to non-VCon (probably
-        -- the megaparsec parser body needs an additional dispatch /
-        -- elaboration step). Retarget when that falls.
+        -- Newtype-transparent record accessors get the megaparsec
+        -- combinators past the 'unParser' projection: when the field
+        -- registry has a single (constructor, 0) entry (i.e. a
+        -- newtype like 'newtype ParsecT … = ParsecT { unParser :: …
+        -- }'), the accessor returns the raw value if it isn't a VCon
+        -- (because IHC elides newtype boxing at runtime).  Next
+        -- blocker: 'Applicative.*>' for ParsecT — the instance's
+        -- default body isn't being picked up, so dispatch falls
+        -- through to a placeholder.  Retarget when that one falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1103,7 +1101,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "record accessor `unParser`" `isInfixOf` m)
+                    (\m -> "class-method `*>` of class `Applicative`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- The 'getString' record-accessor failure has been bridged
