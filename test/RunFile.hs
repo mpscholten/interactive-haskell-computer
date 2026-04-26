@@ -1084,13 +1084,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- Adding ctor-aware import rewrites + stubs for 'TH.location'
-        -- and 'TH.extsEnabled' get ihp-hsx's quoteHsxExpression past
-        -- its source-position / extension-detection prelude.  Next
-        -- blocker: 'parseHsx' (the actual HSX parser, defined in
-        -- IHP.HSX.Parser) is unbound — the load of IHP.HSX.Parser is
-        -- failing or the import-rewrite isn't producing the bare-name
-        -- pair.  Retarget when that one falls.
+        -- Reading sub-library hs-source-dirs from the cabal file gets
+        -- ihp-hsx's parser sub-library (containing IHP.HSX.Parser, the
+        -- actual megaparsec-based HSX parser) on the search path, so
+        -- 'parseHsx' resolves.  Next blocker: 'MonadParsec' class
+        -- dispatch picks the wrong instance ('Just' from Maybe) for
+        -- the 'takeWhileP' method.  Retarget when that one falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1099,7 +1098,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "unbound variable `parseHsx`" `isInfixOf` m)
+                    (\m -> "no instance of `MonadParsec`" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- The 'getString' record-accessor failure has been bridged
