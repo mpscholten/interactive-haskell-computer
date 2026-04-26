@@ -1073,3 +1073,49 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 msg `shouldNotSatisfy`
                     (\m -> "unbound variable `errorCallWithCallStackException`"
                            `isInfixOf` m)
+
+    --------------------------------------------------------------------
+    -- HSX + Blaze hello-world smoke fixtures (expected-fail).
+    --
+    -- These record the target for the HSX rendering milestone. Both
+    -- examples throw today; the tests assert the current error
+    -- messages so the suite stays green and the errors changing
+    -- signals real progress. Graduate to positive expectations once
+    -- rendering works end-to-end.
+    --------------------------------------------------------------------
+    it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
+        -- Reading sub-library hs-source-dirs from the cabal file gets
+        -- ihp-hsx's parser sub-library (containing IHP.HSX.Parser, the
+        -- actual megaparsec-based HSX parser) on the search path, so
+        -- 'parseHsx' resolves.  Next blocker: 'MonadParsec' class
+        -- dispatch picks the wrong instance ('Just' from Maybe) for
+        -- the 'takeWhileP' method.  Retarget when that one falls.
+        r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while HSX quasi-quoting \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "no instance of `MonadParsec`" `isInfixOf` m)
+
+    it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
+        -- The 'getString' record-accessor failure has been bridged
+        -- via an OverloadedStrings-style fallback in 'buildFieldEnv':
+        -- when the accessor sees a [Char] cons-list where it expected
+        -- a 'StaticString', it synthesises the appending closure
+        -- @(s ++)@ that the IsString instance would have produced.
+        -- That advances rendering past the StaticString boundary; the
+        -- next blocker is in the chunk-concatenation path
+        -- ('concatMap: not a list: ...').  Retarget when that one
+        -- falls.
+        r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while blaze rendering \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "concatMap: not a list" `isInfixOf` m)

@@ -50,6 +50,10 @@ data Expr
     | ERecordUpdate !Expr ![(Name, Expr)] -- expr { f1 = e1, ... } record update
     | ESplice  !Expr                   -- $( expr ) TH splice (Phase 2.11)
     | EQuote   !Expr                   -- [| expr |] TH expression bracket (Phase 2.12)
+    -- | @[qqName|body|]@ — QuasiQuoter.  Holds the raw bytes of the body
+    -- so the evaluator can feed them to @qqName.quoteExp :: String -> Q Exp@
+    -- at run time.  Opaque to every other pass (splice expansion, elaboration).
+    | EQuasiQuote !Name !ByteString
     | ELabel !Label                     -- #name OverloadedLabels label (Phase 3.5)
     -- | @f \@T@ — value-level TypeApplications. The @Name@ holds the raw
     -- source bytes of the type argument (e.g. @"Int"@, @"Maybe Int"@, @"\"email\""@).

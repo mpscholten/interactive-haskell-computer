@@ -64,7 +64,7 @@ import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
-import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
+import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO)
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
@@ -78,6 +78,7 @@ import IHC.Classes
     , setEnvFallback
     , setCoreInstanceLoadHook
     , setClassMethodFallback
+    , setThExpToExpr
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -88,7 +89,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
@@ -366,6 +367,15 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Num"
             , BC.pack "GHC.Internal.Real"
             , BC.pack "GHC.Internal.Maybe"
+            -- Language.Haskell.TH.Quote declares 'data QuasiQuoter = QuasiQuoter
+            -- { quoteExp, quotePat, quoteType, quoteDec }'.  QuasiQuoter-providing
+            -- libraries like ihp-hsx record-construct values like
+            -- @hsx = customHsx (HsxSettings…)@ where @customHsx@'s body is
+            -- @QuasiQuoter { quoteExp = … }@.  Without this force-load the
+            -- demand-driven loader doesn't visit TH.Quote so the constructor
+            -- isn't registered, and the record-construction emits 'EVar
+            -- "QuasiQuoter"' which is unbound.
+            , BC.pack "Language.Haskell.TH.Quote"
             ]
     forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
@@ -606,9 +616,16 @@ buildBaseEnv = do
     -- running with whatever subset we managed to load.
     env2 <- preDiscoverPreludeConstructors env1
                 `catch` (\(_ :: SomeException) -> pure env1)
+    -- Pre-discover 'QuasiQuoter' from Language.Haskell.TH.Quote so
+    -- libraries like ihp-hsx can build their @hsx :: QuasiQuoter@
+    -- record-construction without the user having to explicitly
+    -- import the TH module.  See 'preDiscoverTHQuoteConstructors'
+    -- for why this matters for QQ dispatch.
+    env3 <- preDiscoverTHQuoteConstructors env2
+                `catch` (\(_ :: SomeException) -> pure env2)
     -- Seed the env-fallback's base env so Closures built by
     -- 'resolveFallback' can reach builtins + class dispatchers.
-    writeIORef envBaseForFallbackRef env2
+    writeIORef envBaseForFallbackRef env3
     -- Install the core-instance load hook: on the first elaborator
     -- lookup miss ('IHC.Eval.resolveTypedMethod'), force-load
     -- GHC.Internal.Base / Maybe / … so their Applicative / Monad /
@@ -616,13 +633,18 @@ buildBaseEnv = do
     -- IORef flag); later calls are free.  Kept out of startup so the
     -- bare REPL prompt stays fast for users who never use type
     -- annotations.
-    installCoreInstanceLoadHook classReg env2
+    installCoreInstanceLoadHook classReg env3
     -- Install the class-method fallback: if resolveTypedMethod can't
     -- find an instance even after loading core dicts, return the
     -- dispatcher so value-directed lookup can still run.
     setClassMethodFallback (\cls method ->
         pure (Just (classMethodDispatcher classReg cls method)))
-    pure (env2, classReg)
+    -- Install the TH Exp -> Expr decoder so that QuasiQuoter dispatch
+    -- in 'IHC.Eval' can convert the Val produced by @quoteExp@ into an
+    -- 'Expr' to evaluate.  Lives in 'IHC.TH' which already depends on
+    -- 'IHC.Eval'; the hook breaks the would-be cycle.
+    setThExpToExpr thExpToExpr
+    pure (env3, classReg)
 
 -- | Install a one-shot hook that force-loads core instance modules
 -- (@GHC.Internal.Base@ and friends) and registers their instance
@@ -754,6 +776,44 @@ preDiscoverPreludeConstructors env0 = do
         case r of
             Right lm -> pure (lmDataReg lm)
             Left  _  -> pure Map.empty
+
+-- | Source-load 'Language.Haskell.TH.Quote' so its 'QuasiQuoter' record
+-- type — the data constructor + the four field accessors @quoteExp@ /
+-- @quotePat@ / @quoteType@ / @quoteDec@ — are available in env without
+-- the user's program needing an explicit @import@.
+--
+-- Why pre-load: a 'QuasiQuoter'-providing library like @ihp-hsx@ has
+-- @hsx :: QuasiQuoter@ defined as @customHsx (HsxSettings…)@; the body
+-- of @customHsx@ is a record-construction
+-- @QuasiQuoter { quoteExp = …, quotePat = …, … }@.  When the evaluator
+-- reaches that 'ERecordCon' it does @EVar "QuasiQuoter"@ to look up
+-- the constructor.  Without this pre-load the demand loader hasn't
+-- visited @Language.Haskell.TH.Quote@ yet so the constructor is
+-- unbound, killing every @[hsx|…|]@ / @[sql|…|]@ / etc.
+--
+-- Mirrors 'preDiscoverPreludeConstructors' but ALSO seeds the field
+-- accessors via 'buildFieldAccessorEnv' since 'QuasiQuoter' has named
+-- record fields.
+preDiscoverTHQuoteConstructors :: Env -> IO Env
+preDiscoverTHQuoteConstructors env0 = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let cacheDirs  = map fst cacheWithIncludes
+        includeMap = Map.fromList cacheWithIncludes
+    registry <- newIORef Map.empty
+    let modName = BC.pack "Language.Haskell.TH.Quote"
+    r <- try (loadModule registry cacheDirs includeMap modName)
+            :: IO (Either SomeException LoadedModule)
+    case r of
+        Left  _  -> pure env0   -- best-effort: missing cache shouldn't break startup
+        Right lm -> do
+            let dataReg = lmDataReg lm
+                fieldReg = lmFieldReg lm
+            conEnv <- buildConEnv dataReg
+            -- Treat the module's full field registry as both "public"
+            -- and "all" — there's only one module in scope here, so
+            -- there's no public/private distinction to draw.
+            fieldEnv <- buildFieldAccessorEnv [lm] fieldReg fieldReg
+            pure (Map.union env0 (Map.union conEnv fieldEnv))
 
 -- | Load a .hs file for the REPL's @:l@ command and bring its exported
 -- names into scope UNQUALIFIED, matching ghci semantics.
@@ -2506,37 +2566,41 @@ classMethodDispatcher reg cls methodName = selfVal
                               | not (isMethodPlaceholder methodVal) ->
                                     applyAll methodVal (reverse (argT : accArgs))
                             _ -> do
-                            -- Lazy-scan in-scope modules once and retry.
-                              didScan <- lazyInstanceRetry cls tag
-                              mMethod2 <- if didScan
-                                  then do
-                                      a <- lookupInstanceMethodForced reg cls tag methodName
-                                      b <- lookupInSharedRegForced cls tag methodName
-                                      pure (preferMethod a b)
-                                  else pure mMethod
-                              case mMethod2 of
-                                  Just methodVal
-                                    | not (isMethodPlaceholder methodVal) ->
-                                          applyAll methodVal (reverse (argT : accArgs))
-                                  _ -> do
-                                      mResult <- resultPolymorphicMethod
-                                      case mResult of
-                                          Just resultVal ->
-                                              applyAll resultVal (reverse (argT : accArgs))
-                                          Nothing -> do
-                                              -- Dispatchable arg but no matching instance.
-                                              -- Fall back to the class's default body.
-                                              mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                              mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                              let mDef = preferMethod mDef0 mDefShared
-                                              case mDef of
-                                                  Just defVal ->
-                                                      applyAll defVal (reverse (argT : accArgs))
-                                                  _ -> error
-                                                      ( "class-method dispatch: no instance of `"
-                                                       <> BC.unpack cls
-                                                       <> "` for type `" <> BC.unpack tag
-                                                       <> "` (method `" <> BC.unpack methodName <> "`)" )
+                              mHost <- hostShowFallback reg cls tag methodName av
+                              case mHost of
+                                Just hostVal -> pure hostVal
+                                Nothing -> do
+                                  -- Lazy-scan in-scope modules once and retry.
+                                  didScan <- lazyInstanceRetry cls tag
+                                  mMethod2 <- if didScan
+                                      then do
+                                          a <- lookupInstanceMethodForced reg cls tag methodName
+                                          b <- lookupInSharedRegForced cls tag methodName
+                                          pure (preferMethod a b)
+                                      else pure mMethod
+                                  case mMethod2 of
+                                      Just methodVal
+                                        | not (isMethodPlaceholder methodVal) ->
+                                              applyAll methodVal (reverse (argT : accArgs))
+                                      _ -> do
+                                          mResult <- resultPolymorphicMethod
+                                          case mResult of
+                                              Just resultVal ->
+                                                  applyAll resultVal (reverse (argT : accArgs))
+                                              Nothing -> do
+                                                  -- Dispatchable arg but no matching instance.
+                                                  -- Fall back to the class's default body.
+                                                  mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                                  mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                                  let mDef = preferMethod mDef0 mDefShared
+                                                  case mDef of
+                                                      Just defVal ->
+                                                          applyAll defVal (reverse (argT : accArgs))
+                                                      _ -> error
+                                                          ( "class-method dispatch: no instance of `"
+                                                           <> BC.unpack cls
+                                                           <> "` for type `" <> BC.unpack tag
+                                                           <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else do
                     -- Non-dispatchable (function / unit / primitive
                     -- object): stash and wait for the next arg so the
@@ -2696,6 +2760,46 @@ classMethodDispatcher reg cls methodName = selfVal
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+-- | Host-backed fallback for @Show.show@ on primitive types.
+--
+-- Source-loaded @instance Show Int@ overrides @showsPrec@ with
+-- @showSignedInt@, whose body uses primop patterns @(I# n)@ that the
+-- parser doesn't yet handle.  The instance method ends up registered
+-- as 'methodPlaceholder', so the dispatcher falls through to the
+-- class default body @show x = showsPrec 0 x ""@, which itself
+-- dispatches @showsPrec.Int@ → also placeholder → its default @showsPrec
+-- _ x s = show x ++ s@ → calls @show x@ → infinite loop.
+--
+-- For primitive types where 'IHC.Builtins.showValWith' already has a
+-- correct implementation, short-circuit to that instead of letting the
+-- placeholder/default chain run.  Only fires for @Show.show@ — other
+-- methods (showsPrec, showList) keep their normal dispatch so user
+-- overrides still work.
+hostShowFallback
+    :: ClassRegistry
+    -> ByteString    -- ^ class
+    -> ByteString    -- ^ type tag
+    -> ByteString    -- ^ method name
+    -> Val           -- ^ already-forced argument value
+    -> IO (Maybe Val)
+hostShowFallback reg cls tag methodName av
+    | cls == BC.pack "Show"
+    , methodName == BC.pack "show"
+    , isHostShowable tag = do
+        s <- showValWith reg av
+        Just <$> stringToListValIO s
+    | otherwise = pure Nothing
+  where
+    isHostShowable t =
+        t == BC.pack "Int" || t == BC.pack "Integer" ||
+        t == BC.pack "Float" || t == BC.pack "Double" ||
+        t == BC.pack "Char" || t == BC.pack "Bool" ||
+        t == BC.pack "Word" ||
+        t == BC.pack "Int8" || t == BC.pack "Int16" ||
+        t == BC.pack "Int32" || t == BC.pack "Int64" ||
+        t == BC.pack "Word8" || t == BC.pack "Word16" ||
+        t == BC.pack "Word32" || t == BC.pack "Word64"
 
 -- | Look up a class method in the shared (REPL-level) class registry
 -- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is
@@ -3152,7 +3256,20 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                 , not (lmNoFieldSelectors tm)
                 , exportsNameDirect tm n
                 ]
+            -- Data constructors declared in tm.  These live in 'buildConEnv'
+            -- under their bare name (no module prefix), so the rewrite
+            -- target stays as the bare name — the import-rewrite for
+            -- e.g. @qualified Text.Megaparsec as Megaparsec@ then maps
+            -- @Megaparsec.SourcePos@ to bare @SourcePos@ which the env
+            -- already resolves.
+            ctorExported =
+                [ n
+                | n <- requestedNames
+                , Map.member n (lmDataReg tm)
+                , exportsNameDirect tm n
+                ]
             localPairs = [(n, prefix <> n) | n <- nubBS (localExported ++ fieldExported)]
+                      ++ [(n, n)            | n <- ctorExported, n `notElem` localExported, n `notElem` fieldExported]
         -- For ExportName entries not covered by local bodies, follow
         -- tm's own unqualified imports (named re-export chain).
         namedPairs <- namedReexportPairs reg tm bodiesMap requestedNames
@@ -3262,6 +3379,12 @@ rewriteExpr rw = go []
             in EImplicitLet bs' (go bound' e)
         ESplice inner   -> ESplice (go bound inner)
         EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
+        -- QuasiQuoter: rewrite the QQ function name like any free EVar;
+        -- the body bytes are opaque.
+        EQuasiQuote n b
+            | n `elem` bound            -> EQuasiQuote n b
+            | Just q <- Map.lookup n rw -> EQuasiQuote q b
+            | otherwise                 -> EQuasiQuote n b
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
         ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
         e@ETypedMethod{} -> e   -- elaborator product; no name references to rewrite
@@ -4691,8 +4814,14 @@ isBuiltinBackedModule n =
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
     -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
-    -- builtins for splice execution.  The package is not in the base cache.
-    || "Language.Haskell.TH" `BC.isPrefixOf` n
+    -- builtins for splice execution.  Most submodules are stubbed because
+    -- their content is replaced by IHC.TH's synthetic primops.
+    -- HOWEVER: 'Language.Haskell.TH.Quote' is a small pure module that
+    -- declares 'data QuasiQuoter = QuasiQuoter { quoteExp, … }'.  The
+    -- QQ-dispatch path needs that constructor (record-construction in
+    -- ihp-hsx etc.) and it has no primops backing it — interpret it
+    -- from source.
+    || ("Language.Haskell.TH" `BC.isPrefixOf` n && n /= BC.pack "Language.Haskell.TH.Quote")
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
@@ -5729,6 +5858,11 @@ freeVars = goAll []
             in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
         ESplice inner   -> goAll bound inner
         EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        -- QuasiQuoter: the QQ function name is a free var that must be
+        -- discovered so the dispatch sees the imported QuasiQuoter value.
+        EQuasiQuote n _
+            | n `elem` bound -> []
+            | otherwise      -> [n]
         ELabel _        -> []   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
         ETypedMethod{}  -> []   -- elaborator product; no EVar refs
@@ -5782,6 +5916,7 @@ needsRecordFields = goExpr
         EImplicitLet bs e -> any (goExpr . snd) bs || goExpr e
         ESplice e    -> goExpr e
         EQuote _     -> False
+        EQuasiQuote{} -> False   -- QQ body is opaque bytes, no record syntax to descend into
         ELabel _     -> False
         ETyApp e _   -> goExpr e
         ETypedMethod{} -> False
@@ -5852,6 +5987,11 @@ discoveryFreeVars = go []
             in go (names ++ bound) e
         ESplice inner  -> go bound inner
         EQuote _       -> []
+        -- QuasiQuoter: make the QQ fn name a discovery free var so the
+        -- scheduler pre-loads the defining module before eval fires.
+        EQuasiQuote n _
+            | n `elem` bound -> []
+            | otherwise      -> [n]
         ELabel _       -> []
         ETyApp inner _ -> go bound inner
         ETypedMethod{} -> []

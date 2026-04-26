@@ -1246,6 +1246,9 @@ parseDo ctx cur0 = do
                 in concatMap (fv bound' . snd) bs ++ fv bound' e
             ESplice inner      -> fv bound inner
             EQuote  _          -> []
+            EQuasiQuote n _
+                | n `elem` bound -> []
+                | otherwise      -> [n]
             ELabel  _          -> []
             ETyApp e _         -> fv bound e
             ETypedMethod {}    -> []
@@ -2862,6 +2865,7 @@ startsAtom TkOQuoteD       = True  -- Phase 2.12: [d| (silently skipped)
 startsAtom TkOQuoteT       = True  -- Phase 2.12: [t| (silently skipped)
 startsAtom TkOQuoteP       = True  -- Phase 2.12: [p| (silently skipped)
 startsAtom TkOQuoteTy      = True  -- Phase 2.12: [|| (silently skipped)
+startsAtom TkQQOpen{}      = True  -- [hsx|…|] etc. — QuasiQuoter is a valid argument
 startsAtom _               = False
 
 --------------------------------------------------------------------------------
@@ -2924,20 +2928,16 @@ parseAtom ctx cur0 = do
         TkOQuoteT  -> skipQuoteBody ctx cur1 TkCQuote
         TkOQuoteP  -> skipQuoteBody ctx cur1 TkCQuote
         TkOQuoteTy -> skipQuoteBody ctx cur1 TkCQuoteTy
-        -- [name| ... |] — QuasiQuoter.  Without real TH QQ expansion we
-        -- scan the body as opaque bytes (tracking brace/paren/bracket
-        -- depth so nested @[foo|...|]@ work) up to the closing @|]@
-        -- and emit a placeholder @error "unexpanded QQ: name"@.  This
-        -- keeps parsing moving past HSX/interpolate/etc. blocks so the
-        -- surrounding module loads; if the placeholder is ever forced
-        -- at runtime the error message points at the missing expansion.
+        -- [name| ... |] — QuasiQuoter.  Skip the body as opaque bytes
+        -- (tracking brace/paren/bracket depth so nested @[foo|...|]@ work)
+        -- up to the closing @|]@ and emit an 'EQuasiQuote' node carrying
+        -- the captured body bytes.  The evaluator resolves @qqName@ to a
+        -- real 'QuasiQuoter' value and feeds the body through
+        -- @quoteExp :: String -> Q Exp@ at run time.
         TkQQOpen qqName -> do
             curEnd <- skipQQBody ctx cur1
-            let placeholder =
-                    EApp (EVar "error")
-                         (stringToConsList
-                             ("unexpanded QuasiQuoter [" ++ BC.unpack qqName ++ "|…|]"))
-            pure (placeholder, curEnd)
+            let body = sliceBytes (ctxSrc ctx) (cPos cur1, cPos curEnd - 2)
+            pure (EQuasiQuote qqName body, curEnd)
         TkEof -> parseErr ctx "unexpected end of input" tok
         _ -> parseErr ctx "unexpected token" tok
   where

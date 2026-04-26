@@ -39,7 +39,7 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback)
+import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.TypeAST as TA
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
@@ -305,6 +305,20 @@ eval env ipm = go
     -- Produce a TH Exp-shaped Val encoding of the *syntax* of expr.
     -- We do NOT evaluate expr — we encode its AST.
     go (EQuote inner) = evalQuote inner
+
+    -- QuasiQuoter dispatch: @[qqName|body|]@.  Look up qqName, project
+    -- @quoteExp :: String -> Q Exp@ via '$fldProj$quoteExp', apply to the
+    -- body string, run the resulting Q action, decode the TH Exp via the
+    -- 'IHC.TH' hook, and evaluate the result in the current scope.
+    go (EQuasiQuote qqName body) = do
+        qqVal      <- go (EVar qqName)
+        projVal    <- go (EVar (BC.pack "$fldProj$quoteExp"))
+        qqT        <- newWHNFThunk qqVal
+        quoteExpFn <- applyIP ipm projVal qqT
+        bodyT      <- newWHNFThunk =<< stringLiteralToListVal body
+        qExp       <- applyIP ipm quoteExpFn bodyT
+        thExpVal   <- runIOVal qExp
+        eval env ipm =<< runThExpToExpr thExpVal
 
     -- Value-level TypeApplications (@T). ihc is optimistic about types:
     -- the type argument is retained by the parser as AST metadata, but
