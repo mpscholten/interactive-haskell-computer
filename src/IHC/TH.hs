@@ -544,6 +544,10 @@ thBuiltinPairs =
     , ("TH.location",                         locationBuiltin)
     , ("Language.Haskell.TH.location",        locationBuiltin)
     , ("Language.Haskell.TH.Syntax.location", locationBuiltin)
+    , ("extsEnabled",                            extsEnabledBuiltin)
+    , ("TH.extsEnabled",                         extsEnabledBuiltin)
+    , ("Language.Haskell.TH.extsEnabled",        extsEnabledBuiltin)
+    , ("Language.Haskell.TH.Syntax.extsEnabled", extsEnabledBuiltin)
     ]
     -- Phase 2.13: TH AST constructors.  These have no Haskell source in
     -- our cache (the template-haskell package isn't source-loaded) and
@@ -749,6 +753,13 @@ locationBuiltin = pure $ VIO $ do
         rest <- charListVal cs
         restT <- newWHNFThunk rest
         pure (VCon ":" [cT, restT])
+
+-- | @extsEnabled :: Q [Extension]@.  Returns an empty list — IHC
+-- doesn't track per-source-location extension state, and quasi-quoter
+-- bodies that branch on extensions (e.g. ihp-hsx checks for
+-- @OverloadedStrings@) just take the no-extension code path.
+extsEnabledBuiltin :: IO Val
+extsEnabledBuiltin = pure $ VIO $ pure (VCon "[]" [])
 
 -- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
 reifyBuiltin :: IO Val

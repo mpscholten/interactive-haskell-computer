@@ -3207,7 +3207,20 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                 , not (lmNoFieldSelectors tm)
                 , exportsNameDirect tm n
                 ]
+            -- Data constructors declared in tm.  These live in 'buildConEnv'
+            -- under their bare name (no module prefix), so the rewrite
+            -- target stays as the bare name — the import-rewrite for
+            -- e.g. @qualified Text.Megaparsec as Megaparsec@ then maps
+            -- @Megaparsec.SourcePos@ to bare @SourcePos@ which the env
+            -- already resolves.
+            ctorExported =
+                [ n
+                | n <- requestedNames
+                , Map.member n (lmDataReg tm)
+                , exportsNameDirect tm n
+                ]
             localPairs = [(n, prefix <> n) | n <- nubBS (localExported ++ fieldExported)]
+                      ++ [(n, n)            | n <- ctorExported, n `notElem` localExported, n `notElem` fieldExported]
         -- For ExportName entries not covered by local bodies, follow
         -- tm's own unqualified imports (named re-export chain).
         namedPairs <- namedReexportPairs reg tm bodiesMap requestedNames
