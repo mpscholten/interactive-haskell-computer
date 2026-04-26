@@ -348,19 +348,25 @@ currentInstanceScope = readIORef instanceScopeRef
 -- precedent, see 'scanHookRef').
 --------------------------------------------------------------------------------
 
-type EnvFallbackHook = ByteString -> IO (Maybe Thunk)
+-- | The first parameter is the owning module of the closure whose body
+-- is currently being evaluated, when known.  It scopes the unqualified-
+-- name fallback to that module's actual import declarations (per
+-- Haskell 2010 §5.5).  'Nothing' means "no owner context" — typically
+-- transient lookups before the owner sentinel is installed (see
+-- 'currentOwner' in 'IHC.Eval').
+type EnvFallbackHook = Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 
 {-# NOINLINE envFallbackRef #-}
 envFallbackRef :: IORef EnvFallbackHook
-envFallbackRef = unsafePerformIO (newIORef (\_ -> pure Nothing))
+envFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
 
 setEnvFallback :: EnvFallbackHook -> IO ()
 setEnvFallback = writeIORef envFallbackRef
 
-lookupEnvFallback :: ByteString -> IO (Maybe Thunk)
-lookupEnvFallback name = do
+lookupEnvFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+lookupEnvFallback owner name = do
     hook <- readIORef envFallbackRef
-    hook name
+    hook owner name
 
 --------------------------------------------------------------------------------
 -- Class-method dispatcher fallback

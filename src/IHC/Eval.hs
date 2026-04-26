@@ -20,6 +20,8 @@ module IHC.Eval
     , forceMethodVal
     , apply
     , runIOVal
+    , ownerSentinelKey
+    , currentOwner
     ) where
 
 import Control.Exception (throwIO)
@@ -166,7 +168,17 @@ eval env ipm = go
             -- fully-qualified name whose body only became visible after
             -- the env snapshot was taken.  Consult the scheduler-
             -- installed hook before erroring.
-            mT <- lookupEnvFallback name
+            --
+            -- Pass the owner module of the closure being evaluated (read
+            -- from the @"$$owner"@ sentinel inserted in 'Env' at closure
+            -- construction time — see 'IHC.Scheduler.buildSlotFromOwner'
+            -- and the entry-module installation in 'loadProgramFromSource').
+            -- The fallback uses owner to scope the unqualified-name
+            -- search to that module's actual import declarations, per
+            -- Haskell 2010 §5.5.  'Nothing' falls back to the unscoped
+            -- search (entry boundary, builtins, transient lookups).
+            owner <- currentOwner env
+            mT    <- lookupEnvFallback owner name
             case mT of
                 Just t  -> force t
                 Nothing -> error ("IHC.Eval: unbound variable `"
@@ -964,6 +976,31 @@ matchPat (PView fn p) v = do
     -- PView into a case expression via desugarViewPat in the scheduler.
     error ("IHC.Eval: PView reached matchPat — view pattern not desugared: "
             <> show fn <> " -> " <> show p)
+
+-- | Sentinel key used to carry the owning-module name through 'Env'.
+-- The closure constructed for a top-level binding @M.foo@ has its
+-- 'env' extended with @ownerSentinelKey -> VStr "M"@; sub-closures that
+-- extend that env (lambdas, lets) inherit the binding automatically.
+-- The EVar fallback path reads this key via 'currentOwner' to scope
+-- unqualified-name resolution to @M@'s actual import declarations,
+-- per Haskell 2010 §5.5.  The @"$$"@ prefix matches existing IHC
+-- sigil conventions (@$fldProj$name@, @$dotdot@) and is unambiguous —
+-- no real Haskell identifier starts with @$$@.
+ownerSentinelKey :: ByteString
+ownerSentinelKey = BC.pack "$$owner"
+
+-- | Read the owning module from 'Env', if the sentinel is present.
+-- Returns 'Nothing' for envs that haven't had the sentinel installed
+-- (REPL transient evals, certain entry-boundary paths) — those will
+-- fall through to the unscoped legacy fallback.
+currentOwner :: Env -> IO (Maybe ByteString)
+currentOwner env = case lookupEnv ownerSentinelKey env of
+    Nothing -> pure Nothing
+    Just t  -> do
+        v <- force t
+        case v of
+            VStr m -> pure (Just m)
+            _      -> pure Nothing
 
 -- | Optimistic OverloadedStrings bridge for source-loaded bytestring code.
 -- String literals stay as real [Char] lists until a consumer demands a

@@ -62,9 +62,6 @@ import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
-import System.IO (stderr, hPutStrLn, hFlush)
-import qualified System.Environment
-import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv)
@@ -83,7 +80,7 @@ import IHC.Classes
     , setClassMethodFallback
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
-import IHC.Eval (force, apply, forceMethodVal)
+import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
@@ -91,7 +88,6 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import Data.Dynamic (toDyn, fromDynamic)
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
@@ -234,42 +230,35 @@ loadProgram = loadProgramFromSource []
 -- @~\/.cache\/ihc\/sources\/@ (including @mtl@, @transformers@,
 -- @splitmix@, @random@, etc.) are available without the caller having
 -- to enumerate them.
--- | Optional stage-time profiler. Setting @IHC_STAGE_TIME=1@ in the
--- environment prints elapsed wall time for each major load-pipeline
--- stage to stderr — diagnostic only; off-cost is one 'lookupEnv' per
--- stage (~10 µs total).
-stageTimer :: String -> IO a -> IO a
-stageTimer label act = do
-    enabled <- maybe False (const True) <$> System.Environment.lookupEnv "IHC_STAGE_TIME"
-    if not enabled then act else do
-        t0 <- getCurrentTime
-        r  <- act
-        t1 <- getCurrentTime
-        hPutStrLn stderr ("[stage " <> label <> "] "
-                          <> show (diffUTCTime t1 t0))
-        hFlush stderr
-        pure r
-
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
-    stageTimer "installEnvFallbackHook" installEnvFallbackHook
-    cacheWithIncludes0 <- stageTimer "cachedPackageSearchPathWithIncludes#1"
-        cachedPackageSearchPathWithIncludes
+    installEnvFallbackHook
+    cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
     let fullSearchPath0 = searchPath ++ map fst cacheWithIncludes0
         includeMap0     = Map.fromList cacheWithIncludes0
     setGlobalSearchPath fullSearchPath0 includeMap0
-    stageTimer "registerCbitsDylibs" FFI.registerCbitsDylibs
-    cacheWithIncludes <- stageTimer "cachedPackageSearchPathWithIncludes#2"
-        cachedPackageSearchPathWithIncludes
+    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
+    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
+    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
+    -- the nix-built libhs<pkg>-cbits.dylib.
+    FFI.registerCbitsDylibs
+    -- Enumerate cached packages once; hs-source-dirs are respected via
+    -- parseCabalFile inside cachedPackageSearchPath.
+    -- Also collect include-dirs so CPP can find package headers.
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = searchPath ++ cacheDirs
 
     registry <- newIORef Map.empty
-    src <- stageTimer "cppSource" (cppSource src0)
+
+    -- Phase 2.6: run CPP on the entry module's bytes before anything
+    -- else touches them. Directive-free files short-circuit and are
+    -- returned unchanged.
+    src <- cppSource src0
 
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
@@ -293,14 +282,17 @@ loadProgramFromSource searchPath src0 = do
     -- Prelude walk that eagerly loads much of base/ghc-internal — slow
     -- and semantically pointless, because the evaluator resolves to the
     -- builtin anyway.
-    earlyBuiltins <- stageTimer "builtinEnv#1" (builtinEnv classReg)
+    earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames = Map.keysSet earlyBuiltins
 
-    entry <- stageTimer "loadEntryModule" (loadEntryModule registry src)
+    -- Load the entry module. Its name is what the `module X where`
+    -- header declares (or "Main" as a default). We always register it
+    -- as the entry module so its bindings stay unqualified.
+    entry <- loadEntryModule registry src
     let entryName = lmName entry
 
-    stageTimer "discoverMain" $
-        discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
+    -- Drive discovery from `main`.
+    discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
     -- Discover transitively-referenced ENTRY-MODULE bindings.
     -- 'discoveryFreeVars' deliberately doesn't descend into function
@@ -335,7 +327,7 @@ loadProgramFromSource searchPath src0 = do
                 _  -> do
                     mapM_ discoverEntryLocal newLocals
                     chaseLocals (Set.union seen (Set.fromList newLocals))
-    stageTimer "chaseLocals" (chaseLocals Set.empty)
+    chaseLocals Set.empty
 
     -- Force-load every module the entry source imports.  Without this,
     -- @import M (T(..))@ where the user only uses some constructor of T
@@ -351,7 +343,7 @@ loadProgramFromSource searchPath src0 = do
     -- surface as an unbound-variable error at use site, not abort the
     -- whole load.
     let entryImports = map impModule (mhImports (lmHeader entry))
-    stageTimer "loadEntryImports" $ forM_ entryImports $ \m -> do
+    forM_ entryImports $ \m -> do
         _ <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         pure ()
@@ -375,7 +367,7 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Real"
             , BC.pack "GHC.Internal.Maybe"
             ]
-    stageTimer "loadCoreInstanceModules" $ forM_ coreInstanceModules $ \m -> do
+    forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         case r of
@@ -387,8 +379,7 @@ loadProgramFromSource searchPath src0 = do
     -- are in the tied env before methods are evaluated. Without this,
     -- `class Foo a where m x = helper x` with `helper` at top-level
     -- would fail with 'unbound variable `helper`' at dispatch time.
-    stageTimer "discoverClassAndInstanceFreeVars" $
-        discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
+    discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
 
     -- Collect every loaded module.
     reg <- readIORef registry
@@ -407,11 +398,13 @@ loadProgramFromSource searchPath src0 = do
         unionedTFReg = foldr (Map.unionWith (++)) Map.empty
                          (map lmTypeFamilies loadedModules)
     TR.setGlobalRegistry unionedTFReg
-    conEnv   <- stageTimer "buildConEnv" (buildConEnv unionedData)
-    fieldEnv <- stageTimer "buildFieldAccessorEnv"
-        (buildFieldAccessorEnv loadedModules publicFields unionedFields)
-    builtins <- stageTimer "builtinEnv#2" (builtinEnv classReg)
-    ffiEnv   <- stageTimer "buildForeignEnv" (buildForeignEnv loadedModules fullSearchPath)
+    conEnv   <- buildConEnv  unionedData
+    fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
+    builtins <- builtinEnv classReg
+    -- Install a thunk per scanned @foreign import ccall@ declaration
+    -- under a synthetic @__ffi.Module.name@ key. Module bodies reach
+    -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
+    ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
     let baseNoClass = Map.union builtins (Map.union fieldEnv (Map.union conEnv ffiEnv))
     -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
     -- scanClassDecls). For every `class C a where m :: ...` declaration in
@@ -419,15 +412,17 @@ loadProgramFromSource searchPath src0 = do
     -- `(C, typeTagOf firstArg)` in the ClassRegistry and applies the
     -- selected instance method. Names that collide with built-in
     -- dispatchers (e.g. show/==/compare) are skipped.
-    classMethodEnv <- stageTimer "buildClassMethodEnv"
-        (buildClassMethodEnv classReg baseNoClass loadedModules)
+    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = Map.union classMethodEnv baseNoClass
 
-    stageTimer "expandSplicesInModule" $
-        mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
+    -- Phase 2.11: expand TH splices in every loaded module's bodies.
+    -- Run AFTER all modules are discovered (so imports are resolved) but
+    -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
+    -- contains all builtins including the 'lift' function.
+    mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
-    qualPairs <- stageTimer "exportBodies" $
-        concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
+    -- Build (fully-qualified-name, Expr) pairs for every loaded body.
+    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
 
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
@@ -504,8 +499,19 @@ loadProgramFromSource searchPath src0 = do
         envWithAliases = Map.union builtinOverrides (Map.union aliasesWithoutBase qualEnv)
     let env = envWithAliases
 
-    mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure env emptyIPMap rhs)))
+    -- Each body's closure gets the @"$$owner"@ sentinel pointing at
+    -- the module that owns the binding (extracted from the FQN's
+    -- module prefix), so 'IHC.Eval.currentOwner' can scope the
+    -- unqualified-name fallback to that module's import declarations
+    -- (Haskell 2010 §5.5).  Sub-closures that extend this env (lambdas,
+    -- lets) inherit the sentinel automatically.
+    mapM_ (\((fqn, rhs), slot) -> do
+               let ownerName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
+                       Just idx -> BC.take idx fqn
+                       Nothing  -> lmName entry
+               ownerThunk <- newWHNFThunk (VStr ownerName)
+               let envWithOwner = Map.insert ownerSentinelKey ownerThunk env
+               writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
 
     -- Seed the env-fallback's base env so any 'resolveFallback'-built
@@ -822,8 +828,17 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let innerEnv = Map.union aliases qualEnv
-    mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
+    -- Per-body owner sentinel — see 'loadProgramFromSource' for the
+    -- analogous block in the run-from-source path.  The owner is
+    -- extracted from the FQN's module prefix; entries that aren't
+    -- module-prefixed default to the entry module.
+    mapM_ (\((fqn, rhs), slot) -> do
+               let ownerName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
+                       Just idx -> BC.take idx fqn
+                       Nothing  -> lmName entry
+               ownerThunk <- newWHNFThunk (VStr ownerName)
+               let envWithOwner = Map.insert ownerSentinelKey ownerThunk innerEnv
+               writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
     -- Register type-class instances.
     do { classTable <- buildClassMethodTable loadedModules; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable innerEnv) loadedModules }
@@ -1580,8 +1595,15 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                  $ Map.union (Map.fromList rewriteAliasPairs)
                  $ Map.union aliases
                  $ Map.union qualEnv existingEnv
-    mapM_ (\((_, rhs), slot) ->
-               writeIORef slot (Unevaluated (Closure innerEnv emptyIPMap rhs)))
+    -- Per-body owner sentinel for scoped fallback (see comment in
+    -- 'loadProgramFromSource').
+    mapM_ (\((fqn, rhs), slot) -> do
+               let ownerName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
+                       Just idx -> BC.take idx fqn
+                       Nothing  -> impModule imp
+               ownerThunk <- newWHNFThunk (VStr ownerName)
+               let envWithOwner = Map.insert ownerSentinelKey ownerThunk innerEnv
+               writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
     -- H2010 §4.3.2 scope filter: modules not in the user's import
     -- closure ('closure' computed above) MUST NOT contribute instances.
@@ -1691,9 +1713,7 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
             -- Pre-discover free vars of the splice expr in the module
             -- so same-module helpers like `mySplice` get parsed into
             -- lmBodies before we wrap and evaluate.
-            -- Dedupe to avoid quadratic blowup when the splice
-            -- references the same name many times.
-            let fvs = Set.toList (Set.fromList (freeVars spliceExpr))
+            let fvs = freeVars spliceExpr
             mapM_ (\fv -> do
                     r <- try (discoverInModule registry searchPath includeMap lm fv)
                              :: IO (Either SomeException ())
@@ -3877,14 +3897,14 @@ envBaseForFallbackRef = unsafePerformIO (newIORef Map.empty)
 
 installEnvFallbackHook :: IO ()
 installEnvFallbackHook =
-    setEnvFallback $ \name -> do
+    setEnvFallback $ \mOwner name -> do
         cache <- readIORef envFallbackCache
         case Map.lookup name cache of
             Just t  -> pure (Just t)
-            Nothing -> resolveFallback name
+            Nothing -> resolveFallback mOwner name
 
-resolveFallback :: ByteString -> IO (Maybe Thunk)
-resolveFallback name
+resolveFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+resolveFallback _mOwner name
     -- warp's modules use a fixed set of qualified aliases.  When env
     -- binding for an alias-qualified name fails, the demand-driven env
     -- fallback lands here.  Each rewrite redirects an alias to its
@@ -3895,86 +3915,86 @@ resolveFallback name
     --
     -- @import qualified Network.Wai.Handler.Warp.FdCache as F@
     | BC.pack ".F.setFileCloseOnExec" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.setFileCloseOnExec")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.setFileCloseOnExec")
     | BC.pack ".F.withFdCache" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.withFdCache")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.withFdCache")
     | BC.pack ".F.Fd" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.Fd")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.Fd")
     | BC.pack ".F.Refresh" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FdCache.Refresh")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.Refresh")
     -- @import qualified Network.Wai.Handler.Warp.Date as D@
     | BC.pack ".D.withDateCache" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.Date.withDateCache")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.Date.withDateCache")
     | BC.pack ".D.GMTDate" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.Date.GMTDate")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.Date.GMTDate")
     -- @import qualified Network.Wai.Handler.Warp.FileInfoCache as I@
     -- (Note: @I@ is reused in other warp files for Data.IORef and
     -- Data.IntMap.Strict, so we cannot prefix-rewrite — only the
     -- specific FileInfoCache symbols below are safe.)
     | BC.pack ".I.withFileInfoCache" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.withFileInfoCache")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.withFileInfoCache")
     | BC.pack ".I.FileInfo" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.FileInfo")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.FileInfo")
     | BC.pack ".I.fileInfoDate" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoDate")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoDate")
     | BC.pack ".I.fileInfoSize" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoSize")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoSize")
     | BC.pack ".I.fileInfoTime" `isSuffixOf` name =
-        resolveFallback (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoTime")
+        resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FileInfoCache.fileInfoTime")
     -- @import qualified Control.Exception as E@.  Pre-existing
     -- @bracket@ / @bracketOnError@ rewrites strip to bare names (those
     -- are re-exported through the Prelude path).  Other E.* names are
     -- not in Prelude, so we redirect to fully-qualified
     -- @Control.Exception.<name>@.
     | BC.pack ".E.bracketOnError" `isSuffixOf` name =
-        resolveFallback (BC.pack "bracketOnError")
+        resolveFallback _mOwner (BC.pack "bracketOnError")
     | BC.pack ".E.bracket" `isSuffixOf` name =
-        resolveFallback (BC.pack "bracket")
+        resolveFallback _mOwner (BC.pack "bracket")
     | BC.pack ".E.try" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.try")
+        resolveFallback _mOwner (BC.pack "Control.Exception.try")
     | BC.pack ".E.catch" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.catch")
+        resolveFallback _mOwner (BC.pack "Control.Exception.catch")
     | BC.pack ".E.handle" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.handle")
+        resolveFallback _mOwner (BC.pack "Control.Exception.handle")
     | BC.pack ".E.handleJust" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.handleJust")
+        resolveFallback _mOwner (BC.pack "Control.Exception.handleJust")
     | BC.pack ".E.finally" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.finally")
+        resolveFallback _mOwner (BC.pack "Control.Exception.finally")
     | BC.pack ".E.throwIO" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.throwIO")
+        resolveFallback _mOwner (BC.pack "Control.Exception.throwIO")
     | BC.pack ".E.toException" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.toException")
+        resolveFallback _mOwner (BC.pack "Control.Exception.toException")
     | BC.pack ".E.mask_" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.mask_")
+        resolveFallback _mOwner (BC.pack "Control.Exception.mask_")
     | BC.pack ".E.allowInterrupt" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.allowInterrupt")
+        resolveFallback _mOwner (BC.pack "Control.Exception.allowInterrupt")
     | BC.pack ".E.SomeException" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.SomeException")
+        resolveFallback _mOwner (BC.pack "Control.Exception.SomeException")
     | BC.pack ".E.IOException" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.IOException")
+        resolveFallback _mOwner (BC.pack "Control.Exception.IOException")
     | BC.pack ".E.ErrorCall" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.ErrorCall")
+        resolveFallback _mOwner (BC.pack "Control.Exception.ErrorCall")
     | BC.pack ".E.Exception" `isSuffixOf` name =
-        resolveFallback (BC.pack "Control.Exception.Exception")
+        resolveFallback _mOwner (BC.pack "Control.Exception.Exception")
     -- @import qualified System.TimeManager as T@.  Note: warp's
     -- Settings.hs uses @T@ for Data.Text instead, so we cannot
     -- prefix-rewrite — per-symbol only.
     | BC.pack ".T.initialize" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.initialize")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.initialize")
     | BC.pack ".T.stopManager" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.stopManager")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.stopManager")
     | BC.pack ".T.withHandleKillThread" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.withHandleKillThread")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.withHandleKillThread")
     | BC.pack ".T.tickle" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.tickle")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.tickle")
     | BC.pack ".T.pause" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.pause")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.pause")
     | BC.pack ".T.resume" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.resume")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.resume")
     | BC.pack ".T.Handle" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.Handle")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.Handle")
     | BC.pack ".T.Manager" `isSuffixOf` name =
-        resolveFallback (BC.pack "System.TimeManager.Manager")
+        resolveFallback _mOwner (BC.pack "System.TimeManager.Manager")
     -- streaming-commons aliases @import qualified Network.Socket as NS@
     -- and uses the alias for accessors / constructors / actions on AddrInfo
     -- (NS.addrFamily, NS.addrSocketType, NS.addrProtocol, …) plus bind /
@@ -3984,33 +4004,33 @@ resolveFallback name
     -- @Network.Socket.<bareName>@ qualified form, which is registered in
     -- 'IHC.Builtins' (or interpreted from Network.Socket source).
     | BC.pack "NS." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Network.Socket." `BC.append` BC.drop 3 name)
+        resolveFallback _mOwner (BC.pack "Network.Socket." `BC.append` BC.drop 3 name)
     -- @import qualified Network.Socket.ByteString as Sock@ in warp's
     -- Run.hs / SendFile paths (only Sock.sendAll / Sock.sendMany used).
     | BC.pack "Sock." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Network.Socket.ByteString." `BC.append` BC.drop 5 name)
+        resolveFallback _mOwner (BC.pack "Network.Socket.ByteString." `BC.append` BC.drop 5 name)
     -- @import qualified Control.Concurrent as Conc@ — only Conc.yield
     -- and Conc.Sync are referenced, but Conc is unique to warp's Run.hs.
     | BC.pack "Conc." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Control.Concurrent." `BC.append` BC.drop 5 name)
+        resolveFallback _mOwner (BC.pack "Control.Concurrent." `BC.append` BC.drop 5 name)
     -- @import qualified Data.Vault.Lazy as Vault@ — used by warp's
     -- HTTP1.hs / HTTP2/Request.hs and Settings.hs for vault keys.
     | BC.pack "Vault." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Data.Vault.Lazy." `BC.append` BC.drop 6 name)
+        resolveFallback _mOwner (BC.pack "Data.Vault.Lazy." `BC.append` BC.drop 6 name)
     -- @import qualified Data.ByteString.Builder as BB@ — used in
     -- warp's HTTP1 path for response body construction.
     | BC.pack "BB." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Data.ByteString.Builder." `BC.append` BC.drop 3 name)
+        resolveFallback _mOwner (BC.pack "Data.ByteString.Builder." `BC.append` BC.drop 3 name)
     -- @import qualified Data.CaseInsensitive as CI@ — used for
     -- case-insensitive HTTP header keys.
     | BC.pack "CI." `BC.isPrefixOf` name =
-        resolveFallback (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
-resolveFallback name = do
+        resolveFallback _mOwner (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
+resolveFallback mOwner name = do
     mods <- readIORef globalLoadedModulesRef
     case splitQualified name
             <|> splitQualifiedByLoadedModule mods name
             <|> splitQualifiedDottedOperator name of
-        Nothing -> resolveBarePrelude name mods
+        Nothing -> resolveBarePrelude mOwner name mods
         Just (modName, bareName) ->
             case Map.lookup modName mods of
                 Nothing    -> do
@@ -4078,7 +4098,7 @@ resolveFallback name = do
                                 (Map.findWithDefault owner modName mods')
                                 bareName
   where
-    resolveBarePrelude bareName mods = do
+    resolveBarePrelude mOwner bareName mods = do
         mBase <- tryBaseBareSlot bareName
         case mBase of
             Just slot -> pure (Just slot)
@@ -4091,23 +4111,6 @@ resolveFallback name = do
                         case mImportedField of
                             Just slot -> pure (Just slot)
                             Nothing -> do
-                                -- Last-resort: scan EVERY loaded module's
-                                -- 'lmBodies' for an exact-name match.  This
-                                -- handles the case where a binding's body
-                                -- references a same-module helper without
-                                -- qualification, e.g. streaming-commons's
-                                -- @bindPortTCP p s = … bindPortGen NS.Stream
-                                -- p s@: when warp imports @bindPortTCP@,
-                                -- IHC builds a closure whose env is the
-                                -- user's program scope, but the body's free
-                                -- variable @bindPortGen@ lives in
-                                -- Data.Streaming.Network.lmBodies.  Scanning
-                                -- all loaded modules surfaces it.  First
-                                -- match wins; on the off-chance two modules
-                                -- export the same bare name, the older one
-                                -- (alphabetically earlier in the Map) is
-                                -- preferred — same precedence Haskell would
-                                -- give if both were imported unqualified.
                                 -- Constructors first: 'tryAnyModuleBareSlot'
                                 -- can spuriously match a constructor name
                                 -- via 'findOrResolveLhs' (it sees @TextNode
@@ -4121,7 +4124,19 @@ resolveFallback name = do
                                 case mCtor of
                                   Just slot -> pure (Just slot)
                                   Nothing -> do
-                                   mAny <- tryAnyModuleBareSlot mods bareName
+                                   -- When we know the owning module of the
+                                   -- closure being evaluated, scope the
+                                   -- bare-name lookup to that module's
+                                   -- actual import declarations (Haskell
+                                   -- 2010 §5.5).  Without an owner —
+                                   -- transient lookups, entry-boundary
+                                   -- bootstrap, or builtins env-build —
+                                   -- fall back to the unscoped global scan.
+                                   mAny <- case mOwner of
+                                       Just o ->
+                                           tryImportScopedBareSlot mods o bareName
+                                       Nothing ->
+                                           tryAnyModuleBareSlot mods bareName
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
@@ -4169,8 +4184,64 @@ resolveFallback name = do
     -- in via 'import Prelude' being implicit.  Probe LHS via
     -- 'findOrResolveLhs' (cheap source scan) and only commit to
     -- discovery on a match.
-    tryAnyModuleBareSlot mods bareName =
-        go (sortOn (preludePriority . fst) (Map.toList mods))
+    tryAnyModuleBareSlot mods bareName = bareSlotIn mods (Map.toList mods) bareName
+
+    -- | Scoped variant: walk only modules that the @owner@ actually
+    -- imports unqualified (or has in scope via implicit Prelude).
+    -- Mirrors the resolution order Haskell 2010 §5.5 specifies for
+    -- unqualified names, instead of treating every loaded module as if
+    -- it were imported into the calling scope.
+    tryImportScopedBareSlot mods ownerName bareName =
+        case Map.lookup ownerName mods of
+            Nothing    -> tryAnyModuleBareSlot mods bareName
+            Just owner -> do
+                let imports = mhImports (lmHeader owner)
+                    -- Modules imported unqualified for which @bareName@
+                    -- passes the import spec (open, listed, or
+                    -- @hiding@-allowed).
+                    visibleViaImport =
+                        [ impModule imp
+                        | imp <- imports
+                        , not (impQualified imp)
+                        , specAllows (impSpec imp) bareName
+                        ]
+                    -- Implicit Prelude.  Approximate "what Prelude
+                    -- exports" by the set of modules IHC pre-loads as
+                    -- core Prelude scope (see 'coreInstanceModules' in
+                    -- 'loadProgramFromSource').  Skipped only when the
+                    -- owner module sets @NoImplicitPrelude@.
+                    implicit
+                        | hasNoImplicitPrelude (lmSource owner) = []
+                        | otherwise = preludeScope
+                    candidateNames = visibleViaImport ++ implicit
+                    candidates =
+                        [ (n, lm)
+                        | n  <- candidateNames
+                        , Just lm <- [Map.lookup n mods]
+                        ]
+                bareSlotIn mods candidates bareName
+
+    preludeScope :: [ModuleName]
+    preludeScope =
+        [ BC.pack "Prelude"
+        , BC.pack "GHC.Internal.Base"
+        , BC.pack "GHC.Internal.List"
+        , BC.pack "GHC.List"
+        , BC.pack "GHC.Internal.Show"
+        , BC.pack "GHC.Internal.Enum"
+        , BC.pack "GHC.Internal.Ix"
+        , BC.pack "GHC.Internal.Num"
+        , BC.pack "GHC.Internal.Real"
+        , BC.pack "GHC.Internal.Maybe"
+        , BC.pack "GHC.Internal.IO"
+        , BC.pack "GHC.Maybe"
+        ]
+
+    -- Shared body-or-discover walker used by both the scoped and
+    -- unscoped bare-name fallbacks.  Walks @candidates@ in order; for
+    -- each module, first checks 'lmBodies', then probes the source via
+    -- 'findOrResolveLhs' and triggers discovery on a hit.
+    bareSlotIn mods candidates bareName = go candidates
       where
         go [] = pure Nothing
         go ((_, owner) : rest) = do
@@ -4178,9 +4249,6 @@ resolveFallback name = do
             if Map.member bareName bodies
                 then buildSlotFromOwner mods owner bareName
                 else do
-                    -- Source-level probe: is bareName even defined as a
-                    -- top-level binding in this module?  Cheap check
-                    -- before committing to discovery.
                     mLhs <- findOrResolveLhs (lmSource owner) (lmKnown owner) bareName
                     case mLhs of
                         Just _ -> do
@@ -4190,7 +4258,6 @@ resolveFallback name = do
                             _ <- try (discoverInModule transientReg
                                         searchPath includeMap owner bareName)
                                     :: IO (Either SomeException ())
-                            -- Re-read after discovery to confirm it landed.
                             bodies' <- readIORef (lmBodies owner)
                             if Map.member bareName bodies'
                                 then buildSlotFromOwner mods owner bareName
@@ -4228,25 +4295,6 @@ resolveFallback name = do
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         | otherwise = Nothing
-
-    -- | Priority key for ordering modules during bare-name lookup.
-    -- Lower values are tried first.  Prelude-derived modules
-    -- (everything Prelude re-exports through, plus Prelude itself)
-    -- win over arbitrary same-bare-name modules — same rule GHC's
-    -- import resolver bakes in via implicit @import Prelude@.
-    preludePriority :: ModuleName -> Int
-    preludePriority m
-        | m == BC.pack "Prelude"          = 0
-        | BC.pack "GHC.Internal." `BC.isPrefixOf` m = 1
-        | BC.pack "GHC."          `BC.isPrefixOf` m = 2
-        | m == BC.pack "Data.List"        = 3
-        | m == BC.pack "Data.Maybe"       = 3
-        | m == BC.pack "Data.Either"      = 3
-        | m == BC.pack "Data.Tuple"       = 3
-        | m == BC.pack "Data.Char"        = 3
-        | m == BC.pack "Control.Monad"    = 3
-        | m == BC.pack "System.IO"        = 3
-        | otherwise                       = 100
 
     registerSharedDerivedEnumBounded loaded = do
         mReg <- readIORef sharedClassRegRef
@@ -4335,7 +4383,15 @@ resolveFallback name = do
                 slot <- newIORef (BlackHole "<fallback-placeholder>")
                 let selfKey = lmName owner <> BC.pack "." <> bareName
                 ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot
-                let richEnv = Map.union ownerLocalEnv
+                -- Stamp the closure's env with the owning module via
+                -- the @"$$owner"@ sentinel so 'IHC.Eval.currentOwner'
+                -- can scope unqualified-name fallback to this module's
+                -- import declarations (Haskell 2010 §5.5).  Sub-closures
+                -- that extend this env (lambdas, lets) inherit the
+                -- sentinel automatically.
+                ownerThunk <- newWHNFThunk (VStr (lmName owner))
+                let richEnv = Map.insert ownerSentinelKey ownerThunk
+                            $ Map.union ownerLocalEnv
                             $ Map.union baseEnv
                                 (Map.unions [conEnvAll, fieldEnvAll, ffiEnvAll])
                 writeIORef slot
@@ -4394,7 +4450,7 @@ resolveFallback name = do
             | otherwise = do
                 let fqn = ownerName <> BC.pack "." <> localName
                 slot <- newLazyBuiltinThunk $ do
-                    mSlot <- resolveFallback fqn
+                    mSlot <- resolveFallback (Just ownerName) fqn
                     case mSlot of
                         Just targetSlot -> force targetSlot
                         Nothing -> error
@@ -4531,7 +4587,7 @@ resolveFallback name = do
                         [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
                 modifyIORef' globalLoadedModulesRef (Map.union newMods)
                 let providerName = providerMod <> BC.pack "." <> bareName
-                mSlot <- resolveFallback providerName
+                mSlot <- resolveFallback (Just (lmName owner)) providerName
                 case mSlot of
                     Just slot -> do
                         modifyIORef' envFallbackCache (Map.insert name slot)
@@ -4876,9 +4932,11 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
     mapM_ discoverOne loadedModules
   where
     discoverOne lm = do
+        -- Instance method bodies.
         instDecls  <- scanInstanceDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs) | InstanceDecl _ _ _ ms <- instDecls, (n, lhs) <- ms ]
+        -- Class default-method bodies.
         classDecls <- scanClassDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs)
@@ -4886,42 +4944,13 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
               , (n, lhs) <- Map.toList defs
               ]
 
-    discoverMethods lm (methodName, lhs) = do
-        fvs <- methodFreeVars lm methodName lhs
-        -- 'freeVars' is set-based and dedupes itself, so 'fvs' is
-        -- already deduplicated.  Iterate it directly.
-        mapM_ (discoverFree lm) fvs
-
-    -- Cache parsed method-body free-vars per (source-content, method,
-    -- first-clause-byte-span).  Without this, every program load
-    -- re-parses every class/instance method body of every loaded
-    -- module just to compute its free-var set: ~80 method bodies for
-    -- GHC.Internal.Ix alone, ~300+ across the core instance modules.
-    -- The parse is pure in the (Source, FixityTable, [Clause]) tuple
-    -- and cache keys reduce to (Source-content, methodName,
-    -- firstClauseStart) since clause spans uniquely identify the
-    -- definition site within a source.  Fixity is stable per loaded
-    -- module so it's covered by the Source identity.
-    methodFreeVars lm methodName lhs = do
-        let key = case lhsClauses lhs of
-                (Clause (a, _b) _ : _) -> "methodFvs:"
-                                          <> BC.unpack methodName
-                                          <> ":" <> show a
-                _                      -> "methodFvs:"
-                                          <> BC.unpack methodName
-                                          <> ":?"
-        mHit <- readScanCache (srcScanCache (lmSource lm)) key
-        case mHit >>= fromDynamic of
-            Just (fvs :: [ByteString]) -> pure fvs
-            Nothing -> do
-                r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
-                             (lhsClauses lhs))
-                        :: IO (Either SomeException Expr)
-                let fvs = case r of
-                        Left _     -> []
-                        Right expr -> freeVars expr
-                writeScanCache (srcScanCache (lmSource lm)) key (toDyn fvs)
-                pure fvs
+    discoverMethods lm (_, lhs) = do
+        r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
+                     (lhsClauses lhs))
+                :: IO (Either SomeException Expr)
+        case r of
+            Left _     -> pure ()
+            Right expr -> mapM_ (discoverFree lm) (freeVars expr)
 
     discoverFree lm name = do
         r <- try (discoverInModule registry searchPath includeMap lm name)
@@ -5670,65 +5699,56 @@ findOrResolveLhs src known name = do
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
 -- The scheduler uses this list to drive demand-driven discovery.
---
--- Result is deduplicated and the @bound@ set is tracked as a 'Set'
--- (not a list), so 'Set.member' shadow lookups are O(log n) instead
--- of O(n).  For long method bodies (e.g. 'GHC.Internal.Ix.range') the
--- previous list-based implementation produced 80+ entries that were
--- mostly duplicates of the same handful of names; deduplicating at
--- the source eliminates the quadratic blowup downstream.
 freeVars :: Expr -> [ByteString]
-freeVars = Set.toList . goAll Set.empty
+freeVars = goAll []
   where
-    goAll :: Set ByteString -> Expr -> Set ByteString
-    goAll !bound = \case
+    goAll bound = \case
         EVar n
-            | Set.member n bound -> Set.empty
-            | otherwise          -> Set.singleton n
-        ELit _      -> Set.empty
-        EApp f x    -> goAll bound f `Set.union` goAll bound x
-        ELam n e    -> goAll (Set.insert n bound) e
+            | n `elem` bound -> []
+            | otherwise      -> [n]
+        ELit _      -> []
+        EApp f x    -> goAll bound f ++ goAll bound x
+        ELam n e    -> goAll (n : bound) e
         ELet bs e   ->
-            let bound' = Set.union (Set.fromList (map fst bs)) bound
-            in Set.unions (map (goAll bound' . snd) bs)
-               `Set.union` goAll bound' e
-        ECase s as  -> goAll bound s `Set.union` Set.unions (map (goAlt bound) as)
-        EIf c t e   -> goAll bound c `Set.union` goAll bound t `Set.union` goAll bound e
+            let names = map fst bs
+                bound' = names ++ bound
+            in concatMap (\(_, rhs) -> goAll bound' rhs) bs
+               ++ goAll bound' e
+        ECase s as  -> goAll bound s ++ concatMap (goAlt bound) as
+        EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
         EDo stmts   -> goStmts bound stmts
         ENeg e      -> goAll bound e
-        ETuple es   -> Set.unions (map (goAll bound) es)
-        ERecordCon _ fields -> Set.unions (map (goAll bound . snd) fields)
-        ERecordWild _   -> Set.empty   -- fields resolved by scheduler
-        ERecordUpdate e fields ->
-            goAll bound e `Set.union`
-              Set.unions (map (goAll bound . snd) fields)
-        EImplicitRef _  -> Set.empty
+        ETuple es   -> concatMap (goAll bound) es
+        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
+        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
+        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
+        EImplicitRef _  -> []
         EImplicitLet bs e ->
-            let bound' = Set.union (Set.fromList (map fst bs)) bound
-            in Set.unions (map (goAll bound' . snd) bs) `Set.union`
-               goAll bound' e
+            let names = map fst bs
+                bound' = names ++ bound
+            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
         ESplice inner   -> goAll bound inner
-        EQuote _        -> Set.empty
-        ELabel _        -> Set.empty
-        ETyApp inner _  -> goAll bound inner
-        ETypedMethod{}  -> Set.empty
-        EGuardFail      -> Set.empty
+        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        ELabel _        -> []   -- Phase 3.5: labels have no free variables
+        ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
+        ETypedMethod{}  -> []   -- elaborator product; no EVar refs
+        EGuardFail      -> []
 
-    goStmts _     []                  = Set.empty
-    goStmts bound (SExpr e   : rest)  =
-        goAll bound e `Set.union` goStmts bound rest
-    goStmts bound (SBind n e : rest)  =
-        goAll bound e `Set.union` goStmts (Set.insert n bound) rest
+    -- A do-block introduces bindings left-to-right; each SBind/SLet
+    -- extends the bound set for subsequent stmts.
+    goStmts _     []                  = []
+    goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
+    goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
-        let bound' = Set.union (Set.fromList (map fst bs)) bound
-        in Set.unions (map (goAll bound' . snd) bs) `Set.union`
-           goStmts bound' rest
+        let names  = map fst bs
+            bound' = names ++ bound
+        in concatMap (\(_, rhs) -> goAll bound' rhs) bs
+           ++ goStmts bound' rest
     goStmts bound (SImplicitLet bs : rest) =
-        Set.unions (map (goAll bound . snd) bs) `Set.union`
-        goStmts bound rest
+        concatMap (\(_, rhs) -> goAll bound rhs) bs
+           ++ goStmts bound rest
 
-    goAlt bound (Alt p e) =
-        goAll (Set.union (Set.fromList (patBound p)) bound) e
+    goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
 
     patBound :: Pat -> [ByteString]
     patBound (PVar n)            = [n]
@@ -5737,7 +5757,7 @@ freeVars = Set.toList . goAll Set.empty
     patBound (PBang p)           = patBound p
     patBound (PTuple ps)         = concatMap patBound ps
     patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
-    patBound (PRecordWild _)     = []  -- resolved later
+    patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
     patBound (PView _ p)         = patBound p
     patBound _                   = []
 
