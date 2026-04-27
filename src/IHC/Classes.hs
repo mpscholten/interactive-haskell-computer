@@ -50,6 +50,11 @@ module IHC.Classes
     , classMethodFallbackRef
     , setClassMethodFallback
     , lookupClassMethodFallback
+      -- * TH Exp -> Expr decoder hook
+    , ThExpToExprHook
+    , thExpToExprRef
+    , setThExpToExpr
+    , runThExpToExpr
     ) where
 
 import Data.ByteString (ByteString)
@@ -61,6 +66,7 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
+import IHC.AST (Expr)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -184,7 +190,7 @@ typeRepListEq _ _ = pure False
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
-forceThunkState BlackHole = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 type MethodTable = Map ByteString Val
@@ -300,7 +306,7 @@ typeTagOf (VPrimObj (PrimHandle _))      = BC.pack "<Handle>"
 typeTagOf (VPrimObj (PrimForeignPtr _))  = BC.pack "<ForeignPtr>"
 typeTagOf (VPrimObj (PrimPtr _))         = BC.pack "<Ptr>"
 typeTagOf (VPrimObj (PrimByteArray _))   = BC.pack "<MutableByteArray>"
-typeTagOf (VPrimObj (PrimBoxedArray _ _)) = BC.pack "<BoxedArray>"
+typeTagOf (VPrimObj (PrimArray _))       = BC.pack "<MutableArray#>"
 typeTagOf (VPrimObj PrimRealWorld)       = BC.pack "<RealWorld#>"
 typeTagOf (VPrimObj (PrimMVar _))        = BC.pack "<MVar>"
 typeTagOf (VPrimObj (PrimTVar _))        = BC.pack "<TVar>"
@@ -348,19 +354,25 @@ currentInstanceScope = readIORef instanceScopeRef
 -- precedent, see 'scanHookRef').
 --------------------------------------------------------------------------------
 
-type EnvFallbackHook = ByteString -> IO (Maybe Thunk)
+-- | The first parameter is the owning module of the closure whose body
+-- is currently being evaluated, when known.  It scopes the unqualified-
+-- name fallback to that module's actual import declarations (per
+-- Haskell 2010 §5.5).  'Nothing' means "no owner context" — typically
+-- transient lookups before the owner sentinel is installed (see
+-- 'currentOwner' in 'IHC.Eval').
+type EnvFallbackHook = Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 
 {-# NOINLINE envFallbackRef #-}
 envFallbackRef :: IORef EnvFallbackHook
-envFallbackRef = unsafePerformIO (newIORef (\_ -> pure Nothing))
+envFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
 
 setEnvFallback :: EnvFallbackHook -> IO ()
 setEnvFallback = writeIORef envFallbackRef
 
-lookupEnvFallback :: ByteString -> IO (Maybe Thunk)
-lookupEnvFallback name = do
+lookupEnvFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+lookupEnvFallback owner name = do
     hook <- readIORef envFallbackRef
-    hook name
+    hook owner name
 
 --------------------------------------------------------------------------------
 -- Class-method dispatcher fallback
@@ -412,3 +424,28 @@ triggerCoreInstanceLoad :: IO ()
 triggerCoreInstanceLoad = do
     hook <- readIORef coreInstanceLoadHookRef
     hook
+
+--------------------------------------------------------------------------------
+-- TH Exp -> Expr decoder hook
+--
+-- QuasiQuoter dispatch ('EQuasiQuote' in the AST) has to decode the TH
+-- 'Exp' value returned by @quoteExp@ back into an 'Expr'.  That decoder
+-- lives in 'IHC.TH' (which already imports 'IHC.Eval'), so we break the
+-- cycle via this hook: TH installs it at module load time, 'IHC.Eval'
+-- reads through it.
+--------------------------------------------------------------------------------
+
+type ThExpToExprHook = Val -> IO Expr
+
+{-# NOINLINE thExpToExprRef #-}
+thExpToExprRef :: IORef ThExpToExprHook
+thExpToExprRef = unsafePerformIO (newIORef (\_ ->
+    error "IHC.Classes: thExpToExpr hook not installed"))
+
+setThExpToExpr :: ThExpToExprHook -> IO ()
+setThExpToExpr = writeIORef thExpToExprRef
+
+runThExpToExpr :: Val -> IO Expr
+runThExpToExpr v = do
+    hook <- readIORef thExpToExprRef
+    hook v

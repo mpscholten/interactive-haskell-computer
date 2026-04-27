@@ -122,6 +122,16 @@ executable ihc-parse-probe
       , ihc
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
 
+executable probe-hsx
+    import:           warnings, lang
+    hs-source-dirs:   probe
+    main-is:          HsxProbe.hs
+    build-depends:
+        base
+      , bytestring
+      , ihc
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
+
 test-suite ihc-test
     import:           warnings, lang
     type:             exitcode-stdio-1.0
@@ -134,6 +144,7 @@ test-suite ihc-test
       , NorthStarTest
       , ReplTest
       , RunFile
+      , Unsupported
     build-depends:
         base
       , ihc
@@ -143,4 +154,8 @@ test-suite ihc-test
       , filepath
       , hspec            >= 2.10
       , process          >= 1.6
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
+    -- Tests run sequentially under hspec.  Pin the RTS to a single
+    -- capability so parallel GC doesn't spin on every core while the
+    -- actual workload is single-threaded.  The user-facing interpreter
+    -- binary (exe:ihc) still gets -N.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M4G"

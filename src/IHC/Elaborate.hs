@@ -264,15 +264,15 @@ classMethodHint methodName preds body = case preds of
             Just (cls, v)
     _ -> Nothing
 
--- | Is @name@ actually a method declared inside some @class C where
--- ... :: ...@ block?  Consulted so we don't false-positive plain
--- top-level functions whose sigs happen to fit the "one class
--- constraint whose tyvar appears in the body" shape (@array :: Ix i =>
--- ...@, @length :: Foldable t => ...@'s sibling helpers, etc.).
+-- | Is @name@ actually declared as a method inside some @class C where
+-- ... :: ...@ block?  Consulted so we don't route honest top-level
+-- functions whose sigs happen to fit the "one class constraint whose
+-- tyvar appears in the body" shape (@array :: Ix i => (i, i) -> [(i,
+-- e)] -> Array i e@) through the class dispatcher.
 --
--- Uses 'unsafePerformIO' because 'classMethodHint' is pure at the
--- call-site.  The referenced 'IORef' is write-once-mostly (populated by
--- the scheduler at program start) and reads are safe to be reordered.
+-- 'unsafePerformIO' is safe because the referenced 'IORef' is
+-- write-once-mostly (populated by the scheduler at program start) and
+-- reads are commutative.
 isActualClassMethod :: Name -> Bool
 isActualClassMethod name =
     name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)

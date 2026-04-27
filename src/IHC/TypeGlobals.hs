@@ -17,8 +17,8 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Set (Set)
+import qualified Data.Set as Set
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
@@ -39,14 +39,17 @@ globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
 globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
 globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 
--- | Names that actually appear as methods in a @class C where m1 ::
--- ..., m2 :: ...@ declaration somewhere in the loaded modules.
--- Populated by the scheduler from 'scanClassDecls' output.  Consulted
--- by 'IHC.Elaborate.classMethodHint' to reject false positives:
--- top-level bindings like @array :: Ix i => (i, i) -> [(i, e)] -> Array
--- i e@ have the shape of a class method (single-pred constrained
--- tyvar in the body) but AREN'T class methods — treating them as such
--- routes 'array 42 ...' through the wrong dispatcher.
+-- | Names that really appear as methods in a @class C where m1 :: ...@
+-- declaration somewhere in the loaded modules.  Populated by the
+-- scheduler's @buildClassMethodEnv@ and consulted by
+-- @IHC.Elaborate.classMethodHint@.
+--
+-- Without this, @classMethodHint@ would treat any top-level binding
+-- with a one-class-pred signature whose tyvar appears in the body as a
+-- class method — which catches honest functions like
+-- @array :: Ix i => (i, i) -> [(i, e)] -> Array i e@ and routes calls
+-- to them through the class dispatcher ("no instance of Ix for type
+-- `(,)`").
 {-# NOINLINE globalClassMethodNamesRef #-}
 globalClassMethodNamesRef :: IORef (Set ByteString)
 globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
@@ -98,6 +101,9 @@ seedBuiltinClassMethodSigs = do
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]
+    -- Mirror the seed names into the class-method whitelist so the
+    -- elaborator recognises them as actual class methods even before
+    -- @scanClassDecls@ runs for the user's modules.
     modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList
         [ BC.pack "pure"
         , BC.pack "return"

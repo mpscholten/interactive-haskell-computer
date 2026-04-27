@@ -12,7 +12,8 @@ import Test.Hspec
 
 import IHC.Driver
 import IHC.Eval (force)
-import IHC.Parser (ParseError(..))
+import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
+import IHC.Scan (BindingLhs(..), emptyKnownSymbols, findBinding)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (readSourceFile)
 import IHC.Val (Val(..))
@@ -537,6 +538,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "42\n"
 
+    it "parser: bang operator in do-let RHS does not terminate layout" do
+        src <- readSourceFile "test/Fixtures/Phase26/bang_infix_do_let.hs"
+        known <- emptyKnownSymbols
+        Just lhs <- findBinding src known "main"
+        expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        let rendered = show expr
+        rendered `shouldSatisfy` isInfixOf "EVar \"!\""
+        rendered `shouldSatisfy` isInfixOf "handle100Continue"
+
     it "composition `.` via Pratt parser: ((*2) . (+3)) 4 = 14" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/compose.hs")
         n   `shouldBe` 0
@@ -797,9 +807,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         case result of
             Right _ -> expectationFailure "expected a ParseError but the file succeeded"
             Left err -> do
-                -- displayException must format as  path:LINE:COL
+                -- displayException must format as  path:LINE:COL using
+                -- the absolute file line (not a span-relative line), so the
+                -- pointer in parse_error_position_XFAIL.hs lands on line 4
+                -- (`       in x`) where the parser expected `=`.
                 let msg = displayException err
-                msg `shouldSatisfy` (":2:" `isInfixOf`)
+                msg `shouldSatisfy` (":4:" `isInfixOf`)
                 msg `shouldSatisfy` ("parse error at" `isInfixOf`)
 
     --------------------------------------------------------------------
@@ -1060,3 +1073,53 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 msg `shouldNotSatisfy`
                     (\m -> "unbound variable `errorCallWithCallStackException`"
                            `isInfixOf` m)
+
+    --------------------------------------------------------------------
+    -- HSX + Blaze hello-world smoke fixtures (expected-fail).
+    --
+    -- These record the target for the HSX rendering milestone. Both
+    -- examples throw today; the tests assert the current error
+    -- messages so the suite stays green and the errors changing
+    -- signals real progress. Graduate to positive expectations once
+    -- rendering works end-to-end.
+    --------------------------------------------------------------------
+    it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
+        -- Class default placeholders now route through
+        -- 'resultPolymorphicMethod' before erroring (Applicative /
+        -- Functor / Monad methods on ParsecT route to the explicit
+        -- ParsecT instance).  'apply' and 'applyIP' are also
+        -- newtype-transparent: a single-field VCon is unwrapped on
+        -- the fly when used as a function.  Next blocker:
+        -- 'IHC.Eval.applyIP: not a function: <IO> applied to <State…>'
+        -- — the parser body returns a VIO where the source expects
+        -- an Identity, so the wrong monad is being threaded somewhere.
+        -- Retarget when that falls.
+        r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while HSX quasi-quoting \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "applyIP: not a function" `isInfixOf` m)
+
+    it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
+        -- The 'getString' record-accessor failure has been bridged
+        -- via an OverloadedStrings-style fallback in 'buildFieldEnv':
+        -- when the accessor sees a [Char] cons-list where it expected
+        -- a 'StaticString', it synthesises the appending closure
+        -- @(s ++)@ that the IsString instance would have produced.
+        -- That advances rendering past the StaticString boundary; the
+        -- next blocker is in the chunk-concatenation path
+        -- ('concatMap: not a list: ...').  Retarget when that one
+        -- falls.
+        r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected a thrown exception while blaze rendering \
+                 \is unsupported; runFile returned " <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy`
+                    (\m -> "concatMap: not a list" `isInfixOf` m)

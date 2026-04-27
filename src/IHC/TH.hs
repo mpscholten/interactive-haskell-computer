@@ -430,11 +430,14 @@ expandSplicesInExpr env ipm depth expr
     -- Phase 2.12: EQuote is a leaf in the splice-expansion pass.
     -- Its body is NOT expanded (it's a quotation, not a splice).
     go (EQuote e) = pure (EQuote e)
+    -- QuasiQuoter body stays opaque here; expansion happens at eval time.
+    go (EQuasiQuote n b) = pure (EQuasiQuote n b)
     -- Value-level @T: recurse into the inner expression; the type arg is opaque.
     go (ETyApp e ty) = do
         e' <- go e
         pure (ETyApp e' ty)
     go (ETypedMethod cls method tag) = pure (ETypedMethod cls method tag)
+    go EGuardFail = pure EGuardFail
 
     goAlt (Alt p e) = Alt p <$> go e
 
@@ -537,6 +540,14 @@ thBuiltinPairs =
     , ("reify",                               reifyBuiltin)
     , ("Language.Haskell.TH.reify",           reifyBuiltin)
     , ("Language.Haskell.TH.Syntax.reify",    reifyBuiltin)
+    , ("location",                            locationBuiltin)
+    , ("TH.location",                         locationBuiltin)
+    , ("Language.Haskell.TH.location",        locationBuiltin)
+    , ("Language.Haskell.TH.Syntax.location", locationBuiltin)
+    , ("extsEnabled",                            extsEnabledBuiltin)
+    , ("TH.extsEnabled",                         extsEnabledBuiltin)
+    , ("Language.Haskell.TH.extsEnabled",        extsEnabledBuiltin)
+    , ("Language.Haskell.TH.Syntax.extsEnabled", extsEnabledBuiltin)
     ]
     -- Phase 2.13: TH AST constructors.  These have no Haskell source in
     -- our cache (the template-haskell package isn't source-loaded) and
@@ -714,6 +725,42 @@ runQBuiltin = pure $ VFun $ \argT -> do
         VIO _ -> pure v
         other -> pure (VIO (pure other))
 
+-- | @location :: Q Loc@.  Returns a stub 'Loc' with empty filename /
+-- package / module / start / end.  Used by libraries like ihp-hsx for
+-- source-position metadata in error messages — the precise values
+-- don't matter for evaluation, only that the call returns a 'Loc'-shaped
+-- 'VCon' rather than crashing.
+--
+-- 'Loc' from Language.Haskell.TH.Syntax has 5 fields:
+--   loc_filename :: String
+--   loc_package  :: String
+--   loc_module   :: String
+--   loc_start    :: CharPos  (= (Int, Int))
+--   loc_end      :: CharPos
+locationBuiltin :: IO Val
+locationBuiltin = pure $ VIO $ do
+    filenameT <- newWHNFThunk =<< charListVal "<ihc-no-source-loc>"
+    packageT  <- newWHNFThunk =<< charListVal "<ihc>"
+    moduleT   <- newWHNFThunk =<< charListVal "<ihc>"
+    zeroT     <- newWHNFThunk (VInt 0)
+    posT      <- newWHNFThunk (VCon "(,)" [zeroT, zeroT])
+    pure (VCon "Loc" [filenameT, packageT, moduleT, posT, posT])
+  where
+    charListVal :: String -> IO Val
+    charListVal []     = pure (VCon "[]" [])
+    charListVal (c:cs) = do
+        cT <- newWHNFThunk (VChar c)
+        rest <- charListVal cs
+        restT <- newWHNFThunk rest
+        pure (VCon ":" [cT, restT])
+
+-- | @extsEnabled :: Q [Extension]@.  Returns an empty list — IHC
+-- doesn't track per-source-location extension state, and quasi-quoter
+-- bodies that branch on extensions (e.g. ihp-hsx checks for
+-- @OverloadedStrings@) just take the no-extension code path.
+extsEnabledBuiltin :: IO Val
+extsEnabledBuiltin = pure $ VIO $ pure (VCon "[]" [])
+
 -- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
 reifyBuiltin :: IO Val
 reifyBuiltin = pure $ VFun $ \argT -> do
@@ -886,4 +933,3 @@ thDecToBinding dec = case dec of
             _ -> throwTH "LitP: unsupported literal"
     decodePat v =
         throwTH ("thDecToBinding: unsupported pattern " <> showValForDebug v)
-

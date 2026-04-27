@@ -332,10 +332,24 @@ gpdToPackageInfo packageRoot gpd =
         mLib    = fmap condTreeData (condLibrary gpd)
         bi      = fromMaybe emptyBuildInfoStub (fmap libBuildInfo mLib)
         srcDirs0 = hsSourceDirs bi
-        srcDirs  = if null srcDirs0
+        -- Include hs-source-dirs from sub-libraries too.  Cabal allows a
+        -- package to declare 'library FOO' stanzas alongside the main
+        -- 'library' stanza, each with its own hs-source-dirs.  ihp-hsx
+        -- e.g. has 'library ihp-hsx-parser' with @hs-source-dirs: parser@
+        -- separate from the main library's @hs-source-dirs: blaze@; the
+        -- main library imports @IHP.HSX.Parser@ from the parser
+        -- sub-library, so the parser/ directory must be on the search
+        -- path or the import resolves to nothing.
+        subLibDirs =
+            [ sd
+            | (_, condTree) <- condSubLibraries gpd
+            , sd <- hsSourceDirs (libBuildInfo (condTreeData condTree))
+            ]
+        allSrcDirs0 = srcDirs0 ++ subLibDirs
+        srcDirs  = if null allSrcDirs0
                        then [packageRoot]
                        else [ packageRoot </> CabalPath.getSymbolicPath sd
-                            | sd <- srcDirs0
+                            | sd <- allSrcDirs0
                             ]
         -- Expand @default-language: GHC2021@ (etc.) into the implied
         -- extension set.  Cabal itself does not do this expansion — it
