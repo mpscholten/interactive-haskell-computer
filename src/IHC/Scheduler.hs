@@ -376,6 +376,16 @@ loadProgramFromSource searchPath src0 = do
             -- isn't registered, and the record-construction emits 'EVar
             -- "QuasiQuoter"' which is unbound.
             , BC.pack "Language.Haskell.TH.Quote"
+            -- Text.Megaparsec.Internal declares 'instance MonadParsec
+            -- e s (ParsecT e s m)' — the only MonadParsec instance
+            -- ihp-hsx and most users actually exercise.  The
+            -- corresponding methods (takeWhileP, satisfy, …) only
+            -- bind through this instance.  Lazy loading visits the
+            -- file (so 'scanDataDecls' fires) AFTER the
+            -- 'registerInstancesFrom' pass has run, so its instances
+            -- never get registered.  Force-load it.
+            , BC.pack "Text.Megaparsec.Internal"
+            , BC.pack "Text.Megaparsec.Class"
             ]
     forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
@@ -2614,7 +2624,7 @@ classMethodDispatcher reg cls methodName = selfVal
     fallback accArgs = VFun $ \finalArgT -> do
         mDef <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
         case mDef of
-            Just defVal ->
+            Just defVal | not (isMethodPlaceholder defVal) ->
                 applyAll defVal (reverse (finalArgT : accArgs))
             _ -> do
                 mResult <- resultPolymorphicMethod
@@ -2644,6 +2654,42 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "MArray"
         , method `elem` map BC.pack ["newArray", "newArray_", "newListArray", "newGenArray"] =
             [BC.pack "STArray"]
+        -- MonadParsec methods are parameterized by the parser monad
+        -- @m@, which only appears in the result type (e.g. @takeWhileP
+        -- :: Maybe String -> (Token s -> Bool) -> m (Tokens s)@).
+        -- Argument-directed dispatch picks the first arg's tag (often
+        -- @Just@/@Nothing@ from a 'Maybe' label), and the per-tag
+        -- lookup misses.  Fall back to the @ParsecT@ instance — the
+        -- only MonadParsec instance ihp-hsx and most users actually
+        -- exercise — so the parser body resolves without proper type
+        -- elaboration.
+        | clsName == BC.pack "MonadParsec"
+        , method `elem` map BC.pack
+            [ "parseError", "label", "hidden", "try", "lookAhead"
+            , "notFollowedBy", "withRecovery", "observing", "eof"
+            , "token", "tokens", "takeWhileP", "takeWhile1P", "takeP"
+            , "getParserState", "updateParserState", "mkParsec"
+            ]
+        = [BC.pack "ParsecT"]
+        -- Applicative / Functor / Monad methods on parser monads have
+        -- the same shape as MonadParsec methods: 'm' only appears in
+        -- the result type, so argument-directed dispatch can't find
+        -- the ParsecT instance from the args alone.  Class defaults
+        -- like 'a1 *> a2 = (id <$ a1) <*> a2' may also fail to
+        -- evaluate (parser hasn't yet learned every operator they
+        -- use), leaving placeholder slots in the registry.  When the
+        -- result-polymorphic fallback gets a chance to fire, route
+        -- to ParsecT — that instance defines '*>' / '<*' / '<*>' /
+        -- 'fmap' / '>>=' explicitly.
+        | clsName == BC.pack "Applicative"
+        , method `elem` map BC.pack ["*>", "<*", "<*>", "liftA2", "pure"]
+        = [BC.pack "ParsecT"]
+        | clsName == BC.pack "Functor"
+        , method `elem` map BC.pack ["fmap", "<$"]
+        = [BC.pack "ParsecT"]
+        | clsName == BC.pack "Monad"
+        , method `elem` map BC.pack [">>=", ">>", "return"]
+        = [BC.pack "ParsecT"]
         | otherwise = []
 
     specialClassApplication tag av argT accArgs
@@ -2938,10 +2984,16 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                     Left  _ -> pure (placeholder cls methodName)
             Nothing -> pure (placeholder cls methodName)
 
-    placeholder cls methodName = VFun $ \_ -> error
-        ( "class-method `" <> BC.unpack methodName
-       <> "` of class `"   <> BC.unpack cls
-       <> "`: no instance and no default implementation" )
+    -- When the class default for 'methodName' couldn't be captured or
+    -- evaluated (e.g. because the body uses operators that scanClassDecls
+    -- doesn't recognise, like 'a1 *> a2 = (id <$ a1) <*> a2'), register
+    -- 'methodPlaceholder' instead of a function that errors.  The
+    -- dispatcher's 'fallback' then sees this via 'isMethodPlaceholder'
+    -- and routes through 'resultPolymorphicMethod' before erroring,
+    -- giving e.g. 'MonadParsec.*>' a chance to find the ParsecT instance
+    -- (which DOES define '*>' explicitly) instead of failing on the
+    -- missing class default.
+    placeholder _cls _methodName = methodPlaceholder
 
 evalDefaultMethodWith :: Env -> LoadedModule -> Map ByteString ByteString -> BindingLhs -> IO Val
 evalDefaultMethodWith env lm rewrites lhs = do

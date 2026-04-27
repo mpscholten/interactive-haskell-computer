@@ -1073,6 +1073,15 @@ apply :: Val -> Thunk -> IO Val
 apply (VFun f)                    arg = f arg
 apply (VFunIP _ f)                arg = f Map.empty arg
 apply (VClassMethod _ _ tags go)  arg = go tags arg
+-- Newtype-transparent application: a single-field 'VCon' built from a
+-- newtype constructor (e.g. @ParsecT body@) is operationally equivalent
+-- to its inner field at GHC runtime.  Some IHC code paths return the
+-- wrapped 'VCon' instead of unwrapping it; if a caller then tries to
+-- apply that 'VCon' as a function, project the field and retry.  Other
+-- 'VCon' shapes (multi-field, enum-like) still error.
+apply (VCon _ [innerT])           arg = do
+    inner <- force innerT
+    apply inner arg
 apply v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 
@@ -1082,6 +1091,10 @@ applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _         (VFun f)                   arg = f arg
 applyIP callerIPM (VFunIP _ f)               arg = f callerIPM arg
 applyIP _         (VClassMethod _ _ tags go) arg = go tags arg
+-- Newtype-transparent application: see note on 'apply' above.
+applyIP ipm       (VCon _ [innerT])          arg = do
+    inner <- force innerT
+    applyIP ipm inner arg
 applyIP _         v                          arg  = do
     a <- force arg
     error ("IHC.Eval.applyIP: not a function: "

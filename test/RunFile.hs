@@ -1084,12 +1084,16 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- rendering works end-to-end.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
-        -- Reading sub-library hs-source-dirs from the cabal file gets
-        -- ihp-hsx's parser sub-library (containing IHP.HSX.Parser, the
-        -- actual megaparsec-based HSX parser) on the search path, so
-        -- 'parseHsx' resolves.  Next blocker: 'MonadParsec' class
-        -- dispatch picks the wrong instance ('Just' from Maybe) for
-        -- the 'takeWhileP' method.  Retarget when that one falls.
+        -- Class default placeholders now route through
+        -- 'resultPolymorphicMethod' before erroring (Applicative /
+        -- Functor / Monad methods on ParsecT route to the explicit
+        -- ParsecT instance).  'apply' and 'applyIP' are also
+        -- newtype-transparent: a single-field VCon is unwrapped on
+        -- the fly when used as a function.  Next blocker:
+        -- 'IHC.Eval.applyIP: not a function: <IO> applied to <State…>'
+        -- — the parser body returns a VIO where the source expects
+        -- an Identity, so the wrong monad is being threaded somewhere.
+        -- Retarget when that falls.
         r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1098,7 +1102,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "no instance of `MonadParsec`" `isInfixOf` m)
+                    (\m -> "applyIP: not a function" `isInfixOf` m)
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- The 'getString' record-accessor failure has been bridged

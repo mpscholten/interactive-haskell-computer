@@ -5207,10 +5207,19 @@ buildFieldEnv reg = do
                              <> " fields, index " <> show idx
                              <> " out of range"))
                     Nothing -> tryIsStringFallback fieldName clauses v conName
-            _ ->
-                throwIO (userError
-                    ("record accessor `" <> BC.unpack fieldName
-                     <> "` applied to non-constructor value"))
+            _
+              -- Newtype-transparent fallback: if the field-registry
+              -- entry for this name has a SINGLE constructor with a
+              -- SINGLE field (i.e. a newtype), and the runtime value
+              -- isn't wrapped in 'VCon' (because IHC's evaluator
+              -- elides newtype constructors at runtime), return the
+              -- raw value as-is.  Mirrors GHC's runtime behaviour
+              -- where 'ParsecT body' === 'body'.
+              | [(_, 0)] <- clauses -> pure v
+              | otherwise ->
+                  throwIO (userError
+                      ("record accessor `" <> BC.unpack fieldName
+                       <> "` applied to non-constructor value"))
 
     -- Optimistic OverloadedStrings bridge for record accessors.
     --
