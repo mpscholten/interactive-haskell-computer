@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified Coverage
 import qualified JitSmoke
+import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ReplTest
 import qualified RunFile
@@ -19,3 +20,4 @@ main = hspec do
     Unsupported.spec
     ReplTest.spec
     NorthStarTest.spec
+    LexerIhp.spec
