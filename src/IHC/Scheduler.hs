@@ -57,7 +57,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf, sortOn)
-import Control.Monad (forM_, foldM, when)
+import Control.Monad (forM, forM_, foldM, when)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
@@ -497,7 +497,7 @@ loadProgramFromSource searchPath src0 = do
                     , "create", "createAndTrim", "createFp", "createFpAndTrim"
                     , "newForeignPtr", "addForeignPtrFinalizer"
                     , "newUnique", "hashUnique"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
@@ -516,7 +516,16 @@ loadProgramFromSource searchPath src0 = do
         -- class selector; replacing its bare dispatcher with an alias to the
         -- fully-qualified selector creates a self-loop.
         aliasesWithoutBase = Map.difference aliases base
-        envWithAliases = Map.union builtinOverrides (Map.union aliasesWithoutBase qualEnv)
+        aliasBuiltinOverrides =
+            Map.mapMaybeWithKey
+                (\alias _ ->
+                    let bare = builtinBareName alias
+                    in if Set.member bare alwaysBuiltinNames
+                        then Map.lookup bare builtins
+                        else Nothing)
+                aliasesWithoutBase
+        aliasesNormalized = Map.union aliasBuiltinOverrides aliasesWithoutBase
+        envWithAliases = Map.union builtinOverrides (Map.union aliasesNormalized qualEnv)
     let env = envWithAliases
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
@@ -1579,7 +1588,10 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                             case Map.lookup n classMethodEnv of
                                 Just slot -> pure (Just (n, slot))
                                 Nothing   -> pure Nothing
-    requestedStandard0 <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
+    requestedStandard0 <- forM requested $ \n ->
+        case Map.lookup n baseForImport of
+            Just slot | Set.member n ffiBuiltinNames -> pure (Just (n, slot))
+            _ -> resolveRequestedPair targetLm qualPairs slots n
     let preferBuiltinRequested n resolved
             | Set.member n ffiBuiltinNames
             , Just slot <- Map.lookup n baseForImport
@@ -1595,6 +1607,29 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
         thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
+        builtinBareName k =
+            case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
+                Just idx -> BC.drop (idx + 1) k
+                Nothing  -> k
+        alwaysBuiltinNames =
+            Set.union ffiBuiltinNames
+                (Set.fromList
+                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
+                    , "catch", "handle", "try", "evaluate"
+                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
+                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
+                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
+                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "getSystemEventManager", "getSystemTimerManager"
+                    , "registerTimeout", "unregisterTimeout", "updateTimeout"
+                    , "withHandle", "withHandleKillThread"
+                    , "labelThread", "labelThreadByteArray#"
+                    , "settingsHost", "settingsPort"
+                    , "putStrLn", "putStr", "print"
+                    , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
+                    , "stdout", "stderr", "stdin"
+                    ])
         qualPrefix = case impAlias imp of
             Just a  -> a <> BC.pack "."
             Nothing
@@ -1607,7 +1642,16 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             | BC.null qualPrefix = []
             | otherwise =
                 [ (qualPrefix <> n, t) | (n, t) <- requestedPairs ]
-        aliasEnv = Map.fromList (bareAliases ++ qualAliases)
+        aliasEnv0 = Map.fromList (bareAliases ++ qualAliases)
+        aliasBuiltinOverrides =
+            Map.mapMaybeWithKey
+                (\alias _ ->
+                    let bare = builtinBareName alias
+                    in if Set.member bare alwaysBuiltinNames
+                        then Map.lookup bare baseForImport
+                        else Nothing)
+                aliasEnv0
+        aliasEnv = Map.union aliasBuiltinOverrides aliasEnv0
     let isSentinel (EVar _) = True
         isSentinel _        = False
     forM_ (zip qualPairs slots) $ \((fqn, rhs), slot) ->
@@ -1629,29 +1673,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             , BC.isPrefixOf modPrefix qualKey
             , let n = BC.drop (BC.length modPrefix) qualKey
             ]
-        builtinBareName k =
-            case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
-                Just idx -> BC.drop (idx + 1) k
-                Nothing  -> k
-        alwaysBuiltinNames =
-            Set.union ffiBuiltinNames
-                (Set.fromList
-                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
-                    , "catch", "handle", "try", "evaluate"
-                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
-                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
-                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
-                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "closeFdWith", "fdSocket", "unsafeFdSocket"
-                    , "getSystemEventManager", "getSystemTimerManager"
-                    , "registerTimeout", "unregisterTimeout", "updateTimeout"
-                    , "withHandle", "withHandleKillThread"
-                    , "labelThread", "labelThreadByteArray#"
-                    , "settingsHost", "settingsPort"
-                    , "putStrLn", "putStr", "print"
-                    , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
-                    , "stdout", "stderr", "stdin"
-                    ])
         builtinOverrides =
             Map.filterWithKey
                 (\k _ -> Set.member (builtinBareName k) alwaysBuiltinNames)
