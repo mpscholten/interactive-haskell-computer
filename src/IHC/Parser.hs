@@ -454,7 +454,7 @@ isTrivialPat _        = False
 --------------------------------------------------------------------------------
 
 splitOnWhere :: Source -> Span -> (Span, Maybe Span)
-splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) []
+splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) [] []
   where
     -- @depth@: bracket nesting ((/[/{); a @where@ inside brackets can't
     -- be the binding's where.
@@ -464,20 +464,53 @@ splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) []
     -- binding.  We pop entries as we encounter tokens at a column <=
     -- the stacked @of@ column, indicating we've left that case's
     -- layout block.
-    go cur depth caseStack
+    -- @letStack@: stack of @let@-introduced binding columns.  A @let@
+    -- (whether top-level @let ... in@ or do-block @let@) opens an
+    -- implicit binding-block whose first binding establishes the
+    -- column at which subsequent siblings start.  A @where@ whose
+    -- column is strictly greater than some stacked let-binding column
+    -- belongs to a binding inside that let, not to the enclosing
+    -- outer binding.  Without this, a do-block fixture like
+    --
+    --   main = do
+    --     let helper x = inner x
+    --           where inner = ...
+    --     print (helper 41)
+    --
+    -- mis-classifies the inner @where@ as @main@'s where and silently
+    -- drops @print (helper 41)@.  We track the let-binding column as
+    -- the column of the first non-keyword, non-newline token after
+    -- the @let@ keyword (handles both single- and multi-line lets).
+    go cur depth caseStack letStack
         | cPos cur >= end = ((start, end), Nothing)
         | otherwise =
             let (tok, cur') = nextToken src cur in
             case tkKind tok of
                 TkEof    -> ((start, end), Nothing)
-                TkWhere | depth == 0 && not (inAnyCase (tkCol tok) caseStack) ->
+                TkWhere | depth == 0
+                        , not (inAnyCase (tkCol tok) caseStack)
+                        , not (inAnyLet  (tkCol tok) letStack) ->
                     ((start, tkStart tok), Just (tkEnd tok, end))
-                TkLParen   -> go cur' (depth + 1) caseStack
-                TkRParen   -> go cur' (max 0 (depth - 1)) caseStack
-                TkLBracket -> go cur' (depth + 1) caseStack
-                TkRBracket -> go cur' (max 0 (depth - 1)) caseStack
-                TkOf       -> go cur' depth (tkCol tok : popOlderCases (tkCol tok) caseStack)
-                _          -> go cur' depth (popOlderCases (tkCol tok) caseStack)
+                TkLParen   -> go cur' (depth + 1) caseStack letStack
+                TkRParen   -> go cur' (max 0 (depth - 1)) caseStack letStack
+                TkLBracket -> go cur' (depth + 1) caseStack letStack
+                TkRBracket -> go cur' (max 0 (depth - 1)) caseStack letStack
+                TkOf       -> go cur' depth
+                                  (tkCol tok : popOlderCases (tkCol tok) caseStack)
+                                  (popOlderLets (tkCol tok) letStack)
+                TkLet      ->
+                    -- Peek the next significant token to find the
+                    -- let-block's binding column.  Newlines and
+                    -- comments are skipped via 'nextSigSimple'.
+                    let bindCol = case nextSigSimple src cur' of
+                            Just (firstTok, _) -> tkCol firstTok
+                            Nothing            -> tkCol tok + 1
+                    in go cur' depth
+                          (popOlderCases (tkCol tok) caseStack)
+                          (bindCol : popOlderLets (tkCol tok) letStack)
+                _          -> go cur' depth
+                                  (popOlderCases (tkCol tok) caseStack)
+                                  (popOlderLets (tkCol tok) letStack)
 
     -- True iff @col@ is still inside any open case block's body.
     inAnyCase :: Int -> [Int] -> Bool
@@ -486,12 +519,38 @@ splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) []
         | col > topOf = True
         | otherwise   = inAnyCase col rest
 
+    -- True iff @col@ is still inside any open let block (i.e. col is
+    -- strictly greater than the let's binding column).  A @where@ at
+    -- exactly the binding column belongs to the let's *parent* binding,
+    -- not to a let-binding's RHS.
+    inAnyLet :: Int -> [Int] -> Bool
+    inAnyLet _ [] = False
+    inAnyLet col (topLet : rest)
+        | col > topLet = True
+        | otherwise    = inAnyLet col rest
+
     -- Drop any case-stack entries whose layout has ended because we
     -- now see a token at column <= the entry's @of@ column.
     popOlderCases :: Int -> [Int] -> [Int]
     popOlderCases col stk
         | col <= 0  = stk
         | otherwise = dropWhile (\topOf -> col <= topOf) stk
+
+    popOlderLets :: Int -> [Int] -> [Int]
+    popOlderLets col stk
+        | col <= 0  = stk
+        | otherwise = dropWhile (\topLet -> col < topLet) stk
+
+    -- Cheap sig-skipper used only inside 'splitOnWhere' (we don't
+    -- have a 'Ctx' here so we can't reuse 'nextSig').  Returns Nothing
+    -- on EOF.
+    nextSigSimple :: Source -> Cursor -> Maybe (Token, Cursor)
+    nextSigSimple s c =
+        let (t, c') = nextToken s c in
+        case tkKind t of
+            TkEof     -> Nothing
+            TkNewline -> nextSigSimple s c'
+            _         -> Just (t, c')
 parseBindingsIn :: Source -> FixityTable -> Span -> IO [Bind]
 parseBindingsIn src fx (start, end) = do
     let cur0 = Cursor start 1 1
@@ -1494,15 +1553,80 @@ parseDoLet ctx cur0 = do
         (params, cur2) <- collectLetParams ctx cur1 []
         let (sepTok, cur3) = nextSig ctx cur2
             rhsCtx = ctx { ctxMinCol = bindCol }
-        (rhs, curAfter) <- case tkKind sepTok of
+        (rhs0, cur4) <- case tkKind sepTok of
             TkEq -> do
-                (expr, cur4) <- parseExpr rhsCtx cur3
-                pure (RhsPlain expr, cur4)
+                (expr, cur4') <- parseExpr rhsCtx cur3
+                pure (RhsPlain expr, cur4')
             TkBar -> do
-                (branches, cur4) <- parseDoLetGuardBranches rhsCtx cur3 []
-                pure (RhsGuards branches, cur4)
+                (branches, cur4') <- parseDoLetGuardBranches rhsCtx cur3 []
+                pure (RhsGuards branches, cur4')
             _     -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+        -- Consume a trailing @where@ on this binding's RHS so that
+        -- @do { let f x = body where helper = ... ; rest }@ parses
+        -- correctly.  Without this, @parseDoLet@'s @layoutBinds@ stops
+        -- at the @where@ token (it's not at @bindCol@), and
+        -- @parseDo@'s @layoutStmts@ then ALSO stops at @where@ (it's
+        -- not at the do-stmt column), so the where binds AND the next
+        -- do-stmt get silently dropped.  Note that 'splitOnWhere' has
+        -- already excluded this where from the outer binding's range
+        -- (its 'inAnyLet' check sees it nested inside the let), so the
+        -- enclosing 'ctx' covers the where block end-to-end.
+        (rhs, curAfter) <- attachDoLetWhere rhs0 cur4
         pure (name, params, rhs, curAfter)
+
+    attachDoLetWhere rhs cur = do
+        let (peekWhere, curAfterWhere) = nextSig ctx cur
+        case tkKind peekWhere of
+            TkWhere -> do
+                let whereTokCol = tkCol peekWhere
+                    (whereEndPos, curEnd) = findWhereBlockEnd whereTokCol curAfterWhere
+                if cPos curAfterWhere >= whereEndPos
+                    then pure (rhs, cur)
+                    else do
+                        binds <- parseBindingsIn (ctxSrc ctx) (ctxFixity ctx)
+                                                 (cPos curAfterWhere, whereEndPos)
+                        pure (wrapWhereBinds binds rhs, curEnd)
+            _ -> pure (rhs, cur)
+
+
+    -- Walk forward from a position just after @where@ and return both
+    -- the byte offset at which the where-block ends and a 'Cursor'
+    -- positioned there with correct line/col (the lexer needs accurate
+    -- line/col on the cursor passed to subsequent 'nextToken' calls,
+    -- otherwise downstream 'tkCol' checks compare against stale columns
+    -- from the cursor's previous position).  Block ends at the first
+    -- non-newline token whose column is <= @whereTokCol@.
+    findWhereBlockEnd whereTokCol startCur = go startCur
+      where
+        go c
+            | cPos c >= ctxEnd ctx = (ctxEnd ctx, c)
+            | otherwise =
+                let (t, c') = nextToken (ctxSrc ctx) c in
+                case tkKind t of
+                    TkEof     -> (cPos c, c)
+                    TkNewline -> go c'
+                    _ | tkCol t <= whereTokCol ->
+                          -- Build a cursor at the start of @t@ with
+                          -- the lexer-reported line/col for that
+                          -- position.  Using @c@ (the cursor before
+                          -- this nextToken call) would carry stale
+                          -- line/col from before whitespace was
+                          -- skipped.
+                          (tkStart t, Cursor (tkStart t) (tkLine t) (tkCol t))
+                      | otherwise              -> go c'
+
+    wrapWhereBinds [] r = r
+    wrapWhereBinds bs r = case r of
+        RhsPlain e    -> RhsPlain (ELet bs e)
+        RhsGuards ges -> RhsGuards
+            [ ( map (wrapGuardBinds bs) gs
+              , ELet bs b
+              )
+            | (gs, b) <- ges
+            ]
+
+    wrapGuardBinds bs (GuardExpr g)   = GuardExpr (ELet bs g)
+    wrapGuardBinds bs (GuardPat p ge) = GuardPat p (ELet bs ge)
 
     collectMoreDoLetClauses bindCol name cur acc = do
         let (peek, _) = nextSig ctx cur
