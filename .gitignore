@@ -11,3 +11,6 @@ result-*
 /bytestring-*/
 /tasty-*/
 /QuickCheck-*/
+
+# Claude Code worktrees + local session state
+.claude/worktrees/

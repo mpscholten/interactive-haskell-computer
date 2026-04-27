@@ -5,7 +5,7 @@ synopsis:           Interactive Haskell Computer — demand-driven copy-and-patc
 description:        Single-pass, Pascal-style, demand-driven Haskell interpreter targeting macOS/aarch64.
 author:             digitally induced
 maintainer:         marc@digitallyinduced.com
-license:            BSD-3-Clause
+license:            MIT
 build-type:         Simple
 tested-with:        GHC == 9.10.*
 
