@@ -20,8 +20,11 @@ module IHC.Lexer
       -- * Stepping
     , nextToken
     , skipTrivia
+      -- * Errors
+    , LexError(..)
     ) where
 
+import Control.Exception (Exception(..), throw)
 import Data.Bits (shiftL, shiftR, (.|.), (.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -30,6 +33,18 @@ import Data.Char (chr)
 import Data.Word (Word8)
 
 import IHC.Source
+
+-- | Pure throw raised from inside the lexer for malformed literals
+-- (out-of-range char escape, exponent without digits). The top-level
+-- @parseExprOnly@ / @parseBodyExpr@ entry points catch this and re-throw
+-- it as an 'IHC.Parser.ParseError' so callers see a uniform error type.
+data LexError = LexError !FilePath !Int !Int !String
+    deriving (Show)
+
+instance Exception LexError where
+    displayException (LexError file line col msg) =
+        "lex error at " <> file <> ":" <> show line <> ":" <> show col
+        <> "\n  " <> msg
 
 -- | A lexer cursor is just a byte offset + 1-based line/col counters. Layout
 -- tracking lands when we grow past single-line bindings.
@@ -374,6 +389,12 @@ nextToken s c0 =
     -- | Lex the fractional+exponent part of a float literal.
     -- @start@ is the start of the whole literal; @p@ is positioned
     -- just after the integer digits (either at '.' or at 'e'/'E').
+    --
+    -- An exponent indicator (@e@/@E@) MUST be followed by at least one
+    -- digit (after an optional sign); otherwise we'd hand a malformed
+    -- string like @"1e-"@ to 'read' which throws @no parse@. Detect
+    -- the empty-exponent case here and raise a 'LexError' with proper
+    -- source context.
     lexFloat start p0 =
         let p1 = case peekByte s p0 of
                     Just 0x2E -> goDec (p0 + 1)     -- consume '.' then fraction digits
@@ -384,7 +405,12 @@ nextToken s c0 =
                                         Just 0x2B -> p1 + 2   -- '+'
                                         Just 0x2D -> p1 + 2   -- '-'
                                         _         -> p1 + 1
-                           in goDec p3
+                               p4 = goDec p3
+                           in if p4 == p3
+                                then let (line, col) = lineCol s p1
+                                     in throw (LexError (srcName s) line col
+                                            "float exponent must be followed by at least one digit")
+                                else p4
                     _ -> p1
             bs  = stripUnderscores (sliceBytes s (cPos start, p2))
             d   = read (BC.unpack bs) :: Double
@@ -707,7 +733,12 @@ nextToken s c0 =
         "infixl"    -> TkInfixL
         "infixr"    -> TkInfixR
         "infix"     -> TkInfix
-        "forall"    -> TkForall
+        -- 'forall' is a soft keyword: only meaningful in type-signature
+        -- contexts (RankNTypes, ExistentialQuantification). User code
+        -- is allowed to bind it as a value identifier. We emit TkIdent
+        -- and let the type-level scanners explicitly match the *string*
+        -- "forall" when they need the quantifier semantics.
+        "forall"    -> TkIdent "forall"
         "_"         -> TkUnderscore
         _           -> TkIdent bs
 
@@ -936,7 +967,16 @@ readEscape src p = case peekByte src p of
         let (n, p1) = collectDigits base isD val 0 p0 in
         if p1 == p0
             then Nothing
-            else Just (chr n, p1)
+            else if n > 0x10FFFF || n < 0
+                -- Out-of-range char escape (Haskell 2010 §2.6: maxBound::Char
+                -- is U+10FFFF). Bail with a 'LexError' instead of letting
+                -- 'chr' throw 'Prelude.chr: bad argument' deep inside the
+                -- bytestring decoder, which gave the user no source context.
+                then let (line, col) = lineCol src p0
+                     in throw (LexError (srcName src) line col
+                            ("char escape \\" <> show n <>
+                             " out of range (max codepoint is \\1114111)"))
+                else Just (chr n, p1)
 
     collectDigits :: Int -> (Word8 -> Bool) -> (Word8 -> Int) -> Int -> Pos
                    -> (Int, Pos)

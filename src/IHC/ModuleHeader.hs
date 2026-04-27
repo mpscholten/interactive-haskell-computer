@@ -210,15 +210,18 @@ parseExportList src cur0 = go [] cur0
                         (subs, cur2) <- parseExportSubs src curP
                         go (ExportType n (Just subs) : acc) cur2
                     TkDot -> do
-                        -- Qualified export: <ConId>.<bare> or <ConId>.<ConId>
-                        -- The dot is only a qualifier separator if it abuts
-                        -- (no whitespace): peek without skipSig first.
+                        -- Qualified export: <ConId>.<bare> or <ConId>.<ConId>.
+                        -- The dot is a qualifier separator only when it abuts
+                        -- the ConId (no whitespace) — Haskell 2010 §5.2 / §2.4.
+                        -- GHC rejects @module M (B . bar) where@ as a parse
+                        -- error, so we must NOT silently rewrite that form
+                        -- to the qualified export of @bar@.
                         let (dotTok, curAfterDot) = nextToken src cur1
+                            (conTok, _)            = nextSigTok src cur
+                            abuts = tkStart dotTok == tkEnd conTok
                         case tkKind dotTok of
                             TkDot
-                                | tkStart dotTok == tkEnd (fst (nextSigTok src cur))
-                                  || True  ->  -- always treat ConId.ident as qualified
-                                    do
+                                | abuts -> do
                                     let (bareTok, curAfterBare) = nextToken src curAfterDot
                                     case tkKind bareTok of
                                         TkIdent bare -> do

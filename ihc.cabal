@@ -142,6 +142,7 @@ test-suite ihc-test
       , Coverage
       , JitSmoke
       , NorthStarTest
+      , ParserBugs
       , ReplTest
       , RunFile
       , Unsupported

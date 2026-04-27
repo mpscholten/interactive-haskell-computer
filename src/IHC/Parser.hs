@@ -36,7 +36,7 @@ module IHC.Parser
     , scanFixityDecls
     ) where
 
-import Control.Exception (Exception(..), throwIO, try)
+import Control.Exception (Exception(..), catch, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -48,6 +48,15 @@ import IHC.AST
 import IHC.Lexer
 import IHC.Scan (Clause(..))
 import IHC.Source
+
+-- | Run a parser action, converting any pure 'LexError' it forces into a
+-- 'ParseError' so callers see one error type. The lexer raises 'LexError'
+-- via 'throw' (pure) for malformed literals (out-of-range char escape,
+-- empty exponent); without this bridge the user would get a bare
+-- @LexError ...@ instead of a @ParseError@.
+liftLex :: IO a -> IO a
+liftLex action = action `catch` \(LexError file line col msg) ->
+    throwIO (ParseError file line col msg)
 
 -- | A parse error carrying the source location so the error handler can
 -- print @file:line:col@ instead of a raw byte offset.
@@ -147,7 +156,14 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
     grab assoc acc cur = do
         let (precTok, cur1) = skipNewlines cur
         case tkKind precTok of
-            TkInt n -> consumeOps assoc (fromInteger n) acc (advance cur1)
+            TkInt n
+                | n < 0 || n > 9 -> throwIO (ParseError
+                    { peFile = srcName src
+                    , peLine = tkLine precTok
+                    , peCol  = tkCol precTok
+                    , peMsg  = "fixity precedence must be in 0..9, got "
+                               <> show n })
+                | otherwise -> consumeOps assoc (fromInteger n) acc (advance cur1)
             _ -> go acc cur
 
     advance cur = snd (nextToken src cur)
@@ -209,7 +225,7 @@ parseBodyExprWithFixity :: Source -> FixityTable -> [Clause] -> IO Expr
 parseBodyExprWithFixity src _ [] = throwIO (ParseError
     { peFile = srcName src, peLine = 0, peCol = 0
     , peMsg  = "empty clause list" })
-parseBodyExprWithFixity src fx clauses = do
+parseBodyExprWithFixity src fx clauses = liftLex $ do
     parsed <- mapM (parseClause src fx) clauses
     let arity = case parsed of
             ((ps, _) : _) -> length ps
@@ -227,7 +243,7 @@ parseBodyExprWithFixity src fx clauses = do
 -- The entire source is treated as one expression (no binding LHS, no `=`).
 -- Throws 'ParseError' on failure.
 parseExprOnly :: Source -> FixityTable -> IO Expr
-parseExprOnly src fx = do
+parseExprOnly src fx = liftLex $ do
     let end = BC.length (srcBytes src)
         ctx = Ctx src end 0 fx
         cur = startCursor

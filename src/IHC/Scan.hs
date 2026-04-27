@@ -1350,8 +1350,9 @@ scanDataDecls src
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkNewline -> collectCtors tyName cIdx (dReg, fReg) cur'
-            -- `forall tvars .` prefix — skip until '.' then check for constraints
-            TkForall -> do
+            -- `forall tvars .` prefix — skip until '.' then check for constraints.
+            -- 'forall' is a soft keyword (now lexed as TkIdent), so match by name.
+            TkIdent "forall" -> do
                 curAfterDot <- skipForallBinders cur'
                 collectCtors tyName cIdx (dReg, fReg) curAfterDot
             TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
@@ -1842,7 +1843,7 @@ scanFunctorDerivingsRaw src
                 _ | tkCol tok == 1 && tkKind tok /= TkNewline ->
                       pure (reverse acc, c)
                 TkNewline  -> loop acc c'
-                TkForall   -> do
+                TkIdent "forall" -> do
                     cAfterDot <- skipUntilDot c'
                     loop acc cAfterDot
                 TkConId name -> do
@@ -3251,6 +3252,9 @@ data TTok
 tokenToTT :: Token -> Maybe TTok
 tokenToTT t = case tkKind t of
     TkConId n       -> Just (TTCon n)
+    -- 'forall' is now a soft keyword lexed as TkIdent — match by name
+    -- before the generic ident case so it routes to TTForall.
+    TkIdent "forall" -> Just TTForall
     TkIdent n       -> Just (TTVar n)
     TkArrow         -> Just TTArrow
     TkDArrow        -> Just TTDArrow
@@ -3260,7 +3264,6 @@ tokenToTT t = case tkKind t of
     TkRBracket      -> Just TTRBracket
     TkComma         -> Just TTComma
     TkDot           -> Just TTDot
-    TkForall        -> Just TTForall
     TkUnderscore    -> Just TTUnderscore
     TkSymOp n       -> Just (TTSymOp n)
     _               -> Nothing
