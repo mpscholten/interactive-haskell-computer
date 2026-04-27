@@ -2,6 +2,18 @@
 
 A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goal: interpret real Hackage source — eventually the bytestring test suite, then Warp/IHP.
 
+## Agentic engineering
+
+`ihc` is also an experiment in *agentic software engineering*: the bulk of the code is written by AI coding agents, one phase plan at a time. The harnesses driving this project so far are **Claude Code**, **Codex**, and **Hermes** — different agents, same plan-and-fixture workflow, different strengths on different slices. The interpreter's architecture is deliberately shaped to make that workflow productive — and conversely, the things that make `ihc` fast also turn out to be the things that make agents effective on it.
+
+- **Sliceable phases.** Each language feature is a bounded phase with a fixture or test as the acceptance gate — type classes, ADT pattern match, do-notation, `ByteArray#`/`ForeignPtr` primops, STM, the warp listener path, and so on. One agent session, one slice, one merge. The numbered roadmap below is also the agent task queue.
+- **No shims, ever.** Ordinary Hackage source is interpreted, never host-replaced. The only host-backed modules are compiler-built (`GHC.Prim`, `GHC.Types`, `GHC.Magic`) — see [`CLAUDE.md`](CLAUDE.md). Every missing piece surfaces as a concrete agent task — implement the primop, add the extension, fix dispatch — instead of being papered over with a fake. This keeps the interpreter honest and forces the long tail of the language to actually get built.
+- **Demand-driven everything.** Parsing, name resolution, and evaluation walk only the closure of `main`. An agent touching one module doesn't pay for the whole codebase; the compile-error surface stays local to whatever's being changed. The same property is what lets `ihc` skip type-checking unused bindings at runtime.
+- **Plan-driven.** Every non-trivial change starts with a written plan — problem, files, build sequence, verification — so the design intent stays inspectable across sessions and across different agents picking up adjacent slices.
+- **Failure mode is "find the next slice".** When something doesn't run, the answer is rarely "patch the host" — it's "what tiny missing piece does the source need next?" That recasts every bug as a small, testable, agent-shaped task.
+
+The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns out to align cleanly with what agents do well: small steps, narrow blast radius, fixture-driven feedback. The project is as much a study of that alignment as it is a Haskell interpreter.
+
 ## Status (Phase 2.3 — 2026-04-15)
 
 - **102/102 tests pass** (94 fixtures + 8 type-class tests) through a tree-walking lazy evaluator.
@@ -22,7 +34,7 @@ Everything via interpretation — **no JIT path on the runtime today**. The aarc
 
 ## Roadmap
 
-The north-star: **run bytestring's `tests/Main.hs` from source under `ihc`** with the same pass/fail count as `cabal test`. Phase plan in `/Users/marc/.claude/plans/temporal-mixing-raccoon.md`.
+The north-star: **run bytestring's `tests/Main.hs` from source under `ihc`** with the same pass/fail count as `cabal test`. Each phase below is its own written plan (problem, files, build sequence, verification) — the plans live with the agent harness rather than in the repo.
 
 Remaining slices (rough order):
 - 2.3 — type classes (dictionary passing) — ✅ shipped
@@ -90,4 +102,4 @@ names as positional args to fetch additional tarballs.
 | `test/RunFile.hs` | golden-output fixture tests |
 | `test/Fixtures/` | `.hs` programs the suite runs |
 
-See `CLAUDE.md` and `/Users/marc/.claude/plans/` for the full design history (one plan per phase).
+See [`CLAUDE.md`](CLAUDE.md) for project conventions and the no-shims rule that constrains agent work. Per-phase plans (one plan per shipped slice) live with the agent harness rather than in the repo.
