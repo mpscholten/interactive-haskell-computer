@@ -38,6 +38,7 @@ import Control.Exception
     , SomeException, IOException
     , Exception(..)
     )
+import Foreign.C.Error (Errno(..), getErrno, eAGAIN, eWOULDBLOCK, eINTR)
 import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
@@ -2472,6 +2473,19 @@ runIOVal (VCon "IO" [ft]) = do
     case result of
         VCon _ [_stT, resT] -> force resT
         other               -> pure other
+-- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
+-- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
+-- 'VCon "STM" [stateFn]'; if we don't unwrap them here, callers that
+-- expect a plain value (e.g. 'atomically' chains, or any 'do'-bind
+-- inside the warp Counter / time-manager paths) end up working on the
+-- wrapper instead of its result and dispatch breaks downstream.
+runIOVal (VCon "STM" [ft]) = do
+    fv <- force ft
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- apply fv rwT
+    case result of
+        VCon _ [_stT, resT] -> force resT
+        other               -> pure other
 runIOVal v        = pure v
 
 --------------------------------------------------------------------------------
@@ -3752,19 +3766,41 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
     fd <- socketFdFromVal sockV
     allocaBytes 128 $ \addrP ->
       allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        fillBytes addrP 0 128
-        poke (castPtr lenP :: Ptr CInt) 128
-        newFd <- c_accept_host (fromIntegral fd) (castPtr addrP) (castPtr lenP)
-        if newFd == -1
-            then ioError (userError "Network.Socket.accept")
-            else do
-                ref <- newIORef (VInt (fromIntegral newFd))
-                refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-                fdT <- newWHNFThunk (VInt (fromIntegral newFd))
-                sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdT])
-                addrV <- peekSockAddrVal (castPtr addrP)
-                addrT <- newWHNFThunk addrV
-                pure (VCon "(,)" [sockOutT, addrT])
+        let acceptLoop = do
+                fillBytes addrP 0 128
+                poke (castPtr lenP :: Ptr CInt) 128
+                newFd <- c_accept_host (fromIntegral fd)
+                                       (castPtr addrP)
+                                       (castPtr lenP)
+                if newFd /= -1
+                    then pure newFd
+                    else do
+                        -- @Network.Socket@ puts listening sockets in
+                        -- non-blocking mode (see @Syscall.hs@ in
+                        -- @network@), so a real accept must retry on
+                        -- EAGAIN / EWOULDBLOCK via the IO manager and
+                        -- restart on EINTR — otherwise warp's accept
+                        -- loop bails on the first poll-with-no-pending.
+                        Errno e <- getErrno
+                        if Errno e == eAGAIN
+                                || Errno e == eWOULDBLOCK
+                            then do
+                                threadWaitRead (fromIntegral fd)
+                                acceptLoop
+                            else if Errno e == eINTR
+                                then acceptLoop
+                                else ioError
+                                    (userError
+                                       ("Network.Socket.accept: errno="
+                                        <> show e))
+        newFd <- acceptLoop
+        ref <- newIORef (VInt (fromIntegral newFd))
+        refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+        fdT <- newWHNFThunk (VInt (fromIntegral newFd))
+        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdT])
+        addrV <- peekSockAddrVal (castPtr addrP)
+        addrT <- newWHNFThunk addrV
+        pure (VCon "(,)" [sockOutT, addrT])
 
 socketGetNameB :: IO Val
 socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
