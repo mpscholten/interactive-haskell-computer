@@ -5420,11 +5420,25 @@ getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
 
+-- | @registerTimeout :: TimerManager -> Int -> IO () -> IO TimeoutKey@.
+-- Implemented as @forkIO $ threadDelay usec >> callback@ rather than
+-- delegated to the host @GHC.Event@ TimerManager: warp's only use is
+-- registering connection-idle/slowloris timeouts, which only need
+-- "fire roughly N microseconds from now" semantics.  Limitations:
+-- * 'unregisterTimeout' is a no-op (no cancellation),
+-- * timing is via 'threadDelay', not the host monotonic-clock manager.
+-- These are acceptable for the warp request-handling path; revisit if
+-- a fixture starts depending on real cancellation.
 registerTimeoutB :: IO Val
-registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \_cbT -> pure $ VIO $ do
+registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \cbT -> pure $ VIO $ do
     usecV <- force usecT
     case usecV of
-        VInt _ -> do
+        VInt usec -> do
+            cbV <- force cbT
+            _ <- forkIO $ do
+                threadDelay (fromIntegral usec)
+                _ <- runIOVal cbV
+                pure ()
             n <- atomicModifyIORef' uniqueCounterRef $ \x ->
                 let x' = x + 1 in (x', x')
             nT <- newWHNFThunk (VInt n)

@@ -4490,10 +4490,12 @@ resolveFallback mOwner name = do
     tryAnyModuleBareSlot mods bareName = bareSlotIn mods (Map.toList mods) bareName
 
     -- | Scoped variant: walk only modules that the @owner@ actually
-    -- imports unqualified (or has in scope via implicit Prelude).
-    -- Mirrors the resolution order Haskell 2010 §5.5 specifies for
-    -- unqualified names, instead of treating every loaded module as if
-    -- it were imported into the calling scope.
+    -- imports unqualified (or has in scope via implicit Prelude), plus
+    -- the owner module itself (so locally-defined bindings the initial
+    -- discovery walk skipped — e.g. `foo` in `main = print foo` —
+    -- still resolve).  Mirrors the resolution order Haskell 2010 §5.5
+    -- specifies for unqualified names, instead of treating every
+    -- loaded module as if it were imported into the calling scope.
     tryImportScopedBareSlot mods ownerName bareName =
         case Map.lookup ownerName mods of
             Nothing    -> tryAnyModuleBareSlot mods bareName
@@ -4517,11 +4519,14 @@ resolveFallback mOwner name = do
                         | hasNoImplicitPrelude (lmSource owner) = []
                         | otherwise = preludeScope
                     candidateNames = visibleViaImport ++ implicit
-                    candidates =
+                    importCandidates =
                         [ (n, lm)
                         | n  <- candidateNames
                         , Just lm <- [Map.lookup n mods]
                         ]
+                    -- Local bindings shadow imports (H2010 §5.5.1):
+                    -- search the owner module's own source first.
+                    candidates = (ownerName, owner) : importCandidates
                 bareSlotIn mods candidates bareName
 
     preludeScope :: [ModuleName]
