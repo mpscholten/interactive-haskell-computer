@@ -102,4 +102,19 @@ names as positional args to fetch additional tarballs.
 | `test/RunFile.hs` | golden-output fixture tests |
 | `test/Fixtures/` | `.hs` programs the suite runs |
 
+## Contributing
+
+PRs are welcome — especially AI-engineered ones. If you've got an agent harness running (Claude Code, Codex, Hermes, Aider, anything) and spare tokens to burn, **point them at this repo**. The project is built that way and is meant to keep growing that way.
+
+For your agent:
+
+1. **Read [`CLAUDE.md`](CLAUDE.md) first.** It captures project conventions and the load-bearing rule — *no shims for ordinary Hackage libraries*. Interpret real source; implement the missing primop or extension. Push back if your agent reaches for a host shim.
+2. **Pick a slice.** A roadmap entry above, a failing fixture under `test/Fixtures/`, or whatever surfaces when you run `cabal test`. Smaller is better — one feature, one merge.
+3. **Add a fixture or test as the acceptance gate.** Every shipped slice in this repo has one. It's both the spec for the change and the proof it works. PRs without a test are unlikely to land.
+4. **Open the PR.** Note the harness used, keep the diff focused on the slice, and avoid drive-by refactors.
+
+Runtime errors like *"Non-exhaustive patterns in ..."*, *"Unknown primop"*, or *"Class C not in scope"* are usually the next agent-sized task in disguise — pick one and follow the trail.
+
+---
+
 See [`CLAUDE.md`](CLAUDE.md) for project conventions and the no-shims rule that constrains agent work. Per-phase plans (one plan per shipped slice) live with the agent harness rather than in the repo.
