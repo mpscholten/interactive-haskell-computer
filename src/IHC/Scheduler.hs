@@ -3205,7 +3205,7 @@ ffiBuiltinNames = Set.fromList
     , "free"
     , "newUnique", "hashUnique", "fromThreadId"
     , "settingsHost", "settingsPort"
-    , "plusForeignPtr", "plusPtr", "minusPtr", "castPtr"
+    , "plusForeignPtr", "minusForeignPtr", "plusPtr", "minusPtr", "castPtr"
     , "mkWeakIORef"  -- wraps mkWeak#, which has no Haskell implementation
     , "stdout", "stdin", "stderr"  -- RTS pre-built handles
     ]

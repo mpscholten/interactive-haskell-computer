@@ -517,6 +517,9 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
+    , ("minusForeignPtr",            minusForeignPtrB)
+    , ("Data.ByteString.Internal.Type.minusForeignPtr", minusForeignPtrB)
+    , ("GHC.ForeignPtr.minusForeignPtr", minusForeignPtrB)
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -3454,6 +3457,22 @@ plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
             fp <- foreignPtrValToForeignPtr fpv
             mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
         _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
+
+-- | @minusForeignPtr :: ForeignPtr a -> ForeignPtr b -> Int@.  bytestring's
+-- own definition pattern-matches on the @ForeignPtr@ data constructor to
+-- pull out raw addresses, but in IHC @ForeignPtr@ is RTS-backed
+-- ('VPrimObj (PrimForeignPtr _)') with no exposed constructor, so the
+-- pattern match silently fails and the function returns @()@ instead of
+-- the byte difference.  Register a host shim that does the host-side
+-- subtraction directly.
+minusForeignPtrB :: IO Val
+minusForeignPtrB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
+    av <- force aT; bv <- force bT
+    fpA <- foreignPtrValToForeignPtr av
+    fpB <- foreignPtrValToForeignPtr bv
+    let pA = unsafeForeignPtrToPtr fpA
+        pB = unsafeForeignPtrToPtr fpB
+    pure (VInt (fromIntegral (pA `minusPtr` pB)))
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
