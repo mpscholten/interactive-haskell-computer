@@ -141,6 +141,7 @@ test-suite ihc-test
         CabalLoader
       , Coverage
       , JitSmoke
+      , LexerIhp
       , NorthStarTest
       , ReplTest
       , RunFile
