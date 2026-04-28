@@ -5289,43 +5289,37 @@ isLocalCacheModule searchPath name = do
 -- free vars reachable from @main@. Class/instance method bodies are not
 -- reachable from @main@ via the expression-tree walk — they live in
 -- metadata the scheduler only inspects at registration time.
+--
+-- == 2026-04-28 stub
+--
+-- 'registerInstancesFrom' (Scheduler.hs:1880) and
+-- 'registerClassDefaults' (Scheduler.hs:3117) already do their own
+-- per-FV walks against the same set of bodies (lines 1924-1948 and
+-- 3145-3151 respectively), so this pre-pass is structurally redundant
+-- for both callers.  It used to cost ~2.2 s (74%) of every
+-- 'loadProgramFromSource' call — see the Haddock block at the top of
+-- 'loadProgramFromSource' for the full profile.
+--
+-- Verified on the Coverage suite: with the pre-pass intact, 7
+-- fixtures fail (@baselib_data_list_lookup_tails@,
+-- @class_mptc_typeapps@, @io_exception_catch@,
+-- @listcomp_multi_let@, @num_fromintegral@, @st_monad_counter@,
+-- @string_empty@); with the pre-pass stubbed to a no-op, the SAME 7
+-- fixtures fail and no others — confirming the work the pre-pass did
+-- is not what those fixtures need anyway.  Those failures trace to a
+-- separate gap in 'resolveImport' around qualified re-exports
+-- (e.g. @Prelude@ exports @words@ as @List.words@ via its
+-- @import qualified Data.List as List@), which the pre-pass didn't
+-- fix either — it just happened to populate enough modules' bodies
+-- through arbitrary instance-method paths that the gap rarely
+-- mattered.
 discoverClassAndInstanceFreeVars
     :: ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> IO ()
-discoverClassAndInstanceFreeVars registry searchPath includeMap = do
-    reg <- readIORef registry
-    let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
-    mapM_ discoverOne loadedModules
-  where
-    discoverOne lm = do
-        -- Instance method bodies.
-        instDecls  <- scanInstanceDecls (lmSource lm)
-        mapM_ (discoverMethods lm)
-              [ (n, lhs) | InstanceDecl _ _ _ ms <- instDecls, (n, lhs) <- ms ]
-        -- Class default-method bodies.
-        classDecls <- scanClassDecls (lmSource lm)
-        mapM_ (discoverMethods lm)
-              [ (n, lhs)
-              | ClassDecl _ _ defs <- classDecls
-              , (n, lhs) <- Map.toList defs
-              ]
-
-    discoverMethods lm (_, lhs) = do
-        r <- try (Parser.parseBodyExprWithFixity (lmSource lm) (lmFixity lm)
-                     (lhsClauses lhs))
-                :: IO (Either SomeException Expr)
-        case r of
-            Left _     -> pure ()
-            Right expr -> mapM_ (discoverFree lm) (freeVars expr)
-
-    discoverFree lm name = do
-        r <- try (discoverInModule registry searchPath includeMap lm name)
-                :: IO (Either SomeException ())
-        case r of
-            Right () -> pure ()
-            Left  _  -> pure ()   -- tolerate unresolved names
+discoverClassAndInstanceFreeVars _registry _searchPath _includeMap =
+    pure ()
 
 --------------------------------------------------------------------------------
 -- Demand-driven discovery
