@@ -425,6 +425,19 @@ loadProgramFromSource searchPath src0 = do
     -- that won't register.  These modules are cheap to parse and
     -- their instance decls are needed for dispatch-time lookups to
     -- succeed.
+    -- Stage 4 of the lazy-registration plan: keep ONLY the core
+    -- GHC.Internal modules eager — these provide the instance
+    -- registrations that the env-fallback hook depends on for
+    -- Prelude name resolution. Application-specific modules
+    -- (Language.Haskell.TH.Quote, Text.Megaparsec.*) used to be
+    -- on this list as a workaround for the eager
+    -- 'registerInstancesFrom' pass; with Stage 2 cataloguing them
+    -- lazily the workaround is no longer needed for instance
+    -- registration. (TH.Quote's @QuasiQuoter@ data constructor and
+    -- Megaparsec's class+instance still require the module to be
+    -- /loaded/ — that responsibility moves to the user's source
+    -- via @import Language.Haskell.TH.Quote@ etc., which the
+    -- entry-imports force-load on line 412 already handles.)
     let coreInstanceModules =
             [ BC.pack "GHC.Internal.Base"
             , BC.pack "GHC.Internal.Show"
@@ -433,25 +446,6 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Num"
             , BC.pack "GHC.Internal.Real"
             , BC.pack "GHC.Internal.Maybe"
-            -- Language.Haskell.TH.Quote declares 'data QuasiQuoter = QuasiQuoter
-            -- { quoteExp, quotePat, quoteType, quoteDec }'.  QuasiQuoter-providing
-            -- libraries like ihp-hsx record-construct values like
-            -- @hsx = customHsx (HsxSettings…)@ where @customHsx@'s body is
-            -- @QuasiQuoter { quoteExp = … }@.  Without this force-load the
-            -- demand-driven loader doesn't visit TH.Quote so the constructor
-            -- isn't registered, and the record-construction emits 'EVar
-            -- "QuasiQuoter"' which is unbound.
-            , BC.pack "Language.Haskell.TH.Quote"
-            -- Text.Megaparsec.Internal declares 'instance MonadParsec
-            -- e s (ParsecT e s m)' — the only MonadParsec instance
-            -- ihp-hsx and most users actually exercise.  The
-            -- corresponding methods (takeWhileP, satisfy, …) only
-            -- bind through this instance.  Lazy loading visits the
-            -- file (so 'scanDataDecls' fires) AFTER the
-            -- 'registerInstancesFrom' pass has run, so its instances
-            -- never get registered.  Force-load it.
-            , BC.pack "Text.Megaparsec.Internal"
-            , BC.pack "Text.Megaparsec.Class"
             ]
     forM_ coreInstanceModules $ \m -> do
         r <- try (loadModule registry fullSearchPath includeMap m)
