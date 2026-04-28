@@ -42,6 +42,7 @@ library
       , IHC.Eval
       , IHC.FFI
       , IHC.Lexer
+      , IHC.Lower
       , IHC.ModuleHeader
       , IHC.PackageStore
       , IHC.Parser
@@ -140,6 +141,7 @@ test-suite ihc-test
     main-is:          Spec.hs
     other-modules:
         CabalLoader
+      , CoreLowerTest
       , Coverage
       , JitSmoke
       , NorthStarTest
