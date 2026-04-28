@@ -102,7 +102,8 @@ data Pat
     | PWild                             -- _, matches anything, no binding
     | PCon  !Name ![Pat]                -- constructor pattern (Phase 2.1+)
     | PAs   !Name !Pat                  -- xs\@(x:_) as-pattern (Phase 2.6)
-    | PBang !Pat                        -- !x bang-pattern — we ignore strictness (Phase 2.6)
+    | PBang !Pat                        -- !x bang-pattern (Haskell Report §3.17.2 + GHC BangPatterns; A.1)
+    | PIrref !Pat                       -- ~p irrefutable / lazy pattern (Haskell Report §3.17.3; A.2)
     | PTuple ![Pat]                     -- (a, b, ...) tuple pattern (Phase 2.6)
     | PRecord !Name ![(Name, Pat)]      -- Con { f1 = p1, f2 = p2, ... } record pattern (NamedFieldPuns)
     | PRecordWild !Name                 -- Con {..} — RecordWildCards pattern

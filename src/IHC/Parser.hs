@@ -467,6 +467,7 @@ isTrivialPat :: Pat -> Bool
 isTrivialPat (PVar _) = True
 isTrivialPat PWild    = True
 isTrivialPat (PBang p) = isTrivialPat p
+isTrivialPat (PIrref p) = isTrivialPat p
 isTrivialPat _        = False
 
 --------------------------------------------------------------------------------
@@ -634,6 +635,7 @@ parseBindingsIn src fx (start, end) = do
     patVars (PVar n)         = [n]
     patVars (PAs n p)        = n : patVars p
     patVars (PBang p)        = patVars p
+    patVars (PIrref p)       = patVars p
     patVars (PTuple ps)      = concatMap patVars ps
     patVars (PCon _ ps)      = concatMap patVars ps
     patVars (PRecord _ fps)  = concatMap (patVars . snd) fps
@@ -1359,6 +1361,7 @@ parseDo ctx cur0 = do
         patBound (PCon _ ps)     = concatMap patBound ps
         patBound (PAs n p)       = n : patBound p
         patBound (PBang p)       = patBound p
+        patBound (PIrref p)      = patBound p
         patBound (PTuple ps)     = concatMap patBound ps
         patBound (PRecord _ fps) = concatMap (patBound . snd) fps
         patBound (PRecordWild _) = []
@@ -1456,6 +1459,7 @@ parseStmt ctx cur0 = do
     patVars (PVar n)         = [n]
     patVars (PAs n p)        = n : patVars p
     patVars (PBang p)        = patVars p
+    patVars (PIrref p)       = patVars p
     patVars (PTuple ps)      = concatMap patVars ps
     patVars (PCon _ ps)      = concatMap patVars ps
     patVars (PRecord _ fps)  = concatMap (patVars . snd) fps
@@ -1570,6 +1574,7 @@ parseDoLet ctx cur0 = do
     doLetPatVars (PVar n)        = [n]
     doLetPatVars (PAs n p)       = n : doLetPatVars p
     doLetPatVars (PBang p)       = doLetPatVars p
+    doLetPatVars (PIrref p)      = doLetPatVars p
     doLetPatVars (PTuple ps)     = concatMap doLetPatVars ps
     doLetPatVars (PCon _ ps)     = concatMap doLetPatVars ps
     doLetPatVars (PRecord _ fps) = concatMap (doLetPatVars . snd) fps
@@ -1817,6 +1822,10 @@ wrapParams ps body = foldr wrap body ps
     wrap (PVar n)  e = ELam n e
     wrap PWild     e = ELam "_" e
     wrap (PBang p) e = wrap p e
+    -- Irrefutable lambda parameter `\ ~p -> body`: matchPat (PIrref p)
+    -- always succeeds, binding each var of p to a thunk that re-attempts
+    -- the match on force. Keep the case-wrap intact (matchPat handles
+    -- the always-match contract); the PWild fallback is unreachable.
     wrap p         e =
         let n = "$p" in
         ELam n (ECase (EVar n)
@@ -2283,6 +2292,7 @@ parseAltWhereBinds ctx cur0 = do
     patVarsAlt (PVar n)         = [n]
     patVarsAlt (PAs n p)        = n : patVarsAlt p
     patVarsAlt (PBang p)        = patVarsAlt p
+    patVarsAlt (PIrref p)       = patVarsAlt p
     patVarsAlt (PTuple ps)      = concatMap patVarsAlt ps
     patVarsAlt (PCon _ ps)      = concatMap patVarsAlt ps
     patVarsAlt (PRecord _ fps)  = concatMap (patVarsAlt . snd) fps
@@ -2359,11 +2369,13 @@ parseSubPat ctx cur = do
         TkBang -> do
             (p, curN) <- parseSubPat ctx cur1
             pure (PBang p, curN)
-        -- Lazy/irrefutable pattern: ~pat.  Under ihc's already-lazy
-        -- evaluator ~pat has the same runtime semantics as pat (we don't
-        -- enforce strictness without an explicit bang), so strip the
-        -- tilde at parse time and return the inner pattern unchanged.
-        TkSymOp op | op == BC.pack "~" -> parseSubPat ctx cur1
+        -- Lazy/irrefutable pattern: ~pat (Haskell Report §3.17.3).
+        -- The match always succeeds; bound variables become thunks that
+        -- re-attempt the match on force. Eval's matchPat handles PIrref;
+        -- here we just preserve the syntactic distinction.
+        TkSymOp op | op == BC.pack "~" -> do
+            (p, curN) <- parseSubPat ctx cur1
+            pure (PIrref p, curN)
         TkIdent n -> do
             -- Potential as-pattern: ident '@' sub
             -- But '@' followed by TkSymOp is an infix operator (@?=, @=?, etc.),

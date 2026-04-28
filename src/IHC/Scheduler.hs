@@ -3592,6 +3592,7 @@ rewriteExpr rw = go []
     patBound (PCon _ ps)     = concatMap patBound ps
     patBound (PAs n p)       = n : patBound p
     patBound (PBang p)       = patBound p
+    patBound (PIrref p)      = patBound p
     patBound (PTuple ps)     = concatMap patBound ps
     patBound (PRecord _ fps) = concatMap (patBound . snd) fps
     patBound (PRecordWild _) = []
@@ -6077,6 +6078,7 @@ freeVars = goAll []
     patBound (PCon _ ps)         = concatMap patBound ps
     patBound (PAs n p)           = n : patBound p
     patBound (PBang p)           = patBound p
+    patBound (PIrref p)          = patBound p
     patBound (PTuple ps)         = concatMap patBound ps
     patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
     patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
@@ -6126,6 +6128,7 @@ needsRecordFields = goExpr
         PCon _ ps     -> any goPat ps
         PAs _ p       -> goPat p
         PBang p       -> goPat p
+        PIrref p      -> goPat p
         PTuple ps     -> any goPat ps
         PRecord{}     -> True
         PRecordWild{} -> True
@@ -6469,5 +6472,6 @@ desugarRecordPats fldReg = goExpr
     goPat (PCon n ps)      = PCon n (map goPat ps)
     goPat (PAs n p)        = PAs n (goPat p)
     goPat (PBang p)        = PBang (goPat p)
+    goPat (PIrref p)       = PIrref (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit

@@ -952,6 +952,35 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "forced\n"
 
     --------------------------------------------------------------------
+    -- A.2 Irrefutable patterns: §3.17.3 lazy match.  `~p` matches
+    -- every value; bound vars become thunks that re-attempt the match
+    -- on force.  Without lazy semantics, `\ ~(Just x) -> 0` applied to
+    -- Nothing crashes; with PIrref handled in matchPat the application
+    -- returns 0 because x is never forced.
+    --------------------------------------------------------------------
+    it "A.2 lazy lambda: `\\ ~(Just x) -> 0` Nothing returns 0" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/IrrefutablePatterns/lazy_lambda.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n0\n"
+
+    it "A.2 lazy case alt: `case _ of ~(Just x) -> 0` Nothing returns 0" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/IrrefutablePatterns/lazy_case.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n0\n"
+
+    it "A.2 deferred failure: forcing a var bound by ~(Just x) on Nothing raises" do
+        r <- try (runFile "test/Fixtures/IrrefutablePatterns/lazy_force_failure.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected deferred match-failure to raise; runFile returned "
+                 <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy` (\m -> "Irrefutable pattern failed" `isInfixOf` m)
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

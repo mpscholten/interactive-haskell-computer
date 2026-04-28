@@ -713,6 +713,22 @@ pureStateFn v = VFun $ \_stateThunk -> do
     vT <- newWHNFThunk v
     pure (VCon "(#,#)" [stT, vT])
 
+-- | All variables bound by a pattern, left-to-right.  Mirrors the
+-- @patVars@ helpers in 'IHC.Parser' (which are private to that module).
+-- Used by the 'PIrref' matcher to know which thunk slots to allocate.
+patternVars :: Pat -> [Name]
+patternVars (PVar n)         = [n]
+patternVars PWild            = []
+patternVars (PLit _)         = []
+patternVars (PCon _ ps)      = concatMap patternVars ps
+patternVars (PAs n p)        = n : patternVars p
+patternVars (PBang p)        = patternVars p
+patternVars (PIrref p)       = patternVars p
+patternVars (PTuple ps)      = concatMap patternVars ps
+patternVars (PRecord _ fps)  = concatMap (patternVars . snd) fps
+patternVars (PRecordWild _)  = []
+patternVars (PView _ p)      = patternVars p
+
 matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
 matchPat PWild        _          = pure (Just [])
 matchPat (PVar n)     v          = do
@@ -722,6 +738,30 @@ matchPat (PVar n)     v          = do
     t <- newWHNFThunk v
     pure (Just [(n, t)])
 matchPat (PBang p)    v          = matchPat p v
+-- Per Haskell Report §3.17.3: an irrefutable pattern @~p@ ALWAYS
+-- matches.  Each variable bound by @p@ becomes a thunk that, when
+-- forced, re-attempts the inner match against the original value;
+-- only then can the match-fail error fire.  This is the "lazy
+-- pattern" deferral.  Sharing of the inner match is preserved by the
+-- thunk's IORef-backed memoisation.
+matchPat (PIrref p)   v          = do
+    let vars = patternVars p
+    binds <- traverse (\name -> do
+        t <- newLazyBuiltinThunk $ do
+            m <- matchPat p v
+            case m of
+                Just bs -> case lookup name bs of
+                    Just t' -> force t'
+                    Nothing ->
+                        error ("IHC.Eval: irrefutable pattern: variable `"
+                               <> BC.unpack name
+                               <> "` not bound by inner pattern "
+                               <> show p)
+                Nothing ->
+                    error ("Irrefutable pattern failed for pattern "
+                           <> show p)
+        pure (name, t)) vars
+    pure (Just binds)
 matchPat (PAs n p)    v          = do
     m <- matchPat p v
     case m of
