@@ -1020,6 +1020,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             \MyHashable: [\"MyEq\",\"MyShow\"]\n"
 
     --------------------------------------------------------------------
+    -- B.2 Default methods (Report §4.3.2): mutually-recursive class
+    -- defaults `eq = not . neq` / `neq = not . eq` — instance defines
+    -- only one direction, the other dispatches through the default.
+    --------------------------------------------------------------------
+    it "B.2 mutually-recursive class defaults route through dispatcher" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/DefaultMethods/mutual_default.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "False\nTrue\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

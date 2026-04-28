@@ -2683,7 +2683,7 @@ scanClassDeclsRaw src
     -- After `class`, parse head to find the class name, then walk the
     -- `where` body collecting method sigs + default-method bindings.
     scanOneClass cur0 = do
-        (mClassName, supers, curWhere) <- parseClassHead cur0
+        ((mClassName, supers), curWhere) <- parseClassHead cur0
         case mClassName of
             Just cls -> do
                 (methodNames, defaults) <- parseClassBody curWhere
@@ -2709,49 +2709,75 @@ scanClassDeclsRaw src
     -- than relying on the default fallthrough.
     parseClassHead cur0 = scanHead cur0 Nothing [] (0 :: Int) False
       where
-        scanHead cur mCls superRev !depth seenArrow = do
+        -- @mCls@: candidate class name (set after we see TkConId).
+        -- @preRev@: ConIds seen BEFORE @=>@, in reverse source order.
+        --   When @=>@ fires, these become the superclass list and
+        --   @mCls@ is reset to look for the real class name.
+        --   When @=>@ never fires, @preRev@ holds the (single) class
+        --   name and the superclass list is empty.
+        scanHead cur mCls preRev !depth seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (mCls, reverse superRev, cur)
-                TkWhere | depth == 0 -> pure (mCls, reverse superRev, cur')
-                TkNewline -> scanHead cur' mCls superRev depth seenArrow
-                -- `=>` at depth 0 ends the context; commit any
-                -- accumulated ConIds as superclasses, reset the class
-                -- candidate, and look for the real class name.
-                TkDArrow | depth == 0 -> scanHead cur' Nothing superRev depth True
+                TkEof    -> pure (finalize mCls preRev seenArrow, cur)
+                TkWhere | depth == 0 ->
+                    pure (finalize mCls preRev seenArrow, cur')
+                TkNewline -> scanHead cur' mCls preRev depth seenArrow
+                -- `=>` at depth 0 ends the context: pre-arrow ConIds
+                -- become superclasses, reset class candidate, look
+                -- for the real class name on the right of `=>`.
+                TkDArrow | depth == 0 -> scanHead cur' Nothing preRev depth True
                 -- FunctionalDependencies clause: `| a -> b` — skip.
-                TkBar | depth == 0 -> skipFundep cur' mCls superRev
+                TkBar | depth == 0 -> skipFundep cur' mCls preRev seenArrow
                 TkConId n
                     | seenArrow ->
                         case mCls of
-                            Nothing -> scanHead cur' (Just n) superRev depth seenArrow
-                            Just _  -> scanHead cur' mCls superRev depth seenArrow
+                            Nothing -> scanHead cur' (Just n) preRev depth seenArrow
+                            Just _  -> scanHead cur' mCls preRev depth seenArrow
                     | otherwise ->
-                        -- Pre-`=>` ConIds belong to the superclass
-                        -- context.  Accumulate in reverse for cheap
-                        -- prepend; reverse on emit.
-                        scanHead cur' mCls (n : superRev) depth seenArrow
-                TkLParen   -> scanHead cur' mCls superRev (depth + 1) seenArrow
-                TkRParen   -> scanHead cur' mCls superRev (max 0 (depth - 1)) seenArrow
-                TkLBracket -> scanHead cur' mCls superRev (depth + 1) seenArrow
-                TkRBracket -> scanHead cur' mCls superRev (max 0 (depth - 1)) seenArrow
-                _ -> scanHead cur' mCls superRev depth seenArrow
+                        -- Could be the class name (if no @=>@ ever
+                        -- comes) or a superclass (if it does).  Stash
+                        -- in preRev; finalize/finalize-on-`=>` decides
+                        -- which.  Set @mCls@ so it's still available
+                        -- if we exit without `=>`.
+                        scanHead cur' (Just n) (n : preRev) depth seenArrow
+                TkLParen   -> scanHead cur' mCls preRev (depth + 1) seenArrow
+                TkRParen   -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
+                TkLBracket -> scanHead cur' mCls preRev (depth + 1) seenArrow
+                TkRBracket -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
+                _ -> scanHead cur' mCls preRev depth seenArrow
+
+        -- Decide what's the class name and what's the superclass list
+        -- given @mCls@, the pre-`=>` ConId list (reversed), and
+        -- whether we ever saw `=>`.
+        --
+        -- * Saw `=>`: @mCls@ is the class name (captured after the
+        --   reset); @preRev@ in source order is the superclass list.
+        -- * No `=>`: the first ConId in source order is the class
+        --   name; superclass list is empty.
+        finalize :: Maybe ByteString -> [ByteString] -> Bool
+                 -> (Maybe ByteString, [ByteString])
+        finalize mCls preRev seenArrow
+            | seenArrow = (mCls, reverse preRev)
+            | otherwise =
+                case reverse preRev of
+                    []      -> (Nothing, [])
+                    (c : _) -> (Just c, [])
 
         -- After `|` in the class head, consume the fundep list without
         -- interpreting it. Stop at `where`/EOF; keep any class-name
-        -- candidate and the superclass list already captured.
-        skipFundep cur mCls superRev = do
+        -- candidate and the pre-arrow ConId list already captured.
+        skipFundep cur mCls preRev seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof   -> pure (mCls, reverse superRev, cur)
-                TkWhere -> pure (mCls, reverse superRev, cur')
+                TkEof   -> pure (finalize mCls preRev seenArrow, cur)
+                TkWhere -> pure (finalize mCls preRev seenArrow, cur')
                 TkLParen -> do
                     curAfter <- skipParensC 1 cur'
-                    skipFundep curAfter mCls superRev
+                    skipFundep curAfter mCls preRev seenArrow
                 TkLBracket -> do
                     curAfter <- skipBracketsC 1 cur'
-                    skipFundep curAfter mCls superRev
-                _ -> skipFundep cur' mCls superRev
+                    skipFundep curAfter mCls preRev seenArrow
+                _ -> skipFundep cur' mCls preRev seenArrow
 
     skipParensC :: Int -> Cursor -> IO Cursor
     skipParensC !d cur
