@@ -992,6 +992,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "12345678901234567890123456789\n100000000000000000000\n"
 
     --------------------------------------------------------------------
+    -- A.5 Strict data-constructor fields (Report §4.2.1).  `data T =
+    -- MkT !Int Int` forces the strict field on construction.  Detection
+    -- via an IORef bumped from inside the strict-field thunk — with
+    -- the bang honored, the marker is exactly 1; without, it's 0.
+    --------------------------------------------------------------------
+    it "A.5 strict field forces on construction" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/StrictFields/strict_field_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

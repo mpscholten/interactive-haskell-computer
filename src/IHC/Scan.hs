@@ -34,6 +34,9 @@ module IHC.Scan
     , FieldRegistry
     , TypeCtorRegistry
     , scanDataDecls
+      -- * Per-constructor strict-field bitmap (A.5)
+    , lookupCtorStrictness
+    , clearCtorStrictness
       -- * Deriving synthesis
     , FunctorFieldRole(..)
     , FunctorCtor(..)
@@ -64,6 +67,7 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Dynamic (fromDynamic, toDyn)
 import Data.Typeable (Typeable)
 import Control.Monad (when)
@@ -1131,6 +1135,27 @@ type TypeCtorRegistry = Map ByteString [ByteString]
 --   Ctor :: ctx => T1 -> T2 -> TyCon
 -- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
+-- | A.5 — global per-constructor strictness bitmap.  Populated as a
+-- side effect by 'scanDataDecls' when it sees @data T = MkT !A B !C@
+-- style declarations; consumed by 'IHC.Builtins.buildConEnv' so the
+-- ctor-application closure forces strict-field thunks before producing
+-- the 'VCon'.  Only constructors with at least one strict field have
+-- an entry; anything else is implicitly all-lazy.
+{-# NOINLINE ctorStrictnessRef #-}
+ctorStrictnessRef :: IORef (Map ByteString [Bool])
+ctorStrictnessRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Look up a constructor's strict-field bitmap.  Empty list means "no
+-- strictness recorded" (treat all fields as lazy).
+lookupCtorStrictness :: ByteString -> IO [Bool]
+lookupCtorStrictness name =
+    Map.findWithDefault [] name <$> readIORef ctorStrictnessRef
+
+-- | Reset the global strictness map.  Useful for tests that want to
+-- avoid leaking constructor metadata across runs.
+clearCtorStrictness :: IO ()
+clearCtorStrictness = writeIORef ctorStrictnessRef Map.empty
+
 scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
 scanDataDecls src
     | not (hasAnyKeyword src [BC.pack "data", BC.pack "newtype"])
@@ -1367,12 +1392,20 @@ scanDataDecls src
                             TkNewline -> skipNls c1
                             _         -> (t, c1)
                     (peek, curAfterPeek) = skipNls cur'
-                (arity, fields, curN) <- case tkKind peek of
-                    TkLBrace ->
-                        collectRecordFields 0 [] curAfterPeek
+                (arity, strict, fields, curN) <- case tkKind peek of
+                    TkLBrace -> do
+                        (a, fs, c) <- collectRecordFields 0 [] curAfterPeek
+                        pure (a, replicate a False, fs, c)
                     _ -> do
-                        (n, curN') <- countCtorFields 0 cur'
-                        pure (n, [], curN')
+                        (n, s, curN') <- countCtorFields 0 cur'
+                        pure (n, s, [], curN')
+                -- A.5: record per-constructor strictness in the global
+                -- IORef as a side effect so we don't have to thread a
+                -- new map through every helper.  Only stash entries
+                -- whose strictness list contains at least one True; all
+                -- other ctors implicitly have all-lazy fields.
+                when (any id strict) $
+                    modifyIORef' ctorStrictnessRef (Map.insert name strict)
                 let dReg' = Map.insert name (tyName, arity, cIdx) dReg
                     fReg' = foldr
                         (\(fieldName, idx) acc ->
@@ -1408,12 +1441,18 @@ scanDataDecls src
                                             TkNewline -> skipNls c1
                                             _         -> (t, c1)
                                     (peek, curAfterPeek) = skipNls cur'
-                                (arity, fields, curN) <- case tkKind peek of
-                                    TkLBrace ->
-                                        collectRecordFields 0 [] curAfterPeek
+                                (arity, strict, fields, curN) <- case tkKind peek of
+                                    TkLBrace -> do
+                                        (a, fs, c) <- collectRecordFields 0 [] curAfterPeek
+                                        pure (a, replicate a False, fs, c)
                                     _ -> do
-                                        (n, curN') <- countCtorFields 0 cur'
-                                        pure (n, [], curN')
+                                        (n, s, curN') <- countCtorFields 0 cur'
+                                        pure (n, s, [], curN')
+                                -- A.5: record per-constructor strictness, same
+                                -- as in the TkPrimId branch above.
+                                when (any id strict) $
+                                    modifyIORef' ctorStrictnessRef
+                                        (Map.insert name strict)
                                 let dReg' = Map.insert name (tyName, arity, cIdx) dReg
                                     fReg' = foldr
                                         (\(fieldName, idx) acc ->
@@ -1525,43 +1564,46 @@ scanDataDecls src
             _          -> skipType depth cur'
 
     -- Count positional atoms up to '|', '{', column-1 token, or EOF.
-    countCtorFields !n cur = do
+    -- A.5: also track per-field strictness.  We thread the bit list in
+    -- reverse-source order through @revStrict@ and a @pendingBang@ flag
+    -- that's set by 'TkBang' and consumed by the next field-introducing
+    -- token, then pop into the bit list when the field is committed.
+    countCtorFields !n cur =
+        countCtorFieldsS n [] False cur
+
+    countCtorFieldsS !n !revStrict !pendingBang cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkBar            -> pure (n, cur)             -- don't consume
-            TkEof            -> pure (n, cur)
-            TkLBrace         -> pure (n, cur)             -- record block; stop
+            TkBar            -> pure (n, reverse revStrict, cur)  -- don't consume
+            TkEof            -> pure (n, reverse revStrict, cur)
+            TkLBrace         -> pure (n, reverse revStrict, cur)  -- record block; stop
             TkNewline        ->
-                -- If the next significant token is at col 1, decl ends;
-                -- otherwise it's whitespace between fields.
                 let (peek, _) = nextToken src cur' in
                 case tkKind peek of
-                    TkEof -> pure (n, cur')
-                    _ | tkCol peek == 1 -> pure (n, cur')
-                      | otherwise       -> countCtorFields n cur'
+                    TkEof -> pure (n, reverse revStrict, cur')
+                    _ | tkCol peek == 1 -> pure (n, reverse revStrict, cur')
+                      | otherwise       ->
+                          countCtorFieldsS n revStrict pendingBang cur'
             TkLParen -> do
                 curAfter <- skipToMatchingRParen 1 cur'
-                countCtorFields (n + 1) curAfter
-            -- '[' opens a list type like @[Rose]@ — count as one field
-            -- and skip to the matching ']'. Without this the scanner
-            -- treats '[' as a decl terminator and under-counts arity.
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkLBracket -> do
                 curAfter <- skipToMatchingRBracket 1 cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkConId _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkIdent _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkPrimId _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
-            -- TkBang is a strictness annotation on the *next* field, not a
-            -- field itself and not a terminator. Skip it and continue.
-            TkBang    -> countCtorFields n cur'
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
+            -- TkBang is a strictness annotation on the *next* field; mark
+            -- pendingBang so the next field-introducing token records it.
+            TkBang    -> countCtorFieldsS n revStrict True cur'
             -- Unrecognized token stops the field scan gracefully.
-            _ -> pure (n, cur)
+            _ -> pure (n, reverse revStrict, cur)
 
     -- Treat a qualified type name like `A.Array` as part of the same field.
     -- Without this, strict unpacked declarations such as

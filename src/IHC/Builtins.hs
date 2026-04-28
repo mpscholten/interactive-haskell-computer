@@ -86,13 +86,14 @@ import System.IO
 import qualified System.Posix.IO as PosixIO
 import System.Posix.Types (Fd)
 
+import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
 import IHC.Eval (apply, force, forceMethodVal)
-import IHC.Scan (DataRegistry, FieldRegistry)
+import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
 
@@ -5170,10 +5171,32 @@ buildConEnv reg = do
         t <- newLazyBuiltinThunk (pure (buildLam name arity []))
         pure (name, t)
 
+    -- A.5: per Haskell Report §4.2.1, a strict field annotation
+    -- (`MkT !Int Int`) forces the corresponding argument thunk to
+    -- WHNF at construction time.  We look up the constructor's
+    -- strictness bitmap (populated by 'IHC.Scan.scanDataDecls') and,
+    -- when at least one field is strict, force those thunks before
+    -- returning the 'VCon'.  All-lazy ctors keep the original cheap
+    -- path with no extra IO.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
-        pure (buildLam name (left - 1) (t : acc))
+        if left == 1
+            then do
+                let thunks = reverse (t : acc)
+                strict <- lookupCtorStrictness name
+                forceStrictFields strict thunks
+                pure (VCon name thunks)
+            else pure (buildLam name (left - 1) (t : acc))
+
+    -- | Walk the strict-field bitmap and force each marked thunk in
+    -- place, ignoring extra/missing entries gracefully.
+    forceStrictFields :: [Bool] -> [Thunk] -> IO ()
+    forceStrictFields []         _      = pure ()
+    forceStrictFields _          []     = pure ()
+    forceStrictFields (s : ss) (t : ts) = do
+        when s (() <$ force t)
+        forceStrictFields ss ts
 
 -- | Build an environment binding each record-field name to an accessor
 -- function.  For a field @f@ that lives at index @i@ in constructor @Con@,
