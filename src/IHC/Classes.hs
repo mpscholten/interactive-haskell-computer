@@ -285,6 +285,7 @@ normalizeTyTag bs0 = stripQuotes (trimSpace (stripParens bs0))
 -- Used by dispatch builtins to find the right class instance.
 typeTagOf :: Val -> ByteString
 typeTagOf (VInt _)    = BC.pack "Int"
+typeTagOf (VInteger _) = BC.pack "Integer"
 typeTagOf (VFloat _)  = BC.pack "Double"
 typeTagOf (VChar _)   = BC.pack "Char"
 typeTagOf (VStr _)    = BC.pack "String"   -- transitional VStr

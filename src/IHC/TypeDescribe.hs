@@ -31,6 +31,7 @@ describeType = go
   where
     go :: Val -> IO ByteString
     go (VInt   _)   = pure "Int"
+    go (VInteger _) = pure "Integer"
     go (VFloat _)   = pure "Double"
     go (VChar  _)   = pure "Char"
     go (VStr   _)   = pure "[Char]"

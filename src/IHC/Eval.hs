@@ -150,6 +150,7 @@ eval :: Env -> ImplicitParamMap -> Expr -> IO Val
 eval env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
+    go (ELit (LInteger n)) = pure (VInteger n)
     go (ELit (LFloat d)) = pure (VFloat d)
     -- Source-level Haskell strings are [Char]. Keeping literals as real cons
     -- lists lets source-loaded libraries like bytestring pattern-match and
@@ -781,6 +782,16 @@ matchPat (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LInt _)) _       = pure Nothing
+-- A.3: arbitrary-precision Integer literal pattern.  Equality against
+-- VInteger uses the underlying Integer; against VInt we widen to
+-- compare. No match against any other shape.
+matchPat (PLit (LInteger n)) (VInteger m)
+    | n == m    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LInteger n)) (VInt m)
+    | n == toInteger m = pure (Just [])
+    | otherwise        = pure Nothing
+matchPat (PLit (LInteger _)) _   = pure Nothing
 matchPat (PLit (LFloat x)) (VFloat y)
     | x == y    = pure (Just [])
     | otherwise = pure Nothing

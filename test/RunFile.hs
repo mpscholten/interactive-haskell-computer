@@ -981,6 +981,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 msg `shouldSatisfy` (\m -> "Irrefutable pattern failed" `isInfixOf` m)
 
     --------------------------------------------------------------------
+    -- A.3 Numeric literals: parse out-of-Int64-range integers as
+    -- 'LInteger Integer' and evaluate to 'VInteger' instead of silently
+    -- truncating via host 'fromInteger'.
+    --------------------------------------------------------------------
+    it "A.3 big-Integer literal: source decimal preserved through print" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/NumLiterals/big_integer_literal.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "12345678901234567890123456789\n100000000000000000000\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

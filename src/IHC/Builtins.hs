@@ -1795,6 +1795,7 @@ showDouble d
 showVal :: Val -> IO String
 showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
+showVal (VInteger n) = pure (show n)
 showVal (VFloat d)  = pure (showDouble d)
 showVal (VChar c)   = pure (show c)
 showVal VUnit       = pure "()"

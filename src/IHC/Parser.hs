@@ -41,6 +41,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isSpace)
+import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 
@@ -3074,7 +3075,15 @@ parseAtom :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseAtom ctx cur0 = do
     let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
-        TkInt n    -> pure (ELit (LInt (fromInteger n)), cur1)
+        -- A.3: keep arbitrary-precision Integer literals out of Int64
+        -- truncation. In-range numbers stay as 'LInt' (Int64) so the
+        -- existing arithmetic primops fire normally; out-of-range
+        -- literals produce 'LInteger' which evaluates to 'VInteger'.
+        TkInt n
+            | n >= toInteger (minBound :: Int64) &&
+              n <= toInteger (maxBound :: Int64)
+                  -> pure (ELit (LInt (fromInteger n)), cur1)
+            | otherwise -> pure (ELit (LInteger n), cur1)
         TkFloat d  -> pure (ELit (LFloat d), cur1)
         TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)

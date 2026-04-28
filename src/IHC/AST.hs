@@ -112,6 +112,9 @@ data Pat
 
 data Lit
     = LInt    !Int64
+    | LInteger !Integer  -- arbitrary-precision integer (A.3); used when the
+                         -- source literal exceeds 'Int64' range so we don't
+                         -- silently truncate via 'fromInteger' in the parser.
     | LFloat  !Double
     | LStr    !ByteString
     | LChar   !Char
