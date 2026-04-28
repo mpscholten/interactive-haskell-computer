@@ -106,3 +106,10 @@ generalize ctxVars preds body =
     in Scheme quantified preds body
   where
     predFreeVars (Pred _ t) = freeTyVars t
+    -- B.5b: a quantified-constraint binder shadows its bound vars
+    -- inside its own body / context.  No producer of QPred exists
+    -- yet; this arm exists to keep -Wincomplete-patterns clean.
+    predFreeVars (QPred qvs ctx p) =
+        Set.difference
+            (Set.unions (predFreeVars p : map predFreeVars ctx))
+            (Set.fromList qvs)

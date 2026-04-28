@@ -42,7 +42,17 @@ data Type
 -- Multi-parameter constraints (e.g. @MonadState s m@) use 'TyApp' to
 -- group the arguments: @Pred "MonadState" (TyApp (TyVar "s") (TyVar "m"))@
 -- — callers flatten via 'predArgs' when matching instances.
-data Pred = Pred !Name !Type
+data Pred
+    = Pred !Name !Type
+    -- | B.5b — quantified constraint, e.g. @forall a. Eq a => Eq (f a)@.
+    -- @QPred vars body context@ binds 'vars' over a 'body' predicate
+    -- that depends on 'context' predicates.  Today only the parser /
+    -- scanner is aware of quantified constraints (B.5a tolerance);
+    -- the solver that discharges 'QPred' by skolemising 'vars',
+    -- attempting to discharge 'context' under the bound assumptions,
+    -- and re-generalising lives in B.5b alongside the elaborator-
+    -- integrated lowering.  No producer of 'QPred' exists yet.
+    | QPred ![Name] ![Pred] !Pred
     deriving (Eq, Show)
 
 -- | Quantified type.  Used for top-level bindings and class method
@@ -81,6 +91,10 @@ applySubstVisited visited s t = case t of
 
 applySubstPred :: Subst -> Pred -> Pred
 applySubstPred s (Pred cls t) = Pred cls (applySubst s t)
+applySubstPred s (QPred vs ctx body) =
+    -- Bound type vars shadow the substitution under the QPred.
+    let s' = foldr Map.delete s vs
+    in QPred vs (map (applySubstPred s') ctx) (applySubstPred s' body)
 
 applySubstScheme :: Subst -> Scheme -> Scheme
 applySubstScheme s (Scheme vs preds body) =
@@ -106,14 +120,22 @@ freeTyVars t = case t of
             (Set.fromList vs)
   where
     freeTyVarsPred (Pred _ x) = freeTyVars x
+    freeTyVarsPred (QPred vs ctx body) =
+        Set.difference
+            (Set.unions (freeTyVarsPred body : map freeTyVarsPred ctx))
+            (Set.fromList vs)
 
 freeTyVarsScheme :: Scheme -> Set Name
 freeTyVarsScheme (Scheme vs preds body) =
     Set.difference
-        (Set.unions (freeTyVars body : map (freeTyVars . predArg) preds))
+        (Set.unions (freeTyVars body : map predFreeTyVars preds))
         (Set.fromList vs)
   where
-    predArg (Pred _ x) = x
+    predFreeTyVars (Pred _ x) = freeTyVars x
+    predFreeTyVars (QPred qvs ctx p) =
+        Set.difference
+            (Set.unions (predFreeTyVars p : map predFreeTyVars ctx))
+            (Set.fromList qvs)
 
 -- | Leftmost head constructor of a type application chain.  Returns
 -- 'Nothing' if the head is a type variable or an arrow.
