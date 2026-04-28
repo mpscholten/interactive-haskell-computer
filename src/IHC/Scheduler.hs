@@ -74,7 +74,8 @@ import IHC.CabalProject
     )
 import IHC.Diagnostics (warnStub)
 import IHC.Classes
-    ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
+    ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
+    , lookupInstance
     , lookupInstanceMethod, typeTagOf
     , scanHookRef, sharedClassRegRef, setSharedClassReg
     , unionInstanceScope, currentInstanceScope, clearInstanceScope
@@ -2035,6 +2036,17 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- like @FoldCase B.ByteString@ intentionally keep their qualified key so
     -- strict and lazy modules with the same abstract type name do not collide.
     registerInstance classReg cls typ methodVals
+    -- Multi-parameter classes (e.g. @IsLabel "email" Wrap@,
+    -- @SetField "name" User String@) need an additional registration
+    -- under the full @[tag1, tag2, …]@ key so that callers like
+    -- 'lookupUserIsLabel' which scan the whole IsLabel registry can
+    -- distinguish a Symbol-keyed @IsLabel "email" Wrap@ from
+    -- @IsLabel "name" Wrap@. Without this, the single-tag registration
+    -- above only stores @(IsLabel, ["Wrap"])@ for both, dropping the
+    -- Symbol entirely. Single-param classes (length 1) already covered
+    -- by the line above.
+    when (length typeNames > 1) $
+        registerInstanceMulti classReg cls typeNames methodVals
     -- Also register under every runtime data constructor of that type so
     -- that 'typeTagOf (VCon n _) = n' lookups succeed.  For qualified type
     -- heads, resolve the qualifier through the owning module's imports and
