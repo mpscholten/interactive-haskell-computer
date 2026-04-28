@@ -1046,6 +1046,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "1\n"
 
     --------------------------------------------------------------------
+    -- A.4 Numeric defaulting (Report §4.3.4) — DEFERRED.
+    -- ihc monomorphises every integer literal at parse time (A.3
+    -- minimum scope), so there's no ambiguous Num constraint for
+    -- the defaulting rule to act on.  The full rule depends on the
+    -- elaborator-driven 'fromInteger'-insertion path that A.3
+    -- deferred.  This fixture is a tolerance guard: a top-level
+    -- 'default (Int, Double)' declaration must not break parsing.
+    --------------------------------------------------------------------
+    it "A.4 top-level `default (...)` is tolerated" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Defaulting/default_decl_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
