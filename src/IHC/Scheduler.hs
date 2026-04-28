@@ -231,6 +231,42 @@ loadProgram = loadProgramFromSource []
 -- @~\/.cache\/ihc\/sources\/@ (including @mtl@, @transformers@,
 -- @splitmix@, @random@, etc.) are available without the caller having
 -- to enumerate them.
+--
+-- == Where the time goes (2026-04-28 profile, @main = 42@, ~3.0 s/call)
+--
+-- @
+-- discoverClassAndInstanceFreeVars   2.22 s   (74%)   ← the dominant cost
+-- registerInstancesFrom              0.45 s   (15%)
+-- registerClassDefaults              0.30 s   (10%)
+-- exportBodies                       0.14 s    (5%)
+-- buildAliases                       0.05 s
+-- everything else                   ~0.04 s
+-- @
+--
+-- Even for a trivial program, the scheduler eagerly loads Prelude +
+-- 10 \"core instance\" modules, transitively pulling in ~155
+-- modules, and 'discoverClassAndInstanceFreeVars' then parses every
+-- class default-method and instance-method body across all of them
+-- (~1500 method bodies) so 'registerInstancesFrom' / class dispatch
+-- can find each body's free-var deps in the per-run registry.
+--
+-- The eager work conflicts with the project's demand-driven north
+-- star — fixing it requires lazy instance registration (defer
+-- parsing\/registering an instance until something dispatches into
+-- it).  Two simpler attempts were tried and reverted:
+--
+--   1. Per-module memo of \"discovery done\" keyed by module name —
+--      gave ~7× speedup on call 2+ but broke 7 fixtures because the
+--      memo skipped work tied to the current run\'s 'lmBodies' state.
+--   2. Dropping 'hydrateTransitiveImports' on cached-module hits —
+--      slowed call 2 by 50× (2.2 s in 'buildAliases' due to
+--      'namesFromModule' walking inherited fully-populated
+--      'lmBodies').
+--
+-- Cheap incremental win still on the table: drop
+-- @Text.Megaparsec.Internal@ \/ @Text.Megaparsec.Class@ from
+-- 'coreInstanceModules' (used by exactly one HSX fixture but force-
+-- loaded for every other program).
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Reset the cross-run global module catalogue and the env-fallback
