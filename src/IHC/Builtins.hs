@@ -14,6 +14,8 @@ module IHC.Builtins
     , buildFieldEnv
     , showValWith
     , stringToListValIO
+    , clearCtorIndex
+    , clearForeignPtrWord8Ranges
     ) where
 
 import Control.Concurrent
@@ -1565,6 +1567,21 @@ populateCtorIndex reg =
 -- recorded there — structural ordering handles them explicitly.
 lookupCtorIndex :: ByteString -> IO (Maybe (ByteString, Int))
 lookupCtorIndex name = Map.lookup name <$> readIORef ctorIndexRegistry
+
+-- | Reset the global ctor-index registry.  Called by the scheduler so a
+-- second 'loadProgramFromSource' call doesn't see stale entries from a
+-- prior run that no longer correspond to any loaded module's data
+-- decls.
+clearCtorIndex :: IO ()
+clearCtorIndex = writeIORef ctorIndexRegistry Map.empty
+
+-- | Reset the foreign-ptr-Word8 address-range list.  Without this, a
+-- second 'loadProgramFromSource' run accumulates ranges from the first
+-- run's already-collected 'ForeignPtr' allocations — addresses the GC
+-- may have reused for other purposes by the time of the next
+-- 'isMarkedWord8Ptr' check.
+clearForeignPtrWord8Ranges :: IO ()
+clearForeignPtrWord8Ranges = writeIORef foreignPtrWord8RangesRef []
 
 -- | Structural Ord fallback for VCon values.
 --

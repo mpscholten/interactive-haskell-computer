@@ -64,7 +64,10 @@ import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
-import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO)
+import IHC.Builtins
+    ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
+    , clearCtorIndex, clearForeignPtrWord8Ranges
+    )
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
@@ -74,7 +77,8 @@ import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
     , lookupInstanceMethod, typeTagOf
     , scanHookRef, sharedClassRegRef, setSharedClassReg
-    , unionInstanceScope, currentInstanceScope
+    , unionInstanceScope, currentInstanceScope, clearInstanceScope
+    , clearSuperclasses
     , setEnvFallback
     , setCoreInstanceLoadHook
     , setClassMethodFallback
@@ -90,7 +94,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
@@ -234,6 +238,15 @@ loadProgram = loadProgramFromSource []
 -- to enumerate them.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
+    -- Drop accumulated state from any prior 'loadProgramFromSource'
+    -- run.  Without this, refs like 'envFallbackCache' hand out Thunks
+    -- captured against the previous run's frozen 'envBaseForFallbackRef'
+    -- env — those Thunks reference per-run module slots that no longer
+    -- correspond to the new run's discovered bindings, and forcing them
+    -- can spin in self-referential fallback loops as mismatched
+    -- closures keep redirecting through the cache.  See the in-process
+    -- 'runFile'-twice hang for the symptoms.
+    resetPerRunGlobals
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
@@ -4131,6 +4144,34 @@ loadModule registry searchPath includeMap name = do
 {-# NOINLINE globalLoadedModulesRef #-}
 globalLoadedModulesRef :: IORef (Map ModuleName LoadedModule)
 globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Drop every per-run global the scheduler accumulates so a second
+-- 'loadProgramFromSource' call starts from a clean slate.  Caches that
+-- are content-addressable or expensive to rebuild ('mkFreshScanCache',
+-- the cabal package memos) are intentionally retained.
+--
+-- The bug this guards against: 'envFallbackCache' returns 'Thunk'
+-- values whose internal 'Closure' captured the previous run's
+-- 'envBaseForFallbackRef' env.  Those frozen envs reference per-run
+-- module slots that the new run no longer owns; forcing such a Thunk
+-- spins in 'compareBytes' as mismatched closures redirect through the
+-- cache repeatedly.  Same idea for the type-sig / type-synonym /
+-- instance-scope registries, all of which feed elaborator decisions.
+resetPerRunGlobals :: IO ()
+resetPerRunGlobals = do
+    writeIORef globalLoadedModulesRef Map.empty
+    writeIORef envFallbackCache       Map.empty
+    writeIORef envBaseForFallbackRef  Map.empty
+    writeIORef globalTypeSigsRef      Map.empty
+    writeIORef globalTypeSynonymsRef  Map.empty
+    writeIORef globalClassMethodNamesRef Set.empty
+    clearInstanceScope
+    clearSuperclasses
+    clearCtorStrictness
+    clearCtorIndex
+    clearForeignPtrWord8Ranges
+    resetNewNameCounter
+    TR.setGlobalRegistry Map.empty
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do

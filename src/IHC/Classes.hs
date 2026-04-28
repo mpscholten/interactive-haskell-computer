@@ -37,6 +37,7 @@ module IHC.Classes
     , setSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
+    , clearInstanceScope
       -- * Demand-driven env fallback
     , EnvFallbackHook
     , envFallbackRef
@@ -348,6 +349,13 @@ unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
 
 currentInstanceScope :: IO (Set ByteString)
 currentInstanceScope = readIORef instanceScopeRef
+
+-- | Reset the instance-scope set.  Called by the scheduler at the start
+-- of every @loadProgramFromSource@ run so stale module names from a
+-- prior load don't make a re-load see the wrong subset of modules as
+-- "in scope" for instance dispatch.
+clearInstanceScope :: IO ()
+clearInstanceScope = writeIORef instanceScopeRef Set.empty
 
 --------------------------------------------------------------------------------
 -- Demand-driven env fallback
