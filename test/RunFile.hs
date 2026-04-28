@@ -1090,6 +1090,20 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "True\nFalse\n"
 
     --------------------------------------------------------------------
+    -- C.1 GADT pattern-match refinement (Haskell Report addendum /
+    -- GHC user guide §6.4.7) — DEFERRED.  ihc is type-permissive,
+    -- so the GADT-form syntax + 'coerce Refl x = x' shape works at
+    -- runtime without any refinement substitution.  Real elaborator
+    -- work to threadType refinement through the case-alt body
+    -- ships after the typed-IR (C.2.3 follow-up).
+    --------------------------------------------------------------------
+    it "C.1 GADT-form data + Refl pattern-match runtime path" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/GADTs/gadt_refl_runtime.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "5\n'a'\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
