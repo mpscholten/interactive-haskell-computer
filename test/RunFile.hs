@@ -1061,6 +1061,20 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "3\n"
 
     --------------------------------------------------------------------
+    -- B.4 Functional dependencies (GHC user guide §6.8.8) — DEFERRED
+    -- improvement.  The parser/scanner tolerate `class C a b | a -> b`
+    -- cleanly (the `|` clause is skipped without affecting class-name
+    -- capture or method registration) and single-arg dispatch works.
+    -- Constraint improvement via fundeps depends on the typed-IR
+    -- slice (C.2).
+    --------------------------------------------------------------------
+    it "B.4 FunDep-using class parses + dispatches via head type" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/FunDeps/fundep_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
