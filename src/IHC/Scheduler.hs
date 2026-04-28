@@ -233,6 +233,24 @@ loadProgram = loadProgramFromSource []
 -- to enumerate them.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
+    -- Reset the cross-run global module catalogue and the env-fallback
+    -- thunk cache before each program run.  Without this, a SECOND call
+    -- to 'loadProgramFromSource' in the same process inherits every
+    -- module the previous call loaded (via the 'hydrateTransitiveImports'
+    -- branch in 'loadModule'), which can balloon 'buildAliases''s
+    -- allModules from ~155 to ~222 and turn 'namesFromModule' for some
+    -- transitively-pulled-in modules (e.g. @Control.Monad.Trans.Except@)
+    -- into an effectively unbounded walk dominated by ByteString
+    -- 'compareBytes'.  The hspec test suite tripped on this between
+    -- consecutive 'it' cases that each call 'runFile'.
+    --
+    -- The few seconds of re-parse on the second run are cheap relative
+    -- to the alternative (a hang).  Per-run isolation is also more
+    -- correct: the previous run's 'Closure's stored in
+    -- 'envFallbackCache' reference the previous run's environment,
+    -- which has no validity for this run.
+    writeIORef globalLoadedModulesRef Map.empty
+    writeIORef envFallbackCache Map.empty
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.

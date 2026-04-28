@@ -63,6 +63,26 @@ isSubstring needle haystack =
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    -- Regression: the scheduler used to leak state between consecutive
+    -- runFile calls in the same process.  After the first call,
+    -- 'globalLoadedModulesRef' was populated with ~150 modules; the
+    -- second call's 'hydrateTransitiveImports' fanned that out to
+    -- 222+, and 'buildAliases' / 'namesFromModule' for some
+    -- transitively-pulled modules (e.g. Control.Monad.Trans.Except)
+    -- spun indefinitely in ByteString 'compareBytes'.  The fix is to
+    -- reset the cross-run state at the start of each
+    -- 'loadProgramFromSource'.  This test exercises the path with
+    -- *different* fixtures back-to-back so a future regression
+    -- surfaces here rather than as a 1-hour-long hang in some random
+    -- downstream `it` case.
+    it "consecutive runFile calls with different fixtures don't hang" do
+        n1 <- runFile "test/Fixtures/lit42.hs"
+        n2 <- runFile "test/Fixtures/lit_large.hs"
+        n3 <- runFile "test/Fixtures/with_noise.hs"
+        n1 `shouldBe` 42
+        n2 `shouldBe` 81985529216486895
+        n3 `shouldBe` 7
+
     it "runs `main = 42`" do
         n <- runFile "test/Fixtures/lit42.hs"
         n `shouldBe` 42
