@@ -74,30 +74,36 @@ spec = describe "Parser/lexer bug regressions (audit 2026-04-27)" $ do
                 Left e  -> expectationFailure
                     ("expected success on max-valid escape, got " <> show e)
 
-    -- Bug 2 — lexFloat accepts an exponent with sign but no digits and
-    -- crashes `read`.
-    describe "bug2: float with empty exponent must be a parse error" $ do
-        it "rejects '1e-' as a float" $ do
+    -- Bug 2 — 'lexFloat' used to swallow the bare 'e'/'E' as part of a
+    -- float and then crash 'read' on @"1e-"@/@"1e"@. Master added an
+    -- exponent-digit guard that solves the same crash differently:
+    -- the bare @e@ is treated as the start of an identifier, so the
+    -- lexer stops the integer at @1@ and lexes @e@ separately. Either
+    -- way the test's invariant — "no uncaught exception from 'read' /
+    -- 'chr'" — must hold; we just no longer assert ParseError because
+    -- the post-master form is a clean tokenisation.
+    describe "bug2: float with empty exponent does not crash 'read'" $ do
+        it "does not crash on '1e-'" $ do
             r <- parseExpr "1e-"
             case r of
-                Left e | isParseError e -> pure ()
+                Left e | isParseError e -> pure ()       -- old form
+                Right _                 -> pure ()       -- master form
                 Left e -> expectationFailure
-                    ("expected ParseError, got " <> show e)
-                Right _ -> expectationFailure "expected ParseError"
-        it "rejects '1e+' as a float" $ do
+                    ("expected ParseError or success, got " <> show e)
+        it "does not crash on '1e+'" $ do
             r <- parseExpr "1e+"
             case r of
                 Left e | isParseError e -> pure ()
+                Right _                 -> pure ()
                 Left e -> expectationFailure
-                    ("expected ParseError, got " <> show e)
-                Right _ -> expectationFailure "expected ParseError"
-        it "rejects '1e' (bare exponent indicator)" $ do
+                    ("expected ParseError or success, got " <> show e)
+        it "does not crash on '1e' (bare exponent indicator)" $ do
             r <- parseExpr "1e"
             case r of
                 Left e | isParseError e -> pure ()
+                Right _                 -> pure ()
                 Left e -> expectationFailure
-                    ("expected ParseError, got " <> show e)
-                Right _ -> expectationFailure "expected ParseError"
+                    ("expected ParseError or success, got " <> show e)
         it "still accepts '1e10' and '1.5e-3'" $ do
             r1 <- parseExpr "1e10"
             r2 <- parseExpr "1.5e-3"

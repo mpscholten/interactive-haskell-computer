@@ -353,6 +353,15 @@ elaborateDo ienv stmts = do
                                           (Scheme [] [] fresh)
                                           (ieLocals ie) }
             pure (SBind name e', ie', preds, composeSubst sub s')
+        SBangBind name e -> do
+            -- Same shape as SBind; bang is a runtime-strictness annotation,
+            -- not a type-level concern.
+            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
+            fresh <- TyVar <$> freshVar (ieFresh ie)
+            let ie' = ie { ieLocals = Map.insert name
+                                          (Scheme [] [] fresh)
+                                          (ieLocals ie) }
+            pure (SBangBind name e', ie', preds, composeSubst sub s')
         SLet bs -> do
             -- Elaborate each binding's RHS; add names to locals.
             (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
@@ -412,6 +421,7 @@ applyMethodSubst sub = go
 
     goStmt (SExpr e)         = SExpr (go e)
     goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SBangBind n e)   = SBangBind n (go e)
     goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 

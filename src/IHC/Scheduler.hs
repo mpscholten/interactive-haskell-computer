@@ -57,14 +57,17 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf, sortOn)
-import Control.Monad (forM_, foldM, when)
+import Control.Monad (forM, forM_, foldM, when)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
-import IHC.Builtins (builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO)
+import IHC.Builtins
+    ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
+    , clearCtorIndex, clearForeignPtrWord8Ranges
+    )
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
@@ -74,11 +77,13 @@ import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, lookupInstance
     , lookupInstanceMethod, typeTagOf
     , scanHookRef, sharedClassRegRef, setSharedClassReg
-    , unionInstanceScope, currentInstanceScope
+    , unionInstanceScope, currentInstanceScope, clearInstanceScope
+    , clearSuperclasses
     , setEnvFallback
     , setCoreInstanceLoadHook
     , setClassMethodFallback
     , setThExpToExpr
+    , registerSuperclasses
       -- Lazy instance catalogue (Stage 2)
     , addCataloguedInstance
     , drainCataloguedInstancesForClass
@@ -94,7 +99,7 @@ import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
@@ -274,31 +279,17 @@ loadProgram = loadProgramFromSource []
 -- loaded for every other program).
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
-    -- Reset the cross-run global module catalogue and the env-fallback
-    -- thunk cache before each program run.  Without this, a SECOND call
-    -- to 'loadProgramFromSource' in the same process inherits every
-    -- module the previous call loaded (via the 'hydrateTransitiveImports'
-    -- branch in 'loadModule'), which can balloon 'buildAliases''s
-    -- allModules from ~155 to ~222 and turn 'namesFromModule' for some
-    -- transitively-pulled-in modules (e.g. @Control.Monad.Trans.Except@)
-    -- into an effectively unbounded walk dominated by ByteString
-    -- 'compareBytes'.  The hspec test suite tripped on this between
-    -- consecutive 'it' cases that each call 'runFile'.
-    --
-    -- The few seconds of re-parse on the second run are cheap relative
-    -- to the alternative (a hang).  Per-run isolation is also more
-    -- correct: the previous run's 'Closure's stored in
-    -- 'envFallbackCache' reference the previous run's environment,
-    -- which has no validity for this run.
-    writeIORef globalLoadedModulesRef Map.empty
-    writeIORef envFallbackCache Map.empty
-    -- Stage 2 of the lazy-registration plan: 'registerInstancesFrom'
-    -- now stashes each instance under its class name in
-    -- 'instanceCatalogueRef' instead of registering it eagerly. We
-    -- clear the catalogue here so closures from a previous run (which
-    -- captured the previous run's 'LoadedModule' state) don't fire on
-    -- this run.
-    resetInstanceCatalogue
+    -- Drop accumulated state from any prior 'loadProgramFromSource'
+    -- run.  Without this, refs like 'envFallbackCache' hand out Thunks
+    -- captured against the previous run's frozen 'envBaseForFallbackRef'
+    -- env — those Thunks reference per-run module slots that the new
+    -- run no longer owns, and forcing them can spin in self-referential
+    -- fallback loops as mismatched closures keep redirecting through
+    -- the cache.  See the in-process 'runFile'-twice hang for the
+    -- symptoms.  'resetPerRunGlobals' also clears the Stage-2 lazy
+    -- instance catalogue so closures captured against the prior run's
+    -- 'LoadedModule' state don't fire on this run.
+    resetPerRunGlobals
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
@@ -557,7 +548,7 @@ loadProgramFromSource searchPath src0 = do
                     , "create", "createAndTrim", "createFp", "createFpAndTrim"
                     , "newForeignPtr", "addForeignPtrFinalizer"
                     , "newUnique", "hashUnique"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
@@ -576,7 +567,16 @@ loadProgramFromSource searchPath src0 = do
         -- class selector; replacing its bare dispatcher with an alias to the
         -- fully-qualified selector creates a self-loop.
         aliasesWithoutBase = Map.difference aliases base
-        envWithAliases = Map.union builtinOverrides (Map.union aliasesWithoutBase qualEnv)
+        aliasBuiltinOverrides =
+            Map.mapMaybeWithKey
+                (\alias _ ->
+                    let bare = builtinBareName alias
+                    in if Set.member bare alwaysBuiltinNames
+                        then Map.lookup bare builtins
+                        else Nothing)
+                aliasesWithoutBase
+        aliasesNormalized = Map.union aliasBuiltinOverrides aliasesWithoutBase
+        envWithAliases = Map.union builtinOverrides (Map.union aliasesNormalized qualEnv)
     let env = envWithAliases
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
@@ -1639,7 +1639,10 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                             case Map.lookup n classMethodEnv of
                                 Just slot -> pure (Just (n, slot))
                                 Nothing   -> pure Nothing
-    requestedStandard0 <- mapM (resolveRequestedPair targetLm qualPairs slots) requested
+    requestedStandard0 <- forM requested $ \n ->
+        case Map.lookup n baseForImport of
+            Just slot | Set.member n ffiBuiltinNames -> pure (Just (n, slot))
+            _ -> resolveRequestedPair targetLm qualPairs slots n
     let preferBuiltinRequested n resolved
             | Set.member n ffiBuiltinNames
             , Just slot <- Map.lookup n baseForImport
@@ -1655,6 +1658,29 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
         thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
+        builtinBareName k =
+            case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
+                Just idx -> BC.drop (idx + 1) k
+                Nothing  -> k
+        alwaysBuiltinNames =
+            Set.union ffiBuiltinNames
+                (Set.fromList
+                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
+                    , "catch", "handle", "try", "evaluate"
+                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
+                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
+                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
+                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "getSystemEventManager", "getSystemTimerManager"
+                    , "registerTimeout", "unregisterTimeout", "updateTimeout"
+                    , "withHandle", "withHandleKillThread"
+                    , "labelThread", "labelThreadByteArray#"
+                    , "settingsHost", "settingsPort"
+                    , "putStrLn", "putStr", "print"
+                    , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
+                    , "stdout", "stderr", "stdin"
+                    ])
         qualPrefix = case impAlias imp of
             Just a  -> a <> BC.pack "."
             Nothing
@@ -1667,7 +1693,16 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             | BC.null qualPrefix = []
             | otherwise =
                 [ (qualPrefix <> n, t) | (n, t) <- requestedPairs ]
-        aliasEnv = Map.fromList (bareAliases ++ qualAliases)
+        aliasEnv0 = Map.fromList (bareAliases ++ qualAliases)
+        aliasBuiltinOverrides =
+            Map.mapMaybeWithKey
+                (\alias _ ->
+                    let bare = builtinBareName alias
+                    in if Set.member bare alwaysBuiltinNames
+                        then Map.lookup bare baseForImport
+                        else Nothing)
+                aliasEnv0
+        aliasEnv = Map.union aliasBuiltinOverrides aliasEnv0
     let isSentinel (EVar _) = True
         isSentinel _        = False
     forM_ (zip qualPairs slots) $ \((fqn, rhs), slot) ->
@@ -1689,29 +1724,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             , BC.isPrefixOf modPrefix qualKey
             , let n = BC.drop (BC.length modPrefix) qualKey
             ]
-        builtinBareName k =
-            case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
-                Just idx -> BC.drop (idx + 1) k
-                Nothing  -> k
-        alwaysBuiltinNames =
-            Set.union ffiBuiltinNames
-                (Set.fromList
-                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
-                    , "catch", "handle", "try", "evaluate"
-                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
-                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
-                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
-                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "closeFdWith", "fdSocket", "unsafeFdSocket"
-                    , "getSystemEventManager", "getSystemTimerManager"
-                    , "registerTimeout", "unregisterTimeout", "updateTimeout"
-                    , "withHandle", "withHandleKillThread"
-                    , "labelThread", "labelThreadByteArray#"
-                    , "settingsHost", "settingsPort"
-                    , "putStrLn", "putStr", "print"
-                    , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
-                    , "stdout", "stderr", "stdin"
-                    ])
         builtinOverrides =
             Map.filterWithKey
                 (\k _ -> Set.member (builtinBareName k) alwaysBuiltinNames)
@@ -1879,6 +1891,15 @@ buildClassMethodTable :: [LoadedModule] -> IO ClassMethodTable
 buildClassMethodTable loadedModules = do
     tables <- mapM (\lm -> do
                         decls <- scanClassDecls (lmSource lm)
+                        -- B.1: register each class's direct superclass
+                        -- list as a side effect so the global
+                        -- 'superclassesRef' (in IHC.Classes) is
+                        -- populated by the time instance loading runs
+                        -- and the dispatcher can consult it later.
+                        mapM_ (\d -> registerSuperclasses
+                                        (classClassName d)
+                                        (classSuperclasses d))
+                              decls
                         pure [ (classClassName d, classMethodNames d) | d <- decls ])
                    loadedModules
     pure (Map.fromList (concat tables))
@@ -3137,7 +3158,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- top-level bindings that merely happen to have a single-pred
     -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
     let allMethodNames = Set.fromList
-            [ m | ClassDecl _ ms _ <- decls, m <- ms ]
+            [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
@@ -3146,7 +3167,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
     pure (Map.fromList filtered)
   where
-    buildOne (ClassDecl cls methodNames _defaults) =
+    buildOne (ClassDecl cls methodNames _defaults _supers) =
         mapM (mkMethodEntry cls) methodNames
     mkMethodEntry cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
@@ -3175,7 +3196,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
         decls <- scanClassDecls (lmSource lm)
         mapM_ (oneClass lm) decls
 
-    oneClass lm decl@(ClassDecl cls _ defaults)
+    oneClass lm decl@(ClassDecl cls _ defaults _supers)
         | Map.null defaults = pure ()
         | otherwise =
             -- Catalogue the default-registration work under the
@@ -3188,7 +3209,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
 
     -- The pre-Stage-3 eager body, now invoked from the catalogue
     -- closure on first dispatch into this class.
-    registerOneClassDefault lm (ClassDecl cls methodNames defaults) = do
+    registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers) = do
             -- Pre-demand-load each free var referenced in the class's
             -- default bodies so 'buildImportRewritesForNames' can
             -- rewrite them to their fully-qualified form before we try
@@ -3695,6 +3716,8 @@ rewriteExpr rw = go []
                                        : goStmts bound rest
     goStmts bound (SBind n e : rest) = SBind n (go bound e)
                                        : goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = SBangBind n (go bound e)
+                                       : goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest) =
         let names = map fst bs
             bound' = names ++ bound
@@ -3708,6 +3731,7 @@ rewriteExpr rw = go []
     patBound (PCon _ ps)     = concatMap patBound ps
     patBound (PAs n p)       = n : patBound p
     patBound (PBang p)       = patBound p
+    patBound (PIrref p)      = patBound p
     patBound (PTuple ps)     = concatMap patBound ps
     patBound (PRecord _ fps) = concatMap (patBound . snd) fps
     patBound (PRecordWild _) = []
@@ -4215,6 +4239,40 @@ loadModule registry searchPath includeMap name = do
 {-# NOINLINE globalLoadedModulesRef #-}
 globalLoadedModulesRef :: IORef (Map ModuleName LoadedModule)
 globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Drop every per-run global the scheduler accumulates so a second
+-- 'loadProgramFromSource' call starts from a clean slate.  Caches that
+-- are content-addressable or expensive to rebuild ('mkFreshScanCache',
+-- the cabal package memos) are intentionally retained.
+--
+-- The bug this guards against: 'envFallbackCache' returns 'Thunk'
+-- values whose internal 'Closure' captured the previous run's
+-- 'envBaseForFallbackRef' env.  Those frozen envs reference per-run
+-- module slots that the new run no longer owns; forcing such a Thunk
+-- spins in 'compareBytes' as mismatched closures redirect through the
+-- cache repeatedly.  Same idea for the type-sig / type-synonym /
+-- instance-scope registries, all of which feed elaborator decisions.
+resetPerRunGlobals :: IO ()
+resetPerRunGlobals = do
+    writeIORef globalLoadedModulesRef Map.empty
+    writeIORef envFallbackCache       Map.empty
+    writeIORef envBaseForFallbackRef  Map.empty
+    writeIORef globalTypeSigsRef      Map.empty
+    writeIORef globalTypeSynonymsRef  Map.empty
+    writeIORef globalClassMethodNamesRef Set.empty
+    clearInstanceScope
+    clearSuperclasses
+    clearCtorStrictness
+    clearCtorIndex
+    clearForeignPtrWord8Ranges
+    resetNewNameCounter
+    TR.setGlobalRegistry Map.empty
+    -- Stage 2 of the lazy-registration plan: 'registerInstancesFrom'
+    -- now stashes per-instance closures under each class name in
+    -- 'instanceCatalogueRef' instead of registering them eagerly.
+    -- Clear the catalogue too so closures captured against this
+    -- run's 'LoadedModule' state don't fire on the next run.
+    resetInstanceCatalogue
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
@@ -4862,7 +4920,7 @@ resolveFallback mOwner name = do
             `catch` (\(_ :: SomeException) -> pure [])
         let classMethods =
                 [ method
-                | ClassDecl _ methods _ <- classDecls
+                | ClassDecl _ methods _ _ <- classDecls
                 , method <- methods
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
@@ -4978,7 +5036,7 @@ resolveFallback mOwner name = do
 
     tryClassMethodSlot owner bareName = do
         decls <- scanClassDecls (lmSource owner)
-        case [ cls | ClassDecl cls methods _ <- decls, bareName `elem` methods ] of
+        case [ cls | ClassDecl cls methods _ _ <- decls, bareName `elem` methods ] of
             []      -> pure Nothing
             (cls:_) -> do
                 mSharedReg <- readIORef sharedClassRegRef
@@ -5741,13 +5799,13 @@ resolveImport registry searchPath includeMap lm name = do
 
     moduleClassMethods targetLm = do
         decls <- scanClassDecls (lmSource targetLm)
-        pure [ method | ClassDecl _ methods _ <- decls, method <- methods ]
+        pure [ method | ClassDecl _ methods _ _ <- decls, method <- methods ]
 
     exportsClassMethod targetLm methodName = do
         decls <- scanClassDecls (lmSource targetLm)
         let classes =
                 [ (className, methods)
-                | ClassDecl className methods _ <- decls
+                | ClassDecl className methods _ _ <- decls
                 , methodName `elem` methods
                 ]
             exportedBy className methods = case mhExports (lmHeader targetLm) of
@@ -6170,6 +6228,7 @@ freeVars = goAll []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = goAll bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names  = map fst bs
             bound' = names ++ bound
@@ -6186,6 +6245,7 @@ freeVars = goAll []
     patBound (PCon _ ps)         = concatMap patBound ps
     patBound (PAs n p)           = n : patBound p
     patBound (PBang p)           = patBound p
+    patBound (PIrref p)          = patBound p
     patBound (PTuple ps)         = concatMap patBound ps
     patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
     patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
@@ -6220,9 +6280,10 @@ needsRecordFields = goExpr
         EGuardFail    -> False
 
     goStmt = \case
-        SExpr e        -> goExpr e
-        SBind _ e      -> goExpr e
-        SLet bs        -> any (goExpr . snd) bs
+        SExpr e         -> goExpr e
+        SBind _ e       -> goExpr e
+        SBangBind _ e   -> goExpr e
+        SLet bs         -> any (goExpr . snd) bs
         SImplicitLet bs -> any (goExpr . snd) bs
 
     goAlt (Alt p e) = goPat p || goExpr e
@@ -6234,6 +6295,7 @@ needsRecordFields = goExpr
         PCon _ ps     -> any goPat ps
         PAs _ p       -> goPat p
         PBang p       -> goPat p
+        PIrref p      -> goPat p
         PTuple ps     -> any goPat ps
         PRecord{}     -> True
         PRecordWild{} -> True
@@ -6297,6 +6359,7 @@ discoveryFreeVars = go []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = go bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = go bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = go bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names = map fst bs
         in goStmts (names ++ bound) rest
@@ -6460,9 +6523,10 @@ desugarRecordCons fldReg = go
     go (ETyApp inner ty) = ETyApp (go inner) ty   -- value-level @T: recurse into inner
     go e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (go e)
-    goStmt (SBind n e) = SBind n (go e)
-    goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (go e)
+    goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SBangBind n e)   = SBangBind n (go e)
+    goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Look up all fields for a constructor from the FieldRegistry,
@@ -6506,9 +6570,10 @@ desugarRecordPats fldReg = goExpr
     goExpr (ETyApp inner ty) = ETyApp (goExpr inner) ty   -- value-level @T: recurse
     goExpr e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (goExpr e)
-    goStmt (SBind n e) = SBind n (goExpr e)
-    goStmt (SLet bs)   = SLet [(n, goExpr b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (goExpr e)
+    goStmt (SBind n e)       = SBind n (goExpr e)
+    goStmt (SBangBind n e)   = SBangBind n (goExpr e)
+    goStmt (SLet bs)         = SLet [(n, goExpr b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, goExpr b) | (n, b) <- bs]
 
     -- Handle a case expression, desugaring view-pattern alts into a chain.
@@ -6574,5 +6639,6 @@ desugarRecordPats fldReg = goExpr
     goPat (PCon n ps)      = PCon n (map goPat ps)
     goPat (PAs n p)        = PAs n (goPat p)
     goPat (PBang p)        = PBang (goPat p)
+    goPat (PIrref p)       = PIrref (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit

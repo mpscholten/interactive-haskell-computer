@@ -366,13 +366,19 @@ nextToken s c0 =
                 , isDigit b2
                 -> go (p + 1)
             _ ->
-                -- Check for float: '.' followed by digit, or 'e'/'E'.
+                -- Check for float: '.' followed by digit, or 'e'/'E' that
+                -- is the start of a real exponent (digits, optionally
+                -- preceded by '+' / '-').  Without the exponent-digit
+                -- guard, a CSS hex colour byte sequence like @34495e@
+                -- inside an HSX/plain quasi-quoter body sends us into
+                -- lexFloat with @bs == "34495e"@ and 'read' explodes.
                 case peekByte s p of
                     Just 0x2E                                -- '.'
                         | Just b2 <- peekByte s (p + 1)
                         , isDigit b2                        -- not '..' or '.x'
                         -> lexFloat start p
-                    Just e | e == 0x65 || e == 0x45         -- 'e' or 'E'
+                    Just e | (e == 0x65 || e == 0x45)       -- 'e' or 'E'
+                           , validExponentAt (p + 1)
                         -> lexFloat start p
                     _ ->
                         let raw = sliceBytes s (cPos start, p)
@@ -385,6 +391,20 @@ nextToken s c0 =
         skipHashes p = case peekByte s p of
             Just 0x23 -> skipHashes (p + 1)   -- '#'
             _         -> p
+
+    -- | True when the bytes starting at @p@ form a valid float exponent
+    -- payload: an optional sign followed by at least one digit.  Used to
+    -- reject a stray @e@/@E@ that is really part of a following identifier
+    -- or hex colour token (e.g. CSS @#34495e@).
+    validExponentAt p = case peekByte s p of
+        Just 0x2B -> isDigitAt (p + 1)   -- '+'
+        Just 0x2D -> isDigitAt (p + 1)   -- '-'
+        Just b    -> isDigit b
+        Nothing   -> False
+      where
+        isDigitAt q = case peekByte s q of
+            Just b  -> isDigit b
+            Nothing -> False
 
     -- | Lex the fractional+exponent part of a float literal.
     -- @start@ is the start of the whole literal; @p@ is positioned
@@ -400,7 +420,8 @@ nextToken s c0 =
                     Just 0x2E -> goDec (p0 + 1)     -- consume '.' then fraction digits
                     _         -> p0                  -- no '.' — start of exponent
             p2 = case peekByte s p1 of
-                    Just e | e == 0x65 || e == 0x45  -- 'e' or 'E'
+                    Just e | (e == 0x65 || e == 0x45)        -- 'e' or 'E'
+                           , validExponentAt (p1 + 1)
                         -> let p3 = case peekByte s (p1 + 1) of
                                         Just 0x2B -> p1 + 2   -- '+'
                                         Just 0x2D -> p1 + 2   -- '-'

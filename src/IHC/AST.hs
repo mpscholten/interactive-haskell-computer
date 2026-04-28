@@ -76,13 +76,17 @@ data Expr
 
 -- | A single statement inside a do-block.
 --
---   * 'SExpr' — a bare expression, e.g. @putStrLn "hi"@
---   * 'SBind' — a bind statement @x <- action@
---   * 'SLet'  — @let x = e; y = e2@ inside do (no @in@ — the scope is
---               the remainder of the do-block)
+--   * 'SExpr'     — a bare expression, e.g. @putStrLn "hi"@
+--   * 'SBind'     — a bind statement @x <- action@
+--   * 'SBangBind' — a strict bind @!x <- action@ (Haskell Report §3.17.2 +
+--                   GHC @BangPatterns@): force the bound result to WHNF
+--                   before continuing the do-block.
+--   * 'SLet'      — @let x = e; y = e2@ inside do (no @in@ — the scope is
+--                   the remainder of the do-block)
 data Stmt
     = SExpr !Expr
     | SBind !Name !Expr
+    | SBangBind !Name !Expr
     | SLet  ![Bind]
     | SImplicitLet ![(Name, Expr)]
     deriving (Eq, Show)
@@ -98,7 +102,8 @@ data Pat
     | PWild                             -- _, matches anything, no binding
     | PCon  !Name ![Pat]                -- constructor pattern (Phase 2.1+)
     | PAs   !Name !Pat                  -- xs\@(x:_) as-pattern (Phase 2.6)
-    | PBang !Pat                        -- !x bang-pattern — we ignore strictness (Phase 2.6)
+    | PBang !Pat                        -- !x bang-pattern (Haskell Report §3.17.2 + GHC BangPatterns; A.1)
+    | PIrref !Pat                       -- ~p irrefutable / lazy pattern (Haskell Report §3.17.3; A.2)
     | PTuple ![Pat]                     -- (a, b, ...) tuple pattern (Phase 2.6)
     | PRecord !Name ![(Name, Pat)]      -- Con { f1 = p1, f2 = p2, ... } record pattern (NamedFieldPuns)
     | PRecordWild !Name                 -- Con {..} — RecordWildCards pattern
@@ -107,6 +112,9 @@ data Pat
 
 data Lit
     = LInt    !Int64
+    | LInteger !Integer  -- arbitrary-precision integer (A.3); used when the
+                         -- source literal exceeds 'Int64' range so we don't
+                         -- silently truncate via 'fromInteger' in the parser.
     | LFloat  !Double
     | LStr    !ByteString
     | LChar   !Char

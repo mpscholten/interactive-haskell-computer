@@ -14,6 +14,8 @@ module IHC.Builtins
     , buildFieldEnv
     , showValWith
     , stringToListValIO
+    , clearCtorIndex
+    , clearForeignPtrWord8Ranges
     ) where
 
 import Control.Concurrent
@@ -52,7 +54,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicM
 import Data.Int (Int64)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
-import Data.Word (Word8, Word16, Word32, Word64)
+import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Foreign.C.String (peekCAString, withCString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
@@ -86,14 +88,16 @@ import System.IO
 import qualified System.Posix.IO as PosixIO
 import System.Posix.Types (Fd)
 
+import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     , drainCataloguedInstancesForClass
     )
+import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal)
-import IHC.Scan (DataRegistry, FieldRegistry)
+import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
 
@@ -468,6 +472,12 @@ builtins reg =
     , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
+    -- B.1: debug-only superclass-relation probe.  Source-loaded code
+    -- can call @__ihc_class_supers \"MyOrd\"@ to inspect the global
+    -- superclass map; useful for testing that the scanner captured
+    -- the @class C a => D a@ relation. Single argument is a [Char]
+    -- list (a String); result is a [[Char]] list (a [String]).
+    , ("__ihc_class_supers", classSupersProbeB)
     , ("exitWith",    exitWithB)
     , ("exitSuccess", exitSuccessB)
     -- Char / numeric conversions
@@ -709,8 +719,30 @@ builtins reg =
     , ("free", freeB)
     , ("Foreign.Marshal.Alloc.free", freeB)
     , ("GHC.Internal.Foreign.Marshal.Alloc.free", freeB)
+    , ("bind", socketBindB)
+    , ("Network.Socket.bind", socketBindB)
+    , ("Network.Socket.Types.bind", socketBindB)
     , ("Network.Socket.SockAddr.bind", socketBindB)
     , ("Network.Socket.Syscall.bind", socketBindB)
+    -- Network.Socket.bind is the actual OS bind(2) boundary for AF_INET/AF_INET6
+    -- sockets. We keep SockAddr data constructors source-interpreted, but perform
+    -- the sockaddr marshalling + bind syscall in the host.
+    -- Network.Socket.close / close' ultimately coordinate fd shutdown through
+    -- closeFdWith and the host RTS/OS socket object. We keep network's Socket
+    -- value shape source-compatible, but perform the actual invalidation +
+    -- close(2) in the host.
+    , ("close", socketCloseB False)
+    , ("close'", socketCloseB True)
+    , ("Network.Socket.close", socketCloseB False)
+    , ("Network.Socket.close'", socketCloseB True)
+    , ("Network.Socket.Types.close", socketCloseB False)
+    , ("Network.Socket.Types.close'", socketCloseB True)
+    -- Network.Socket.withFdSocket reads the live fd out of the mutable Socket
+    -- cell and runs an IO callback. The Socket is host-backed already, so we
+    -- bridge this directly rather than re-entering the interpreted wrapper.
+    , ("withFdSocket", withFdSocketB)
+    , ("Network.Socket.withFdSocket", withFdSocketB)
+    , ("Network.Socket.Types.withFdSocket", withFdSocketB)
     -- Network.Socket's Socket value is already represented by IHC as a
     -- host-backed fd-bearing constructor. fdSocket/unsafeFdSocket expose that
     -- fd as IO CInt in network >= 3, so this is an RTS/OS bridge over the
@@ -1537,6 +1569,21 @@ populateCtorIndex reg =
 lookupCtorIndex :: ByteString -> IO (Maybe (ByteString, Int))
 lookupCtorIndex name = Map.lookup name <$> readIORef ctorIndexRegistry
 
+-- | Reset the global ctor-index registry.  Called by the scheduler so a
+-- second 'loadProgramFromSource' call doesn't see stale entries from a
+-- prior run that no longer correspond to any loaded module's data
+-- decls.
+clearCtorIndex :: IO ()
+clearCtorIndex = writeIORef ctorIndexRegistry Map.empty
+
+-- | Reset the foreign-ptr-Word8 address-range list.  Without this, a
+-- second 'loadProgramFromSource' run accumulates ranges from the first
+-- run's already-collected 'ForeignPtr' allocations — addresses the GC
+-- may have reused for other purposes by the time of the next
+-- 'isMarkedWord8Ptr' check.
+clearForeignPtrWord8Ranges :: IO ()
+clearForeignPtrWord8Ranges = writeIORef foreignPtrWord8RangesRef []
+
 -- | Structural Ord fallback for VCon values.
 --
 -- Returns 'Just ord' when @av@ and @bv@ can be compared structurally,
@@ -1796,6 +1843,7 @@ showDouble d
 showVal :: Val -> IO String
 showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
+showVal (VInteger n) = pure (show n)
 showVal (VFloat d)  = pure (showDouble d)
 showVal (VChar c)   = pure (show c)
 showVal VUnit       = pure "()"
@@ -2246,6 +2294,25 @@ getLineB :: IO Val
 getLineB = pure $ VIO $ do
     s <- getLine
     stringToListValIO s
+
+-- | B.1: debug-only probe of the global superclass-relation map.
+-- Takes a class name (as a [Char] list) and returns the list of
+-- direct superclass names ([[Char]]).  Used by fixtures to verify
+-- that @class Eq a => Ord a@ et al. are captured by the scanner.
+classSupersProbeB :: IO Val
+classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av    <- force aT
+    cls   <- valToString av
+    supers <- IHC.Classes.lookupSuperclasses (BC.pack cls)
+    -- Build a Haskell-level [String] cons list from the result.
+    let buildList []     = pure (VCon "[]" [])
+        buildList (n:ns) = do
+            headV <- stringToListValIO (BC.unpack n)
+            headT <- newWHNFThunk headV
+            restV <- buildList ns
+            restT <- newWHNFThunk restV
+            pure (VCon ":" [headT, restT])
+    buildList supers
 
 errorB :: IO Val
 errorB = pure $ VFun $ \a -> do
@@ -3717,6 +3784,12 @@ valsToConsList (x:xs) = do
 wordPtrToPtr :: Word64 -> Ptr a
 wordPtrToPtr w = castPtr (intPtrToPtr (fromIntegral w :: IntPtr))
 
+htons16 :: Word16 -> Word16
+htons16 = byteSwap16
+
+htonl32 :: Word32 -> Word32
+htonl32 = byteSwap32
+
 socketBindB :: IO Val
 socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
     sockV <- force sockT
@@ -3824,18 +3897,55 @@ socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
             else peekSockAddrVal (castPtr addrP)
 
 socketFdFromVal :: Val -> IO Int64
-socketFdFromVal (VCon "Socket" [_refT, fdT]) = do
-    fdV <- force fdT
+socketFdFromVal v = do
+    fdV <- socketCurrentFdVal v
     case fdV of
         VInt fd -> pure fd
         other   -> error ("Socket fd is not an Int: " <> showValForDebug other)
-socketFdFromVal other = error ("bind: not a Socket: " <> showValForDebug other)
+
+socketCurrentFdVal :: Val -> IO Val
+socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
+    refV <- force refT
+    case refV of
+        VPrimObj (PrimIORef rf) -> readIORef rf
+        other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
+socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
 
 socketFdB :: IO Val
 socketFdB = pure $ VFun $ \sockT -> pure $ VIO $ do
     sockV <- force sockT
     fd <- socketFdFromVal sockV
     pure (VInt fd)
+
+socketCloseB :: Bool -> (IO Val)
+socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
+    sockV <- force sockT
+    case sockV of
+        VCon "Socket" [refT, _fdT] -> do
+            refV <- force refT
+            case refV of
+                VPrimObj (PrimIORef rf) -> do
+                    oldFdV <- atomicModifyIORef' rf $ \cur -> (VInt (-1), cur)
+                    case oldFdV of
+                        VInt oldFd
+                            | oldFd == -1 -> pure VUnit
+                            | otherwise -> do
+                                rc <- c_close_host (fromIntegral oldFd)
+                                if rc == -1 && throwOnError
+                                    then ioError (userError "Network.Socket.close'")
+                                    else pure VUnit
+                        other -> error ("Socket fd cell is not an Int: " <> showValForDebug other)
+                other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
+        other -> error ("close: not a Socket: " <> showValForDebug other)
+
+withFdSocketB :: IO Val
+withFdSocketB = pure $ VFun $ \sockT -> pure $ VFun $ \fnT -> pure $ VIO $ do
+    sockV <- force sockT
+    fd <- socketFdFromVal sockV
+    fnV <- force fnT
+    fdT <- newWHNFThunk (VInt fd)
+    r <- apply fnV fdT
+    runIOVal r
 
 socketSendBufB :: IO Val
 socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
@@ -3929,8 +4039,8 @@ sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
     pure (16, \p -> do
         pokeByteOff p 0 (16 :: Word8)
         pokeByteOff p 1 (2 :: Word8)
-        pokeByteOff p 2 (fromIntegral port :: Word16)
-        pokeByteOff p 4 (fromIntegral addr :: Word32))
+        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
+        pokeByteOff p 4 (htonl32 (fromIntegral addr) :: Word32))
 sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
     port <- intField "SockAddrInet6.port" portT
     flow <- intField "SockAddrInet6.flow" flowT
@@ -3939,13 +4049,13 @@ sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
     pure (28, \p -> do
         pokeByteOff p 0 (28 :: Word8)
         pokeByteOff p 1 (30 :: Word8)
-        pokeByteOff p 2 (fromIntegral port :: Word16)
-        pokeByteOff p 4 (fromIntegral flow :: Word32)
-        pokeByteOff p 8 (fromIntegral a0 :: Word32)
-        pokeByteOff p 12 (fromIntegral a1 :: Word32)
-        pokeByteOff p 16 (fromIntegral a2 :: Word32)
-        pokeByteOff p 20 (fromIntegral a3 :: Word32)
-        pokeByteOff p 24 (fromIntegral scope :: Word32))
+        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
+        pokeByteOff p 4 (htonl32 (fromIntegral flow) :: Word32)
+        pokeByteOff p 8 (htonl32 (fromIntegral a0) :: Word32)
+        pokeByteOff p 12 (htonl32 (fromIntegral a1) :: Word32)
+        pokeByteOff p 16 (htonl32 (fromIntegral a2) :: Word32)
+        pokeByteOff p 20 (htonl32 (fromIntegral a3) :: Word32)
+        pokeByteOff p 24 (htonl32 (fromIntegral scope) :: Word32))
 sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug other)
 
 hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)
@@ -4010,6 +4120,9 @@ foreign import ccall unsafe "getsockname"
 
 foreign import ccall unsafe "bind"
     c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
+
+foreign import ccall unsafe "close"
+    c_close_host :: CInt -> IO CInt
 
 foreign import ccall unsafe "send"
     c_send_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
@@ -5177,10 +5290,32 @@ buildConEnv reg = do
         t <- newLazyBuiltinThunk (pure (buildLam name arity []))
         pure (name, t)
 
+    -- A.5: per Haskell Report §4.2.1, a strict field annotation
+    -- (`MkT !Int Int`) forces the corresponding argument thunk to
+    -- WHNF at construction time.  We look up the constructor's
+    -- strictness bitmap (populated by 'IHC.Scan.scanDataDecls') and,
+    -- when at least one field is strict, force those thunks before
+    -- returning the 'VCon'.  All-lazy ctors keep the original cheap
+    -- path with no extra IO.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
-        pure (buildLam name (left - 1) (t : acc))
+        if left == 1
+            then do
+                let thunks = reverse (t : acc)
+                strict <- lookupCtorStrictness name
+                forceStrictFields strict thunks
+                pure (VCon name thunks)
+            else pure (buildLam name (left - 1) (t : acc))
+
+    -- | Walk the strict-field bitmap and force each marked thunk in
+    -- place, ignoring extra/missing entries gracefully.
+    forceStrictFields :: [Bool] -> [Thunk] -> IO ()
+    forceStrictFields []         _      = pure ()
+    forceStrictFields _          []     = pure ()
+    forceStrictFields (s : ss) (t : ts) = do
+        when s (() <$ force t)
+        forceStrictFields ss ts
 
 -- | Build an environment binding each record-field name to an accessor
 -- function.  For a field @f@ that lives at index @i@ in constructor @Con@,
