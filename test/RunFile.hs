@@ -1075,6 +1075,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "True\nFalse\n"
 
     --------------------------------------------------------------------
+    -- B.5a Quantified constraints (GHC user guide §6.8.10) — DEFERRED
+    -- solver.  ihc's parseClassHead handles the @(forall a. C a => D
+    -- (f a))@ syntax via the depth-aware token scan from B.1, and
+    -- runtime tag-keyed dispatch is unaffected by the type-level
+    -- quantifier, so programs that use @QuantifiedConstraints@ load
+    -- and run.  Skolemise/discharge/regeneralise solving (B.5b) ships
+    -- after the elaborator-integrated lowering (C.2.3 follow-up).
+    --------------------------------------------------------------------
+    it "B.5a quantified-constraint class parses + dispatches" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/QuantifiedConstraints/qc_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
