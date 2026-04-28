@@ -37,6 +37,11 @@ module IHC.Classes
     , setSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
+      -- * Lazy instance catalogue (Stage 2 of lazy registration plan)
+    , addCataloguedInstance
+    , drainCataloguedInstancesForClass
+    , resetInstanceCatalogue
+    , catalogueHasClass
       -- * Demand-driven env fallback
     , EnvFallbackHook
     , envFallbackRef
@@ -57,6 +62,7 @@ module IHC.Classes
     , runThExpToExpr
     ) where
 
+import Control.Exception (SomeException, catch)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -236,14 +242,46 @@ lookupInstanceMulti reg className typeTags = do
     m <- readIORef reg
     pure (Map.lookup (className, typeTags) m)
 
+-- | Look up @(class, type-tag) -> method-name -> Val@. On a miss, the
+-- Stage-2 lazy-instance catalogue is drained for @class@ — closures
+-- registered by 'registerInstancesFrom' run, materialising every
+-- catalogued instance of that class — and the lookup retries. After
+-- the drain the catalogue's per-class entry is gone so subsequent
+-- misses are O(1) IORef reads.
+--
+-- This means /every/ call site (the dispatcher, @show@/@==@/@compare@
+-- builtins, the elaborator's @resolveTypedMethod@, …) automatically
+-- gets lazy-registration support without needing to call drain
+-- explicitly. Callers that need a strictly-non-mutating lookup can
+-- still use 'lookupInstanceMethodRaw'.
 lookupInstanceMethod :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
 lookupInstanceMethod reg className typeTag methodName =
     lookupInstanceMethodMulti reg className [typeTag] methodName
 
+-- | Multi-tag variant of 'lookupInstanceMethod'. Same drain-on-miss
+-- semantics — see that function's note.
 lookupInstanceMethodMulti :: ClassRegistry -> ByteString -> [ByteString] -> ByteString -> IO (Maybe Val)
 lookupInstanceMethodMulti reg className typeTags methodName = do
     mMethods <- lookupInstanceMulti reg className typeTags
-    pure (mMethods >>= Map.lookup methodName)
+    case mMethods >>= Map.lookup methodName of
+        Just v  -> pure (Just v)
+        Nothing -> do
+            drained <- drainCataloguedInstancesForClass className
+            if drained
+                then do
+                    mMethods' <- lookupInstanceMulti reg className typeTags
+                    pure (mMethods' >>= Map.lookup methodName)
+                else pure Nothing
+
+-- | Strictly-non-mutating variant of 'lookupInstanceMethod' — does NOT
+-- drain the lazy-instance catalogue. Used by call sites that need to
+-- distinguish "no instance is registered" from "an instance is
+-- catalogued but not yet materialised" without triggering
+-- materialisation.
+lookupInstanceMethodRaw :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
+lookupInstanceMethodRaw reg className typeTag methodName = do
+    m <- readIORef reg
+    pure (Map.lookup (className, [typeTag]) m >>= Map.lookup methodName)
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a
@@ -341,6 +379,93 @@ unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
 
 currentInstanceScope :: IO (Set ByteString)
 currentInstanceScope = readIORef instanceScopeRef
+
+--------------------------------------------------------------------------------
+-- Lazy instance catalogue (Stage 2 of the lazy-registration plan)
+--
+-- The eager 'registerInstancesFrom' walked every loaded module's
+-- instance-method bodies and called 'evalMethodWithLazy' on each — even
+-- for instances of classes that no user code dispatches into. On a
+-- 155-module load that's ~0.45 s of wasted work.
+--
+-- Stage 2 replaces that with a /catalogue/: 'registerInstancesFrom'
+-- becomes a cheap "for each instance found by 'scanInstanceDecls', stash
+-- a closure under the class name." When the dispatcher misses a
+-- @(class, tag)@ lookup, 'lazyInstanceRetry' drains every catalogued
+-- closure for /that one class/ — running the existing 'registerOne'
+-- body verbatim — and retries. Classes that never get dispatched into
+-- pay zero method-body parse / FV / eval work.
+--
+-- Ordering: closures are appended to a per-class list and drained in
+-- append order; with 'registerInstance''s last-write-wins semantics,
+-- this matches what eager registration would produce as long as the
+-- caller catalogues modules in the same iteration order.
+--
+-- Reset boundary: 'resetInstanceCatalogue' is called once per
+-- 'loadProgramFromSource' run (alongside 'globalLoadedModulesRef'
+-- reset), so per-run state doesn't leak across runFile boundaries.
+--------------------------------------------------------------------------------
+
+-- | The catalogue. Keys are class names; values are append-ordered
+-- lists of "register me on demand" closures, each performing the work
+-- the eager 'registerOne' would have done up front.
+type InstanceCatalogue = Map ByteString [IO ()]
+
+{-# NOINLINE instanceCatalogueRef #-}
+instanceCatalogueRef :: IORef InstanceCatalogue
+instanceCatalogueRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Stash a "register one instance of @cls@" closure into the catalogue.
+-- Cheap: just an 'IORef' update. The expensive work (parsing instance
+-- method bodies, free-var discovery, 'evalMethodWithLazy') is deferred
+-- to the closure itself and only runs if 'drainCataloguedInstancesForClass'
+-- is later called for @cls@.
+addCataloguedInstance :: ByteString -> IO () -> IO ()
+addCataloguedInstance cls action =
+    -- Map.insertWith f new old:  f is called as f new old, so to append
+    -- the new singleton AT THE END we want @old ++ new@.
+    modifyIORef' instanceCatalogueRef
+        (Map.insertWith (\new old -> old ++ new) cls [action])
+
+-- | Drain every catalogued closure for @cls@, running them in append
+-- order. Removes the entries from the catalogue so subsequent drains
+-- for the same class are O(1) no-ops. Returns 'True' iff at least one
+-- closure was drained (i.e. the caller should retry its lookup).
+--
+-- Individual closures that throw are swallowed: the dispatcher's
+-- existing 'methodPlaceholder' machinery already handles per-method
+-- evaluation failure, and a single bad instance must not poison the
+-- whole class.
+drainCataloguedInstancesForClass :: ByteString -> IO Bool
+drainCataloguedInstancesForClass cls = do
+    cat <- readIORef instanceCatalogueRef
+    case Map.lookup cls cat of
+        Nothing      -> pure False
+        Just []      -> pure False
+        Just actions -> do
+            modifyIORef' instanceCatalogueRef (Map.delete cls)
+            mapM_ runOne actions
+            pure True
+  where
+    runOne action = action `catch` \(_ :: SomeException) -> pure ()
+
+-- | Discard every catalogued closure. Called once per
+-- 'loadProgramFromSource' run, alongside the 'globalLoadedModulesRef'
+-- reset, so per-run state doesn't leak across consecutive runFile
+-- calls.
+resetInstanceCatalogue :: IO ()
+resetInstanceCatalogue = writeIORef instanceCatalogueRef Map.empty
+
+-- | True iff the catalogue currently holds any closures for @cls@.
+-- Used by callers that need to materialise a class's instances eagerly
+-- (e.g. derived-Functor synthesis must see explicit 'Functor T'
+-- instances before deciding whether to skip a 'deriving' clause).
+catalogueHasClass :: ByteString -> IO Bool
+catalogueHasClass cls = do
+    cat <- readIORef instanceCatalogueRef
+    case Map.lookup cls cat of
+        Just (_:_) -> pure True
+        _          -> pure False
 
 --------------------------------------------------------------------------------
 -- Demand-driven env fallback

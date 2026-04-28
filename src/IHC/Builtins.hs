@@ -90,6 +90,7 @@ import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
+    , drainCataloguedInstancesForClass
     )
 import IHC.Eval (apply, force, forceMethodVal)
 import IHC.Scan (DataRegistry, FieldRegistry)
@@ -1993,6 +1994,13 @@ fromLabelB reg = pure $ VFun $ \a -> do
 --    under @[\"Proxy\"]@ — that's the fallthrough handled by the caller.
 lookupUserIsLabel :: ClassRegistry -> ByteString -> IO (Maybe Val)
 lookupUserIsLabel reg lbl = do
+    -- Stage 2: user-defined @IsLabel s T@ instances now sit in
+    -- 'instanceCatalogueRef' under @"IsLabel"@. Drain them into the
+    -- registry before we scan @reg@ — this is the IsLabel-dispatch
+    -- counterpart of 'lazyInstanceRetry' inside the class-method
+    -- dispatcher.  The drain is cheap when empty and runs at most
+    -- once per (cls, tag) combination per run.
+    _ <- drainCataloguedInstancesForClass (BC.pack "IsLabel")
     m <- readIORef reg
     let entries = [ (tags, methods)
                   | ((cls, tags), methods) <- Map.toList m

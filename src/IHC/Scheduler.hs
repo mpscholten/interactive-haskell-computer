@@ -79,6 +79,11 @@ import IHC.Classes
     , setCoreInstanceLoadHook
     , setClassMethodFallback
     , setThExpToExpr
+      -- Lazy instance catalogue (Stage 2)
+    , addCataloguedInstance
+    , drainCataloguedInstancesForClass
+    , resetInstanceCatalogue
+    , catalogueHasClass
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -287,6 +292,13 @@ loadProgramFromSource searchPath src0 = do
     -- which has no validity for this run.
     writeIORef globalLoadedModulesRef Map.empty
     writeIORef envFallbackCache Map.empty
+    -- Stage 2 of the lazy-registration plan: 'registerInstancesFrom'
+    -- now stashes each instance under its class name in
+    -- 'instanceCatalogueRef' instead of registering it eagerly. We
+    -- clear the catalogue here so closures from a previous run (which
+    -- captured the previous run's 'LoadedModule' state) don't fire on
+    -- this run.
+    resetInstanceCatalogue
     -- Install the demand-driven env fallback for this program run so
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
@@ -1877,10 +1889,25 @@ buildClassMethodTable loadedModules = do
                    loadedModules
     pure (Map.fromList (concat tables))
 
+-- | Stage 2 of the lazy-registration plan: do the bare minimum work
+-- now (a memoised 'scanInstanceDecls' and one 'addCataloguedInstance'
+-- call per instance) and defer the expensive 'registerOne' bodies —
+-- per-FV 'discoverInModule', 'buildImportRewritesForNames',
+-- 'evalMethodWithLazy' — to dispatch time.
+--
+-- The catalogue is keyed by class name; 'lazyInstanceRetry' drains
+-- every entry for one class on the first dispatcher miss into that
+-- class. Classes that no user code dispatches into pay zero
+-- instance-body work.
 registerInstancesFrom :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath] -> ClassRegistry -> TypeCtorRegistry -> ClassMethodTable -> Env -> LoadedModule -> IO ()
 registerInstancesFrom registry searchPath includeMap classReg typeCtors classTable env lm = do
     decls <- scanInstanceDecls (lmSource lm)
-    mapM_ (registerOne registry searchPath includeMap classReg typeCtors classTable env lm) decls
+    mapM_ catalogueOne decls
+  where
+    catalogueOne decl@(InstanceDecl cls _ _ _) =
+        addCataloguedInstance cls
+            (registerOne registry searchPath includeMap classReg
+                         typeCtors classTable env lm decl)
 
 -- | Sentinel used as a placeholder when an instance method can't be
 -- evaluated (parse error, unbound helper, etc.). The dispatcher detects
@@ -2325,6 +2352,15 @@ buildImportRewritesForNames registry lm needed = do
 -- runtime).
 registerDerivedFunctorInstances :: ClassRegistry -> [LoadedModule] -> IO ()
 registerDerivedFunctorInstances classReg loadedModules = do
+    -- Stage 2: explicit @instance Functor T@ declarations are NOT
+    -- registered eagerly — they sit in 'instanceCatalogueRef' under
+    -- the @"Functor"@ key. We must materialise them BEFORE the
+    -- derived synthesis below, otherwise 'registerOneFunctor's
+    -- 'lookupInstance' miss leads to the derived dict winning over
+    -- the user's hand-written instance.  Draining is cheap (the
+    -- catalogue is per-run and "Functor" only) and only fires the
+    -- closures the user actually wrote.
+    _ <- drainCataloguedInstancesForClass (BC.pack "Functor")
     mapM_ oneModule loadedModules
   where
     oneModule lm = do
@@ -2414,7 +2450,13 @@ applyRoleOne classReg fT (FRRec, t) = do
 --------------------------------------------------------------------------------
 
 registerDerivedEnumBoundedInstances :: ClassRegistry -> [LoadedModule] -> IO ()
-registerDerivedEnumBoundedInstances classReg loadedModules =
+registerDerivedEnumBoundedInstances classReg loadedModules = do
+    -- Stage 2: same reasoning as 'registerDerivedFunctorInstances' —
+    -- materialise any catalogued explicit @instance Enum T@ /
+    -- @instance Bounded T@ before deriving so the user's
+    -- hand-written instance wins via 'lookupInstance' check.
+    _ <- drainCataloguedInstancesForClass (BC.pack "Enum")
+    _ <- drainCataloguedInstancesForClass (BC.pack "Bounded")
     mapM_ oneModule loadedModules
   where
     oneModule lm = do
@@ -3050,30 +3092,40 @@ preferMethod a b =
             Just v | not (isMethodPlaceholder v) -> Just v
             _ -> a
 
--- | Lazy-scan any in-scope modules that haven't yet been scanned for
--- instances. Called once per dispatch miss; the 'scannedModulesRef' set
--- carried in 'scanHookRef''s closure guards against re-scanning. Returns
--- 'True' if the scan hook was invoked at least once this call (i.e. the
--- caller should retry the lookup).
+-- | Stage 2: on a dispatcher miss for @(cls, tag)@, drain every
+-- catalogued closure for @cls@, materialising its instances into the
+-- registry. Returns 'True' iff the catalogue had any entries (so the
+-- caller knows to retry the lookup).
+--
+-- The legacy 'scanHookRef' path is preserved as a /secondary/ retry
+-- — currently inert (nothing installs the hook) but kept so that
+-- experiments / future hooks can plug in without rewriting this
+-- function.
 lazyInstanceRetry :: ByteString -> ByteString -> IO Bool
-lazyInstanceRetry _cls _tag = do
-    mHook <- readIORef scanHookRef
-    case mHook of
-        Nothing   -> pure False
-        Just hook -> do
-            scope <- currentInstanceScope
-            -- Each call to hook is idempotent: the hook maintains its
-            -- own 'scanned' set and returns immediately for already-
-            -- scanned modules.  The retry is bounded by the size of the
-            -- current instance scope.
-            let modList = Set.toList scope
-            anyScanned <- foldM (\acc m -> do
-                                    r <- try (hook m) :: IO (Either SomeException ())
-                                    case r of
-                                        Right () -> pure (acc || True)
-                                        Left  _  -> pure acc)
-                                False modList
-            pure anyScanned
+lazyInstanceRetry cls _tag = do
+    drained <- drainCataloguedInstancesForClass cls
+    if drained
+        then pure True
+        else legacyHookRetry
+  where
+    legacyHookRetry = do
+        mHook <- readIORef scanHookRef
+        case mHook of
+            Nothing   -> pure False
+            Just hook -> do
+                scope <- currentInstanceScope
+                -- Each call to hook is idempotent: the hook maintains its
+                -- own 'scanned' set and returns immediately for already-
+                -- scanned modules.  The retry is bounded by the size of the
+                -- current instance scope.
+                let modList = Set.toList scope
+                anyScanned <- foldM (\acc m -> do
+                                        r <- try (hook m) :: IO (Either SomeException ())
+                                        case r of
+                                            Right () -> pure (acc || True)
+                                            Left  _  -> pure acc)
+                                    False modList
+                pure anyScanned
 
 -- | Build an Env containing a dispatcher thunk for every method of every
 -- user-defined class visible in any loaded module. Method-name collisions

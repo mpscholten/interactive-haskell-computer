@@ -74,7 +74,9 @@ resolveTypedMethod reg cls method tag = do
             -- First-miss retry: the REPL doesn't pre-load core instance
             -- dicts (keeps startup latency low). The hook force-loads
             -- GHC.Internal.Base / Maybe / … once per session; subsequent
-            -- calls are free.
+            -- calls are free. ('lookupInstanceMethod' inside @tryResolve@
+            -- already drains the Stage-2 lazy-instance catalogue on
+            -- miss, so a separate drain is unnecessary here.)
             triggerCoreInstanceLoad
             resolved2 <- tryResolve
             case resolved2 of
@@ -393,6 +395,8 @@ eval env ipm = go
                         Nothing -> pure Nothing
                         Just classReg -> do
                             let tag = normalizeTyTag ty
+                            -- 'lookupInstanceMethod' drains the Stage-2
+                            -- lazy-instance catalogue on miss.
                             mv <- lookupInstanceMethod classReg
                                     (BC.pack "Bounded") tag method
                             case mv of
