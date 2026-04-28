@@ -40,6 +40,7 @@ library
       , IHC.Driver
       , IHC.Elaborate
       , IHC.Eval
+      , IHC.EvalCore
       , IHC.FFI
       , IHC.Lexer
       , IHC.Lower

@@ -19,6 +19,7 @@ module IHC.Eval
     , force
     , forceMethodVal
     , apply
+    , matchPat
     , runIOVal
     , ownerSentinelKey
     , currentOwner

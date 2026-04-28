@@ -8,9 +8,11 @@ import Test.Hspec
 
 import qualified Data.ByteString.Char8 as BC
 
-import IHC.AST   (Alt(..), Expr(..), Lit(..), Pat(..))
+import IHC.AST     (Alt(..), Expr(..), Lit(..), Pat(..))
 import IHC.Core
-import IHC.Lower (lower, placeholderType)
+import IHC.EvalCore (evalCore)
+import IHC.Lower   (lower, placeholderType)
+import IHC.Val     (Val(..), emptyEnv, emptyIPMap)
 
 spec :: Spec
 spec = describe "IHC.Lower.lower" $ do
@@ -91,3 +93,57 @@ spec = describe "IHC.Lower.lower" $ do
               -- Expressed positionally to avoid importing Type(..)
               -- here; the actual constructor lives in TypeAST.
               coreType core
+
+    --------------------------------------------------------------
+    -- C.2.3 stub — 'evalCore' over the lowered shape produces the
+    -- same WHNF result as 'eval' on the original Expr for the
+    -- structural cases the lowering pass currently emits.  ('Val'
+    -- has no 'Show' instance, so we project to comparable shapes
+    -- via 'asInt' / 'asChar' before the assertion.)
+    --------------------------------------------------------------
+    describe "evalCore on lower output (differential check)" $ do
+        let runCoreInt expr = do
+                v <- evalCore emptyEnv emptyIPMap (lower expr)
+                pure (asInt v)
+            runCoreChar expr = do
+                v <- evalCore emptyEnv emptyIPMap (lower expr)
+                pure (asChar v)
+
+        it "literal: lower (ELit 42) reduces to VInt 42" $ do
+            n <- runCoreInt (ELit (LInt 42))
+            n `shouldBe` Just 42
+
+        it "literal: lower (ELit 'a') reduces to VChar 'a'" $ do
+            c <- runCoreChar (ELit (LChar 'a'))
+            c `shouldBe` Just 'a'
+
+        it "let: lower (let x = 7 in x) reduces to 7" $ do
+            let e = ELet [(BC.pack "x", ELit (LInt 7))]
+                         (EVar (BC.pack "x"))
+            n <- runCoreInt e
+            n `shouldBe` Just 7
+
+        it "case: lower (case 1 of 1 -> 'A'; _ -> 'B') reduces to 'A'" $ do
+            let e = ECase (ELit (LInt 1))
+                         [ Alt (PLit (LInt 1)) (ELit (LChar 'A'))
+                         , Alt PWild           (ELit (LChar 'B'))
+                         ]
+            c <- runCoreChar e
+            c `shouldBe` Just 'A'
+
+        it "case wildcard fallback: lower (case 2 of 1 -> 'A'; _ -> 'B') = 'B'" $ do
+            let e = ECase (ELit (LInt 2))
+                         [ Alt (PLit (LInt 1)) (ELit (LChar 'A'))
+                         , Alt PWild           (ELit (LChar 'B'))
+                         ]
+            c <- runCoreChar e
+            c `shouldBe` Just 'B'
+
+  where
+    asInt :: Val -> Maybe Int
+    asInt (VInt n) = Just (fromIntegral n)
+    asInt _        = Nothing
+
+    asChar :: Val -> Maybe Char
+    asChar (VChar c) = Just c
+    asChar _         = Nothing
