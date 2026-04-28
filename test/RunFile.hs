@@ -1031,6 +1031,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "False\nTrue\n"
 
     --------------------------------------------------------------------
+    -- B.3 Overlap pragmas (GHC user guide §6.8.7) — DEFERRED.
+    -- ihc's lexer consumes @{-# OVERLAPPING #-}@ etc. as whitespace
+    -- and the registry has no notion of specificity (tags can't
+    -- distinguish @[Char]@ from @[a]@). Real overlap-aware dispatch
+    -- depends on the typed-IR slice (C.2). This fixture is a
+    -- regression guard for the pragma-tolerance level — declarations
+    -- with overlap pragmas must continue to parse and run.
+    --------------------------------------------------------------------
+    it "B.3 overlap pragmas are tolerated (last-write-wins today)" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Overlap/overlap_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
