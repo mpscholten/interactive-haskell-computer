@@ -79,6 +79,7 @@ import IHC.Classes
     , setCoreInstanceLoadHook
     , setClassMethodFallback
     , setThExpToExpr
+    , registerSuperclasses
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -1819,6 +1820,15 @@ buildClassMethodTable :: [LoadedModule] -> IO ClassMethodTable
 buildClassMethodTable loadedModules = do
     tables <- mapM (\lm -> do
                         decls <- scanClassDecls (lmSource lm)
+                        -- B.1: register each class's direct superclass
+                        -- list as a side effect so the global
+                        -- 'superclassesRef' (in IHC.Classes) is
+                        -- populated by the time instance loading runs
+                        -- and the dispatcher can consult it later.
+                        mapM_ (\d -> registerSuperclasses
+                                        (classClassName d)
+                                        (classSuperclasses d))
+                              decls
                         pure [ (classClassName d, classMethodNames d) | d <- decls ])
                    loadedModules
     pure (Map.fromList (concat tables))
@@ -3037,7 +3047,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- top-level bindings that merely happen to have a single-pred
     -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
     let allMethodNames = Set.fromList
-            [ m | ClassDecl _ ms _ <- decls, m <- ms ]
+            [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
@@ -3046,7 +3056,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
     pure (Map.fromList filtered)
   where
-    buildOne (ClassDecl cls methodNames _defaults) =
+    buildOne (ClassDecl cls methodNames _defaults _supers) =
         mapM (mkMethodEntry cls) methodNames
     mkMethodEntry cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
@@ -3068,7 +3078,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
         decls <- scanClassDecls (lmSource lm)
         mapM_ (oneClass lm) decls
 
-    oneClass lm (ClassDecl cls methodNames defaults)
+    oneClass lm (ClassDecl cls methodNames defaults supers)
         | Map.null defaults = pure ()
         | otherwise = do
             -- Pre-demand-load each free var referenced in the class's
@@ -4747,7 +4757,7 @@ resolveFallback mOwner name = do
             `catch` (\(_ :: SomeException) -> pure [])
         let classMethods =
                 [ method
-                | ClassDecl _ methods _ <- classDecls
+                | ClassDecl _ methods _ _ <- classDecls
                 , method <- methods
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
@@ -4863,7 +4873,7 @@ resolveFallback mOwner name = do
 
     tryClassMethodSlot owner bareName = do
         decls <- scanClassDecls (lmSource owner)
-        case [ cls | ClassDecl cls methods _ <- decls, bareName `elem` methods ] of
+        case [ cls | ClassDecl cls methods _ _ <- decls, bareName `elem` methods ] of
             []      -> pure Nothing
             (cls:_) -> do
                 mSharedReg <- readIORef sharedClassRegRef
@@ -5257,7 +5267,7 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
         classDecls <- scanClassDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs)
-              | ClassDecl _ _ defs <- classDecls
+              | ClassDecl _ _ defs _ <- classDecls
               , (n, lhs) <- Map.toList defs
               ]
 
@@ -5632,13 +5642,13 @@ resolveImport registry searchPath includeMap lm name = do
 
     moduleClassMethods targetLm = do
         decls <- scanClassDecls (lmSource targetLm)
-        pure [ method | ClassDecl _ methods _ <- decls, method <- methods ]
+        pure [ method | ClassDecl _ methods _ _ <- decls, method <- methods ]
 
     exportsClassMethod targetLm methodName = do
         decls <- scanClassDecls (lmSource targetLm)
         let classes =
                 [ (className, methods)
-                | ClassDecl className methods _ <- decls
+                | ClassDecl className methods _ _ <- decls
                 , methodName `elem` methods
                 ]
             exportedBy className methods = case mhExports (lmHeader targetLm) of

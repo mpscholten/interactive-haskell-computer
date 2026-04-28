@@ -55,6 +55,12 @@ module IHC.Classes
     , thExpToExprRef
     , setThExpToExpr
     , runThExpToExpr
+      -- * B.1: superclass tracking
+    , registerSuperclasses
+    , lookupSuperclasses
+    , clearSuperclasses
+    , allSuperclasses
+    , checkSuperclassCoverage
     ) where
 
 import Data.ByteString (ByteString)
@@ -451,3 +457,72 @@ runThExpToExpr :: Val -> IO Expr
 runThExpToExpr v = do
     hook <- readIORef thExpToExprRef
     hook v
+
+--------------------------------------------------------------------------------
+-- B.1: superclass tracking (Haskell Report §4.3.1)
+--
+-- @class C1 a, C2 a => D a where …@ declares C1 and C2 as superclasses
+-- of D: every @instance D T@ implies the existence of @instance C1 T@
+-- and @instance C2 T@.  We track that relation in a global IORef so
+-- the scheduler can verify coherence after instance loading and the
+-- dispatcher can (in B.2) reach class default-method bodies that
+-- reference superclass methods.
+--
+-- The map is keyed by class name only — single-param classes vs.
+-- multi-param classes share the same channel because dispatch in ihc
+-- already lives entirely in tag space.  We record only the superclass
+-- class names; tracking which type variable each superclass is applied
+-- to would require a real type AST and is deferred.
+--------------------------------------------------------------------------------
+
+{-# NOINLINE superclassesRef #-}
+superclassesRef :: IORef (Map ByteString [ByteString])
+superclassesRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Register a class's superclass list.  Idempotent: subsequent
+-- registrations for the same class name overwrite (later modules win,
+-- matching the rest of the registry).
+registerSuperclasses :: ByteString -> [ByteString] -> IO ()
+registerSuperclasses cls supers
+    | null supers = pure ()
+    | otherwise   = modifyIORef' superclassesRef (Map.insert cls supers)
+
+-- | Direct superclasses of a class (one hop).
+lookupSuperclasses :: ByteString -> IO [ByteString]
+lookupSuperclasses cls =
+    Map.findWithDefault [] cls <$> readIORef superclassesRef
+
+-- | Reset the global superclass map.  Useful for tests.
+clearSuperclasses :: IO ()
+clearSuperclasses = writeIORef superclassesRef Map.empty
+
+-- | Transitive closure: every superclass reachable from @cls@ via the
+-- direct-superclass relation, deduplicated.  Excludes @cls@ itself.
+allSuperclasses :: ByteString -> IO [ByteString]
+allSuperclasses cls = do
+    m <- readIORef superclassesRef
+    let go !seen [] = seen
+        go !seen (c : cs)
+            | Set.member c seen = go seen cs
+            | otherwise =
+                let seen'   = Set.insert c seen
+                    parents = Map.findWithDefault [] c m
+                in go seen' (parents ++ cs)
+        roots = Map.findWithDefault [] cls m
+    pure (Set.toList (go Set.empty roots))
+
+-- | After all instances have been registered, walk the class registry
+-- and report any @(D, T)@ entry whose required superclass instance
+-- @(C, T)@ is missing.  Returns a list of @(D, T, C)@ triples that
+-- callers can format into diagnostics.  Side-effect free.
+checkSuperclassCoverage :: ClassRegistry -> IO [(ByteString, [ByteString], ByteString)]
+checkSuperclassCoverage reg = do
+    rmap <- readIORef reg
+    superMap <- readIORef superclassesRef
+    let problems =
+            [ (cls, tags, super)
+            | ((cls, tags), _methods) <- Map.toList rmap
+            , super <- Map.findWithDefault [] cls superMap
+            , not (Map.member (super, tags) rmap)
+            ]
+    pure problems

@@ -92,6 +92,7 @@ import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
+import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal)
 import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
@@ -468,6 +469,12 @@ builtins reg =
     , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
+    -- B.1: debug-only superclass-relation probe.  Source-loaded code
+    -- can call @__ihc_class_supers \"MyOrd\"@ to inspect the global
+    -- superclass map; useful for testing that the scanner captured
+    -- the @class C a => D a@ relation. Single argument is a [Char]
+    -- list (a String); result is a [[Char]] list (a [String]).
+    , ("__ihc_class_supers", classSupersProbeB)
     , ("exitWith",    exitWithB)
     , ("exitSuccess", exitSuccessB)
     -- Char / numeric conversions
@@ -2240,6 +2247,25 @@ getLineB :: IO Val
 getLineB = pure $ VIO $ do
     s <- getLine
     stringToListValIO s
+
+-- | B.1: debug-only probe of the global superclass-relation map.
+-- Takes a class name (as a [Char] list) and returns the list of
+-- direct superclass names ([[Char]]).  Used by fixtures to verify
+-- that @class Eq a => Ord a@ et al. are captured by the scanner.
+classSupersProbeB :: IO Val
+classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av    <- force aT
+    cls   <- valToString av
+    supers <- IHC.Classes.lookupSuperclasses (BC.pack cls)
+    -- Build a Haskell-level [String] cons list from the result.
+    let buildList []     = pure (VCon "[]" [])
+        buildList (n:ns) = do
+            headV <- stringToListValIO (BC.unpack n)
+            headT <- newWHNFThunk headV
+            restV <- buildList ns
+            restT <- newWHNFThunk restV
+            pure (VCon ":" [headT, restT])
+    buildList supers
 
 errorB :: IO Val
 errorB = pure $ VFun $ \a -> do

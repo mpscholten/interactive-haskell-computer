@@ -1004,6 +1004,22 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "forced\n"
 
     --------------------------------------------------------------------
+    -- B.1 Superclass dictionaries: scanner captures the head context
+    -- (`class C a => D a where …`) into a global superclass-relation
+    -- map; the debug builtin `__ihc_class_supers` exposes it.  This
+    -- is the data layer for B.2 (default methods using superclass
+    -- methods) and the deferred coherence check.
+    --------------------------------------------------------------------
+    it "B.1 scanner captures class superclass context" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Superclass/superclass_capture.hs")
+        n   `shouldBe` 0
+        out `shouldBe`
+            "MyEq: []\n\
+            \MyOrd: [\"MyEq\"]\n\
+            \MyHashable: [\"MyEq\",\"MyShow\"]\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do
