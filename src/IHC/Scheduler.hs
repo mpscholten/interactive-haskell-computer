@@ -79,6 +79,7 @@ import IHC.Classes
     , setCoreInstanceLoadHook
     , setClassMethodFallback
     , setThExpToExpr
+    , registerSuperclasses
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -1840,6 +1841,15 @@ buildClassMethodTable :: [LoadedModule] -> IO ClassMethodTable
 buildClassMethodTable loadedModules = do
     tables <- mapM (\lm -> do
                         decls <- scanClassDecls (lmSource lm)
+                        -- B.1: register each class's direct superclass
+                        -- list as a side effect so the global
+                        -- 'superclassesRef' (in IHC.Classes) is
+                        -- populated by the time instance loading runs
+                        -- and the dispatcher can consult it later.
+                        mapM_ (\d -> registerSuperclasses
+                                        (classClassName d)
+                                        (classSuperclasses d))
+                              decls
                         pure [ (classClassName d, classMethodNames d) | d <- decls ])
                    loadedModules
     pure (Map.fromList (concat tables))
@@ -3058,7 +3068,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- top-level bindings that merely happen to have a single-pred
     -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
     let allMethodNames = Set.fromList
-            [ m | ClassDecl _ ms _ <- decls, m <- ms ]
+            [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
@@ -3067,7 +3077,7 @@ buildClassMethodEnv classReg existing loadedModules = do
     let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
     pure (Map.fromList filtered)
   where
-    buildOne (ClassDecl cls methodNames _defaults) =
+    buildOne (ClassDecl cls methodNames _defaults _supers) =
         mapM (mkMethodEntry cls) methodNames
     mkMethodEntry cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
@@ -3089,7 +3099,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
         decls <- scanClassDecls (lmSource lm)
         mapM_ (oneClass lm) decls
 
-    oneClass lm (ClassDecl cls methodNames defaults)
+    oneClass lm (ClassDecl cls methodNames defaults supers)
         | Map.null defaults = pure ()
         | otherwise = do
             -- Pre-demand-load each free var referenced in the class's
@@ -3598,6 +3608,8 @@ rewriteExpr rw = go []
                                        : goStmts bound rest
     goStmts bound (SBind n e : rest) = SBind n (go bound e)
                                        : goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = SBangBind n (go bound e)
+                                       : goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest) =
         let names = map fst bs
             bound' = names ++ bound
@@ -3611,6 +3623,7 @@ rewriteExpr rw = go []
     patBound (PCon _ ps)     = concatMap patBound ps
     patBound (PAs n p)       = n : patBound p
     patBound (PBang p)       = patBound p
+    patBound (PIrref p)      = patBound p
     patBound (PTuple ps)     = concatMap patBound ps
     patBound (PRecord _ fps) = concatMap (patBound . snd) fps
     patBound (PRecordWild _) = []
@@ -4765,7 +4778,7 @@ resolveFallback mOwner name = do
             `catch` (\(_ :: SomeException) -> pure [])
         let classMethods =
                 [ method
-                | ClassDecl _ methods _ <- classDecls
+                | ClassDecl _ methods _ _ <- classDecls
                 , method <- methods
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
@@ -4881,7 +4894,7 @@ resolveFallback mOwner name = do
 
     tryClassMethodSlot owner bareName = do
         decls <- scanClassDecls (lmSource owner)
-        case [ cls | ClassDecl cls methods _ <- decls, bareName `elem` methods ] of
+        case [ cls | ClassDecl cls methods _ _ <- decls, bareName `elem` methods ] of
             []      -> pure Nothing
             (cls:_) -> do
                 mSharedReg <- readIORef sharedClassRegRef
@@ -5275,7 +5288,7 @@ discoverClassAndInstanceFreeVars registry searchPath includeMap = do
         classDecls <- scanClassDecls (lmSource lm)
         mapM_ (discoverMethods lm)
               [ (n, lhs)
-              | ClassDecl _ _ defs <- classDecls
+              | ClassDecl _ _ defs _ <- classDecls
               , (n, lhs) <- Map.toList defs
               ]
 
@@ -5650,13 +5663,13 @@ resolveImport registry searchPath includeMap lm name = do
 
     moduleClassMethods targetLm = do
         decls <- scanClassDecls (lmSource targetLm)
-        pure [ method | ClassDecl _ methods _ <- decls, method <- methods ]
+        pure [ method | ClassDecl _ methods _ _ <- decls, method <- methods ]
 
     exportsClassMethod targetLm methodName = do
         decls <- scanClassDecls (lmSource targetLm)
         let classes =
                 [ (className, methods)
-                | ClassDecl className methods _ <- decls
+                | ClassDecl className methods _ _ <- decls
                 , methodName `elem` methods
                 ]
             exportedBy className methods = case mhExports (lmHeader targetLm) of
@@ -6079,6 +6092,7 @@ freeVars = goAll []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = goAll bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names  = map fst bs
             bound' = names ++ bound
@@ -6095,6 +6109,7 @@ freeVars = goAll []
     patBound (PCon _ ps)         = concatMap patBound ps
     patBound (PAs n p)           = n : patBound p
     patBound (PBang p)           = patBound p
+    patBound (PIrref p)          = patBound p
     patBound (PTuple ps)         = concatMap patBound ps
     patBound (PRecord _ fps)     = concatMap (patBound . snd) fps
     patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
@@ -6129,9 +6144,10 @@ needsRecordFields = goExpr
         EGuardFail    -> False
 
     goStmt = \case
-        SExpr e        -> goExpr e
-        SBind _ e      -> goExpr e
-        SLet bs        -> any (goExpr . snd) bs
+        SExpr e         -> goExpr e
+        SBind _ e       -> goExpr e
+        SBangBind _ e   -> goExpr e
+        SLet bs         -> any (goExpr . snd) bs
         SImplicitLet bs -> any (goExpr . snd) bs
 
     goAlt (Alt p e) = goPat p || goExpr e
@@ -6143,6 +6159,7 @@ needsRecordFields = goExpr
         PCon _ ps     -> any goPat ps
         PAs _ p       -> goPat p
         PBang p       -> goPat p
+        PIrref p      -> goPat p
         PTuple ps     -> any goPat ps
         PRecord{}     -> True
         PRecordWild{} -> True
@@ -6206,6 +6223,7 @@ discoveryFreeVars = go []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = go bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = go bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = go bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names = map fst bs
         in goStmts (names ++ bound) rest
@@ -6369,9 +6387,10 @@ desugarRecordCons fldReg = go
     go (ETyApp inner ty) = ETyApp (go inner) ty   -- value-level @T: recurse into inner
     go e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (go e)
-    goStmt (SBind n e) = SBind n (go e)
-    goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (go e)
+    goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SBangBind n e)   = SBangBind n (go e)
+    goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Look up all fields for a constructor from the FieldRegistry,
@@ -6415,9 +6434,10 @@ desugarRecordPats fldReg = goExpr
     goExpr (ETyApp inner ty) = ETyApp (goExpr inner) ty   -- value-level @T: recurse
     goExpr e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (goExpr e)
-    goStmt (SBind n e) = SBind n (goExpr e)
-    goStmt (SLet bs)   = SLet [(n, goExpr b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (goExpr e)
+    goStmt (SBind n e)       = SBind n (goExpr e)
+    goStmt (SBangBind n e)   = SBangBind n (goExpr e)
+    goStmt (SLet bs)         = SLet [(n, goExpr b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, goExpr b) | (n, b) <- bs]
 
     -- Handle a case expression, desugaring view-pattern alts into a chain.
@@ -6483,5 +6503,6 @@ desugarRecordPats fldReg = goExpr
     goPat (PCon n ps)      = PCon n (map goPat ps)
     goPat (PAs n p)        = PAs n (goPat p)
     goPat (PBang p)        = PBang (goPat p)
+    goPat (PIrref p)       = PIrref (goPat p)
     goPat (PTuple ps)      = PTuple (map goPat ps)
     goPat p                = p  -- PVar, PWild, PLit

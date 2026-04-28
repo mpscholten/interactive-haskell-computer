@@ -19,6 +19,7 @@ module IHC.Eval
     , force
     , forceMethodVal
     , apply
+    , matchPat
     , runIOVal
     , ownerSentinelKey
     , currentOwner
@@ -150,6 +151,7 @@ eval :: Env -> ImplicitParamMap -> Expr -> IO Val
 eval env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
+    go (ELit (LInteger n)) = pure (VInteger n)
     go (ELit (LFloat d)) = pure (VFloat d)
     -- Source-level Haskell strings are [Char]. Keeping literals as real cons
     -- lists lets source-loaded libraries like bytestring pattern-match and
@@ -713,6 +715,22 @@ pureStateFn v = VFun $ \_stateThunk -> do
     vT <- newWHNFThunk v
     pure (VCon "(#,#)" [stT, vT])
 
+-- | All variables bound by a pattern, left-to-right.  Mirrors the
+-- @patVars@ helpers in 'IHC.Parser' (which are private to that module).
+-- Used by the 'PIrref' matcher to know which thunk slots to allocate.
+patternVars :: Pat -> [Name]
+patternVars (PVar n)         = [n]
+patternVars PWild            = []
+patternVars (PLit _)         = []
+patternVars (PCon _ ps)      = concatMap patternVars ps
+patternVars (PAs n p)        = n : patternVars p
+patternVars (PBang p)        = patternVars p
+patternVars (PIrref p)       = patternVars p
+patternVars (PTuple ps)      = concatMap patternVars ps
+patternVars (PRecord _ fps)  = concatMap (patternVars . snd) fps
+patternVars (PRecordWild _)  = []
+patternVars (PView _ p)      = patternVars p
+
 matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
 matchPat PWild        _          = pure (Just [])
 matchPat (PVar n)     v          = do
@@ -722,6 +740,30 @@ matchPat (PVar n)     v          = do
     t <- newWHNFThunk v
     pure (Just [(n, t)])
 matchPat (PBang p)    v          = matchPat p v
+-- Per Haskell Report §3.17.3: an irrefutable pattern @~p@ ALWAYS
+-- matches.  Each variable bound by @p@ becomes a thunk that, when
+-- forced, re-attempts the inner match against the original value;
+-- only then can the match-fail error fire.  This is the "lazy
+-- pattern" deferral.  Sharing of the inner match is preserved by the
+-- thunk's IORef-backed memoisation.
+matchPat (PIrref p)   v          = do
+    let vars = patternVars p
+    binds <- traverse (\name -> do
+        t <- newLazyBuiltinThunk $ do
+            m <- matchPat p v
+            case m of
+                Just bs -> case lookup name bs of
+                    Just t' -> force t'
+                    Nothing ->
+                        error ("IHC.Eval: irrefutable pattern: variable `"
+                               <> BC.unpack name
+                               <> "` not bound by inner pattern "
+                               <> show p)
+                Nothing ->
+                    error ("Irrefutable pattern failed for pattern "
+                           <> show p)
+        pure (name, t)) vars
+    pure (Just binds)
 matchPat (PAs n p)    v          = do
     m <- matchPat p v
     case m of
@@ -741,6 +783,16 @@ matchPat (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LInt _)) _       = pure Nothing
+-- A.3: arbitrary-precision Integer literal pattern.  Equality against
+-- VInteger uses the underlying Integer; against VInt we widen to
+-- compare. No match against any other shape.
+matchPat (PLit (LInteger n)) (VInteger m)
+    | n == m    = pure (Just [])
+    | otherwise = pure Nothing
+matchPat (PLit (LInteger n)) (VInt m)
+    | n == toInteger m = pure (Just [])
+    | otherwise        = pure Nothing
+matchPat (PLit (LInteger _)) _   = pure Nothing
 matchPat (PLit (LFloat x)) (VFloat y)
     | x == y    = pure (Just [])
     | otherwise = pure Nothing
@@ -852,6 +904,23 @@ matchPat (PCon name pats) (VCon vname vthunks)
         matchFields rest ((n, t) : acc)
     matchFields ((PWild, _) : rest) acc =
         matchFields rest acc
+    -- Per Haskell Report §3.17.2 + GHC BangPatterns: a bang sub-pattern
+    -- forces the corresponding field thunk to WHNF before binding. The
+    -- generic _ -> force arm below handles non-PVar inner patterns
+    -- correctly (the force happens unconditionally), but PBang (PVar n)
+    -- would otherwise route through matchPat's PBang->p collapse and
+    -- bind n to an unforced thunk via the PVar arm above. Force here.
+    matchFields ((PBang inner, t) : rest) acc = do
+        _ <- force t  -- ! : force the field thunk; sharing preserved.
+        case inner of
+            PVar n -> matchFields rest ((n, t) : acc)
+            PWild  -> matchFields rest acc
+            _      -> do
+                fv <- force t
+                m  <- matchPat inner fv
+                case m of
+                    Nothing   -> pure Nothing
+                    Just subs -> matchFields rest (reverse subs ++ acc)
     matchFields ((p, t) : rest) acc = do
         fv <- force t
         m  <- matchPat p fv
@@ -1140,6 +1209,23 @@ evalDo env ipm (SBind name e : rest) =
         mv <- eval env ipm e
         v  <- runIOVal mv
         vT <- newWHNFThunk v
+        let env' = extendEnv name vT env
+        restV <- evalDo env' ipm rest
+        runIOVal restV
+evalDo env ipm [SBangBind _ e] =
+    -- Defensive: a do-block ending in a (bang-)bind is ill-formed; mirror SBind.
+    eval env ipm e
+evalDo env ipm (SBangBind name e : rest) =
+    -- Per Haskell Report §3.17.2 + GHC BangPatterns: !x <- m forces the
+    -- bound result to WHNF before the rest of the do-block runs. The
+    -- parser desugars do-blocks to (>>=)/(>>)/lambda chains, so this
+    -- branch is only hit on the defensive EDo fallback path; we still
+    -- preserve the strictness contract here for completeness.
+    pure $ VIO $ do
+        mv <- eval env ipm e
+        v  <- runIOVal mv
+        vT <- newWHNFThunk v
+        _  <- force vT  -- bang: force to WHNF before continuing
         let env' = extendEnv name vT env
         restV <- evalDo env' ipm rest
         runIOVal restV

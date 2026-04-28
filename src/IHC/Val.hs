@@ -59,6 +59,13 @@ import IHC.AST (Expr, Name)
 -- inside a 'VCon'.
 data Val
     = VInt   !Int64
+    | VInteger !Integer                -- arbitrary-precision Integer (A.3);
+                                       -- produced by 'ELit (LInteger _)'.
+                                       -- Today only the print path handles
+                                       -- VInteger directly; arithmetic
+                                       -- between VInteger and VInt errors
+                                       -- pending the elaborator-driven
+                                       -- fromInteger-insertion path.
     | VFloat !Double                   -- Float/Double (Phase 2.9+)
     | VChar  !Char                     -- single character (Phase 2.2+)
     | VStr   !ByteString               -- raw bytes — transitional, some
@@ -122,6 +129,7 @@ data PrimObj
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
+showValForDebug (VInteger n) = show n
 showValForDebug (VFloat d)  = show d
 showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)

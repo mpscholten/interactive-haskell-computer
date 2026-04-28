@@ -34,13 +34,16 @@ library
       , IHC.Builtins
       , IHC.CabalProject
       , IHC.Classes
+      , IHC.Core
       , IHC.Cpp
       , IHC.Diagnostics
       , IHC.Driver
       , IHC.Elaborate
       , IHC.Eval
+      , IHC.EvalCore
       , IHC.FFI
       , IHC.Lexer
+      , IHC.Lower
       , IHC.ModuleHeader
       , IHC.PackageStore
       , IHC.Parser
@@ -139,6 +142,7 @@ test-suite ihc-test
     main-is:          Spec.hs
     other-modules:
         CabalLoader
+      , CoreLowerTest
       , Coverage
       , JitSmoke
       , LexerIhp

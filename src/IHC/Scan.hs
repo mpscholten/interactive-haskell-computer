@@ -34,6 +34,9 @@ module IHC.Scan
     , FieldRegistry
     , TypeCtorRegistry
     , scanDataDecls
+      -- * Per-constructor strict-field bitmap (A.5)
+    , lookupCtorStrictness
+    , clearCtorStrictness
       -- * Deriving synthesis
     , FunctorFieldRole(..)
     , FunctorCtor(..)
@@ -64,6 +67,7 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Dynamic (fromDynamic, toDyn)
 import Data.Typeable (Typeable)
 import Control.Monad (when)
@@ -1131,6 +1135,27 @@ type TypeCtorRegistry = Map ByteString [ByteString]
 --   Ctor :: ctx => T1 -> T2 -> TyCon
 -- data TyCon = forall a. C a => Ctor T1       -- existential ctor
 -- @
+-- | A.5 — global per-constructor strictness bitmap.  Populated as a
+-- side effect by 'scanDataDecls' when it sees @data T = MkT !A B !C@
+-- style declarations; consumed by 'IHC.Builtins.buildConEnv' so the
+-- ctor-application closure forces strict-field thunks before producing
+-- the 'VCon'.  Only constructors with at least one strict field have
+-- an entry; anything else is implicitly all-lazy.
+{-# NOINLINE ctorStrictnessRef #-}
+ctorStrictnessRef :: IORef (Map ByteString [Bool])
+ctorStrictnessRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Look up a constructor's strict-field bitmap.  Empty list means "no
+-- strictness recorded" (treat all fields as lazy).
+lookupCtorStrictness :: ByteString -> IO [Bool]
+lookupCtorStrictness name =
+    Map.findWithDefault [] name <$> readIORef ctorStrictnessRef
+
+-- | Reset the global strictness map.  Useful for tests that want to
+-- avoid leaking constructor metadata across runs.
+clearCtorStrictness :: IO ()
+clearCtorStrictness = writeIORef ctorStrictnessRef Map.empty
+
 scanDataDecls :: Source -> IO (DataRegistry, FieldRegistry, TypeCtorRegistry)
 scanDataDecls src
     | not (hasAnyKeyword src [BC.pack "data", BC.pack "newtype"])
@@ -1367,12 +1392,20 @@ scanDataDecls src
                             TkNewline -> skipNls c1
                             _         -> (t, c1)
                     (peek, curAfterPeek) = skipNls cur'
-                (arity, fields, curN) <- case tkKind peek of
-                    TkLBrace ->
-                        collectRecordFields 0 [] curAfterPeek
+                (arity, strict, fields, curN) <- case tkKind peek of
+                    TkLBrace -> do
+                        (a, fs, c) <- collectRecordFields 0 [] curAfterPeek
+                        pure (a, replicate a False, fs, c)
                     _ -> do
-                        (n, curN') <- countCtorFields 0 cur'
-                        pure (n, [], curN')
+                        (n, s, curN') <- countCtorFields 0 cur'
+                        pure (n, s, [], curN')
+                -- A.5: record per-constructor strictness in the global
+                -- IORef as a side effect so we don't have to thread a
+                -- new map through every helper.  Only stash entries
+                -- whose strictness list contains at least one True; all
+                -- other ctors implicitly have all-lazy fields.
+                when (any id strict) $
+                    modifyIORef' ctorStrictnessRef (Map.insert name strict)
                 let dReg' = Map.insert name (tyName, arity, cIdx) dReg
                     fReg' = foldr
                         (\(fieldName, idx) acc ->
@@ -1408,12 +1441,18 @@ scanDataDecls src
                                             TkNewline -> skipNls c1
                                             _         -> (t, c1)
                                     (peek, curAfterPeek) = skipNls cur'
-                                (arity, fields, curN) <- case tkKind peek of
-                                    TkLBrace ->
-                                        collectRecordFields 0 [] curAfterPeek
+                                (arity, strict, fields, curN) <- case tkKind peek of
+                                    TkLBrace -> do
+                                        (a, fs, c) <- collectRecordFields 0 [] curAfterPeek
+                                        pure (a, replicate a False, fs, c)
                                     _ -> do
-                                        (n, curN') <- countCtorFields 0 cur'
-                                        pure (n, [], curN')
+                                        (n, s, curN') <- countCtorFields 0 cur'
+                                        pure (n, s, [], curN')
+                                -- A.5: record per-constructor strictness, same
+                                -- as in the TkPrimId branch above.
+                                when (any id strict) $
+                                    modifyIORef' ctorStrictnessRef
+                                        (Map.insert name strict)
                                 let dReg' = Map.insert name (tyName, arity, cIdx) dReg
                                     fReg' = foldr
                                         (\(fieldName, idx) acc ->
@@ -1525,43 +1564,46 @@ scanDataDecls src
             _          -> skipType depth cur'
 
     -- Count positional atoms up to '|', '{', column-1 token, or EOF.
-    countCtorFields !n cur = do
+    -- A.5: also track per-field strictness.  We thread the bit list in
+    -- reverse-source order through @revStrict@ and a @pendingBang@ flag
+    -- that's set by 'TkBang' and consumed by the next field-introducing
+    -- token, then pop into the bit list when the field is committed.
+    countCtorFields !n cur =
+        countCtorFieldsS n [] False cur
+
+    countCtorFieldsS !n !revStrict !pendingBang cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkBar            -> pure (n, cur)             -- don't consume
-            TkEof            -> pure (n, cur)
-            TkLBrace         -> pure (n, cur)             -- record block; stop
+            TkBar            -> pure (n, reverse revStrict, cur)  -- don't consume
+            TkEof            -> pure (n, reverse revStrict, cur)
+            TkLBrace         -> pure (n, reverse revStrict, cur)  -- record block; stop
             TkNewline        ->
-                -- If the next significant token is at col 1, decl ends;
-                -- otherwise it's whitespace between fields.
                 let (peek, _) = nextToken src cur' in
                 case tkKind peek of
-                    TkEof -> pure (n, cur')
-                    _ | tkCol peek == 1 -> pure (n, cur')
-                      | otherwise       -> countCtorFields n cur'
+                    TkEof -> pure (n, reverse revStrict, cur')
+                    _ | tkCol peek == 1 -> pure (n, reverse revStrict, cur')
+                      | otherwise       ->
+                          countCtorFieldsS n revStrict pendingBang cur'
             TkLParen -> do
                 curAfter <- skipToMatchingRParen 1 cur'
-                countCtorFields (n + 1) curAfter
-            -- '[' opens a list type like @[Rose]@ — count as one field
-            -- and skip to the matching ']'. Without this the scanner
-            -- treats '[' as a decl terminator and under-counts arity.
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkLBracket -> do
                 curAfter <- skipToMatchingRBracket 1 cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkConId _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkIdent _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
             TkPrimId _ -> do
                 curAfter <- skipQualifiedTypeTail cur'
-                countCtorFields (n + 1) curAfter
-            -- TkBang is a strictness annotation on the *next* field, not a
-            -- field itself and not a terminator. Skip it and continue.
-            TkBang    -> countCtorFields n cur'
+                countCtorFieldsS (n + 1) (pendingBang : revStrict) False curAfter
+            -- TkBang is a strictness annotation on the *next* field; mark
+            -- pendingBang so the next field-introducing token records it.
+            TkBang    -> countCtorFieldsS n revStrict True cur'
             -- Unrecognized token stops the field scan gracefully.
-            _ -> pure (n, cur)
+            _ -> pure (n, reverse revStrict, cur)
 
     -- Treat a qualified type name like `A.Array` as part of the same field.
     -- Without this, strict unpacked declarations such as
@@ -2599,6 +2641,14 @@ data ClassDecl = ClassDecl
     { classClassName   :: !ByteString
     , classMethodNames :: ![ByteString]
     , classDefaults    :: !(Map ByteString BindingLhs)
+    -- | B.1 — superclass class names captured from the head context
+    -- (the @C1 a, C2 a@ block before @=>@).  Empty when the class has
+    -- no context.  The relation is stored as a flat list of names; we
+    -- don't currently track which type variable each superclass is
+    -- applied to since dispatch is by tag and ihc treats single-param
+    -- and multi-param classes uniformly through the (class, [tag])
+    -- composite key.
+    , classSuperclasses :: ![ByteString]
     } deriving (Eq, Show)
 
 -- | Scan the whole source for top-level @class@ declarations and return
@@ -2633,15 +2683,22 @@ scanClassDeclsRaw src
     -- After `class`, parse head to find the class name, then walk the
     -- `where` body collecting method sigs + default-method bindings.
     scanOneClass cur0 = do
-        (mClassName, curWhere) <- parseClassHead cur0
+        ((mClassName, supers), curWhere) <- parseClassHead cur0
         case mClassName of
             Just cls -> do
                 (methodNames, defaults) <- parseClassBody curWhere
-                pure (Just (ClassDecl cls methodNames defaults))
+                pure (Just (ClassDecl cls methodNames defaults supers))
             Nothing -> pure Nothing
 
     -- Parse: [context =>] ClassName tyvar* [| fundep, ...] where
     -- Grab the first ConId AFTER any =>.  Stop at `where`.
+    --
+    -- B.1: also collect class-context ConIds seen BEFORE the `=>`
+    -- token (e.g. @class Eq a => Ord a@ produces superclasses
+    -- @[\"Eq\"]@; @class (Eq a, Show a) => Foo a@ produces
+    -- @[\"Eq\", \"Show\"]@).  We walk the full token stream rather
+    -- than skipping parens wholesale so the ConIds inside the tuple
+    -- context are visible.
     --
     -- FunctionalDependencies: the optional `| a b -> c, d -> e` clause
     -- between the class-head params and `where` has no runtime meaning
@@ -2650,47 +2707,77 @@ scanClassDeclsRaw src
     -- lowercase tyvars in the fundep body from ever being mistaken for
     -- something meaningful, and documents the intent explicitly rather
     -- than relying on the default fallthrough.
-    parseClassHead cur0 = scanHead cur0 Nothing False
+    parseClassHead cur0 = scanHead cur0 Nothing [] (0 :: Int) False
       where
-        scanHead cur mCls seenArrow = do
+        -- @mCls@: candidate class name (set after we see TkConId).
+        -- @preRev@: ConIds seen BEFORE @=>@, in reverse source order.
+        --   When @=>@ fires, these become the superclass list and
+        --   @mCls@ is reset to look for the real class name.
+        --   When @=>@ never fires, @preRev@ holds the (single) class
+        --   name and the superclass list is empty.
+        scanHead cur mCls preRev !depth seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (mCls, cur)
-                TkWhere  -> pure (mCls, cur')
-                TkNewline -> scanHead cur' mCls seenArrow
-                -- `=>` ends the context; reset our candidate class name
-                -- so the NEXT ConId is the real class.
-                TkDArrow -> scanHead cur' Nothing True
-                -- FunctionalDependencies: `| a -> b, c -> d` — skip the
-                -- whole fundep clause, stopping only at `where`/EOF.
-                TkBar -> skipFundep cur' mCls
-                TkConId n ->
-                    case mCls of
-                        Nothing -> scanHead cur' (Just n) seenArrow
-                        Just _  -> scanHead cur' mCls seenArrow
-                TkLParen -> do
-                    curAfter <- skipParensC 1 cur'
-                    scanHead curAfter mCls seenArrow
-                TkLBracket -> do
-                    curAfter <- skipBracketsC 1 cur'
-                    scanHead curAfter mCls seenArrow
-                _ -> scanHead cur' mCls seenArrow
+                TkEof    -> pure (finalize mCls preRev seenArrow, cur)
+                TkWhere | depth == 0 ->
+                    pure (finalize mCls preRev seenArrow, cur')
+                TkNewline -> scanHead cur' mCls preRev depth seenArrow
+                -- `=>` at depth 0 ends the context: pre-arrow ConIds
+                -- become superclasses, reset class candidate, look
+                -- for the real class name on the right of `=>`.
+                TkDArrow | depth == 0 -> scanHead cur' Nothing preRev depth True
+                -- FunctionalDependencies clause: `| a -> b` — skip.
+                TkBar | depth == 0 -> skipFundep cur' mCls preRev seenArrow
+                TkConId n
+                    | seenArrow ->
+                        case mCls of
+                            Nothing -> scanHead cur' (Just n) preRev depth seenArrow
+                            Just _  -> scanHead cur' mCls preRev depth seenArrow
+                    | otherwise ->
+                        -- Could be the class name (if no @=>@ ever
+                        -- comes) or a superclass (if it does).  Stash
+                        -- in preRev; finalize/finalize-on-`=>` decides
+                        -- which.  Set @mCls@ so it's still available
+                        -- if we exit without `=>`.
+                        scanHead cur' (Just n) (n : preRev) depth seenArrow
+                TkLParen   -> scanHead cur' mCls preRev (depth + 1) seenArrow
+                TkRParen   -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
+                TkLBracket -> scanHead cur' mCls preRev (depth + 1) seenArrow
+                TkRBracket -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
+                _ -> scanHead cur' mCls preRev depth seenArrow
+
+        -- Decide what's the class name and what's the superclass list
+        -- given @mCls@, the pre-`=>` ConId list (reversed), and
+        -- whether we ever saw `=>`.
+        --
+        -- * Saw `=>`: @mCls@ is the class name (captured after the
+        --   reset); @preRev@ in source order is the superclass list.
+        -- * No `=>`: the first ConId in source order is the class
+        --   name; superclass list is empty.
+        finalize :: Maybe ByteString -> [ByteString] -> Bool
+                 -> (Maybe ByteString, [ByteString])
+        finalize mCls preRev seenArrow
+            | seenArrow = (mCls, reverse preRev)
+            | otherwise =
+                case reverse preRev of
+                    []      -> (Nothing, [])
+                    (c : _) -> (Just c, [])
 
         -- After `|` in the class head, consume the fundep list without
         -- interpreting it. Stop at `where`/EOF; keep any class-name
-        -- candidate already captured in @mCls@.
-        skipFundep cur mCls = do
+        -- candidate and the pre-arrow ConId list already captured.
+        skipFundep cur mCls preRev seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof   -> pure (mCls, cur)
-                TkWhere -> pure (mCls, cur')
+                TkEof   -> pure (finalize mCls preRev seenArrow, cur)
+                TkWhere -> pure (finalize mCls preRev seenArrow, cur')
                 TkLParen -> do
                     curAfter <- skipParensC 1 cur'
-                    skipFundep curAfter mCls
+                    skipFundep curAfter mCls preRev seenArrow
                 TkLBracket -> do
                     curAfter <- skipBracketsC 1 cur'
-                    skipFundep curAfter mCls
-                _ -> skipFundep cur' mCls
+                    skipFundep curAfter mCls preRev seenArrow
+                _ -> skipFundep cur' mCls preRev seenArrow
 
     skipParensC :: Int -> Cursor -> IO Cursor
     skipParensC !d cur

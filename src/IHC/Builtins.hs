@@ -86,13 +86,15 @@ import System.IO
 import qualified System.Posix.IO as PosixIO
 import System.Posix.Types (Fd)
 
+import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     )
+import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal)
-import IHC.Scan (DataRegistry, FieldRegistry)
+import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
 
@@ -467,6 +469,12 @@ builtins reg =
     , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
+    -- B.1: debug-only superclass-relation probe.  Source-loaded code
+    -- can call @__ihc_class_supers \"MyOrd\"@ to inspect the global
+    -- superclass map; useful for testing that the scanner captured
+    -- the @class C a => D a@ relation. Single argument is a [Char]
+    -- list (a String); result is a [[Char]] list (a [String]).
+    , ("__ihc_class_supers", classSupersProbeB)
     , ("exitWith",    exitWithB)
     , ("exitSuccess", exitSuccessB)
     -- Char / numeric conversions
@@ -1817,6 +1825,7 @@ showDouble d
 showVal :: Val -> IO String
 showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
+showVal (VInteger n) = pure (show n)
 showVal (VFloat d)  = pure (showDouble d)
 showVal (VChar c)   = pure (show c)
 showVal VUnit       = pure "()"
@@ -2260,6 +2269,25 @@ getLineB :: IO Val
 getLineB = pure $ VIO $ do
     s <- getLine
     stringToListValIO s
+
+-- | B.1: debug-only probe of the global superclass-relation map.
+-- Takes a class name (as a [Char] list) and returns the list of
+-- direct superclass names ([[Char]]).  Used by fixtures to verify
+-- that @class Eq a => Ord a@ et al. are captured by the scanner.
+classSupersProbeB :: IO Val
+classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
+    av    <- force aT
+    cls   <- valToString av
+    supers <- IHC.Classes.lookupSuperclasses (BC.pack cls)
+    -- Build a Haskell-level [String] cons list from the result.
+    let buildList []     = pure (VCon "[]" [])
+        buildList (n:ns) = do
+            headV <- stringToListValIO (BC.unpack n)
+            headT <- newWHNFThunk headV
+            restV <- buildList ns
+            restT <- newWHNFThunk restV
+            pure (VCon ":" [headT, restT])
+    buildList supers
 
 errorB :: IO Val
 errorB = pure $ VFun $ \a -> do
@@ -5237,10 +5265,32 @@ buildConEnv reg = do
         t <- newLazyBuiltinThunk (pure (buildLam name arity []))
         pure (name, t)
 
+    -- A.5: per Haskell Report §4.2.1, a strict field annotation
+    -- (`MkT !Int Int`) forces the corresponding argument thunk to
+    -- WHNF at construction time.  We look up the constructor's
+    -- strictness bitmap (populated by 'IHC.Scan.scanDataDecls') and,
+    -- when at least one field is strict, force those thunks before
+    -- returning the 'VCon'.  All-lazy ctors keep the original cheap
+    -- path with no extra IO.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
-        pure (buildLam name (left - 1) (t : acc))
+        if left == 1
+            then do
+                let thunks = reverse (t : acc)
+                strict <- lookupCtorStrictness name
+                forceStrictFields strict thunks
+                pure (VCon name thunks)
+            else pure (buildLam name (left - 1) (t : acc))
+
+    -- | Walk the strict-field bitmap and force each marked thunk in
+    -- place, ignoring extra/missing entries gracefully.
+    forceStrictFields :: [Bool] -> [Thunk] -> IO ()
+    forceStrictFields []         _      = pure ()
+    forceStrictFields _          []     = pure ()
+    forceStrictFields (s : ss) (t : ts) = do
+        when s (() <$ force t)
+        forceStrictFields ss ts
 
 -- | Build an environment binding each record-field name to an accessor
 -- function.  For a field @f@ that lives at index @i@ in constructor @Con@,

@@ -925,6 +925,185 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "#firstName\n#lastName\n#email\n"
 
     --------------------------------------------------------------------
+    -- A.1 Bang patterns: §3.17.2 strictness at let / lambda /
+    -- constructor sub-pattern / do-bind sites.  Each fixture uses an
+    -- IORef bump-counter inside a thunk to detect whether the bang
+    -- forced eagerly: with strict bang the marker is non-zero by the
+    -- time main reads it; without, it stays at zero.
+    --------------------------------------------------------------------
+    it "A.1 bang let: `let !x = e` in do-block forces eagerly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/let_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang lambda: `\\(!x) -> 0` forces argument on apply" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/lambda_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang constructor sub-pattern: `f (MkT !y)` forces field" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/con_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang do-bind: `!x <- m` forces bound result" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/do_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    --------------------------------------------------------------------
+    -- A.2 Irrefutable patterns: §3.17.3 lazy match.  `~p` matches
+    -- every value; bound vars become thunks that re-attempt the match
+    -- on force.  Without lazy semantics, `\ ~(Just x) -> 0` applied to
+    -- Nothing crashes; with PIrref handled in matchPat the application
+    -- returns 0 because x is never forced.
+    --------------------------------------------------------------------
+    it "A.2 lazy lambda: `\\ ~(Just x) -> 0` Nothing returns 0" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/IrrefutablePatterns/lazy_lambda.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n0\n"
+
+    it "A.2 lazy case alt: `case _ of ~(Just x) -> 0` Nothing returns 0" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/IrrefutablePatterns/lazy_case.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "0\n0\n"
+
+    it "A.2 deferred failure: forcing a var bound by ~(Just x) on Nothing raises" do
+        r <- try (runFile "test/Fixtures/IrrefutablePatterns/lazy_force_failure.hs")
+        case (r :: Either SomeException Int) of
+            Right code -> expectationFailure
+                ("expected deferred match-failure to raise; runFile returned "
+                 <> show code)
+            Left e -> do
+                let msg = displayException e
+                msg `shouldSatisfy` (\m -> "Irrefutable pattern failed" `isInfixOf` m)
+
+    --------------------------------------------------------------------
+    -- A.3 Numeric literals: parse out-of-Int64-range integers as
+    -- 'LInteger Integer' and evaluate to 'VInteger' instead of silently
+    -- truncating via host 'fromInteger'.
+    --------------------------------------------------------------------
+    it "A.3 big-Integer literal: source decimal preserved through print" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/NumLiterals/big_integer_literal.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "12345678901234567890123456789\n100000000000000000000\n"
+
+    --------------------------------------------------------------------
+    -- A.5 Strict data-constructor fields (Report §4.2.1).  `data T =
+    -- MkT !Int Int` forces the strict field on construction.  Detection
+    -- via an IORef bumped from inside the strict-field thunk — with
+    -- the bang honored, the marker is exactly 1; without, it's 0.
+    --------------------------------------------------------------------
+    it "A.5 strict field forces on construction" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/StrictFields/strict_field_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    --------------------------------------------------------------------
+    -- B.1 Superclass dictionaries: scanner captures the head context
+    -- (`class C a => D a where …`) into a global superclass-relation
+    -- map; the debug builtin `__ihc_class_supers` exposes it.  This
+    -- is the data layer for B.2 (default methods using superclass
+    -- methods) and the deferred coherence check.
+    --------------------------------------------------------------------
+    it "B.1 scanner captures class superclass context" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Superclass/superclass_capture.hs")
+        n   `shouldBe` 0
+        out `shouldBe`
+            "MyEq: []\n\
+            \MyOrd: [\"MyEq\"]\n\
+            \MyHashable: [\"MyEq\",\"MyShow\"]\n"
+
+    --------------------------------------------------------------------
+    -- B.2 Default methods (Report §4.3.2): mutually-recursive class
+    -- defaults `eq = not . neq` / `neq = not . eq` — instance defines
+    -- only one direction, the other dispatches through the default.
+    --------------------------------------------------------------------
+    it "B.2 mutually-recursive class defaults route through dispatcher" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/DefaultMethods/mutual_default.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "False\nTrue\n"
+
+    --------------------------------------------------------------------
+    -- B.3 Overlap pragmas (GHC user guide §6.8.7) — DEFERRED.
+    -- ihc's lexer consumes @{-# OVERLAPPING #-}@ etc. as whitespace
+    -- and the registry has no notion of specificity (tags can't
+    -- distinguish @[Char]@ from @[a]@). Real overlap-aware dispatch
+    -- depends on the typed-IR slice (C.2). This fixture is a
+    -- regression guard for the pragma-tolerance level — declarations
+    -- with overlap pragmas must continue to parse and run.
+    --------------------------------------------------------------------
+    it "B.3 overlap pragmas are tolerated (last-write-wins today)" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Overlap/overlap_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "1\n"
+
+    --------------------------------------------------------------------
+    -- A.4 Numeric defaulting (Report §4.3.4) — DEFERRED.
+    -- ihc monomorphises every integer literal at parse time (A.3
+    -- minimum scope), so there's no ambiguous Num constraint for
+    -- the defaulting rule to act on.  The full rule depends on the
+    -- elaborator-driven 'fromInteger'-insertion path that A.3
+    -- deferred.  This fixture is a tolerance guard: a top-level
+    -- 'default (Int, Double)' declaration must not break parsing.
+    --------------------------------------------------------------------
+    it "A.4 top-level `default (...)` is tolerated" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/Defaulting/default_decl_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "3\n"
+
+    --------------------------------------------------------------------
+    -- B.4 Functional dependencies (GHC user guide §6.8.8) — DEFERRED
+    -- improvement.  The parser/scanner tolerate `class C a b | a -> b`
+    -- cleanly (the `|` clause is skipped without affecting class-name
+    -- capture or method registration) and single-arg dispatch works.
+    -- Constraint improvement via fundeps depends on the typed-IR
+    -- slice (C.2).
+    --------------------------------------------------------------------
+    it "B.4 FunDep-using class parses + dispatches via head type" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/FunDeps/fundep_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\n"
+
+    --------------------------------------------------------------------
+    -- B.5a Quantified constraints (GHC user guide §6.8.10) — DEFERRED
+    -- solver.  ihc's parseClassHead handles the @(forall a. C a => D
+    -- (f a))@ syntax via the depth-aware token scan from B.1, and
+    -- runtime tag-keyed dispatch is unaffected by the type-level
+    -- quantifier, so programs that use @QuantifiedConstraints@ load
+    -- and run.  Skolemise/discharge/regeneralise solving (B.5b) ships
+    -- after the elaborator-integrated lowering (C.2.3 follow-up).
+    --------------------------------------------------------------------
+    it "B.5a quantified-constraint class parses + dispatches" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/QuantifiedConstraints/qc_tolerated.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\nFalse\n"
+
+    --------------------------------------------------------------------
+    -- C.1 GADT pattern-match refinement (Haskell Report addendum /
+    -- GHC user guide §6.4.7) — DEFERRED.  ihc is type-permissive,
+    -- so the GADT-form syntax + 'coerce Refl x = x' shape works at
+    -- runtime without any refinement substitution.  Real elaborator
+    -- work to threadType refinement through the case-alt body
+    -- ships after the typed-IR (C.2.3 follow-up).
+    --------------------------------------------------------------------
+    it "C.1 GADT-form data + Refl pattern-match runtime path" do
+        (n, out) <- captureStdout
+                       (runFile "test/Fixtures/GADTs/gadt_refl_runtime.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "5\n'a'\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

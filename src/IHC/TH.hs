@@ -441,9 +441,10 @@ expandSplicesInExpr env ipm depth expr
 
     goAlt (Alt p e) = Alt p <$> go e
 
-    goStmt (SExpr e)   = SExpr <$> go e
-    goStmt (SBind n e) = SBind n <$> go e
-    goStmt (SLet bs)   = SLet <$> mapM (\(n, b) -> (n,) <$> go b) bs
+    goStmt (SExpr e)         = SExpr <$> go e
+    goStmt (SBind n e)       = SBind n <$> go e
+    goStmt (SBangBind n e)   = SBangBind n <$> go e
+    goStmt (SLet bs)         = SLet <$> mapM (\(n, b) -> (n,) <$> go b) bs
     goStmt (SImplicitLet bs) = SImplicitLet <$> mapM (\(n, b) -> (n,) <$> go b) bs
 
 --------------------------------------------------------------------------------
