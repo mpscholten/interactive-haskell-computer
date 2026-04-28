@@ -852,6 +852,23 @@ matchPat (PCon name pats) (VCon vname vthunks)
         matchFields rest ((n, t) : acc)
     matchFields ((PWild, _) : rest) acc =
         matchFields rest acc
+    -- Per Haskell Report §3.17.2 + GHC BangPatterns: a bang sub-pattern
+    -- forces the corresponding field thunk to WHNF before binding. The
+    -- generic _ -> force arm below handles non-PVar inner patterns
+    -- correctly (the force happens unconditionally), but PBang (PVar n)
+    -- would otherwise route through matchPat's PBang->p collapse and
+    -- bind n to an unforced thunk via the PVar arm above. Force here.
+    matchFields ((PBang inner, t) : rest) acc = do
+        _ <- force t  -- ! : force the field thunk; sharing preserved.
+        case inner of
+            PVar n -> matchFields rest ((n, t) : acc)
+            PWild  -> matchFields rest acc
+            _      -> do
+                fv <- force t
+                m  <- matchPat inner fv
+                case m of
+                    Nothing   -> pure Nothing
+                    Just subs -> matchFields rest (reverse subs ++ acc)
     matchFields ((p, t) : rest) acc = do
         fv <- force t
         m  <- matchPat p fv
@@ -1140,6 +1157,23 @@ evalDo env ipm (SBind name e : rest) =
         mv <- eval env ipm e
         v  <- runIOVal mv
         vT <- newWHNFThunk v
+        let env' = extendEnv name vT env
+        restV <- evalDo env' ipm rest
+        runIOVal restV
+evalDo env ipm [SBangBind _ e] =
+    -- Defensive: a do-block ending in a (bang-)bind is ill-formed; mirror SBind.
+    eval env ipm e
+evalDo env ipm (SBangBind name e : rest) =
+    -- Per Haskell Report §3.17.2 + GHC BangPatterns: !x <- m forces the
+    -- bound result to WHNF before the rest of the do-block runs. The
+    -- parser desugars do-blocks to (>>=)/(>>)/lambda chains, so this
+    -- branch is only hit on the defensive EDo fallback path; we still
+    -- preserve the strictness contract here for completeness.
+    pure $ VIO $ do
+        mv <- eval env ipm e
+        v  <- runIOVal mv
+        vT <- newWHNFThunk v
+        _  <- force vT  -- bang: force to WHNF before continuing
         let env' = extendEnv name vT env
         restV <- evalDo env' ipm rest
         runIOVal restV

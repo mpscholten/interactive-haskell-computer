@@ -3577,6 +3577,8 @@ rewriteExpr rw = go []
                                        : goStmts bound rest
     goStmts bound (SBind n e : rest) = SBind n (go bound e)
                                        : goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = SBangBind n (go bound e)
+                                       : goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest) =
         let names = map fst bs
             bound' = names ++ bound
@@ -6058,6 +6060,7 @@ freeVars = goAll []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = goAll bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names  = map fst bs
             bound' = names ++ bound
@@ -6108,9 +6111,10 @@ needsRecordFields = goExpr
         EGuardFail    -> False
 
     goStmt = \case
-        SExpr e        -> goExpr e
-        SBind _ e      -> goExpr e
-        SLet bs        -> any (goExpr . snd) bs
+        SExpr e         -> goExpr e
+        SBind _ e       -> goExpr e
+        SBangBind _ e   -> goExpr e
+        SLet bs         -> any (goExpr . snd) bs
         SImplicitLet bs -> any (goExpr . snd) bs
 
     goAlt (Alt p e) = goPat p || goExpr e
@@ -6185,6 +6189,7 @@ discoveryFreeVars = go []
     goStmts _     []                  = []
     goStmts bound (SExpr e   : rest)  = go bound e ++ goStmts bound rest
     goStmts bound (SBind n e : rest)  = go bound e ++ goStmts (n : bound) rest
+    goStmts bound (SBangBind n e : rest) = go bound e ++ goStmts (n : bound) rest
     goStmts bound (SLet bs   : rest)  =
         let names = map fst bs
         in goStmts (names ++ bound) rest
@@ -6348,9 +6353,10 @@ desugarRecordCons fldReg = go
     go (ETyApp inner ty) = ETyApp (go inner) ty   -- value-level @T: recurse into inner
     go e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (go e)
-    goStmt (SBind n e) = SBind n (go e)
-    goStmt (SLet bs)   = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (go e)
+    goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SBangBind n e)   = SBangBind n (go e)
+    goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Look up all fields for a constructor from the FieldRegistry,
@@ -6394,9 +6400,10 @@ desugarRecordPats fldReg = goExpr
     goExpr (ETyApp inner ty) = ETyApp (goExpr inner) ty   -- value-level @T: recurse
     goExpr e                = e  -- EVar, ELit
 
-    goStmt (SExpr e)   = SExpr (goExpr e)
-    goStmt (SBind n e) = SBind n (goExpr e)
-    goStmt (SLet bs)   = SLet [(n, goExpr b) | (n, b) <- bs]
+    goStmt (SExpr e)         = SExpr (goExpr e)
+    goStmt (SBind n e)       = SBind n (goExpr e)
+    goStmt (SBangBind n e)   = SBangBind n (goExpr e)
+    goStmt (SLet bs)         = SLet [(n, goExpr b) | (n, b) <- bs]
     goStmt (SImplicitLet bs) = SImplicitLet [(n, goExpr b) | (n, b) <- bs]
 
     -- Handle a case expression, desugaring view-pattern alts into a chain.

@@ -376,7 +376,18 @@ desugarClauses [(pats, RhsPlain body)] _
             toName PWild     = "_"
             toName (PBang p) = toName p
             toName _         = error "impossible"
-        in foldr ELam body (map toName pats)
+            isStrict (PBang _) = True
+            isStrict _         = False
+            -- Per Haskell Report §3.17.2: `f !x = body` forces x to
+            -- WHNF before body runs. We inject `seq <name> ` for each
+            -- strict argument; the trivial-pattern fast path otherwise
+            -- binds the lambda parameter to an unforced thunk.
+            names    = map toName pats
+            wrapSeq acc (p, n)
+                | isStrict p = EApp (EApp (EVar "seq") (EVar n)) acc
+                | otherwise  = acc
+            body'    = foldl wrapSeq body (zip pats names)
+        in foldr ELam body' names
 desugarClauses clauses arity =
     let argNames = [BC.pack ("$a" ++ show i) | i <- [0 .. arity - 1]]
         ultimateFail = EApp (EVar "error")
@@ -426,7 +437,16 @@ matchPatterns ((p, argName) : rest) body fallback =
                 ELet [(n, EVar argName)] (matchPatterns rest body fallback)
         PWild ->
             matchPatterns rest body fallback
-        PBang inner -> matchPatterns ((inner, argName) : rest) body fallback
+        PBang inner ->
+            -- Per Haskell Report §3.17.2: `f !p = body` forces argName
+            -- to WHNF before matching p / running body. matchPatterns
+            -- alone would only force when the inner pattern is a
+            -- constructor (via the ECase fall-through); for PVar/PWild
+            -- it would silently bind to an unforced thunk. Wrap the
+            -- continuation in `seq argName _` to introduce the
+            -- strictness edge regardless of the inner shape.
+            let body' = matchPatterns ((inner, argName) : rest) body fallback
+            in EApp (EApp (EVar "seq") (EVar argName)) body'
         -- ViewPatterns: (f -> p) desugars to
         --   let $vpN = f argName in case $vpN of { p -> restBody; _ -> fallback }
         PView fn vp ->
@@ -1196,6 +1216,7 @@ parseDo ctx cur0 = do
     monadicDo []               = EDo []  -- shouldn't happen; fallback
     monadicDo [SExpr e]        = e
     monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
+    monadicDo [SBangBind _ e]  = e  -- ditto for !x <- m as final stmt
     monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
     monadicDo [SImplicitLet bs] = EImplicitLet bs (EDo [])
     monadicDo (SExpr e : rest) =
@@ -1204,6 +1225,13 @@ parseDo ctx cur0 = do
     monadicDo (SBind name e : rest) =
         -- e >>= \name -> do { rest }
         EApp (EApp (EVar ">>=") e) (ELam name (monadicDo rest))
+    monadicDo (SBangBind name e : rest) =
+        -- !name <- e ;  rest   ==>   e >>= \name -> seq name (do { rest })
+        -- Per Haskell Report §3.17.2 + GHC BangPatterns: the bound result
+        -- is forced to WHNF before the rest of the do-block runs.
+        EApp (EApp (EVar ">>=") e)
+             (ELam name
+                 (EApp (EApp (EVar "seq") (EVar name)) (monadicDo rest)))
     monadicDo (SLet bs : rest) =
         -- let bs in do { rest }
         ELet bs (monadicDo rest)
@@ -1316,6 +1344,7 @@ parseDo ctx cur0 = do
         fvStmts _     []                  = []
         fvStmts bound (SExpr e   : rest)  = fv bound e ++ fvStmts bound rest
         fvStmts bound (SBind n e : rest)  = fv bound e ++ fvStmts (n : bound) rest
+        fvStmts bound (SBangBind n e : rest) = fv bound e ++ fvStmts (n : bound) rest
         fvStmts bound (SLet bs   : rest)  =
             let names  = map fst bs
                 bound' = names ++ bound
@@ -1408,7 +1437,7 @@ parseStmt ctx cur0 = do
         case pat of
             PVar n -> [SBind n action]
             PWild  -> [SBind (BC.pack "_") action]
-            PBang (PVar n) -> [SBind n action]
+            PBang (PVar n) -> [SBangBind n action]
             _ ->
                 let tmpName = BC.pack ("$doBindPat" <> show (cPos cur0))
                     vars = nubBSLocal (patVars pat)
@@ -1460,12 +1489,45 @@ parseDoLet ctx cur0 = do
                 _ -> do
                     (binds, curEnd) <- bracedBinds curAfter []
                     pure ([SLet binds], curEnd)
-        _ ->
-            let bindCol = tkCol firstTok
-            in do
-                (binds, curEnd) <- layoutBinds bindCol cur0 []
-                pure ([SLet binds], curEnd)
+        -- Per Haskell Report §3.17.2 + GHC BangPatterns: `let !x = e`
+        -- inside a do-block must force e to WHNF before the rest of the
+        -- block runs. Lower the simple single-binding form to
+        -- @!x <- pure e@, which we already implement via SBangBind.
+        -- Multi-binding lets (`let !x = e1; y = e2`) and complex bang
+        -- patterns (`let !(a, b) = e`) fall through to the layout path
+        -- below — covered separately by A.1/A.5 follow-ups.
+        TkBang -> do
+            let (peekId, curId) = nextSig ctx curAfter
+            case tkKind peekId of
+                TkIdent n -> do
+                    let (peekEq, curEq) = nextSig ctx curId
+                    case tkKind peekEq of
+                        TkEq -> do
+                            -- Peek past the RHS to confirm this is a single
+                            -- binding (no follow-up at the same column).
+                            let bindCol = tkCol firstTok
+                                rhsCtx  = ctx { ctxMinCol = bindCol }
+                            (rhs, cur3) <- parseExpr rhsCtx curEq
+                            let (peekAfter, _) = nextSig ctx cur3
+                                isSingle = tkCol peekAfter /= bindCol
+                                            || tkKind peekAfter == TkEof
+                            if isSingle
+                                then pure ([SBangBind n
+                                              (EApp (EVar "pure") rhs)], cur3)
+                                else do
+                                    -- Multi-binding let; fall back to layout.
+                                    (binds, curEnd) <- layoutBinds bindCol cur0 []
+                                    pure ([SLet binds], curEnd)
+                        _ -> fallbackLayout firstTok
+                _ -> fallbackLayout firstTok
+        _ -> fallbackLayout firstTok
   where
+    fallbackLayout firstTok =
+        let bindCol = tkCol firstTok
+        in do
+            (binds, curEnd) <- layoutBinds bindCol cur0 []
+            pure ([SLet binds], curEnd)
+
     parseImplicitDoBinds bindCol cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
         name <- case tkKind nameTok of

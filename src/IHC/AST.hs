@@ -76,13 +76,17 @@ data Expr
 
 -- | A single statement inside a do-block.
 --
---   * 'SExpr' — a bare expression, e.g. @putStrLn "hi"@
---   * 'SBind' — a bind statement @x <- action@
---   * 'SLet'  — @let x = e; y = e2@ inside do (no @in@ — the scope is
---               the remainder of the do-block)
+--   * 'SExpr'     — a bare expression, e.g. @putStrLn "hi"@
+--   * 'SBind'     — a bind statement @x <- action@
+--   * 'SBangBind' — a strict bind @!x <- action@ (Haskell Report §3.17.2 +
+--                   GHC @BangPatterns@): force the bound result to WHNF
+--                   before continuing the do-block.
+--   * 'SLet'      — @let x = e; y = e2@ inside do (no @in@ — the scope is
+--                   the remainder of the do-block)
 data Stmt
     = SExpr !Expr
     | SBind !Name !Expr
+    | SBangBind !Name !Expr
     | SLet  ![Bind]
     | SImplicitLet ![(Name, Expr)]
     deriving (Eq, Show)

@@ -925,6 +925,33 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "#firstName\n#lastName\n#email\n"
 
     --------------------------------------------------------------------
+    -- A.1 Bang patterns: §3.17.2 strictness at let / lambda /
+    -- constructor sub-pattern / do-bind sites.  Each fixture uses an
+    -- IORef bump-counter inside a thunk to detect whether the bang
+    -- forced eagerly: with strict bang the marker is non-zero by the
+    -- time main reads it; without, it stays at zero.
+    --------------------------------------------------------------------
+    it "A.1 bang let: `let !x = e` in do-block forces eagerly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/let_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang lambda: `\\(!x) -> 0` forces argument on apply" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/lambda_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang constructor sub-pattern: `f (MkT !y)` forces field" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/con_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    it "A.1 bang do-bind: `!x <- m` forces bound result" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/BangPatterns/do_force.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "forced\n"
+
+    --------------------------------------------------------------------
     -- Graduated XFAILs (fixtures that now pass)
     --------------------------------------------------------------------
     it "bang pattern strict: sumStrict with [1..10] = 55" do

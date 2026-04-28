@@ -149,6 +149,7 @@ exprSubtrees e = e : case e of
   where
     stmtSubtrees (SExpr x)          = exprSubtrees x
     stmtSubtrees (SBind _ x)        = exprSubtrees x
+    stmtSubtrees (SBangBind _ x)    = exprSubtrees x
     stmtSubtrees (SLet bs)          = concatMap (exprSubtrees . snd) bs
     stmtSubtrees (SImplicitLet bs)  = concatMap (exprSubtrees . snd) bs
 
