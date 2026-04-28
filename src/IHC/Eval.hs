@@ -112,16 +112,21 @@ resolveTypedMethod reg cls method tag = do
             Just vv | not (isPlaceholder vv) -> pure (Just vv)
             _ -> tryFallbacks rest
 
-    -- Known equalities between class methods — used when an instance
-    -- relies on the class's default body instead of providing a
-    -- per-instance override.  Mapped to the class/method that DOES
-    -- have a concrete body.
-    fallbackList c m
-      | c == BC.pack "Monad", m == BC.pack "return" =
-            [(BC.pack "Applicative", BC.pack "pure")]
-      | c == BC.pack "Monad", m == BC.pack "(>>)"   =
-            [(BC.pack "Applicative", BC.pack "(*>)")]
-      | otherwise = []
+    fallbackList = typedMethodFallbacks
+
+-- | Known equalities between class methods — used when an instance
+-- relies on the class's default body instead of providing a
+-- per-instance override.  Mapped to the class/method that DOES
+-- have a concrete body. Shared by 'resolveTypedMethod' (the lookup
+-- path) and 'allTypedMethodsResolvable' (the elaborator-rewrite
+-- validation guard).
+typedMethodFallbacks :: Name -> Name -> [(Name, Name)]
+typedMethodFallbacks c m
+  | c == BC.pack "Monad", m == BC.pack "return" =
+        [(BC.pack "Applicative", BC.pack "pure")]
+  | c == BC.pack "Monad", m == BC.pack "(>>)"   =
+        [(BC.pack "Applicative", BC.pack "(*>)")]
+  | otherwise = []
 
 force :: Thunk -> IO Val
 force t = do
@@ -425,8 +430,106 @@ eval env ipm = go
                                 (Elab.ExpectType annTy) e)
                            :: IO (Either SomeException (Expr, TA.Type))
                     case r of
-                        Right (e', _) | e' /= e -> pure (Just e')
-                        _                       -> pure Nothing
+                        Right (e', _) | e' /= e -> do
+                            -- Validate the rewrite. The elaborator emits
+                            -- 'ETypedMethod cls method tag' wherever a
+                            -- name's signature looks like a class
+                            -- method (constraint @cls v@ with @v@ in the
+                            -- body, name in 'globalClassMethodNamesRef').
+                            -- That heuristic mis-fires for top-level
+                            -- functions that happen to share a name with
+                            -- a class method elsewhere — the canonical
+                            -- example is 'Control.Exception.try' getting
+                            -- routed through 'MonadParsec.try''s
+                            -- dispatcher because megaparsec's
+                            -- 'Text.Megaparsec.Class' is on the
+                            -- core-instance load list.
+                            --
+                            -- If the rewritten expression contains an
+                            -- 'ETypedMethod' whose resolved
+                            -- @(cls, tag, method)@ has no registered
+                            -- instance (after the lazy-instance catalogue
+                            -- has been drained, which 'lookupInstanceMethod'
+                            -- does on miss), the dispatch path will return
+                            -- a useless value-directed dispatcher
+                            -- (VClassMethod → VFun with no real backing),
+                            -- which then mis-binds the caller's argument.
+                            -- Better to skip the rewrite and let the
+                            -- evaluator resolve the bare 'EVar' through
+                            -- the env (where the actual builtin or
+                            -- source-loaded body lives).
+                            ok <- allTypedMethodsResolvable classReg e'
+                            if ok then pure (Just e') else pure Nothing
+                        _ -> pure Nothing
+
+    -- | True iff every 'ETypedMethod' node in @e@ has a real, non-placeholder
+    -- registered instance for its resolved @(cls, tag, method)@. Used to
+    -- decide whether to keep an elaborator rewrite or fall back to the
+    -- original expression. Drains the lazy-instance catalogue for each
+    -- class as a side effect (via 'lookupInstanceMethod'), which is
+    -- fine — those drains would have happened anyway when the dispatch
+    -- ran the rewrite.
+    allTypedMethodsResolvable :: ClassRegistry -> Expr -> IO Bool
+    allTypedMethodsResolvable reg = go
+      where
+        -- True iff there's a real method body — either directly under
+        -- @(cls, tag, method)@, under one of the known fallback pairs
+        -- ('Monad.return' → 'Applicative.pure'), or under the class
+        -- default tag @<default>@. All three lookups go through
+        -- 'lookupInstanceMethod', which drains the lazy-instance
+        -- catalogue on miss.
+        checkOne cls method tag = do
+            direct <- lookupInstanceMethod reg cls tag method
+            case nonPlaceholder direct of
+                Just _  -> pure True
+                Nothing -> do
+                    fb <- tryFb (typedMethodFallbacks cls method) tag
+                    if fb
+                        then pure True
+                        else do
+                            mDef <- lookupInstanceMethod reg cls
+                                        (BC.pack "<default>") method
+                            case nonPlaceholder mDef of
+                                Just _  -> pure True
+                                Nothing -> pure False
+
+        tryFb [] _              = pure False
+        tryFb ((c, m):rest) tag = do
+            mv <- lookupInstanceMethod reg c tag m
+            case nonPlaceholder mv of
+                Just _  -> pure True
+                Nothing -> tryFb rest tag
+
+        nonPlaceholder mv = case mv of
+            Just (VCon n []) | n == BC.pack "<ihc-method-placeholder>" -> Nothing
+            _ -> mv
+
+        go (ETypedMethod cls method tag) = checkOne cls method tag
+        go (EApp f x)            = (&&) <$> go f <*> go x
+        go (ELam _ body)         = go body
+        go (ELet bs body)        = (&&) <$> allM (\(_, b) -> go b) bs <*> go body
+        go (ECase s as)          = (&&) <$> go s <*> allM (\(Alt _ b) -> go b) as
+        go (EIf c t b)           = allM go [c, t, b]
+        go (EDo stmts)           = allM goStmt stmts
+        go (ENeg inner)          = go inner
+        go (ETuple es)           = allM go es
+        go (ERecordCon _ fs)     = allM (\(_, v) -> go v) fs
+        go (ERecordUpdate s fs)  = (&&) <$> go s <*> allM (\(_, v) -> go v) fs
+        go (ESplice inner)       = go inner
+        go (EQuote inner)        = go inner
+        go (ETyApp inner _)      = go inner
+        go (EImplicitLet bs body) = (&&) <$> allM (\(_, b) -> go b) bs <*> go body
+        go _                     = pure True
+
+        goStmt (SExpr s)         = go s
+        goStmt (SBind _ s)       = go s
+        goStmt (SLet bs)         = allM (\(_, b) -> go b) bs
+        goStmt (SImplicitLet bs) = allM (\(_, b) -> go b) bs
+
+        allM _ []     = pure True
+        allM p (x:xs) = do
+            r <- p x
+            if r then allM p xs else pure False
 
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)

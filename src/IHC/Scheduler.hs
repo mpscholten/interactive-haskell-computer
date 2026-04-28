@@ -3159,13 +3159,20 @@ buildClassMethodEnv classReg existing loadedModules = do
         t <- newWHNFThunk v
         pure (methodName, t)
 
--- | After the environment is fully tied, evaluate each class's default
--- method bodies in that env and register them in the ClassRegistry under
--- the sentinel type tag '<default>'. The dispatcher falls back to these
--- when no real instance is registered for a given type.
+-- | Stage 3 of the lazy-registration plan: defer class-default
+-- materialisation the same way Stage 2 deferred per-instance
+-- materialisation. The default-body work — parsing each default,
+-- per-FV @discoverInModule@, @buildImportRewritesForNames@, and
+-- @evalDefaultMethodWith@ — is wrapped in a closure stashed under
+-- the class name in 'instanceCatalogueRef'. The closure runs the
+-- first time @lookupInstanceMethod@ misses on that class (drain
+-- triggered).
 --
--- The default entry stores one name-keyed method table. Methods without a
--- default body get a placeholder Val that errors only if dispatched to.
+-- Reusing the Stage-2 catalogue (keyed by class) means /one/ drain
+-- per class materialises BOTH explicit instances AND that class's
+-- defaults. The dispatcher's existing fallback to @defaultTypeTag@
+-- for unmatched (cls, tag) lookups then finds the registered
+-- defaults exactly as before.
 registerClassDefaults :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath] -> ClassRegistry -> Env -> [LoadedModule] -> IO ()
 registerClassDefaults registry searchPath includeMap classReg env loadedModules =
     mapM_ oneModule loadedModules
@@ -3174,9 +3181,20 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
         decls <- scanClassDecls (lmSource lm)
         mapM_ (oneClass lm) decls
 
-    oneClass lm (ClassDecl cls methodNames defaults)
+    oneClass lm decl@(ClassDecl cls _ defaults)
         | Map.null defaults = pure ()
-        | otherwise = do
+        | otherwise =
+            -- Catalogue the default-registration work under the
+            -- class name. The closure is identical to the eager
+            -- body that previously ran here; deferring it just
+            -- means the parse/FV/eval cost only fires for classes
+            -- that actually get dispatched into.
+            addCataloguedInstance cls
+                (registerOneClassDefault lm decl)
+
+    -- The pre-Stage-3 eager body, now invoked from the catalogue
+    -- closure on first dispatch into this class.
+    registerOneClassDefault lm (ClassDecl cls methodNames defaults) = do
             -- Pre-demand-load each free var referenced in the class's
             -- default bodies so 'buildImportRewritesForNames' can
             -- rewrite them to their fully-qualified form before we try
