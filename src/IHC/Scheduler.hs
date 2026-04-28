@@ -5722,10 +5722,38 @@ resolveImport
     -> ByteString
     -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
-    -- Only unqualified (non-qualified-import) imports can provide
-    -- unqualified names.
-    let imports = filter (not . impQualified) (mhImports (lmHeader lm))
-    tryImports imports
+    -- Only unqualified (non-qualified-import) imports can normally
+    -- provide unqualified names — that's what the user-facing scope
+    -- of @import qualified M as B@ guarantees (it brings @B.foo@,
+    -- not bare @foo@).
+    let unqualImports = filter (not . impQualified) (mhImports (lmHeader lm))
+    r <- tryImports unqualImports
+    case r of
+        Just _  -> pure r
+        Nothing
+            -- Special case: when @lm@ itself is the re-exporter the
+            -- caller landed on (i.e. @lm@'s export list has
+            -- @ExportName name@ but nothing local defines it), the
+            -- name's actual definition can come through @lm@'s
+            -- /qualified/ imports too. Concrete shape: Prelude has
+            -- @import qualified GHC.Internal.Data.List as List@ and
+            -- @List.words@ in its export list (the export-list
+            -- parser strips the qualifier so we record
+            -- @ExportName \"words\"@). Without this retry, the
+            -- demand-driven env-fallback's @discoverInModule
+            -- preludeLm \"words\"@ → @resolveImport prelude
+            -- \"words\"@ chain dead-ends because Prelude's
+            -- non-qualified imports don't supply @words@ either,
+            -- and the chain never reaches @Data.OldList@ where
+            -- @words@ is actually defined.
+            --
+            -- 'followNamedReexportD' already has the chain logic
+            -- (it considers qualified imports — see its comment at
+            -- line 5870-5872); reuse it. Depth 3 covers the
+            -- typical Prelude → Data.List → Data.OldList case.
+            | exportsMissingName lm name ->
+                followNamedReexportD 3 lm []
+            | otherwise -> pure Nothing
   where
     tryImports [] = pure Nothing
     tryImports (imp:rest)
