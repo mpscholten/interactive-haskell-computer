@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtForall
 import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
@@ -25,3 +26,4 @@ main = hspec do
     ReplTest.spec
     NorthStarTest.spec
     LexerIhp.spec
+    HsExtForall.spec
