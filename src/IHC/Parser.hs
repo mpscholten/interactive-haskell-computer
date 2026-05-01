@@ -293,7 +293,17 @@ parsePatsIn :: Source -> FixityTable -> Span -> IO [Pat]
 parsePatsIn src fx (start, end) = do
     let ctx  = Ctx src end 0 fx
         cur0 = Cursor start 1 1
-    loop ctx cur0 []
+    -- Distinguish prefix vs infix LHS.  Prefix form `name pat1 pat2 = body`
+    -- expects atomic patterns (constructors with args must be parenthesised:
+    -- `f (Just x) y = …`).  Infix form `pat1 op pat2 = body` allows full
+    -- constructor-application patterns on either side: `Just f <*> m = …`
+    -- means @(<*>) (Just f) m = …@, with `Just f` as ONE pattern.  Without
+    -- the lookahead below we'd parse @Just f <*> m@ as three atomic
+    -- patterns @[Just, f, m]@ and silently drop the constructor argument.
+    isInfix <- hasTopLevelInfixOp ctx cur0
+    if isInfix
+        then loopInfix ctx cur0 []
+        else loop ctx cur0 []
   where
     loop ctx cur acc = do
         let (tok, cur1) = nextSig ctx cur
@@ -328,6 +338,54 @@ parsePatsIn src fx (start, end) = do
               | otherwise -> do
                 (p, cur') <- parseSubPat ctx cur
                 loop ctx cur' (p : acc)
+
+    -- Infix LHS: `pat1 OP pat2 = body` or `pat1 \`fn\` pat2 = body`.
+    -- Each side is a full constructor-application pattern (parseTopPat
+    -- absorbs ctor args), and the operator/backtick name in the middle
+    -- is consumed without being kept as a pattern.
+    loopInfix ctx cur acc = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkBacktick ->
+                case readBacktickName ctx cur1 of
+                    Just (_, cur2) ->
+                        let (closeTok, cur3) = nextSig ctx cur2
+                        in case tkKind closeTok of
+                            TkBacktick -> loopInfix ctx cur3 acc
+                            _          -> pure (reverse acc)
+                    Nothing -> pure (reverse acc)
+            TkSymOp _ -> loopInfix ctx cur1 acc
+            TkAt ->
+                let (peek2, cur2) = nextSig ctx cur1
+                in case tkKind peek2 of
+                    TkSymOp _ -> loopInfix ctx cur2 acc
+                    _         -> loopInfix ctx cur1 acc
+            _ | not (startsPat (tkKind tok)) -> pure (reverse acc)
+              | otherwise -> do
+                (p, cur') <- parseTopPat ctx cur
+                loopInfix ctx cur' (p : acc)
+
+-- | Look ahead in @cur0..end@ for a top-level (paren-depth 0) infix
+-- operator before @=@ or @|@.  Mirrors 'IHC.Scan.findTopLevelOpBeforeEq'
+-- but operates on parser tokens.  Returns True for any @TkSymOp@ /
+-- @TkBacktick@ at depth 0 before the RHS separator.
+hasTopLevelInfixOp :: Ctx -> Cursor -> IO Bool
+hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int)
+  where
+    go cur depth =
+        let (tok, cur') = nextSig ctx0 cur in
+        case tkKind tok of
+            TkEof                       -> pure False
+            TkSymOp _ | depth == 0      -> pure True
+            TkBacktick | depth == 0     -> pure True
+            TkLParen                    -> go cur' (depth + 1)
+            TkLBracket                  -> go cur' (depth + 1)
+            TkLBrace                    -> go cur' (depth + 1)
+            TkRParen                    -> go cur' (max 0 (depth - 1))
+            TkRBracket                  -> go cur' (max 0 (depth - 1))
+            TkRBrace                    -> go cur' (max 0 (depth - 1))
+            _                           -> go cur' depth
 
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do

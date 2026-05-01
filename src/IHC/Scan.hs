@@ -2436,14 +2436,27 @@ scanInstanceDeclsRaw src
               -- branches above don't match.  Scan forward to find a
               -- top-level symbolic operator before @=@ and register the
               -- clause under that operator name.  LHS patterns span
-              -- from the start of the line (cur) up to @=@.
+              -- from the start of the line (cur) up to @=@.  Multi-
+              -- clause variants like
+              --   > Nothing <*> _m = Nothing
+              --   > Just f  <*> m  = fmap f m
+              -- (where the first LHS token is a constructor, hitting
+              -- this catch-all rather than the TkIdent branch above)
+              -- need the same clause-collection treatment as
+              -- 'tryInfixThen' or only the LAST clause survives.
               | tkCol tok > 1 -> do
                   mInfix <- tryInfixMethod (tkCol tok) cur
                   case mInfix of
                       Just (opName, clause, curNext) -> do
-                          let lhs = BindingLhs [clause]
+                          (moreClauses, curFinal) <-
+                              collectInfixClauses opName (tkCol tok) [clause] curNext
+                          let existing = case Map.lookup opName acc of
+                                             Just (BindingLhs cs) -> cs
+                                             Nothing              -> []
+                              lhs  = BindingLhs
+                                       (existing ++ reverse moreClauses)
                               acc' = Map.insert opName lhs acc
-                          scanMethods acc' curNext
+                          scanMethods acc' curFinal
                       Nothing -> scanMethods acc cur'
               | otherwise -> scanMethods acc cur'
 
