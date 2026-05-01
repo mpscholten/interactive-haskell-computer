@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtMisc
 import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
@@ -16,6 +17,7 @@ import qualified Unsupported
 main :: IO ()
 main = hspec do
     ParserBugs.spec
+    HsExtMisc.spec
     JitSmoke.spec
     CoreLowerTest.spec
     RunFile.spec
