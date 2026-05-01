@@ -407,9 +407,9 @@ builtins reg =
     , ("fmap",     fmapDispatch reg)
     , ("GHC.Internal.Base.fmap", fmapDispatch reg)
     , ("Prelude.fmap", fmapDispatch reg)
-    , ("<*>",      apB)
-    , ("GHC.Internal.Base.<*>", apB)
-    , ("Prelude.<*>", apB)
+    , ("<*>",      apDispatch reg)
+    , ("GHC.Internal.Base.<*>", apDispatch reg)
+    , ("Prelude.<*>", apDispatch reg)
     , ("$",        dollarB)
     , ("GHC.Internal.Base.$", dollarB)
     , ("Prelude.$", dollarB)
@@ -2510,6 +2510,11 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                   <> BC.unpack tag <> "`" )
 
 -- | @f <*> m = do { fun <- f; v <- m; return (fun v) }@.
+--
+-- IO-only fallback. Most callers should go through 'apDispatch' so a
+-- registered @Applicative@ instance (e.g. @Maybe@, @Either@) wins over
+-- the IO interpretation; without that, @Nothing <*> _@ silently
+-- collapses to a VIO and downstream apply hits a non-function.
 apB :: IO Val
 apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     fv <- force ft
@@ -2518,6 +2523,40 @@ apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     v  <- runIOVal mv
     vT <- newWHNFThunk v
     apply f1 vT
+
+-- | Dispatching @<*>@. Forces the first argument and looks up an
+-- @(Applicative, typeTagOf fv)@ entry in the 'ClassRegistry'. If the
+-- first argument's tag has no Applicative instance (e.g. @Nothing@'s
+-- "Nothing" tag may not be registered while only "Just" is), we also try
+-- the second argument's tag — for the same Applicative both sides share
+-- the type but distinct constructors. Falls back to the VIO-only
+-- behaviour of 'apB' so existing IO uses keep working.
+apDispatch :: ClassRegistry -> IO Val
+apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
+    fv <- force ft
+    let tryTag tag = lookupInstanceMethod reg (BC.pack "Applicative") tag (BC.pack "<*>")
+                       >>= forceInstanceMethod
+    mApMethod <- tryTag (typeTagOf fv)
+    mApMethod2 <- case mApMethod of
+        Just _  -> pure mApMethod
+        Nothing -> do
+            mv <- force mt
+            tryTag (typeTagOf mv)
+    case mApMethod2 of
+        Just apMethod -> do
+            fT <- newWHNFThunk fv
+            r1 <- apply apMethod fT
+            apply r1 mt
+        Nothing -> case fv of
+            VIO _ -> pure $ VIO $ do
+                f1 <- runIOVal fv
+                mv <- force mt
+                v  <- runIOVal mv
+                vT <- newWHNFThunk v
+                apply f1 vT
+            _ -> error
+                ( "<*>: no Applicative instance registered for type `"
+                  <> BC.unpack (typeTagOf fv) <> "`" )
 
 dollarB :: IO Val
 dollarB = pure $ VFun $ \ft -> pure $ VFun $ \xt -> do
