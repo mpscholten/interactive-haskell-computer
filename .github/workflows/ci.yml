@@ -22,24 +22,34 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@v8
 
-      - name: Cabal update
-        run: nix develop --command cabal update
+      # Pure-interpreter tests run hermetically via `nix flake check`.
+      # The check derivation builds against the nix-pinned source root
+      # (which includes base/ghc-internal/etc.) so the loader has every
+      # Prelude .hs it needs without any ~/.cache/ihc/sources/ priming.
+      - name: Run pure-interpreter tests (nix flake check)
+        run: nix flake check --print-build-logs
 
-      - name: Build
-        run: nix develop --command cabal build all
+      # Two test groups need the cabal build tree (dist-newstyle/...) and
+      # the codesigned ihc binary, so they don't fit inside `nix flake check`:
+      #   * JIT smoke tests — need com.apple.security.cs.allow-jit + MAP_JIT
+      #   * REPL smoke tests — spawn the cabal-built ihc binary as a subprocess
+      # Build + sign once, run both groups against the same dist tree.
+      - name: Cabal update (for cabal-tree tests)
+        run: nix develop --command cabal update
 
       - name: Sign test binary (JIT entitlement required on macOS)
         run: nix develop --command make sign-test
 
-      - name: Test
+      - name: Run JIT + REPL tests (need dist-newstyle ihc binary)
         run: |
           nix develop --command cabal test ihc-test --test-show-details=streaming \
-            2>&1 | tee /tmp/ihc-test.log; exit ${PIPESTATUS[0]}
+            --test-options="--match \"JIT smoke test\" --match \"REPL smoke tests\"" \
+            2>&1 | tee /tmp/ihc-cabal.log; exit ${PIPESTATUS[0]}
 
-      - name: Upload test log on failure
+      - name: Upload cabal test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-log
-          path: /tmp/ihc-test.log
+          path: /tmp/ihc-cabal.log
           retention-days: 7
