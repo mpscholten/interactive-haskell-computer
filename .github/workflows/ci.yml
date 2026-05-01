@@ -33,9 +33,13 @@ jobs:
       # the codesigned ihc binary, so they don't fit inside `nix flake check`:
       #   * JIT smoke tests — need com.apple.security.cs.allow-jit + MAP_JIT
       #   * REPL smoke tests — spawn the cabal-built ihc binary as a subprocess
-      # Build + sign once, run both groups against the same dist tree.
+      # Build the exe + signed test binary once, run both groups against
+      # the same dist tree.
       - name: Cabal update (for cabal-tree tests)
         run: nix develop --command cabal update
+
+      - name: Build ihc executable (REPL tests spawn it as a subprocess)
+        run: nix develop --command cabal build exe:ihc
 
       - name: Sign test binary (JIT entitlement required on macOS)
         run: nix develop --command make sign-test
