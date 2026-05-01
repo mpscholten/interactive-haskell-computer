@@ -407,9 +407,9 @@ builtins reg =
     , ("fmap",     fmapDispatch reg)
     , ("GHC.Internal.Base.fmap", fmapDispatch reg)
     , ("Prelude.fmap", fmapDispatch reg)
-    , ("<*>",      apB)
-    , ("GHC.Internal.Base.<*>", apB)
-    , ("Prelude.<*>", apB)
+    , ("<*>",      apDispatch reg)
+    , ("GHC.Internal.Base.<*>", apDispatch reg)
+    , ("Prelude.<*>", apDispatch reg)
     , ("$",        dollarB)
     , ("GHC.Internal.Base.$", dollarB)
     , ("Prelude.$", dollarB)
@@ -2510,6 +2510,11 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                   <> BC.unpack tag <> "`" )
 
 -- | @f <*> m = do { fun <- f; v <- m; return (fun v) }@.
+--
+-- IO-only fallback. Most callers should go through 'apDispatch' so a
+-- registered @Applicative@ instance (e.g. @Maybe@, @Either@) wins over
+-- the IO interpretation; without that, @Nothing <*> _@ silently
+-- collapses to a VIO and downstream apply hits a non-function.
 apB :: IO Val
 apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     fv <- force ft
@@ -2518,6 +2523,40 @@ apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
     v  <- runIOVal mv
     vT <- newWHNFThunk v
     apply f1 vT
+
+-- | Dispatching @<*>@. Forces the first argument and looks up an
+-- @(Applicative, typeTagOf fv)@ entry in the 'ClassRegistry'. If the
+-- first argument's tag has no Applicative instance (e.g. @Nothing@'s
+-- "Nothing" tag may not be registered while only "Just" is), we also try
+-- the second argument's tag — for the same Applicative both sides share
+-- the type but distinct constructors. Falls back to the VIO-only
+-- behaviour of 'apB' so existing IO uses keep working.
+apDispatch :: ClassRegistry -> IO Val
+apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
+    fv <- force ft
+    let tryTag tag = lookupInstanceMethod reg (BC.pack "Applicative") tag (BC.pack "<*>")
+                       >>= forceInstanceMethod
+    mApMethod <- tryTag (typeTagOf fv)
+    mApMethod2 <- case mApMethod of
+        Just _  -> pure mApMethod
+        Nothing -> do
+            mv <- force mt
+            tryTag (typeTagOf mv)
+    case mApMethod2 of
+        Just apMethod -> do
+            fT <- newWHNFThunk fv
+            r1 <- apply apMethod fT
+            apply r1 mt
+        Nothing -> case fv of
+            VIO _ -> pure $ VIO $ do
+                f1 <- runIOVal fv
+                mv <- force mt
+                v  <- runIOVal mv
+                vT <- newWHNFThunk v
+                apply f1 vT
+            _ -> error
+                ( "<*>: no Applicative instance registered for type `"
+                  <> BC.unpack (typeTagOf fv) <> "`" )
 
 dollarB :: IO Val
 dollarB = pure $ VFun $ \ft -> pure $ VFun $ \xt -> do
@@ -3741,19 +3780,23 @@ peekSockAddrVal p
                 strT <- newWHNFThunk strV
                 pure (VCon "SockAddrUnix" [strT])
             2 -> do
-                port <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
+                portRaw <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
                 addr <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
+                let port = byteSwap16 portRaw  -- ntohs: PortNumber holds host order
                 portT <- newWHNFThunk (VInt (fromIntegral port))
                 addrT <- newWHNFThunk (VInt (fromIntegral addr))
                 pure (VCon "SockAddrInet" [portT, addrT])
             30 -> do
-                port <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
-                flow <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
-                a0 <- peekByteOff (castPtr p :: Ptr Word32) 8 :: IO Word32
-                a1 <- peekByteOff (castPtr p :: Ptr Word32) 12 :: IO Word32
-                a2 <- peekByteOff (castPtr p :: Ptr Word32) 16 :: IO Word32
-                a3 <- peekByteOff (castPtr p :: Ptr Word32) 20 :: IO Word32
+                portRaw <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
+                flowRaw <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
+                a0Raw <- peekByteOff (castPtr p :: Ptr Word32) 8 :: IO Word32
+                a1Raw <- peekByteOff (castPtr p :: Ptr Word32) 12 :: IO Word32
+                a2Raw <- peekByteOff (castPtr p :: Ptr Word32) 16 :: IO Word32
+                a3Raw <- peekByteOff (castPtr p :: Ptr Word32) 20 :: IO Word32
                 scope <- peekByteOff (castPtr p :: Ptr Word32) 24 :: IO Word32
+                let port = byteSwap16 portRaw                     -- ntohs
+                    flow = byteSwap32 flowRaw                     -- ntohl
+                    [a0,a1,a2,a3] = map byteSwap32 [a0Raw,a1Raw,a2Raw,a3Raw] -- ntohl each
                 portT <- newWHNFThunk (VInt (fromIntegral port))
                 flowT <- newWHNFThunk (VInt (fromIntegral flow))
                 addrT <- newWHNFThunk =<< fourTupleVal (map (VInt . fromIntegral) [a0, a1, a2, a3])
@@ -3801,7 +3844,9 @@ socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
         pokeAddr (castPtr p)
         rc <- c_bind_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
         if rc == -1
-            then ioError (userError "Network.Socket.bind")
+            then do
+                Errno e <- getErrno
+                ioError (userError ("Network.Socket.bind: errno=" <> show e))
             else pure VUnit
 
 socketCreateB :: IO Val
@@ -4036,16 +4081,21 @@ sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
 sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
     port <- intField "SockAddrInet.port" portT
     addr <- intField "SockAddrInet.addr" addrT
+    -- HostAddress is a Word32 already in network byte order (its host-LE
+    -- bytes ARE the network bytes).  PortNumber is host order, so htons
+    -- is required for sin_port; sin_addr is poked raw.
     pure (16, \p -> do
         pokeByteOff p 0 (16 :: Word8)
         pokeByteOff p 1 (2 :: Word8)
         pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
-        pokeByteOff p 4 (htonl32 (fromIntegral addr) :: Word32))
+        pokeByteOff p 4 (fromIntegral addr :: Word32))
 sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
     port <- intField "SockAddrInet6.port" portT
     flow <- intField "SockAddrInet6.flow" flowT
     scope <- intField "SockAddrInet6.scope" scopeT
     (a0, a1, a2, a3) <- hostAddress6Fields addrT
+    -- HostAddress6 = (Word32, Word32, Word32, Word32) in HOST byte order,
+    -- so each chunk needs htonl on poke.  ScopeID is raw (host concept).
     pure (28, \p -> do
         pokeByteOff p 0 (28 :: Word8)
         pokeByteOff p 1 (30 :: Word8)
@@ -4055,7 +4105,7 @@ sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
         pokeByteOff p 12 (htonl32 (fromIntegral a1) :: Word32)
         pokeByteOff p 16 (htonl32 (fromIntegral a2) :: Word32)
         pokeByteOff p 20 (htonl32 (fromIntegral a3) :: Word32)
-        pokeByteOff p 24 (htonl32 (fromIntegral scope) :: Word32))
+        pokeByteOff p 24 (fromIntegral scope :: Word32))
 sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug other)
 
 hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)

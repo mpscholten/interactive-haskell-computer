@@ -4285,6 +4285,11 @@ resetPerRunGlobals = do
     -- Clear the catalogue too so closures captured against this
     -- run's 'LoadedModule' state don't fire on the next run.
     resetInstanceCatalogue
+    -- Drop the (lm, name) → resolveImport memo from the prior run so
+    -- a fresh 'lmName' doesn't see stale resolutions captured against
+    -- the previous registry.
+    resetResolveImportCache
+    resetDiscoveryNegCache
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
@@ -5470,6 +5475,24 @@ discoverInModule
     -> IO ()
 discoverInModule = discoverInModuleWith Set.empty
 
+-- | Negative-result memo for 'discoverInModuleWith'.  Holds
+-- @(lmName, name)@ pairs that previously walked to a Nothing result
+-- (no local binding, no builtin alias, no import resolution).  The
+-- entry-time check turns retry calls (common from runtime env-fallback
+-- paths) into O(1) Set lookups instead of repeating the
+-- findOrResolveLhs+resolveImport chain.  Cleared per run by
+-- 'resetDiscoveryNegCache' (wired into 'resetPerRunGlobals').
+{-# NOINLINE discoverNegCacheRef #-}
+discoverNegCacheRef :: IORef (Set (ByteString, ByteString))
+discoverNegCacheRef = unsafePerformIO (newIORef Set.empty)
+
+resetDiscoveryNegCache :: IO ()
+resetDiscoveryNegCache = writeIORef discoverNegCacheRef Set.empty
+
+recordDiscoveryMiss :: LoadedModule -> ByteString -> IO ()
+recordDiscoveryMiss lm name =
+    modifyIORef' discoverNegCacheRef (Set.insert (lmName lm, name))
+
 -- | Variant of 'discoverInModule' that accepts a set of known builtin names
 -- so that the demand-driven resolver can skip the Prelude source walk for
 -- names that the evaluator can already resolve via the host builtin env.
@@ -5484,7 +5507,24 @@ discoverInModuleWith
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModuleWith builtins registry searchPath includeMap lm name
+discoverInModuleWith builtins registry searchPath includeMap lm name = do
+    -- Negative-result memo.  Both the unqualified-import-not-found and
+    -- the Set.member-name-builtins paths return without recording
+    -- anything in @lmBodies@, so a subsequent call to
+    -- @discoverInModule lm name@ re-runs 'findOrResolveLhs' (which
+    -- walks lm's source) AND 'resolveImport' (which loadModules every
+    -- unqualified import).  For warp-shaped programs that's hundreds
+    -- of redundant module loads per name across many lm's.  A small
+    -- @(lmName, name)@ Set short-circuits on retry.
+    cache <- readIORef discoverNegCacheRef
+    if Set.member (lmName lm, name) cache
+        then pure ()
+        else discoverInModuleWith' builtins registry searchPath includeMap lm name
+
+discoverInModuleWith'
+    :: Set ByteString -> ModuleRegistry -> [FilePath]
+    -> Map FilePath [FilePath] -> LoadedModule -> ByteString -> IO ()
+discoverInModuleWith' builtins registry searchPath includeMap lm name
     | Just (qual, bareName) <- splitQualified name = do
         case qualifiedBuiltinAlias lm qual bareName builtins of
             Just rhs ->
@@ -5537,7 +5577,7 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                         case mExpr of
                             Nothing
                                 | Set.member name builtins ->
-                                    pure ()
+                                    recordDiscoveryMiss lm name
                                 | otherwise -> do
                                     mForeign <- resolveImport registry searchPath includeMap lm name
                                     case mForeign of
@@ -5550,7 +5590,7 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                                                 (Map.insert name
                                                     (EVar (srcMod <> BC.pack "." <> name)))
                                         Nothing ->
-                                            pure ()
+                                            recordDiscoveryMiss lm name
                             Just expr0 -> do
                                 visibleFields <-
                                     if needsRecordFields expr0
@@ -5581,7 +5621,7 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                         -- makes implicit Prelude tractable for programs that
                         -- only use builtin names (the common case).
                         | Set.member name builtins ->
-                            pure ()
+                            recordDiscoveryMiss lm name
                         | otherwise -> do
                             -- Not local. Try imports.
                             mForeign <- resolveImport registry searchPath includeMap lm name
@@ -5596,8 +5636,11 @@ discoverInModuleWith builtins registry searchPath includeMap lm name
                                             (EVar (srcMod <> BC.pack "." <> name)))
                                 Nothing ->
                                     -- Assume a builtin; let the evaluator
-                                    -- complain if truly missing.
-                                    pure ()
+                                    -- complain if truly missing.  Memoize
+                                    -- the miss so retries from the runtime
+                                    -- env-fallback don't replay the
+                                    -- findOrResolveLhs+resolveImport walk.
+                                    recordDiscoveryMiss lm name
 
 qualifiedBuiltinAlias
     :: LoadedModule
@@ -5734,6 +5777,42 @@ resolveImport
     -> ByteString
     -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
+    -- Cache: every call walks @lm@'s unqualified imports and may
+    -- @loadModule@ each.  For warp-shaped programs the same
+    -- @(module, name)@ pair gets re-resolved hundreds of times during
+    -- demand-driven discovery, with each retry costing
+    -- O(unqualified-imports-of-lm) loadModule calls — observed at
+    -- ~3,300 loadModule calls/sec hammering the registry.  A simple
+    -- per-(lm-name, query-name) memo cuts that to one resolve per
+    -- pair.  Cache hits return both the @Just M@ and the @Nothing@
+    -- (no-resolution) outcomes so failed lookups don't replay either.
+    cache <- readIORef resolveImportCacheRef
+    case Map.lookup (lmName lm, name) cache of
+        Just cached -> pure cached
+        Nothing -> do
+            r0 <- resolveImport' registry searchPath includeMap lm name
+            modifyIORef' resolveImportCacheRef
+                (Map.insert (lmName lm, name) r0)
+            pure r0
+
+-- | Reset the resolve-import cache between runFile calls so a stale
+-- 'lmName' from a prior run doesn't shadow a fresh resolution.  Wired
+-- alongside the other per-run resets in 'loadProgramFromSource'.
+resetResolveImportCache :: IO ()
+resetResolveImportCache = writeIORef resolveImportCacheRef Map.empty
+
+{-# NOINLINE resolveImportCacheRef #-}
+resolveImportCacheRef :: IORef (Map (ByteString, ByteString) (Maybe ModuleName))
+resolveImportCacheRef = unsafePerformIO (newIORef Map.empty)
+
+resolveImport'
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO (Maybe ModuleName)
+resolveImport' registry searchPath includeMap lm name = do
     -- Only unqualified (non-qualified-import) imports can normally
     -- provide unqualified names — that's what the user-facing scope
     -- of @import qualified M as B@ guarantees (it brings @B.foo@,
