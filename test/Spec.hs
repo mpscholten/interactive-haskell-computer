@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtTypeApps
 import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
@@ -21,6 +22,7 @@ main = hspec do
     RunFile.spec
     CabalLoader.spec
     Coverage.spec
+    HsExtTypeApps.spec
     Unsupported.spec
     ReplTest.spec
     NorthStarTest.spec
