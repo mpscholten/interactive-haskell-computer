@@ -144,6 +144,7 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , HsExtRecords
       , JitSmoke
       , LexerIhp
       , NorthStarTest
