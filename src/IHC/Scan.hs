@@ -2301,9 +2301,20 @@ scanInstanceDeclsRaw src
         case topLevelCommaCount toks of
             n | n > 0 -> Just (BC.pack ("(" <> replicate n ',' <> ")"))
             _ -> case dropNoise toks of
+                -- Prefix tuple-constructor head: @((,) a)@ → @(,)@,
+                -- @((,,) a b)@ → @(,,)@.  Without this we fall through
+                -- to the TkIdent case and pick up the type variable
+                -- (e.g. "a") as the head, which means
+                -- @instance Functor ((,) a)@ registers under "a" instead
+                -- of "(,)" and the dispatcher never finds it.
+                (TkLParen : rest) | (commas, TkRParen : _) <- spanCommas rest ->
+                    Just (BC.pack ("(" <> replicate (length commas) ',' <> ")"))
                 (TkConId n : rest) -> Just (normalizeTyTag (qualifiedConHeadTokens n rest))
                 (TkIdent n : _)    -> Just (normalizeTyTag n)
                 _                  -> Nothing
+      where
+        spanCommas :: [TokenKind] -> ([TokenKind], [TokenKind])
+        spanCommas = span (\case TkComma -> True; _ -> False)
 
     qualifiedConHead :: ByteString -> Cursor -> (ByteString, Cursor)
     qualifiedConHead first cur =
@@ -2531,7 +2542,13 @@ scanInstanceDeclsRaw src
                 TkEof                    -> pure Nothing
                 TkEq      | depth == 0   -> pure Nothing
                 TkBar     | depth == 0   -> pure Nothing
-                TkSymOp op | depth == 0  -> pure (Just op)
+                -- @~@ at depth 0 is the irrefutable-pattern prefix
+                -- (Report §3.17.3), not an infix operator.  Treating it
+                -- as infix mis-registers @bimap f g ~(a, b) = …@ as a
+                -- method named @~@ instead of the prefix-form @bimap@,
+                -- and the real method body is lost.
+                TkSymOp op | depth == 0
+                           , op /= BC.pack "~" -> pure (Just op)
                 -- Dedicated-op tokens the lexer carves out (==, /=, <, <=,
                 -- >, >=, &&, ||, +, ++, *, :, $) are unambiguously infix
                 -- binary operators when seen at depth 0 between two LHS
