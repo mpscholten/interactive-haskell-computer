@@ -10,6 +10,7 @@ import Control.Exception (SomeException, evaluate, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
+import IHC.AST
 import IHC.Lexer (Token(..), TokenKind(..), nextToken, startCursor)
 import IHC.ModuleHeader
     ( ExportItem(..)
@@ -17,7 +18,7 @@ import IHC.ModuleHeader
     , ModuleHeader(..)
     , parseModuleHeader
     )
-import IHC.Parser (defaultFixityTable, parseExprOnly)
+import IHC.Parser (defaultFixityTable, parseExprAtEof)
 import IHC.Source (Source, mkSource)
 
 mkSrc :: ByteString -> Source
@@ -26,10 +27,8 @@ mkSrc = mkSource "<test>"
 lexOne :: ByteString -> IO (Either SomeException TokenKind)
 lexOne bs = try (evaluate (tkKind (fst (nextToken (mkSrc bs) startCursor))))
 
-parseExpr :: ByteString -> IO (Either SomeException ())
-parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
-    pure ()
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSrc bs) defaultFixityTable)
 
 shouldLexAs :: ByteString -> TokenKind -> IO ()
 shouldLexAs bs expected = do
@@ -41,13 +40,21 @@ shouldLexAs bs expected = do
         Left e -> expectationFailure
             ("lexer crashed: " <> show e)
 
-shouldParse :: ByteString -> IO ()
+shouldParse :: ByteString -> Expectation
 shouldParse bs = do
     r <- parseExpr bs
     case r of
         Right _ -> pure ()
         Left e -> expectationFailure
-            ("expected parse success, got " <> show e)
+            ("expected parse success on " <> show bs <> ", got " <> show e)
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- parseExpr bs
+    case r of
+        Right got -> got `shouldBe` expected
+        Left e    -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
 
 spec :: Spec
 spec = describe "Hs2010 — Lexical identifiers & operators" $ do
@@ -168,9 +175,9 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
 
     describe "§1.4 Qualified names" $ do
         it "1.4.1 qvarid `Foo.bar` parses as a qualified expression" $
-            shouldParse "Foo.bar"
+            "Foo.bar" `shouldParseTo` EVar "Foo.bar"
         it "1.4.2 qconid `Foo.Bar` parses as a qualified constructor" $
-            shouldParse "Foo.Bar"
+            "Foo.Bar" `shouldParseTo` EVar "Foo.Bar"
         it "1.4.3 qvarsym `Foo.++` parses as a qualified operator" $ do
             r <- parseExpr "1 Foo.++ 2"
             case r of
@@ -184,13 +191,14 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
                 Left _  -> pendingWith
                     "known gap: parser does not yet fuse qconsym (Module.:op) chains"
         it "1.4.5 multi-component qualifier `A.B.x` parses" $
-            shouldParse "A.B.x"
+            "A.B.x" `shouldParseTo` EVar "A.B.x"
         it "1.4.5 multi-component qualifier `A.B.C.x` parses" $
-            shouldParse "A.B.C.x"
+            "A.B.C.x" `shouldParseTo` EVar "A.B.C.x"
         it "1.4.6 dot abuts: `F.x` is a qualified name" $
-            shouldParse "F.x"
+            "F.x" `shouldParseTo` EVar "F.x"
         it "1.4.6 dot does not abut: `F . x` is constructor + composition" $
-            shouldParse "F . x"
+            "F . x" `shouldParseTo`
+                EApp (EApp (EVar ".") (EVar "F")) (EVar "x")
 
     describe "§1.4 Qualified names — module-header export forms" $ do
         it "abutting `M (B.bar)` exports the qualified name `bar`" $ do
@@ -208,16 +216,20 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
 
     describe "Higher-level conformance via parseExpr" $ do
         it "soft keyword `forall` binds as a value identifier (ParserBugs Bug 3)" $
-            shouldParse "let forall = 1 in forall"
+            "let forall = 1 in forall" `shouldParseTo`
+                ELet [("forall", ELit (LInt 1))] (EVar "forall")
         it "soft keyword `as` binds as a value identifier" $
-            shouldParse "let as = 1 in as"
+            "let as = 1 in as" `shouldParseTo`
+                ELet [("as", ELit (LInt 1))] (EVar "as")
         it "varsym `+++` parses as an infix expression" $
-            shouldParse "1 +++ 2"
+            "1 +++ 2" `shouldParseTo`
+                EApp (EApp (EVar "+++") (ELit (LInt 1))) (ELit (LInt 2))
         it "consym `:+:` parses as an infix expression" $
-            shouldParse "1 :+: 2"
+            "1 :+: 2" `shouldParseTo`
+                EApp (EApp (EVar ":+:") (ELit (LInt 1))) (ELit (LInt 2))
         it "qualified varid `Data.List.head` parses" $
-            shouldParse "Data.List.head"
+            "Data.List.head" `shouldParseTo` EVar "Data.List.head"
         it "parenthesised cons `(:)` parses as an atom" $
-            shouldParse "(:)"
+            "(:)" `shouldParseTo` EVar ":"
         it "parenthesised varsym `(+)` parses as an atom" $
-            shouldParse "(+)"
+            "(+)" `shouldParseTo` EVar "+"
