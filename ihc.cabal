@@ -144,6 +144,7 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Hs2010ClassInst
       , Hs2010Types
       , HsExtGADTs
       , Hs2010Patterns
