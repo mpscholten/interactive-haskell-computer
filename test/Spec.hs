@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtForall
 import qualified Hs2010Fixity
 import qualified Hs2010Deriving
 import qualified HsExtDeriving
@@ -67,3 +68,4 @@ main = hspec do
     ReplTest.spec
     NorthStarTest.spec
     LexerIhp.spec
+    HsExtForall.spec
