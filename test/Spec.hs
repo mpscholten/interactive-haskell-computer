@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified Hs2010LexComments
 import qualified HsExtLiterals
 import qualified Hs2010ExprCtl
 import qualified Hs2010Modules
@@ -23,6 +24,7 @@ import qualified Unsupported
 main :: IO ()
 main = hspec do
     ParserBugs.spec
+    Hs2010LexComments.spec
     HsExtLiterals.spec
     Hs2010ExprCtl.spec
     Hs2010Modules.spec
