@@ -6,6 +6,7 @@ import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
 import qualified Hs2010LexLayout
+import qualified Hs2010DataDecl
 import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
@@ -18,6 +19,7 @@ main :: IO ()
 main = hspec do
     ParserBugs.spec
     Hs2010LexLayout.spec
+    Hs2010DataDecl.spec
     JitSmoke.spec
     CoreLowerTest.spec
     RunFile.spec
