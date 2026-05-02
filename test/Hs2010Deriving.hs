@@ -1,3 +1,6 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module Hs2010Deriving (spec) where
 
 import Control.Exception (SomeException, fromException, try)
@@ -8,57 +11,59 @@ import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
 
--- | Assert that 'loadProgramFromSource' parses the program. A 'ParseError'
--- is a definite failure; any other exception means the parse made it
--- through and only later elaboration (typecheck, dispatch, …) tripped on
--- the stub program — which is fine for a parser conformance test.
-assertParses :: ByteString -> Expectation
-assertParses bs = do
+-- | Strict load assertion: the program must load all the way through
+-- 'loadProgramFromSource' without raising. A 'ParseError' or any other
+-- exception is a failure — silently swallowing post-parse exceptions
+-- hides regressions where elaboration starts to throw on shapes that
+-- previously elaborated cleanly.
+assertLoads :: ByteString -> Expectation
+assertLoads bs = do
     r <- try (loadProgramFromSource [] (mkSource "<test>" bs))
     case r of
         Right _ -> pure ()
         Left (e :: SomeException)
             | Just (pe :: ParseError) <- fromException e -> expectationFailure
-                ("expected parse to succeed, got ParseError: " <> show pe)
-            | otherwise -> pure ()
+                ("expected program to load, got ParseError: " <> show pe)
+            | otherwise -> expectationFailure
+                ("expected program to load, got exception: " <> show e)
 
 spec :: Spec
 spec = describe "Hs2010 — Class specifics & deriving" $ do
 
     describe "8.1 Class hierarchy / superclasses" $ do
         it "8.1.1 single superclass: class Eq a => Ord' a" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class Eq a => Ord' a where\n\
                 \  cmp :: a -> a -> Bool\n"
 
         it "8.1.2 multi-superclass tuple context: class (Eq a, Show a) => T a" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class (Eq a, Show a) => T a where\n\
                 \  m :: a -> a\n"
 
         it "8.1.3 class without where body: class C a" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a\n"
 
     describe "8.2 Class body items" $ do
         it "8.2.1 method type signature" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \  m :: a -> a\n"
 
         it "8.2.2 default method binding (function-form)" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \  m :: a -> a\n\
                 \  m x = x\n"
 
         it "8.2.3 class-method fixity declaration" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \  infixl 5 `m`\n\
@@ -66,7 +71,7 @@ spec = describe "Hs2010 — Class specifics & deriving" $ do
 
     describe "8.3 Instance body items" $ do
         it "8.3.1 function-form method binding only" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \  m :: a -> a\n\
@@ -75,7 +80,7 @@ spec = describe "Hs2010 — Class specifics & deriving" $ do
                 \  m x = x\n"
 
         it "8.3.2 empty instance: instance C T where" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \data T = T\n\
@@ -87,79 +92,79 @@ spec = describe "Hs2010 — Class specifics & deriving" $ do
 
     describe "8.4 Instance-head shapes" $ do
         it "8.4.1 gtycon alone: instance C Int" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \instance C Int where\n"
 
         it "8.4.2 constructor applied to distinct tyvars: instance C (M' a b)" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \data M' a b = M'\n\
                 \instance C (M' a b) where\n"
 
         it "8.4.3 tuple of distinct tyvars: instance C (a,b)" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \instance C (a, b) where\n"
 
         it "8.4.4 single-tyvar list: instance C [a]" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \instance C [a] where\n"
 
         it "8.4.5 function arrow with distinct tyvars: instance C (a -> b)" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \class C a where\n\
                 \instance C (a -> b) where\n"
 
     describe "8.5 deriving classes" $ do
         it "8.5.1a deriving Eq" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving Eq\n"
 
         it "8.5.1b deriving Ord" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving Ord\n"
 
         it "8.5.1c deriving Show" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving Show\n"
 
         it "8.5.1d deriving Read" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving Read\n"
 
         it "8.5.1e deriving Bounded" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = A | B deriving Bounded\n"
 
         it "8.5.1f deriving Enum" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = A | B deriving Enum\n"
 
         it "8.5.1g deriving Ix" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = A | B deriving Ix\n"
 
         it "8.5.2 single class form: deriving Show" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving Show\n"
 
         it "8.5.3 parenthesised list: deriving (Eq, Ord)" $
-            assertParses
+            assertLoads
                 "module M where\n\
                 \data T = T deriving (Eq, Ord)\n"
 
