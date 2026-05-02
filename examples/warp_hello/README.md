@@ -19,7 +19,7 @@ main = run 3099 $ \_ respond ->
 nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 ```
 
-## Current state (2026-05-01)
+## Current state (2026-05-02)
 
 This example **does not yet complete an HTTP request**. It is checked in
 to anchor the warp-server objective and provide a reproducer for the
@@ -39,24 +39,33 @@ What works:
 
 What does not work:
 
-* `socketAcceptB` is never reached. After `listen` returns, the
-  interpreter spends all CPU in interpreted-thunk evaluation before it
-  ever enters Warp's `acceptLoop`. `curl http://127.0.0.1:3099/` connects
-  at the kernel level (the listen backlog absorbs the SYN) but receives
-  zero response bytes and times out.
-* Sampling the running process with `sample <pid>` shows the main thread
-  hot in `Data.ByteString.compareBytes` underneath
-  `Data.List.filter`/`elem` and the IHC `schedule` /
-  interpreter info tables. This is the same env-fallback chain
-  flagged as "remaining spin is downstream" in the
-  `Scheduler: memoise resolveImport + discoverInModule miss results`
-  commit (ef9e6fb).
+* `socketAcceptB` is never reached. The bracket's inner action returns
+  a `<function>` (VFun) instead of an `IO ()`, so the bracket cleans up
+  and `runIO` exits with the unrun function as the terminal value.
+* Diagnostic instrumentation (added then reverted in this session)
+  showed the leak originates inside three runIOVal call sites in
+  `IHC.Builtins.hs`:
+  * Line ~2471 in `seqDispatch`'s non-IO fallback — `>>` is invoked
+    with a function-typed first arg.
+  * Line ~2416 in `bindDispatch`'s non-IO fallback — `>>=`'s
+    continuation result is a function.
+  * Line ~5987 in `atomicallyHashB` — STM state-transformer `apply`
+    returns a function instead of the `(# State#, a #)` tuple.
+* The `HasCallStack`-traced runs reproduce reliably (warp setup
+  evaluates, listener appears, then bracket teardown fires after a
+  few seconds with `runIO non-VIO after 1 VIO unwraps: <VFun>`).
 
-In short: the gap is no longer in source loading, parsing, primops, or
-socket setup. It is the cost of demanding the lazy thunks that sit
-between `listen` and `acceptLoop` in Warp's connection-manager and
-timer-manager wiring. Closing it requires turning the env-fallback
-hot path into something better than linear scans over ByteString lists.
+The next session should re-add HasCallStack-based instrumentation to
+`runIOVal` and trace which source binding evaluates to a partial
+application instead of an IO action — the bug is upstream of the three
+detected sites and likely in either `Counter <$> newTVarIO 0` (from
+warp's `newCounter`), the timer-manager `withII` chain, or one of
+warp's eta-reduced point-free helpers (`runSettingsConnectionMaker`
+takes 2 args but is invoked with 3).
+
+The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
+fix (commit da212e0) closed the previous "silent exit before listen"
+class of failures.
 
 ## Reproduce the diagnosis
 
