@@ -97,6 +97,12 @@ library
         -fno-stack-protector
         -mmacosx-version-min=14.0
 
+    -- Interpreter inner loops (env lookup, thunk forcing, class dispatch)
+    -- run millions of times during warp-style programs. -O2 unlocks
+    -- enough inlining + specialisation in those hot paths to make the
+    -- difference between "minutes per request" and "fast enough".
+    ghc-options:      -O2
+
 executable ihc
     import:           warnings, lang
     hs-source-dirs:   app
@@ -107,7 +113,7 @@ executable ihc
       , filepath
       , ihc
       , text
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G"
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2
 
     -- Post-build codesigning must be handled outside cabal (see Makefile /
     -- scripts/codesign-jit.sh). cabal does not have a portable post-build hook.

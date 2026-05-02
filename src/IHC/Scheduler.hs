@@ -4268,6 +4268,8 @@ resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
     writeIORef globalLoadedModulesRef Map.empty
     writeIORef envFallbackCache       Map.empty
+    writeIORef envFallbackNegCacheRef (0, Set.empty)
+    writeIORef envFallbackCacheGenRef 0
     writeIORef envBaseForFallbackRef  Map.empty
     writeIORef globalTypeSigsRef      Map.empty
     writeIORef globalTypeSynonymsRef  Map.empty
@@ -4294,6 +4296,9 @@ resetPerRunGlobals = do
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
+    -- Bump the env-fallback generation: a previously-cached "Nothing"
+    -- might now resolve via this module.
+    bumpEnvFallbackGen
     -- Mirror per-module type sigs + synonyms into the flat global
     -- registries used by 'IHC.Elaborate'.  Last-writer-wins for name
     -- collisions across modules (rare in practice — sigs are
@@ -4391,13 +4396,77 @@ envFallbackCache = unsafePerformIO (newIORef Map.empty)
 envBaseForFallbackRef :: IORef Env
 envBaseForFallbackRef = unsafePerformIO (newIORef Map.empty)
 
+-- | Negative-result memo for the env-fallback hook.  When 'resolveFallback'
+-- returns 'Nothing' for some @(owner, name)@ pair, that result is recorded
+-- here so the next lookup short-circuits instead of re-walking the rewrite
+-- table, 'splitQualifiedByLoadedModule', and the per-candidate
+-- 'findOrResolveLhs' chain.
+--
+-- The cache is generation-tagged.  'envFallbackCacheGenRef' is bumped
+-- whenever new sources of names enter the system — a fresh 'LoadedModule'
+-- is registered, or a previously-discovered module gains a body via
+-- 'discoverInModule'.  Either of those events can flip a previously-Nothing
+-- lookup to Just, so the negative cache from before the bump must not be
+-- consulted.  The check compares the cache's stored generation against the
+-- current one; on mismatch we treat the cache as empty.
+{-# NOINLINE envFallbackNegCacheRef #-}
+envFallbackNegCacheRef :: IORef (Int, Set (Maybe ByteString, ByteString))
+envFallbackNegCacheRef = unsafePerformIO (newIORef (0, Set.empty))
+
+{-# NOINLINE envFallbackCacheGenRef #-}
+envFallbackCacheGenRef :: IORef Int
+envFallbackCacheGenRef = unsafePerformIO (newIORef 0)
+
+bumpEnvFallbackGen :: IO ()
+bumpEnvFallbackGen = modifyIORef' envFallbackCacheGenRef (+1)
+
+-- | Merge a batch of newly-loaded modules into the global registry and
+-- bump the env-fallback generation in one place.  Use this instead of
+-- writing directly to 'globalLoadedModulesRef' so the fallback's
+-- negative cache stays consistent with what's resolvable.
+mergeGlobalLoadedModules :: Map ModuleName LoadedModule -> IO ()
+mergeGlobalLoadedModules newMods
+    | Map.null newMods = pure ()
+    | otherwise = do
+        modifyIORef' globalLoadedModulesRef (Map.union newMods)
+        bumpEnvFallbackGen
+
+-- | Insert a body into a module's 'lmBodies' and bump the env-fallback
+-- generation.  Centralised so the negative cache invalidates whenever
+-- a previously-missing name might now resolve.
+insertLmBody :: LoadedModule -> ByteString -> Expr -> IO ()
+insertLmBody lm name expr = do
+    modifyIORef' (lmBodies lm) (Map.insert name expr)
+    bumpEnvFallbackGen
+
 installEnvFallbackHook :: IO ()
 installEnvFallbackHook =
     setEnvFallback $ \mOwner name -> do
         cache <- readIORef envFallbackCache
         case Map.lookup name cache of
             Just t  -> pure (Just t)
-            Nothing -> resolveFallback mOwner name
+            Nothing -> do
+                gen <- readIORef envFallbackCacheGenRef
+                (negGen, negSet) <- readIORef envFallbackNegCacheRef
+                let key = (mOwner, name)
+                if negGen == gen && Set.member key negSet
+                    then pure Nothing
+                    else do
+                        result <- resolveFallback mOwner name
+                        case result of
+                            Just _  -> pure result
+                            Nothing -> do
+                                -- Re-read the generation: 'resolveFallback'
+                                -- may have loaded modules itself, bumping
+                                -- it.  The negative we just observed is
+                                -- valid against the post-resolve state.
+                                gen' <- readIORef envFallbackCacheGenRef
+                                modifyIORef' envFallbackNegCacheRef $
+                                    \(prevGen, prevSet) ->
+                                        if prevGen == gen'
+                                            then (gen', Set.insert key prevSet)
+                                            else (gen', Set.singleton key)
+                                pure Nothing
 
 resolveFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 resolveFallback _mOwner name
@@ -4553,8 +4622,7 @@ resolveFallback mOwner name = do
                                     reg <- readIORef transientReg
                                     let newMods = Map.fromList
                                             [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                    modifyIORef' globalLoadedModulesRef
-                                        (Map.union newMods)
+                                    mergeGlobalLoadedModules newMods
                                     mods' <- readIORef globalLoadedModulesRef
                                     buildSlotFromOwner mods'
                                         (Map.findWithDefault owner modName mods')
@@ -4587,8 +4655,7 @@ resolveFallback mOwner name = do
                                     reg <- readIORef transientReg
                                     let newMods = Map.fromList
                                             [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                    modifyIORef' globalLoadedModulesRef
-                                        (Map.union newMods)
+                                    mergeGlobalLoadedModules newMods
                                     readIORef globalLoadedModulesRef
                             buildSlotFromOwner mods'
                                 (Map.findWithDefault owner modName mods')
@@ -4652,8 +4719,7 @@ resolveFallback mOwner name = do
                                                 reg <- readIORef transientReg
                                                 let newMods = Map.fromList
                                                         [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                                modifyIORef' globalLoadedModulesRef
-                                                    (Map.union newMods)
+                                                mergeGlobalLoadedModules newMods
                                                 mods' <- readIORef globalLoadedModulesRef
                                                 buildSlotFromOwner mods'
                                                     (Map.findWithDefault preludeLm ownerName mods')
@@ -5046,7 +5112,7 @@ resolveFallback mOwner name = do
                                 [ (n, loadedLm)
                                 | (n, Loaded loadedLm) <- Map.toList reg
                                 ]
-                        modifyIORef' globalLoadedModulesRef (Map.union newMods)
+                        mergeGlobalLoadedModules newMods
                         mods' <- readIORef globalLoadedModulesRef
                         tryGlobalFieldSlot mods' bareName
                 _ -> go transientReg searchPath includeMap rest
@@ -5086,7 +5152,7 @@ resolveFallback mOwner name = do
                 reg <- readIORef transientReg
                 let newMods = Map.fromList
                         [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                modifyIORef' globalLoadedModulesRef (Map.union newMods)
+                mergeGlobalLoadedModules newMods
                 let providerName = providerMod <> BC.pack "." <> bareName
                 mSlot <- resolveFallback (Just (lmName owner)) providerName
                 case mSlot of
@@ -5528,7 +5594,7 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
     | Just (qual, bareName) <- splitQualified name = do
         case qualifiedBuiltinAlias lm qual bareName builtins of
             Just rhs ->
-                modifyIORef' (lmBodies lm) (Map.insert name rhs)
+                insertLmBody lm name rhs
             Nothing -> do
                 mTarget <- resolveQualifiedName registry searchPath includeMap lm qual bareName
                 case mTarget of
@@ -5551,7 +5617,7 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                               | Map.member bareName targetBodies = EVar fqn
                               | Set.member fqn builtins          = EVar fqn
                               | otherwise                        = EVar bareName
-                        modifyIORef' (lmBodies lm) (Map.insert name rhs)
+                        insertLmBody lm name rhs
                     Nothing ->
                         throwIO (UnresolvedName
                             ("qualified name " <> BC.unpack name
@@ -5586,9 +5652,8 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                             -- module's FQN, not a bare-name
                                             -- self-reference (which would
                                             -- self-loop at eval time).
-                                            modifyIORef' (lmBodies lm)
-                                                (Map.insert name
-                                                    (EVar (srcMod <> BC.pack "." <> name)))
+                                            insertLmBody lm name
+                                                (EVar (srcMod <> BC.pack "." <> name))
                                         Nothing ->
                                             recordDiscoveryMiss lm name
                             Just expr0 -> do
@@ -5598,7 +5663,7 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                         else pure (lmFieldReg lm)
                                 let expr = desugarRecordPats visibleFields
                                              (desugarRecordCons visibleFields expr0)
-                                modifyIORef' (lmBodies lm) (Map.insert name expr)
+                                insertLmBody lm name expr
                                 -- Recurse into every free var. Qualified ones
                                 -- will be routed on the next call.
                                 -- Deduplicate to avoid O(n^2) re-traversal when a
@@ -5631,9 +5696,8 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                     -- module's FQN so eval-time lookup goes
                                     -- through thunkByKey to the real binding
                                     -- (foreign-import sentinel or source body).
-                                    modifyIORef' (lmBodies lm)
-                                        (Map.insert name
-                                            (EVar (srcMod <> BC.pack "." <> name)))
+                                    insertLmBody lm name
+                                        (EVar (srcMod <> BC.pack "." <> name))
                                 Nothing ->
                                     -- Assume a builtin; let the evaluator
                                     -- complain if truly missing.  Memoize
