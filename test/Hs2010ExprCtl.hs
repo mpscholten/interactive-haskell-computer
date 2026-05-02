@@ -7,16 +7,15 @@ import Control.Exception (SomeException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (defaultFixityTable, parseExprOnly)
+import IHC.AST
+import IHC.Parser (defaultFixityTable, parseExprAtEof)
 import IHC.Source (Source, mkSource)
 
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
 
-parseExpr :: ByteString -> IO (Either SomeException ())
-parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
-    pure ()
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSrc bs) defaultFixityTable)
 
 shouldParse :: ByteString -> Expectation
 shouldParse bs = do
@@ -26,34 +25,59 @@ shouldParse bs = do
         Left e  -> expectationFailure
             ("expected parse success on " <> show bs <> ", got " <> show e)
 
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- parseExpr bs
+    case r of
+        Right got -> got `shouldBe` expected
+        Left e    -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
+
 spec :: Spec
 spec = describe "Hs2010 — Expression control flow" $ do
 
     describe "5.1 atomic expressions" $ do
-        it "5.1.1 variable `x`" $ shouldParse "x"
-        it "5.1.2 qualified variable `M.x`" $ shouldParse "M.x"
-        it "5.1.3 operator-as-varid `(+)`" $ shouldParse "(+)"
-        it "5.1.4 constructor `Just`" $ shouldParse "Just"
-        it "5.1.5 constructor operator in parens `(:)`" $ shouldParse "(:)"
+        it "5.1.1 variable `x`" $
+            "x" `shouldParseTo` EVar "x"
+        it "5.1.2 qualified variable `M.x`" $
+            "M.x" `shouldParseTo` EVar "M.x"
+        it "5.1.3 operator-as-varid `(+)`" $
+            "(+)" `shouldParseTo` EVar "+"
+        it "5.1.4 constructor `Just`" $
+            "Just" `shouldParseTo` EVar "Just"
+        it "5.1.5 constructor operator in parens `(:)`" $
+            "(:)" `shouldParseTo` EVar ":"
         it "5.1.6 unit constructor `()`" $ shouldParse "()"
         it "5.1.7 nil-list constructor `[]`" $ shouldParse "[]"
         it "5.1.8a tuple constructor `(,)`" $
             pendingWith "known gap: tuple constructors (,) as values"
         it "5.1.8b tuple constructor `(,,)`" $
             pendingWith "known gap: tuple constructors (,,) as values"
-        it "5.1.9 integer literal `1`" $ shouldParse "1"
-        it "5.1.10 float literal `1.5`" $ shouldParse "1.5"
-        it "5.1.11 char literal `'a'`" $ shouldParse "'a'"
-        it "5.1.12 string literal `\"x\"`" $ shouldParse "\"x\""
-        it "5.1.13 parenthesised expression `(e)`" $ shouldParse "(x)"
+        it "5.1.9 integer literal `1`" $
+            "1" `shouldParseTo` ELit (LInt 1)
+        it "5.1.10 float literal `1.5`" $
+            "1.5" `shouldParseTo` ELit (LFloat 1.5)
+        it "5.1.11 char literal `'a'`" $
+            "'a'" `shouldParseTo` ELit (LChar 'a')
+        it "5.1.12 string literal `\"x\"` (parser desugars to cons-list of chars)" $
+            "\"x\"" `shouldParseTo`
+                EApp (EApp (EVar ":") (ELit (LChar 'x'))) (EVar "[]")
+        it "5.1.13 parenthesised expression `(e)`" $
+            "(x)" `shouldParseTo` EVar "x"
 
     describe "5.2 application" $ do
-        it "5.2.1 function application `f x y`" $ shouldParse "f x y"
-        it "5.2.2 constructor application `Just 1`" $ shouldParse "Just 1"
+        it "5.2.1 function application `f x y`" $
+            "f x y" `shouldParseTo`
+                EApp (EApp (EVar "f") (EVar "x")) (EVar "y")
+        it "5.2.2 constructor application `Just 1`" $
+            "Just 1" `shouldParseTo`
+                EApp (EVar "Just") (ELit (LInt 1))
 
     describe "5.3 lambda abstractions" $ do
-        it "5.3.1 single-arg lambda `\\x -> x`" $ shouldParse "\\x -> x"
-        it "5.3.2 multi-arg lambda `\\x y -> y`" $ shouldParse "\\x y -> y"
+        it "5.3.1 single-arg lambda `\\x -> x`" $
+            "\\x -> x" `shouldParseTo` ELam "x" (EVar "x")
+        it "5.3.2 multi-arg lambda `\\x y -> y`" $
+            "\\x y -> y" `shouldParseTo` ELam "x" (ELam "y" (EVar "y"))
         it "5.3.3 lambda with constructor pattern `\\(x:xs) -> x`" $
             shouldParse "\\(x:xs) -> x"
         it "5.3.4 lambda with as-pattern `\\a@b -> a`" $
@@ -61,7 +85,8 @@ spec = describe "Hs2010 — Expression control flow" $ do
 
     describe "5.4 let bindings" $ do
         it "5.4.1 let with single binding" $
-            shouldParse "let x = 1 in x"
+            "let x = 1 in x" `shouldParseTo`
+                ELet [("x", ELit (LInt 1))] (EVar "x")
         it "5.4.2a let with multi-binding (explicit braces)" $
             shouldParse "let { x = 1; y = 2 } in x"
         it "5.4.2b let with multi-binding (true layout — same line)" $
@@ -71,7 +96,8 @@ spec = describe "Hs2010 — Expression control flow" $ do
 
     describe "5.5 conditional" $ do
         it "5.5.1 `if c then a else b`" $
-            shouldParse "if c then a else b"
+            "if c then a else b" `shouldParseTo`
+                EIf (EVar "c") (EVar "a") (EVar "b")
         it "5.5.2 `if` with optional semicolons" $
             pendingWith "known gap: optional `;` between `if`/`then`/`else`"
 
@@ -99,10 +125,16 @@ spec = describe "Hs2010 — Expression control flow" $ do
         it "5.7.3 let statement `do let x = 1 ; e`" $
             shouldParse "do { let x = 1 ; e }"
         it "5.7.4 empty statement `do ; e`" $
-            pendingWith "known gap: empty statement in do"
-        it "5.7.5 final statement must be an expression" $ do
-            r <- parseExpr "do { x <- m }"
+            pendingWith "known gap: empty `;` statement at start of do block"
+        it "5.7.5 final must be expression — invalid `do x <- m`" $
+            pendingWith "known gap: parser doesn't enforce do-block final-expression rule"
+
+    describe "EOF strictness — silent-skip protection" $ do
+        it "rejects trailing tokens after a complete expression (e.g. `1 in 2`)" $ do
+            r <- parseExpr "1 in 2"
             case r of
                 Left _  -> pure ()
-                Right _ -> pendingWith
-                    "known gap: parser accepts trailing bind in do; report rule not enforced"
+                Right e -> expectationFailure
+                    ("expected ParseError on trailing tokens, got " <> show e)
+        it "accepts a complete expression with no trailing tokens" $
+            "1" `shouldParseTo` ELit (LInt 1)

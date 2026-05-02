@@ -29,6 +29,7 @@ module IHC.Parser
     ( parseBodyExpr
     , parseBodyExprWithFixity
     , parseExprOnly
+    , parseExprAtEof
     , ParseError(..)
     , FixityTable
     , Assoc(..)
@@ -250,6 +251,23 @@ parseExprOnly src fx = liftLex $ do
         cur = startCursor
     (e, _) <- parseExpr ctx cur
     pure e
+
+-- | Like 'parseExprOnly', but additionally requires that the parser
+-- consume the entire input. Trailing tokens (including stray operators
+-- or garbage after a complete expression) raise a 'ParseError' instead
+-- of being silently ignored. Use this in tests that need to assert the
+-- parser actually saw the whole snippet rather than stopping early.
+parseExprAtEof :: Source -> FixityTable -> IO Expr
+parseExprAtEof src fx = liftLex $ do
+    let end = BC.length (srcBytes src)
+        ctx = Ctx src end 0 fx
+        cur = startCursor
+    (e, cur1) <- parseExpr ctx cur
+    let (tok, _) = nextToken src cur1
+    case tkKind tok of
+        TkEof -> pure e
+        leftover -> throwIO (ParseError (srcName src) (cLine cur1) (cCol cur1)
+                ("trailing tokens after expression; first leftover: " <> show leftover))
 
 --------------------------------------------------------------------------------
 -- Parsed clauses
