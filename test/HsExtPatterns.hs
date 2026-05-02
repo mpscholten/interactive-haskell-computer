@@ -1,0 +1,109 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
+module HsExtPatterns (spec) where
+
+import Control.Exception (SomeException, fromException, try)
+import Data.ByteString (ByteString)
+import Test.Hspec
+
+import IHC.Parser (ParseError, defaultFixityTable, parseExprOnly)
+import IHC.Scheduler (loadProgramFromSource)
+import IHC.Source (Source, mkSource)
+
+mkSrc :: ByteString -> Source
+mkSrc = mkSource "<test>"
+
+parseExpr :: ByteString -> IO (Either SomeException ())
+parseExpr bs = try $ do
+    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
+    pure ()
+
+-- | Parse-only check for declaration-level fixtures.  We only care that the
+-- parser doesn't reject the source with a ParseError; later elaboration can
+-- legitimately fail on tiny stub modules and that's not a parser bug.
+parseModule :: ByteString -> IO (Either SomeException ())
+parseModule bs = do
+    r <- try (loadProgramFromSource [] (mkSrc bs))
+    pure $ case r of
+        Right _ -> Right ()
+        Left (e :: SomeException)
+            | Just (_ :: ParseError) <- fromException e -> Left e
+            | otherwise                                 -> Right ()
+
+shouldParse :: Either SomeException () -> Expectation
+shouldParse = \case
+    Right _ -> pure ()
+    Left e  -> expectationFailure ("expected parse success, got: " <> show e)
+
+spec :: Spec
+spec = describe "HsExt — Pattern extensions" $ do
+
+    describe "BangPatterns" $ do
+        it "BangPatterns: \\(!x) -> x in lambda" $ do
+            r <- parseExpr "\\(!x) -> x"
+            shouldParse r
+
+        it "BangPatterns: let !x = 1 in x" $ do
+            r <- parseExpr "let !x = 1 in x"
+            shouldParse r
+
+        it "BangPatterns: case y of !x -> x" $ do
+            r <- parseExpr "case y of !x -> x"
+            shouldParse r
+
+    describe "ViewPatterns" $ do
+        it "ViewPatterns: \\(f -> p) -> p in lambda" $ do
+            r <- parseExpr "\\(f -> p) -> p"
+            shouldParse r
+
+        it "ViewPatterns: case y of (f -> p) -> p" $ do
+            r <- parseExpr "case y of (f -> p) -> p"
+            shouldParse r
+
+    describe "NamedFieldPuns" $ do
+        it "NamedFieldPuns: \\C{x} -> x in lambda" $ do
+            r <- parseExpr "\\C{x} -> x"
+            shouldParse r
+
+        it "NamedFieldPuns: case y of C{x} -> x" $ do
+            r <- parseExpr "case y of C{x} -> x"
+            shouldParse r
+
+    describe "RecordWildCards" $ do
+        it "RecordWildCards: \\C{..} -> x in lambda" $ do
+            r <- parseExpr "\\C{..} -> x"
+            shouldParse r
+
+        it "RecordWildCards: case y of C{..} -> x" $ do
+            r <- parseExpr "case y of C{..} -> x"
+            shouldParse r
+
+    describe "PatternSynonyms" $ do
+        it "PatternSynonyms: bidirectional pattern P x = Just x" $ do
+            pendingWith "needs LANGUAGE PatternSynonyms support"
+            r <- parseModule
+                "{-# LANGUAGE PatternSynonyms #-}\n\
+                \module M where\n\
+                \pattern P x = Just x\n\
+                \main = pure ()\n"
+            shouldParse r
+
+        it "PatternSynonyms: uni-directional pattern Q x <- Just x" $ do
+            pendingWith "needs LANGUAGE PatternSynonyms support"
+            r <- parseModule
+                "{-# LANGUAGE PatternSynonyms #-}\n\
+                \module M where\n\
+                \pattern Q x <- Just x\n\
+                \main = pure ()\n"
+            shouldParse r
+
+        it "PatternSynonyms: record pattern R {y} = T y" $ do
+            pendingWith "needs LANGUAGE PatternSynonyms support"
+            r <- parseModule
+                "{-# LANGUAGE PatternSynonyms #-}\n\
+                \module M where\n\
+                \data T = T Int\n\
+                \pattern R {y} = T y\n\
+                \main = pure ()\n"
+            shouldParse r
