@@ -145,6 +145,9 @@ test-suite ihc-test
       , CoreLowerTest
       , Coverage
       , Hs2010LexStr
+      , Hs2010ExprData
+      , Hs2010LexLayout
+      , Hs2010DataDecl
       , JitSmoke
       , LexerIhp
       , NorthStarTest
