@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtDeriving
 import qualified HsExtSyntax
 import qualified HsExtClasses
 import qualified HsExtKinds
@@ -34,6 +35,7 @@ import qualified Unsupported
 main :: IO ()
 main = hspec do
     ParserBugs.spec
+    HsExtDeriving.spec
     HsExtSyntax.spec
     HsExtClasses.spec
     HsExtKinds.spec
