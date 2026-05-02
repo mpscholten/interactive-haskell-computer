@@ -10,7 +10,7 @@ import Test.Hspec
 import IHC.Parser
     ( ParseError
     , defaultFixityTable
-    , parseExprOnly
+    , parseExprAtEof
     )
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
@@ -27,7 +27,7 @@ isParseError e = case fromException e of
 -- exception (including 'ParseError') as a failed expectation.
 parseExprOk :: ByteString -> Expectation
 parseExprOk bs = do
-    r <- try (parseExprOnly (mkSrc bs) defaultFixityTable)
+    r <- try (parseExprAtEof (mkSrc bs) defaultFixityTable)
     case r of
         Right _                  -> pure ()
         Left (e :: SomeException) -> expectationFailure
