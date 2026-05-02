@@ -52,6 +52,7 @@ import Control.Applicative ((<|>))
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -342,7 +343,7 @@ loadProgramFromSource searchPath src0 = do
     -- and semantically pointless, because the evaluator resolves to the
     -- builtin anyway.
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Map.keysSet earlyBuiltins
+    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
 
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
@@ -477,7 +478,7 @@ loadProgramFromSource searchPath src0 = do
     -- under a synthetic @__ffi.Module.name@ key. Module bodies reach
     -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
     ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
-    let baseNoClass = Map.union builtins (Map.union fieldEnv (Map.union conEnv ffiEnv))
+    let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv (HashMap.union conEnv ffiEnv))
     -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
     -- scanClassDecls). For every `class C a where m :: ...` declaration in
     -- any loaded module, bind `m` as a top-level dispatcher that looks up
@@ -485,7 +486,7 @@ loadProgramFromSource searchPath src0 = do
     -- selected instance method. Names that collide with built-in
     -- dispatchers (e.g. show/==/compare) are skipped.
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
-    let base = Map.union classMethodEnv baseNoClass
+    let base = HashMap.union classMethodEnv baseNoClass
 
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
@@ -494,7 +495,7 @@ loadProgramFromSource searchPath src0 = do
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
-    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
+    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
 
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
@@ -513,7 +514,7 @@ loadProgramFromSource searchPath src0 = do
         case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
             Just idx -> do
                 let bareName = BC.drop (idx + 1) fqn
-                case Map.lookup bareName builtins of
+                case HashMap.lookup bareName builtins of
                     Just builtinThunk
                         | isSentinel rhs || Set.member bareName ffiBuiltinNames -> do
                             builtinState <- readIORef builtinThunk
@@ -560,24 +561,24 @@ loadProgramFromSource searchPath src0 = do
                     , "stdout", "stderr", "stdin"
                     ])
         builtinOverrides =
-            Map.filterWithKey
+            HashMap.filterWithKey
                 (\k _ -> Set.member (builtinBareName k) alwaysBuiltinNames)
                 builtins
         -- Import aliases should not overwrite base entries such as
         -- class-method dispatchers.  Network.Socket.Info.getAddrInfo is a
         -- class selector; replacing its bare dispatcher with an alias to the
         -- fully-qualified selector creates a self-loop.
-        aliasesWithoutBase = Map.difference aliases base
+        aliasesWithoutBase = HashMap.difference aliases base
         aliasBuiltinOverrides =
-            Map.mapMaybeWithKey
+            HashMap.mapMaybeWithKey
                 (\alias _ ->
                     let bare = builtinBareName alias
                     in if Set.member bare alwaysBuiltinNames
-                        then Map.lookup bare builtins
+                        then HashMap.lookup bare builtins
                         else Nothing)
                 aliasesWithoutBase
-        aliasesNormalized = Map.union aliasBuiltinOverrides aliasesWithoutBase
-        envWithAliases = Map.union builtinOverrides (Map.union aliasesNormalized qualEnv)
+        aliasesNormalized = HashMap.union aliasBuiltinOverrides aliasesWithoutBase
+        envWithAliases = HashMap.union builtinOverrides (HashMap.union aliasesNormalized qualEnv)
     let env = envWithAliases
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
@@ -591,7 +592,7 @@ loadProgramFromSource searchPath src0 = do
                        Just idx -> BC.take idx fqn
                        Nothing  -> lmName entry
                ownerThunk <- newWHNFThunk (VStr ownerName)
-               let envWithOwner = Map.insert ownerSentinelKey ownerThunk env
+               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
 
@@ -672,7 +673,7 @@ buildBaseEnv = do
     FFI.registerCbitsDylibs
     builtins <- builtinEnv classReg
     conEnv   <- buildConEnv Map.empty
-    let env0 = Map.union builtins conEnv
+    let env0 = HashMap.union builtins conEnv
     -- Pre-discover GHC.Exception / GHC.Internal.Exception helpers.
     -- Best-effort: swallow any exception so a cache miss (missing
     -- source, stale cache, etc.) never blocks REPL startup — the REPL
@@ -839,7 +840,7 @@ preDiscoverPreludeConstructors env0 = do
     -- Right-biased union means existing bindings in env0 (builtins,
     -- prior discoveries, etc.) take precedence; we only add constructor
     -- names that weren't already registered.
-    pure (Map.union env0 conEnv)
+    pure (HashMap.union env0 conEnv)
   where
     scanDataRegFor registry cacheDirs includeMap modName = do
         r <- try (loadModule registry cacheDirs includeMap modName)
@@ -884,7 +885,7 @@ preDiscoverTHQuoteConstructors env0 = do
             -- and "all" — there's only one module in scope here, so
             -- there's no public/private distinction to draw.
             fieldEnv <- buildFieldAccessorEnv [lm] fieldReg fieldReg
-            pure (Map.union env0 (Map.union conEnv fieldEnv))
+            pure (HashMap.union env0 (HashMap.union conEnv fieldEnv))
 
 -- | Load a .hs file for the REPL's @:l@ command and bring its exported
 -- names into scope UNQUALIFIED, matching ghci semantics.
@@ -920,7 +921,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- resolved by IHC.Builtins (see 'discoverInModuleWith' for why this
     -- matters for the implicit-Prelude walk).
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Map.keysSet earlyBuiltins
+    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
     -- Load the entry module.
     entry <- loadEntryModule registry src
     -- Determine which names to bring into scope.
@@ -946,19 +947,19 @@ loadFileIntoEnv searchPath path existingEnv = do
     builtins  <- builtinEnv classReg
     -- Foreign import dispatchers (see parallel call in loadImportOnlyIntoEnv).
     ffiEnv    <- buildForeignEnv loadedModules fullSearchPath
-    let baseNoClass = Map.union builtins (Map.union fieldEnv' (Map.union conEnv ffiEnv))
+    let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv' (HashMap.union conEnv ffiEnv))
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
-    let base = Map.union classMethodEnv baseNoClass
+    let base = HashMap.union classMethodEnv baseNoClass
     -- Phase 2.11: expand TH splices.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
     -- Build (key, Expr) pairs.  Entry module bindings are keyed bare.
-    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules
+    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
-    let innerEnv = Map.union aliases qualEnv
+    let innerEnv = HashMap.union aliases qualEnv
     -- Per-body owner sentinel — see 'loadProgramFromSource' for the
     -- analogous block in the run-from-source path.  The owner is
     -- extracted from the FQN's module prefix; entries that aren't
@@ -968,7 +969,7 @@ loadFileIntoEnv searchPath path existingEnv = do
                        Just idx -> BC.take idx fqn
                        Nothing  -> lmName entry
                ownerThunk <- newWHNFThunk (VStr ownerName)
-               let envWithOwner = Map.insert ownerSentinelKey ownerThunk innerEnv
+               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk innerEnv
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
     -- Register type-class instances.
@@ -983,16 +984,16 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- test green.
     let hasMain = BC.pack "main" `elem` allNames
     mainFallback <- if hasMain
-        then pure Map.empty
+        then pure HashMap.empty
         else do
             slot <- newIORef (Evaluated VUnit)
-            pure (Map.singleton (BC.pack "main") slot)
+            pure (HashMap.singleton (BC.pack "main") slot)
     -- Merge into the existing REPL env (existing wins on collision).
-    let newBindings = Map.union aliases (Map.union qualEnv mainFallback)
-        additions   = Map.difference newBindings existingEnv
-        merged      = Map.union existingEnv additions
+    let newBindings = HashMap.union aliases (HashMap.union qualEnv mainFallback)
+        additions   = HashMap.difference newBindings existingEnv
+        merged      = HashMap.union existingEnv additions
         -- Count exported names that are newly visible (bare unqualified keys).
-        newExportedCount = length (filter (`Map.member` additions) exported)
+        newExportedCount = length (filter (`HashMap.member` additions) exported)
     pure (merged, newExportedCount)
 
 type ExportNamesMemo = IORef (Map ModuleName [ByteString])
@@ -1439,8 +1440,8 @@ loadImportIntoEnv searchPath imp existingEnv
         builtins <- builtinEnv classReg
         let modName = impModule imp
             prefix  = modName <> BC.pack "."
-            fqnMap  = Map.filterWithKey (\k _ -> BC.isPrefixOf prefix k) builtins
-        if Map.null fqnMap
+            fqnMap  = HashMap.filterWithKey (\k _ -> BC.isPrefixOf prefix k) builtins
+        if HashMap.null fqnMap
             then pure (existingEnv, 0)
             else do
                 let qualPrefix = case impAlias imp of
@@ -1449,7 +1450,7 @@ loadImportIntoEnv searchPath imp existingEnv
                                 | otherwise        -> BC.empty
                     aliasUnder p =
                         [ (p <> BC.drop (BC.length prefix) k, slot)
-                        | (k, slot) <- Map.toList fqnMap
+                        | (k, slot) <- HashMap.toList fqnMap
                         ]
                     bareAliases
                         | impQualified imp = []
@@ -1457,11 +1458,11 @@ loadImportIntoEnv searchPath imp existingEnv
                     qualAliases
                         | BC.null qualPrefix = []
                         | otherwise          = aliasUnder qualPrefix
-                    additions = Map.fromList
+                    additions = HashMap.fromList
                                     (bareAliases ++ qualAliases)
-                                    `Map.difference` existingEnv
-                    merged    = Map.union existingEnv additions
-                pure (merged, Map.size additions)
+                                    `HashMap.difference` existingEnv
+                    merged    = HashMap.union existingEnv additions
+                pure (merged, HashMap.size additions)
     | ImportOnly names <- impSpec imp = loadImportOnlyIntoEnv searchPath imp names existingEnv
     | otherwise = do
         -- Append cached package search dirs so mtl, transformers, etc. resolve.
@@ -1490,7 +1491,7 @@ loadImportIntoEnv searchPath imp existingEnv
                 nubBS ([ qualPrefix <> n | not (BC.null qualPrefix) ] ++ [n])
             resolveOne n = newLazyBuiltinThunk $ do
                 (env', _) <- loadImportIntoEnv searchPath (importOne n) existingEnv
-                let mThunk = mapMaybe (`Map.lookup` env') (lookupKeys n)
+                let mThunk = mapMaybe (`HashMap.lookup` env') (lookupKeys n)
                 case mThunk of
                     (t:_) -> force t
                     []    -> error
@@ -1506,10 +1507,10 @@ loadImportIntoEnv searchPath imp existingEnv
                 | BC.null qualPrefix = []
                 | otherwise =
                     [ (qualPrefix <> n, t) | (n, t) <- exportPairs ]
-            newBindings = Map.fromList (bareAliases ++ qualAliases)
-            additions   = Map.difference newBindings existingEnv
-            merged      = Map.union existingEnv additions
-        pure (merged, Map.size additions)
+            newBindings = HashMap.fromList (bareAliases ++ qualAliases)
+            additions   = HashMap.difference newBindings existingEnv
+            merged      = HashMap.union existingEnv additions
+        pure (merged, HashMap.size additions)
 
 loadImportOnlyIntoEnv
     :: [FilePath]
@@ -1527,7 +1528,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     classReg <- newClassRegistry
     targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Map.keysSet earlyBuiltins
+    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
     -- Preload direct imports of targetLm so class declarations in
     -- re-export chains become visible to 'buildClassMethodEnv'.
@@ -1591,11 +1592,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     -- the sentinel EVar inserted by buildLoadedModule points at a key
     -- that isn't in the env.
     ffiEnv   <- buildForeignEnv loadedModules0 fullSearchPath
-    let baseNoClass = Map.union builtins (Map.union fieldEnv' (Map.union conEnv ffiEnv))
+    let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv' (HashMap.union conEnv ffiEnv))
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
-    let baseForImport = Map.union classMethodEnv baseNoClass
+    let baseForImport = HashMap.union classMethodEnv baseNoClass
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
-    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Map.keysSet builtins)) loadedModules0
+    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules0
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
     -- For builtin-backed stubs with no qualPairs, synthesize alias
     -- slots for any requested name whose FQN has a builtin binding.
@@ -1615,17 +1616,17 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                 capStart = case BC.uncons n of
                     Just (c, _) -> c >= 'A' && c <= 'Z'
                     Nothing     -> False
-            in case Map.lookup fqn baseForImport of
+            in case HashMap.lookup fqn baseForImport of
                 Just slot -> pure (Just (n, slot))
                 Nothing | capStart
-                        , Just slot <- Map.lookup n conEnv
+                        , Just slot <- HashMap.lookup n conEnv
                         -> pure (Just (n, slot))
                 Nothing   ->
                     -- Record selectors are synthesized into fieldEnv'
                     -- rather than exported as source bodies, so an
                     -- ImportOnly request for a selector like runStateT
                     -- must be able to surface the prebuilt accessor.
-                    case Map.lookup n fieldEnv' of
+                    case HashMap.lookup n fieldEnv' of
                         Just slot -> pure (Just (n, slot))
                         Nothing   ->
                             -- Class methods are ambient: they have no single
@@ -1637,16 +1638,16 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                             -- top-level bindings are keyed under their FQN in
                             -- 'baseForImport' and are NOT eligible for this
                             -- fallback.
-                            case Map.lookup n classMethodEnv of
+                            case HashMap.lookup n classMethodEnv of
                                 Just slot -> pure (Just (n, slot))
                                 Nothing   -> pure Nothing
     requestedStandard0 <- forM requested $ \n ->
-        case Map.lookup n baseForImport of
+        case HashMap.lookup n baseForImport of
             Just slot | Set.member n ffiBuiltinNames -> pure (Just (n, slot))
             _ -> resolveRequestedPair targetLm qualPairs slots n
     let preferBuiltinRequested n resolved
             | Set.member n ffiBuiltinNames
-            , Just slot <- Map.lookup n baseForImport
+            , Just slot <- HashMap.lookup n baseForImport
             = Just (n, slot)
             | otherwise
             = resolved
@@ -1657,7 +1658,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let requestedPairs =
             mapMaybe id requestedStandard ++ mapMaybe id requestedFromBuiltins
     let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
-        thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+        thunkByKey = HashMap.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
         builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
@@ -1694,23 +1695,23 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             | BC.null qualPrefix = []
             | otherwise =
                 [ (qualPrefix <> n, t) | (n, t) <- requestedPairs ]
-        aliasEnv0 = Map.fromList (bareAliases ++ qualAliases)
+        aliasEnv0 = HashMap.fromList (bareAliases ++ qualAliases)
         aliasBuiltinOverrides =
-            Map.mapMaybeWithKey
+            HashMap.mapMaybeWithKey
                 (\alias _ ->
                     let bare = builtinBareName alias
                     in if Set.member bare alwaysBuiltinNames
-                        then Map.lookup bare baseForImport
+                        then HashMap.lookup bare baseForImport
                         else Nothing)
                 aliasEnv0
-        aliasEnv = Map.union aliasBuiltinOverrides aliasEnv0
+        aliasEnv = HashMap.union aliasBuiltinOverrides aliasEnv0
     let isSentinel (EVar _) = True
         isSentinel _        = False
     forM_ (zip qualPairs slots) $ \((fqn, rhs), slot) ->
         case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
             Just idx -> do
                 let bareName = BC.drop (idx + 1) fqn
-                case Map.lookup bareName builtins of
+                case HashMap.lookup bareName builtins of
                     Just builtinThunk
                         | isSentinel rhs || Set.member bareName ffiBuiltinNames -> do
                             builtinState <- readIORef builtinThunk
@@ -1718,15 +1719,15 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     _ -> pure ()
             Nothing -> pure ()
     aliases <- buildAliases registry fullSearchPath includeMap targetLm slots qualPairs
-    rewriteAliasPairs <- concat <$> mapM (rewriteAliases registry fullSearchPath includeMap thunkByKey (Map.keysSet builtins)) loadedModules0
+    rewriteAliasPairs <- concat <$> mapM (rewriteAliases registry fullSearchPath includeMap thunkByKey (Set.fromList (HashMap.keys builtins))) loadedModules0
     let selfAliases =
             [ (n, slot)
-            | (qualKey, slot) <- Map.toList thunkByKey
+            | (qualKey, slot) <- HashMap.toList thunkByKey
             , BC.isPrefixOf modPrefix qualKey
             , let n = BC.drop (BC.length modPrefix) qualKey
             ]
         builtinOverrides =
-            Map.filterWithKey
+            HashMap.filterWithKey
                 (\k _ -> Set.member (builtinBareName k) alwaysBuiltinNames)
                 builtins
         -- innerEnv (see the parallel note in 'loadImportIntoEnv'): we
@@ -1734,12 +1735,12 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         -- REPL-level pre-discoveries (e.g. the GHC.Exception helpers
         -- primed by 'buildBaseEnv') remain reachable from inside the
         -- imported bindings.
-        innerEnv = Map.union builtinOverrides
-                 $ Map.union (Map.fromList selfAliases)
-                 $ Map.union (Map.fromList requestedPairs)
-                 $ Map.union (Map.fromList rewriteAliasPairs)
-                 $ Map.union aliases
-                 $ Map.union qualEnv existingEnv
+        innerEnv = HashMap.union builtinOverrides
+                 $ HashMap.union (HashMap.fromList selfAliases)
+                 $ HashMap.union (HashMap.fromList requestedPairs)
+                 $ HashMap.union (HashMap.fromList rewriteAliasPairs)
+                 $ HashMap.union aliases
+                 $ HashMap.union qualEnv existingEnv
     -- Per-body owner sentinel for scoped fallback (see comment in
     -- 'loadProgramFromSource').
     mapM_ (\((fqn, rhs), slot) -> do
@@ -1747,7 +1748,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                        Just idx -> BC.take idx fqn
                        Nothing  -> impModule imp
                ownerThunk <- newWHNFThunk (VStr ownerName)
-               let envWithOwner = Map.insert ownerSentinelKey ownerThunk innerEnv
+               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk innerEnv
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
     -- H2010 §4.3.2 scope filter: modules not in the user's import
@@ -1776,26 +1777,26 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             registerDerivedFunctorInstances sharedReg instanceScope
             registerDerivedEnumBoundedInstances sharedReg instanceScope
         _ -> pure ()
-    let additions  = Map.difference aliasEnv existingEnv
-        merged     = Map.union existingEnv additions
-    pure (merged, Map.size additions)
+    let additions  = HashMap.difference aliasEnv existingEnv
+        merged     = HashMap.union existingEnv additions
+    pure (merged, HashMap.size additions)
   where
     resolveRequestedPair lm qualPairs slots n = do
         bodies <- readIORef (lmBodies lm)
-        let thunkByKey   = Map.fromList (zip (map fst qualPairs) slots)
+        let thunkByKey   = HashMap.fromList (zip (map fst qualPairs) slots)
             ownKey       = lmName lm <> BC.pack "." <> n
             ownIsLocal   = case Map.lookup n bodies of
                 Just expr -> expr /= EVar n
                 Nothing   -> False
             suffix       = BC.pack "." <> n
             fallbackSlot =
-                case [ t | (k, t) <- Map.toList thunkByKey
+                case [ t | (k, t) <- HashMap.toList thunkByKey
                          , suffix `isSuffixOf` k ] of
                     (t:_) -> Just t
                     []    -> Nothing
             slot
-                | ownIsLocal = Map.lookup ownKey thunkByKey
-                | otherwise  = fallbackSlot <|> Map.lookup ownKey thunkByKey
+                | ownIsLocal = HashMap.lookup ownKey thunkByKey
+                | otherwise  = fallbackSlot <|> HashMap.lookup ownKey thunkByKey
         pure ((n,) <$> slot)
 
     rewriteAliases registry searchPath includeMap thunkByKey builtinNames lm = do
@@ -1804,7 +1805,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             [ (alias, slot)
             | (alias, targetKey) <- Map.toList rw
             , BC.elem '.' alias
-            , Just slot <- [Map.lookup targetKey thunkByKey]
+            , Just slot <- [HashMap.lookup targetKey thunkByKey]
             ]
 
 -- | Phase 2.11: expand TH splices in all bodies of a loaded module.
@@ -3176,8 +3177,8 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
     pairs <- concat <$> mapM buildOne decls
-    let filtered = [ p | p@(n, _) <- pairs, not (Map.member n existing) ]
-    pure (Map.fromList filtered)
+    let filtered = [ p | p@(n, _) <- pairs, not (HashMap.member n existing) ]
+    pure (HashMap.fromList filtered)
   where
     buildOne (ClassDecl cls methodNames _defaults _supers) =
         mapM (mkMethodEntry cls) methodNames
@@ -3780,7 +3781,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     reg <- readIORef registry
     let allModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
     internalPairs <- concat <$> mapM (internalAliases thunkByKey) allModules
-    pure (Map.fromList (internalPairs ++ entryPairs))
+    pure (HashMap.fromList (internalPairs ++ entryPairs))
   where
     aliasesForImport thunkByKey imp = do
             -- We need to know which names the target module actually
@@ -3829,7 +3830,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
             _                -> pure []
 
     lazyAliasesForName imp n = do
-        slot <- newIORef (Unevaluated (Closure Map.empty emptyIPMap target))
+        slot <- newIORef (Unevaluated (Closure HashMap.empty emptyIPMap target))
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
       where
         target = EVar (impModule imp <> BC.pack "." <> n)
@@ -4046,22 +4047,22 @@ buildFieldAccessorEnv lms publicFields allFields = do
     projEnv <- buildFieldEnv allFields
     -- Fully-qualified accessors for import rewrites and FQN fallback.
     qualEnv <- buildQualifiedFieldEnv lms
-    let projKeyed = Map.mapKeys fieldProjName projEnv
-    pure (Map.unions [bareEnv, projKeyed, qualEnv])
+    let projKeyed = HashMap.fromList [ (fieldProjName k, v) | (k, v) <- HashMap.toList projEnv ]
+    pure (HashMap.unions [bareEnv, projKeyed, qualEnv])
   where
     buildQualifiedFieldEnv :: [LoadedModule] -> IO Env
     buildQualifiedFieldEnv mods = do
         pieces <- mapM perModule mods
-        pure (Map.unions pieces)
+        pure (HashMap.unions pieces)
 
     perModule :: LoadedModule -> IO Env
     perModule lm
-        | lmNoFieldSelectors lm = pure Map.empty
-        | Map.null (lmFieldReg lm) = pure Map.empty
+        | lmNoFieldSelectors lm = pure HashMap.empty
+        | Map.null (lmFieldReg lm) = pure HashMap.empty
         | otherwise = do
             env <- buildFieldEnv (lmFieldReg lm)
             let prefix = lmName lm <> BC.pack "."
-            pure (Map.mapKeys (prefix <>) env)
+            pure (HashMap.fromList [ (prefix <> k, v) | (k, v) <- HashMap.toList env ])
 
 -- | Fields visible while desugaring a module body. Record constructors and
 -- patterns can mention records imported from other modules, but the owning
@@ -4270,7 +4271,7 @@ resetPerRunGlobals = do
     writeIORef envFallbackCache       Map.empty
     writeIORef envFallbackNegCacheRef (0, Set.empty)
     writeIORef envFallbackCacheGenRef 0
-    writeIORef envBaseForFallbackRef  Map.empty
+    writeIORef envBaseForFallbackRef  HashMap.empty
     writeIORef globalTypeSigsRef      Map.empty
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
@@ -4394,7 +4395,7 @@ envFallbackCache = unsafePerformIO (newIORef Map.empty)
 -- materialisation of bodies the user's expression never touches.
 {-# NOINLINE envBaseForFallbackRef #-}
 envBaseForFallbackRef :: IORef Env
-envBaseForFallbackRef = unsafePerformIO (newIORef Map.empty)
+envBaseForFallbackRef = unsafePerformIO (newIORef HashMap.empty)
 
 -- | Negative-result memo for the env-fallback hook.  When 'resolveFallback'
 -- returns 'Nothing' for some @(owner, name)@ pair, that result is recorded
@@ -4957,10 +4958,10 @@ resolveFallback mOwner name = do
                 -- that extend this env (lambdas, lets) inherit the
                 -- sentinel automatically.
                 ownerThunk <- newWHNFThunk (VStr (lmName owner))
-                let richEnv = Map.insert ownerSentinelKey ownerThunk
-                            $ Map.union ownerLocalEnv
-                            $ Map.union baseEnv
-                                (Map.unions [conEnvAll, fieldEnvAll, ffiEnvAll])
+                let richEnv = HashMap.insert ownerSentinelKey ownerThunk
+                            $ HashMap.union ownerLocalEnv
+                            $ HashMap.union baseEnv
+                                (HashMap.unions [conEnvAll, fieldEnvAll, ffiEnvAll])
                 writeIORef slot
                     (Unevaluated (Closure richEnv emptyIPMap expr'))
                 modifyIORef' envFallbackCache
@@ -5008,7 +5009,7 @@ resolveFallback mOwner name = do
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
         pairs <- concat <$> mapM mkLocal localNames
-        pure (Map.fromList pairs)
+        pure (HashMap.fromList pairs)
       where
         ownerName = lmName owner
         mkLocal localName
@@ -5033,7 +5034,7 @@ resolveFallback mOwner name = do
         let unionedData =
                 unionDataRegistries (lmDataReg owner : map lmDataReg (Map.elems mods))
         conEnv <- buildConEnv unionedData
-        pure (Map.lookup bareName conEnv)
+        pure (HashMap.lookup bareName conEnv)
 
     buildTargetedImportRewrites transientReg searchPath includeMap owner baseEnv existingRw expr = do
         pairs <- concat <$> mapM resolveOne candidates
@@ -5044,7 +5045,7 @@ resolveFallback mOwner name = do
             | fv <- nubBS (freeVars expr)
             , not (BC.elem '.' fv)
             , not (Map.member fv existingRw)
-            , not (Map.member fv baseEnv)
+            , not (HashMap.member fv baseEnv)
             ]
 
         resolveOne fv = do
@@ -5058,7 +5059,7 @@ resolveFallback mOwner name = do
 
     tryBaseBareSlot bareName = do
         baseEnv <- readIORef envBaseForFallbackRef
-        case Map.lookup bareName baseEnv of
+        case HashMap.lookup bareName baseEnv of
             Nothing   -> pure Nothing
             Just slot -> do
                 -- An ImportOnly alias for a data constructor is stored in
@@ -5081,7 +5082,7 @@ resolveFallback mOwner name = do
         let loaded = Map.elems mods
             (publicFields, unionedFields) = partitionFieldRegistries loaded
         fieldEnvAll <- buildFieldAccessorEnv loaded publicFields unionedFields
-        pure (Map.lookup bareName fieldEnvAll)
+        pure (HashMap.lookup bareName fieldEnvAll)
 
     tryImportedFieldSlot mods bareName = do
         searchPath <- readIORef globalSearchPathRef
@@ -5166,7 +5167,7 @@ resolveFallback mOwner name = do
             (publicFields, unionedFields) = partitionFieldRegistries loaded
         fieldEnvAll <- buildFieldAccessorEnv loaded publicFields unionedFields
         let fqn = lmName owner <> BC.pack "." <> bareName
-        case Map.lookup fqn fieldEnvAll <|> Map.lookup bareName fieldEnvAll of
+        case HashMap.lookup fqn fieldEnvAll <|> HashMap.lookup bareName fieldEnvAll of
             Just slot -> do
                 modifyIORef' envFallbackCache (Map.insert name slot)
                 pure (Just slot)
@@ -5377,7 +5378,7 @@ buildForeignEnv :: [LoadedModule] -> [FilePath] -> IO Env
 buildForeignEnv lms searchPath = do
     registerPackageExtras lms searchPath
     pairs <- concat <$> mapM perModule lms
-    pure (Map.fromList pairs)
+    pure (HashMap.fromList pairs)
   where
     perModule lm = mapM (mkPair lm) (lmForeignDecls lm)
     mkPair lm decl = do

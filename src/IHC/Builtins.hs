@@ -53,6 +53,7 @@ import Data.Char (chr, ord)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Foreign.C.String (peekCAString, withCString)
@@ -5397,7 +5398,7 @@ buildConEnv reg = do
 buildFieldEnv :: FieldRegistry -> IO Env
 buildFieldEnv reg = do
     pairs <- mapM mkAccessor (Map.toList reg)
-    pure (Map.fromList pairs)
+    pure (HashMap.fromList pairs)
   where
     -- Defer VFun allocation for each record-field accessor. A program that
     -- never projects out that particular field never pays the cost.
