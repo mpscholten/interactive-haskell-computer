@@ -97,7 +97,7 @@ import IHC.Classes
     , drainCataloguedInstancesForClass
     )
 import qualified IHC.Classes
-import IHC.Eval (apply, force, forceMethodVal)
+import IHC.Eval (apply, force, forceMethodVal, runIOVal)
 import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
@@ -251,7 +251,7 @@ builtinEnv reg = do
     -- the ClassRegistry (which is a separate store from the Env).
     defaultFromLabel <- fromLabelB reg
     registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy")
-        (Map.singleton (BC.pack "fromLabel") defaultFromLabel)
+        (HashMap.singleton (BC.pack "fromLabel") defaultFromLabel)
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ orderingCtors ++ unboxCtors
                          ++ unitCtor ++ [("IO", ioCtorT)]
@@ -2052,7 +2052,7 @@ lookupUserIsLabel reg lbl = do
     _ <- drainCataloguedInstancesForClass (BC.pack "IsLabel")
     m <- readIORef reg
     let entries = [ (tags, methods)
-                  | ((cls, tags), methods) <- Map.toList m
+                  | ((cls, tags), methods) <- HashMap.toList m
                   , cls == BC.pack "IsLabel"
                   ]
         -- First pass: instance whose leading tag matches the label literal.
@@ -2060,7 +2060,7 @@ lookupUserIsLabel reg lbl = do
             [ fromLabelMethod
             | (tag : _, methods) <- entries
             , tag == lbl
-            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
+            , Just fromLabelMethod <- [HashMap.lookup (BC.pack "fromLabel") methods]
             ]
         -- Second pass: polymorphic user instance — first tag is a lower-case
         -- type variable (e.g. 's'), not the @Proxy@ default and not a
@@ -2073,7 +2073,7 @@ lookupUserIsLabel reg lbl = do
             , not (BS.null tag)
             , let c = BC.head tag
             , c >= 'a' && c <= 'z'
-            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
+            , Just fromLabelMethod <- [HashMap.lookup (BC.pack "fromLabel") methods]
             ]
     -- Instance method bodies are registered lazily as 'VLazyMethod'
     -- (see 'IHC.Scheduler.evalMethodWithLazy').  Force the wrapper now
@@ -2577,31 +2577,8 @@ voidB = pure $ VFun $ \mt -> pure $ VIO $ do
     _ <- runIOVal mv
     pure VUnit
 
--- | Run one IO layer. Mirrors the helper in 'IHC.Eval' so builtin
--- bind/sequence can also execute source-constructed @IO@ values.
-runIOVal :: Val -> IO Val
-runIOVal (VIO io) = io
-runIOVal (VCon "IO" [ft]) = do
-    fv <- force ft
-    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
-    case result of
-        VCon _ [_stT, resT] -> force resT
-        other               -> pure other
--- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
--- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
--- 'VCon "STM" [stateFn]'; if we don't unwrap them here, callers that
--- expect a plain value (e.g. 'atomically' chains, or any 'do'-bind
--- inside the warp Counter / time-manager paths) end up working on the
--- wrapper instead of its result and dispatch breaks downstream.
-runIOVal (VCon "STM" [ft]) = do
-    fv <- force ft
-    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
-    case result of
-        VCon _ [_stT, resT] -> force resT
-        other               -> pure other
-runIOVal v        = pure v
+-- runIOVal lives in 'IHC.Eval' (and now also covers STM, which used to
+-- be a separate copy here).  We import it from there.
 
 --------------------------------------------------------------------------------
 -- IORef primops. Each returns 'VIO' — construction, read, and write

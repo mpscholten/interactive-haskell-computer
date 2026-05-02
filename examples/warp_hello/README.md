@@ -19,11 +19,11 @@ main = run 3099 $ \_ respond ->
 nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 ```
 
-## Current state (2026-05-02)
+## Current state (2026-05-03)
 
 The kernel listener is up reliably on `127.0.0.1:3099`, but
 `socketAcceptB` is still not reached: warp's setup chain after `listen`
-spends all CPU in interpreter work without entering `acceptLoop`.
+spins in host code without entering `acceptLoop`.
 `curl http://127.0.0.1:3099/` connects (the listen backlog absorbs the
 SYN) but receives zero response bytes.
 
@@ -56,23 +56,58 @@ What does not work:
 * `socketAcceptB` is never reached. After bind/listen and
   `setSocketCloseOnExec` succeed, warp's setup chain
   (`runSettingsConnectionMakerSecure → withII → acceptConnection →
-  E.mask_ acceptLoop`) spends all CPU in interpreted-thunk evaluation
-  before entering the accept loop. `curl --max-time 60` times out
-  with zero response bytes; the server keeps grinding.
-* The hot path is still env-lookup / class-method dispatch
-  (`Data.ByteString.compareBytes`, `eq_info`, `==` typeclass
-  dispatch, `stg_ap_*` machinery) — same flavour of slowness flagged
-  in the May 1 memoization commit (`ef9e6fb`).
+  E.mask_ acceptLoop`) hangs at 100% CPU before entering the accept
+  loop. `curl --max-time 60` times out with zero response bytes.
+* **The May-2 instrumentation pass corrected the prior diagnosis.**
+  Counters in `eval`, `force`, `apply`/`applyIP`, `runIOVal`,
+  `bindDispatch`/`seqDispatch`/`fmapDispatch`, `lookupInstanceMethod`,
+  `classMethodDispatcher`'s value-directed dispatch, and the
+  env-fallback hook all *flatline* once the program hangs (frozen at
+  e.g. `forces=271 apply=293 eval=430 runIO=41 fallback=38 lookupI=4
+  bind=7 seq=9 fmap=0 dispatch=6`). The CPU is therefore burning
+  entirely in compiled host code, **not** the interpreter.
+* `sample` shows the hot path is **`GHC.Internal.Data.Typeable.Internal`**:
+  `Lc4jT_info` and `Lc4k8_info` (~25% combined) are local closures
+  inside the `Typeable` machinery (immediate neighbours of
+  `mkTrApp_info`, `sameTypeRep_info`, `showTypeable_info` in the
+  binary), with `Data.ByteString.Internal.Type.compareBytes` /
+  `eq_info` / `GHC.Classes.zeze_info` (`==`) accounting for another
+  ~30%. `Lc4Anc_info` (~6%) is in `IHC.Scheduler` and references
+  `compareBytes`, `Just`, and `Nothing` — i.e. a `Map ByteString`
+  lookup helper. Last interpreter activity: `force #271` on the
+  `runSettingsConnection` lambda, then `applyIP` consumed up to
+  293 calls (lambda's set/getConn/app args + descent into the
+  `runSettingsConnectionMaker` chain) — and then everything stops
+  while the host keeps spinning.
 
-The remaining work is **interpreter throughput on the post-listen
-path**, not source loading or primops. Two follow-ups:
+The remaining work is **identifying the host-level `Typeable`-driven
+hot loop** that the warp setup chain triggers between
+`runSettingsConnection` and `acceptConnection`. Plausible suspects:
 
-1. Profile-guided HashMap-ification of the still-Map-backed
-   `ClassRegistry` (currently
-   `Map (ByteString, [ByteString]) MethodTable`).
-2. Closure compilation: lift the `eval`/`force`/`apply` inner loop
-   so each thunk has a precompiled entry function instead of an
-   AST-walk per evaluation.
+1. A repeated `try`/`catch` cycle inside warp's `withII` /
+   `mkAutoUpdate` chain, each iteration computing `TypeRep`s for
+   exception matching.
+2. Some derived-`Typeable` dispatch that hits a non-terminating case
+   in `containers`/`hashable` instance derivation when fed our
+   interpreter-shaped values.
+
+Either way the trail starts at the binary symbols `Lc4jT_info`
+(0x101a60410-relative-to-text in a recent build) and `Lc4Anc_info`
+(`IHC.Scheduler.o` offset 0x2dc0) — disassembly shows both call
+into bytestring `compareBytes` and the `Maybe` constructors.
+
+Earlier follow-ups that landed but proved insufficient:
+
+1. **HashMap-ification of `ClassRegistry` and `MethodTable`** (commit
+   in this branch). Both went from `Map`-backed to `HashMap`-backed,
+   eliminating log-n `compareBytes` per dispatch lookup. The change
+   is correct but the warp hang persists, because dispatch is not the
+   actual hot loop (counters above prove it).
+2. **Unified `runIOVal` between `IHC.Eval` and `IHC.Builtins`**: the
+   two modules previously kept independent copies; bind/seq/fmap
+   dispatch in `Builtins` was using its own runIOVal, hiding it from
+   diagnostic counters added to the `Eval` copy. Now both paths
+   share one definition.
 
 The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
 fix (commit da212e0) closed the previous "silent exit before listen"

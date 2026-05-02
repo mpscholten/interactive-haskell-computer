@@ -377,7 +377,7 @@ tryClassDecl envRef classReg src = do
                                     (classMethodNames decl)
             -- 2. Evaluate default method bodies (if any) in the current
             --    env, producing a slot list keyed by method-name order.
-            defaults <- Map.fromList <$> mapM (\methodName -> do
+            defaults <- HashMap.fromList <$> mapM (\methodName -> do
                             v <- mkDefault env src decl methodName
                             pure (methodName, v))
                         (classMethodNames decl)
@@ -388,7 +388,7 @@ tryClassDecl envRef classReg src = do
             let newPairs = [ p | p@(n, _) <- dispatcherPairs, not (HashMap.member n env) ]
             writeIORef envRef (HashMap.union (HashMap.fromList newPairs) env)
             -- Register the default-method list under the sentinel tag.
-            unless (Map.null defaults) $
+            unless (HashMap.null defaults) $
                 registerInstance classReg (classClassName decl)
                                  defaultTypeTag defaults
             let skippedNote
@@ -455,7 +455,7 @@ tryInstanceDecl envRef classReg line = do
         Right (InstanceDecl cls typ typs methods : _) -> do
             env <- readIORef envRef
             r2 <- (try (evalInstanceMethods src env methods)
-                    :: IO (Either SomeException (Map.Map BC.ByteString Val)))
+                    :: IO (Either SomeException (HashMap.HashMap BC.ByteString Val)))
             case r2 of
                 Left err        -> pure (Left (show err))
                 Right methodMap -> do
@@ -478,9 +478,9 @@ evalInstanceMethods
     :: Source
     -> Env
     -> [(BC.ByteString, BindingLhs)]
-    -> IO (Map.Map BC.ByteString Val)
+    -> IO (HashMap.HashMap BC.ByteString Val)
 evalInstanceMethods src env methods =
-    Map.fromList <$> mapM evalOne methods
+    HashMap.fromList <$> mapM evalOne methods
   where
     evalOne (methodName, lhs) = do
         expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)

@@ -2025,9 +2025,9 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     v <- evalMethodIn rewrites mn (Just lhs)
                     pure (mn, v))
                 extraMethods
-            pure (Map.fromList (classEntries ++ extraEntries))
+            pure (HashMap.fromList (classEntries ++ extraEntries))
         Nothing ->
-            Map.fromList <$>
+            HashMap.fromList <$>
                 mapM (\(mn, lhs) -> do
                     v <- evalMethodIn rewrites mn (Just lhs)
                     pure (mn, v))
@@ -2404,7 +2404,7 @@ registerDerivedFunctorInstances classReg loadedModules = do
 registerOneFunctor :: ClassRegistry -> FunctorDerivDecl -> IO ()
 registerOneFunctor classReg decl = do
     let fmapVal = synthFmapForDecl classReg decl
-        methods = Map.singleton (BC.pack "fmap") fmapVal
+        methods = HashMap.singleton (BC.pack "fmap") fmapVal
         functorCls = BC.pack "Functor"
     existing <- lookupInstance classReg functorCls (fdTyName decl)
     case existing of
@@ -2504,7 +2504,7 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
         case existing of
             Just _  -> pure ()
             Nothing -> do
-                let methods = Map.fromList
+                let methods = HashMap.fromList
                         [ (BC.pack "minBound", VCon (head ctors) [])
                         , (BC.pack "maxBound", VCon (last ctors) [])
                         ]
@@ -2516,7 +2516,7 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
             Just _  -> pure ()
             Nothing -> do
                 let ctorIndex = Map.fromList (zip ctors [0 :: Int ..])
-                    methods = Map.fromList
+                    methods = HashMap.fromList
                         [ (BC.pack "fromEnum", derivedFromEnum ctorIndex)
                         , (BC.pack "toEnum", derivedToEnum ctors)
                         ]
@@ -2629,7 +2629,7 @@ registerOneEnum classReg (tyName, ctors) = do
     let enumCls    = BC.pack "Enum"
         fromEnumV  = synthFromEnumForCtors ctors
         toEnumV    = synthToEnumForCtors   ctors
-        methods    = Map.fromList
+        methods    = HashMap.fromList
                         [ (BC.pack "fromEnum", fromEnumV)
                         , (BC.pack "toEnum",   toEnumV)
                         ]
@@ -2647,7 +2647,7 @@ registerOneBounded classReg (tyName, ctors) = do
         lastCtor   = last ctors
         minBoundV  = VCon firstCtor []
         maxBoundV  = VCon lastCtor  []
-        methods    = Map.fromList
+        methods    = HashMap.fromList
                         [ (BC.pack "minBound", minBoundV)
                         , (BC.pack "maxBound", maxBoundV)
                         ]
@@ -3248,7 +3248,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                            Left  _  -> pure ())
                   (Set.toList fvs)
             rewrites <- buildImportRewritesForNames registry lm fvs
-            vals <- Map.fromList <$> mapM (\methodName -> do
+            vals <- HashMap.fromList <$> mapM (\methodName -> do
                         v <- slotVal lm cls defaults rewrites methodName
                         pure (methodName, v))
                     methodNames

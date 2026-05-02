@@ -72,6 +72,8 @@ module IHC.Classes
 import Control.Exception (SomeException, catch)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.HashMap.Strict as HashMap
+import Data.HashMap.Strict (HashMap)
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -206,20 +208,32 @@ forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
-type MethodTable = Map ByteString Val
+-- | A class instance's method table. HashMap keyed by method name, so
+-- per-call dispatch is one hash + one ByteString eq instead of
+-- log(n) compareBytes ops. The methods within a single instance are few
+-- (typically 1–10), but the dispatcher is hot — every '>>', '>>=',
+-- 'fmap', '<*>' in interpreted code goes through one of these lookups.
+type MethodTable = HashMap ByteString Val
 
 -- | The global class registry. Maps @(ClassName, [TypeTag])@ to a
 -- method-name/value table.
+--
+-- HashMap-backed (was Map): warp's hot setup path saturates on
+-- 'Data.ByteString.compareBytes' under 'lookupInstanceMethodForced'.
+-- Each '>>' or '>>=' between 'listen' and 'accept' triggers two
+-- registry lookups — one against the dispatcher's local 'reg', one
+-- against 'sharedClassRegRef'. With ~hundreds of instances loaded,
+-- log(n) ByteString compares add up.
 --
 -- The tag list supports multi-parameter type classes (MPTC) where an
 -- instance is identified by several types — e.g. @instance SetField
 -- \"name\" User String where ...@ registers under
 -- @(\"SetField\", [\"name\", \"User\", \"String\"])@. Single-parameter
 -- classes use a 1-element list for their tag.
-type ClassRegistry = IORef (Map (ByteString, [ByteString]) MethodTable)
+type ClassRegistry = IORef (HashMap (ByteString, [ByteString]) MethodTable)
 
 newClassRegistry :: IO ClassRegistry
-newClassRegistry = newIORef Map.empty
+newClassRegistry = newIORef HashMap.empty
 
 -- | Register a dict (method table) for a single-tag @(class, type-tag)@
 -- pair. Overwrites any previously registered instance (last write wins).
@@ -234,7 +248,7 @@ registerInstance reg className typeTag methods =
 -- key. Overwrites any previously registered instance (last write wins).
 registerInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> MethodTable -> IO ()
 registerInstanceMulti reg className typeTags methods =
-    modifyIORef' reg (Map.insert (className, typeTags) methods)
+    modifyIORef' reg (HashMap.insert (className, typeTags) methods)
 
 -- | Look up the method table for a given @(class, type-tag)@ pair.
 -- Single-tag convenience wrapper.
@@ -247,7 +261,7 @@ lookupInstance reg className typeTag =
 lookupInstanceMulti :: ClassRegistry -> ByteString -> [ByteString] -> IO (Maybe MethodTable)
 lookupInstanceMulti reg className typeTags = do
     m <- readIORef reg
-    pure (Map.lookup (className, typeTags) m)
+    pure (HashMap.lookup (className, typeTags) m)
 
 -- | Look up @(class, type-tag) -> method-name -> Val@. On a miss, the
 -- Stage-2 lazy-instance catalogue is drained for @class@ — closures
@@ -270,14 +284,14 @@ lookupInstanceMethod reg className typeTag methodName =
 lookupInstanceMethodMulti :: ClassRegistry -> ByteString -> [ByteString] -> ByteString -> IO (Maybe Val)
 lookupInstanceMethodMulti reg className typeTags methodName = do
     mMethods <- lookupInstanceMulti reg className typeTags
-    case mMethods >>= Map.lookup methodName of
+    case mMethods >>= HashMap.lookup methodName of
         Just v  -> pure (Just v)
         Nothing -> do
             drained <- drainCataloguedInstancesForClass className
             if drained
                 then do
                     mMethods' <- lookupInstanceMulti reg className typeTags
-                    pure (mMethods' >>= Map.lookup methodName)
+                    pure (mMethods' >>= HashMap.lookup methodName)
                 else pure Nothing
 
 -- | Strictly-non-mutating variant of 'lookupInstanceMethod' — does NOT
@@ -288,7 +302,7 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
 lookupInstanceMethodRaw :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
 lookupInstanceMethodRaw reg className typeTag methodName = do
     m <- readIORef reg
-    pure (Map.lookup (className, [typeTag]) m >>= Map.lookup methodName)
+    pure (HashMap.lookup (className, [typeTag]) m >>= HashMap.lookup methodName)
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a
@@ -654,8 +668,8 @@ checkSuperclassCoverage reg = do
     superMap <- readIORef superclassesRef
     let problems =
             [ (cls, tags, super)
-            | ((cls, tags), _methods) <- Map.toList rmap
+            | ((cls, tags), _methods) <- HashMap.toList rmap
             , super <- Map.findWithDefault [] cls superMap
-            , not (Map.member (super, tags) rmap)
+            , not (HashMap.member (super, tags) rmap)
             ]
     pure problems
