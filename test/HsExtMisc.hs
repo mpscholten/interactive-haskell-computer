@@ -15,7 +15,7 @@ import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (ParseError, defaultFixityTable, parseExprOnly)
+import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
 
@@ -24,14 +24,14 @@ isParseError e = case fromException e of
     Just (_ :: ParseError) -> True
     Nothing                -> False
 
--- | Parse a single expression. 'parseExprOnly' is permissive about
+-- | Parse a single expression. 'parseExprAtEof' is permissive about
 -- trailing input — it returns the longest-prefix parse and discards the
 -- final cursor. To detect parses that only consume a prefix (e.g.
 -- @\"mdo { x <- foo }\"@ where @mdo@ is silently treated as an
 -- identifier), use 'parseExprStrict' instead.
 parseExpr :: ByteString -> IO (Either SomeException ())
 parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSource "<test>" bs) defaultFixityTable
+    _ <- parseExprAtEof (mkSource "<test>" bs) defaultFixityTable
     pure ()
 
 -- | Strict expression parse: surrounds the input with a list literal so
