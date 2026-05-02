@@ -3360,6 +3360,10 @@ ffiBuiltinNames = Set.fromList
     , "plusForeignPtr", "minusForeignPtr", "plusPtr", "minusPtr", "castPtr"
     , "mkWeakIORef"  -- wraps mkWeak#, which has no Haskell implementation
     , "stdout", "stdin", "stderr"  -- RTS pre-built handles
+    -- unix package: setFdOption uses c_fcntl_read internally, which we
+    -- don't FFI-back; force our host implementation that calls the
+    -- ghc-internal PosixIO.setFdOption directly.
+    , "setFdOption"
     ]
 
 -- | Build a map from each locally-visible imported name to its

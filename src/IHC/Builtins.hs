@@ -5693,11 +5693,19 @@ setFdOptionB :: IO Val
 setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
     fdV <- force fdT
     enabledV <- force enabledT
-    case fdV of
-        VInt fd -> do
-            PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
-            pure VUnit
-        _ -> error ("setFdOption: not an fd: " <> showValForDebug fdV)
+    fd <- unwrapFd fdV
+    PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
+    pure VUnit
+  where
+    -- Accept either a raw VInt (host-backed sockets pass the raw fd) or
+    -- the @Fd@ newtype wrapper @VCon "Fd" [VInt _]@ (source code that
+    -- imports @System.Posix.Types (Fd)@ and constructs values through
+    -- the constructor).
+    unwrapFd (VInt n) = pure n
+    unwrapFd (VCon "Fd" [innerT]) = do
+        innerV <- force innerT
+        unwrapFd innerV
+    unwrapFd other = error ("setFdOption: not an fd: " <> showValForDebug other)
 
 -- | @getNumCapabilities@ - return 1 (simplified).
 getNumCapabilitiesB :: IO Val

@@ -21,48 +21,58 @@ nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 
 ## Current state (2026-05-02)
 
-This example **does not yet complete an HTTP request** but no longer
-hits the VFun-leak bug. The blocker is now a downstream
-`setFdOption`/`Fd` pattern dispatch issue.
+The kernel listener is up reliably on `127.0.0.1:3099`, but
+`socketAcceptB` is still not reached: warp's setup chain after `listen`
+spends all CPU in interpreter work without entering `acceptLoop`.
+`curl http://127.0.0.1:3099/` connects (the listen backlog absorbs the
+SYN) but receives zero response bytes.
 
 What works:
 
 * The whole warp / wai / http-types / network / streaming-commons /
-  auto-update / time-manager dependency tree loads from source.
+  auto-update / time-manager / unix dependency tree loads from source.
 * `Network.Socket.socket`, `bind`, `listen` execute via host-backed
-  builtins.
+  builtins; the listener appears within ~10 s.
 * The four original dry-run blockers (bare-import re-exports, record
   patterns in instance methods, `{-# LANGUAGE Strict #-}`,
-  `UnboxedTuples`) are all resolved and have coverage fixtures under
-  `test/Fixtures/Coverage/`.
-* The VFun-leak bug (where `acceptConnection`'s body had `void`
-  rewritten through `Network.Wai.Handler.Warp.Types.void` and
-  evaluated to a `<function>` instead of an `IO ()`) is **fixed** —
-  see the `directRewritePairs` foreign-alias-target detection in
-  [src/IHC/Scheduler.hs:3573](src/IHC/Scheduler.hs:3573).
+  `UnboxedTuples`) are all resolved.
+* **VFun-leak fixed**: `directRewritePairs` no longer treats
+  foreign-alias sentinels (bodies like `EVar "OtherMod.name"`
+  inserted as memoization hints) as local definitions. Previously
+  `acceptConnection`'s `void $ E.mask_ acceptLoop` rewrote `void` to
+  `Network.Wai.Handler.Warp.Types.void`, whose body forwarded to
+  `GHC.Internal.Data.Functor.void` (a `VFunIP`, not a `VIO`) — the
+  do-block `>>` saw a function as its first arg and the bracket
+  exited with the function as its terminal result.
+* **setFdOption pattern-dispatch fixed**: `setFdOption` is now in
+  `ffiBuiltinNames` so the unix package's source-level
+  `setFdOption (Fd fd) opt val` definition (which calls
+  `c_fcntl_read`/`c_fcntl_write` we don't FFI-back) doesn't shadow
+  our host implementation. `setFdOptionB` also unwraps the `Fd`
+  newtype wrapper for source-constructed values.
 
 What does not work:
 
-* The post-listen path now reaches `setSocketCloseOnExec → setFdOption fd CloseOnExec True`
-  inside warp's `runSettingsSocket`, but a 3-arg function with
-  patterns `[(Fd fd), opt, val]` is matched against arguments that
-  don't have an `Fd` constructor wrapper. The error fires inside
-  `errorB` with:
-  `Non-exhaustive patterns in function: [[PCon "Fd" [PVar "fd"], PVar "opt", PVar "val"]]`.
-  No source-level `setFdOption` exists in the cache (the unix
-  package isn't shipped), so this points at our env-fallback or
-  rewrite logic resolving the bare `setFdOption` to a synthesised
-  source-style function instead of the host-backed
-  [`setFdOptionB`](src/IHC/Builtins.hs:5692) builtin.
+* `socketAcceptB` is never reached. After bind/listen and
+  `setSocketCloseOnExec` succeed, warp's setup chain
+  (`runSettingsConnectionMakerSecure → withII → acceptConnection →
+  E.mask_ acceptLoop`) spends all CPU in interpreted-thunk evaluation
+  before entering the accept loop. `curl --max-time 60` times out
+  with zero response bytes; the server keeps grinding.
+* The hot path is still env-lookup / class-method dispatch
+  (`Data.ByteString.compareBytes`, `eq_info`, `==` typeclass
+  dispatch, `stg_ap_*` machinery) — same flavour of slowness flagged
+  in the May 1 memoization commit (`ef9e6fb`).
 
-The next session should:
+The remaining work is **interpreter throughput on the post-listen
+path**, not source loading or primops. Two follow-ups:
 
-1. Re-add a print at the call site where `setFdOption` is being
-   dispatched (instrument `apply` for `(EVar "setFdOption")` callers
-   in Run.hs's body chain) to see which Val the lookup returns.
-2. If it's a VFunIP (user-defined lambda), trace back through
-   `discoverInModule` and the rewrite map to find which module
-   contributed the source-style body.
+1. Profile-guided HashMap-ification of the still-Map-backed
+   `ClassRegistry` (currently
+   `Map (ByteString, [ByteString]) MethodTable`).
+2. Closure compilation: lift the `eval`/`force`/`apply` inner loop
+   so each thunk has a precompiled entry function instead of an
+   AST-walk per evaluation.
 
 The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
 fix (commit da212e0) closed the previous "silent exit before listen"
