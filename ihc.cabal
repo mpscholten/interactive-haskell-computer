@@ -144,6 +144,7 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Hs2010LexNum
       , HsExtTypeApps
       , HsExtForall
       , Hs2010Fixity
