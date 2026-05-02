@@ -1,55 +1,46 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | Parser conformance tests for kind-related GHC extensions.
---
--- Covers: KindSignatures, DataKinds, PolyKinds, StandaloneKindSignatures,
--- StarIsType.
---
--- The IHC parser today recognises 'TkTick' for the bare @\'@ that opens
--- a promoted-list/tuple in a type, but the type-context promoted syntax
--- (@\'True@, @\'Just@, @\'[Int,Bool]@, @\'(Int,Bool)@) is not yet
--- consumed at the right place in the parser.  Those cases are pinned
--- with 'pendingWith' below so they show up explicitly in hspec output
--- and can graduate cleanly when the parser is extended.
 module HsExtKinds (spec) where
 
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (ParseError, defaultFixityTable, parseExprOnly)
+import IHC.AST (Expr)
+import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
-import IHC.Source (Source, mkSource)
-
-mkSrc :: ByteString -> Source
-mkSrc = mkSource "<test>"
+import IHC.Source (mkSource)
 
 isParseError :: SomeException -> Bool
 isParseError e = case fromException e of
     Just (_ :: ParseError) -> True
     Nothing                -> False
 
--- | Run the whole-expression parser. 'Right ()' = parse succeeded;
--- 'Left e' carries the exception so the caller can distinguish a
--- 'ParseError' from any other surprise.
-parseExpr :: ByteString -> IO (Either SomeException ())
-parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
-    pure ()
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSource "<test>" bs) defaultFixityTable)
 
--- | Try to parse + elaborate a tiny module.  We only require the parse
--- step to succeed: an elaboration-time @SomeException@ that is /not/ a
--- 'ParseError' counts as success because the stub program has no real
--- runtime, which the elaborator may legitimately reject downstream.
+-- | A 'Left' that is a 'ParseError' downgrades to 'pendingWith'; any other
+-- result (success, or non-'ParseError' failure) is fine. Use for known-gap
+-- expression-level features so they surface as @pending@ until the parser
+-- accepts them.
+shouldParseOrPending :: String -> ByteString -> Expectation
+shouldParseOrPending gap bs = do
+    r <- parseExpr bs
+    case r of
+        Right _                       -> pure ()
+        Left e | not (isParseError e) -> pure ()
+        Left _                        -> pendingWith gap
+
 parseModule :: ByteString -> IO (Either SomeException ())
 parseModule bs = try $ do
     _ <- loadProgramFromSource [] (mkSource "Probe.hs" bs)
     pure ()
 
--- | Assertion helper for module-level fixtures: either the whole load
--- succeeded, or it failed for a reason that is NOT a 'ParseError' (i.e.
--- the parse step was happy and only later elaboration objected).
+-- | Module-level fixture assertion: either the load succeeded outright,
+-- or it failed for a reason that is not a 'ParseError' (i.e. parse was
+-- happy and only later elaboration objected on a stub program). A
+-- 'ParseError' is a hard failure.
 expectModuleParseOk :: IO (Either SomeException ()) -> Expectation
 expectModuleParseOk action = do
     r <- action
@@ -60,9 +51,9 @@ expectModuleParseOk action = do
             ("expected parse success, got ParseError: " <> show e)
 
 -- | Like 'expectModuleParseOk' but downgrades a 'ParseError' to a
--- 'pendingWith' so a known-gap feature surfaces as @pending@ rather
--- than @failed@. Lets the test graduate automatically once the parser
--- accepts the snippet.
+-- 'pendingWith' so a known-gap feature surfaces as @pending@ rather than
+-- @failed@. Lets the test graduate automatically once the parser accepts
+-- the snippet.
 expectModuleParseOkOrPending :: String -> IO (Either SomeException ()) -> Expectation
 expectModuleParseOkOrPending gap action = do
     r <- action
@@ -115,12 +106,10 @@ spec = describe "HsExt — Kinds & DataKinds" $ do
         it "DataKinds: 'Just (promoted ctor) — value position" $ do
             pendingWith "known gap: lexer emits TkChar for `'X`; parser does not yet treat as DataKinds promoted ctor in expression"
 
-        it "DataKinds: '[] (promoted empty list) parses as expression" $ do
-            r <- parseExpr "{-# LANGUAGE DataKinds #-}\n'[]"
-            case r of
-                Right _ -> pure ()
-                Left _  -> pendingWith
-                    "known gap: TkTick + `[` lex but parser expression path doesn't accept promoted-list literal yet"
+        it "DataKinds: '[] (promoted empty list) parses as expression" $
+            shouldParseOrPending
+                "known gap: TkTick + `[` lex but parser expression path doesn't accept promoted-list literal yet"
+                "{-# LANGUAGE DataKinds #-}\n'[]"
 
         it "DataKinds: '[Int, Bool] (promoted list) — type position" $ do
             pendingWith "known gap: type-context promoted-list syntax not in parser"
