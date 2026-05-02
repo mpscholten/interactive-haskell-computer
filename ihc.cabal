@@ -145,6 +145,31 @@ test-suite ihc-test
       , CoreLowerTest
       , Coverage
       , HsExtMisc
+      , HsExtRecords
+      , Hs2010LexNum
+      , HsExtTypeApps
+      , HsExtForall
+      , Hs2010Fixity
+      , Hs2010Deriving
+      , HsExtDeriving
+      , HsExtSyntax
+      , HsExtClasses
+      , HsExtKinds
+      , HsExtPatterns
+      , Hs2010ClassInst
+      , Hs2010Types
+      , HsExtGADTs
+      , Hs2010Patterns
+      , Hs2010LexIdent
+      , Hs2010Bindings
+      , Hs2010LexComments
+      , HsExtLiterals
+      , Hs2010ExprCtl
+      , Hs2010Modules
+      , Hs2010LexStr
+      , Hs2010ExprData
+      , Hs2010LexLayout
+      , Hs2010DataDecl
       , JitSmoke
       , LexerIhp
       , NorthStarTest
