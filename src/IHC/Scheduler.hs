@@ -3573,13 +3573,46 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
     directRewritePairs reg tm requestedNames = do
         bodiesMap <- readIORef (lmBodies tm)
         let prefix   = lmName tm <> BC.pack "."
+            -- A "foreign-alias sentinel" is a body of the form
+            -- @EVar "OtherModule.name"@ inserted by 'discoverInModuleWith''
+            -- as a memoization hint: "I tried to resolve @name@ here and it
+            -- lives in @OtherModule@".  These bodies are NOT local
+            -- definitions — treating them as such causes downstream
+            -- modules that import @tm@ to rewrite bare @name@ references
+            -- to @tm.name@, which then forwards to @OtherModule.name@ at
+            -- runtime.  That extra hop matters: the source body for
+            -- @void = \\x -> () <$ x@ at the foreign target evaluates to
+            -- a 'VFunIP', not a 'VIO', so a do-block @>>@ that traverses
+            -- the redirect chain ends up applying @>>@ to a function
+            -- value.  Detect the sentinel and emit the rewrite to the
+            -- foreign target directly.
+            --
+            -- We require the EVar's bare component to MATCH the body's
+            -- name and the prefix to be a real loaded module.  Without
+            -- this check we'd mis-redirect bodies whose RHS is a local
+            -- alias-qualified reference like @myMax = P.maxBound@ where
+            -- @P@ is a per-module alias for @Prelude@ — those need
+            -- @rewriteExpr@ to translate the alias into the real FQN at
+            -- exportBodies time.
+            foreignAliasTarget n expr = case expr of
+                EVar v
+                    | v /= n
+                    , v /= prefix <> n
+                    , Just (qual, bareN) <- splitQualified v
+                    , bareN == n
+                    , Map.member qual reg
+                    -> Just v
+                _   -> Nothing
             -- Names defined directly in tm and exported.
             localExported =
-                [ n
+                [ (n, target)
                 | n <- requestedNames
                 , Just expr <- [Map.lookup n bodiesMap]
                 , not (isSelfAliasIn tm n expr) || isJust (specialSelfAliasTarget tm n expr)
                 , exportsNameDirect tm n
+                , let target = case foreignAliasTarget n expr of
+                        Just v  -> v
+                        Nothing -> prefix <> n
                 ]
             fieldExported =
                 [ n
@@ -3600,8 +3633,10 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                 , Map.member n (lmDataReg tm)
                 , exportsNameDirect tm n
                 ]
-            localPairs = [(n, prefix <> n) | n <- nubBS (localExported ++ fieldExported)]
-                      ++ [(n, n)            | n <- ctorExported, n `notElem` localExported, n `notElem` fieldExported]
+            localExportedNames = map fst localExported
+            localPairs = localExported
+                      ++ [(n, prefix <> n) | n <- fieldExported, n `notElem` localExportedNames]
+                      ++ [(n, n)            | n <- ctorExported, n `notElem` localExportedNames, n `notElem` fieldExported]
         -- For ExportName entries not covered by local bodies, follow
         -- tm's own unqualified imports (named re-export chain).
         namedPairs <- namedReexportPairs reg tm bodiesMap requestedNames

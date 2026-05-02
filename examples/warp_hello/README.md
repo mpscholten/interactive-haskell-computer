@@ -21,47 +21,48 @@ nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 
 ## Current state (2026-05-02)
 
-This example **does not yet complete an HTTP request**. It is checked in
-to anchor the warp-server objective and provide a reproducer for the
-remaining gap.
+This example **does not yet complete an HTTP request** but no longer
+hits the VFun-leak bug. The blocker is now a downstream
+`setFdOption`/`Fd` pattern dispatch issue.
 
 What works:
 
 * The whole warp / wai / http-types / network / streaming-commons /
   auto-update / time-manager dependency tree loads from source.
 * `Network.Socket.socket`, `bind`, `listen` execute via host-backed
-  builtins; `lsof -nP -iTCP:3099 -sTCP:LISTEN` shows the kernel
-  listener within a few seconds.
+  builtins.
 * The four original dry-run blockers (bare-import re-exports, record
   patterns in instance methods, `{-# LANGUAGE Strict #-}`,
   `UnboxedTuples`) are all resolved and have coverage fixtures under
   `test/Fixtures/Coverage/`.
+* The VFun-leak bug (where `acceptConnection`'s body had `void`
+  rewritten through `Network.Wai.Handler.Warp.Types.void` and
+  evaluated to a `<function>` instead of an `IO ()`) is **fixed** —
+  see the `directRewritePairs` foreign-alias-target detection in
+  [src/IHC/Scheduler.hs:3573](src/IHC/Scheduler.hs:3573).
 
 What does not work:
 
-* `socketAcceptB` is never reached. The bracket's inner action returns
-  a `<function>` (VFun) instead of an `IO ()`, so the bracket cleans up
-  and `runIO` exits with the unrun function as the terminal value.
-* Diagnostic instrumentation (added then reverted in this session)
-  showed the leak originates inside three runIOVal call sites in
-  `IHC.Builtins.hs`:
-  * Line ~2471 in `seqDispatch`'s non-IO fallback — `>>` is invoked
-    with a function-typed first arg.
-  * Line ~2416 in `bindDispatch`'s non-IO fallback — `>>=`'s
-    continuation result is a function.
-  * Line ~5987 in `atomicallyHashB` — STM state-transformer `apply`
-    returns a function instead of the `(# State#, a #)` tuple.
-* The `HasCallStack`-traced runs reproduce reliably (warp setup
-  evaluates, listener appears, then bracket teardown fires after a
-  few seconds with `runIO non-VIO after 1 VIO unwraps: <VFun>`).
+* The post-listen path now reaches `setSocketCloseOnExec → setFdOption fd CloseOnExec True`
+  inside warp's `runSettingsSocket`, but a 3-arg function with
+  patterns `[(Fd fd), opt, val]` is matched against arguments that
+  don't have an `Fd` constructor wrapper. The error fires inside
+  `errorB` with:
+  `Non-exhaustive patterns in function: [[PCon "Fd" [PVar "fd"], PVar "opt", PVar "val"]]`.
+  No source-level `setFdOption` exists in the cache (the unix
+  package isn't shipped), so this points at our env-fallback or
+  rewrite logic resolving the bare `setFdOption` to a synthesised
+  source-style function instead of the host-backed
+  [`setFdOptionB`](src/IHC/Builtins.hs:5692) builtin.
 
-The next session should re-add HasCallStack-based instrumentation to
-`runIOVal` and trace which source binding evaluates to a partial
-application instead of an IO action — the bug is upstream of the three
-detected sites and likely in either `Counter <$> newTVarIO 0` (from
-warp's `newCounter`), the timer-manager `withII` chain, or one of
-warp's eta-reduced point-free helpers (`runSettingsConnectionMaker`
-takes 2 args but is invoked with 3).
+The next session should:
+
+1. Re-add a print at the call site where `setFdOption` is being
+   dispatched (instrument `apply` for `(EVar "setFdOption")` callers
+   in Run.hs's body chain) to see which Val the lookup returns.
+2. If it's a VFunIP (user-defined lambda), trace back through
+   `discoverInModule` and the rewrite map to find which module
+   contributed the source-style body.
 
 The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
 fix (commit da212e0) closed the previous "silent exit before listen"
