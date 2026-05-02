@@ -144,6 +144,7 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Hs2010LexIdent
       , Hs2010Bindings
       , Hs2010LexComments
       , HsExtLiterals
