@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtTypeApps
 import qualified HsExtForall
 import qualified Hs2010Fixity
 import qualified Hs2010Deriving
@@ -64,6 +65,7 @@ main = hspec do
     RunFile.spec
     CabalLoader.spec
     Coverage.spec
+    HsExtTypeApps.spec
     Unsupported.spec
     ReplTest.spec
     NorthStarTest.spec
