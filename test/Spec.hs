@@ -5,6 +5,7 @@ import Test.Hspec
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified HsExtTypeFams
 import qualified HsExtMisc
 import qualified HsExtRecords
 import qualified Hs2010LexNum
@@ -70,6 +71,7 @@ main = hspec do
     RunFile.spec
     CabalLoader.spec
     Coverage.spec
+    HsExtTypeFams.spec
     HsExtTypeApps.spec
     Unsupported.spec
     ReplTest.spec
