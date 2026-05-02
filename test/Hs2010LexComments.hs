@@ -1,11 +1,14 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Hs2010LexComments (spec) where
 
 import Control.Exception (SomeException, evaluate, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
+import IHC.AST
 import IHC.Lexer (Token(..), TokenKind(..), nextToken, startCursor)
-import IHC.Parser (defaultFixityTable, parseExprOnly)
+import IHC.Parser (defaultFixityTable, parseExprAtEof)
 import IHC.Source (Source, mkSource)
 
 mkSrc :: ByteString -> Source
@@ -24,10 +27,19 @@ drainTokens bs = try (evaluate (go (mkSrc bs) startCursor))
             TkEof -> [TkEof]
             _     -> kind : go src c'
 
-parseExpr :: ByteString -> IO (Either SomeException ())
-parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
-    pure ()
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSrc bs) defaultFixityTable)
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- parseExpr bs
+    case r of
+        Right got -> got `shouldBe` expected
+        Left e    -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
+
+onePlusTwo :: Expr
+onePlusTwo = EApp (EApp (EVar "+") (ELit (LInt 1))) (ELit (LInt 2))
 
 spec :: Spec
 spec = describe "Hs2010 — Lexical comments & whitespace" $ do
@@ -50,11 +62,8 @@ spec = describe "Hs2010 — Lexical comments & whitespace" $ do
             Right ks -> ks `shouldBe` [TkNewline, TkEof]
             Left e   -> expectationFailure ("lexer crashed: " <> show e)
 
-    it "1.1.2 expression after a `---- x` line still parses" $ do
-        r <- parseExpr "---- prefix\n1 + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.2 expression after a `---- x` line still parses" $
+        "---- prefix\n1 + 2" `shouldParseTo` onePlusTwo
 
     it "1.1.3 nested block comment {- a -} disappears" $ do
         r <- drainTokens "{- a -}"
@@ -62,11 +71,8 @@ spec = describe "Hs2010 — Lexical comments & whitespace" $ do
             Right ks -> ks `shouldBe` [TkEof]
             Left e   -> expectationFailure ("lexer crashed: " <> show e)
 
-    it "1.1.3 block comment between tokens treated as whitespace" $ do
-        r <- parseExpr "1 {- a -} + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.3 block comment between tokens treated as whitespace" $
+        "1 {- a -} + 2" `shouldParseTo` onePlusTwo
 
     it "1.1.4 block comment nested to depth 2 — `{-{-x-}-}`" $ do
         r <- drainTokens "{-{-x-}-}"
@@ -74,11 +80,8 @@ spec = describe "Hs2010 — Lexical comments & whitespace" $ do
             Right ks -> ks `shouldBe` [TkEof]
             Left e   -> expectationFailure ("lexer crashed: " <> show e)
 
-    it "1.1.4 expression around `{-{-x-}-}` parses" $ do
-        r <- parseExpr "1 {-{-x-}-} + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.4 expression around `{-{-x-}-}` parses" $
+        "1 {-{-x-}-} + 2" `shouldParseTo` onePlusTwo
 
     it "1.1.4 block comment nested to depth 3 — `{- {- {- x -} -} -}`" $ do
         r <- drainTokens "{- {- {- x -} -} -}"
@@ -86,11 +89,8 @@ spec = describe "Hs2010 — Lexical comments & whitespace" $ do
             Right ks -> ks `shouldBe` [TkEof]
             Left e   -> expectationFailure ("lexer crashed: " <> show e)
 
-    it "1.1.4 inner close at depth 1 does not close the outer comment" $ do
-        r <- parseExpr "1 {- {- inner -} still-comment -} + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.4 inner close at depth 1 does not close the outer comment" $
+        "1 {- {- inner -} still-comment -} + 2" `shouldParseTo` onePlusTwo
 
     it "1.1.5 pragma-shaped comment {-# X #-} consumed as whitespace" $ do
         r <- drainTokens "{-# X #-}"
@@ -98,17 +98,12 @@ spec = describe "Hs2010 — Lexical comments & whitespace" $ do
             Right ks -> ks `shouldBe` [TkEof]
             Left e   -> expectationFailure ("lexer crashed: " <> show e)
 
-    it "1.1.5 expression around {-# LANGUAGE Foo #-} parses" $ do
-        r <- parseExpr "1 {-# LANGUAGE Foo #-} + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.5 expression around {-# LANGUAGE Foo #-} parses" $
+        "1 {-# LANGUAGE Foo #-} + 2" `shouldParseTo` onePlusTwo
 
-    it "1.1.5 multi-line pragma-shaped comment skipped" $ do
-        r <- parseExpr "1 {-# OPTIONS_GHC\n -fwarn-unused-imports\n#-} + 2"
-        case r of
-            Right _ -> pure ()
-            Left e  -> expectationFailure ("expected success, got " <> show e)
+    it "1.1.5 multi-line pragma-shaped comment skipped" $
+        "1 {-# OPTIONS_GHC\n -fwarn-unused-imports\n#-} + 2"
+            `shouldParseTo` onePlusTwo
 
     it "1.1.6 unicode whitespace (U+00A0) treated as whitespace" $ do
         let nbsp = "1\xC2\xA0+\xC2\xA02"
