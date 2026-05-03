@@ -1,0 +1,459 @@
+-- | Per-package instance manifests — IHC's analogue of GHC's @.hi@ files.
+--
+-- The problem this solves: when an IHC fixture runs, the scheduler
+-- needs to know which modules contain typeclass instances for the
+-- classes the user's program references.  For example, dispatching
+-- @fmap@ on @[]@ requires @instance Functor []@, which lives in
+-- @GHC.Internal.Base@.  Demand-driven discovery short-circuits at
+-- builtin-shimmed names like @fmap@, so the FV walk never reaches
+-- Prelude's re-export chain to @GHC.Internal.Base@; without help, the
+-- instance is never catalogued.
+--
+-- Historically a hardcoded seven-module force-load papered over this
+-- in 'IHC.Scheduler.loadProgramFromSource'.  This module replaces that
+-- list with a derived index built from real Haskell source.  GHC does
+-- the same via @.hi@: each module emits compile-time metadata that
+-- downstream uses populate @InstEnv@ from.  We do the same at the
+-- package granularity — once per @<pkg>-<ver>@ in
+-- @~/.cache/ihc/sources/@, scan headers and class/instance decls, and
+-- write a binary blob to @~/.cache/ihc/manifests/<pkg>-<ver>.manifest@.
+--
+-- At process start (or first need), we read every manifest and build:
+--
+--   * 'miClassProviders' — class name → set of modules with instances
+--   * 'miMethodOwner'    — method name → owning class
+--
+-- The scheduler queries these instead of consulting a hand-curated list.
+module IHC.InstanceManifest
+    ( -- * Types
+      PackageManifest (..)
+    , ModuleManifest  (..)
+    , ClassEntry      (..)
+    , InstanceEntry   (..)
+    , ManifestIndex   (..)
+    , currentFormatVersion
+      -- * Generation
+    , generatePackageManifest
+      -- * On-disk persistence
+    , manifestCacheDir
+    , manifestPathFor
+    , writeManifestFile
+    , readManifestFile
+      -- * Process-level index
+    , getManifestIndex
+    , resetManifestIndex
+    , providersForClass
+    , classForMethod
+    , providerModulesForMethods
+    ) where
+
+import Control.Exception (SomeException, try)
+import Control.Monad (filterM, foldM)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BC
+import Data.IORef
+import qualified Data.List as List
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import qualified Data.Set as Set
+import Data.Set (Set)
+import qualified Data.Time.Clock.POSIX as POSIX
+import System.Directory
+    ( XdgDirectory (XdgCache)
+    , createDirectoryIfMissing
+    , doesDirectoryExist
+    , doesFileExist
+    , getModificationTime
+    , getXdgDirectory
+    , listDirectory
+    )
+import System.FilePath (takeDirectory, (</>))
+import System.IO.Unsafe (unsafePerformIO)
+
+import qualified IHC.Cpp as Cpp
+import qualified IHC.ModuleHeader as MH
+import IHC.Lexer (startCursor)
+import qualified IHC.Scan as Scan
+import qualified IHC.Source as Src
+
+--------------------------------------------------------------------------------
+-- Types
+--------------------------------------------------------------------------------
+
+-- | Bumped when the on-disk schema changes incompatibly.  A manifest
+-- with a different version is treated as stale and regenerated.
+currentFormatVersion :: Int
+currentFormatVersion = 1
+
+data PackageManifest = PackageManifest
+    { pmFormatVersion :: !Int
+    , pmPackageId     :: !ByteString                  -- ^ e.g. @"ghc-internal-9.1003.0"@
+    , pmSourceHash    :: !ByteString                  -- ^ derived from path + mtime tuples
+    , pmModules       :: !(Map ByteString ModuleManifest)
+    } deriving (Show, Read)
+
+data ModuleManifest = ModuleManifest
+    { mmName      :: !ByteString
+    , mmFilePath  :: !FilePath
+    , mmImports   :: ![ByteString]
+    , mmClasses   :: ![ClassEntry]
+    , mmInstances :: ![InstanceEntry]
+    , mmTypeCtors :: ![ByteString]   -- ^ type constructors declared in this module
+    } deriving (Show, Read)
+
+data ClassEntry = ClassEntry
+    { ceClassName    :: !ByteString
+    , ceMethodNames  :: ![ByteString]
+    , ceSuperclasses :: ![ByteString]
+    } deriving (Show, Read)
+
+data InstanceEntry = InstanceEntry
+    { ieClassName :: !ByteString
+    , ieTypeNames :: ![ByteString]
+    } deriving (Show, Read)
+
+-- | The denormalised lookup tables used at runtime.  Built once per
+-- process from all manifests and cached in 'manifestIndexRef'.
+data ManifestIndex = ManifestIndex
+    { miClassProviders :: !(Map ByteString (Set ByteString))
+        -- ^ class name → modules that declare instances for it
+    , miClassHeads     :: !(Map ByteString [ByteString])
+        -- ^ class name → list of head-type names appearing in instances
+        --   (used to follow @instance Monad Maybe@ → load @Maybe@'s
+        --   defining module via 'miTypeProviders').
+    , miMethodOwner    :: !(Map ByteString ByteString)
+        -- ^ method name → owning class
+    , miTypeProviders  :: !(Map ByteString ByteString)
+        -- ^ type-constructor name → module that declares it.
+        --   Loading a module's instance heads (@instance Monad Maybe@
+        --   in @GHC.Internal.Base@) also pulls in the modules that
+        --   DEFINE the head types (@data Maybe = Nothing | Just@ in
+        --   @GHC.Internal.Maybe@), without which dispatch can't
+        --   resolve the type tag.
+    } deriving (Show)
+
+emptyIndex :: ManifestIndex
+emptyIndex = ManifestIndex Map.empty Map.empty Map.empty Map.empty
+
+--------------------------------------------------------------------------------
+-- Generation
+--------------------------------------------------------------------------------
+
+-- | Build a 'PackageManifest' for one source-cache directory.  Walks
+-- every @.hs@ under @root@, parses just the header + class/instance
+-- declarations, and packages the result.  Body parsing and evaluation
+-- are deliberately avoided — the manifest is metadata only.
+generatePackageManifest :: ByteString -> FilePath -> IO PackageManifest
+generatePackageManifest pkgId root = do
+    files <- collectHaskellFiles root
+    sortedFiles <- pure (List.sort files)
+    hash <- computeSourceHash sortedFiles
+    modules <- foldM (\acc fp -> do
+                         m <- scanModule fp
+                         case m of
+                             Nothing -> pure acc
+                             Just mm -> pure (Map.insert (mmName mm) mm acc))
+                     Map.empty
+                     sortedFiles
+    pure PackageManifest
+        { pmFormatVersion = currentFormatVersion
+        , pmPackageId     = pkgId
+        , pmSourceHash    = hash
+        , pmModules       = modules
+        }
+
+-- | Recursively collect every @.hs@ file under a directory, skipping
+-- @dist@ / @dist-newstyle@ / hidden directories.
+collectHaskellFiles :: FilePath -> IO [FilePath]
+collectHaskellFiles root = do
+    exists <- doesDirectoryExist root
+    if not exists
+        then pure []
+        else go root
+  where
+    go dir = do
+        entries <- listDirectory dir
+        let visible = filter (not . isHidden) entries
+        concat <$> mapM (classify dir) visible
+
+    classify dir name = do
+        let path = dir </> name
+        isDir <- doesDirectoryExist path
+        if isDir
+            then if isSkippable name then pure [] else go path
+            else if isHaskellSource name then pure [path] else pure []
+
+    isHidden ('.' : _) = True
+    isHidden _         = False
+
+    isSkippable n = n `elem`
+        [ "dist", "dist-newstyle", "_build", ".stack-work", "stack-work" ]
+
+    isHaskellSource n = ".hs" `List.isSuffixOf` n
+
+-- | Cheap hash: concatenated path + posix mtime per file, joined by NL.
+-- We don't need cryptographic strength — collisions just mean a stale
+-- manifest survives, which the next regen will fix.
+computeSourceHash :: [FilePath] -> IO ByteString
+computeSourceHash files = do
+    parts <- mapM filePart files
+    pure (BC.intercalate (BC.pack "\n") parts)
+  where
+    filePart fp = do
+        mt <- getModificationTime fp
+        let secs = POSIX.utcTimeToPOSIXSeconds mt
+        pure (BC.pack (fp <> "@" <> show (truncate secs :: Integer)))
+
+-- | Read one source file and produce a 'ModuleManifest'.  Errors are
+-- swallowed (a malformed file just contributes nothing to the manifest).
+scanModule :: FilePath -> IO (Maybe ModuleManifest)
+scanModule fp = do
+    r <- try (scanModuleUnsafe fp) :: IO (Either SomeException (Maybe ModuleManifest))
+    case r of
+        Right m  -> pure m
+        Left _   -> pure Nothing
+
+scanModuleUnsafe :: FilePath -> IO (Maybe ModuleManifest)
+scanModuleUnsafe fp = do
+    src0 <- Src.readSourceFile fp
+    -- Run CPP so files using @#if MIN_VERSION_base(...)@ etc. parse.
+    -- We don't have package include-dirs at manifest-generation time
+    -- (those come from cabal metadata that's process-scoped in the
+    -- scheduler), but 'defaultCppContext' covers the macros every
+    -- ghc-internal file actually consults.
+    bs' <- Cpp.cppPreprocessWithIncludes [] Cpp.defaultCppContext
+                                         (Src.srcName src0) (Src.srcBytes src0)
+    let src = Src.withBytes src0 bs'
+    (mHdr, _) <- MH.parseModuleHeader src startCursor
+    case mHdr >>= MH.mhName of
+        Nothing -> pure Nothing
+        Just modName -> do
+            let imports = maybe [] (map MH.impModule . MH.mhImports) mHdr
+            classes <- map fromClassDecl <$> Scan.scanClassDecls src
+            instances <- map fromInstanceDecl <$> Scan.scanInstanceDecls src
+            (_, _, typeCtorReg) <- Scan.scanDataDecls src
+            let typeCtors = Map.keys typeCtorReg
+            pure $ Just ModuleManifest
+                { mmName      = modName
+                , mmFilePath  = fp
+                , mmImports   = imports
+                , mmClasses   = classes
+                , mmInstances = instances
+                , mmTypeCtors = typeCtors
+                }
+  where
+    fromClassDecl c = ClassEntry
+        { ceClassName    = Scan.classClassName c
+        , ceMethodNames  = Scan.classMethodNames c
+        , ceSuperclasses = Scan.classSuperclasses c
+        }
+    fromInstanceDecl i = InstanceEntry
+        { ieClassName = Scan.instClassName i
+        , ieTypeNames = Scan.instTypeNames i
+        }
+
+--------------------------------------------------------------------------------
+-- On-disk persistence
+--------------------------------------------------------------------------------
+
+-- | Default cache directory for manifests.  Sibling of the source
+-- cache that 'IHC.PackageStore' / 'cachedPackageSearchPathWithIncludes'
+-- populate.
+manifestCacheDir :: IO FilePath
+manifestCacheDir = do
+    home <- getCacheHome
+    pure (home </> "ihc" </> "manifests")
+  where
+    getCacheHome = getXdgDirectory XdgCache ""
+
+manifestPathFor :: ByteString -> IO FilePath
+manifestPathFor pkgId = do
+    dir <- manifestCacheDir
+    pure (dir </> BC.unpack pkgId <> ".manifest")
+
+writeManifestFile :: FilePath -> PackageManifest -> IO ()
+writeManifestFile path pm = do
+    createDirectoryIfMissing True (takeDirectory path)
+    -- Show/Read derives are sufficient — manifests are small, latency
+    -- of read/parse is negligible compared to the work it replaces
+    -- (scanning sources every fixture).
+    writeFile path (show pm)
+
+readManifestFile :: FilePath -> IO (Maybe PackageManifest)
+readManifestFile path = do
+    exists <- doesFileExist path
+    if not exists
+        then pure Nothing
+        else do
+            r <- try (readFile path) :: IO (Either SomeException String)
+            case r of
+                Left _  -> pure Nothing
+                Right s -> case reads s of
+                    [(pm, "")] | pmFormatVersion pm == currentFormatVersion ->
+                        pure (Just pm)
+                    [(pm, rest)]
+                        | pmFormatVersion pm == currentFormatVersion
+                        , all (`elem` (" \n\r\t" :: String)) rest ->
+                        pure (Just pm)
+                    _ -> pure Nothing
+
+--------------------------------------------------------------------------------
+-- Process-level index
+--------------------------------------------------------------------------------
+
+{-# NOINLINE manifestIndexRef #-}
+manifestIndexRef :: IORef (Maybe ManifestIndex)
+manifestIndexRef = unsafePerformIO (newIORef Nothing)
+
+-- | Lazy, memoised: the first call walks the manifest cache and (if
+-- necessary) regenerates manifests for any package whose hash has
+-- changed.  Subsequent calls return the cached index.
+getManifestIndex :: IO ManifestIndex
+getManifestIndex = do
+    cached <- readIORef manifestIndexRef
+    case cached of
+        Just idx -> pure idx
+        Nothing  -> do
+            idx <- buildIndexFromCache
+            writeIORef manifestIndexRef (Just idx)
+            pure idx
+
+resetManifestIndex :: IO ()
+resetManifestIndex = writeIORef manifestIndexRef Nothing
+
+-- | Walk @~/.cache/ihc/sources/<pkg>@ directories, ensure each has a
+-- fresh manifest, then load and merge them into a single index.
+buildIndexFromCache :: IO ManifestIndex
+buildIndexFromCache = do
+    sourcesDir <- sourcesCacheDir
+    sourcesExist <- doesDirectoryExist sourcesDir
+    if not sourcesExist
+        then pure emptyIndex
+        else do
+            entries <- listDirectory sourcesDir
+            let candidates = filter (not . isPrefixOfDot) entries
+            packages <- filterM (\p -> doesDirectoryExist (sourcesDir </> p)) candidates
+            manifests <- mapM (loadOrGenerate sourcesDir) packages
+            pure (buildIndex (concatMap Map.elems (map pmModules (catMaybes manifests))))
+  where
+    catMaybes = foldr (\x acc -> case x of { Just v -> v : acc; Nothing -> acc }) []
+    isPrefixOfDot ('.' : _) = True
+    isPrefixOfDot _         = False
+
+sourcesCacheDir :: IO FilePath
+sourcesCacheDir = do
+    h <- getXdgDirectory XdgCache ""
+    pure (h </> "ihc" </> "sources")
+
+-- | Read the manifest for one package, regenerating if absent or stale.
+-- Returns 'Nothing' only if the package has no Haskell source at all.
+loadOrGenerate :: FilePath -> FilePath -> IO (Maybe PackageManifest)
+loadOrGenerate sourcesDir pkgName = do
+    let pkgId = BC.pack pkgName
+        srcRoot = sourcesDir </> pkgName
+    manifestPath <- manifestPathFor pkgId
+    cached <- readManifestFile manifestPath
+    files <- collectHaskellFiles srcRoot
+    if null files
+        then pure Nothing
+        else do
+            currentHash <- computeSourceHash (List.sort files)
+            case cached of
+                Just pm | pmSourceHash pm == currentHash -> pure (Just pm)
+                _ -> do
+                    pm <- generatePackageManifest pkgId srcRoot
+                    -- Persist for next run; failures are non-fatal.
+                    _ <- try (writeManifestFile manifestPath pm)
+                            :: IO (Either SomeException ())
+                    pure (Just pm)
+
+-- | Fold a list of 'ModuleManifest' into the denormalised lookup
+-- tables.  Multiple modules can provide instances for the same class;
+-- multiple classes can declare the same method (rare but possible).
+buildIndex :: [ModuleManifest] -> ManifestIndex
+buildIndex ms = ManifestIndex
+    { miClassProviders = providers
+    , miClassHeads     = classHeads
+    , miMethodOwner    = methodOwners
+    , miTypeProviders  = typeProviders
+    }
+  where
+    providers = foldr addProviders Map.empty ms
+    addProviders mm acc = foldr (addProv (mmName mm)) acc (mmInstances mm)
+    addProv modName ie =
+        Map.insertWith Set.union (ieClassName ie) (Set.singleton modName)
+
+    classHeads = foldr addHeads Map.empty ms
+    addHeads mm acc = foldr addHead acc (mmInstances mm)
+    -- The instance head's first type name (the head constructor) is
+    -- what dispatch ultimately tags on.  @instTypeNames@ may be longer
+    -- for MPTC; the first slot is the principal head.
+    addHead ie acc = case ieTypeNames ie of
+        []      -> acc
+        (h : _) -> Map.insertWith (++) (ieClassName ie) [h] acc
+
+    methodOwners = foldr addMethods Map.empty ms
+    addMethods mm acc = foldr addClass acc (mmClasses mm)
+    addClass ce acc0 = foldr (\m -> Map.insert m (ceClassName ce)) acc0
+                             (ceMethodNames ce)
+
+    -- Two old/new versions of @base@ may both ship a definition for
+    -- the same type (e.g. @data Maybe@ in both @GHC.Maybe@ from old
+    -- @base@ and @GHC.Internal.Maybe@ from new @ghc-internal@).
+    -- Prefer the modern @GHC.Internal.*@ home so dispatch resolves
+    -- against the canonical type tag.
+    typeProviders = foldr addTypes Map.empty ms
+    addTypes mm acc = foldr (addType (mmName mm)) acc (mmTypeCtors mm)
+    addType modName tyName acc =
+        case Map.lookup tyName acc of
+            Nothing -> Map.insert tyName modName acc
+            Just existing
+                | isInternal modName && not (isInternal existing) ->
+                    Map.insert tyName modName acc
+                | otherwise -> acc
+    isInternal m = BC.pack "GHC.Internal." `BC.isPrefixOf` m
+
+--------------------------------------------------------------------------------
+-- Convenience queries
+--------------------------------------------------------------------------------
+
+-- | Modules that declare an @instance ClassName T@ for the given class,
+-- across every loaded manifest.  Empty if the class is unknown.
+providersForClass :: ManifestIndex -> ByteString -> Set ByteString
+providersForClass idx cls =
+    Map.findWithDefault Set.empty cls (miClassProviders idx)
+
+-- | Class name a method belongs to, if known.  @Nothing@ if no
+-- 'class C ... where method ...' was scanned for this name.
+classForMethod :: ManifestIndex -> ByteString -> Maybe ByteString
+classForMethod idx m = Map.lookup m (miMethodOwner idx)
+
+-- | Given a set of identifiers (typically the union of free variables
+-- across the user's entry source), pick out the ones that are class
+-- methods according to the manifest, look up each method's class, and
+-- return the union of provider modules across all referenced classes.
+-- Also pulls in modules that DEFINE the head types of those instances
+-- (so loading @instance Monad Maybe@ from @GHC.Internal.Base@ also
+-- loads @data Maybe@ from @GHC.Internal.Maybe@), without which dispatch
+-- can't resolve the instance head's type tag.
+--
+-- This is the manifest-driven replacement for the hand-curated
+-- @coreInstanceModules@ force-load.  A program using only @putStrLn@
+-- gets exactly @Show@'s providers + their head types; a program using
+-- @fmap@ also gets @Functor@'s; a program using none of the standard
+-- methods gets the empty set.
+providerModulesForMethods :: ManifestIndex -> Set ByteString -> Set ByteString
+providerModulesForMethods idx names = providers `Set.union` headTypeModules
+  where
+    classes = [ cls | n <- Set.toList names, Just cls <- [classForMethod idx n] ]
+    providers = Set.unions [ providersForClass idx cls | cls <- classes ]
+    -- For each referenced class, look up its instance heads and add
+    -- the defining modules of those head types.  Handles
+    -- @data Maybe@ in @GHC.Internal.Maybe@ vs. @instance Monad Maybe@
+    -- in @GHC.Internal.Base@ split.
+    headTypeModules = Set.fromList
+        [ definingMod
+        | cls <- classes
+        , tyName <- Map.findWithDefault [] cls (miClassHeads idx)
+        , Just definingMod <- [Map.lookup tyName (miTypeProviders idx)]
+        ]

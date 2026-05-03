@@ -97,6 +97,7 @@ import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
+import qualified IHC.InstanceManifest as Manifest
 import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
@@ -408,53 +409,45 @@ loadProgramFromSource searchPath src0 = do
                 :: IO (Either SomeException LoadedModule)
         pure ()
 
-    -- Force-load a small set of core modules that provide fundamental
-    -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
-    -- Either; Show/Eq/Ord for primitives; etc.).
+    -- Manifest-driven core load.
     --
-    -- Why this list is here:
-    --   - 'loadModule' parses a module but does NOT recursively load
-    --     its imports.  Transitive loading happens via demand-driven
-    --     'discoverInModuleWith' walks (line ~5610) — but that walk
-    --     short-circuits at builtin-shimmed names like @print@,
-    --     @fmap@, @+@.  So a fixture like
-    --     @main = print (fmap (+10) [1,2,3])@ never reaches Prelude's
-    --     re-export chain to 'GHC.Internal.Base' where @instance
-    --     Functor []@ lives.
-    --   - The cleanest fix is to make 'loadModule' itself transitively
-    --     load 'mhImports', but Prelude's transitive closure exhausts
-    --     the heap on cold load (each fixture run resets
-    --     'globalLoadedModulesRef', so the cost cannot be amortised).
-    --     A bounded depth-2 walk works correctness-wise but pushes the
-    --     suite from 67s to >>1h because every fixture re-pays the
-    --     per-module setup work in 'expandSplicesInModule',
-    --     'discoverClassAndInstanceFreeVars', and the line ~573
-    --     'registerInstancesFrom' pass.
-    --   - So we keep this hand-curated set of seven modules: it's
-    --     exactly the GHC.Internal.* tier that Prelude's source-level
-    --     header imports.  Sourced from real Haskell (they are listed
-    --     in @base-4.20.2.0/src/Prelude.hs@ lines 167-185), but
-    --     hardcoded here because we cannot afford to discover them
-    --     dynamically per fixture run.
+    -- Demand-driven discovery short-circuits at builtin-shimmed names
+    -- ('discoverInModuleWith' at ~line 5610: @Set.member name builtins@),
+    -- so an FV walk over @main = print (fmap (+10) [1,2,3])@ never
+    -- reaches @GHC.Internal.Base@ where @instance Functor []@ lives —
+    -- the call resolves to a builtin, and the walk records a miss.
     --
-    -- Eliminating this list cleanly requires either persisting
-    -- 'globalLoadedModulesRef' across runs (currently risky — leaves
-    -- stale 'lmBodies' state) or moving the per-module setup passes
-    -- behind their own catalogues.  Both are out of scope for this
-    -- change.  See plan at ~/.claude/plans/this-feel-like-it-zazzy-dongarra.md.
-    let coreInstanceModules =
-            [ BC.pack "GHC.Internal.Base"
-            , BC.pack "GHC.Internal.Show"
-            , BC.pack "GHC.Internal.Enum"
-            , BC.pack "GHC.Internal.Ix"
-            , BC.pack "GHC.Internal.Num"
-            , BC.pack "GHC.Internal.Real"
-            , BC.pack "GHC.Internal.Maybe"
-            ]
-    forM_ coreInstanceModules $ \m -> do
-        _ <- try (loadModule registry fullSearchPath includeMap m)
-                :: IO (Either SomeException LoadedModule)
-        pure ()
+    -- Mirrors GHC's @InstEnv@ population from @.hi@ files.
+    -- 'IHC.InstanceManifest' precomputes a @class → providing modules@
+    -- index by scanning @~/.cache/ihc/sources/@ once per package and
+    -- caches the result on disk.  At program-load time we look up the
+    -- class methods the user's code actually mentions, take the union
+    -- of provider modules across those classes, and load just those.
+    --
+    -- The filter to @GHC.Internal.*@ is a scope decision, not a
+    -- hardcoded module list: it bounds the eager load to the boot
+    -- libraries that are reachable through builtin-shim short-circuits.
+    -- Providers in user-imported packages (Data.Map, lens, aeson, …)
+    -- are still loaded — but through the regular import path
+    -- ('entryImports' force-load above), which fires the auto-register
+    -- hook to catalogue their instances.  Without the filter, every
+    -- class with hundreds of cross-package providers would be loaded
+    -- on every fixture and exhaust the heap.
+    do
+        manifest <- Manifest.getManifestIndex
+        bodies <- readIORef (lmBodies entry)
+        let entryFvs = Set.fromList
+                [ fv
+                | expr <- Map.elems bodies
+                , fv   <- freeVars expr ++ syntheticClassMethodNames expr
+                ]
+            allProviders = Manifest.providerModulesForMethods manifest entryFvs
+            ghcInternalPrefix = BC.pack "GHC.Internal."
+            providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
+        forM_ (Set.toList providers) $ \m -> do
+            _ <- try (loadModule registry fullSearchPath includeMap m)
+                    :: IO (Either SomeException LoadedModule)
+            pure ()
 
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
@@ -6391,6 +6384,53 @@ findOrResolveLhs src known name = do
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
 -- The scheduler uses this list to drive demand-driven discovery.
+-- | Class-method names that the evaluator inserts at runtime but that
+-- never appear as 'EVar' in the parsed AST.  Returned alongside
+-- 'freeVars' when the manifest-driven load needs to know which
+-- typeclasses are exercised by a fixture.
+--
+-- @do@-notation inserts @>>=@ / @>>@ when desugared at eval time;
+-- numeric literals dispatch through @fromInteger@ / @fromRational@;
+-- 'ENeg' dispatches through @negate@.  Without these synthetic
+-- references, programs that use @do { x <- m; ... }@ never trigger a
+-- load of 'Monad' instance providers, and the dispatcher misses.
+syntheticClassMethodNames :: Expr -> [ByteString]
+syntheticClassMethodNames = goExpr
+  where
+    goExpr = \case
+        EDo stmts ->
+            (BC.pack ">>=" : BC.pack ">>" : BC.pack "return" : BC.pack "fail" : [])
+              ++ concatMap goStmt stmts
+        ELit _      -> []
+        EVar _      -> []
+        EApp f x    -> goExpr f ++ goExpr x
+        ELam _ e    -> goExpr e
+        ELet bs e   -> concatMap (goExpr . snd) bs ++ goExpr e
+        ECase s as  -> goExpr s ++ concatMap goAlt as
+        EIf c t e   -> goExpr c ++ goExpr t ++ goExpr e
+        ENeg e      -> BC.pack "negate" : goExpr e
+        ETuple es   -> concatMap goExpr es
+        ERecordCon _ fields    -> concatMap (goExpr . snd) fields
+        ERecordWild _          -> []
+        ERecordUpdate e fields -> goExpr e ++ concatMap (goExpr . snd) fields
+        EImplicitRef _   -> []
+        EImplicitLet bs e -> concatMap (goExpr . snd) bs ++ goExpr e
+        ESplice e   -> goExpr e
+        EQuote _    -> []
+        EQuasiQuote _ _ -> []
+        ELabel _    -> []
+        ETyApp e _  -> goExpr e
+        ETypedMethod{} -> []
+        EGuardFail  -> []
+
+    goStmt (SExpr e)            = goExpr e
+    goStmt (SBind _ e)          = goExpr e
+    goStmt (SBangBind _ e)      = goExpr e
+    goStmt (SLet bs)            = concatMap (goExpr . snd) bs
+    goStmt (SImplicitLet bs)    = concatMap (goExpr . snd) bs
+
+    goAlt (Alt _ e) = goExpr e
+
 freeVars :: Expr -> [ByteString]
 freeVars = goAll []
   where
