@@ -9,7 +9,10 @@ import Test.Hspec
 
 import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
-import IHC.Source (mkSource)
+import IHC.Source (Source, mkSource)
+
+mkSrc :: ByteString -> Source
+mkSrc = mkSource "<test>"
 
 -- | Load a tiny module wrapping the given top-level declaration. Parse
 -- success is the only assertion; later elaboration may legitimately
@@ -17,10 +20,10 @@ import IHC.Source (mkSource)
 assertParses :: ByteString -> Expectation
 assertParses declBs = do
     let src = "module M where\nmain :: IO ()\nmain = pure ()\n" <> declBs <> "\n"
-    r <- try (loadProgramFromSource [] (mkSource "<test>" src))
+    r <- try (loadProgramFromSource [] (mkSrc src))
     case r of
         Right _ -> pure ()
-        Left e -> case fromException e of
+        Left (e :: SomeException) -> case fromException e of
             Just (pe :: ParseError) -> expectationFailure
                 ("expected parse to succeed, got ParseError: " <> show pe)
             Nothing -> pure ()

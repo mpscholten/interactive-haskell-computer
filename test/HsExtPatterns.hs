@@ -7,7 +7,7 @@ import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (ParseError, defaultFixityTable, parseExprOnly)
+import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
 
@@ -16,7 +16,7 @@ mkSrc = mkSource "<test>"
 
 parseExpr :: ByteString -> IO (Either SomeException ())
 parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
+    _ <- parseExprAtEof (mkSrc bs) defaultFixityTable
     pure ()
 
 -- | Parse-only check for declaration-level fixtures.  We only care that the

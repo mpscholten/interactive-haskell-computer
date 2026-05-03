@@ -1,3 +1,6 @@
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- | Parser conformance tests for Haskell 2010 §3.4–3.7:
 -- class, instance, default, and foreign declarations.
 module Hs2010ClassInst (spec) where
@@ -6,6 +9,7 @@ import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
+import IHC.Lexer (LexError)
 import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
@@ -14,24 +18,37 @@ import IHC.Val (Env, Thunk)
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
 
-isParseError :: SomeException -> Bool
-isParseError e = case fromException e of
-    Just (_ :: ParseError) -> True
-    Nothing                -> False
+isParseFailure :: SomeException -> Bool
+isParseFailure e =
+       case (fromException e :: Maybe ParseError) of
+           Just _  -> True
+           Nothing -> case (fromException e :: Maybe LexError) of
+                          Just _  -> True
+                          Nothing -> False
 
 -- | Load a tiny module and assert the parse step succeeded.
--- A 'Right' is success; a 'Left' that is NOT a 'ParseError' is also
--- success (the parser accepted the source; a later elaboration step
--- legitimately failed on a stub program).  Only a 'ParseError' counts
--- as a failure for parser-conformance purposes.
+--
+-- A 'Right' is success: the whole pipeline (parse, rename, elaborate,
+-- evaluate the @main@ thunk forcefully enough to obtain a value) made
+-- it through. That is the strongest possible witness — and the only
+-- one that proves no silent-skip happened.
+--
+-- A 'Left' that is a 'ParseError' or 'LexError' is a parser bug and
+-- fails the test loudly.
+--
+-- A 'Left' that is anything else is treated as success: parsing did
+-- consume the input, and a later pass legitimately rejected the stub
+-- program (e.g. a missing instance, an unknown name). Tests in this
+-- module construct minimal stubs that intentionally do not type-check
+-- end-to-end, so we cannot demand 'Right'.
 parsesAsModule :: ByteString -> IO ()
 parsesAsModule bs = do
     r <- try (loadProgramFromSource [] (mkSrc bs))
             :: IO (Either SomeException (Env, Thunk))
     case r of
         Right _ -> pure ()
-        Left e | isParseError e ->
-            expectationFailure ("parse failed: " <> show e)
+        Left e | isParseFailure e ->
+            expectationFailure ("parse/lex failed: " <> show e)
         Left _ -> pure ()
 
 mainStub :: ByteString

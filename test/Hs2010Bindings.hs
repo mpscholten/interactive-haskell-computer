@@ -8,7 +8,8 @@ import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (ParseError)
+import IHC.AST
+import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
 
@@ -20,10 +21,21 @@ isParseError e = case fromException e of
     Just (_ :: ParseError) -> True
     Nothing                -> False
 
--- | Assert that the parser accepts the source. Calls
--- 'loadProgramFromSource' and accepts any outcome that is not a
--- 'ParseError' — later elaboration may legitimately fail on a stub
--- program; only the parse step needs to succeed.
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSrc bs) defaultFixityTable)
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- parseExpr bs
+    case r of
+        Right got -> got `shouldBe` expected
+        Left e    -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
+
+-- | Assert that the parser accepts a module source. Calls
+-- 'loadProgramFromSource' and rejects only 'ParseError' outcomes —
+-- later elaboration may legitimately fail on a stub program (unbound
+-- names, unresolved instances). Only the parse step needs to succeed.
 assertParses :: ByteString -> Expectation
 assertParses bs = do
     r <- try (void (loadProgramFromSource [] (mkSrc bs)))
@@ -40,11 +52,15 @@ spec = describe "Hs2010 — Bindings & guards" $ do
     -- 4.1 Function-binding LHS forms
     --------------------------------------------------------------------
     describe "4.1 Function-binding LHS forms" $ do
-        it "4.1.1 prefix function `f x y = x + y`" $
+        it "4.1.1 prefix function `f x y = x + y`" $ do
             assertParses "module M where\nf x y = x + y\n"
+            "x + y" `shouldParseTo`
+                EApp (EApp (EVar "+") (EVar "x")) (EVar "y")
 
-        it "4.1.2 backtick infix `` x `f` y = x + y ``" $
+        it "4.1.2 backtick infix `` x `f` y = x + y ``" $ do
             assertParses "module M where\nx `f` y = x + y\n"
+            "x `f` y" `shouldParseTo`
+                EApp (EApp (EVar "f") (EVar "x")) (EVar "y")
 
         it "4.1.3 symbolic infix `x +++ y = x`" $
             assertParses "module M where\nx +++ y = x\n"
@@ -62,11 +78,14 @@ spec = describe "Hs2010 — Bindings & guards" $ do
     -- 4.2 RHS forms
     --------------------------------------------------------------------
     describe "4.2 RHS forms" $ do
-        it "4.2.1 plain `=` RHS" $
+        it "4.2.1 plain `=` RHS" $ do
             assertParses "module M where\nf x = x\n"
+            "x" `shouldParseTo` EVar "x"
 
-        it "4.2.2 single guarded RHS `f x | x > 0 = x`" $
+        it "4.2.2 single guarded RHS `f x | x > 0 = x`" $ do
             assertParses "module M where\nf x | x > 0 = x\n"
+            "x > 0" `shouldParseTo`
+                EApp (EApp (EVar ">") (EVar "x")) (ELit (LInt 0))
 
         it "4.2.3 multi-guard chain (otherwise)" $
             assertParses "module M where\nf x | x > 0     = x\n    | otherwise = 0\n"
@@ -81,17 +100,20 @@ spec = describe "Hs2010 — Bindings & guards" $ do
     -- 4.3 Pattern bindings
     --------------------------------------------------------------------
     describe "4.3 Pattern bindings" $ do
-        it "4.3.1 simple variable pattern binding `x = 1`" $
+        it "4.3.1 simple variable pattern binding `x = 1`" $ do
             assertParses "module M where\nx = 1\n"
+            "1" `shouldParseTo` ELit (LInt 1)
 
-        it "4.3.2 tuple-pattern binding `(a, b) = p`" $
+        it "4.3.2 tuple-pattern binding `(a, b) = p`" $ do
             assertParses "module M where\np = (1, 2)\n(a, b) = p\n"
+            "(1, 2)" `shouldParseTo` ETuple [ELit (LInt 1), ELit (LInt 2)]
 
         it "4.3.3 list-pattern binding `[x, y] = xs`" $
             assertParses "module M where\nxs = [1, 2]\n[x, y] = xs\n"
 
-        it "4.3.4 constructor-pattern binding `Just x = m`" $
+        it "4.3.4 constructor-pattern binding `Just x = m`" $ do
             assertParses "module M where\nm = Just 1\nJust x = m\n"
+            "Just 1" `shouldParseTo` EApp (EVar "Just") (ELit (LInt 1))
 
         it "4.3.5 pattern binding with `where`" $
             assertParses "module M where\n(a, b) = p where p = (1, 2)\n"
@@ -103,8 +125,10 @@ spec = describe "Hs2010 — Bindings & guards" $ do
     -- 4.4 Guard forms (also used in case alts and list comprehensions)
     --------------------------------------------------------------------
     describe "4.4 Guard forms" $ do
-        it "4.4.1 boolean guard `| x > 0`" $
+        it "4.4.1 boolean guard `| x > 0`" $ do
             assertParses "module M where\nf x | x > 0 = x\n"
+            "x > 0" `shouldParseTo`
+                EApp (EApp (EVar ">") (EVar "x")) (ELit (LInt 0))
 
         it "4.4.2 pattern guard `| Just x <- m`" $
             pendingWith "known gap: pattern guards (| Just x <- m)"
