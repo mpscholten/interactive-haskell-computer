@@ -3649,34 +3649,43 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
     -- | Collect (name, qualified-key) pairs for ExportName entries that
     -- are not locally defined in @tm@ but are re-exported via @tm@'s
     -- own unqualified imports.
-    namedReexportPairs reg tm bodiesMap requestedNames = do
+    namedReexportPairs reg tm bodiesMap requestedNames =
         case mhExports (lmHeader tm) of
             ExportAll    -> pure []   -- ExportAll: no explicit name list to iterate
             ExportList xs -> do
                 let exportedNames = [ n | ExportName n <- xs, n `elem` requestedNames ]
-                    -- Names that appear in the export list but are NOT locally defined
-                    -- must come from an import (named re-export chain).
                     missingNames  = filter (\n ->
                         case Map.lookup n bodiesMap of
                             Just expr -> isSelfAliasIn tm n expr && not (isJust (specialSelfAliasTarget tm n expr))
                             Nothing   -> True
                         ) exportedNames
-                concat <$> mapM (findNameInImports reg tm [lmName tm]) missingNames
+                -- Shared visited set across all per-name findNameInImports walks
+                -- in this query.  Without it, the recursion's per-path visited
+                -- list explodes quadratically: every transitive import is
+                -- re-explored from each branch.  See trace from 2026-05-03 where
+                -- a single '<$>' lookup triggered 19,000+ findNameInImports calls
+                -- through GHC.Internal.* before timing out.
+                visitedRef <- newIORef (Set.singleton (lmName tm))
+                concat <$> mapM (findNameInImports reg tm visitedRef) missingNames
 
     -- | Find which of @tm@'s unqualified imports provides @n@, returning
     -- a @(n, qualified-key)@ pair if found.
-    findNameInImports reg tm visited n = do
-        -- Walk all imports (qualified + unqualified).  The module's
-        -- export list may re-export a qualified name (e.g. Prelude's
-        -- @List.words@ where @List@ is @import qualified … as List@).
-        -- The qualifier is stripped at ModuleHeader parse time so we
-        -- must consider qualified imports as potential providers when
-        -- building rewrite pairs.
+    -- Shared 'visitedRef' (an IORef holding a Set ByteString of already-
+    -- explored module names) is required to keep transitive-import walks
+    -- bounded.  The per-path 'visited' list it replaced re-explored the
+    -- same module from every branch, blowing up exponentially in the
+    -- number of imports.
+    findNameInImports reg tm visitedRef n = do
         let viaImports = mhImports (lmHeader tm)
-            viable = filter (\i ->
+        viable <- do
+            visited <- readIORef visitedRef
+            pure $ filter (\i ->
                 impModule i /= BC.pack "Prelude" &&
-                impModule i `notElem` visited &&
+                not (Set.member (impModule i) visited) &&
                 specAllows (impSpec i) n) viaImports
+        -- Reserve the modules we're about to explore so recursive walks
+        -- don't re-enter them.
+        modifyIORef' visitedRef (\s -> foldr Set.insert s (map impModule viable))
         go viable
       where
         go []         = pure []
@@ -3695,7 +3704,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                             pure [(n, srcPrefix <> n)]
                       _ -> do
                             -- Try one level deeper (srcLm might also re-export).
-                            deeper <- findNameInImports reg srcLm (impModule imp : visited) n
+                            deeper <- findNameInImports reg srcLm visitedRef n
                             case deeper of
                                 [] -> go rest
                                 ps -> pure ps

@@ -21,11 +21,12 @@ nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 
 ## Current state (2026-05-03)
 
-The kernel listener is up reliably on `127.0.0.1:3099`, but
-`socketAcceptB` is still not reached: warp's setup chain after `listen`
-spins in host code without entering `acceptLoop`.
-`curl http://127.0.0.1:3099/` connects (the listen backlog absorbs the
-SYN) but receives zero response bytes.
+The hang in warp's setup chain is **fixed**.  `curl
+http://127.0.0.1:3099/` now connects, and the server starts responding
+to the request — but the response itself fails partway through with an
+`IhcException: IOError`, leaving curl with `Recv failure: Connection
+reset by peer`.  The listener stays up for the brief window before
+that exception unwinds the bracket and closes the socket.
 
 What works:
 
@@ -38,76 +39,53 @@ What works:
   `UnboxedTuples`) are all resolved.
 * **VFun-leak fixed**: `directRewritePairs` no longer treats
   foreign-alias sentinels (bodies like `EVar "OtherMod.name"`
-  inserted as memoization hints) as local definitions. Previously
-  `acceptConnection`'s `void $ E.mask_ acceptLoop` rewrote `void` to
-  `Network.Wai.Handler.Warp.Types.void`, whose body forwarded to
-  `GHC.Internal.Data.Functor.void` (a `VFunIP`, not a `VIO`) — the
-  do-block `>>` saw a function as its first arg and the bracket
-  exited with the function as its terminal result.
+  inserted as memoization hints) as local definitions.
 * **setFdOption pattern-dispatch fixed**: `setFdOption` is now in
   `ffiBuiltinNames` so the unix package's source-level
   `setFdOption (Fd fd) opt val` definition (which calls
   `c_fcntl_read`/`c_fcntl_write` we don't FFI-back) doesn't shadow
-  our host implementation. `setFdOptionB` also unwraps the `Fd`
-  newtype wrapper for source-constructed values.
+  our host implementation.
+* **`findNameInImports` exponential blowup fixed (this commit)**: the
+  named-reexport resolver in `IHC.Scheduler` was using a per-path
+  `[ByteString]` visited list, which let every recursive entry into
+  the same module re-explore its full import graph.  For warp's
+  `Network.Wai.Handler.Warp.Imports → Control.Applicative`
+  reexport chain, a single `<$>` lookup triggered ~19,000
+  `findNameInImports` calls in a few seconds — Lc4jT_info /
+  Lc4Anc_info hot symbols seen in the May-2 sample were this
+  recursive Map.lookup chasing. Switched to a shared
+  `IORef (Set ByteString)` so each module is explored at most once
+  per query.  Resolving runSettingsConnectionMaker now completes
+  immediately and warp proceeds into `withII` and `acceptConnection`.
 
 What does not work:
 
-* `socketAcceptB` is never reached. After bind/listen and
-  `setSocketCloseOnExec` succeed, warp's setup chain
-  (`runSettingsConnectionMakerSecure → withII → acceptConnection →
-  E.mask_ acceptLoop`) hangs at 100% CPU before entering the accept
-  loop. `curl --max-time 60` times out with zero response bytes.
-* **The May-2 instrumentation pass corrected the prior diagnosis.**
-  Counters in `eval`, `force`, `apply`/`applyIP`, `runIOVal`,
-  `bindDispatch`/`seqDispatch`/`fmapDispatch`, `lookupInstanceMethod`,
-  `classMethodDispatcher`'s value-directed dispatch, and the
-  env-fallback hook all *flatline* once the program hangs (frozen at
-  e.g. `forces=271 apply=293 eval=430 runIO=41 fallback=38 lookupI=4
-  bind=7 seq=9 fmap=0 dispatch=6`). The CPU is therefore burning
-  entirely in compiled host code, **not** the interpreter.
-* `sample` shows the hot path is **`GHC.Internal.Data.Typeable.Internal`**:
-  `Lc4jT_info` and `Lc4k8_info` (~25% combined) are local closures
-  inside the `Typeable` machinery (immediate neighbours of
-  `mkTrApp_info`, `sameTypeRep_info`, `showTypeable_info` in the
-  binary), with `Data.ByteString.Internal.Type.compareBytes` /
-  `eq_info` / `GHC.Classes.zeze_info` (`==`) accounting for another
-  ~30%. `Lc4Anc_info` (~6%) is in `IHC.Scheduler` and references
-  `compareBytes`, `Just`, and `Nothing` — i.e. a `Map ByteString`
-  lookup helper. Last interpreter activity: `force #271` on the
-  `runSettingsConnection` lambda, then `applyIP` consumed up to
-  293 calls (lambda's set/getConn/app args + descent into the
-  `runSettingsConnectionMaker` chain) — and then everything stops
-  while the host keeps spinning.
+* `IhcException: IOError` is thrown somewhere between the connection
+  setup (warp's `socketConnection set s`) and the response write.  The
+  trace right before the throw shows the `raiseIO# se` re-throw path
+  — a `SomeException` is caught and re-thrown, indicating warp's
+  exception machinery is firing on something missing (e.g. a host
+  primop returning `IOError` from `EAGAIN` retry, or an unimplemented
+  TLS / sendfile shim).  Listener is up briefly, curl handshakes
+  succeed, but the response bytes never arrive.
 
-The remaining work is **identifying the host-level `Typeable`-driven
-hot loop** that the warp setup chain triggers between
-`runSettingsConnection` and `acceptConnection`. Plausible suspects:
+The remaining work is to identify which IO action throws the
+`IOError`.  Likely candidates:
 
-1. A repeated `try`/`catch` cycle inside warp's `withII` /
-   `mkAutoUpdate` chain, each iteration computing `TypeRep`s for
-   exception matching.
-2. Some derived-`Typeable` dispatch that hits a non-terminating case
-   in `containers`/`hashable` instance derivation when fed our
-   interpreter-shaped values.
+1. `Network.Socket.ByteString.recv` / `Sock.sendMany` host wrapper
+   throwing on EAGAIN without retrying via `threadWaitRead`.
+2. `connSendFile` / `connSendAll` pulling from a host shim that
+   isn't wired up for the buffer types warp constructs.
+3. An `evaluate` deep inside `socketConnection` forcing a thunk that
+   was built lazily and now references a missing FFI symbol.
 
-Either way the trail starts at the binary symbols `Lc4jT_info`
-(0x101a60410-relative-to-text in a recent build) and `Lc4Anc_info`
-(`IHC.Scheduler.o` offset 0x2dc0) — disassembly shows both call
-into bytestring `compareBytes` and the `Maybe` constructors.
+Earlier follow-ups that also landed:
 
-Earlier follow-ups that landed but proved insufficient:
-
-1. **HashMap-ification of `ClassRegistry` and `MethodTable`** (commit
-   in this branch). Both went from `Map`-backed to `HashMap`-backed,
-   eliminating log-n `compareBytes` per dispatch lookup. The change
-   is correct but the warp hang persists, because dispatch is not the
-   actual hot loop (counters above prove it).
-2. **Unified `runIOVal` between `IHC.Eval` and `IHC.Builtins`**: the
-   two modules previously kept independent copies; bind/seq/fmap
-   dispatch in `Builtins` was using its own runIOVal, hiding it from
-   diagnostic counters added to the `Eval` copy. Now both paths
-   share one definition.
+1. **HashMap-ification of `ClassRegistry` and `MethodTable`** —
+   eliminates log-n `compareBytes` per dispatch lookup.
+2. **Unified `runIOVal` between `IHC.Eval` and `IHC.Builtins`** —
+   one definition with VIO, source-built `VCon "IO"`, and `VCon "STM"`
+   cases.
 
 The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
 fix (commit da212e0) closed the previous "silent exit before listen"
