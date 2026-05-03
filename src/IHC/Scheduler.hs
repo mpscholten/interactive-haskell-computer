@@ -434,14 +434,13 @@ loadProgramFromSource searchPath src0 = do
     -- class with hundreds of cross-package providers would be loaded
     -- on every fixture and exhaust the heap.
     do
-        manifest <- Manifest.getManifestIndex
         bodies <- readIORef (lmBodies entry)
         let entryFvs = Set.fromList
                 [ fv
                 | expr <- Map.elems bodies
                 , fv   <- freeVars expr ++ syntheticClassMethodNames expr
                 ]
-            allProviders = Manifest.providerModulesForMethods manifest entryFvs
+            allProviders = Manifest.providerModulesForMethods Manifest.manifestIndex entryFvs
             ghcInternalPrefix = BC.pack "GHC.Internal."
             providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
         forM_ (Set.toList providers) $ \m -> do

@@ -38,8 +38,7 @@ module IHC.InstanceManifest
       -- * Generation
     , generatePackageManifest
       -- * Process-level index
-    , getManifestIndex
-    , resetManifestIndex
+    , manifestIndex
     , providersForClass
     , classForMethod
     , providerModulesForMethods
@@ -49,7 +48,6 @@ import Control.Exception (SomeException, try)
 import Control.Monad (filterM, foldM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef
 import qualified Data.List as List
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -228,25 +226,21 @@ scanModuleUnsafe fp = do
 -- Process-level index
 --------------------------------------------------------------------------------
 
-{-# NOINLINE manifestIndexRef #-}
-manifestIndexRef :: IORef (Maybe ManifestIndex)
-manifestIndexRef = unsafePerformIO (newIORef Nothing)
-
--- | Lazy, memoised: the first call walks the entire source cache and
--- builds the index.  Subsequent calls return the cached value.
--- Process-level so the test suite's 1596 fixtures share one scan.
-getManifestIndex :: IO ManifestIndex
-getManifestIndex = do
-    cached <- readIORef manifestIndexRef
-    case cached of
-        Just idx -> pure idx
-        Nothing  -> do
-            idx <- buildIndexFromCache
-            writeIORef manifestIndexRef (Just idx)
-            pure idx
-
-resetManifestIndex :: IO ()
-resetManifestIndex = writeIORef manifestIndexRef Nothing
+-- | The manifest index, evaluated at most once per process.
+--
+-- This is a top-level CAF: GHC's runtime guarantees that a NOINLINE
+-- top-level binding under 'unsafePerformIO' is forced exactly once
+-- and its result shared by every subsequent reference.  No IORef, no
+-- 'Maybe'-wrapping, no @get-or-build@ ceremony — callers just use
+-- 'manifestIndex' as a value.
+--
+-- The first reference triggers the source-cache scan (~1–2 s for
+-- ~233 ghc-internal modules); subsequent references are constant-time
+-- map lookups against the cached value.  The test suite's 1596
+-- fixtures share one scan.
+{-# NOINLINE manifestIndex #-}
+manifestIndex :: ManifestIndex
+manifestIndex = unsafePerformIO buildIndexFromCache
 
 -- | Walk @~/.cache/ihc/sources/<pkg>@ directories, scan every
 -- @.hs@ file once, and merge into a single index.
