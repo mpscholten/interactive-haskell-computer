@@ -36,9 +36,11 @@ shouldParseTo bs expected = do
 multiWayIfFallback :: Expr
 multiWayIfFallback =
     EApp (EVar "error")
-         (foldr cons nil "multi-way if: no branch matched")
+         (foldr cons nil ("multi-way if: no branch matched" :: String))
   where
+    cons :: Char -> Expr -> Expr
     cons c rest = EApp (EApp (EVar ":") (ELit (LChar c))) rest
+    nil :: Expr
     nil         = EVar "[]"
 
 spec :: Spec
