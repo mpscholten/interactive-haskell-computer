@@ -19,73 +19,92 @@ main = run 3099 $ \_ respond ->
 nix develop -c cabal run exe:ihc -- run examples/warp_hello/Main.hs
 ```
 
-## Current state (2026-05-03)
+## Current state (2026-05-03 — late)
 
-The hang in warp's setup chain is **fixed**.  `curl
-http://127.0.0.1:3099/` now connects, and the server starts responding
-to the request — but the response itself fails partway through with an
-`IhcException: IOError`, leaving curl with `Recv failure: Connection
-reset by peer`.  The listener stays up for the brief window before
-that exception unwinds the bracket and closes the socket.
+The hang is **fixed**, and several follow-on bugs have been peeled
+back.  `curl http://127.0.0.1:3099/` now reaches the listener and
+TCP-handshakes successfully, but the server closes the connection
+before sending a response — curl reports `Recv failure: Connection
+reset by peer`.  The IHC process exits cleanly (return code 0) with
+no exception printed: warp's `runSettings` returns instead of
+spinning in the accept loop.
 
 What works:
 
 * The whole warp / wai / http-types / network / streaming-commons /
   auto-update / time-manager / unix dependency tree loads from source.
-* `Network.Socket.socket`, `bind`, `listen` execute via host-backed
-  builtins; the listener appears within ~10 s.
-* The four original dry-run blockers (bare-import re-exports, record
-  patterns in instance methods, `{-# LANGUAGE Strict #-}`,
-  `UnboxedTuples`) are all resolved.
-* **VFun-leak fixed**: `directRewritePairs` no longer treats
-  foreign-alias sentinels (bodies like `EVar "OtherMod.name"`
-  inserted as memoization hints) as local definitions.
-* **setFdOption pattern-dispatch fixed**: `setFdOption` is now in
-  `ffiBuiltinNames` so the unix package's source-level
-  `setFdOption (Fd fd) opt val` definition (which calls
-  `c_fcntl_read`/`c_fcntl_write` we don't FFI-back) doesn't shadow
-  our host implementation.
-* **`findNameInImports` exponential blowup fixed (this commit)**: the
-  named-reexport resolver in `IHC.Scheduler` was using a per-path
-  `[ByteString]` visited list, which let every recursive entry into
-  the same module re-explore its full import graph.  For warp's
-  `Network.Wai.Handler.Warp.Imports → Control.Applicative`
-  reexport chain, a single `<$>` lookup triggered ~19,000
-  `findNameInImports` calls in a few seconds — Lc4jT_info /
-  Lc4Anc_info hot symbols seen in the May-2 sample were this
-  recursive Map.lookup chasing. Switched to a shared
-  `IORef (Set ByteString)` so each module is explored at most once
-  per query.  Resolving runSettingsConnectionMaker now completes
-  immediately and warp proceeds into `withII` and `acceptConnection`.
+* `Network.Socket.socket`, `bind`, `listen`, `setSocketOption` and the
+  unix `setFdOption` execute via host-backed builtins; listener
+  appears within ~1 s.
+* `mkAutoUpdate` from `auto-update` runs (one `forkIO` for the
+  date-cache worker), `mask_` fires once for that fork.
+* End-to-end TCP handshake works: curl connects to the listener.
+* **Findings landed since the May-2 hang report:**
+  * **`findNameInImports` exponential blowup fixed**: the
+    named-reexport resolver in `IHC.Scheduler` was using a per-path
+    `[ByteString]` visited list, which let every recursive entry
+    into the same module re-explore its full import graph.  For
+    `Network.Wai.Handler.Warp.Imports → Control.Applicative`, a
+    single `<$>` lookup triggered ~19,000 calls in seconds.
+    Switched to a shared `IORef (Set ByteString)`; resolving
+    `runSettingsConnectionMaker` completes instantly.
+  * **TVar primops route through `requireTVarPrim`**: `readTVar`,
+    `writeTVar`, `modifyTVar'`, `readTVarIO` now unwrap the
+    source-level `newtype TVar a = TVar (TVar# RealWorld a)` and
+    further `newtype Counter = Counter (TVar Int)`-style wrappers.
+    Previously each builtin only matched the bare
+    `VPrimObj (PrimTVar tv)` and threw "not a TVar" on the first
+    `Counter` shape warp constructs.
+  * **`getAddrInfo` respects hints**: the builtin used to ignore the
+    `hints` argument and pass `NULL` to the OS, which returned both
+    UDP and TCP entries.  warp's `bindPortGenEx` then tried the UDP
+    address first, with `setSocketOption sock TCP_NODELAY 1` failing
+    EINVAL.  warp caught it via `tryAddrs` and retried with the TCP
+    addr, but the per-attempt churn is wasted.  Now we build a host
+    `struct addrinfo` from the `Maybe AddrInfo` Val (4 OS-relevant
+    fields: flags, family, socktype, protocol).
+  * **HashMap-ification of `ClassRegistry` and `MethodTable`** —
+    eliminates log-n `compareBytes` per dispatch lookup.
+  * **Unified `runIOVal` between `IHC.Eval` and `IHC.Builtins`** —
+    one definition with VIO, source-built `VCon "IO"`, and
+    `VCon "STM"` cases.
+  * **VFun-leak fix** — `directRewritePairs` no longer treats
+    foreign-alias sentinels as local definitions.
+  * **`setFdOption` host route** — `setFdOption` is in
+    `ffiBuiltinNames` so the unix package's source-level
+    pattern-matched definition can't shadow our host impl.
 
 What does not work:
 
-* `IhcException: IOError` is thrown somewhere between the connection
-  setup (warp's `socketConnection set s`) and the response write.  The
-  trace right before the throw shows the `raiseIO# se` re-throw path
-  — a `SomeException` is caught and re-thrown, indicating warp's
-  exception machinery is firing on something missing (e.g. a host
-  primop returning `IOError` from `EAGAIN` retry, or an unimplemented
-  TLS / sendfile shim).  Listener is up briefly, curl handshakes
-  succeed, but the response bytes never arrive.
+* `runSettings` returns instead of running the accept loop.  Tracing
+  shows: `mask_B` fires exactly once (mkAutoUpdate's `mask_ $ forkIO`
+  in the date cache worker setup); `voidB` never fires; `socketAcceptB`
+  never fires; `atomicallyB` never fires.  So the chain stops between
+  `mkAutoUpdate` returning to `withDateCache` and `acceptConnection`
+  being invoked.  Default settings have
+  `settingsFdCacheDuration = 0` and `settingsFileInfoCacheDuration = 0`,
+  so `withFdCache 0 action = action getFdNothing` and
+  `withFileInfoCache 0 action = action getInfoNaive` should be
+  near-trivial pass-throughs.  The next investigation step is to
+  confirm whether `withFdCache`/`withFileInfoCache` actually invoke
+  their continuation `action` — specifically whether the `case 0`
+  pattern match is hitting in our interpreter for the `Int` value
+  computed via `settingsFdCacheDuration set * 1000000`.
 
-The remaining work is to identify which IO action throws the
-`IOError`.  Likely candidates:
+Reproduction:
 
-1. `Network.Socket.ByteString.recv` / `Sock.sendMany` host wrapper
-   throwing on EAGAIN without retrying via `threadWaitRead`.
-2. `connSendFile` / `connSendAll` pulling from a host shim that
-   isn't wired up for the buffer types warp constructs.
-3. An `evaluate` deep inside `socketConnection` forcing a thunk that
-   was built lazily and now references a missing FFI symbol.
+```bash
+direnv exec . cabal build exe:ihc
+direnv exec . ./dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc \
+    run examples/warp_hello/Main.hs &
+IHC_PID=$!
 
-Earlier follow-ups that also landed:
+# Listener appears for ~1 s then disappears as runSettings returns.
+until lsof -nP -iTCP:3099 -sTCP:LISTEN | grep -q LISTEN; do sleep 0.05; done
+curl -v --max-time 1 http://127.0.0.1:3099/   # connects, then "Recv failure"
 
-1. **HashMap-ification of `ClassRegistry` and `MethodTable`** —
-   eliminates log-n `compareBytes` per dispatch lookup.
-2. **Unified `runIOVal` between `IHC.Eval` and `IHC.Builtins`** —
-   one definition with VIO, source-built `VCon "IO"`, and `VCon "STM"`
-   cases.
+kill "$IHC_PID"
+```
 
 The HashMap-backed Env (commit 993fef5) and the `try`-catches-all
 fix (commit da212e0) closed the previous "silent exit before listen"
