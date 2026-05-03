@@ -42,6 +42,7 @@ library
       , IHC.Eval
       , IHC.EvalCore
       , IHC.FFI
+      , IHC.InstanceManifest
       , IHC.Lexer
       , IHC.Lower
       , IHC.ModuleHeader
