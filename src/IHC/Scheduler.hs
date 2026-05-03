@@ -82,6 +82,7 @@ import IHC.Classes
     , clearSuperclasses
     , setEnvFallback
     , setCoreInstanceLoadHook
+    , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
     , setThExpToExpr
     , registerSuperclasses
@@ -409,27 +410,38 @@ loadProgramFromSource searchPath src0 = do
 
     -- Force-load a small set of core modules that provide fundamental
     -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
-    -- Either; Show/Eq/Ord for primitives; etc.).  Without this, a
-    -- fixture like @main = print (fmap (+10) [1,2,3])@ never triggers
-    -- loading of @GHC.Internal.Base@ because every FV in its body
-    -- (@print@, @fmap@, numeric ops) short-circuits via the builtin
-    -- name set — and an instance that isn't scanned is an instance
-    -- that won't register.  These modules are cheap to parse and
-    -- their instance decls are needed for dispatch-time lookups to
-    -- succeed.
-    -- Stage 4 of the lazy-registration plan: keep ONLY the core
-    -- GHC.Internal modules eager — these provide the instance
-    -- registrations that the env-fallback hook depends on for
-    -- Prelude name resolution. Application-specific modules
-    -- (Language.Haskell.TH.Quote, Text.Megaparsec.*) used to be
-    -- on this list as a workaround for the eager
-    -- 'registerInstancesFrom' pass; with Stage 2 cataloguing them
-    -- lazily the workaround is no longer needed for instance
-    -- registration. (TH.Quote's @QuasiQuoter@ data constructor and
-    -- Megaparsec's class+instance still require the module to be
-    -- /loaded/ — that responsibility moves to the user's source
-    -- via @import Language.Haskell.TH.Quote@ etc., which the
-    -- entry-imports force-load on line 412 already handles.)
+    -- Either; Show/Eq/Ord for primitives; etc.).
+    --
+    -- Why this list is here:
+    --   - 'loadModule' parses a module but does NOT recursively load
+    --     its imports.  Transitive loading happens via demand-driven
+    --     'discoverInModuleWith' walks (line ~5610) — but that walk
+    --     short-circuits at builtin-shimmed names like @print@,
+    --     @fmap@, @+@.  So a fixture like
+    --     @main = print (fmap (+10) [1,2,3])@ never reaches Prelude's
+    --     re-export chain to 'GHC.Internal.Base' where @instance
+    --     Functor []@ lives.
+    --   - The cleanest fix is to make 'loadModule' itself transitively
+    --     load 'mhImports', but Prelude's transitive closure exhausts
+    --     the heap on cold load (each fixture run resets
+    --     'globalLoadedModulesRef', so the cost cannot be amortised).
+    --     A bounded depth-2 walk works correctness-wise but pushes the
+    --     suite from 67s to >>1h because every fixture re-pays the
+    --     per-module setup work in 'expandSplicesInModule',
+    --     'discoverClassAndInstanceFreeVars', and the line ~573
+    --     'registerInstancesFrom' pass.
+    --   - So we keep this hand-curated set of seven modules: it's
+    --     exactly the GHC.Internal.* tier that Prelude's source-level
+    --     header imports.  Sourced from real Haskell (they are listed
+    --     in @base-4.20.2.0/src/Prelude.hs@ lines 167-185), but
+    --     hardcoded here because we cannot afford to discover them
+    --     dynamically per fixture run.
+    --
+    -- Eliminating this list cleanly requires either persisting
+    -- 'globalLoadedModulesRef' across runs (currently risky — leaves
+    -- stale 'lmBodies' state) or moving the per-module setup passes
+    -- behind their own catalogues.  Both are out of scope for this
+    -- change.  See plan at ~/.claude/plans/this-feel-like-it-zazzy-dongarra.md.
     let coreInstanceModules =
             [ BC.pack "GHC.Internal.Base"
             , BC.pack "GHC.Internal.Show"
@@ -440,11 +452,9 @@ loadProgramFromSource searchPath src0 = do
             , BC.pack "GHC.Internal.Maybe"
             ]
     forM_ coreInstanceModules $ \m -> do
-        r <- try (loadModule registry fullSearchPath includeMap m)
+        _ <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
-        case r of
-            Right _ -> pure ()
-            Left  _ -> pure ()   -- best-effort; keep going if a module is absent
+        pure ()
 
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
@@ -601,19 +611,39 @@ loadProgramFromSource searchPath src0 = do
     -- Phase 2.3: scan instance declarations from all loaded modules
     -- and register their method vals into the ClassRegistry. This must
     -- happen AFTER the env is fully tied so instance bodies can see all
-    -- bindings (including recursive ones).
-    do { classTable <- buildClassMethodTable loadedModules; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules }
+    -- bindings (including recursive ones).  Re-read the registry here so
+    -- modules pulled in by 'expandSplicesInModule' (which runs after the
+    -- 'loadedModules' snapshot at the top of this function) participate
+    -- in the registration pass.
+    regAfterSplices <- readIORef registry
+    let loadedModules' = [ lm | (_, Loaded lm) <- Map.toList regAfterSplices ]
+    classTable <- buildClassMethodTable loadedModules'
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules'
+    -- Install the per-load instance-registration hook now that the env
+    -- is fully tied.  Any subsequent 'loadModule' call (typically a lazy
+    -- fallback load via 'resolveFallback') will fire this hook, which
+    -- catalogues the freshly-loaded module's instances against the same
+    -- env the explicit pass above used.  Without this, a module loaded
+    -- on demand after the knot has been tied would have its instances
+    -- ignored entirely.
+    setRegisterInstancesHook $ \modName -> do
+        globalMods <- readIORef globalLoadedModulesRef
+        case Map.lookup modName globalMods of
+            Just lm ->
+                registerInstancesFrom registry fullSearchPath includeMap
+                                      classReg unionedTypeCtors classTable env lm
+            Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
-    registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules
+    registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules'
     -- Synthesize user-derived Functor instances for every @deriving
     -- Functor@ annotated data/newtype decl. Runs after the explicit
     -- instance-registration pass so we can honour any hand-written
     -- @instance Functor T where ...@ already in the registry (the
     -- registrar skips types that already have a Functor dict).
-    registerDerivedFunctorInstances classReg loadedModules
-    registerDerivedEnumBoundedInstances classReg loadedModules
+    registerDerivedFunctorInstances classReg loadedModules'
+    registerDerivedEnumBoundedInstances classReg loadedModules'
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -4247,6 +4277,12 @@ loadModule registry searchPath includeMap name = do
                             lm <- buildLoadedModule declared False header src
                             modifyIORef' registry (Map.insert name (Loaded lm))
                             registerGlobalLoadedModule lm
+                            -- Fire the per-load instance-registration hook
+                            -- (no-op until installed by the scheduler).
+                            -- Catalogues this module's instance decls into
+                            -- the Stage-2 InstanceCatalogue so dispatcher
+                            -- misses can drain them.
+                            triggerRegisterInstances name
                             pure lm
 
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
@@ -4294,6 +4330,12 @@ resetPerRunGlobals = do
     -- Clear the catalogue too so closures captured against this
     -- run's 'LoadedModule' state don't fire on the next run.
     resetInstanceCatalogue
+    -- Drop the per-load instance-registration hook installed by the
+    -- previous 'loadProgramFromSource' run.  Without this, any
+    -- 'loadModule' call before the new run's hook is reinstalled would
+    -- fire the previous run's closure — referencing its
+    -- now-defunct ClassRegistry / Env / typeCtors and corrupting state.
+    setRegisterInstancesHook (\_ -> pure ())
     -- Drop the (lm, name) → resolveImport memo from the prior run so
     -- a fresh 'lmName' doesn't see stale resolutions captured against
     -- the previous registry.

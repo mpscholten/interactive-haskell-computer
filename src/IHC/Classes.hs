@@ -52,6 +52,11 @@ module IHC.Classes
     , coreInstanceLoadHookRef
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
+      -- * Per-load instance-registration hook
+    , RegisterInstancesHook
+    , registerInstancesHookRef
+    , setRegisterInstancesHook
+    , triggerRegisterInstances
       -- * Class-method dispatcher fallback
     , classMethodFallbackRef
     , setClassMethodFallback
@@ -565,6 +570,38 @@ triggerCoreInstanceLoad :: IO ()
 triggerCoreInstanceLoad = do
     hook <- readIORef coreInstanceLoadHookRef
     hook
+
+--------------------------------------------------------------------------------
+-- Per-load instance-registration hook
+--
+-- Fired by 'loadModule' (in IHC.Scheduler) every time a module finishes
+-- a fresh load.  The scheduler installs this hook after building the
+-- shared env so the closure can capture registry/classReg/typeCtors/
+-- classTable/env and call 'registerInstancesFrom' on the just-loaded
+-- module — putting its instances into the Stage-2 catalogue without a
+-- separate global pass.
+--
+-- Keyed by module name (rather than 'LoadedModule') to keep this module
+-- free of an import cycle with 'IHC.Scheduler'.  The installed hook
+-- looks the name up in 'globalLoadedModulesRef' to recover the module.
+--
+-- No-op until installed, so the very first entry-module load (which
+-- happens before the scheduler can install the hook) is safe.
+--------------------------------------------------------------------------------
+
+type RegisterInstancesHook = ByteString -> IO ()
+
+{-# NOINLINE registerInstancesHookRef #-}
+registerInstancesHookRef :: IORef RegisterInstancesHook
+registerInstancesHookRef = unsafePerformIO (newIORef (\_ -> pure ()))
+
+setRegisterInstancesHook :: RegisterInstancesHook -> IO ()
+setRegisterInstancesHook = writeIORef registerInstancesHookRef
+
+triggerRegisterInstances :: ByteString -> IO ()
+triggerRegisterInstances modName = do
+    hook <- readIORef registerInstancesHookRef
+    hook modName
 
 --------------------------------------------------------------------------------
 -- TH Exp -> Expr decoder hook
