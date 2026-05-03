@@ -7,7 +7,7 @@ import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
-import IHC.Parser (ParseError, defaultFixityTable, parseExprOnly)
+import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
 
@@ -21,7 +21,7 @@ isParseError e = case fromException e of
 
 parseExpr :: ByteString -> IO (Either SomeException ())
 parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
+    _ <- parseExprAtEof (mkSrc bs) defaultFixityTable
     pure ()
 
 assertExprParses :: ByteString -> Expectation
