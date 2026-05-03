@@ -11,27 +11,19 @@ import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
 
-isParseError :: SomeException -> Bool
-isParseError e = case fromException e of
-    Just (_ :: ParseError) -> True
-    Nothing                -> False
-
--- | Parse-only check for declaration-level fixtures.  We only care that the
--- parser doesn't reject the source with a ParseError; later elaboration can
--- legitimately fail on tiny stub modules and that's not a parser bug.
-parseModule :: ByteString -> IO (Either SomeException ())
-parseModule bs = do
+-- | Assert that 'loadProgramFromSource' parses the program. A 'ParseError'
+-- is a definite failure; any other exception means the parse made it
+-- through and only later elaboration (typecheck, dispatch, ...) tripped on
+-- the stub program — which is fine for a parser conformance test.
+assertParses :: ByteString -> Expectation
+assertParses bs = do
     r <- try (loadProgramFromSource [] (mkSource "<test>" bs))
     case r of
-        Right _ -> pure (Right ())
+        Right _ -> pure ()
         Left (e :: SomeException)
-            | isParseError e -> pure (Left e)
-            | otherwise      -> pure (Right ())
-
-shouldParse :: Either SomeException () -> Expectation
-shouldParse = \case
-    Right _ -> pure ()
-    Left e  -> expectationFailure ("expected parse success, got: " <> show e)
+            | Just (pe :: ParseError) <- fromException e -> expectationFailure
+                ("expected parse to succeed, got ParseError: " <> show pe)
+            | otherwise -> pure ()
 
 spec :: Spec
 spec = describe "HsExt — Deriving extensions" $ do
@@ -39,46 +31,42 @@ spec = describe "HsExt — Deriving extensions" $ do
     describe "StandaloneDeriving" $ do
         it "StandaloneDeriving: deriving instance Eq T" $ do
             pendingWith "known gap: StandaloneDeriving is unsupported"
-            r <- parseModule
+            assertParses
                 "{-# LANGUAGE StandaloneDeriving #-}\n\
                 \module M where\n\
                 \data T = T\n\
                 \deriving instance Eq T\n\
                 \main = pure ()\n"
-            shouldParse r
 
         it "StandaloneDeriving: deriving instance with context" $ do
             pendingWith "known gap: StandaloneDeriving is unsupported"
-            r <- parseModule
+            assertParses
                 "{-# LANGUAGE StandaloneDeriving #-}\n\
                 \module M where\n\
                 \data T a = T a\n\
                 \deriving instance Eq a => Eq (T a)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DerivingStrategies" $ do
-        it "DerivingStrategies: deriving stock (Eq, Show)" $ do
-            r <- parseModule
+        it "DerivingStrategies: deriving stock (Eq, Show)" $
+            assertParses
                 "{-# LANGUAGE DerivingStrategies #-}\n\
                 \module M where\n\
                 \data T = T\n\
                 \  deriving stock (Eq, Show)\n\
                 \main = pure ()\n"
-            shouldParse r
 
-        it "DerivingStrategies: deriving newtype (Eq, Ord)" $ do
-            r <- parseModule
+        it "DerivingStrategies: deriving newtype (Eq, Ord)" $
+            assertParses
                 "{-# LANGUAGE DerivingStrategies #-}\n\
                 \{-# LANGUAGE GeneralizedNewtypeDeriving #-}\n\
                 \module M where\n\
                 \newtype Age = Age Int\n\
                 \  deriving newtype (Eq, Ord)\n\
                 \main = pure ()\n"
-            shouldParse r
 
-        it "DerivingStrategies: deriving anyclass (ToJSON)" $ do
-            r <- parseModule
+        it "DerivingStrategies: deriving anyclass (ToJSON)" $
+            assertParses
                 "{-# LANGUAGE DerivingStrategies #-}\n\
                 \{-# LANGUAGE DeriveAnyClass #-}\n\
                 \module M where\n\
@@ -86,12 +74,11 @@ spec = describe "HsExt — Deriving extensions" $ do
                 \data T = T\n\
                 \  deriving anyclass (ToJSON)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DerivingVia" $ do
         it "DerivingVia: deriving Show via (Wrap T)" $ do
             pendingWith "known gap: DerivingVia clause not parsed"
-            r <- parseModule
+            assertParses
                 "{-# LANGUAGE DerivingStrategies #-}\n\
                 \{-# LANGUAGE DerivingVia #-}\n\
                 \module M where\n\
@@ -99,28 +86,25 @@ spec = describe "HsExt — Deriving extensions" $ do
                 \data T = T\n\
                 \  deriving Show via (Wrap T)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "GeneralizedNewtypeDeriving" $ do
-        it "GeneralizedNewtypeDeriving: newtype Age = Age Int deriving (Eq, Ord, Num)" $ do
-            r <- parseModule
+        it "GeneralizedNewtypeDeriving: newtype Age = Age Int deriving (Eq, Ord, Num)" $
+            assertParses
                 "{-# LANGUAGE GeneralizedNewtypeDeriving #-}\n\
                 \module M where\n\
                 \newtype Age = Age Int deriving (Eq, Ord, Num)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DeriveFunctor / DeriveFoldable / DeriveTraversable" $ do
-        it "DeriveFunctor: data Tree a deriving Functor" $ do
-            r <- parseModule
+        it "DeriveFunctor: data Tree a deriving Functor" $
+            assertParses
                 "{-# LANGUAGE DeriveFunctor #-}\n\
                 \module M where\n\
                 \data Tree a = Leaf | Node a (Tree a) (Tree a) deriving Functor\n\
                 \main = pure ()\n"
-            shouldParse r
 
-        it "DeriveFoldable / DeriveTraversable: data Tree a deriving (Functor, Foldable, Traversable)" $ do
-            r <- parseModule
+        it "DeriveFoldable / DeriveTraversable: data Tree a deriving (Functor, Foldable, Traversable)" $
+            assertParses
                 "{-# LANGUAGE DeriveFunctor #-}\n\
                 \{-# LANGUAGE DeriveFoldable #-}\n\
                 \{-# LANGUAGE DeriveTraversable #-}\n\
@@ -128,20 +112,18 @@ spec = describe "HsExt — Deriving extensions" $ do
                 \data Tree a = Leaf | Node a (Tree a) (Tree a)\n\
                 \  deriving (Functor, Foldable, Traversable)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DeriveGeneric" $ do
-        it "DeriveGeneric: data T = T deriving Generic" $ do
-            r <- parseModule
+        it "DeriveGeneric: data T = T deriving Generic" $
+            assertParses
                 "{-# LANGUAGE DeriveGeneric #-}\n\
                 \module M where\n\
                 \data T = T deriving Generic\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DeriveAnyClass" $ do
-        it "DeriveAnyClass: data T = T deriving (FromJSON) with anyclass strategy" $ do
-            r <- parseModule
+        it "DeriveAnyClass: data T = T deriving (FromJSON) with anyclass strategy" $
+            assertParses
                 "{-# LANGUAGE DeriveAnyClass #-}\n\
                 \{-# LANGUAGE DerivingStrategies #-}\n\
                 \module M where\n\
@@ -149,13 +131,11 @@ spec = describe "HsExt — Deriving extensions" $ do
                 \data T = T\n\
                 \  deriving anyclass (FromJSON)\n\
                 \main = pure ()\n"
-            shouldParse r
 
     describe "DeriveLift" $ do
-        it "DeriveLift: data T = T deriving Lift" $ do
-            r <- parseModule
+        it "DeriveLift: data T = T deriving Lift" $
+            assertParses
                 "{-# LANGUAGE DeriveLift #-}\n\
                 \module M where\n\
                 \data T = T deriving Lift\n\
                 \main = pure ()\n"
-            shouldParse r
