@@ -1,17 +1,6 @@
--- | Parser conformance tests for GHC type-class extensions.
---
--- Coverage: MultiParamTypeClasses, FunctionalDependencies,
--- FlexibleInstances, FlexibleContexts, InstanceSigs, ConstraintKinds,
--- UndecidableInstances.
---
--- Each fixture is a tiny module loaded via 'loadProgramFromSource' so
--- the parser exercises the real declaration-level path.  Only the
--- /parse/ step needs to succeed: any subsequent elaboration error
--- (missing types, undefined references, etc.) is acceptable provided
--- it is not a 'ParseError'.  Project notes flag FunctionalDependencies
--- and InstanceSigs as unsupported; those tests use 'pendingWith' so
--- they show up in hspec output and graduate cleanly when the parser
--- learns them.
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 module HsExtClasses (spec) where
 
 import Control.Exception (SomeException, fromException, try)
@@ -22,35 +11,43 @@ import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
 
-parseModule :: ByteString -> IO (Either SomeException ())
-parseModule bs = try $ do
-    _ <- loadProgramFromSource [] (mkSource "<test>" bs)
-    pure ()
+data ParseOutcome
+    = ParseAccepted
+    | ParseAcceptedWithDownstream !SomeException
+    | ParseRejected !ParseError
 
--- | Pass criterion for declaration-level fixtures: the parse phase
--- finished without a 'ParseError'.  Any other exception (elaboration
--- failure on a stub program, missing class instance, …) means the
--- parser already accepted the input and is reporting a downstream
--- problem — that is success for a pure parser test.
-parsedOk :: Either SomeException () -> Bool
-parsedOk (Right _) = True
-parsedOk (Left e)  = case fromException e :: Maybe ParseError of
-    Just _  -> False
-    Nothing -> True
+parseModule :: ByteString -> IO ParseOutcome
+parseModule bs = do
+    r <- try (loadProgramFromSource [] (mkSource "<test>" bs))
+    pure $ case r of
+        Right _ -> ParseAccepted
+        Left e  -> case fromException e :: Maybe ParseError of
+            Just pe -> ParseRejected pe
+            Nothing -> ParseAcceptedWithDownstream e
 
-expectParse :: ByteString -> Expectation
-expectParse bs = do
+shouldParse :: ByteString -> Expectation
+shouldParse bs = do
     r <- parseModule bs
-    if parsedOk r
-        then pure ()
-        else expectationFailure ("expected parser acceptance, got " <> show r)
+    case r of
+        ParseAccepted                 -> pure ()
+        ParseAcceptedWithDownstream _ -> pure ()
+        ParseRejected pe              -> expectationFailure
+            ("expected parser acceptance on fixture, got ParseError: " <> show pe)
+
+shouldParseOrPending :: String -> ByteString -> Expectation
+shouldParseOrPending reason bs = do
+    r <- parseModule bs
+    case r of
+        ParseAccepted                 -> pure ()
+        ParseAcceptedWithDownstream _ -> pure ()
+        ParseRejected _               -> pendingWith reason
 
 spec :: Spec
 spec = describe "HsExt — Type-class extensions" $ do
 
     describe "MultiParamTypeClasses" $ do
         it "MultiParamTypeClasses: class with two parameters" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "module M where\n"
                 , "class C a b where\n"
@@ -58,7 +55,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "MultiParamTypeClasses: class with three parameters" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "module M where\n"
                 , "class C a b c where\n"
@@ -66,7 +63,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "MultiParamTypeClasses: instance for two-parameter class" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FlexibleInstances #-}\n"
                 , "module M where\n"
@@ -77,20 +74,17 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
     describe "FunctionalDependencies" $ do
-        it "FunctionalDependencies: single fundep `a -> b`" $ do
-            r <- parseModule $ mconcat
+        it "FunctionalDependencies: single fundep `a -> b`" $
+            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
                 , "class C a b | a -> b where\n"
                 , "  m :: a -> b\n"
                 ]
-            if parsedOk r
-                then pure ()
-                else pendingWith "needs LANGUAGE FunctionalDependencies support"
 
-        it "FunctionalDependencies: multi fundeps `a -> b, b -> a`" $ do
-            r <- parseModule $ mconcat
+        it "FunctionalDependencies: multi fundeps `a -> b, b -> a`" $
+            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
@@ -98,25 +92,19 @@ spec = describe "HsExt — Type-class extensions" $ do
                 , "  m :: a -> b\n"
                 , "  n :: b -> a\n"
                 ]
-            if parsedOk r
-                then pure ()
-                else pendingWith "needs LANGUAGE FunctionalDependencies support"
 
-        it "FunctionalDependencies: multi-LHS fundep `a b -> c`" $ do
-            r <- parseModule $ mconcat
+        it "FunctionalDependencies: multi-LHS fundep `a b -> c`" $
+            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
                 , "class C a b c | a b -> c where\n"
                 , "  m :: a -> b -> c\n"
                 ]
-            if parsedOk r
-                then pure ()
-                else pendingWith "needs LANGUAGE FunctionalDependencies support"
 
     describe "FlexibleInstances" $ do
         it "FlexibleInstances: instance C [Int]" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleInstances #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -126,7 +114,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FlexibleInstances: instance C (a, [b])" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleInstances #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -136,7 +124,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FlexibleInstances: nested type ctor instance" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleInstances #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -147,7 +135,7 @@ spec = describe "HsExt — Type-class extensions" $ do
 
     describe "FlexibleContexts" $ do
         it "FlexibleContexts: signature with `Show [a] =>`" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleContexts #-}\n"
                 , "module M where\n"
                 , "f :: Show [a] => [a] -> String\n"
@@ -155,7 +143,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FlexibleContexts: signature with `Eq (M a) =>`" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleContexts #-}\n"
                 , "module M where\n"
                 , "data M a = M a\n"
@@ -164,7 +152,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FlexibleContexts: multi-context with non-tyvar heads" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE FlexibleContexts #-}\n"
                 , "module M where\n"
                 , "h :: (Show [a], Eq [a]) => [a] -> String\n"
@@ -172,8 +160,8 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
     describe "InstanceSigs" $ do
-        it "InstanceSigs: method signature inside instance body" $ do
-            r <- parseModule $ mconcat
+        it "InstanceSigs: method signature inside instance body" $
+            shouldParseOrPending "needs LANGUAGE InstanceSigs support" $ mconcat
                 [ "{-# LANGUAGE InstanceSigs #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -183,12 +171,9 @@ spec = describe "HsExt — Type-class extensions" $ do
                 , "  m :: T -> T\n"
                 , "  m x = x\n"
                 ]
-            if parsedOk r
-                then pure ()
-                else pendingWith "needs LANGUAGE InstanceSigs support"
 
-        it "InstanceSigs: contextful method signature inside instance" $ do
-            r <- parseModule $ mconcat
+        it "InstanceSigs: contextful method signature inside instance" $
+            shouldParseOrPending "needs LANGUAGE InstanceSigs support" $ mconcat
                 [ "{-# LANGUAGE InstanceSigs #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -197,20 +182,17 @@ spec = describe "HsExt — Type-class extensions" $ do
                 , "  m :: [Int] -> String\n"
                 , "  m _ = \"x\"\n"
                 ]
-            if parsedOk r
-                then pure ()
-                else pendingWith "needs LANGUAGE InstanceSigs support"
 
     describe "ConstraintKinds" $ do
         it "ConstraintKinds: type alias for a constraint tuple" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE ConstraintKinds #-}\n"
                 , "module M where\n"
                 , "type Foo a = (Eq a, Show a)\n"
                 ]
 
         it "ConstraintKinds: signature uses constraint synonym" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE ConstraintKinds #-}\n"
                 , "module M where\n"
                 , "type Foo a = (Eq a, Show a)\n"
@@ -219,7 +201,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "ConstraintKinds: single-class synonym" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE ConstraintKinds #-}\n"
                 , "module M where\n"
                 , "type Stringy a = Show a\n"
@@ -229,7 +211,7 @@ spec = describe "HsExt — Type-class extensions" $ do
 
     describe "UndecidableInstances" $ do
         it "UndecidableInstances: pragma is accepted on a class/instance pair" $
-            expectParse $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE UndecidableInstances #-}\n"
                 , "{-# LANGUAGE FlexibleInstances #-}\n"
                 , "module M where\n"
