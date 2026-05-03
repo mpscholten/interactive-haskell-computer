@@ -279,15 +279,11 @@ builtins reg =
     , ("/",        binOpFloat (/))
     , ("mod",      binOpInt mod)
     , ("div",      binOpInt div)
-    , ("negate",   unaryOpNum negate negate)
     , ("abs",      unaryOpNum abs abs)
     , ("signum",   unaryOpNum signum signum)
-    , ("succ",     unaryOpNum (+1) (+1))
-    , ("pred",     unaryOpNum (subtract 1) (subtract 1))
     , ("min",      minDispatch reg)
     , ("max",      maxDispatch reg)
     , ("gcd",      binOpInt gcd)
-    , ("subtract", binOpNum (\a b -> b - a) (\a b -> b - a))
     , ("sqrt",     unaryOpFloat sqrt)
     , ("floor",    floatToIntB floor)
     , ("ceiling",  floatToIntB ceiling)
@@ -297,7 +293,6 @@ builtins reg =
     , ("fromInteger",  fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
-    , (".",        compose)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
@@ -315,7 +310,6 @@ builtins reg =
     , ("&&",       andB)
     , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
-    , ("++",       listConcat)
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
     , ("length",   lengthB)
@@ -410,9 +404,6 @@ builtins reg =
     , ("<*>",      apDispatch reg)
     , ("GHC.Internal.Base.<*>", apDispatch reg)
     , ("Prelude.<*>", apDispatch reg)
-    , ("$",        dollarB)
-    , ("GHC.Internal.Base.$", dollarB)
-    , ("Prelude.$", dollarB)
     , ("join",     joinB)
     , ("void",     voidB)
     , ("Control.Monad.void", voidB)
@@ -468,7 +459,6 @@ builtins reg =
     , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
-    , ("$!",          dollarBangB)
     , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
@@ -1257,17 +1247,6 @@ floatToIntB op = pure $ VFun $ \a -> do
         VInt n   -> pure (VInt n)
         _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
 
--- | @(.) :: (b -> c) -> (a -> b) -> a -> c@. Built as a three-arg
--- curried 'VFun'. @f@ and @g@ are held as thunks; @x@ is passed to @g@,
--- whose result is forced and handed to @f@.
-compose :: IO Val
-compose = pure $ VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
-    fv <- force fT
-    gv <- force gT
-    gx <- apply gv xT
-    gxT <- newWHNFThunk gx
-    apply fv gxT
-
 -- cmpInt removed in Phase 2.3 — replaced by eqDispatch/ordDispatch
 
 -- | Boolean-returning version of a comparison: returns VCon "True" or "False".
@@ -1910,36 +1889,6 @@ isUnboxedTupleConName bs = case BC.unpack bs of
               && all (\c -> c == ',' || c == '#') inner
     _ -> False
 
--- | @xs ++ ys@ as a list concat. For VStr+VStr the fast path uses
--- ByteString concat. For cons-lists we walk the spine of @xs@,
--- forcing each cons (but NOT the head elements), and reuse the
--- original @ys@ thunk as the final tail — so elements stay lazy.
-listConcat :: IO Val
-listConcat = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    case av of
-        VStr x -> do
-            bv <- force b
-            case bv of
-                VStr y -> pure (VStr (x <> y))
-                _ -> do
-                    -- VStr ++ [Char]: promote and chain.
-                    listV <- stringToListValIO (BC.unpack x)
-                    appendVal listV b
-        _ -> appendVal av b
-  where
-    appendVal :: Val -> Thunk -> IO Val
-    appendVal (VCon "[]" _)     bT = force bT
-    appendVal (VCon ":" [h, t]) bT = do
-        -- Force the tail's spine lazily on demand: we create a WHNF
-        -- thunk whose value is the recursive append on the next cons.
-        tv    <- force t
-        rv    <- appendVal tv bT
-        restT <- newWHNFThunk rv
-        pure (VCon ":" [h, restT])
-    appendVal other _ =
-        error ("(++): not a list: " <> showValForDebug other)
-
 -- | @concatMap :: (a -> [b]) -> [a] -> [b]@ — builtin so that our
 -- list-comprehension desugar ('IHC.Parser.parseListComp') and the
 -- @Monad []@ instance body in @GHC.Internal.Base@ ('>>=' via the
@@ -2558,11 +2507,6 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                 ( "<*>: no Applicative instance registered for type `"
                   <> BC.unpack (typeTagOf fv) <> "`" )
 
-dollarB :: IO Val
-dollarB = pure $ VFun $ \ft -> pure $ VFun $ \xt -> do
-    fv <- force ft
-    apply fv xt
-
 -- | @join mm = do { m <- mm; m }@.
 joinB :: IO Val
 joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
@@ -2932,15 +2876,6 @@ seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | @assert cond x = x@.  Like GHC's default (assertions ignored) behaviour.
 assertB :: IO Val
 assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force x
-
--- | @f $! x@: force @x@, then apply @f@ to the (now-evaluated) thunk.
--- Returns a 1-arg remainder (curried).
-dollarBangB :: IO Val
-dollarBangB = pure $ VFun $ \f -> pure $ VFun $ \x -> do
-    xv <- force x
-    xT <- newWHNFThunk xv
-    fv <- force f
-    apply fv xT
 
 -- | @exitWith code@: throws 'ExitCode'. Wrapped in VIO so it's delayed.
 exitWithB :: IO Val

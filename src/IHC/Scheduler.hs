@@ -102,7 +102,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import qualified IHC.TypeAST
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -3172,6 +3172,14 @@ buildClassMethodEnv classReg existing loadedModules = do
     let allMethodNames = Set.fromList
             [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
+    -- Mirror as method→class so the env-fallback can lazily synthesise
+    -- a dispatcher when a class method is referenced before its
+    -- declaring class has been pulled into the env.
+    let methodClassPairs =
+            [ (m, [cls]) | ClassDecl cls ms _ _ <- decls, m <- ms ]
+    modifyIORef' globalMethodClassRef
+        (Map.unionWith (\a b -> a ++ filter (`notElem` a) b)
+                       (Map.fromListWith (++) methodClassPairs))
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
@@ -4272,6 +4280,7 @@ resetPerRunGlobals = do
     writeIORef globalTypeSigsRef      Map.empty
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
+    writeIORef globalMethodClassRef   Map.empty
     clearInstanceScope
     clearSuperclasses
     clearCtorStrictness
@@ -4636,6 +4645,20 @@ resolveFallback mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
+                                     -- Class-method dispatcher fallback: when
+                                     -- @bareName@ is a method of a class that
+                                     -- has been scanned (e.g. @Num@'s @abs@),
+                                     -- synthesise a 'classMethodDispatcher' on
+                                     -- the spot. This is the same slot that
+                                     -- 'buildClassMethodEnv' would have built
+                                     -- at startup, but we need it on demand
+                                     -- when the user's reference precedes the
+                                     -- buildClassMethodEnv pass that would
+                                     -- have placed it in the env.
+                                     mMethod <- tryClassMethodFromRegistry bareName
+                                     case mMethod of
+                                      Just slot -> pure (Just slot)
+                                      Nothing -> do
                                         searchPath <- readIORef globalSearchPathRef
                                         includeMap <- readIORef globalIncludeMapRef
                                         transientReg <- newIORef (Map.map Loaded mods)
@@ -4681,6 +4704,30 @@ resolveFallback mOwner name = do
     -- 'findOrResolveLhs' (cheap source scan) and only commit to
     -- discovery on a match.
     tryAnyModuleBareSlot mods bareName = bareSlotIn mods (Map.toList mods) bareName
+
+    -- | When @bareName@ is a class method whose declaring class has
+    -- already been scanned (registered in 'globalMethodClassRef' by
+    -- 'buildClassMethodEnv'), synthesise a fresh
+    -- 'classMethodDispatcher' for it and wrap as a thunk. Mirrors what
+    -- 'buildClassMethodEnv' does at startup, but on demand — needed
+    -- when the user's reference fires before the class entered the env
+    -- (e.g. an entry program with no explicit imports referencing
+    -- @abs@: 'Num' may not be in 'loadedModules' at the original
+    -- 'buildClassMethodEnv' pass).  Returns the first class's
+    -- dispatcher; @classMethodDispatcher@'s own runtime probing covers
+    -- the multi-class-overload case via tag-driven lookup.
+    tryClassMethodFromRegistry bareName = do
+        m <- readIORef globalMethodClassRef
+        case Map.lookup bareName m of
+            Just (cls : _) -> do
+                mReg <- readIORef sharedClassRegRef
+                case mReg of
+                    Just reg -> do
+                        let v = classMethodDispatcher reg cls bareName
+                        slot <- newWHNFThunk v
+                        pure (Just slot)
+                    Nothing -> pure Nothing
+            _ -> pure Nothing
 
     -- | Scoped variant: walk only modules that the @owner@ actually
     -- imports unqualified (or has in scope via implicit Prelude), plus
