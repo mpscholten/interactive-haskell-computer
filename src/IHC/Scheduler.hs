@@ -2863,13 +2863,44 @@ classMethodDispatcher reg cls methodName = selfVal
                                                            <> BC.unpack cls
                                                            <> "` for type `" <> BC.unpack tag
                                                            <> "` (method `" <> BC.unpack methodName <> "`)" )
-                else do
-                    -- Non-dispatchable (function / unit / primitive
-                    -- object): stash and wait for the next arg so the
-                    -- dispatcher can look at a dispatchable argument
-                    -- later in the application chain.
-                    let v = dispatch (remaining - 1) (argT : accArgs)
-                    pure v
+                else if isUnaryResultPolymorphicMethod cls methodName
+                    then do
+                        -- Arity-1 methods like @Applicative.pure@ /
+                        -- @Monad.return@ wrap a value into a monadic
+                        -- action; the only arg they ever see IS this
+                        -- value.  Walking past it (waiting for a
+                        -- dispatchable arg that will never arrive) leaves
+                        -- the bind chain holding a half-resolved
+                        -- dispatcher 'VFun' and silently drops the
+                        -- continuation result — observed as warp's
+                        -- @waitForZero@ returning a stuck function
+                        -- instead of @()@.  Fire result-polymorphic
+                        -- now so the call resolves to a real instance
+                        -- (e.g. @IO@ / @STM@) and the bind keeps
+                        -- chaining proper actions.
+                        mResult <- resultPolymorphicMethod
+                        case mResult of
+                            Just resultVal ->
+                                applyAll resultVal (reverse (argT : accArgs))
+                            Nothing -> do
+                                mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                case preferMethod mDef0 mDefShared of
+                                    Just defVal | not (isMethodPlaceholder defVal) ->
+                                        applyAll defVal (reverse (argT : accArgs))
+                                    _ -> error
+                                        ( "class-method dispatch: arity-1 `"
+                                         <> BC.unpack cls <> "." <> BC.unpack methodName
+                                         <> "` got non-dispatchable arg of tag `"
+                                         <> BC.unpack tag
+                                         <> "` and no result-polymorphic / default instance" )
+                    else do
+                        -- Non-dispatchable (function / primitive object):
+                        -- stash and wait for the next arg so the dispatcher
+                        -- can look at a dispatchable argument later in the
+                        -- application chain.
+                        let v = dispatch (remaining - 1) (argT : accArgs)
+                        pure v
 
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
@@ -2933,16 +2964,45 @@ classMethodDispatcher reg cls methodName = selfVal
         -- result-polymorphic fallback gets a chance to fire, route
         -- to ParsecT — that instance defines '*>' / '<*' / '<*>' /
         -- 'fmap' / '>>=' explicitly.
+        --
+        -- IO / STM are tried BEFORE ParsecT for @pure@ / @return@
+        -- specifically: warp's @waitForZero@ does
+        -- @atomically $ do { x <- readTVar v; when (x > 0) retry }@,
+        -- whose @when False retry@ tail evaluates to @pure ()@ in STM
+        -- context.  Our STM≈IO bridge means the IO instance produces a
+        -- properly-shaped @VCon "IO" [_]@ that 'runIOVal' can unwrap;
+        -- the ParsecT instance returns a parser closure 'VFun' that
+        -- the IO bind chain can't handle (the warp_hello hang we hit
+        -- on 2026-05-03).  Parser code uses elaborated
+        -- 'ETypedMethod' nodes for explicit type annotations, so the
+        -- result-polymorphic fallback only fires when no annotation
+        -- exists — at which point IO is the safer default.
         | clsName == BC.pack "Applicative"
-        , method `elem` map BC.pack ["*>", "<*", "<*>", "liftA2", "pure"]
+        , method `elem` map BC.pack ["pure"]
+        = [BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
+        | clsName == BC.pack "Applicative"
+        , method `elem` map BC.pack ["*>", "<*", "<*>", "liftA2"]
         = [BC.pack "ParsecT"]
         | clsName == BC.pack "Functor"
         , method `elem` map BC.pack ["fmap", "<$"]
         = [BC.pack "ParsecT"]
         | clsName == BC.pack "Monad"
-        , method `elem` map BC.pack [">>=", ">>", "return"]
+        , method `elem` map BC.pack ["return"]
+        = [BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
+        | clsName == BC.pack "Monad"
+        , method `elem` map BC.pack [">>=", ">>"]
         = [BC.pack "ParsecT"]
         | otherwise = []
+
+    -- | Methods whose first (and only) value-arg drives 'pure'-like
+    -- semantics: when that arg is non-dispatchable, the dispatcher
+    -- must NOT walk past it (no further arg ever comes).  Fire
+    -- result-polymorphic immediately instead.  See the `else if`
+    -- branch in 'dispatch'.
+    isUnaryResultPolymorphicMethod :: ByteString -> ByteString -> Bool
+    isUnaryResultPolymorphicMethod c m =
+        (c == BC.pack "Applicative" && m == BC.pack "pure")
+     || (c == BC.pack "Monad"       && m == BC.pack "return")
 
     specialClassApplication tag av argT accArgs
         | cls == BC.pack "IsString"
