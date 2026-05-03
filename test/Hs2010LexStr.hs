@@ -2,22 +2,25 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Haskell 2010 §1.6-1.7 — character and string literal parser
--- conformance tests.  Mirrors the audit pattern in 'ParserBugs':
--- supported features assert @Right _@ from 'lexOne' or 'parseExpr';
--- known parser gaps use 'pendingWith'.  Also pins the codepoint
--- boundary from ParserBugs Bug 1 (\\1114111 accepted, \\1114112
--- rejected with 'ParseError') so it shows up under the taxonomy.
+-- conformance tests.  Lexer-level checks assert exact 'TokenKind'
+-- via 'lexOne'; parser-level checks route through 'parseExprAtEof'
+-- (so trailing tokens are an error, not a silent skip) and assert
+-- exact AST equality where the shape is short, falling back to
+-- 'shouldParse' for verbose strings.  Known parser gaps use
+-- 'pendingWith'.  Also pins the codepoint boundary from ParserBugs
+-- Bug 1 (\\1114111 accepted, \\1114112 rejected with 'ParseError').
 module Hs2010LexStr (spec) where
 
 import Control.Exception (SomeException, evaluate, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
+import IHC.AST
 import IHC.Lexer (Token(..), TokenKind(..), nextToken, startCursor)
 import IHC.Parser
     ( ParseError
     , defaultFixityTable
-    , parseExprOnly
+    , parseExprAtEof
     )
 import IHC.Source (Source, mkSource)
 
@@ -27,10 +30,8 @@ mkSrc = mkSource "<test>"
 lexOne :: ByteString -> IO (Either SomeException TokenKind)
 lexOne bs = try (evaluate (tkKind (fst (nextToken (mkSrc bs) startCursor))))
 
-parseExpr :: ByteString -> IO (Either SomeException ())
-parseExpr bs = try $ do
-    _ <- parseExprOnly (mkSrc bs) defaultFixityTable
-    pure ()
+parseExpr :: ByteString -> IO (Either SomeException Expr)
+parseExpr bs = try (parseExprAtEof (mkSrc bs) defaultFixityTable)
 
 isParseError :: SomeException -> Bool
 isParseError e = case fromException e of
@@ -45,13 +46,21 @@ expectChar c r = case r of
     Left e -> expectationFailure
         ("lexer crashed: " <> show e)
 
-expectStringParse :: ByteString -> Expectation
-expectStringParse bs = do
+shouldParse :: ByteString -> Expectation
+shouldParse bs = do
     r <- parseExpr bs
     case r of
         Right _ -> pure ()
         Left e  -> expectationFailure
-            ("expected successful parse of " <> show bs <> ", got " <> show e)
+            ("expected parse success on " <> show bs <> ", got " <> show e)
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- parseExpr bs
+    case r of
+        Right got -> got `shouldBe` expected
+        Left e    -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
 
 spec :: Spec
 spec = describe "Hs2010 — Lexical char & string literals" $ do
@@ -133,26 +142,29 @@ spec = describe "Hs2010 — Lexical char & string literals" $ do
             expectChar ' ' r
 
     describe "1.7 string literals" $ do
-        it "1.7.1 plain string \"hi\"" $
-            expectStringParse "\"hi\""
+        it "1.7.1 plain string \"hi\" (parser desugars to cons-list of chars)" $
+            "\"hi\"" `shouldParseTo`
+                EApp (EApp (EVar ":") (ELit (LChar 'h')))
+                     (EApp (EApp (EVar ":") (ELit (LChar 'i'))) (EVar "[]"))
 
-        it "1.7.2 empty string \"\"" $
-            expectStringParse "\"\""
+        it "1.7.2 empty string \"\" (parser desugars to nil)" $
+            "\"\"" `shouldParseTo` EVar "[]"
 
         it "1.7.3 string with escape \"a\\nb\"" $
-            expectStringParse "\"a\\nb\""
+            shouldParse "\"a\\nb\""
 
         it "1.7.4 embedded single quote \"it's\"" $
-            expectStringParse "\"it's\""
+            shouldParse "\"it's\""
 
         it "1.7.5 escaped double quote \"\\\"\"" $
-            expectStringParse "\"\\\"\""
+            "\"\\\"\"" `shouldParseTo`
+                EApp (EApp (EVar ":") (ELit (LChar '"'))) (EVar "[]")
 
         it "1.7.6 string gap \"a\\  \\b\"" $
-            expectStringParse "\"a\\  \\b\""
+            shouldParse "\"a\\  \\b\""
 
         it "1.7.7 null escape \\& separator \"\\137\\&9\"" $
-            expectStringParse "\"\\137\\&9\""
+            shouldParse "\"\\137\\&9\""
 
     describe "char escape codepoint boundary (ParserBugs Bug 1 mirror)" $ do
         it "accepts '\\1114111' (max valid Unicode codepoint)" $ do
