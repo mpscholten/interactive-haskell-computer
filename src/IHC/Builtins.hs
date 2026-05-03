@@ -3666,32 +3666,38 @@ peekFullAddrInfoVal p = do
     peekAddrInfoVal p flags family socktype protocol
 
 -- | @getAddrInfo :: Maybe AddrInfo -> Maybe HostName -> Maybe ServiceName
--- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@; ignores
--- the @hints@ argument for now (passes NULL) — warp/streaming-commons
--- pass hints with @addrFlags=[AI_PASSIVE], addrSocketType=Stream@ which
--- the OS uses to filter, but for the warp-listen case the default
--- result list is already TCP-stream-suitable.  Walks the linked list
--- via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64 layout) and
--- materialises each entry as a 'VCon "AddrInfo"' before
+-- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@.  Parses
+-- the @hints@ argument and passes through the OS-relevant fields
+-- (addrFlags, addrFamily, addrSocketType, addrProtocol).  Walks the
+-- linked list via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64
+-- layout) and materialises each entry as a 'VCon "AddrInfo"' before
 -- @freeaddrinfo@-ing the chain.
+--
+-- Without parsing hints, warp's @bindPortGenEx@ would receive a
+-- mixed UDP+TCP result list, and the first @setSocketOption sock
+-- NoDelay 1@ on the UDP entry would throw EINVAL.  The exception
+-- is caught by @tryAddrs@ and the next addr (TCP) used, but the
+-- per-attempt churn is wasted work.
 getAddrInfoB :: IO Val
-getAddrInfoB = pure $ VFun $ \_hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
+getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
+    hintsV <- force hintsT
     hostV <- force hostT
     serviceV <- force serviceT
     withMaybeCString hostV $ \hostP ->
         withMaybeCString serviceV $ \serviceP ->
-            alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
-                rc <- c_getaddrinfo_host hostP serviceP nullPtr resPP
-                if rc /= 0
-                    then ioError (userError ("getaddrinfo: returned " ++ show rc))
-                    else do
-                        firstP <- peek resPP
-                        if firstP == nullPtr
-                            then pure (VCon "[]" [])
-                            else do
-                                lst <- walkAddrInfo firstP
-                                c_freeaddrinfo_host firstP
-                                pure lst
+            withHintsPtr hintsV $ \hintsP ->
+                alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
+                    rc <- c_getaddrinfo_host hostP serviceP hintsP resPP
+                    if rc /= 0
+                        then ioError (userError ("getaddrinfo: returned " ++ show rc))
+                        else do
+                            firstP <- peek resPP
+                            if firstP == nullPtr
+                                then pure (VCon "[]" [])
+                                else do
+                                    lst <- walkAddrInfo firstP
+                                    c_freeaddrinfo_host firstP
+                                    pure lst
   where
     walkAddrInfo :: Ptr Word8 -> IO Val
     walkAddrInfo p = do
@@ -3713,6 +3719,80 @@ getAddrInfoB = pure $ VFun $ \_hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \
             s <- valToString inner
             withCString s (action . castPtr)
         other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
+
+    -- Build a host @struct addrinfo@ from a @Maybe AddrInfo@ Val and
+    -- pass its pointer to the action.  Without this, @c_getaddrinfo@
+    -- gets a NULL hints pointer and returns ALL socket types — warp
+    -- requests Stream-only, but we'd hand back UDP entries too, then
+    -- @setSocketOption sock TCP_NODELAY@ on the UDP socket fails with
+    -- EINVAL.  The first 4 fields (flags, family, socktype, protocol)
+    -- are 4-byte ints; the rest can be zero-filled because
+    -- getaddrinfo only reads the first four when given hints.
+    withHintsPtr :: Val -> (Ptr Word8 -> IO a) -> IO a
+    withHintsPtr v action = case v of
+        VCon "Nothing" [] -> action nullPtr
+        VCon "Just" [innerT] -> do
+            inner <- force innerT
+            (flags, family, socktype, protocol) <- extractHintsFields inner
+            allocaBytes 48 $ \p -> do
+                fillBytes p 0 48
+                pokeByteOff (castPtr p :: Ptr Word32) 0  flags
+                pokeByteOff (castPtr p :: Ptr Word32) 4  family
+                pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
+                pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
+                action p
+        _ -> action nullPtr
+
+    -- Extract (flags, family, socktype, protocol) from an AddrInfo
+    -- record value.  Pattern: VCon "AddrInfo" [flagsT, familyT,
+    -- socktypeT, protocolT, addressT, canonNameT].  The flags field is
+    -- a list of constructors like @[AI_PASSIVE]@ that we OR-fold; the
+    -- family / socktype / protocol fields are single-field VCons
+    -- wrapping @CInt@ codes.
+    extractHintsFields :: Val -> IO (Word32, Word32, Word32, Word32)
+    extractHintsFields val = case val of
+        VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
+            flagsV    <- force flagsT
+            familyV   <- force familyT
+            socktypeV <- force socktypeT
+            protocolV <- force protocolT
+            flags    <- foldFlagBits flagsV
+            family   <- conIntField "addrFamily" familyV
+            socktype <- conIntField "addrSocketType" socktypeV
+            protocol <- conIntField "addrProtocol" protocolV
+            pure (flags, family, socktype, protocol)
+        _ -> pure (0, 0, 0, 0)
+
+    -- @[AI_FOO, AI_BAR]@ → bitwise-or of named flag values.
+    foldFlagBits :: Val -> IO Word32
+    foldFlagBits = go 0
+      where
+        go !acc v = case v of
+            VCon "[]" []        -> pure acc
+            VCon ":" [hT, tT]   -> do
+                hV <- force hT
+                tV <- force tT
+                let bit = case hV of
+                        VCon "AI_ADDRCONFIG" _ -> 1024
+                        VCon "AI_ALL" _        -> 256
+                        VCon "AI_CANONNAME" _  -> 2
+                        VCon "AI_NUMERICHOST" _ -> 4
+                        VCon "AI_NUMERICSERV" _ -> 4096
+                        VCon "AI_PASSIVE" _    -> 1
+                        VCon "AI_V4MAPPED" _   -> 2048
+                        _                       -> 0
+                go (acc .|. bit) tV
+            _ -> pure acc
+
+    conIntField :: String -> Val -> IO Word32
+    conIntField name v = case v of
+        VCon _ [innerT] -> do
+            inner <- force innerT
+            case inner of
+                VInt n -> pure (fromIntegral n)
+                _      -> error (name <> ": inner not VInt: " <> showValForDebug inner)
+        VInt n          -> pure (fromIntegral n)
+        _ -> error (name <> ": not a single-field VCon or VInt: " <> showValForDebug v)
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -5837,39 +5917,33 @@ newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
 readTVarB :: IO Val
 readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
     tvv <- force tvT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> atomically (readTVar tv)
-        _ -> error ("readTVar: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "readTVar" tvv
+    atomically (readTVar tv)
 
 writeTVarB :: IO Val
 writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
     tvv <- force tvT
     av  <- force aT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> do
-            atomically (writeTVar tv av)
-            pure VUnit
-        _ -> error ("writeTVar: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "writeTVar" tvv
+    atomically (writeTVar tv av)
+    pure VUnit
 
 modifyTVar'B :: IO Val
 modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
     tvv <- force tvT
     fv  <- force fT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> do
-            cur  <- atomically (readTVar tv)
-            curT <- newWHNFThunk cur
-            new  <- apply fv curT
-            atomically (writeTVar tv new)
-            pure VUnit
-        _ -> error ("modifyTVar': not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "modifyTVar'" tvv
+    cur  <- atomically (readTVar tv)
+    curT <- newWHNFThunk cur
+    new  <- apply fv curT
+    atomically (writeTVar tv new)
+    pure VUnit
 
 readTVarIOB :: IO Val
 readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
     tvv <- force tvT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> readTVarIO tv
-        _ -> error ("readTVarIO: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "readTVarIO" tvv
+    readTVarIO tv
 
 --------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
@@ -6053,6 +6127,11 @@ extractExceptionMessage val = case val of
         tryValToString msgT (BC.pack "ErrorCall")
     VCon "ErrorCallWithLocation" (msgT : _) ->
         tryValToString msgT (BC.pack "ErrorCallWithLocation")
+    -- IOError record: ioe_handle, ioe_type, ioe_location, ioe_description, ioe_errno, ioe_filename
+    VCon "IOError" [_handleT, _typeT, locT, descT, _errnoT, _fileT] -> do
+        loc <- tryValToString locT (BC.pack "")
+        desc <- tryValToString descT (BC.pack "")
+        pure (BC.pack "IOError: " <> loc <> BC.pack ": " <> desc)
     VCon n _ -> pure n
     _        -> pure (BC.pack (showValForDebug val))
   where
