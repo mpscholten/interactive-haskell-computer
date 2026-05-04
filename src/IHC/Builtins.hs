@@ -2657,15 +2657,19 @@ secondFnB = pure $ VFun $ \gT -> pure $ VFun $ \tupT -> do
 
 newIORefB :: IO Val
 newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    v  <- force a
-    rf <- newIORef v
+    -- Store the THUNK directly so error-throwing initialisers
+    -- (e.g. warp's @newIORef $ error "keepAliveRef not filled"@) are
+    -- only evaluated on read.
+    rf <- newIORef a
     pure (VPrimObj (PrimIORef rf))
 
 readIORefB :: IO Val
 readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
     case av of
-        VPrimObj (PrimIORef rf) -> readIORef rf
+        VPrimObj (PrimIORef rf) -> do
+            t <- readIORef rf
+            force t
         _ -> error ("readIORef: not an IORef: " <> showValForDebug av)
 
 writeIORefB :: IO Val
@@ -2673,8 +2677,8 @@ writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a
     case av of
         VPrimObj (PrimIORef rf) -> do
-            bv <- force b
-            writeIORef rf bv
+            -- Install the thunk directly; readers force on demand.
+            writeIORef rf b
             pure VUnit
         _ -> error ("writeIORef: not an IORef: " <> showValForDebug av)
 
@@ -2687,10 +2691,10 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
     case av of
         VPrimObj (PrimIORef rf) -> do
             fv <- force f
-            cur <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             new <- apply fv curT
-            writeIORef rf new
+            newT <- newWHNFThunk new
+            writeIORef rf newT
             pure VUnit
         _ -> error ("modifyIORef: not an IORef: " <> showValForDebug av)
 
@@ -2704,14 +2708,12 @@ atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
     case av of
         VPrimObj (PrimIORef rf) -> do
             fv <- force f
-            cur <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             pair <- apply fv curT >>= runIOVal
             case pair of
                 VCon _ [newT, resultT] -> do
-                    new <- force newT
                     result <- force resultT
-                    writeIORef rf new
+                    writeIORef rf newT
                     pure result
                 _ -> error ("atomicModifyIORef': function did not return a pair: "
                             <> showValForDebug pair)
@@ -2743,8 +2745,7 @@ mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $
 -- source-loaded callers (GHC.STRef.newSTRef) can case-match on the result.
 newMutVarB :: IO Val
 newMutVarB = pure $ VFun $ \initThunk -> pure $ VFun $ \_st -> do
-    v  <- force initThunk
-    rf <- newIORef v
+    rf <- newIORef initThunk
     stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
     refT <- newWHNFThunk (VPrimObj (PrimIORef rf))
     pure (VCon "(#,#)" [stT, refT])
@@ -2756,9 +2757,8 @@ readMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_st -> do
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            v   <- readIORef rf
+            vT  <- readIORef rf
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
-            vT  <- newWHNFThunk v
             pure (VCon "(#,#)" [stT, vT])
         _ -> error ("readMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2770,8 +2770,7 @@ writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            v <- force valThunk
-            writeIORef rf v
+            writeIORef rf valThunk
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2783,19 +2782,15 @@ atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            cur  <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             -- f cur returns a (a, b) pair
             res  <- apply fv curT
             resV <- runIOVal res
             case resV of
                 VCon _ [newT, bT] -> do
-                    new <- force newT
-                    b   <- force bT
-                    writeIORef rf new
+                    writeIORef rf newT
                     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
-                    bT' <- newWHNFThunk b
-                    pure (VCon "(#,#)" [stT, bT'])
+                    pure (VCon "(#,#)" [stT, bT])
                 _ -> error ("atomicModifyMutVar#: f did not return a pair: "
                             <> showValForDebug resV)
         _ -> error ("atomicModifyMutVar#: not a MutVar#: " <> showValForDebug mvV)
@@ -2808,21 +2803,15 @@ atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            cur  <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             res  <- apply fv curT
             resV <- runIOVal res
             case resV of
                 VCon _ [newT, bT] -> do
-                    new  <- force newT
-                    b    <- force bT
-                    writeIORef rf new
+                    writeIORef rf newT
                     stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-                    curT' <- newWHNFThunk cur
-                    newT' <- newWHNFThunk new
-                    bT'   <- newWHNFThunk b
-                    pairT <- newWHNFThunk (VCon "(,)" [newT', bT'])
-                    pure (VCon "(#,,#)" [stT, curT', pairT])
+                    pairT <- newWHNFThunk (VCon "(,)" [newT, bT])
+                    pure (VCon "(#,,#)" [stT, curT, pairT])
                 _ -> error ("atomicModifyMutVar2#: f did not return a pair: "
                             <> showValForDebug resV)
         _ -> error ("atomicModifyMutVar2#: not a MutVar#: " <> showValForDebug mvV)
@@ -2836,14 +2825,12 @@ atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            old  <- readIORef rf
-            oldT <- newWHNFThunk old
+            oldT <- readIORef rf
             new  <- apply fv oldT
-            writeIORef rf new
+            newT <- newWHNFThunk new
+            writeIORef rf newT
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-            oldT' <- newWHNFThunk old
-            newT  <- newWHNFThunk new
-            pure (VCon "(#,,#)" [stT, oldT', newT])
+            pure (VCon "(#,,#)" [stT, oldT, newT])
         _ -> error ("atomicModifyMutVar_#: not a MutVar#: " <> showValForDebug mvV)
 
 -- | @atomicSwapMutVar# :: MutVar# s a -> a -> State# s -> (# State# s, a #)@
@@ -2855,11 +2842,9 @@ atomicSwapMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \newThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            old <- readIORef rf
-            new <- force newThunk
-            writeIORef rf new
+            oldT <- readIORef rf
+            writeIORef rf newThunk
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-            oldT <- newWHNFThunk old
             pure (VCon "(#,#)" [stT, oldT])
         _ -> error ("atomicSwapMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2871,13 +2856,11 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            new <- force newThunk
-            writeIORef rf new
+            writeIORef rf newThunk
             -- Return (# s, 0#, new #) — 0# means success
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
             zT   <- newWHNFThunk (VInt 0)
-            newT <- newWHNFThunk new
-            pure (VCon "(#,,#)" [stT, zT, newT])
+            pure (VCon "(#,,#)" [stT, zT, newThunk])
         _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
 mkWeakHashB :: IO Val
@@ -3993,9 +3976,9 @@ socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $
     if fd == -1
         then ioError (userError "Network.Socket.socket")
         else do
-            ref <- newIORef (VInt (fromIntegral fd))
-            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
             fdT <- newWHNFThunk (VInt (fromIntegral fd))
+            ref <- newIORef fdT
+            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
             pure (VCon "Socket" [refT, fdT])
 
 socketSetOptionB :: IO Val
@@ -4055,10 +4038,10 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
                                        ("Network.Socket.accept: errno="
                                         <> show e))
         newFd <- acceptLoop
-        ref <- newIORef (VInt (fromIntegral newFd))
+        fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
+        ref <- newIORef fdValT
         refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-        fdT <- newWHNFThunk (VInt (fromIntegral newFd))
-        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdT])
+        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdValT])
         addrV <- peekSockAddrVal (castPtr addrP)
         addrT <- newWHNFThunk addrV
         pure (VCon "(,)" [sockOutT, addrT])
@@ -4087,7 +4070,7 @@ socketCurrentFdVal :: Val -> IO Val
 socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
     refV <- force refT
     case refV of
-        VPrimObj (PrimIORef rf) -> readIORef rf
+        VPrimObj (PrimIORef rf) -> readIORef rf >>= force
         other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
 socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
 
@@ -4105,7 +4088,9 @@ socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
             refV <- force refT
             case refV of
                 VPrimObj (PrimIORef rf) -> do
-                    oldFdV <- atomicModifyIORef' rf $ \cur -> (VInt (-1), cur)
+                    sentinelT <- newWHNFThunk (VInt (-1))
+                    oldT <- atomicModifyIORef' rf $ \cur -> (sentinelT, cur)
+                    oldFdV <- force oldT
                     case oldFdV of
                         VInt oldFd
                             | oldFd == -1 -> pure VUnit

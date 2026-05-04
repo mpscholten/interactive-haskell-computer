@@ -107,7 +107,15 @@ data Val
 -- user-inspectable — programs pass them through primops only
 -- ('readIORef', 'hClose', …).
 data PrimObj
-    = PrimIORef  !(IORef Val)
+    -- The slot holds a 'Thunk' (not a 'Val') so 'newIORef $ error msg'
+    -- behaves correctly: in real Haskell, the IORef stores a thunk that
+    -- raises only when read, never at construction time.  Our previous
+    -- 'IORef Val' representation forced the value at @newIORef@, so warp's
+    -- @keepAliveRef <- newIORef $ error \"keepAliveRef not filled\"@
+    -- raised in 'processRequest' before the response handler ran.
+    -- Reads force the thunk on demand; writes install a fresh
+    -- (already-evaluated) thunk via 'newWHNFThunk'.
+    = PrimIORef  !(IORef Thunk)
     | PrimHandle !Handle
     -- Phase 2.8: low-level memory objects for ByteString / ForeignPtr support.
     | PrimForeignPtr !(ForeignPtr Word8)
