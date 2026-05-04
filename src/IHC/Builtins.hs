@@ -6677,11 +6677,25 @@ toExceptionB = pure $ VFun $ \eT -> do
 -- what we want), 'Nothing' would rethrow.
 fromExceptionB :: IO Val
 fromExceptionB = pure $ VFun $ \eT -> do
-    ev <- force eT
-    let inner = case ev of
-                    VCon "SomeException" [innerT] -> innerT
-                    _                              -> eT
-    pure (VCon "Just" [inner])
+    -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
+    -- is type-driven in real Haskell: it returns 'Just' only if the
+    -- 'SomeException' wraps a value of type 'e'.  Without type info at
+    -- runtime our previous "always Just" implementation made guards
+    -- like @Just (ExceptionInsideResponseBody _) <- fromException e@
+    -- match every exception, and downcast queries like
+    -- @case fromException e of Just (SomeAsyncException _) -> True ;
+    -- Nothing -> False@ raise 'PatternMatchFail' when @e@ is a plain
+    -- IOError (@Just (IOError ...)@ doesn't match @Just
+    -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
+    --
+    -- Defaulting to 'Nothing' is the safe answer for exception-type
+    -- DOWNCASTS — the common pattern in warp / wai / standard handler
+    -- code.  Code that genuinely wants the wrapped value can pattern
+    -- match @SomeException e <- ...@ directly (we wrap host
+    -- exceptions in 'VCon "SomeException" [innerT]', and the record-
+    -- accessor / matchPat paths already descend through the wrap).
+    _ <- force eT
+    pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --
