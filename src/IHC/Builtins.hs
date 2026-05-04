@@ -841,6 +841,10 @@ builtins reg =
     , ("Control.Concurrent.forkIO", forkIOB)
     , ("GHC.Conc.Sync.forkIO", forkIOB)
     , ("GHC.Internal.Conc.Sync.forkIO", forkIOB)
+    -- Compiler-intrinsic 'fork#' primop. ghc-prim has no .hs source;
+    -- forkIO and warp's defaultFork bottom out into this.
+    , ("fork#",           forkHashB)
+    , ("GHC.Prim.fork#",  forkHashB)
     , ("killThread",      killThreadB)
     , ("myThreadId",      myThreadIdB)
     , ("myThreadId#",     myThreadIdHashB)
@@ -5589,6 +5593,22 @@ forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
         _ <- runIOVal av
         pure ()
     pure (VPrimObj (PrimThreadId tid))
+
+-- | @fork# :: IO () -> State# RealWorld -> (# State# RealWorld, ThreadId# #)@
+-- — GHC primop used by source-loaded @forkIO@ and warp's @defaultFork@
+-- (the latter inlines the primop call).  No Haskell source in
+-- @ghc-prim@; we host it.  Wraps the host 'forkIO' and packages the
+-- result as a state-passing unboxed tuple so source-side
+-- @case fork# io s of (# s', tid #) -> ...@ matches our pattern bridge.
+forkHashB :: IO Val
+forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    av <- force aT
+    tid <- forkIO $ do
+        _ <- runIOVal av
+        pure ()
+    rwT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
+    pure (VCon "(#,#)" [rwT, tidT])
 
 -- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
 killThreadB :: IO Val
