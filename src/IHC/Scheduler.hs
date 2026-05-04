@@ -2796,7 +2796,21 @@ classMethodDispatcher reg cls methodName = selfVal
         | remaining <= 0 = fallback accArgs
         | otherwise = VFun $ \argT -> do
             av <- force argT
-            let tag = typeTagOf av
+            -- 'typeTagOf' returns "<IO>" for host-built 'VIO' values, but
+            -- type-class instances are keyed under "IO" (the source ctor
+            -- name).  For methods of monadic classes (Functor, Applicative,
+            -- Monad), normalise so the container arg drives dispatch to
+            -- the source-loaded @IO@ instance — e.g. @() <$ X@ inside
+            -- @void X@ where the value arg is non-dispatchable @()@ and
+            -- the container is host @VIO@.  Other classes (Foldable
+            -- with @foldr f z xs@ where @z@ might happen to be @VIO@)
+            -- keep the raw "<IO>" tag and walk past — IO isn't a
+            -- Foldable instance.
+            let rawTag = typeTagOf av
+                tag | rawTag == BC.pack "<IO>" && isMonadicClass cls
+                        = BC.pack "IO"
+                    | otherwise
+                        = rawTag
             if isDispatchableTag tag
                 then do
                     mSpecial <- specialClassApplication tag av argT accArgs
@@ -3003,6 +3017,21 @@ classMethodDispatcher reg cls methodName = selfVal
     isUnaryResultPolymorphicMethod c m =
         (c == BC.pack "Applicative" && m == BC.pack "pure")
      || (c == BC.pack "Monad"       && m == BC.pack "return")
+
+    -- | Classes whose IO instance source-loads: when a container arg
+    -- has the host 'VIO' tag "<IO>", normalise to "IO" so the
+    -- source-loaded instance is the lookup key.  Used by 'dispatch' to
+    -- bridge 'VIO' (host action) ↔ 'IO' (source ctor) for methods like
+    -- @() <\$ X@, @fmap@, @>>=@ etc.  Restricted to monadic classes —
+    -- @Foldable IO@ isn't an instance, and @foldr f z xs@ would mis-
+    -- classify a 'VIO' acc accumulator as the container.
+    isMonadicClass :: ByteString -> Bool
+    isMonadicClass c = c `elem` map BC.pack
+        [ "Functor", "Applicative", "Monad"
+        , "MonadIO", "MonadFail", "MonadFix"
+        , "Alternative", "MonadPlus"
+        , "Semigroup", "Monoid"  -- (a -> IO ()) Monoid via IO instance
+        ]
 
     specialClassApplication tag av argT accArgs
         | cls == BC.pack "IsString"
@@ -4636,8 +4665,12 @@ resolveFallback _mOwner name
         resolveFallback _mOwner (BC.pack "Control.Exception.finally")
     | BC.pack ".E.throwIO" `isSuffixOf` name =
         resolveFallback _mOwner (BC.pack "Control.Exception.throwIO")
-    | BC.pack ".E.toException" `isSuffixOf` name =
+    | BC.pack ".E.toException" `isSuffixOf` name
+   || name == BC.pack "E.toException" =
         resolveFallback _mOwner (BC.pack "Control.Exception.toException")
+    | BC.pack ".E.fromException" `isSuffixOf` name
+   || name == BC.pack "E.fromException" =
+        resolveFallback _mOwner (BC.pack "Control.Exception.fromException")
     | BC.pack ".E.mask_" `isSuffixOf` name =
         resolveFallback _mOwner (BC.pack "Control.Exception.mask_")
     | BC.pack ".E.allowInterrupt" `isSuffixOf` name =
@@ -4700,6 +4733,24 @@ resolveFallback _mOwner name
     | BC.pack "CI." `BC.isPrefixOf` name =
         resolveFallback _mOwner (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
 resolveFallback mOwner name = do
+    -- Builtins override the source-discovery path: an entry like
+    -- @"Control.Exception.toException"@ in the base env (added by
+    -- 'buildBaseEnv' for class methods that have no top-level body in
+    -- their owning module) must be served directly, even though
+    -- @lmBodies@ doesn't contain @toException@.  Without this, qualified
+    -- references like @E.toException@ — rewritten to
+    -- @Control.Exception.toException@ by the alias-prefix branches above
+    -- — fall through to the source-loading path, miss the class-method
+    -- (it's in the class declaration, not a top-level binding), and
+    -- the caller sees @unbound variable `E.toException`@ when warp's
+    -- @acceptNewConnection@ catches a non-recoverable accept errno.
+    baseEnv <- readIORef envBaseForFallbackRef
+    case HashMap.lookup name baseEnv of
+        Just t  -> pure (Just t)
+        Nothing -> resolveFallbackSource mOwner name
+
+resolveFallbackSource :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+resolveFallbackSource mOwner name = do
     mods <- readIORef globalLoadedModulesRef
     case splitQualified name
             <|> splitQualifiedByLoadedModule mods name

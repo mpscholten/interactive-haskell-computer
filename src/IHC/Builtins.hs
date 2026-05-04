@@ -1046,11 +1046,17 @@ builtins reg =
     -- In the Val world we have no type-driven dispatch, so identity-with-
     -- SomeException-wrap is fine (same contract as toExceptionWithBacktrace).
     , ("toException",     toExceptionB)
+    , ("Control.Exception.toException", toExceptionB)
+    , ("GHC.Internal.Control.Exception.toException", toExceptionB)
+    , ("GHC.Internal.Exception.toException", toExceptionB)
     -- fromException: pair of toException. Used by source-loaded catch:
     --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
     -- With Val-level dynamic typing we cannot implement the type match;
     -- we always return Just, so the user handler sees the raw exception Val.
     , ("fromException",   fromExceptionB)
+    , ("Control.Exception.fromException", fromExceptionB)
+    , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
+    , ("GHC.Internal.Exception.fromException", fromExceptionB)
     -- unIO: inverse of the IO constructor. Source at
     -- GHC.Internal.Base defines `unIO (IO a) = a`. At the Val level VIO
     -- hides the state-transformer shape, so we reconstruct a fresh one:
@@ -5467,6 +5473,15 @@ buildFieldEnv reg = do
     access fieldName clauses argThunk = do
         v <- force argThunk
         case v of
+            -- 'SomeException' is the universal exception wrapper; it
+            -- holds the real exception in its single field.  Code that
+            -- accesses concrete-exception fields (e.g. @ioe_errno e@
+            -- where @e :: SomeException@ post-'try', as in warp's
+            -- 'acceptNewConnection') needs us to descend through the
+            -- wrap.  Project the inner field and recurse so the
+            -- accessor sees the underlying 'IOError' / etc.
+            VCon "SomeException" [innerT] ->
+                access fieldName clauses innerT
             VCon conName args ->
                 case lookup conName clauses of
                     Just idx | idx < length args ->
@@ -6711,7 +6726,16 @@ hostExceptionToVal e = do
     locT <- newWHNFThunk =<< stringToListValIO ""
     errnoT <- newWHNFThunk (VCon "Nothing" [])
     fileT <- newWHNFThunk (VCon "Nothing" [])
-    pure (VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT])
+    -- Wrap in 'SomeException' so handlers that pattern-match
+    -- @\(SomeException e) -> ...@ (e.g. warp's 'throughAsync',
+    -- 'settingsOnException') see the expected ctor.  Existing handlers
+    -- that match on the inner @IOError@ ctor still work via
+    -- newtype-transparent pattern matching: 'matchPat' on
+    -- @PCon "IOError"@ against a single-field @VCon "SomeException"@
+    -- projects the inner field and retries.
+    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
+    ioErrT <- newWHNFThunk ioErrVal
+    pure (VCon "SomeException" [ioErrT])
 
 evaluateB :: IO Val
 evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
