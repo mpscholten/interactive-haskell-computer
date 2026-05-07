@@ -53,6 +53,7 @@ import Data.Char (chr, ord)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
+import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Foreign.C.String (peekCAString, withCString)
@@ -96,7 +97,7 @@ import IHC.Classes
     , drainCataloguedInstancesForClass
     )
 import qualified IHC.Classes
-import IHC.Eval (apply, force, forceMethodVal)
+import IHC.Eval (apply, force, forceMethodVal, runIOVal)
 import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
@@ -250,7 +251,7 @@ builtinEnv reg = do
     -- the ClassRegistry (which is a separate store from the Env).
     defaultFromLabel <- fromLabelB reg
     registerInstance reg (BC.pack "IsLabel") (BC.pack "Proxy")
-        (Map.singleton (BC.pack "fromLabel") defaultFromLabel)
+        (HashMap.singleton (BC.pack "fromLabel") defaultFromLabel)
     pure (extendEnvMany (pairs ++ listCtors ++ boolish ++ ioModes ++ handles
                          ++ orderingCtors ++ unboxCtors
                          ++ unitCtor ++ [("IO", ioCtorT)]
@@ -408,6 +409,19 @@ builtins reg =
     , ("void",     voidB)
     , ("Control.Monad.void", voidB)
     , ("GHC.Internal.Base.void", voidB)
+    -- @Control.Arrow.first@ / @second@ - for the @(->)@ arrow.  Warp's
+    -- @runSettingsConnectionMaker@ uses
+    -- @first ((,TCP) \<$\>)@ to lift @(,Transport)@ into the IO action and
+    -- map it over the @(connectionMaker, sockAddr)@ tuple.  Our class
+    -- dispatcher mis-classifies the call: arg-direction lands on the
+    -- tuple (since the function is non-dispatchable) and looks up
+    -- @Arrow (,) first@, which doesn't exist (Arrow is for arrows, not
+    -- tuples).  Host directly under the (->)-instance semantics:
+    -- @first f (a, b) = (f a, b)@.
+    , ("first",   firstFnB)
+    , ("Control.Arrow.first", firstFnB)
+    , ("second",  secondFnB)
+    , ("Control.Arrow.second", secondFnB)
     -- IORef
     , ("newIORef",    newIORefB)
     , ("GHC.IORef.newIORef", newIORefB)
@@ -686,6 +700,28 @@ builtins reg =
     , ("setSocketOption", socketSetOptionB)
     , ("Network.Socket.setSocketOption", socketSetOptionB)
     , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
+    -- 'Network.Socket.Options' uses pattern synonyms for the common
+    -- 'SocketOption' constants (e.g. @pattern NoDelay = SockOpt 6 1@).
+    -- Our parser doesn't yet expand pattern synonyms; warp uses
+    -- @setSocketOption s NoDelay 1@ (and 'KeepAlive', 'ReuseAddr') so
+    -- we host them as plain VCon "SockOpt" values keyed by the
+    -- platform constants.  Values from
+    -- 'Network.Socket.Options' on macOS / Linux post-hsc.
+    , ("NoDelay",    sockOptB 6 1)              -- IPPROTO_TCP, TCP_NODELAY
+    , ("Network.Socket.NoDelay",            sockOptB 6 1)
+    , ("Network.Socket.Options.NoDelay",    sockOptB 6 1)
+    , ("ReuseAddr",  sockOptB 65535 4)          -- SOL_SOCKET, SO_REUSEADDR
+    , ("Network.Socket.ReuseAddr",          sockOptB 65535 4)
+    , ("Network.Socket.Options.ReuseAddr",  sockOptB 65535 4)
+    , ("KeepAlive",  sockOptB 65535 8)          -- SOL_SOCKET, SO_KEEPALIVE
+    , ("Network.Socket.KeepAlive",          sockOptB 65535 8)
+    , ("Network.Socket.Options.KeepAlive",  sockOptB 65535 8)
+    , ("Broadcast",  sockOptB 65535 32)         -- SOL_SOCKET, SO_BROADCAST
+    , ("Network.Socket.Broadcast",          sockOptB 65535 32)
+    , ("Network.Socket.Options.Broadcast",  sockOptB 65535 32)
+    , ("ReusePort",  sockOptB 65535 512)        -- SOL_SOCKET, SO_REUSEPORT
+    , ("Network.Socket.ReusePort",          sockOptB 65535 512)
+    , ("Network.Socket.Options.ReusePort",  sockOptB 65535 512)
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
     , ("Network.Socket.listen", socketListenB)
@@ -830,6 +866,10 @@ builtins reg =
     , ("Control.Concurrent.forkIO", forkIOB)
     , ("GHC.Conc.Sync.forkIO", forkIOB)
     , ("GHC.Internal.Conc.Sync.forkIO", forkIOB)
+    -- Compiler-intrinsic 'fork#' primop. ghc-prim has no .hs source;
+    -- forkIO and warp's defaultFork bottom out into this.
+    , ("fork#",           forkHashB)
+    , ("GHC.Prim.fork#",  forkHashB)
     , ("killThread",      killThreadB)
     , ("myThreadId",      myThreadIdB)
     , ("myThreadId#",     myThreadIdHashB)
@@ -1035,11 +1075,17 @@ builtins reg =
     -- In the Val world we have no type-driven dispatch, so identity-with-
     -- SomeException-wrap is fine (same contract as toExceptionWithBacktrace).
     , ("toException",     toExceptionB)
+    , ("Control.Exception.toException", toExceptionB)
+    , ("GHC.Internal.Control.Exception.toException", toExceptionB)
+    , ("GHC.Internal.Exception.toException", toExceptionB)
     -- fromException: pair of toException. Used by source-loaded catch:
     --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
     -- With Val-level dynamic typing we cannot implement the type match;
     -- we always return Just, so the user handler sees the raw exception Val.
     , ("fromException",   fromExceptionB)
+    , ("Control.Exception.fromException", fromExceptionB)
+    , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
+    , ("GHC.Internal.Exception.fromException", fromExceptionB)
     -- unIO: inverse of the IO constructor. Source at
     -- GHC.Internal.Base defines `unIO (IO a) = a`. At the Val level VIO
     -- hides the state-transformer shape, so we reconstruct a fresh one:
@@ -2000,7 +2046,7 @@ lookupUserIsLabel reg lbl = do
     _ <- drainCataloguedInstancesForClass (BC.pack "IsLabel")
     m <- readIORef reg
     let entries = [ (tags, methods)
-                  | ((cls, tags), methods) <- Map.toList m
+                  | ((cls, tags), methods) <- HashMap.toList m
                   , cls == BC.pack "IsLabel"
                   ]
         -- First pass: instance whose leading tag matches the label literal.
@@ -2008,7 +2054,7 @@ lookupUserIsLabel reg lbl = do
             [ fromLabelMethod
             | (tag : _, methods) <- entries
             , tag == lbl
-            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
+            , Just fromLabelMethod <- [HashMap.lookup (BC.pack "fromLabel") methods]
             ]
         -- Second pass: polymorphic user instance — first tag is a lower-case
         -- type variable (e.g. 's'), not the @Proxy@ default and not a
@@ -2021,7 +2067,7 @@ lookupUserIsLabel reg lbl = do
             , not (BS.null tag)
             , let c = BC.head tag
             , c >= 'a' && c <= 'z'
-            , Just fromLabelMethod <- [Map.lookup (BC.pack "fromLabel") methods]
+            , Just fromLabelMethod <- [HashMap.lookup (BC.pack "fromLabel") methods]
             ]
     -- Instance method bodies are registered lazily as 'VLazyMethod'
     -- (see 'IHC.Scheduler.evalMethodWithLazy').  Force the wrapper now
@@ -2520,31 +2566,33 @@ voidB = pure $ VFun $ \mt -> pure $ VIO $ do
     _ <- runIOVal mv
     pure VUnit
 
--- | Run one IO layer. Mirrors the helper in 'IHC.Eval' so builtin
--- bind/sequence can also execute source-constructed @IO@ values.
-runIOVal :: Val -> IO Val
-runIOVal (VIO io) = io
-runIOVal (VCon "IO" [ft]) = do
-    fv <- force ft
-    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
-    case result of
-        VCon _ [_stT, resT] -> force resT
-        other               -> pure other
--- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
--- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
--- 'VCon "STM" [stateFn]'; if we don't unwrap them here, callers that
--- expect a plain value (e.g. 'atomically' chains, or any 'do'-bind
--- inside the warp Counter / time-manager paths) end up working on the
--- wrapper instead of its result and dispatch breaks downstream.
-runIOVal (VCon "STM" [ft]) = do
-    fv <- force ft
-    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
-    case result of
-        VCon _ [_stT, resT] -> force resT
-        other               -> pure other
-runIOVal v        = pure v
+-- | @first f (a, b) = (f a, b)@ — the @Arrow (->)@ instance method.
+-- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
+firstFnB :: IO Val
+firstFnB = pure $ VFun $ \fT -> pure $ VFun $ \tupT -> do
+    fv  <- force fT
+    tupV <- force tupT
+    case tupV of
+        VCon "(,)" [aT, bT] -> do
+            r  <- apply fv aT
+            rT <- newWHNFThunk r
+            pure (VCon "(,)" [rT, bT])
+        _ -> error ("first: not a tuple: " <> showValForDebug tupV)
+
+-- | @second g (a, b) = (a, g b)@ — counterpart to 'firstFnB'.
+secondFnB :: IO Val
+secondFnB = pure $ VFun $ \gT -> pure $ VFun $ \tupT -> do
+    gv  <- force gT
+    tupV <- force tupT
+    case tupV of
+        VCon "(,)" [aT, bT] -> do
+            r  <- apply gv bT
+            rT <- newWHNFThunk r
+            pure (VCon "(,)" [aT, rT])
+        _ -> error ("second: not a tuple: " <> showValForDebug tupV)
+
+-- runIOVal lives in 'IHC.Eval' (and now also covers STM, which used to
+-- be a separate copy here).  We import it from there.
 
 --------------------------------------------------------------------------------
 -- IORef primops. Each returns 'VIO' — construction, read, and write
@@ -2553,15 +2601,19 @@ runIOVal v        = pure v
 
 newIORefB :: IO Val
 newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    v  <- force a
-    rf <- newIORef v
+    -- Store the THUNK directly so error-throwing initialisers
+    -- (e.g. warp's @newIORef $ error "keepAliveRef not filled"@) are
+    -- only evaluated on read.
+    rf <- newIORef a
     pure (VPrimObj (PrimIORef rf))
 
 readIORefB :: IO Val
 readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
     case av of
-        VPrimObj (PrimIORef rf) -> readIORef rf
+        VPrimObj (PrimIORef rf) -> do
+            t <- readIORef rf
+            force t
         _ -> error ("readIORef: not an IORef: " <> showValForDebug av)
 
 writeIORefB :: IO Val
@@ -2569,8 +2621,8 @@ writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a
     case av of
         VPrimObj (PrimIORef rf) -> do
-            bv <- force b
-            writeIORef rf bv
+            -- Install the thunk directly; readers force on demand.
+            writeIORef rf b
             pure VUnit
         _ -> error ("writeIORef: not an IORef: " <> showValForDebug av)
 
@@ -2583,10 +2635,10 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
     case av of
         VPrimObj (PrimIORef rf) -> do
             fv <- force f
-            cur <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             new <- apply fv curT
-            writeIORef rf new
+            newT <- newWHNFThunk new
+            writeIORef rf newT
             pure VUnit
         _ -> error ("modifyIORef: not an IORef: " <> showValForDebug av)
 
@@ -2600,14 +2652,12 @@ atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
     case av of
         VPrimObj (PrimIORef rf) -> do
             fv <- force f
-            cur <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             pair <- apply fv curT >>= runIOVal
             case pair of
                 VCon _ [newT, resultT] -> do
-                    new <- force newT
                     result <- force resultT
-                    writeIORef rf new
+                    writeIORef rf newT
                     pure result
                 _ -> error ("atomicModifyIORef': function did not return a pair: "
                             <> showValForDebug pair)
@@ -2639,8 +2689,7 @@ mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $
 -- source-loaded callers (GHC.STRef.newSTRef) can case-match on the result.
 newMutVarB :: IO Val
 newMutVarB = pure $ VFun $ \initThunk -> pure $ VFun $ \_st -> do
-    v  <- force initThunk
-    rf <- newIORef v
+    rf <- newIORef initThunk
     stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
     refT <- newWHNFThunk (VPrimObj (PrimIORef rf))
     pure (VCon "(#,#)" [stT, refT])
@@ -2652,9 +2701,8 @@ readMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_st -> do
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            v   <- readIORef rf
+            vT  <- readIORef rf
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
-            vT  <- newWHNFThunk v
             pure (VCon "(#,#)" [stT, vT])
         _ -> error ("readMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2666,8 +2714,7 @@ writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            v <- force valThunk
-            writeIORef rf v
+            writeIORef rf valThunk
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2679,19 +2726,15 @@ atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            cur  <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             -- f cur returns a (a, b) pair
             res  <- apply fv curT
             resV <- runIOVal res
             case resV of
                 VCon _ [newT, bT] -> do
-                    new <- force newT
-                    b   <- force bT
-                    writeIORef rf new
+                    writeIORef rf newT
                     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
-                    bT' <- newWHNFThunk b
-                    pure (VCon "(#,#)" [stT, bT'])
+                    pure (VCon "(#,#)" [stT, bT])
                 _ -> error ("atomicModifyMutVar#: f did not return a pair: "
                             <> showValForDebug resV)
         _ -> error ("atomicModifyMutVar#: not a MutVar#: " <> showValForDebug mvV)
@@ -2704,21 +2747,15 @@ atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            cur  <- readIORef rf
-            curT <- newWHNFThunk cur
+            curT <- readIORef rf
             res  <- apply fv curT
             resV <- runIOVal res
             case resV of
                 VCon _ [newT, bT] -> do
-                    new  <- force newT
-                    b    <- force bT
-                    writeIORef rf new
+                    writeIORef rf newT
                     stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-                    curT' <- newWHNFThunk cur
-                    newT' <- newWHNFThunk new
-                    bT'   <- newWHNFThunk b
-                    pairT <- newWHNFThunk (VCon "(,)" [newT', bT'])
-                    pure (VCon "(#,,#)" [stT, curT', pairT])
+                    pairT <- newWHNFThunk (VCon "(,)" [newT, bT])
+                    pure (VCon "(#,,#)" [stT, curT, pairT])
                 _ -> error ("atomicModifyMutVar2#: f did not return a pair: "
                             <> showValForDebug resV)
         _ -> error ("atomicModifyMutVar2#: not a MutVar#: " <> showValForDebug mvV)
@@ -2732,14 +2769,12 @@ atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             fv   <- force fThunk
-            old  <- readIORef rf
-            oldT <- newWHNFThunk old
+            oldT <- readIORef rf
             new  <- apply fv oldT
-            writeIORef rf new
+            newT <- newWHNFThunk new
+            writeIORef rf newT
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-            oldT' <- newWHNFThunk old
-            newT  <- newWHNFThunk new
-            pure (VCon "(#,,#)" [stT, oldT', newT])
+            pure (VCon "(#,,#)" [stT, oldT, newT])
         _ -> error ("atomicModifyMutVar_#: not a MutVar#: " <> showValForDebug mvV)
 
 -- | @atomicSwapMutVar# :: MutVar# s a -> a -> State# s -> (# State# s, a #)@
@@ -2751,11 +2786,9 @@ atomicSwapMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \newThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            old <- readIORef rf
-            new <- force newThunk
-            writeIORef rf new
+            oldT <- readIORef rf
+            writeIORef rf newThunk
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
-            oldT <- newWHNFThunk old
             pure (VCon "(#,#)" [stT, oldT])
         _ -> error ("atomicSwapMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
@@ -2767,13 +2800,11 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
     mvV <- force mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            new <- force newThunk
-            writeIORef rf new
+            writeIORef rf newThunk
             -- Return (# s, 0#, new #) — 0# means success
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
             zT   <- newWHNFThunk (VInt 0)
-            newT <- newWHNFThunk new
-            pure (VCon "(#,,#)" [stT, zT, newT])
+            pure (VCon "(#,,#)" [stT, zT, newThunk])
         _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
 mkWeakHashB :: IO Val
@@ -2964,6 +2995,13 @@ fromIntegralB = pure $ VFun $ \a -> do
         , "Int8", "Int16", "Int32", "Int64"
         , "Word", "Word8", "Word16", "Word32", "Word64"
         , "CFloat", "CDouble"
+        -- 'Integer' has a multi-ctor representation in @ghc-bignum@:
+        --   data Integer = IS !Int# | IP !ByteArray# | IN !ByteArray#
+        -- The 'IS' constructor (small Integer fitting in an Int) flows
+        -- here when source-loaded numeric code constructs an Integer
+        -- and warp/wai then runs it through 'fromIntegral'.  Treat it
+        -- as the Int it wraps.
+        , "IS"
         ]
 
 --------------------------------------------------------------------------------
@@ -3623,32 +3661,38 @@ peekFullAddrInfoVal p = do
     peekAddrInfoVal p flags family socktype protocol
 
 -- | @getAddrInfo :: Maybe AddrInfo -> Maybe HostName -> Maybe ServiceName
--- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@; ignores
--- the @hints@ argument for now (passes NULL) — warp/streaming-commons
--- pass hints with @addrFlags=[AI_PASSIVE], addrSocketType=Stream@ which
--- the OS uses to filter, but for the warp-listen case the default
--- result list is already TCP-stream-suitable.  Walks the linked list
--- via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64 layout) and
--- materialises each entry as a 'VCon "AddrInfo"' before
+-- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@.  Parses
+-- the @hints@ argument and passes through the OS-relevant fields
+-- (addrFlags, addrFamily, addrSocketType, addrProtocol).  Walks the
+-- linked list via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64
+-- layout) and materialises each entry as a 'VCon "AddrInfo"' before
 -- @freeaddrinfo@-ing the chain.
+--
+-- Without parsing hints, warp's @bindPortGenEx@ would receive a
+-- mixed UDP+TCP result list, and the first @setSocketOption sock
+-- NoDelay 1@ on the UDP entry would throw EINVAL.  The exception
+-- is caught by @tryAddrs@ and the next addr (TCP) used, but the
+-- per-attempt churn is wasted work.
 getAddrInfoB :: IO Val
-getAddrInfoB = pure $ VFun $ \_hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
+getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
+    hintsV <- force hintsT
     hostV <- force hostT
     serviceV <- force serviceT
     withMaybeCString hostV $ \hostP ->
         withMaybeCString serviceV $ \serviceP ->
-            alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
-                rc <- c_getaddrinfo_host hostP serviceP nullPtr resPP
-                if rc /= 0
-                    then ioError (userError ("getaddrinfo: returned " ++ show rc))
-                    else do
-                        firstP <- peek resPP
-                        if firstP == nullPtr
-                            then pure (VCon "[]" [])
-                            else do
-                                lst <- walkAddrInfo firstP
-                                c_freeaddrinfo_host firstP
-                                pure lst
+            withHintsPtr hintsV $ \hintsP ->
+                alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
+                    rc <- c_getaddrinfo_host hostP serviceP hintsP resPP
+                    if rc /= 0
+                        then ioError (userError ("getaddrinfo: returned " ++ show rc))
+                        else do
+                            firstP <- peek resPP
+                            if firstP == nullPtr
+                                then pure (VCon "[]" [])
+                                else do
+                                    lst <- walkAddrInfo firstP
+                                    c_freeaddrinfo_host firstP
+                                    pure lst
   where
     walkAddrInfo :: Ptr Word8 -> IO Val
     walkAddrInfo p = do
@@ -3670,6 +3714,80 @@ getAddrInfoB = pure $ VFun $ \_hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \
             s <- valToString inner
             withCString s (action . castPtr)
         other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
+
+    -- Build a host @struct addrinfo@ from a @Maybe AddrInfo@ Val and
+    -- pass its pointer to the action.  Without this, @c_getaddrinfo@
+    -- gets a NULL hints pointer and returns ALL socket types — warp
+    -- requests Stream-only, but we'd hand back UDP entries too, then
+    -- @setSocketOption sock TCP_NODELAY@ on the UDP socket fails with
+    -- EINVAL.  The first 4 fields (flags, family, socktype, protocol)
+    -- are 4-byte ints; the rest can be zero-filled because
+    -- getaddrinfo only reads the first four when given hints.
+    withHintsPtr :: Val -> (Ptr Word8 -> IO a) -> IO a
+    withHintsPtr v action = case v of
+        VCon "Nothing" [] -> action nullPtr
+        VCon "Just" [innerT] -> do
+            inner <- force innerT
+            (flags, family, socktype, protocol) <- extractHintsFields inner
+            allocaBytes 48 $ \p -> do
+                fillBytes p 0 48
+                pokeByteOff (castPtr p :: Ptr Word32) 0  flags
+                pokeByteOff (castPtr p :: Ptr Word32) 4  family
+                pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
+                pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
+                action p
+        _ -> action nullPtr
+
+    -- Extract (flags, family, socktype, protocol) from an AddrInfo
+    -- record value.  Pattern: VCon "AddrInfo" [flagsT, familyT,
+    -- socktypeT, protocolT, addressT, canonNameT].  The flags field is
+    -- a list of constructors like @[AI_PASSIVE]@ that we OR-fold; the
+    -- family / socktype / protocol fields are single-field VCons
+    -- wrapping @CInt@ codes.
+    extractHintsFields :: Val -> IO (Word32, Word32, Word32, Word32)
+    extractHintsFields val = case val of
+        VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
+            flagsV    <- force flagsT
+            familyV   <- force familyT
+            socktypeV <- force socktypeT
+            protocolV <- force protocolT
+            flags    <- foldFlagBits flagsV
+            family   <- conIntField "addrFamily" familyV
+            socktype <- conIntField "addrSocketType" socktypeV
+            protocol <- conIntField "addrProtocol" protocolV
+            pure (flags, family, socktype, protocol)
+        _ -> pure (0, 0, 0, 0)
+
+    -- @[AI_FOO, AI_BAR]@ → bitwise-or of named flag values.
+    foldFlagBits :: Val -> IO Word32
+    foldFlagBits = go 0
+      where
+        go !acc v = case v of
+            VCon "[]" []        -> pure acc
+            VCon ":" [hT, tT]   -> do
+                hV <- force hT
+                tV <- force tT
+                let bit = case hV of
+                        VCon "AI_ADDRCONFIG" _ -> 1024
+                        VCon "AI_ALL" _        -> 256
+                        VCon "AI_CANONNAME" _  -> 2
+                        VCon "AI_NUMERICHOST" _ -> 4
+                        VCon "AI_NUMERICSERV" _ -> 4096
+                        VCon "AI_PASSIVE" _    -> 1
+                        VCon "AI_V4MAPPED" _   -> 2048
+                        _                       -> 0
+                go (acc .|. bit) tV
+            _ -> pure acc
+
+    conIntField :: String -> Val -> IO Word32
+    conIntField name v = case v of
+        VCon _ [innerT] -> do
+            inner <- force innerT
+            case inner of
+                VInt n -> pure (fromIntegral n)
+                _      -> error (name <> ": inner not VInt: " <> showValForDebug inner)
+        VInt n          -> pure (fromIntegral n)
+        _ -> error (name <> ": not a single-field VCon or VInt: " <> showValForDebug v)
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -3793,9 +3911,9 @@ socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $
     if fd == -1
         then ioError (userError "Network.Socket.socket")
         else do
-            ref <- newIORef (VInt (fromIntegral fd))
-            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
             fdT <- newWHNFThunk (VInt (fromIntegral fd))
+            ref <- newIORef fdT
+            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
             pure (VCon "Socket" [refT, fdT])
 
 socketSetOptionB :: IO Val
@@ -3855,10 +3973,10 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
                                        ("Network.Socket.accept: errno="
                                         <> show e))
         newFd <- acceptLoop
-        ref <- newIORef (VInt (fromIntegral newFd))
+        fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
+        ref <- newIORef fdValT
         refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-        fdT <- newWHNFThunk (VInt (fromIntegral newFd))
-        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdT])
+        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdValT])
         addrV <- peekSockAddrVal (castPtr addrP)
         addrT <- newWHNFThunk addrV
         pure (VCon "(,)" [sockOutT, addrT])
@@ -3887,7 +4005,7 @@ socketCurrentFdVal :: Val -> IO Val
 socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
     refV <- force refT
     case refV of
-        VPrimObj (PrimIORef rf) -> readIORef rf
+        VPrimObj (PrimIORef rf) -> readIORef rf >>= force
         other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
 socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
 
@@ -3905,7 +4023,9 @@ socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
             refV <- force refT
             case refV of
                 VPrimObj (PrimIORef rf) -> do
-                    oldFdV <- atomicModifyIORef' rf $ \cur -> (VInt (-1), cur)
+                    sentinelT <- newWHNFThunk (VInt (-1))
+                    oldT <- atomicModifyIORef' rf $ \cur -> (sentinelT, cur)
+                    oldFdV <- force oldT
                     case oldFdV of
                         VInt oldFd
                             | oldFd == -1 -> pure VUnit
@@ -4087,6 +4207,15 @@ socketOptionField t = do
             opt <- intField "socket.option.name" optT
             pure (level, opt)
         other -> error ("setSocketOption: not a SocketOption: " <> showValForDebug other)
+
+-- | Helper for the @Network.Socket.Options@ pattern-synonym constants
+-- (e.g. @NoDelay = SockOpt 6 1@).  Returns the underlying
+-- 'SockOpt' VCon directly so 'socketOptionField' can decode it.
+sockOptB :: Int64 -> Int64 -> IO Val
+sockOptB level opt = do
+    levelT <- newWHNFThunk (VInt level)
+    optT   <- newWHNFThunk (VInt opt)
+    pure (VCon "SockOpt" [levelT, optT])
 
 foreign import ccall unsafe "socket"
     c_socket_host :: CInt -> CInt -> CInt -> IO CInt
@@ -5332,7 +5461,7 @@ buildConEnv reg = do
 buildFieldEnv :: FieldRegistry -> IO Env
 buildFieldEnv reg = do
     pairs <- mapM mkAccessor (Map.toList reg)
-    pure (Map.fromList pairs)
+    pure (HashMap.fromList pairs)
   where
     -- Defer VFun allocation for each record-field accessor. A program that
     -- never projects out that particular field never pays the cost.
@@ -5344,6 +5473,15 @@ buildFieldEnv reg = do
     access fieldName clauses argThunk = do
         v <- force argThunk
         case v of
+            -- 'SomeException' is the universal exception wrapper; it
+            -- holds the real exception in its single field.  Code that
+            -- accesses concrete-exception fields (e.g. @ioe_errno e@
+            -- where @e :: SomeException@ post-'try', as in warp's
+            -- 'acceptNewConnection') needs us to descend through the
+            -- wrap.  Project the inner field and recurse so the
+            -- accessor sees the underlying 'IOError' / etc.
+            VCon "SomeException" [innerT] ->
+                access fieldName clauses innerT
             VCon conName args ->
                 case lookup conName clauses of
                     Just idx | idx < length args ->
@@ -5451,6 +5589,22 @@ forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
         _ <- runIOVal av
         pure ()
     pure (VPrimObj (PrimThreadId tid))
+
+-- | @fork# :: IO () -> State# RealWorld -> (# State# RealWorld, ThreadId# #)@
+-- — GHC primop used by source-loaded @forkIO@ and warp's @defaultFork@
+-- (the latter inlines the primop call).  No Haskell source in
+-- @ghc-prim@; we host it.  Wraps the host 'forkIO' and packages the
+-- result as a state-passing unboxed tuple so source-side
+-- @case fork# io s of (# s', tid #) -> ...@ matches our pattern bridge.
+forkHashB :: IO Val
+forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
+    av <- force aT
+    tid <- forkIO $ do
+        _ <- runIOVal av
+        pure ()
+    rwT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
+    pure (VCon "(#,#)" [rwT, tidT])
 
 -- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
 killThreadB :: IO Val
@@ -5627,11 +5781,19 @@ setFdOptionB :: IO Val
 setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
     fdV <- force fdT
     enabledV <- force enabledT
-    case fdV of
-        VInt fd -> do
-            PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
-            pure VUnit
-        _ -> error ("setFdOption: not an fd: " <> showValForDebug fdV)
+    fd <- unwrapFd fdV
+    PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
+    pure VUnit
+  where
+    -- Accept either a raw VInt (host-backed sockets pass the raw fd) or
+    -- the @Fd@ newtype wrapper @VCon "Fd" [VInt _]@ (source code that
+    -- imports @System.Posix.Types (Fd)@ and constructs values through
+    -- the constructor).
+    unwrapFd (VInt n) = pure n
+    unwrapFd (VCon "Fd" [innerT]) = do
+        innerV <- force innerT
+        unwrapFd innerV
+    unwrapFd other = error ("setFdOption: not an fd: " <> showValForDebug other)
 
 -- | @getNumCapabilities@ - return 1 (simplified).
 getNumCapabilitiesB :: IO Val
@@ -5786,39 +5948,33 @@ newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
 readTVarB :: IO Val
 readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
     tvv <- force tvT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> atomically (readTVar tv)
-        _ -> error ("readTVar: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "readTVar" tvv
+    atomically (readTVar tv)
 
 writeTVarB :: IO Val
 writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
     tvv <- force tvT
     av  <- force aT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> do
-            atomically (writeTVar tv av)
-            pure VUnit
-        _ -> error ("writeTVar: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "writeTVar" tvv
+    atomically (writeTVar tv av)
+    pure VUnit
 
 modifyTVar'B :: IO Val
 modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
     tvv <- force tvT
     fv  <- force fT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> do
-            cur  <- atomically (readTVar tv)
-            curT <- newWHNFThunk cur
-            new  <- apply fv curT
-            atomically (writeTVar tv new)
-            pure VUnit
-        _ -> error ("modifyTVar': not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "modifyTVar'" tvv
+    cur  <- atomically (readTVar tv)
+    curT <- newWHNFThunk cur
+    new  <- apply fv curT
+    atomically (writeTVar tv new)
+    pure VUnit
 
 readTVarIOB :: IO Val
 readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
     tvv <- force tvT
-    case tvv of
-        VPrimObj (PrimTVar tv) -> readTVarIO tv
-        _ -> error ("readTVarIO: not a TVar: " <> showValForDebug tvv)
+    tv  <- requireTVarPrim "readTVarIO" tvv
+    readTVarIO tv
 
 --------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
@@ -6002,6 +6158,11 @@ extractExceptionMessage val = case val of
         tryValToString msgT (BC.pack "ErrorCall")
     VCon "ErrorCallWithLocation" (msgT : _) ->
         tryValToString msgT (BC.pack "ErrorCallWithLocation")
+    -- IOError record: ioe_handle, ioe_type, ioe_location, ioe_description, ioe_errno, ioe_filename
+    VCon "IOError" [_handleT, _typeT, locT, descT, _errnoT, _fileT] -> do
+        loc <- tryValToString locT (BC.pack "")
+        desc <- tryValToString descT (BC.pack "")
+        pure (BC.pack "IOError: " <> loc <> BC.pack ": " <> desc)
     VCon n _ -> pure n
     _        -> pure (BC.pack (showValForDebug val))
   where
@@ -6451,11 +6612,25 @@ toExceptionB = pure $ VFun $ \eT -> do
 -- what we want), 'Nothing' would rethrow.
 fromExceptionB :: IO Val
 fromExceptionB = pure $ VFun $ \eT -> do
-    ev <- force eT
-    let inner = case ev of
-                    VCon "SomeException" [innerT] -> innerT
-                    _                              -> eT
-    pure (VCon "Just" [inner])
+    -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
+    -- is type-driven in real Haskell: it returns 'Just' only if the
+    -- 'SomeException' wraps a value of type 'e'.  Without type info at
+    -- runtime our previous "always Just" implementation made guards
+    -- like @Just (ExceptionInsideResponseBody _) <- fromException e@
+    -- match every exception, and downcast queries like
+    -- @case fromException e of Just (SomeAsyncException _) -> True ;
+    -- Nothing -> False@ raise 'PatternMatchFail' when @e@ is a plain
+    -- IOError (@Just (IOError ...)@ doesn't match @Just
+    -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
+    --
+    -- Defaulting to 'Nothing' is the safe answer for exception-type
+    -- DOWNCASTS — the common pattern in warp / wai / standard handler
+    -- code.  Code that genuinely wants the wrapped value can pattern
+    -- match @SomeException e <- ...@ directly (we wrap host
+    -- exceptions in 'VCon "SomeException" [innerT]', and the record-
+    -- accessor / matchPat paths already descend through the wrap).
+    _ <- force eT
+    pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --
@@ -6511,9 +6686,9 @@ catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
                 rv     <- apply hv excT
                 runIOVal rv))
         (\(exc :: SomeException) -> do
-            let msg = BC.pack (show exc)
-            excT <- newWHNFThunk (VStr msg)
-            rv   <- apply hv excT
+            excVal <- hostExceptionToVal exc
+            excT   <- newWHNFThunk excVal
+            rv     <- apply hv excT
             runIOVal rv)
 
 handleB :: IO Val
@@ -6534,18 +6709,63 @@ handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
             rv   <- apply hv excT
             runIOVal rv)
 
+-- | @Control.Exception.try :: Exception e => IO a -> IO (Either e a)@.
+--
+-- The previous implementation only caught 'IhcException' (the
+-- interpreter-thrown wrapper for source-level @throw@ / @throwIO@).
+-- Anything thrown by a host-backed builtin — most notably the
+-- 'IOException's that 'Network.Socket' operations raise — slipped
+-- straight past, terminating the calling thread silently.  Warp's
+-- @acceptNewConnection@ depends on @try@ catching the syscall errors
+-- that @accept@/@setSocketOption@ throw, so this regression caused
+-- @runSettings@ to bail after one iteration of the accept loop with
+-- exit code 0 and no diagnostic output.
+--
+-- Now we catch @SomeException@ and convert it to a Val:
+--   * 'IhcException' is unwrapped to its embedded 'Val' (preserves
+--     source-level @throw v@ semantics).
+--   * Anything else is materialised via 'hostExceptionToVal' as a
+--     stub @IOError@ record so source code that pattern-matches on
+--     fields like 'ioe_errno' doesn't blow up.
 tryB :: IO Val
 tryB = pure $ VFun $ \aT -> pure $ VIO $ do
     av <- force aT
-    r  <- CE.try @IhcException (runIOVal av)
+    r  <- CE.try @SomeException (runIOVal av)
     case r of
         Right v -> do
             vT <- newWHNFThunk v
             pure (VCon "Right" [vT])
-        Left exc -> do
-            excVal <- ihcExceptionToVal exc
-            excT   <- newWHNFThunk excVal
+        Left e -> do
+            excVal <- case CE.fromException e of
+                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
+                Nothing                       -> hostExceptionToVal e
+            excT <- newWHNFThunk excVal
             pure (VCon "Left" [excT])
+
+-- | Convert a host-thrown 'SomeException' into a Val that source-level
+-- pattern matching on 'IOError' can introspect.  Most Haskell code in
+-- the ecosystem reaches for 'ioe_errno', 'ioeGetErrorType', and
+-- 'displayException', so we materialise a record that supplies these
+-- fields with conservative defaults (no errno, OtherError type, the
+-- exception's @show@ as description).
+hostExceptionToVal :: SomeException -> IO Val
+hostExceptionToVal e = do
+    descT <- newWHNFThunk =<< stringToListValIO (show e)
+    handleT <- newWHNFThunk (VCon "Nothing" [])
+    typeT <- newWHNFThunk (VCon "OtherError" [])
+    locT <- newWHNFThunk =<< stringToListValIO ""
+    errnoT <- newWHNFThunk (VCon "Nothing" [])
+    fileT <- newWHNFThunk (VCon "Nothing" [])
+    -- Wrap in 'SomeException' so handlers that pattern-match
+    -- @\(SomeException e) -> ...@ (e.g. warp's 'throughAsync',
+    -- 'settingsOnException') see the expected ctor.  Existing handlers
+    -- that match on the inner @IOError@ ctor still work via
+    -- newtype-transparent pattern matching: 'matchPat' on
+    -- @PCon "IOError"@ against a single-field @VCon "SomeException"@
+    -- projects the inner field and retries.
+    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
+    ioErrT <- newWHNFThunk ioErrVal
+    pure (VCon "SomeException" [ioErrT])
 
 evaluateB :: IO Val
 evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do

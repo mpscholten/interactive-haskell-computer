@@ -41,3 +41,18 @@ Before adding anything to `isBuiltinBackedModule` or the primop catalog in `IHC.
 4. **No shims for ordinary Hackage libraries.** Do NOT host-shim `tasty`, `optparse-applicative`, `containers`, `Data.Text`, `aeson`, etc. — even if it's faster to ship. Those are ordinary Haskell; we interpret them. (See the Phase 2.10b abandonment and the tasty/optparse shim removal for precedent.)
 
 If interpreting a module from source reveals a missing language extension, primop, or class-dispatch case, the correct response is to **implement the missing feature**, not to add another shim. This keeps the interpreter honest and exercises the full parser/evaluator path.
+
+## Fixing interpreter bugs: reproduce → fixture → fix → verify
+
+When real Hackage code (warp, IHP, blaze-html, …) fails with an interpreter error, **do not start by editing `src/IHC/`**. Follow this loop — it has a much higher hit rate and ships a regression test with every fix:
+
+1. **Reduce.** Boil the failure down to the smallest standalone `.hs` program that hits the same error signature (same constructor list in the `PatternMatchFail` message, same dispatcher error, etc.). Use a custom ADT so the fixture doesn't depend on having the failing package interpretable end-to-end.
+2. **Fixture.** Drop the reduced program into `test/Fixtures/Coverage/<name>.hs` with a matching `<name>.out` golden-stdout file. The Coverage suite auto-discovers fixtures — no test wiring needed. See the module header in `test/Unsupported.hs` for the Coverage / Unsupported split and graduation rules.
+3. **RED.** Run `direnv exec . cabal test ihc-test` and confirm the fixture fails with the same error signature as the original. If it doesn't, the reduction lost something — refine.
+4. **Fix at the interpreter level.** Parser, scheduler, or evaluator — wherever the bug lives. Do **not** paper over it by adding a host-shim or builtin (the "Builtin modules: minimum surface only" rule above still applies). Add a one-line stderr trace if needed to localise the failure; revert the trace before committing.
+5. **GREEN + baseline.** Re-run `cabal test ihc-test`. Confirm both (a) the new fixture passes, and (b) the existing baseline failure count is unchanged or smaller. A new failure elsewhere means the fix over-corrected and regressed something else.
+6. **Commit fixture + fix together.** One commit, both files. The fixture is now a permanent canary against future regressions.
+
+Worked example: commit `5b1d33c` (`Parser: parseBindingsIn seeds cursor with source line/col, not (1,1)`). One source file (`src/IHC/Parser.hs`) + two fixtures (`test/Fixtures/Coverage/where_multiclause_function.hs`, `where_multiclause_3args.hs`). Tests went 992 → 994 with no change to existing pass/fail counts.
+
+When **not** to use this loop: for language features we genuinely haven't implemented yet (a missing extension, an unknown primop, etc.), the fixture goes under `test/Fixtures/Unsupported/` with a `-- Gap:` comment. The Unsupported suite emits those as `pendingWith`, so they document the gap without breaking CI. Once the feature lands, move the fixture to `test/Fixtures/Coverage/`.

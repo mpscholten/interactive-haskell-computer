@@ -1373,7 +1373,19 @@ runIOVal (VCon "IO" [ft]) = do
     fv <- force ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- apply fv rwT
-    -- result should be (# State#, a #) unboxed tuple
+    case result of
+        VCon _ [_stT, resT] -> force resT
+        other               -> pure other
+-- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
+-- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
+-- 'VCon "STM" [stateFn]'; if we don't unwrap them here, callers that
+-- expect a plain value (e.g. 'atomically' chains, or any 'do'-bind
+-- inside the warp Counter / time-manager paths) end up working on the
+-- wrapper instead of its result and dispatch breaks downstream.
+runIOVal (VCon "STM" [ft]) = do
+    fv <- force ft
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- apply fv rwT
     case result of
         VCon _ [_stT, resT] -> force resT
         other               -> pure other

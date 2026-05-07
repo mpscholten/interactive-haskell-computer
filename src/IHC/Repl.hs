@@ -12,6 +12,7 @@ import Control.Exception (SomeException, throwIO, try)
 import Control.Monad (foldM, unless)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.HashMap.Strict as HashMap
 import Data.IORef
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
@@ -318,9 +319,11 @@ tryDataDecl envRef fieldRegRef src _line = do
                 -- declaration there is considered to have selectors
                 -- enabled since the REPL has no module-level pragma.
                 fieldEnv <- buildFieldEnv fldReg
-                let projEnv = Map.mapKeys (BC.append (BC.pack "$fldProj$")) fieldEnv
+                let projEnv = HashMap.fromList
+                        [ (BC.append (BC.pack "$fldProj$") k, v)
+                        | (k, v) <- HashMap.toList fieldEnv ]
                 modifyIORef' envRef
-                    (Map.union projEnv . Map.union fieldEnv . Map.union conEnv)
+                    (HashMap.union projEnv . HashMap.union fieldEnv . HashMap.union conEnv)
                 -- Accumulate the field registry so subsequent expressions
                 -- can desugar record-construction / record-update / wild
                 -- patterns against the types declared at this prompt.
@@ -374,18 +377,18 @@ tryClassDecl envRef classReg src = do
                                     (classMethodNames decl)
             -- 2. Evaluate default method bodies (if any) in the current
             --    env, producing a slot list keyed by method-name order.
-            defaults <- Map.fromList <$> mapM (\methodName -> do
+            defaults <- HashMap.fromList <$> mapM (\methodName -> do
                             v <- mkDefault env src decl methodName
                             pure (methodName, v))
                         (classMethodNames decl)
-            let existing = [ n | (n, _) <- dispatcherPairs, Map.member n env ]
+            let existing = [ n | (n, _) <- dispatcherPairs, HashMap.member n env ]
             -- Names already bound in the REPL env (builtins like show/==/
             -- compare or earlier user classes) are NOT overwritten — the
             -- existing dispatcher/implementation stays in charge.
-            let newPairs = [ p | p@(n, _) <- dispatcherPairs, not (Map.member n env) ]
-            writeIORef envRef (Map.union (Map.fromList newPairs) env)
+            let newPairs = [ p | p@(n, _) <- dispatcherPairs, not (HashMap.member n env) ]
+            writeIORef envRef (HashMap.union (HashMap.fromList newPairs) env)
             -- Register the default-method list under the sentinel tag.
-            unless (Map.null defaults) $
+            unless (HashMap.null defaults) $
                 registerInstance classReg (classClassName decl)
                                  defaultTypeTag defaults
             let skippedNote
@@ -452,7 +455,7 @@ tryInstanceDecl envRef classReg line = do
         Right (InstanceDecl cls typ typs methods : _) -> do
             env <- readIORef envRef
             r2 <- (try (evalInstanceMethods src env methods)
-                    :: IO (Either SomeException (Map.Map BC.ByteString Val)))
+                    :: IO (Either SomeException (HashMap.HashMap BC.ByteString Val)))
             case r2 of
                 Left err        -> pure (Left (show err))
                 Right methodMap -> do
@@ -475,9 +478,9 @@ evalInstanceMethods
     :: Source
     -> Env
     -> [(BC.ByteString, BindingLhs)]
-    -> IO (Map.Map BC.ByteString Val)
+    -> IO (HashMap.HashMap BC.ByteString Val)
 evalInstanceMethods src env methods =
-    Map.fromList <$> mapM evalOne methods
+    HashMap.fromList <$> mapM evalOne methods
   where
     evalOne (methodName, lhs) = do
         expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
@@ -578,7 +581,7 @@ tryEvalSessionBind loadedRef importsRef fldReg env name rhs = do
                 Left  e   -> pure (Left (show e))
                 Right res -> do
                     slot <- newWHNFThunk res
-                    pure (Right (Map.insert (BC.pack name) slot env'))
+                    pure (Right (HashMap.insert (BC.pack name) slot env'))
 
 -- | Extract the binding name from a REPL-level @let@ declaration.
 -- Returns 'Just name' when the input looks like @let f ...@ with an @=@
@@ -636,7 +639,7 @@ tryEvalLetDecl loadedRef importsRef fldReg env name input = do
             -- that captures the extended env.  This makes the binding
             -- visible to itself (recursion) and to later REPL lines.
             slot <- newIORef (BlackHole "<repl-placeholder>")
-            let env' = Map.insert key slot env0
+            let env' = HashMap.insert key slot env0
             writeIORef slot (Unevaluated (Closure env' emptyIPMap expr))
             pure (Right env')
 
@@ -703,7 +706,7 @@ ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
         [ (imp, fv)
         | fv <- freeVars expr
         , splitQualified fv == Nothing
-        , Map.notMember fv env
+        , not (HashMap.member fv env)
         , imp <- matchingUnqualifiedImports fv imports
         ]
 

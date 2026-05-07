@@ -667,7 +667,21 @@ splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) [] []
             _         -> Just (t, c')
 parseBindingsIn :: Source -> FixityTable -> Span -> IO [Bind]
 parseBindingsIn src fx (start, end) = do
-    let cur0 = Cursor start 1 1
+    -- Seed the lexer cursor with the source's ACTUAL line/col at the
+    -- slice's start byte.  Previously hardcoded to @(1, 1)@, which made
+    -- 'tkCol' for subsequent tokens relative to the slice rather than
+    -- the file — same-column layout checks
+    -- ('collectMoreWhereClauses' for multi-clause where-bindings,
+    -- and the inner @|@-pipe column comparison for guards) only fired
+    -- on the first clause because every later clause sat at a column
+    -- relative to the file but compared against a column relative to
+    -- the slice.  Symptom: warp's
+    -- @foldlChunks f = go where go !a Empty = a ; go !a (Chunk c cs) = ...@
+    -- was parsed as a single @go !a Empty = a@ binding, raising
+    -- 'PatternMatchFail' on every non-Empty input — which warp's HTTP1
+    -- request-body length pass triggered for every incoming request.
+    let (startLine, startCol) = offsetToPos src start
+        cur0    = Cursor start startLine startCol
         provCtx = Ctx src end 0 fx
         (firstTok, curAfter) = nextSig provCtx cur0
     case tkKind firstTok of

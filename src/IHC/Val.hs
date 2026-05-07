@@ -41,6 +41,8 @@ import Control.Exception (Exception)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
+import qualified Data.HashMap.Strict as HashMap
+import Data.HashMap.Strict (HashMap)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Int (Int64)
@@ -105,7 +107,15 @@ data Val
 -- user-inspectable — programs pass them through primops only
 -- ('readIORef', 'hClose', …).
 data PrimObj
-    = PrimIORef  !(IORef Val)
+    -- The slot holds a 'Thunk' (not a 'Val') so 'newIORef $ error msg'
+    -- behaves correctly: in real Haskell, the IORef stores a thunk that
+    -- raises only when read, never at construction time.  Our previous
+    -- 'IORef Val' representation forced the value at @newIORef@, so warp's
+    -- @keepAliveRef <- newIORef $ error \"keepAliveRef not filled\"@
+    -- raised in 'processRequest' before the response handler ran.
+    -- Reads force the thunk on demand; writes install a fresh
+    -- (already-evaluated) thunk via 'newWHNFThunk'.
+    = PrimIORef  !(IORef Thunk)
     | PrimHandle !Handle
     -- Phase 2.8: low-level memory objects for ByteString / ForeignPtr support.
     | PrimForeignPtr !(ForeignPtr Word8)
@@ -213,19 +223,27 @@ newLazyBuiltinThunk mkV = newIORef (LazyBuiltin mkV)
 -- Environments
 --------------------------------------------------------------------------------
 
-type Env = Map Name Thunk
+-- | Phase 2.18: switched to 'Data.HashMap.Strict' for the runtime
+-- environment.  Closure evaluation is dominated by 'EVar' lookups,
+-- where 'Data.Map' was costing log(n) ByteString compares per hit
+-- (~50 bytes per fully-qualified name × ~8 levels deep for a 200-key
+-- env = ~400 byte ops per lookup).  Profiling warp's hello-world
+-- showed the interpreter saturated in 'Data.ByteString.compareBytes'
+-- under @schedule@.  HashMap.lookup costs one hash + at most one
+-- ByteString eq, eliminating the log factor entirely.
+type Env = HashMap Name Thunk
 
 emptyEnv :: Env
-emptyEnv = Map.empty
+emptyEnv = HashMap.empty
 
 extendEnv :: Name -> Thunk -> Env -> Env
-extendEnv = Map.insert
+extendEnv = HashMap.insert
 
 extendEnvMany :: [(Name, Thunk)] -> Env -> Env
-extendEnvMany kvs env = foldr (\(k, v) e -> Map.insert k v e) env kvs
+extendEnvMany kvs env = foldr (\(k, v) e -> HashMap.insert k v e) env kvs
 
 lookupEnv :: Name -> Env -> Maybe Thunk
-lookupEnv = Map.lookup
+lookupEnv = HashMap.lookup
 
 --------------------------------------------------------------------------------
 -- Runtime failures
