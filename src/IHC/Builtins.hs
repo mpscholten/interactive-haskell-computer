@@ -510,7 +510,6 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
     , ("minusForeignPtr",            minusForeignPtrB)
-    , ("Data.ByteString.Internal.Type.minusForeignPtr", minusForeignPtrB)
     , ("GHC.ForeignPtr.minusForeignPtr", minusForeignPtrB)
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
