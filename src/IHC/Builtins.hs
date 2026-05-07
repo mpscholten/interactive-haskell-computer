@@ -67,7 +67,7 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, sizeOf)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -514,6 +514,11 @@ builtins reg =
     , ("plusAddr#",   plusAddrB)
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
+    -- GHC.Prim-only raw-address Int access.  Source-loaded
+    -- GHC.Internal.Storable defines writeIntOffPtr/readIntOffPtr in terms of
+    -- these primops; there is no .hs implementation to interpret below them.
+    , ("readIntOffAddr#",  readIntOffAddrHashB)
+    , ("writeIntOffAddr#", writeIntOffAddrHashB)
     -- Phase 2.8: Ptr arithmetic
     , ("plusPtr",   plusPtrB)
     , ("minusPtr",  minusPtrB)
@@ -2323,7 +2328,8 @@ undefinedB = pure (VIO (error "Prelude.undefined"))
 --------------------------------------------------------------------------------
 -- Monad core. Every builtin here is a plain global binding so Phase
 -- 2.3 class-dispatch can later overlay it with dictionary-threaded
--- versions. The only monad we actually handle here is IO — 'VIO'.
+-- versions. The IO monad appears either as host-backed 'VIO' or as the
+-- source-loaded @IO@ newtype, depending on how far evaluation has gone.
 --------------------------------------------------------------------------------
 
 -- | @return x = VIO (pure x)@. The @x@ thunk is not forced until the
@@ -2340,12 +2346,8 @@ bindDispatch :: ClassRegistry -> IO Val
 bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
     mv <- force ma
     case mv of
-        VIO _ -> pure $ VIO $ do
-            v  <- runIOVal mv
-            kv <- force kt
-            vT <- newWHNFThunk v
-            r  <- apply kv vT
-            runIOVal r
+        VIO _        -> ioBind mv kt
+        VCon "IO" [_] -> ioBind mv kt
         -- ST monad bind:
         -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
@@ -2407,16 +2409,21 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                         vT <- newWHNFThunk v
                         r  <- apply kv vT
                         runIOVal r
+  where
+    ioBind mv kt = pure $ VIO $ do
+        v  <- runIOVal mv
+        kv <- force kt
+        vT <- newWHNFThunk v
+        r  <- apply kv vT
+        runIOVal r
 
 -- | @m >> n@ = run m (discarding result), then run n.
 seqDispatch :: ClassRegistry -> IO Val
 seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
     mv <- force ma
     case mv of
-        VIO _ -> pure $ VIO $ do
-            _ <- runIOVal mv
-            nv <- force mb
-            runIOVal nv
+        VIO _         -> ioSeq mv mb
+        VCon "IO" [_] -> ioSeq mv mb
         -- ST monad seq:
         -- m >> n = m >>= \_ -> n  for ST
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
@@ -2464,6 +2471,11 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
                         _ <- runIOVal mv
                         nv <- force mb
                         runIOVal nv
+  where
+    ioSeq mv mb = pure $ VIO $ do
+        _ <- runIOVal mv
+        nv <- force mb
+        runIOVal nv
 
 -- Strict ST state functions produce unboxed tuples in state-first order,
 -- while lazy ST produces boxed pairs in value-first order. Constructor names
@@ -3104,6 +3116,36 @@ addr2IntB = pure $ VFun $ \a -> do
         VPrimObj (PrimPtr p) ->
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
+
+-- | @readIntOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Int# #)@.
+-- GHC.Prim raw-address access used by source-loaded GHC.Internal.Storable.
+readIntOffAddrHashB :: IO Val
+readIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                      pure $ VFun $ \_stT -> do
+    addrV <- force addrT
+    idxV  <- force idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (castPtr p :: Ptr Int) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            nT  <- newWHNFThunk (VInt (fromIntegral n))
+            pure (VCon "(#,#)" [stT, nT])
+        _ -> error ("readIntOffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeIntOffAddr# :: Addr# -> Int# -> Int# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded GHC.Internal.Storable.
+writeIntOffAddrHashB :: IO Val
+writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                       pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force addrT
+    idxV  <- force idxT
+    valV  <- force valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
+            pokeElemOff (castPtr p :: Ptr Int) (fromIntegral i)
+                        (fromIntegral n :: Int)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: Ptr arithmetic

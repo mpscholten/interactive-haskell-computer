@@ -310,7 +310,8 @@ parseClause src fx (Clause patsSpan rhsSpan) = do
 parsePatsIn :: Source -> FixityTable -> Span -> IO [Pat]
 parsePatsIn src fx (start, end) = do
     let ctx  = Ctx src end 0 fx
-        cur0 = Cursor start 1 1
+        (startLine, startCol) = offsetToPos src start
+        cur0 = Cursor start startLine startCol
     -- Distinguish prefix vs infix LHS.  Prefix form `name pat1 pat2 = body`
     -- expects atomic patterns (constructors with args must be parenthesised:
     -- `f (Just x) y = …`).  Infix form `pat1 op pat2 = body` allows full
@@ -568,8 +569,11 @@ isTrivialPat _        = False
 --------------------------------------------------------------------------------
 
 splitOnWhere :: Source -> Span -> (Span, Maybe Span)
-splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) [] []
+splitOnWhere src (start, end) = go cur0 (0 :: Int) [] []
   where
+    (startLine, startCol) = offsetToPos src start
+    cur0 = Cursor start startLine startCol
+
     -- @depth@: bracket nesting ((/[/{); a @where@ inside brackets can't
     -- be the binding's where.
     -- @caseStack@: stack of @of@-keyword columns currently open.  A
@@ -3643,6 +3647,8 @@ tryQualified ctx firstName firstTok cur0 =
     go acc lastTok cur =
         let (dotTok, curAfterDot) = nextToken src cur in
         case tkKind dotTok of
+            TkDotDot | tkStart dotTok == tkEnd lastTok ->
+                pure (EVar (acc <> BC.pack ".."), curAfterDot)
             TkDot | tkStart dotTok == tkEnd lastTok ->
                 let (segTok, curAfterSeg) = nextToken src curAfterDot in
                 case tkKind segTok of
@@ -3650,6 +3656,9 @@ tryQualified ctx firstName firstTok cur0 =
                         pure (EVar (acc <> BC.pack "." <> n), curAfterSeg)
                     TkConId n | tkStart segTok == tkEnd dotTok ->
                         go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    _ | Just opName <- tokenOpName (tkKind segTok)
+                      , tkStart segTok == tkEnd dotTok ->
+                        pure (EVar (acc <> BC.pack "." <> opName), curAfterSeg)
                     _ -> pure (EVar acc, cur)
             _ -> pure (EVar acc, cur)
 
