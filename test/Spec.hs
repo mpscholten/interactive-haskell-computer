@@ -32,7 +32,6 @@ import qualified Hs2010LexStr
 import qualified Hs2010ExprData
 import qualified Hs2010LexLayout
 import qualified Hs2010DataDecl
-import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ParserBugs
@@ -66,7 +65,6 @@ main = hspec do
     Hs2010ExprData.spec
     Hs2010LexLayout.spec
     Hs2010DataDecl.spec
-    JitSmoke.spec
     CoreLowerTest.spec
     RunFile.spec
     CabalLoader.spec

@@ -30,7 +30,7 @@ The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns o
 - Multi-module loading with qualified imports + per-module `KnownSymbols`.
 - Lambdas (multi-arg + `\case`), sections, backtick infix, `$`, `.`, `MultiWayIf`.
 
-Everything via interpretation — **no JIT path on the runtime today**. The aarch64 JIT from Phase 1 is dormant in `src/IHC/{Jit,Encode,Emit,IR,CodeBuffer,Stdlib}.hs` and `rts/`.
+Everything via interpretation — **no JIT path on the runtime today**.
 
 ## Roadmap
 
@@ -98,7 +98,6 @@ names as positional args to fetch additional tarballs.
 | `src/IHC/Builtins.hs` | host-Haskell primitives (no FFI shims) |
 | `src/IHC/Scheduler.hs` | discovery + multi-module loading + tying-the-knot |
 | `src/IHC/Driver.hs` | CLI entry point: file → search-path → eval → exit code |
-| `src/IHC/Jit.hs` + `src/IHC/{Encode,Emit,IR,CodeBuffer,Stdlib}.hs` + `rts/*` | dormant Phase-1 aarch64 JIT (no longer on runtime path) |
 | `test/RunFile.hs` | golden-output fixture tests |
 | `test/Fixtures/` | `.hs` programs the suite runs |
 

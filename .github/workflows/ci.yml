@@ -8,8 +8,7 @@ on:
 
 jobs:
   build:
-    # Apple Silicon is MANDATORY — the runtime emits aarch64 machine code and
-    # MAP_JIT pages require Apple Silicon semantics; x86_64 cannot run the output.
+    # macos-14 is Apple Silicon — IHC currently only targets Apple Silicon.
     runs-on: macos-14
 
     steps:
@@ -29,20 +28,14 @@ jobs:
       - name: Run pure-interpreter tests (nix flake check)
         run: nix flake check --print-build-logs
 
-      # Two test groups need the cabal build tree (dist-newstyle/...) and
-      # the codesigned ihc binary, so they don't fit inside `nix flake check`:
-      #   * JIT smoke tests — need com.apple.security.cs.allow-jit + MAP_JIT
-      #   * REPL smoke tests — spawn the cabal-built ihc binary as a subprocess
-      # Build the exe + signed test binary once, run both groups against
-      # the same dist tree.
+      # REPL smoke tests need the cabal build tree (dist-newstyle/...)
+      # because they spawn the cabal-built ihc binary as a subprocess —
+      # they don't fit inside `nix flake check`.
       - name: Cabal update (for cabal-tree tests)
         run: nix develop --command cabal update
 
       - name: Build ihc executable (REPL tests spawn it as a subprocess)
         run: nix develop --command cabal build exe:ihc
-
-      - name: Sign test binary (JIT entitlement required on macOS)
-        run: nix develop --command make sign-test
 
       # Three REPL tests are skipped because they assert that something
       # SHOULD be unbound (or that an error message contains "unbound
@@ -51,10 +44,10 @@ jobs:
       # both bleed into bare scope (real REPL scope bug — track separately),
       # and the `readFile` bind-error path emits a different error message
       # now.  Drop the skips when those underlying issues land fixes.
-      - name: Run JIT + REPL tests (need dist-newstyle ihc binary)
+      - name: Run REPL tests (need dist-newstyle ihc binary)
         run: |
           nix develop --command cabal test ihc-test --test-show-details=streaming \
-            --test-options="--match \"JIT smoke test\" --match \"REPL smoke tests\" --skip simple_exports --skip isSubsequenceOf --skip \"session bind error\"" \
+            --test-options="--match \"REPL smoke tests\" --skip simple_exports --skip isSubsequenceOf --skip \"session bind error\"" \
             2>&1 | tee /tmp/ihc-cabal.log; exit ${PIPESTATUS[0]}
 
       - name: Upload cabal test log on failure

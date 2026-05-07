@@ -5,9 +5,8 @@
 -- strict in their numeric arguments (force first), since the
 -- arithmetic operators need actual numbers.
 --
--- These replace the Phase-1 'IHC.Stdlib' C-ABI shims. There is no
--- @foreign export@; the evaluator and the builtins are both Haskell
--- code in the same process, so calls are direct.
+-- The evaluator and the builtins are both Haskell code in the same
+-- process, so calls are direct (no @foreign export@ / FFI bridge).
 module IHC.Builtins
     ( builtinEnv
     , buildConEnv

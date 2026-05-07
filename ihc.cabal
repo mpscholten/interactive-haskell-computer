@@ -59,15 +59,6 @@ library
       , IHC.TypeReduce
       , IHC.TypeUnify
       , IHC.Val
-      -- Dormant Phase-1 JIT machinery, kept in tree but no longer
-      -- on the runtime path. May be re-activated as a tier-2 opt JIT
-      -- once the interpreter supports the full language.
-      , IHC.CodeBuffer
-      , IHC.Emit
-      , IHC.Encode
-      , IHC.IR
-      , IHC.Jit
-      , IHC.Stdlib
     build-depends:
         base             >= 4.19 && < 5
       , bytestring       >= 0.11
@@ -84,21 +75,6 @@ library
       , time             >= 1.12
       , unix             >= 2.8
       , unordered-containers >= 0.2
-
-    c-sources:
-        rts/jit.c
-      , rts/bridge.c
-    -- rts/enter.S will be added once it has real content.
-    include-dirs:
-        rts
-    install-includes:
-        jit.h
-
-    cc-options:
-        -Wall
-        -Wextra
-        -fno-stack-protector
-        -mmacosx-version-min=14.0
 
     -- Interpreter inner loops (env lookup, thunk forcing, class dispatch)
     -- run millions of times during warp-style programs. -O2 unlocks
@@ -117,9 +93,6 @@ executable ihc
       , ihc
       , text
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2
-
-    -- Post-build codesigning must be handled outside cabal (see Makefile /
-    -- scripts/codesign-jit.sh). cabal does not have a portable post-build hook.
 
 executable ihc-parse-probe
     import:           warnings, lang
@@ -180,7 +153,6 @@ test-suite ihc-test
       , Hs2010ExprData
       , Hs2010LexLayout
       , Hs2010DataDecl
-      , JitSmoke
       , LexerIhp
       , NorthStarTest
       , ParserBugs

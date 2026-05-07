@@ -384,10 +384,7 @@
 
         # `nix flake check` builds the project against the nix-pinned source
         # root and runs the pure-interpreter test suite hermetically.
-        # Two suites are skipped here and run in separate CI steps instead:
-        #   * JIT smoke test — needs com.apple.security.cs.allow-jit
-        #     codesigning + MAP_JIT page allocation, neither of which work
-        #     inside the nix build sandbox on macOS.
+        # One suite is skipped here and run in a separate CI step instead:
         #   * REPL smoke tests — spawn the ihc binary at a hard-coded
         #     dist-newstyle/ path that only exists in the cabal build tree.
         checks.ihc-tests =
@@ -397,9 +394,8 @@
             # --test-option= which doesn't survive the cabal/hspec
             # argv-parsing handoff for us here).
             #
-            # Two suites are skipped because they need infrastructure the
+            # One suite is skipped because it needs infrastructure the
             # nix sandbox can't provide:
-            #   * "JIT smoke test" — codesigning + MAP_JIT entitlement
             #   * "REPL smoke tests" — spawn a binary at a hard-coded
             #     dist-newstyle/ path that only exists in the cabal tree
             #
@@ -417,7 +413,6 @@
               export DYLD_LIBRARY_PATH=${ihcCbitsRoot}/lib
               export DYLD_FALLBACK_LIBRARY_PATH=${ihcCbitsRoot}/lib
               ./dist/build/ihc-test/ihc-test \
-                --skip "JIT smoke test" \
                 --skip "REPL smoke tests" \
                 --skip "qualified class methods" \
                 --skip "parse error shows file:line:col" \
@@ -453,7 +448,7 @@
               echo "IHC dev shell — GHC $(ghc --version), cabal $(cabal --version | head -1)" >&2
               echo "Target: macOS / aarch64 only." >&2
               if [ "$(uname -sm)" != "Darwin arm64" ]; then
-                echo "WARNING: not on Darwin arm64 — builds will fail (MAP_JIT + Apple-ABI stencils)." >&2
+                echo "WARNING: not on Darwin arm64 — IHC currently only targets Apple Silicon." >&2
               fi
             fi
 
