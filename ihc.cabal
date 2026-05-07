@@ -10,7 +10,7 @@ build-type:         Simple
 tested-with:        GHC == 9.10.*
 
 common warnings
-    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing -Werror=incomplete-patterns
+    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing -Werror=incomplete-patterns -Werror=incomplete-uni-patterns -Werror=incomplete-record-updates -Werror=missing-fields -Werror=missing-methods
 
 common lang
     default-language: GHC2024

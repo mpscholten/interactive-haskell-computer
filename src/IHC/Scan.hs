@@ -3602,7 +3602,15 @@ collectTypeVars body preds =
             TyApp a b    -> collect a ++ collect b
             TyArrow a b  -> collect a ++ collect b
             TyForall _ _ _ -> []   -- don't descend into nested foralls
-        fromPreds = concatMap (\(Pred _ a) -> collect a) preds
+        -- Mirror 'freeTyVarsPred' in TypeAST: a 'QPred' binds 'vs' over
+        -- its 'ctx' and 'body', so its free vars are the union minus the
+        -- locally bound vars.  No producer of 'QPred' exists yet (B.5b),
+        -- but covering the case keeps -Wincomplete-uni-patterns happy.
+        collectPred (Pred _ a)             = collect a
+        collectPred (QPred vs ctx pbody) =
+            let inner = concatMap collectPred ctx ++ collectPred pbody
+            in filter (`notElem` vs) inner
+        fromPreds = concatMap collectPred preds
         fromBody  = collect body
         -- De-dup preserving order.
         uniq = foldr (\x acc -> if x `elem` acc then acc else x : acc) []
