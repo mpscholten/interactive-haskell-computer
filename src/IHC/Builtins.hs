@@ -373,11 +373,6 @@ builtins reg =
     , ("Data.ByteString.Char8.head",      bs8HeadB)
     , ("Data.ByteString.Char8.index",     bs8IndexB)
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
-    -- Data.Functor.Identity.runIdentity: field accessor. The scanner
-    -- fails to register it (see Scheduler's field-accessor discovery
-    -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
-    , ("runIdentity",                        runIdentityB)
-    , ("Data.Functor.Identity.runIdentity",  runIdentityB)
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
@@ -3360,17 +3355,6 @@ bsPackB = pure $ VFun $ \a -> do
             copyBytes (castPtr dst) (castPtr src) l
         pure newfp
     mkBsVal fp len
-
--- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
--- and forces the payload. Also accepts `Identity { runIdentity = x }`
--- record-constructor form since ihc lowers both to the same VCon shape.
-runIdentityB :: IO Val
-runIdentityB = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VCon "Identity" (tx : _) -> force tx
-        other -> error ("runIdentity: expected Identity wrapper, got "
-                         <> showValForDebug other)
 
 bsUnpackB :: IO Val
 bsUnpackB = pure $ VFun $ \a -> do

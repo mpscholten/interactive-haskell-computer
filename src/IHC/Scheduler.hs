@@ -5102,6 +5102,10 @@ resolveFallbackSource mOwner name = do
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
+        -- runIdentity: Phase C.1 builtins-removal -- force-load
+        -- Data.Functor.Identity so its lmFieldReg enters the global
+        -- pool and tryFieldSlot synthesises the newtype accessor.
+        | bareName == BC.pack "runIdentity" = Just (BC.pack "Data.Functor.Identity")
         | otherwise = Nothing
 
     registerSharedDerivedEnumBounded loaded = do
