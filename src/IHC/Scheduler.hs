@@ -4382,12 +4382,31 @@ loadModule registry searchPath includeMap name = do
                                       -- Cross-run cache hit: fork the
                                       -- cached module so this run gets
                                       -- a private 'lmBodies' / 'lmKnown'
-                                      -- discovery slate. The cached lm
-                                      -- itself stays untouched in
-                                      -- 'globalLoadedModulesRef' so the
-                                      -- next run can fork it again.
+                                      -- discovery slate. We REPLACE the
+                                      -- entry in 'globalLoadedModulesRef'
+                                      -- with the fork so the env-
+                                      -- fallback path (which reads from
+                                      -- the global ref) sees this run's
+                                      -- discovered bodies, not the prior
+                                      -- run's. The skeleton (header,
+                                      -- scanned data/class/instance
+                                      -- decls, type sigs, fixity, FFI
+                                      -- decls, source bytes) is shared
+                                      -- via record-update; only the
+                                      -- mutable IORef fields ('lmBodies'
+                                      -- and 'lmKnown') are private.
+                                      -- Without this, env-fallback's
+                                      -- 'tryAnyModuleBareSlot' walks the
+                                      -- cached lm's stale 'lmBodies' and
+                                      -- misses bindings this run's fork
+                                      -- discovered (e.g.  st_monad_counter's
+                                      -- 'modifySTRef' after a prior
+                                      -- run had only loaded
+                                      -- 'newSTRef'/'readSTRef').
                                       fresh <- forkLoadedModuleForRun lm
                                       modifyIORef' registry (Map.insert name (Loaded fresh))
+                                      modifyIORef' globalLoadedModulesRef
+                                          (Map.insert name fresh)
                                       -- Re-mirror per-module sigs +
                                       -- synonyms into the per-run globals
                                       -- (cleared by 'resetPerRunGlobals').
