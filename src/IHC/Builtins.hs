@@ -355,22 +355,13 @@ builtins reg =
     , ("Data.Unique.hashUnique", hashUniqueB)
     , ("Data.Unique.Really.newUnique", newUniqueB)
     , ("Data.Unique.Really.hashUnique", hashUniqueB)
-    -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
-    -- treat each Char's low 8 bits as a byte. Nearly all other ops
-    -- share Data.ByteString's implementations directly.
-    , ("Data.ByteString.Char8.empty",     bsEmptyB)
-    , ("Data.ByteString.Char8.null",      bsNullB)
-    , ("Data.ByteString.Char8.length",    bsLengthShimB)
-    , ("Data.ByteString.Char8.pack",      bs8PackB)
-    , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
-    , ("Data.ByteString.Char8.append",    bsAppendB)
-    , ("Data.ByteString.Char8.concat",    bsConcatB)
-    , ("Data.ByteString.Char8.take",      bsTakeB)
-    , ("Data.ByteString.Char8.drop",      bsDropB)
-    , ("Data.ByteString.Char8.singleton", bs8SingletonB)
-    , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
-    , ("Data.ByteString.Char8.head",      bs8HeadB)
-    , ("Data.ByteString.Char8.index",     bs8IndexB)
+    -- Data.ByteString.Char8.putStrLn: kept as a host shim because
+    -- source-loaded `hPutStrLn` calls `length ps` against a ByteString,
+    -- but the interpreter's `Prelude hiding (Foldable(..))` handling
+    -- doesn't yet remove `Prelude.length` from scope, so the call
+    -- routes to the polymorphic `length` and fails with
+    -- "length: not a list: <BS...>". Remove this shim once the
+    -- import-hiding dispatch is fixed at the Scheduler level.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- IO
     , ("putStrLn", putStrLnB)
@@ -3497,66 +3488,11 @@ bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
             pure (VInt (fromIntegral w))
 
--- | Data.ByteString.Char8.pack — same runtime value as BS.pack but
--- input is a String ([Char]) with each Char lowered to a Word8 byte.
-bs8PackB :: IO Val
-bs8PackB = pure $ VFun $ \a -> do
-    av <- force a
-    s  <- valToString av
-    bsFromBS (BC.pack s)
-
--- | Data.ByteString.Char8.unpack — BS → String by reading each byte
--- as the corresponding Char (not UTF-8 decoded).
-bs8UnpackB :: IO Val
-bs8UnpackB = pure $ VFun $ \a -> do
-    av <- force a
-    bs <- bsValToBS av
-    stringToListValIO (BC.unpack bs)
-
-bs8SingletonB :: IO Val
-bs8SingletonB = pure $ VFun $ \cT -> do
-    cv <- force cT
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  n  -> pure (toEnum (fromIntegral n))
-        _        -> error ("BS.Char8.singleton: not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.singleton c)
-
-bs8ReplicateB :: IO Val
-bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
-    nv <- force nT; cv <- force cT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.Char8.replicate: first arg not an Int: " <> showValForDebug nv)
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  i  -> pure (toEnum (fromIntegral i))
-        _        -> error ("BS.Char8.replicate: second arg not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.replicate n c)
-
-bs8HeadB :: IO Val
-bs8HeadB = pure $ VFun $ \aT -> do
-    av <- force aT
-    (fp, len) <- bsValPayload av
-    if len <= 0
-        then error "BS.Char8.head: empty ByteString"
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
-            pure (VChar (toEnum (fromIntegral w)))
-
-bs8IndexB :: IO Val
-bs8IndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force aT; iv <- force iT
-    i <- case iv of
-        VInt n -> pure (fromIntegral n :: Int)
-        _      -> error ("BS.Char8.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
-    if i < 0 || i >= len
-        then error ("BS.Char8.index: out of bounds: " <> show i <> " vs length " <> show len)
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
-            pure (VChar (toEnum (fromIntegral w)))
-
+-- | Data.ByteString.Char8.putStrLn — kept as a host shim because
+-- source-loaded `Char8.hPutStrLn` calls Prelude `length` on a ByteString
+-- (the `Prelude hiding (Foldable(..))` import isn't honored yet by the
+-- interpreter's name resolution, so `length` doesn't get redirected to
+-- `Data.ByteString.length`). Remove once that's fixed at the Scheduler.
 bs8PutStrLnB :: IO Val
 bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
