@@ -1086,14 +1086,39 @@ builtins reg =
     , ("Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Exception.fromException", fromExceptionB)
-    -- unIO: inverse of the IO constructor. Source at
-    -- GHC.Internal.Base defines `unIO (IO a) = a`. At the Val level VIO
-    -- hides the state-transformer shape, so we reconstruct a fresh one:
-    -- take a State# token, run the VIO action, wrap the result as
-    -- (# State#, a #).
+    -- =================================================================
+    -- VIO <-> State# bridge -- RTS-exclusive
+    --
+    -- IHC's runtime represents IO as VIO (a host IO action that reduces
+    -- to Val).  Source-level GHC defines `newtype IO a = IO (State#
+    -- RealWorld -> (# State# RealWorld, a #))` -- a state-transformer
+    -- over an unboxed-tuple result.  The two shapes are not
+    -- interconvertible in Haskell source: there is no userland term
+    -- that can coerce between a host IO action and a function consuming
+    -- a State# token (the unboxed-tuple constructor `(#,#)` is a
+    -- wired-in primitive; State# is uninhabited at the source level).
+    -- These bridges sit at the boundary and are compiler-intrinsic in
+    -- the same way that `unsafeCoerce` is -- see the justification at
+    -- `isBuiltinBackedModule`'s `Unsafe.Coerce` clause
+    -- (Scheduler.hs:5493-5500).  Removing them would require giving Val
+    -- a real State#-token shape; that is out of scope.
+    -- =================================================================
+
+    -- unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)
+    -- Source defines `unIO (IO a) = a`; we reconstruct a fresh state
+    -- transformer from a VIO action.  RTS-exclusive: VIO's inner host
+    -- IO action cannot be expressed as a source-level State# function.
     , ("unIO",            unIOB)
     , ("GHC.IO.unIO",     unIOB)
     , ("GHC.Internal.IO.unIO", unIOB)
+    -- ioToST / unsafeIOToST :: IO a -> ST s a
+    -- Source body re-wraps a State# function in the ST newtype.  IHC's
+    -- ST is also a state-transformer at the source level, but the VIO
+    -- carrier needs unwrapping into the host IO before re-wrapping as
+    -- an ST runner -- this transformation crosses the VIO/State#
+    -- boundary and is not source-expressible.  unsafeIOToST is the
+    -- unchecked variant (source uses `unsafeCoerce`, itself compiler-
+    -- intrinsic; see Unsafe.Coerce clause).
     , ("ioToST",          ioToSTB)
     , ("GHC.IO.ioToST",   ioToSTB)
     , ("GHC.Internal.IO.ioToST", ioToSTB)
@@ -1101,6 +1126,11 @@ builtins reg =
     , ("GHC.IO.unsafeIOToST", ioToSTB)
     , ("GHC.Internal.IO.unsafeIOToST", ioToSTB)
     , ("Control.Monad.ST.Unsafe.unsafeIOToST", ioToSTB)
+    -- stToIO / unsafeSTToIO :: ST RealWorld a -> IO a
+    -- Inverse direction: takes an ST's State# function, runs it via
+    -- the host runStateTransformer, packages the result as VIO.  Same
+    -- RTS boundary as ioToST -- runs a source-level State# token
+    -- producer inside the host IO interpreter.
     , ("stToIO",          stToIOB)
     , ("GHC.IO.stToIO",   stToIOB)
     , ("GHC.Internal.IO.stToIO", stToIOB)
@@ -1108,6 +1138,9 @@ builtins reg =
     , ("GHC.IO.unsafeSTToIO", stToIOB)
     , ("GHC.Internal.IO.unsafeSTToIO", stToIOB)
     , ("Control.Monad.ST.Unsafe.unsafeSTToIO", stToIOB)
+    -- =================================================================
+    -- end VIO <-> State# bridge
+    -- =================================================================
     , ("catch",           catchB)
     , ("GHC.IO.catch",    catchB)
     , ("GHC.Internal.IO.catch", catchB)
