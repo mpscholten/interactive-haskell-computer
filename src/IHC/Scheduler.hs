@@ -4434,23 +4434,28 @@ loadModule registry searchPath includeMap name = do
                                       -- Hydrate the per-run registry
                                       -- with all transitively-referenced
                                       -- modules from the cached lm's
-                                      -- bodies. Empirically required:
-                                      -- skipping this caused a hang
-                                      -- (likely a re-export sentinel in
-                                      -- the cached body referencing a
-                                      -- module that the per-run
-                                      -- discovery path didn't pull in,
-                                      -- so an env-fallback lookup
-                                      -- bottomed out in a redirect
-                                      -- loop).  The cost grows with
-                                      -- accumulated cached body size;
-                                      -- if this becomes the dominant
-                                      -- per-fixture cost, follow up
-                                      -- with a memo of "transitive
-                                      -- module references per
-                                      -- LoadedModule" computed once at
-                                      -- registration time.
-                                      hydrateTransitiveImports registry searchPath includeMap lm
+                                      -- bodies. Earlier the hang seen
+                                      -- without this came from
+                                      -- env-fallback finding stale
+                                      -- 'EVar "Foo.bar"' sentinels in
+                                      -- the cached lm's bodies; with
+                                      -- the global cache replacement
+                                      -- above (fork → globalLoadedModulesRef),
+                                      -- env-fallback now reads the
+                                      -- fork's empty bodies instead, so
+                                      -- the stale-sentinel hang
+                                      -- mechanism is gone. Discovery
+                                      -- from this run's @main@ pulls
+                                      -- transitive deps through
+                                      -- 'resolveImport' as it
+                                      -- encounters them, exactly the
+                                      -- path the original (cache-miss)
+                                      -- code took. Skipping hydrate
+                                      -- saves walking accumulated
+                                      -- sentinels (the dominant
+                                      -- per-fixture cost growing with
+                                      -- prior-run discovery state) and
+                                      -- the bulk of the Path B cost.
                                       pure fresh
                                   else do
                                       -- Same-run cache hit (the cache is
