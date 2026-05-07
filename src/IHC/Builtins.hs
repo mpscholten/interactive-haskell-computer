@@ -332,22 +332,6 @@ builtins reg =
     , ("Data.ByteString.singleton", bsSingletonB)
     , ("Data.ByteString.replicate", bsReplicateB)
     , ("Data.ByteString.index",     bsIndexB)
-    -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
-    -- allocation boundaries; the caller-supplied fill action is still
-    -- interpreted, but the mutable memory it writes into must be host-managed.
-    , ("create", bsCreateB)
-    , ("createAndTrim", bsCreateAndTrimB)
-    , ("createFp", bsCreateFpB)
-    , ("createFpAndTrim", bsCreateFpAndTrimB)
-    , ("Data.ByteString.Internal.create", bsCreateB)
-    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.create", bsCreateB)
-    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB)
-    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB)
-    , ("PS", bsPSConB)
-    , ("Data.ByteString.Internal.PS", bsPSConB)
-    , ("Data.ByteString.Internal.Type.PS", bsPSConB)
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
@@ -3259,16 +3243,6 @@ bsValPayload v = case v of
         markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
         pure (fp, BS.length bs)
 
-bsPSConB :: IO Val
-bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
-    fpv <- force fpT
-    offv <- force offT
-    lenv <- force lenT
-    fp <- foreignPtrValToForeignPtr fpv
-    case (offv, lenv) of
-        (VInt off, VInt len) -> mkBsVal (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
-        _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
-
 {-# NOINLINE uniqueCounterRef #-}
 uniqueCounterRef :: IORef Int64
 uniqueCounterRef = unsafePerformIO (newIORef 0)
@@ -3287,72 +3261,6 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VCon "Unique" [nT] -> force nT
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
-
-byteStringCreateLen :: String -> Val -> IO Int
-byteStringCreateLen label val =
-    case val of
-        VInt n -> pure (fromIntegral n)
-        other  -> error (label <> ": callback did not return Int: " <> showValForDebug other)
-
-bsCreateB :: IO Val
-bsCreateB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                _ <- runIOVal rv
-                mkBsVal fp (fromIntegral n)
-        _ -> error ("create: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateAndTrimB :: IO Val
-bsCreateAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            used <- withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                byteStringCreateLen "createAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
-
-bsCreateFpB :: IO Val
-bsCreateFpB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            _ <- runIOVal rv
-            mkBsVal fp (fromIntegral n)
-        _ -> error ("createFp: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateFpAndTrimB :: IO Val
-bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
 
 bsUnpackB :: IO Val
 bsUnpackB = pure $ VFun $ \a -> do
