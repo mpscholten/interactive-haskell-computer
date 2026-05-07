@@ -233,6 +233,16 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                     curSkipped <- skipThroughBinding src name cur'
                     let acc' = if bindName `elem` acc then acc else bindName : acc
                     go acc' curSkipped
+            -- MagicHash value-level identifier at col 1, e.g.
+            -- `compareInt# x# y# = ...` from GHC.Classes.  Treat the
+            -- name (including the trailing @#@) as the binding key.
+            TkPrimId name | tkCol tok == 1 && primIdIsValueLevel name -> do
+                let bindName = case peekInfixOp src cur' of
+                                   Just op -> op
+                                   Nothing -> name
+                curSkipped <- skipThroughBinding src name cur'
+                let acc' = if bindName `elem` acc then acc else bindName : acc
+                go acc' curSkipped
             -- Prefix operator binding: @(|>) x f = ...@.
             -- Or paren-wrapped pattern + backtick infix: @(I# x) \`eqInt\` (I# y) = ...@.
             TkLParen | tkCol tok == 1 -> do
@@ -465,6 +475,15 @@ tokenOpNameBS = \case
     TkSymOp n  -> Just n
     _          -> Nothing
 
+-- | True iff a 'TkPrimId' name is a value-level identifier ending in @#@
+-- (e.g. @compareInt#@, @divInt#@), as opposed to a type/constructor-level
+-- one like @Int#@ or @State#@.  Lowercase-start ⇒ value level.
+primIdIsValueLevel :: ByteString -> Bool
+primIdIsValueLevel bs =
+    case BC.uncons bs of
+        Just (c, _) -> c >= 'a' && c <= 'z'
+        Nothing     -> False
+
 -- | Detect a prefix-form operator binding: @(op) pat* = ...@. The cursor
 -- must be positioned at the @(@ token start (i.e. just before the opening
 -- paren has been consumed).  Returns @Just (opName, cursorAfterCloseParen)@
@@ -561,6 +580,14 @@ findBinding src ref target = do
                     handleTopPattern acc tok cur'
                 | tkCol tok == 1 -> handleTopIdent acc name tok cur'
                 | otherwise      -> go acc cur'
+            -- MagicHash value-level binding at col 1, e.g.
+            -- `compareInt# x# y# = ...` (from GHC.Classes).  These are
+            -- 'TkPrimId' rather than 'TkIdent'; route them through the
+            -- same handler so the trailing-@#@ name is recorded.
+            TkPrimId name
+                | tkCol tok == 1 && primIdIsValueLevel name ->
+                    handleTopIdent acc name tok cur'
+                | otherwise -> go acc cur'
             -- Prefix-form operator binding: @(|>) x f = ...@
             -- Or paren-wrapped-pattern infix binding: @(I# x) \`eqInt\` (I# y) = ...@
             TkLParen | tkCol tok == 1 ->
