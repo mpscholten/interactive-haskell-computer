@@ -42,6 +42,11 @@ Before adding anything to `isBuiltinBackedModule` or the primop catalog in `IHC.
 
 If interpreting a module from source reveals a missing language extension, primop, or class-dispatch case, the correct response is to **implement the missing feature**, not to add another shim. This keeps the interpreter honest and exercises the full parser/evaluator path.
 
+### Tracked carve-outs (known violations, blocked on separate work)
+
+- **`Data.ByteString` shims** at `src/IHC/Builtins.hs:317-375` — source-loading `Data.ByteString` works correctly but takes ~9 minutes to complete because Scheduler discovery cascades through `GHC.Internal.Show`'s transitive closure (see the inline comment at `Builtins.hs:3155-3161`). Tolerated until Scheduler discovery latency is bounded; then the shims graduate by deletion.
+- **VIO ↔ State# bridges** at `src/IHC/Builtins.hs:1089-1140` (`unIO`, `ioToST`/`unsafeIOToST`, `stToIO`/`unsafeSTToIO`) — truly RTS-exclusive. The VIO runtime representation cannot be expressed as a source-level `State# RealWorld -> (# State# RealWorld, a #)` function; these bridges are compiler-intrinsic in the same way `unsafeCoerce` is (see the `Unsafe.Coerce` justification at `Scheduler.hs:5493-5500`). Documented inline; not for removal.
+
 ## Fixing interpreter bugs: reproduce → fixture → fix → verify
 
 When real Hackage code (warp, IHP, blaze-html, …) fails with an interpreter error, **do not start by editing `src/IHC/`**. Follow this loop — it has a much higher hit rate and ships a regression test with every fix:
