@@ -1405,6 +1405,66 @@ primBoolVal :: Bool -> Val
 primBoolVal True  = VInt 1
 primBoolVal False = VInt 0
 
+--------------------------------------------------------------------------------
+-- Primop builder helpers
+--
+-- Many Int#/Char#/Word# primops follow the same shape: force two
+-- arguments, pattern-match on (VInt, VInt) (or extract via
+-- 'charPrimOrd'), apply an operator, wrap the result. The helpers
+-- below collapse those families to one-liners — each primop becomes
+-- a name + operator pair instead of an eight-line copy.
+--------------------------------------------------------------------------------
+
+-- | Binary Int# comparison primop (e.g. <#, ==#, >=#).
+makeIntCmpOp :: String -> (Int64 -> Int64 -> Bool) -> IO Val
+makeIntCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (primBoolVal (op x y))
+        _ -> error (name <> ": bad args: " <> showValForDebug av)
+
+-- | Binary Char# comparison primop. Args are unwrapped through
+-- 'charPrimOrd' (which itself errors on non-Char/Int args).
+makeCharCmpOp :: (Int -> Int -> Bool) -> IO Val
+makeCharCmpOp op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    pure (primBoolVal (op (charPrimOrd av) (charPrimOrd bv)))
+
+-- | Binary Word# comparison primop. The args are reinterpreted as
+-- 'Word64' before applying the operator.
+makeWordCmpOp :: String -> (Word64 -> Word64 -> Bool) -> IO Val
+makeWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) ->
+            pure (primBoolVal (op (fromIntegral x) (fromIntegral y)))
+        _ -> error (name <> ": bad args")
+
+-- | Binary Word# arithmetic primop. The op runs in 'Word64'; the
+-- result is cast back to 'Int64' (storage type for 'VInt').
+makeWordArithOp :: String -> (Word64 -> Word64 -> Word64) -> IO Val
+makeWordArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) ->
+            pure (VInt (fromIntegral (op (fromIntegral x) (fromIntegral y))))
+        _ -> error (name <> ": bad args")
+
+-- | Extract a host IORef from a 'VPrimObj' or fail with a
+-- context-tagged error. Used by readIORef / writeIORef /
+-- modifyIORef / atomicModifyIORef'.
+extractIORef :: String -> Val -> IO (IORef Thunk)
+extractIORef _   (VPrimObj (PrimIORef rf)) = pure rf
+extractIORef ctx v = error (ctx <> ": not an IORef: " <> showValForDebug v)
+
+-- | Coerce a 'Val' (either 'VInt' or 'VChar') to a host 'Word8'.
+-- Used by ByteString primops that accept either a numeric literal
+-- or a character literal.
+valToWord8 :: String -> Val -> IO Word8
+valToWord8 _   (VInt i)  = pure (fromIntegral i)
+valToWord8 _   (VChar c) = pure (fromIntegral (fromEnum c))
+valToWord8 ctx v         = error (ctx <> ": not a Word8: " <> showValForDebug v)
+
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
 isTruthy (VCon "True" _)  = True
@@ -2752,38 +2812,28 @@ newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
 
 readIORefB :: IO Val
 readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimIORef rf) -> do
-            t <- readIORef rf
-            force legacyHooks t
-        _ -> error ("readIORef: not an IORef: " <> showValForDebug av)
+    rf <- force legacyHooks a >>= extractIORef "readIORef"
+    readIORef rf >>= force legacyHooks
 
 writeIORefB :: IO Val
 writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimIORef rf) -> do
-            -- Install the thunk directly; readers force on demand.
-            writeIORef rf b
-            pure VUnit
-        _ -> error ("writeIORef: not an IORef: " <> showValForDebug av)
+    rf <- force legacyHooks a >>= extractIORef "writeIORef"
+    -- Install the thunk directly; readers force on demand.
+    writeIORef rf b
+    pure VUnit
 
 -- | @modifyIORef ref f@. We force f then apply it to a thunk holding
 -- the current ref contents. Works for both the lazy and strict forms
 -- (Phase 2.4 does not differentiate beyond that).
 modifyIORefB :: IO Val
 modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimIORef rf) -> do
-            fv <- force legacyHooks f
-            curT <- readIORef rf
-            new <- apply legacyHooks fv curT
-            newT <- newWHNFThunk new
-            writeIORef rf newT
-            pure VUnit
-        _ -> error ("modifyIORef: not an IORef: " <> showValForDebug av)
+    rf <- force legacyHooks a >>= extractIORef "modifyIORef"
+    fv <- force legacyHooks f
+    curT <- readIORef rf
+    new <- apply legacyHooks fv curT
+    newT <- newWHNFThunk new
+    writeIORef rf newT
+    pure VUnit
 
 -- | @atomicModifyIORef' ref f@ for ihc's host-backed IORef.  This mirrors
 -- the existing IORef builtins and is atomic enough for ihc's single-threaded
@@ -2791,20 +2841,17 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
 -- @new@, and return @result@.
 atomicModifyIORefB :: IO Val
 atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimIORef rf) -> do
-            fv <- force legacyHooks f
-            curT <- readIORef rf
-            pair <- apply legacyHooks fv curT >>= runIOVal legacyHooks
-            case pair of
-                VCon _ [newT, resultT] -> do
-                    result <- force legacyHooks resultT
-                    writeIORef rf newT
-                    pure result
-                _ -> error ("atomicModifyIORef': function did not return a pair: "
-                            <> showValForDebug pair)
-        _ -> error ("atomicModifyIORef': not an IORef: " <> showValForDebug av)
+    rf <- force legacyHooks a >>= extractIORef "atomicModifyIORef'"
+    fv <- force legacyHooks f
+    curT <- readIORef rf
+    pair <- apply legacyHooks fv curT >>= runIOVal legacyHooks
+    case pair of
+        VCon _ [newT, resultT] -> do
+            result <- force legacyHooks resultT
+            writeIORef rf newT
+            pure result
+        _ -> error ("atomicModifyIORef': function did not return a pair: "
+                    <> showValForDebug pair)
 
 mkWeakIORefB :: IO Val
 mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $ do
@@ -3441,23 +3488,16 @@ bsConcatB = pure $ VFun $ \a -> do
 
 bsSingletonB :: IO Val
 bsSingletonB = pure $ VFun $ \wT -> do
-    wv <- force legacyHooks wT
-    w <- case wv of
-        VInt i  -> pure (fromIntegral i :: Word8)
-        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-        _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
+    w <- force legacyHooks wT >>= valToWord8 "BS.singleton"
     bsFromBS (BS.singleton w)
 
 bsReplicateB :: IO Val
 bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
-    nv <- force legacyHooks nT; wv <- force legacyHooks wT
+    nv <- force legacyHooks nT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
         _      -> error ("BS.replicate: first arg not an Int: " <> showValForDebug nv)
-    w <- case wv of
-        VInt i  -> pure (fromIntegral i :: Word8)
-        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-        _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
+    w <- force legacyHooks wT >>= valToWord8 "BS.replicate: second arg"
     bsFromBS (BS.replicate n w)
 
 bsIndexB :: IO Val
@@ -4710,77 +4750,21 @@ timesIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VInt x, VInt y) -> pure (VInt (x * y))
         _ -> error ("*#: bad args: " <> showValForDebug av)
 
-ltIntHashB :: IO Val
-ltIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x < y))
-        _ -> error ("<#: bad args: " <> showValForDebug av)
+ltIntHashB, leIntHashB, eqIntHashB, gtIntHashB, geIntHashB, neIntHashB :: IO Val
+ltIntHashB = makeIntCmpOp "<#"  (<)
+leIntHashB = makeIntCmpOp "<=#" (<=)
+eqIntHashB = makeIntCmpOp "==#" (==)
+gtIntHashB = makeIntCmpOp ">#"  (>)
+geIntHashB = makeIntCmpOp ">=#" (>=)
+neIntHashB = makeIntCmpOp "/=#" (/=)
 
-leIntHashB :: IO Val
-leIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x <= y))
-        _ -> error ("<=#: bad args: " <> showValForDebug av)
-
-eqIntHashB :: IO Val
-eqIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x == y))
-        _ -> error ("==#: bad args: " <> showValForDebug av)
-
-gtIntHashB :: IO Val
-gtIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x > y))
-        _ -> error (">#: bad args: " <> showValForDebug av)
-
-geIntHashB :: IO Val
-geIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x >= y))
-        _ -> error (">=#: bad args: " <> showValForDebug av)
-
-neIntHashB :: IO Val
-neIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x /= y))
-        _ -> error ("/=#: bad args: " <> showValForDebug av)
-
-ltCharHashB :: IO Val
-ltCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av < charPrimOrd bv))
-
-leCharHashB :: IO Val
-leCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av <= charPrimOrd bv))
-
-eqCharHashB :: IO Val
-eqCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av == charPrimOrd bv))
-
-gtCharHashB :: IO Val
-gtCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av > charPrimOrd bv))
-
-geCharHashB :: IO Val
-geCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av >= charPrimOrd bv))
-
-neCharHashB :: IO Val
-neCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    pure (primBoolVal (charPrimOrd av /= charPrimOrd bv))
+ltCharHashB, leCharHashB, eqCharHashB, gtCharHashB, geCharHashB, neCharHashB :: IO Val
+ltCharHashB = makeCharCmpOp (<)
+leCharHashB = makeCharCmpOp (<=)
+eqCharHashB = makeCharCmpOp (==)
+gtCharHashB = makeCharCmpOp (>)
+geCharHashB = makeCharCmpOp (>=)
+neCharHashB = makeCharCmpOp (/=)
 
 charPrimOrd :: Val -> Int
 charPrimOrd (VChar c) = ord c
@@ -4814,80 +4798,19 @@ timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- Phase 2.8: GHC.Exts Word# comparison + arithmetic primops
 --------------------------------------------------------------------------------
 
-ltWordB :: IO Val
-ltWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) < fromIntegral y))
-        _ -> error "ltWord#: bad args"
+ltWordB, leWordB, eqWordB, gtWordB, geWordB :: IO Val
+ltWordB = makeWordCmpOp "ltWord#" (<)
+leWordB = makeWordCmpOp "leWord#" (<=)
+eqWordB = makeWordCmpOp "eqWord#" (==)
+gtWordB = makeWordCmpOp "gtWord#" (>)
+geWordB = makeWordCmpOp "geWord#" (>=)
 
-leWordB :: IO Val
-leWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) <= fromIntegral y))
-        _ -> error "leWord#: bad args"
-
-eqWordB :: IO Val
-eqWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal (x == y))
-        _ -> error "eqWord#: bad args"
-
-gtWordB :: IO Val
-gtWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) > fromIntegral y))
-        _ -> error "gtWord#: bad args"
-
-geWordB :: IO Val
-geWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) >= fromIntegral y))
-        _ -> error "geWord#: bad args"
-
-minusWordB :: IO Val
-minusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VInt (fromIntegral (fromIntegral x - fromIntegral y :: Word64)))
-        _ -> error "minusWord#: bad args"
-
-plusWordB :: IO Val
-plusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VInt (fromIntegral (fromIntegral x + fromIntegral y :: Word64)))
-        _ -> error "plusWord#: bad args"
-
-timesWordB :: IO Val
-timesWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VInt (fromIntegral (fromIntegral x * fromIntegral y :: Word64)))
-        _ -> error "timesWord#: bad args"
-
-quotWordB :: IO Val
-quotWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VInt (fromIntegral ((fromIntegral x :: Word64) `quot` fromIntegral y)))
-        _ -> error "quotWord#: bad args"
-
-remWordB :: IO Val
-remWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (VInt (fromIntegral ((fromIntegral x :: Word64) `rem` fromIntegral y)))
-        _ -> error "remWord#: bad args"
+plusWordB, minusWordB, timesWordB, quotWordB, remWordB :: IO Val
+plusWordB  = makeWordArithOp "plusWord#"  (+)
+minusWordB = makeWordArithOp "minusWord#" (-)
+timesWordB = makeWordArithOp "timesWord#" (*)
+quotWordB  = makeWordArithOp "quotWord#"  quot
+remWordB   = makeWordArithOp "remWord#"   rem
 
 popCntB :: IO Val
 popCntB = pure $ VFun $ \a -> do
