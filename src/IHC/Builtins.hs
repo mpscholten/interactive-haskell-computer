@@ -3848,7 +3848,10 @@ peekSockAddrVal p
                 scope <- peekByteOff (castPtr p :: Ptr Word32) 24 :: IO Word32
                 let port = byteSwap16 portRaw                     -- ntohs
                     flow = byteSwap32 flowRaw                     -- ntohl
-                    [a0,a1,a2,a3] = map byteSwap32 [a0Raw,a1Raw,a2Raw,a3Raw] -- ntohl each
+                    a0 = byteSwap32 a0Raw                         -- ntohl each
+                    a1 = byteSwap32 a1Raw
+                    a2 = byteSwap32 a2Raw
+                    a3 = byteSwap32 a3Raw
                 portT <- newWHNFThunk (VInt (fromIntegral port))
                 flowT <- newWHNFThunk (VInt (fromIntegral flow))
                 addrT <- newWHNFThunk =<< fourTupleVal (map (VInt . fromIntegral) [a0, a1, a2, a3])
