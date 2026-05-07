@@ -783,20 +783,14 @@ builtins reg =
     , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
     , ("Network.Socket.sendBuf", socketSendBufB)
     , ("Network.Socket.recvBuf", socketRecvBufB)
-    , ("settingsPort", warpSettingsPortB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsPort", warpSettingsPortB)
-    , ("settingsHost", warpSettingsHostB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsHost", warpSettingsHostB)
-    , ("settingsTimeout", warpSettingsTimeoutB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsTimeout", warpSettingsTimeoutB)
-    , ("settingsFdCacheDuration", warpSettingsFdCacheDurationB)
-    , ( "Network.Wai.Handler.Warp.Settings.settingsFdCacheDuration"
-      , warpSettingsFdCacheDurationB
-      )
-    , ("settingsFileInfoCacheDuration", warpSettingsFileInfoCacheDurationB)
-    , ( "Network.Wai.Handler.Warp.Settings.settingsFileInfoCacheDuration"
-      , warpSettingsFileInfoCacheDurationB
-      )
+    -- Phase C.3 (builtins-removal): the @Settings@ field accessors
+    -- (settingsPort/Host/Timeout/FdCacheDuration/FileInfoCacheDuration)
+    -- used to live here as positional shims that indexed into a host-
+    -- constructed VCon.  They were removed once defaultSettings became
+    -- source-loaded via Scheduler.preludeDirectOwner: the loaded module
+    -- registers all Settings fields in lmFieldReg, and tryFieldSlot
+    -- synthesises the accessors automatically.  Helpers warpSettings*B
+    -- and settingsFieldB went with them.
     -- Network.Socket AddrInfo record-field accessors.  The host backing
     -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
     -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
@@ -4106,36 +4100,6 @@ freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
     p <- ptrValToPtr ptrV
     free p
     pure VUnit
-
-warpSettingsPortB :: IO Val
-warpSettingsPortB = settingsFieldB "settingsPort" 0
-
-warpSettingsHostB :: IO Val
-warpSettingsHostB = settingsFieldB "settingsHost" 1
-
--- warp's @Settings@ record field order (see
--- ~/.cache/ihc/sources/warp-3.4.12/Network/Wai/Handler/Warp/Settings.hs):
--- 0 settingsPort, 1 settingsHost, 2 settingsOnException,
--- 3 settingsOnExceptionResponse, 4 settingsOnOpen, 5 settingsOnClose,
--- 6 settingsTimeout, 7 settingsManager, 8 settingsFdCacheDuration,
--- 9 settingsFileInfoCacheDuration, ...
-warpSettingsTimeoutB :: IO Val
-warpSettingsTimeoutB = settingsFieldB "settingsTimeout" 6
-
-warpSettingsFdCacheDurationB :: IO Val
-warpSettingsFdCacheDurationB = settingsFieldB "settingsFdCacheDuration" 8
-
-warpSettingsFileInfoCacheDurationB :: IO Val
-warpSettingsFileInfoCacheDurationB =
-    settingsFieldB "settingsFileInfoCacheDuration" 9
-
-settingsFieldB :: String -> Int -> IO Val
-settingsFieldB label idx = pure $ VFun $ \settingsT -> do
-    settingsV <- force settingsT
-    case settingsV of
-        VCon "Settings" fields
-            | idx < length fields -> force (fields !! idx)
-        other -> error (label <> ": not Settings: " <> showValForDebug other)
 
 -- | Generic field accessor for the host-built @VCon "AddrInfo" [flags,
 -- family, socktype, protocol, addr, canonName]@ value.  Used to back
