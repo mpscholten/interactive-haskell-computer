@@ -61,6 +61,7 @@ import Data.List (isPrefixOf, sortOn)
 import Control.Monad (forM, forM_, foldM, when)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
+import qualified System.Environment as SysEnv
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
@@ -4354,11 +4355,14 @@ loadModule registry searchPath includeMap name = do
         Just (Loaded lm) -> pure lm
         Just Loading     -> throwIO (ImportCycle name)
         Nothing -> do
+            keepCache <- keepModuleCacheAcrossRuns
             if isBuiltinBackedModule name
                 then do
                     globalMods <- readIORef globalLoadedModulesRef
                     case Map.lookup name globalMods of
                         Just lm -> do
+                            -- Builtin stubs have empty bodies/known so
+                            -- fork is meaningless; reuse cached as-is.
                             modifyIORef' registry (Map.insert name (Loaded lm))
                             pure lm
                         Nothing -> do
@@ -4373,30 +4377,82 @@ loadModule registry searchPath includeMap name = do
                         Just lm
                           | not (lmIsEntry lm)
                           , srcName (lmSource lm) == path -> do
-                              modifyIORef' registry (Map.insert name (Loaded lm))
-                              -- A previous run's discovery populated
-                              -- 'lmBodies' with sentinel 'EVar
-                              -- "Target.name"' entries for re-exports,
-                              -- and also called 'loadModule' on
-                              -- @Target@ as a side effect via
-                              -- 'resolveImport'.  Serving the cached
-                              -- module skips that side effect, so the
-                              -- referenced modules would be missing
-                              -- from this run's registry and their
-                              -- bindings wouldn't end up in the final
-                              -- env — yielding eval-time unbound
-                              -- variables like
-                              -- @GHC.Internal.Data.OldList.sort@.  Walk
-                              -- the cached bodies, extract every module
-                              -- prefix, and 'loadModule' each to
-                              -- rebuild the transitive closure in the
-                              -- per-run registry.  'loadModule' is
-                              -- idempotent (it short-circuits on
-                              -- per-run hits) and recursively triggers
-                              -- hydration for any cached module it
-                              -- pulls in.
-                              hydrateTransitiveImports registry searchPath includeMap lm
-                              pure lm
+                              if keepCache
+                                  then do
+                                      -- Cross-run cache hit: fork the
+                                      -- cached module so this run gets
+                                      -- a private 'lmBodies' / 'lmKnown'
+                                      -- discovery slate. The cached lm
+                                      -- itself stays untouched in
+                                      -- 'globalLoadedModulesRef' so the
+                                      -- next run can fork it again.
+                                      fresh <- forkLoadedModuleForRun lm
+                                      modifyIORef' registry (Map.insert name (Loaded fresh))
+                                      -- Re-mirror per-module sigs +
+                                      -- synonyms into the per-run globals
+                                      -- (cleared by 'resetPerRunGlobals').
+                                      -- 'registerGlobalLoadedModule' is the
+                                      -- usual mirror site, but we don't
+                                      -- call it on cache hits.
+                                      modifyIORef' globalTypeSigsRef
+                                          (Map.union (lmTypeSigs fresh))
+                                      modifyIORef' globalTypeSynonymsRef
+                                          (Map.union (lmTypeSynonyms fresh))
+                                      -- Catalogue instances against this
+                                      -- run's class registry. No-op until
+                                      -- the scheduler installs the hook
+                                      -- (see 'setRegisterInstancesHook'
+                                      -- in 'loadProgramFromSource').
+                                      -- Empirically required: omitting
+                                      -- this caused hangs after the
+                                      -- knot was tied (lazy fallback
+                                      -- loads of cached modules went
+                                      -- through this hook to register
+                                      -- instances; a missing hook fire
+                                      -- left the new run's class
+                                      -- registry incomplete).
+                                      triggerRegisterInstances name
+                                      -- Hydrate the per-run registry
+                                      -- with all transitively-referenced
+                                      -- modules from the cached lm's
+                                      -- bodies. Empirically required:
+                                      -- skipping this caused a hang
+                                      -- (likely a re-export sentinel in
+                                      -- the cached body referencing a
+                                      -- module that the per-run
+                                      -- discovery path didn't pull in,
+                                      -- so an env-fallback lookup
+                                      -- bottomed out in a redirect
+                                      -- loop).  The cost grows with
+                                      -- accumulated cached body size;
+                                      -- if this becomes the dominant
+                                      -- per-fixture cost, follow up
+                                      -- with a memo of "transitive
+                                      -- module references per
+                                      -- LoadedModule" computed once at
+                                      -- registration time.
+                                      hydrateTransitiveImports registry searchPath includeMap lm
+                                      pure fresh
+                                  else do
+                                      -- Same-run cache hit (the cache is
+                                      -- wiped between runs unless the
+                                      -- flag is on). Original semantics:
+                                      -- a previous discovery in THIS run
+                                      -- populated 'lmBodies' with
+                                      -- sentinel 'EVar "Target.name"'
+                                      -- entries for re-exports, and also
+                                      -- called 'loadModule' on @Target@
+                                      -- as a side effect via
+                                      -- 'resolveImport'. Serving the
+                                      -- cached module here skips the
+                                      -- per-run-registry insertion of
+                                      -- 'Target', so we walk the
+                                      -- cached bodies and load each
+                                      -- referenced module. (Idempotent
+                                      -- via per-run registry hits.)
+                                      modifyIORef' registry (Map.insert name (Loaded lm))
+                                      hydrateTransitiveImports registry searchPath includeMap lm
+                                      pure lm
                         _ -> do
                             src0 <- readSourceFile path
                             let fileDir    = takeDirectory path
@@ -4442,7 +4498,16 @@ globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
 -- instance-scope registries, all of which feed elaborator decisions.
 resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
-    writeIORef globalLoadedModulesRef Map.empty
+    -- 'globalLoadedModulesRef' (the parsed-module skeleton cache) is
+    -- the cross-fixture amortization win: wiping it forces every
+    -- 'loadProgramFromSource' run to re-scan ~155 base modules from
+    -- '~/.cache/ihc/sources/'.  When 'IHC_KEEP_MODULE_CACHE' is set,
+    -- we keep the cache and rely on 'loadModule' forking each entry
+    -- it serves so the new run has a private 'lmBodies' / 'lmKnown'
+    -- state. The cache itself stays pristine.
+    keepCache <- keepModuleCacheAcrossRuns
+    when (not keepCache) $
+        writeIORef globalLoadedModulesRef Map.empty
     writeIORef envFallbackCache       Map.empty
     writeIORef envFallbackNegCacheRef (0, Set.empty)
     writeIORef envFallbackCacheGenRef 0
@@ -5589,6 +5654,82 @@ buildLoadedModule name isEntry header src = do
         , lmTypeSigs         = Map.fromList sigs
         , lmTypeSynonyms     = Map.fromList synonyms
         }
+
+-- | Fork a cached 'LoadedModule' for use in a fresh
+-- 'loadProgramFromSource' run.  Returns a copy that shares all the
+-- expensive-to-rebuild fields (parsed header, scanned data\/class\/
+-- instance decls, type signatures, fixity table, foreign-decl list)
+-- with the cached original, but allocates new IORefs for the per-run
+-- mutable state ('lmBodies' for demand-driven discovery, 'lmKnown'
+-- for the parser's findOrResolveLhs cursor memo).
+--
+-- This is the cornerstone of cross-fixture amortization: the global
+-- 'globalLoadedModulesRef' cache survives 'resetPerRunGlobals' (when
+-- 'IHC_KEEP_MODULE_CACHE' is set), and the cache-hit branch of
+-- 'loadModule' forks each entry it serves so the new run gets a clean
+-- discovery slate without paying re-parse cost.
+--
+-- Without forking, the new run would mutate the cached 'lmBodies'
+-- IORef, which over many runs:
+--
+--   * accumulates an ever-growing union of all runs' discovered
+--     bindings (slowing 'buildAliases'\'s 'namesFromModule' walk —
+--     this is exactly the regression mode of the second reverted
+--     amortization attempt documented at the top of
+--     'loadProgramFromSource');
+--   * leaks 'EVar' sentinels that pointed at OTHER cached modules
+--     ('hydrateTransitiveImports' would re-load those cleanly, but
+--     the 'discoverInModule' cycle that originally inserted them
+--     captured run-specific lookup state).
+--
+-- Forking sidesteps both: the cache holds pristine "skeleton" modules
+-- (their 'lmBodies' contains only the FFI sentinels seeded at
+-- 'buildLoadedModule' time, plus whatever the run that originally
+-- parsed them discovered), and each fresh run gets its own empty
+-- discovery slate seeded with FFI sentinels only.
+forkLoadedModuleForRun :: LoadedModule -> IO LoadedModule
+forkLoadedModuleForRun lm = do
+    bodies <- newIORef Map.empty
+    -- Re-seed FFI sentinels exactly the way 'buildLoadedModule' does.
+    -- Discovery short-circuits on these so they must be present.
+    forM_ (lmForeignDecls lm) $ \decl ->
+        modifyIORef' bodies
+            (Map.insert (FFI.fdName decl)
+                        (EVar (ffiSynthKey (lmName lm) (FFI.fdName decl))))
+    known <- emptyKnownSymbols
+    pure lm { lmBodies = bodies, lmKnown = known }
+
+-- | Whether to preserve 'globalLoadedModulesRef' across
+-- 'loadProgramFromSource' runs (cross-fixture amortization).  Reads
+-- the @IHC_KEEP_MODULE_CACHE@ environment variable; any non-empty
+-- value enables the optimisation.
+--
+-- Off by default while we soak: enabling this changes the cache
+-- semantics in a way that the historical 'envFallbackCache' stale-
+-- closure bug (see 'resetPerRunGlobals') was also touching.  The
+-- forking path in 'loadModule' addresses the lmBodies side; this
+-- flag lets us A/B test before flipping the default.
+--
+-- Result is cached in 'keepModuleCacheRef' on first read — env-var
+-- lookups are slow enough that calling this on every 'loadModule'
+-- (~150 calls per fixture × 250 fixtures ≈ 38k calls) measurably
+-- regresses suite wall-time even when the flag is off.
+{-# NOINLINE keepModuleCacheRef #-}
+keepModuleCacheRef :: IORef (Maybe Bool)
+keepModuleCacheRef = unsafePerformIO (newIORef Nothing)
+
+keepModuleCacheAcrossRuns :: IO Bool
+keepModuleCacheAcrossRuns = do
+    cached <- readIORef keepModuleCacheRef
+    case cached of
+        Just b  -> pure b
+        Nothing -> do
+            m <- SysEnv.lookupEnv "IHC_KEEP_MODULE_CACHE"
+            let b = case m of
+                      Just s | not (null s) -> True
+                      _                     -> False
+            writeIORef keepModuleCacheRef (Just b)
+            pure b
 
 -- | Synthetic env key under which a foreign import's dispatch 'Val' is
 -- registered.  Derived from @(moduleName, haskellName)@ so collisions
