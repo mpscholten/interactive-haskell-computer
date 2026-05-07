@@ -276,11 +276,6 @@ loadProgram = loadProgramFromSource []
 --      slowed call 2 by 50× (2.2 s in 'buildAliases' due to
 --      'namesFromModule' walking inherited fully-populated
 --      'lmBodies').
---
--- Cheap incremental win still on the table: drop
--- @Text.Megaparsec.Internal@ \/ @Text.Megaparsec.Class@ from
--- 'coreInstanceModules' (used by exactly one HSX fixture but force-
--- loaded for every other program).
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Drop accumulated state from any prior 'loadProgramFromSource'
@@ -767,39 +762,49 @@ installCoreInstanceLoadHook classReg baseEnv = do
 -- | Force-load the canonical set of "instance-bearing" modules and
 -- register the instances they declare.  Called at most once per REPL
 -- session via 'installCoreInstanceLoadHook'.
+--
+-- The set of modules to load is derived from @Prelude.hs@ itself:
+-- load @Prelude@, then walk its parsed import list and load each
+-- imported module.  No hardcoded module names — what an
+-- implicit-Prelude Haskell session sees IS what we load.  Instance
+-- coverage automatically follows whatever @Prelude@ re-exports in the
+-- installed @base@ version.
 loadCoreInstanceModules :: ClassRegistry -> Env -> IO ()
 loadCoreInstanceModules classReg baseEnv = do
     cacheWithIncludes <- cachedPackageSearchPathWithIncludes
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = cacheDirs
-        coreModules =
-            [ BC.pack "GHC.Internal.Base"
-            , BC.pack "GHC.Internal.Maybe"
-            , BC.pack "GHC.Internal.Data.Either"
-            ]
     registry <- newIORef Map.empty
-    loaded <- mapM
-        (\m -> do
-            r <- try (loadModule registry fullSearchPath includeMap m)
-                     :: IO (Either SomeException LoadedModule)
-            case r of
-                Right lm -> pure (Just lm)
-                Left  _  -> pure Nothing)
-        coreModules
-    let lms = [lm | Just lm <- loaded]
-    unionInstanceScope (Set.fromList (map lmName lms))
-    classTable <- buildClassMethodTable lms
-    let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg lms)
-    mapM_ (registerInstancesFrom registry fullSearchPath includeMap
-                                 classReg tyCtors classTable baseEnv) lms
-    -- Also mirror into the shared reg (matches the loadImport path).
-    mSharedReg <- readIORef sharedClassRegRef
-    case mSharedReg of
-        Just sharedReg | sharedReg /= classReg ->
+    -- Load Prelude itself.  Its parsed header gives us the canonical
+    -- list of instance-bearing modules to force-load below.
+    rPrelude <- try (loadModule registry fullSearchPath includeMap (BC.pack "Prelude"))
+                    :: IO (Either SomeException LoadedModule)
+    case rPrelude of
+        Left _          -> pure ()       -- no source cache; hook is a no-op
+        Right preludeLm -> do
+            let preludeImports = map impModule (mhImports (lmHeader preludeLm))
+            loadedImports <- mapM
+                (\m -> do
+                    r <- try (loadModule registry fullSearchPath includeMap m)
+                             :: IO (Either SomeException LoadedModule)
+                    case r of
+                        Right lm -> pure (Just lm)
+                        Left  _  -> pure Nothing)
+                preludeImports
+            let lms = preludeLm : [lm | Just lm <- loadedImports]
+            unionInstanceScope (Set.fromList (map lmName lms))
+            classTable <- buildClassMethodTable lms
+            let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg lms)
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
-                                         sharedReg tyCtors classTable baseEnv) lms
-        _ -> pure ()
+                                         classReg tyCtors classTable baseEnv) lms
+            -- Also mirror into the shared reg (matches the loadImport path).
+            mSharedReg <- readIORef sharedClassRegRef
+            case mSharedReg of
+                Just sharedReg | sharedReg /= classReg ->
+                    mapM_ (registerInstancesFrom registry fullSearchPath includeMap
+                                                 sharedReg tyCtors classTable baseEnv) lms
+                _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
 -- @SomeException@, @displayException@ from @GHC.Internal.Exception@
