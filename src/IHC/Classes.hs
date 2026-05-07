@@ -284,8 +284,7 @@ lookupInstanceMulti reg className typeTags = do
 -- This means /every/ call site (the dispatcher, @show@/@==@/@compare@
 -- builtins, the elaborator's @resolveTypedMethod@, …) automatically
 -- gets lazy-registration support without needing to call drain
--- explicitly. Callers that need a strictly-non-mutating lookup can
--- still use 'lookupInstanceMethodRaw'.
+-- explicitly.
 lookupInstanceMethod :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
 lookupInstanceMethod reg className typeTag methodName =
     lookupInstanceMethodMulti reg className [typeTag] methodName
@@ -304,16 +303,6 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
                     mMethods' <- lookupInstanceMulti reg className typeTags
                     pure (mMethods' >>= HashMap.lookup methodName)
                 else pure Nothing
-
--- | Strictly-non-mutating variant of 'lookupInstanceMethod' — does NOT
--- drain the lazy-instance catalogue. Used by call sites that need to
--- distinguish "no instance is registered" from "an instance is
--- catalogued but not yet materialised" without triggering
--- materialisation.
-lookupInstanceMethodRaw :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
-lookupInstanceMethodRaw reg className typeTag methodName = do
-    m <- readIORef reg
-    pure (HashMap.lookup (className, [typeTag]) m >>= HashMap.lookup methodName)
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a

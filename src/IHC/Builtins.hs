@@ -2637,28 +2637,14 @@ sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
     consAppend other _ =
         error ("<>: unexpected list shape: " <> showValForDebug other)
 
--- | @f <*> m = do { fun <- f; v <- m; return (fun v) }@.
---
--- IO-only fallback. Most callers should go through 'apDispatch' so a
--- registered @Applicative@ instance (e.g. @Maybe@, @Either@) wins over
--- the IO interpretation; without that, @Nothing <*> _@ silently
--- collapses to a VIO and downstream apply hits a non-function.
-apB :: IO Val
-apB = pure $ VFun $ \ft -> pure $ VFun $ \mt -> pure $ VIO $ do
-    fv <- force ft
-    f1 <- runIOVal fv
-    mv <- force mt
-    v  <- runIOVal mv
-    vT <- newWHNFThunk v
-    apply f1 vT
 
 -- | Dispatching @<*>@. Forces the first argument and looks up an
 -- @(Applicative, typeTagOf fv)@ entry in the 'ClassRegistry'. If the
 -- first argument's tag has no Applicative instance (e.g. @Nothing@'s
 -- "Nothing" tag may not be registered while only "Just" is), we also try
 -- the second argument's tag — for the same Applicative both sides share
--- the type but distinct constructors. Falls back to the VIO-only
--- behaviour of 'apB' so existing IO uses keep working.
+-- the type but distinct constructors. Falls back to a VIO-only inline
+-- implementation so existing IO uses keep working.
 apDispatch :: ClassRegistry -> IO Val
 apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     fv <- force ft

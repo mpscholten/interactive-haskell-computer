@@ -1482,14 +1482,6 @@ scanDataDecls src
               -> pure (TkEof, cur)
             _       -> peekEqOrWhere cur'
 
-    skipUntilEq :: Cursor -> IO Cursor
-    skipUntilEq cur = do
-        let (tok, cur') = nextToken src cur
-        case tkKind tok of
-            TkEq   -> pure cur'
-            TkEof  -> pure cur
-            _      -> skipUntilEq cur'
-
     -- Collect GADT-form constructors: each line is
     --   CtorName :: [ctx =>] T1 -> T2 -> ... -> ReturnType
     -- We count all '->' arrows at depth 0 and subtract 1 (last arrow
@@ -2493,17 +2485,6 @@ scanInstanceDeclsRaw src
         isJust Nothing  = False
 
         normalize = normalizeTyTag
-
-    skipParens :: Int -> Cursor -> IO Cursor
-    skipParens !d cur
-        | d <= 0    = pure cur
-        | otherwise = do
-            let (tok, cur') = nextToken src cur
-            case tkKind tok of
-                TkLParen -> skipParens (d + 1) cur'
-                TkRParen -> skipParens (d - 1) cur'
-                TkEof    -> pure cur'
-                _        -> skipParens d cur'
 
     collectParens :: Int -> [TokenKind] -> Cursor -> IO ([TokenKind], Cursor)
     collectParens !d !acc cur

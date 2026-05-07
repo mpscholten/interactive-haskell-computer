@@ -593,7 +593,3 @@ tokenize bs
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
 
--- | Minimal monadic foldM — pure; not used yet.
-foldM :: (Monad m) => (b -> a -> m b) -> b -> [a] -> m b
-foldM _ z [] = pure z
-foldM f z (x:xs) = do { z' <- f z x; foldM f z' xs }

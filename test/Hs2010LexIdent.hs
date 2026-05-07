@@ -40,14 +40,6 @@ shouldLexAs bs expected = do
         Left e -> expectationFailure
             ("lexer crashed: " <> show e)
 
-shouldParse :: ByteString -> Expectation
-shouldParse bs = do
-    r <- parseExpr bs
-    case r of
-        Right _ -> pure ()
-        Left e -> expectationFailure
-            ("expected parse success on " <> show bs <> ", got " <> show e)
-
 shouldParseTo :: ByteString -> Expr -> Expectation
 shouldParseTo bs expected = do
     r <- parseExpr bs
