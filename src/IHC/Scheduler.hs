@@ -303,15 +303,6 @@ loadProgramFromSource searchPath src0 = do
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
     installEnvFallbackHook
-    cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
-    let fullSearchPath0 = searchPath ++ map fst cacheWithIncludes0
-        includeMap0     = Map.fromList cacheWithIncludes0
-    setGlobalSearchPath fullSearchPath0 includeMap0
-    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
-    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
-    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
-    -- the nix-built libhs<pkg>-cbits.dylib.
-    FFI.registerCbitsDylibs
     -- Enumerate cached packages once; hs-source-dirs are respected via
     -- parseCabalFile inside cachedPackageSearchPath.
     -- Also collect include-dirs so CPP can find package headers.
@@ -319,6 +310,12 @@ loadProgramFromSource searchPath src0 = do
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = searchPath ++ cacheDirs
+    setGlobalSearchPath fullSearchPath includeMap
+    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
+    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
+    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
+    -- the nix-built libhs<pkg>-cbits.dylib.
+    FFI.registerCbitsDylibs
 
     registry <- newIORef Map.empty
 
