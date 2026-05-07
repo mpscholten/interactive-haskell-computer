@@ -246,28 +246,34 @@ loadProgram = loadProgramFromSource []
 -- @splitmix@, @random@, etc.) are available without the caller having
 -- to enumerate them.
 --
--- == Where the time goes (2026-04-28 profile, @main = 42@, ~3.0 s/call)
+-- == Where the time goes
 --
--- @
--- discoverClassAndInstanceFreeVars   2.22 s   (74%)   ← the dominant cost
--- registerInstancesFrom              0.45 s   (15%)
--- registerClassDefaults              0.30 s   (10%)
--- exportBodies                       0.14 s    (5%)
--- buildAliases                       0.05 s
--- everything else                   ~0.04 s
--- @
+-- A 2026-04-28 profile pegged this at ~3.0 s/call for @main = 42@,
+-- with @discoverClassAndInstanceFreeVars@ alone accounting for 74%
+-- (~2.22 s) by parsing every class-default and instance-method body
+-- across ~155 transitively-loaded modules (~1500 bodies).  Four
+-- lazy-registration stages have since shipped, bringing per-call
+-- cost to roughly 0.5–1.0 s:
 --
--- Even for a trivial program, the scheduler eagerly loads Prelude +
--- 10 \"core instance\" modules, transitively pulling in ~155
--- modules, and 'discoverClassAndInstanceFreeVars' then parses every
--- class default-method and instance-method body across all of them
--- (~1500 method bodies) so 'registerInstancesFrom' / class dispatch
--- can find each body's free-var deps in the per-run registry.
+--   * 'bd1e2bd' — stage 1: stub 'discoverClassAndInstanceFreeVars'
+--     (now a no-op; see line ~5767).
+--   * 'd8e41e4' — stage 2: 'registerInstancesFrom' becomes a
+--     catalogue pass; instance bodies are parsed and registered on
+--     first dispatch via the drain hook in 'lookupInstanceMethod'.
+--   * 'dd04ae1' — stage 3: 'registerClassDefaults' lazified the
+--     same way.
+--   * '4d72f25' — stage 4: drop application-specific entries
+--     (Language.Haskell.TH.Quote, Text.Megaparsec.*) from the eager
+--     core-instance load list, since stages 2–3 catalogue their
+--     instances on demand.
+--   * '8aac0cc' — followup: replace the hardcoded core-instance
+--     module list with a per-package instance manifest
+--     ('IHC.InstanceManifest') queried from each entry module's
+--     free vars.  See the manifest-driven block below.
 --
--- The eager work conflicts with the project's demand-driven north
--- star — fixing it requires lazy instance registration (defer
--- parsing\/registering an instance until something dispatches into
--- it).  Two simpler attempts were tried and reverted:
+-- Two prior amortization attempts were tried and reverted; they
+-- remain load-bearing context for anyone considering cross-fixture
+-- cache reuse:
 --
 --   1. Per-module memo of \"discovery done\" keyed by module name —
 --      gave ~7× speedup on call 2+ but broke 7 fixtures because the
@@ -277,10 +283,9 @@ loadProgram = loadProgramFromSource []
 --      'namesFromModule' walking inherited fully-populated
 --      'lmBodies').
 --
--- Cheap incremental win still on the table: drop
--- @Text.Megaparsec.Internal@ \/ @Text.Megaparsec.Class@ from
--- 'coreInstanceModules' (used by exactly one HSX fixture but force-
--- loaded for every other program).
+-- Cross-fixture amortization is gated on the @envFallbackCache@
+-- stale-Closure issue documented in 'resetPerRunGlobals' below; the
+-- per-run reset is a correctness fix, not a perf knob.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Drop accumulated state from any prior 'loadProgramFromSource'
@@ -5011,10 +5016,9 @@ resolveFallbackSource mOwner name = do
                         , specAllows (impSpec imp) bareName
                         ]
                     -- Implicit Prelude.  Approximate "what Prelude
-                    -- exports" by the set of modules IHC pre-loads as
-                    -- core Prelude scope (see 'coreInstanceModules' in
-                    -- 'loadProgramFromSource').  Skipped only when the
-                    -- owner module sets @NoImplicitPrelude@.
+                    -- exports" by the 'preludeScope' set defined
+                    -- below.  Skipped only when the owner module
+                    -- sets @NoImplicitPrelude@.
                     implicit
                         | hasNoImplicitPrelude (lmSource owner) = []
                         | otherwise = preludeScope
