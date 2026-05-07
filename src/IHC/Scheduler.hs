@@ -83,6 +83,7 @@ import IHC.Classes
     , clearSuperclasses
     , setEnvFallback
     , setCoreInstanceLoadHook
+    , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
     , setThExpToExpr
     , registerSuperclasses
@@ -97,13 +98,14 @@ import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.ModuleHeader
+import qualified IHC.InstanceManifest as Manifest
 import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import qualified IHC.TypeAST
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, seedBuiltinClassMethodSigs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -408,44 +410,44 @@ loadProgramFromSource searchPath src0 = do
                 :: IO (Either SomeException LoadedModule)
         pure ()
 
-    -- Force-load a small set of core modules that provide fundamental
-    -- typeclass instances (Functor/Applicative/Monad for [], Maybe,
-    -- Either; Show/Eq/Ord for primitives; etc.).  Without this, a
-    -- fixture like @main = print (fmap (+10) [1,2,3])@ never triggers
-    -- loading of @GHC.Internal.Base@ because every FV in its body
-    -- (@print@, @fmap@, numeric ops) short-circuits via the builtin
-    -- name set — and an instance that isn't scanned is an instance
-    -- that won't register.  These modules are cheap to parse and
-    -- their instance decls are needed for dispatch-time lookups to
-    -- succeed.
-    -- Stage 4 of the lazy-registration plan: keep ONLY the core
-    -- GHC.Internal modules eager — these provide the instance
-    -- registrations that the env-fallback hook depends on for
-    -- Prelude name resolution. Application-specific modules
-    -- (Language.Haskell.TH.Quote, Text.Megaparsec.*) used to be
-    -- on this list as a workaround for the eager
-    -- 'registerInstancesFrom' pass; with Stage 2 cataloguing them
-    -- lazily the workaround is no longer needed for instance
-    -- registration. (TH.Quote's @QuasiQuoter@ data constructor and
-    -- Megaparsec's class+instance still require the module to be
-    -- /loaded/ — that responsibility moves to the user's source
-    -- via @import Language.Haskell.TH.Quote@ etc., which the
-    -- entry-imports force-load on line 412 already handles.)
-    let coreInstanceModules =
-            [ BC.pack "GHC.Internal.Base"
-            , BC.pack "GHC.Internal.Show"
-            , BC.pack "GHC.Internal.Enum"
-            , BC.pack "GHC.Internal.Ix"
-            , BC.pack "GHC.Internal.Num"
-            , BC.pack "GHC.Internal.Real"
-            , BC.pack "GHC.Internal.Maybe"
-            ]
-    forM_ coreInstanceModules $ \m -> do
-        r <- try (loadModule registry fullSearchPath includeMap m)
-                :: IO (Either SomeException LoadedModule)
-        case r of
-            Right _ -> pure ()
-            Left  _ -> pure ()   -- best-effort; keep going if a module is absent
+    -- Manifest-driven core load.
+    --
+    -- Demand-driven discovery short-circuits at builtin-shimmed names
+    -- ('discoverInModuleWith' at ~line 5610: @Set.member name builtins@),
+    -- so an FV walk over @main = print (fmap (+10) [1,2,3])@ never
+    -- reaches @GHC.Internal.Base@ where @instance Functor []@ lives —
+    -- the call resolves to a builtin, and the walk records a miss.
+    --
+    -- Mirrors GHC's @InstEnv@ population from @.hi@ files.
+    -- 'IHC.InstanceManifest' precomputes a @class → providing modules@
+    -- index by scanning @~/.cache/ihc/sources/@ once per package and
+    -- caches the result on disk.  At program-load time we look up the
+    -- class methods the user's code actually mentions, take the union
+    -- of provider modules across those classes, and load just those.
+    --
+    -- The filter to @GHC.Internal.*@ is a scope decision, not a
+    -- hardcoded module list: it bounds the eager load to the boot
+    -- libraries that are reachable through builtin-shim short-circuits.
+    -- Providers in user-imported packages (Data.Map, lens, aeson, …)
+    -- are still loaded — but through the regular import path
+    -- ('entryImports' force-load above), which fires the auto-register
+    -- hook to catalogue their instances.  Without the filter, every
+    -- class with hundreds of cross-package providers would be loaded
+    -- on every fixture and exhaust the heap.
+    do
+        bodies <- readIORef (lmBodies entry)
+        let entryFvs = Set.fromList
+                [ fv
+                | expr <- Map.elems bodies
+                , fv   <- freeVars expr ++ syntheticClassMethodNames expr
+                ]
+            allProviders = Manifest.providerModulesForMethods Manifest.manifestIndex entryFvs
+            ghcInternalPrefix = BC.pack "GHC.Internal."
+            providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
+        forM_ (Set.toList providers) $ \m -> do
+            _ <- try (loadModule registry fullSearchPath includeMap m)
+                    :: IO (Either SomeException LoadedModule)
+            pure ()
 
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
@@ -602,19 +604,39 @@ loadProgramFromSource searchPath src0 = do
     -- Phase 2.3: scan instance declarations from all loaded modules
     -- and register their method vals into the ClassRegistry. This must
     -- happen AFTER the env is fully tied so instance bodies can see all
-    -- bindings (including recursive ones).
-    do { classTable <- buildClassMethodTable loadedModules; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules }
+    -- bindings (including recursive ones).  Re-read the registry here so
+    -- modules pulled in by 'expandSplicesInModule' (which runs after the
+    -- 'loadedModules' snapshot at the top of this function) participate
+    -- in the registration pass.
+    regAfterSplices <- readIORef registry
+    let loadedModules' = [ lm | (_, Loaded lm) <- Map.toList regAfterSplices ]
+    classTable <- buildClassMethodTable loadedModules'
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules'
+    -- Install the per-load instance-registration hook now that the env
+    -- is fully tied.  Any subsequent 'loadModule' call (typically a lazy
+    -- fallback load via 'resolveFallback') will fire this hook, which
+    -- catalogues the freshly-loaded module's instances against the same
+    -- env the explicit pass above used.  Without this, a module loaded
+    -- on demand after the knot has been tied would have its instances
+    -- ignored entirely.
+    setRegisterInstancesHook $ \modName -> do
+        globalMods <- readIORef globalLoadedModulesRef
+        case Map.lookup modName globalMods of
+            Just lm ->
+                registerInstancesFrom registry fullSearchPath includeMap
+                                      classReg unionedTypeCtors classTable env lm
+            Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
-    registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules
+    registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules'
     -- Synthesize user-derived Functor instances for every @deriving
     -- Functor@ annotated data/newtype decl. Runs after the explicit
     -- instance-registration pass so we can honour any hand-written
     -- @instance Functor T where ...@ already in the registry (the
     -- registrar skips types that already have a Functor dict).
-    registerDerivedFunctorInstances classReg loadedModules
-    registerDerivedEnumBoundedInstances classReg loadedModules
+    registerDerivedFunctorInstances classReg loadedModules'
+    registerDerivedEnumBoundedInstances classReg loadedModules'
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -3262,6 +3284,14 @@ buildClassMethodEnv classReg existing loadedModules = do
     let allMethodNames = Set.fromList
             [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
+    -- Mirror as method→class so the env-fallback can lazily synthesise
+    -- a dispatcher when a class method is referenced before its
+    -- declaring class has been pulled into the env.
+    let methodClassPairs =
+            [ (m, [cls]) | ClassDecl cls ms _ _ <- decls, m <- ms ]
+    modifyIORef' globalMethodClassRef
+        (Map.unionWith (\a b -> a ++ filter (`notElem` a) b)
+                       (Map.fromListWith (++) methodClassPairs))
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
@@ -4377,6 +4407,12 @@ loadModule registry searchPath includeMap name = do
                             lm <- buildLoadedModule declared False header src
                             modifyIORef' registry (Map.insert name (Loaded lm))
                             registerGlobalLoadedModule lm
+                            -- Fire the per-load instance-registration hook
+                            -- (no-op until installed by the scheduler).
+                            -- Catalogues this module's instance decls into
+                            -- the Stage-2 InstanceCatalogue so dispatcher
+                            -- misses can drain them.
+                            triggerRegisterInstances name
                             pure lm
 
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
@@ -4412,6 +4448,7 @@ resetPerRunGlobals = do
     writeIORef globalTypeSigsRef      Map.empty
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
+    writeIORef globalMethodClassRef   Map.empty
     clearInstanceScope
     clearSuperclasses
     clearCtorStrictness
@@ -4425,6 +4462,12 @@ resetPerRunGlobals = do
     -- Clear the catalogue too so closures captured against this
     -- run's 'LoadedModule' state don't fire on the next run.
     resetInstanceCatalogue
+    -- Drop the per-load instance-registration hook installed by the
+    -- previous 'loadProgramFromSource' run.  Without this, any
+    -- 'loadModule' call before the new run's hook is reinstalled would
+    -- fire the previous run's closure — referencing its
+    -- now-defunct ClassRegistry / Env / typeCtors and corrupting state.
+    setRegisterInstancesHook (\_ -> pure ())
     -- Drop the (lm, name) → resolveImport memo from the prior run so
     -- a fresh 'lmName' doesn't see stale resolutions captured against
     -- the previous registry.
@@ -4863,6 +4906,20 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
+                                     -- Class-method dispatcher fallback: when
+                                     -- @bareName@ is a method of a class that
+                                     -- has been scanned (e.g. @Num@'s @abs@),
+                                     -- synthesise a 'classMethodDispatcher' on
+                                     -- the spot. This is the same slot that
+                                     -- 'buildClassMethodEnv' would have built
+                                     -- at startup, but we need it on demand
+                                     -- when the user's reference precedes the
+                                     -- buildClassMethodEnv pass that would
+                                     -- have placed it in the env.
+                                     mMethod <- tryClassMethodFromRegistry bareName
+                                     case mMethod of
+                                      Just slot -> pure (Just slot)
+                                      Nothing -> do
                                         searchPath <- readIORef globalSearchPathRef
                                         includeMap <- readIORef globalIncludeMapRef
                                         transientReg <- newIORef (Map.map Loaded mods)
@@ -4907,6 +4964,30 @@ resolveFallbackSource mOwner name = do
     -- 'findOrResolveLhs' (cheap source scan) and only commit to
     -- discovery on a match.
     tryAnyModuleBareSlot mods bareName = bareSlotIn mods (Map.toList mods) bareName
+
+    -- | When @bareName@ is a class method whose declaring class has
+    -- already been scanned (registered in 'globalMethodClassRef' by
+    -- 'buildClassMethodEnv'), synthesise a fresh
+    -- 'classMethodDispatcher' for it and wrap as a thunk. Mirrors what
+    -- 'buildClassMethodEnv' does at startup, but on demand — needed
+    -- when the user's reference fires before the class entered the env
+    -- (e.g. an entry program with no explicit imports referencing
+    -- @abs@: 'Num' may not be in 'loadedModules' at the original
+    -- 'buildClassMethodEnv' pass).  Returns the first class's
+    -- dispatcher; @classMethodDispatcher@'s own runtime probing covers
+    -- the multi-class-overload case via tag-driven lookup.
+    tryClassMethodFromRegistry bareName = do
+        m <- readIORef globalMethodClassRef
+        case Map.lookup bareName m of
+            Just (cls : _) -> do
+                mReg <- readIORef sharedClassRegRef
+                case mReg of
+                    Just reg -> do
+                        let v = classMethodDispatcher reg cls bareName
+                        slot <- newWHNFThunk v
+                        pure (Just slot)
+                    Nothing -> pure Nothing
+            _ -> pure Nothing
 
     -- | Scoped variant: walk only modules that the @owner@ actually
     -- imports unqualified (or has in scope via implicit Prelude), plus
@@ -6526,6 +6607,53 @@ findOrResolveLhs src known name = do
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
 -- The scheduler uses this list to drive demand-driven discovery.
+-- | Class-method names that the evaluator inserts at runtime but that
+-- never appear as 'EVar' in the parsed AST.  Returned alongside
+-- 'freeVars' when the manifest-driven load needs to know which
+-- typeclasses are exercised by a fixture.
+--
+-- @do@-notation inserts @>>=@ / @>>@ when desugared at eval time;
+-- numeric literals dispatch through @fromInteger@ / @fromRational@;
+-- 'ENeg' dispatches through @negate@.  Without these synthetic
+-- references, programs that use @do { x <- m; ... }@ never trigger a
+-- load of 'Monad' instance providers, and the dispatcher misses.
+syntheticClassMethodNames :: Expr -> [ByteString]
+syntheticClassMethodNames = goExpr
+  where
+    goExpr = \case
+        EDo stmts ->
+            (BC.pack ">>=" : BC.pack ">>" : BC.pack "return" : BC.pack "fail" : [])
+              ++ concatMap goStmt stmts
+        ELit _      -> []
+        EVar _      -> []
+        EApp f x    -> goExpr f ++ goExpr x
+        ELam _ e    -> goExpr e
+        ELet bs e   -> concatMap (goExpr . snd) bs ++ goExpr e
+        ECase s as  -> goExpr s ++ concatMap goAlt as
+        EIf c t e   -> goExpr c ++ goExpr t ++ goExpr e
+        ENeg e      -> BC.pack "negate" : goExpr e
+        ETuple es   -> concatMap goExpr es
+        ERecordCon _ fields    -> concatMap (goExpr . snd) fields
+        ERecordWild _          -> []
+        ERecordUpdate e fields -> goExpr e ++ concatMap (goExpr . snd) fields
+        EImplicitRef _   -> []
+        EImplicitLet bs e -> concatMap (goExpr . snd) bs ++ goExpr e
+        ESplice e   -> goExpr e
+        EQuote _    -> []
+        EQuasiQuote _ _ -> []
+        ELabel _    -> []
+        ETyApp e _  -> goExpr e
+        ETypedMethod{} -> []
+        EGuardFail  -> []
+
+    goStmt (SExpr e)            = goExpr e
+    goStmt (SBind _ e)          = goExpr e
+    goStmt (SBangBind _ e)      = goExpr e
+    goStmt (SLet bs)            = concatMap (goExpr . snd) bs
+    goStmt (SImplicitLet bs)    = concatMap (goExpr . snd) bs
+
+    goAlt (Alt _ e) = goExpr e
+
 freeVars :: Expr -> [ByteString]
 freeVars = goAll []
   where

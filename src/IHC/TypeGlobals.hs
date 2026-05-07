@@ -9,6 +9,7 @@ module IHC.TypeGlobals
     ( globalTypeSigsRef
     , globalTypeSynonymsRef
     , globalClassMethodNamesRef
+    , globalMethodClassRef
     , seedBuiltinClassMethodSigs
     ) where
 
@@ -53,6 +54,18 @@ globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 {-# NOINLINE globalClassMethodNamesRef #-}
 globalClassMethodNamesRef :: IORef (Set ByteString)
 globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
+
+-- | Method-name → declaring-class-names. Used by the env-fallback to
+-- lazily synthesise a class-method dispatcher when a bare reference
+-- (@abs@, @negate@, …) misses the env. Populated alongside
+-- 'globalClassMethodNamesRef' by the scheduler's @buildClassMethodEnv@.
+-- A method may appear in multiple classes (rare, e.g. user code defining
+-- a custom @Foldable@-shadowing class); we keep the list in
+-- registration order and the fallback tries each class until one's
+-- dispatcher resolves.
+{-# NOINLINE globalMethodClassRef #-}
+globalMethodClassRef :: IORef (Map ByteString [ByteString])
+globalMethodClassRef = unsafePerformIO (newIORef Map.empty)
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
@@ -104,10 +117,73 @@ seedBuiltinClassMethodSigs = do
     -- Mirror the seed names into the class-method whitelist so the
     -- elaborator recognises them as actual class methods even before
     -- @scanClassDecls@ runs for the user's modules.
-    modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList
-        [ BC.pack "pure"
-        , BC.pack "return"
-        , BC.pack "mempty"
-        , BC.pack "minBound"
-        , BC.pack "maxBound"
+    modifyIORef' globalClassMethodNamesRef $ Set.union $ Set.fromList $ map BC.pack
+        [ "pure"
+        , "return"
+        , "mempty"
+        , "minBound"
+        , "maxBound"
         ]
+    -- Seed method→class for the builtin numeric/enum/float classes so
+    -- the env-fallback can synthesise a 'classMethodDispatcher' on demand
+    -- when bare references like @abs@ or @negate@ resolve before the
+    -- declaring module's @scanClassDecls@ has populated the registry
+    -- — and to cover the methods the scanner currently misses (multi-name
+    -- sigs like @(+), (-), (*) :: a -> a -> a@ and single-name sigs
+    -- preceded by Haddock comments inside class blocks).
+    modifyIORef' globalMethodClassRef $ Map.unionWith (\a b -> a ++ filter (`notElem` a) b) $
+        Map.fromListWith (++) $ map (\(m, c) -> (BC.pack m, [BC.pack c]))
+            -- Num
+            [ ("+",          "Num")
+            , ("-",          "Num")
+            , ("*",          "Num")
+            , ("negate",     "Num")
+            , ("abs",        "Num")
+            , ("signum",     "Num")
+            , ("fromInteger","Num")
+            -- Enum
+            , ("succ",       "Enum")
+            , ("pred",       "Enum")
+            , ("toEnum",     "Enum")
+            , ("fromEnum",   "Enum")
+            -- Bounded
+            , ("minBound",   "Bounded")
+            , ("maxBound",   "Bounded")
+            -- Fractional
+            , ("/",          "Fractional")
+            , ("recip",      "Fractional")
+            , ("fromRational","Fractional")
+            -- Floating
+            , ("pi",         "Floating")
+            , ("exp",        "Floating")
+            , ("log",        "Floating")
+            , ("sqrt",       "Floating")
+            , ("**",         "Floating")
+            , ("logBase",    "Floating")
+            , ("sin",        "Floating")
+            , ("cos",        "Floating")
+            , ("tan",        "Floating")
+            , ("asin",       "Floating")
+            , ("acos",       "Floating")
+            , ("atan",       "Floating")
+            , ("sinh",       "Floating")
+            , ("cosh",       "Floating")
+            , ("tanh",       "Floating")
+            , ("asinh",      "Floating")
+            , ("acosh",      "Floating")
+            , ("atanh",      "Floating")
+            -- RealFrac
+            , ("properFraction","RealFrac")
+            , ("truncate",   "RealFrac")
+            , ("round",      "RealFrac")
+            , ("ceiling",    "RealFrac")
+            , ("floor",      "RealFrac")
+            -- Foldable
+            , ("length",     "Foldable")
+            -- Applicative / Monad seeds (already in env via builtins, but
+            -- registering the class lets future env-fallbacks dispatch).
+            , ("pure",       "Applicative")
+            , ("return",     "Monad")
+            -- Monoid / Semigroup
+            , ("mempty",     "Monoid")
+            ]
