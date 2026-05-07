@@ -51,6 +51,7 @@ import IHC.AST
 import IHC.Lexer
 import IHC.Scan (Clause(..))
 import IHC.Source
+import IHC.StringUtils (isAsciiSpace)
 
 -- | Run a parser action, converting any pure 'LexError' it forces into a
 -- 'ParseError' so callers see one error type. The lexer raises 'LexError'
@@ -1049,12 +1050,11 @@ parseExpr ctx cur0 = do
         TkDColon -> do
             cur3 <- skipTypeToBinding ctx cur2
             let src     = ctxSrc ctx
-                tyBytes = BC.dropWhile isSpace
+                tyBytes = BC.dropWhile isAsciiSpace
                             (BC.reverse
-                                (BC.dropWhile isSpace
+                                (BC.dropWhile isAsciiSpace
                                     (BC.reverse
                                         (sliceBytes src (cPos cur2, cPos cur3)))))
-                isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
             if BS.null tyBytes
                 then pure (e, cur3)
                 else pure (ETyApp e tyBytes, cur3)

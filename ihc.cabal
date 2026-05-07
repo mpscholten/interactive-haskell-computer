@@ -55,6 +55,7 @@ library
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.StringUtils
       , IHC.TH
       , IHC.TypeAST
       , IHC.TypeDescribe

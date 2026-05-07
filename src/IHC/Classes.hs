@@ -94,6 +94,7 @@ import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr)
+import IHC.StringUtils (trimAscii)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -320,16 +321,12 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
 --   * @42@       (a @Nat@ literal)   → @42@
 --   * @\'x\'@    (a @Char@ literal)   → @x@
 normalizeTyTag :: ByteString -> ByteString
-normalizeTyTag bs0 = stripQuotes (trimSpace (stripParens bs0))
+normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
   where
-    trimSpace s =
-        BC.dropWhile isSpace (BC.reverse (BC.dropWhile isSpace (BC.reverse s)))
-    isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
-
     stripParens s
         | BC.length s >= 2
         , BC.head s == '('
-        , BC.last s == ')'    = stripParens (trimSpace (BC.init (BC.tail s)))
+        , BC.last s == ')'    = stripParens (trimAscii (BC.init (BC.tail s)))
         | otherwise           = s
 
     stripQuotes s
