@@ -34,6 +34,7 @@ library
       , IHC.Builtins
       , IHC.CabalProject
       , IHC.Classes
+      , IHC.Context
       , IHC.Core
       , IHC.Cpp
       , IHC.Diagnostics
@@ -44,6 +45,7 @@ library
       , IHC.FFI
       , IHC.InstanceManifest
       , IHC.Lexer
+      , IHC.Loader.Types
       , IHC.Lower
       , IHC.ModuleHeader
       , IHC.PackageStore
