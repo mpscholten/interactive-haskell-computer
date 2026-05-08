@@ -52,6 +52,10 @@ module IHC.Classes
     , coreInstanceLoadHookRef
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
+      -- * Ctor -> type-name lookup (for source-loaded ADTs)
+    , ctorTypeHookRef
+    , setCtorTypeHook
+    , lookupCtorType
       -- * Per-load instance-registration hook
     , RegisterInstancesHook
     , registerInstancesHookRef
@@ -360,7 +364,23 @@ typeTagOf (VCon "True"  _) = BC.pack "Bool"
 typeTagOf (VCon "False" _) = BC.pack "Bool"
 typeTagOf (VCon "(,)" _)   = BC.pack "(,)"
 typeTagOf (VCon "(,,)" _)  = BC.pack "(,,)"
-typeTagOf (VCon n _)    = n
+-- Common-case ctor -> type-name normalisation for built-in data types
+-- whose instances are registered under the type name, not the
+-- constructor name.  Without this, @<*>@/@>>=@/@<>@ on a 'Just'/'Nothing'
+-- looks for @Applicative Just@ etc. and finds nothing.
+typeTagOf (VCon "Just"    _) = BC.pack "Maybe"
+typeTagOf (VCon "Nothing" _) = BC.pack "Maybe"
+typeTagOf (VCon "Left"    _) = BC.pack "Either"
+typeTagOf (VCon "Right"   _) = BC.pack "Either"
+typeTagOf (VCon n _) =
+    -- For source-loaded ADTs (e.g. warp's @StdMethod = GET | POST | ...@),
+    -- consult the scheduler-installed ctor->type hook so dispatch keys
+    -- on the type name, not the ctor name.  Falls back to the ctor
+    -- name when the hook hasn't been installed (boot, REPL transient
+    -- lookups) or doesn't know about @n@.
+    case unsafePerformIO (lookupCtorType n) of
+        Just ty -> ty
+        Nothing -> n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
@@ -584,6 +604,36 @@ triggerCoreInstanceLoad :: IO ()
 triggerCoreInstanceLoad = do
     hook <- readIORef coreInstanceLoadHookRef
     hook
+
+--------------------------------------------------------------------------------
+-- Ctor -> type-name lookup hook (Section: source-loaded ADT dispatch)
+--
+-- 'typeTagOf' hardcodes a handful of stdlib ctor -> type-name mappings
+-- (Just/Nothing -> Maybe, etc.), but every source-loaded ADT - warp's
+-- 'StdMethod', any user-defined enum, etc. - falls into the @VCon n _ -> n@
+-- arm and surfaces with the ctor name as its type tag.  Class dispatch
+-- then looks for an instance keyed on @"GET"@ instead of @"StdMethod"@
+-- and silently fails, the host @Ix Int@ shim takes over because @Int@
+-- happens to be a dispatchable tag, and the call ends in
+-- @Ix Int.index: non-Int index@.
+--
+-- A scheduler-installed hook supplies the live ctor->type mapping built
+-- from 'lmDataReg' across all loaded modules.  Same pattern as
+-- 'coreInstanceLoadHookRef': default to @const Nothing@ until installed,
+-- @typeTagOf@ peeks via @unsafePerformIO@.
+--------------------------------------------------------------------------------
+
+{-# NOINLINE ctorTypeHookRef #-}
+ctorTypeHookRef :: IORef (ByteString -> Maybe ByteString)
+ctorTypeHookRef = unsafePerformIO (newIORef (const Nothing))
+
+setCtorTypeHook :: (ByteString -> Maybe ByteString) -> IO ()
+setCtorTypeHook = writeIORef ctorTypeHookRef
+
+lookupCtorType :: ByteString -> IO (Maybe ByteString)
+lookupCtorType ctor = do
+    f <- readIORef ctorTypeHookRef
+    pure (f ctor)
 
 --------------------------------------------------------------------------------
 -- Per-load instance-registration hook

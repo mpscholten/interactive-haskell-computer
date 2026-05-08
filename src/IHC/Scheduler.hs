@@ -83,6 +83,7 @@ import IHC.Classes
     , unionInstanceScope, currentInstanceScope, clearInstanceScope
     , clearSuperclasses
     , setEnvFallback
+    , setCtorTypeHook
     , setCoreInstanceLoadHook
     , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
@@ -262,6 +263,11 @@ loadProgramFromSource searchPath src0 = do
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
     installEnvFallbackHook
+    -- Install the ctor -> type-name hook so 'typeTagOf' on a
+    -- source-loaded ADT ctor (e.g. @GET :: StdMethod@) returns the
+    -- type name, not the ctor name -- required for class instance
+    -- dispatch keyed on the type.
+    installCtorTypeHook
     -- Enumerate cached packages once; hs-source-dirs are respected via
     -- parseCabalFile inside cachedPackageSearchPath.
     -- Also collect include-dirs so CPP can find package headers.
@@ -5010,6 +5016,25 @@ installEnvFallbackHook =
                                             then (gen', Set.insert key prevSet)
                                             else (gen', Set.singleton key)
                                 pure Nothing
+
+-- | Install the ctor -> type-name hook used by 'IHC.Classes.typeTagOf'
+-- for source-loaded ADTs.  Without this, dispatch on a value like
+-- @VCon "GET" []@ keys on @"GET"@ instead of @"StdMethod"@; class
+-- instance lookup misses and the fallback host shim takes over with
+-- the wrong type tag.
+--
+-- The hook reads 'globalLoadedModulesRef' on every call so that
+-- modules loaded after install time are still consulted.
+installCtorTypeHook :: IO ()
+installCtorTypeHook =
+    setCtorTypeHook $ \ctor -> unsafePerformIO $ do
+        mods <- readIORef globalLoadedModulesRef
+        let walk [] = Nothing
+            walk (lm : rest) =
+                case Map.lookup ctor (lmDataReg lm) of
+                    Just (tyName, _arity, _idx) -> Just tyName
+                    Nothing                     -> walk rest
+        pure (walk (Map.elems mods))
 
 resolveFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 resolveFallback _mOwner name
