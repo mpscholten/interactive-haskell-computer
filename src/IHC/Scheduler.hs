@@ -5493,6 +5493,19 @@ resolveFallbackSource mOwner name = do
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter" ] = Just (BC.pack "GHC.List")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
+        -- Warp Settings field selectors: when source uses
+        -- @Network.Wai.Handler.Warp.Internal (settingsPort, ...)@,
+        -- the selectors live (data-decl wise) in
+        -- @Network.Wai.Handler.Warp.Settings@; Internal merely
+        -- re-exports them.  Force-loading Settings here populates
+        -- 'lmFieldReg' so 'tryGlobalFieldSlot' can synthesise the
+        -- accessor before 'defaultSettings' itself has been forced.
+        | bareName `elem` [ "settingsPort"
+                          , "settingsHost"
+                          , "settingsTimeout"
+                          , "settingsFdCacheDuration"
+                          , "settingsFileInfoCacheDuration"
+                          ] = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         -- runIdentity: Phase C.1 builtins-removal -- force-load
         -- Data.Functor.Identity so its lmFieldReg enters the global
         -- pool and tryFieldSlot synthesises the newtype accessor.
