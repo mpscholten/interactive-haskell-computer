@@ -5632,7 +5632,7 @@ resolveFallbackSource mOwner name = do
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
                 slot <- newIORef (BlackHole "<fallback-placeholder>")
                 let selfKey = lmName owner <> BC.pack "." <> bareName
-                ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot
+                ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot baseEnv
                 -- Stamp the closure's env with the owning module via
                 -- the @"$$owner"@ sentinel so 'IHC.Eval.currentOwner'
                 -- can scope unqualified-name fallback to this module's
@@ -5719,15 +5719,27 @@ resolveFallbackSource mOwner name = do
                         modifyIORef' (lmBodies owner) (Map.insert bareName expr)
                         buildSlotFromOwner mods owner bareName
 
-    buildOwnerLocalEnv owner bodies bareName selfSlot = do
+    buildOwnerLocalEnv owner bodies bareName selfSlot baseEnv = do
         scanned <- scanAllTopLevelNames (lmSource owner)
             `catch` (\(_ :: SomeException) -> pure [])
         classDecls <- scanClassDecls (lmSource owner)
             `catch` (\(_ :: SomeException) -> pure [])
-        let classMethods =
+        let -- Class-method names declared in the owner module are added
+            -- so that bodies inside the owner can reach the
+            -- class-method-dispatcher slot for them via the FQN
+            -- 'resolveFallback' path.  However, if the bare name already
+            -- has a working binding in 'baseEnv' (a builtin), DO NOT
+            -- shadow it: the source-loaded body's call site (e.g.
+            -- @n `rem` 2@ inside source-loaded @even@) needs the
+            -- builtin's monomorphic Int implementation, not a
+            -- class-method dispatcher whose instance manifest may not
+            -- have been force-loaded yet (instance discovery is
+            -- elaborator-driven; raw 'EVar' bodies skip elaboration).
+            classMethods =
                 [ method
                 | ClassDecl _ methods _ _ <- classDecls
                 , method <- methods
+                , not (HashMap.member method baseEnv)
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
         pairs <- concat <$> mapM mkLocal localNames

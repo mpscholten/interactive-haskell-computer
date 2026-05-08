@@ -303,8 +303,6 @@ builtins reg =
     , (">",        ordDispatch reg 2)
     , (">=",       ordDispatch reg 3)
     , ("compare",  compareDispatch reg)
-    , ("even",     evenB)
-    , ("odd",      oddB)
     , ("not",      notB)
     -- Boolean
     , ("&&",       andB)
@@ -1328,20 +1326,6 @@ notB :: IO Val
 notB = pure $ VFun $ \a -> do
     av <- force a
     pure (boolVal (not (isTruthy av)))
-
-evenB :: IO Val
-evenB = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VInt n -> pure (boolVal (even n))
-        _ -> error ("even: not an Int: " <> showValForDebug av)
-
-oddB :: IO Val
-oddB = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VInt n -> pure (boolVal (odd n))
-        _ -> error ("odd: not an Int: " <> showValForDebug av)
 
 andB :: IO Val
 andB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
