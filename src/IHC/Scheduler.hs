@@ -6118,8 +6118,16 @@ keepModuleCacheAcrossRuns = do
             let b = case m of
                       Just s | not (null s) -> True
                       _                     -> False
-            writeIORef keepModuleCacheRef (Just b)
-            pure b
+            -- Atomically install the cached value.  If another thread
+            -- raced us through the @lookupEnv@ branch and won, honour
+            -- their decision rather than overwriting it; the env-var
+            -- value is invariant within a run, so both branches agree
+            -- on the result anyway, but the atomic CAS gives us proper
+            -- memory ordering on the write/read pair.
+            atomicModifyIORef' keepModuleCacheRef $ \prev ->
+                case prev of
+                    Just p  -> (Just p, p)
+                    Nothing -> (Just b, b)
 
 -- | Synthetic env key under which a foreign import's dispatch 'Val' is
 -- registered.  Derived from @(moduleName, haskellName)@ so collisions
