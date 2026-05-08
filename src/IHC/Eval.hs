@@ -42,6 +42,7 @@ import Control.Exception (try, SomeException)
 import IHC.AST
 import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import qualified IHC.Elaborate as Elab
+import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
@@ -851,6 +852,23 @@ patternVars (PRecord _ fps)  = concatMap (patternVars . snd) fps
 patternVars (PRecordWild _)  = []
 patternVars (PView _ p)      = patternVars p
 
+-- | Attempt to match a constructor pattern against a value via the
+-- pattern synonym registry: if @name@ is registered as a pattern
+-- synonym with parameters @ps@ and body @b@, substitute @ps -> args@
+-- in @b@ and re-match against @v@.  Falls back to 'Nothing' when
+-- @name@ is not a registered synonym (i.e. genuinely an unknown
+-- constructor).
+tryPatSyn :: Name -> [Pat] -> Val -> IO (Maybe [(Name, Thunk)])
+tryPatSyn name args v = do
+    mPs <- PatSyn.lookupPatSyn name
+    case mPs of
+        Just (PatSyn.PatSyn params body)
+            | length params == length args ->
+                let sub   = Map.fromList (zip params args)
+                    body' = PatSyn.substPat sub body
+                in matchPat body' v
+        _ -> pure Nothing
+
 matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
 matchPat PWild        _          = pure (Just [])
 matchPat (PVar n)     v          = do
@@ -1013,7 +1031,7 @@ matchPat pat@(PCon "PS" _) v = do
 -- strict state-passing order.
 matchPat (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
     matchFields [(pState, stateT), (pVal, valT)] []
-matchPat (PCon name pats) (VCon vname vthunks)
+matchPat (PCon name pats) v@(VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For
         -- each pair: if the sub-pattern is a 'PVar' we bind the name
@@ -1022,7 +1040,11 @@ matchPat (PCon name pats) (VCon vname vthunks)
         -- sub-pattern we MUST force the thunk to pattern-match its
         -- structure, then recurse.
         matchFields (zip pats vthunks) []
-    | otherwise = pure Nothing
+    | otherwise =
+        -- Constructor name doesn't match the value's constructor.
+        -- May still succeed via a pattern synonym (e.g.
+        -- @pattern Head x \<- (x:_)@ matched against a non-empty list).
+        tryPatSyn name pats v
   where
     matchFields [] acc = pure (Just (reverse acc))
     matchFields ((PVar n, t) : rest) acc =
@@ -1169,8 +1191,7 @@ matchPat pat@(PCon pname _) (VClassMethod _ _ _ go) = do
     case resolved of
         VClassMethod{} -> pure Nothing
         _              -> matchPat pat resolved
-matchPat (PCon pname ppats) v = do
-    pure Nothing
+matchPat (PCon pname ppats) v = tryPatSyn pname ppats v
 -- Record patterns: should have been desugared to PCon by the scheduler.
 -- If they reach here (e.g. in a standalone test), fall back to failure.
 matchPat (PRecord _ _) _ = pure Nothing

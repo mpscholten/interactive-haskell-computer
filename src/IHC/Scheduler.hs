@@ -104,6 +104,7 @@ import IHC.ModuleHeader
 import qualified IHC.InstanceManifest as Manifest
 import qualified IHC.Parser as Parser
 import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
+import qualified IHC.PatSyn as PatSyn
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
@@ -6040,6 +6041,14 @@ buildLoadedModule name isEntry header src = do
     foreigns            <- scanForeignImports src
     sigs                <- scanTypeSigs src
     synonyms            <- scanTypeSynonyms src
+    -- Pattern synonyms: register every @pattern Name p \<- body@ /
+    -- @pattern Name p = body@ declaration in the global registry so
+    -- @matchPat (PCon Name args)@ can expand them at match time.
+    -- Errors during body parsing are non-fatal — we just skip the
+    -- synonym (it'll behave like an unknown constructor at match time).
+    psDecls <- scanPatternSynonyms src
+    psPairs <- catMaybes <$> mapM (parsePatSynDecl src defaultFixityTable) psDecls
+    PatSyn.registerPatSyns psPairs
     bodies              <- newIORef Map.empty
     -- Pre-populate 'lmBodies' with a sentinel @EVar ffiSynthKey@ for
     -- every scanned 'foreign import ccall' decl.  discoverInModule will
@@ -6154,6 +6163,23 @@ keepModuleCacheAcrossRuns = do
                 case prev of
                     Just p  -> (Just p, p)
                     Nothing -> (Just b, b)
+
+-- | Parse the body of a single pattern synonym declaration.  Returns
+-- 'Nothing' if the body fails to parse (we log nothing and skip the
+-- synonym; matching against its name will then return 'Nothing' from
+-- the constructor path, equivalent to "unknown constructor").
+parsePatSynDecl
+    :: Source
+    -> FixityTable
+    -> PatternSynonymDecl
+    -> IO (Maybe (ByteString, PatSyn.PatSyn))
+parsePatSynDecl src fx decl = do
+    eRes <- try (Parser.parsePatIn src fx (psdBody decl))
+    case eRes of
+        Right body ->
+            let ps = PatSyn.PatSyn (psdParams decl) body
+            in pure (Just (psdName decl, ps))
+        Left (_ :: SomeException) -> pure Nothing
 
 -- | Synthetic env key under which a foreign import's dispatch 'Val' is
 -- registered.  Derived from @(moduleName, haskellName)@ so collisions
