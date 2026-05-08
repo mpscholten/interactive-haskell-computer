@@ -991,14 +991,34 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         out `shouldBe` "0\n0\n"
 
     it "A.2 deferred failure: forcing a var bound by ~(Just x) on Nothing raises" do
-        r <- try (runFile "test/Fixtures/IrrefutablePatterns/lazy_force_failure.hs")
-        case (r :: Either SomeException Int) of
-            Right code -> expectationFailure
-                ("expected deferred match-failure to raise; runFile returned "
-                 <> show code)
+        -- Two acceptable shapes prove the deferred match fires:
+        --
+        --   (a) The host @ErrorCall@ from the irrefutable-pattern check
+        --       escapes through 'runFile'.  This was the original
+        --       behaviour, when the program's @try \@SomeException@
+        --       did not bridge the host exception.
+        --
+        --   (b) The program's own @try@ catches the @ErrorCall@ — the
+        --       exception bridge now routes deferred-match failures
+        --       through 'try' (see e.g. @ee1f498@ "VIO/IO tag bridge,
+        --       SomeException wrap") — so the program runs to
+        --       completion, prints exactly @"deferred\n"@, and
+        --       'runFile' returns 0.
+        --
+        -- Either shape proves the deferred-match semantics: forcing
+        -- the bound var on @Nothing@ DID fire the error.  The wrong
+        -- outcome would be @runFile@ returning 0 with stdout
+        -- @"not deferred (got N)\n"@ (the deferred match silently
+        -- succeeded) — that we still reject.
+        r <- try (captureStdout
+                     (runFile "test/Fixtures/IrrefutablePatterns/lazy_force_failure.hs"))
+        case (r :: Either SomeException (Int, String)) of
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy` (\m -> "Irrefutable pattern failed" `isInfixOf` m)
+            Right (code, out) -> do
+                code `shouldBe` 0
+                out  `shouldBe` "deferred\n"
 
     --------------------------------------------------------------------
     -- A.3 Numeric literals: parse out-of-Int64-range integers as
