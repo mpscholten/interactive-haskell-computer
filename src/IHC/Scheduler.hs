@@ -4829,9 +4829,15 @@ resetPerRunGlobals = do
     -- the cross-fixture amortization win: wiping it forces every
     -- 'loadProgramFromSource' run to re-scan ~155 base modules from
     -- '~/.cache/ihc/sources/'.  When 'IHC_KEEP_MODULE_CACHE' is set,
-    -- we keep the cache and rely on 'loadModule' forking each entry
-    -- it serves so the new run has a private 'lmBodies' / 'lmKnown'
-    -- state. The cache itself stays pristine.
+    -- we keep the cache; 'loadModule' on cache-hit forks each entry
+    -- it serves (fresh 'lmBodies' / 'lmKnown' IORefs) and writes the
+    -- fork back into 'globalLoadedModulesRef' so this run's eval-
+    -- time env-fallback sees this run's discovered bodies, not the
+    -- prior run's. The skeleton fields (header, scanned data/class/
+    -- instance decls, type sigs, fixity table, foreign decls, source
+    -- bytes) are immutable values shared by record-update, so the
+    -- expensive parse work survives intact across the run boundary
+    -- — only 'lmBodies' and 'lmKnown' churn per run.
     keepCache <- keepModuleCacheAcrossRuns
     when (not keepCache) $
         writeIORef globalLoadedModulesRef Map.empty
@@ -6083,7 +6089,11 @@ buildLoadedModule name isEntry header src = do
 -- 'globalLoadedModulesRef' cache survives 'resetPerRunGlobals' (when
 -- 'IHC_KEEP_MODULE_CACHE' is set), and the cache-hit branch of
 -- 'loadModule' forks each entry it serves so the new run gets a clean
--- discovery slate without paying re-parse cost.
+-- discovery slate without paying re-parse cost. The fork is also
+-- written back into 'globalLoadedModulesRef' (replacing the prior
+-- entry) so the eval-time env-fallback path — which reads the global
+-- ref directly — sees this run's discovered bodies rather than the
+-- prior run's stale ones.
 --
 -- Without forking, the new run would mutate the cached 'lmBodies'
 -- IORef, which over many runs:
@@ -6098,11 +6108,21 @@ buildLoadedModule name isEntry header src = do
 --     the 'discoverInModule' cycle that originally inserted them
 --     captured run-specific lookup state).
 --
--- Forking sidesteps both: the cache holds pristine "skeleton" modules
--- (their 'lmBodies' contains only the FFI sentinels seeded at
--- 'buildLoadedModule' time, plus whatever the run that originally
--- parsed them discovered), and each fresh run gets its own empty
--- discovery slate seeded with FFI sentinels only.
+-- Forking sidesteps both: each fresh run starts with empty 'lmBodies'
+-- (just FFI sentinels) and an empty 'lmKnown' parser cursor. The
+-- skeleton fields — 'lmHeader', 'lmSource', 'lmDataReg',
+-- 'lmFieldReg', 'lmTypeCtorReg', 'lmFixity', 'lmForeignDecls',
+-- 'lmTypeSigs', 'lmTypeSynonyms', 'lmTypeFamilies' — are immutable
+-- values shared via record-update, so the expensive parse work
+-- ('scanDataDecls', 'parseModuleHeader', etc.) survives across runs
+-- intact.
+--
+-- After the fork-replaces-cache write, the cached entry's 'lmBodies'
+-- IS THIS run's working state (the fork's IORef). It grows as
+-- discovery in this run inserts bindings. The next run forks from
+-- this evolving lm, again starting with empty bodies — the parse
+-- artefacts in the skeleton fields persist, but the discovery state
+-- does not.
 forkLoadedModuleForRun :: LoadedModule -> IO LoadedModule
 forkLoadedModuleForRun lm = do
     bodies <- newIORef Map.empty
