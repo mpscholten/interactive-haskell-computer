@@ -313,39 +313,25 @@ builtins reg =
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
     , ("length",   lengthB)
-    -- Data.ByteString shims (see isBuiltinBackedModule comment).
-    -- Registered under bare names so qualified-alias fallback
-    -- (`BS.pack` → `EVar "pack"`) hits these. Remove when
-    -- source-load perf is fixed.
-    , ("Data.ByteString.empty",     bsEmptyB)
-    , ("Data.ByteString.null",      bsNullB)
-    , ("Data.ByteString.length",    bsLengthShimB)
-    , ("Data.ByteString.pack",      bsPackB)
+    -- Data.ByteString shims kept as documented carve-outs because
+    -- source-loading bytestring exposes interpreter gaps:
+    --   unpack    — internal recursive function "non-exhaustive patterns"
+    --   append    — `append = mappend`, Monoid dispatch yields a
+    --               <<ihc-method-placeholder>> rather than the BS instance
+    --   concat    — `concat = mconcat`, same Monoid dispatch gap
+    --   singleton — uses `allBytes` 256-byte static buffer; hits
+    --               `expected Ptr: <:>` on the Ptr cons
+    --   replicate — silent wrong output ("/\NUL\NUL" for `replicate 3 65`)
+    --   index     — body calls `length ps`; the polymorphic `length`
+    --               routes to Foldable.length, which has no BS instance
+    -- The other 7 entries (empty, null, length, pack, take, drop, head)
+    -- source-load cleanly and are dropped in this change.
     , ("Data.ByteString.unpack",    bsUnpackB)
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
-    , ("Data.ByteString.take",      bsTakeB)
-    , ("Data.ByteString.drop",      bsDropB)
     , ("Data.ByteString.singleton", bsSingletonB)
     , ("Data.ByteString.replicate", bsReplicateB)
-    , ("Data.ByteString.head",      bsHeadB)
     , ("Data.ByteString.index",     bsIndexB)
-    -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
-    -- allocation boundaries; the caller-supplied fill action is still
-    -- interpreted, but the mutable memory it writes into must be host-managed.
-    , ("create", bsCreateB)
-    , ("createAndTrim", bsCreateAndTrimB)
-    , ("createFp", bsCreateFpB)
-    , ("createFpAndTrim", bsCreateFpAndTrimB)
-    , ("Data.ByteString.Internal.create", bsCreateB)
-    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.create", bsCreateB)
-    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB)
-    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB)
-    , ("PS", bsPSConB)
-    , ("Data.ByteString.Internal.PS", bsPSConB)
-    , ("Data.ByteString.Internal.Type.PS", bsPSConB)
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
@@ -355,22 +341,13 @@ builtins reg =
     , ("Data.Unique.hashUnique", hashUniqueB)
     , ("Data.Unique.Really.newUnique", newUniqueB)
     , ("Data.Unique.Really.hashUnique", hashUniqueB)
-    -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
-    -- treat each Char's low 8 bits as a byte. Nearly all other ops
-    -- share Data.ByteString's implementations directly.
-    , ("Data.ByteString.Char8.empty",     bsEmptyB)
-    , ("Data.ByteString.Char8.null",      bsNullB)
-    , ("Data.ByteString.Char8.length",    bsLengthShimB)
-    , ("Data.ByteString.Char8.pack",      bs8PackB)
-    , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
-    , ("Data.ByteString.Char8.append",    bsAppendB)
-    , ("Data.ByteString.Char8.concat",    bsConcatB)
-    , ("Data.ByteString.Char8.take",      bsTakeB)
-    , ("Data.ByteString.Char8.drop",      bsDropB)
-    , ("Data.ByteString.Char8.singleton", bs8SingletonB)
-    , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
-    , ("Data.ByteString.Char8.head",      bs8HeadB)
-    , ("Data.ByteString.Char8.index",     bs8IndexB)
+    -- Data.ByteString.Char8.putStrLn: kept as a host shim because
+    -- source-loaded `hPutStrLn` calls `length ps` against a ByteString,
+    -- but the interpreter's `Prelude hiding (Foldable(..))` handling
+    -- doesn't yet remove `Prelude.length` from scope, so the call
+    -- routes to the polymorphic `length` and fails with
+    -- "length: not a list: <BS...>". Remove this shim once the
+    -- import-hiding dispatch is fixed at the Scheduler level.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- IO
     , ("putStrLn", putStrLnB)
@@ -543,7 +520,6 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
     , ("minusForeignPtr",            minusForeignPtrB)
-    , ("Data.ByteString.Internal.Type.minusForeignPtr", minusForeignPtrB)
     , ("GHC.ForeignPtr.minusForeignPtr", minusForeignPtrB)
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
@@ -3322,21 +3298,6 @@ bsValPayload v = case v of
         markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
         pure (fp, BS.length bs)
 
-bsEmptyB :: IO Val
-bsEmptyB = do
-    fp <- mallocForeignPtrBytes 0
-    mkBsVal fp 0
-
-bsPSConB :: IO Val
-bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
-    fpv <- force fpT
-    offv <- force offT
-    lenv <- force lenT
-    fp <- foreignPtrValToForeignPtr fpv
-    case (offv, lenv) of
-        (VInt off, VInt len) -> mkBsVal (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
-        _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
-
 {-# NOINLINE uniqueCounterRef #-}
 uniqueCounterRef :: IORef Int64
 uniqueCounterRef = unsafePerformIO (newIORef 0)
@@ -3355,97 +3316,6 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VCon "Unique" [nT] -> force nT
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
-
-byteStringCreateLen :: String -> Val -> IO Int
-byteStringCreateLen label val =
-    case val of
-        VInt n -> pure (fromIntegral n)
-        other  -> error (label <> ": callback did not return Int: " <> showValForDebug other)
-
-bsCreateB :: IO Val
-bsCreateB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                _ <- runIOVal rv
-                mkBsVal fp (fromIntegral n)
-        _ -> error ("create: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateAndTrimB :: IO Val
-bsCreateAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            used <- withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                byteStringCreateLen "createAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
-
-bsCreateFpB :: IO Val
-bsCreateFpB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            _ <- runIOVal rv
-            mkBsVal fp (fromIntegral n)
-        _ -> error ("createFp: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateFpAndTrimB :: IO Val
-bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
-
-bsLengthShimB :: IO Val
-bsLengthShimB = pure $ VFun $ \a -> do
-    av <- force a
-    (_, len) <- bsValPayload av
-    pure (VInt (fromIntegral len))
-
-bsNullB :: IO Val
-bsNullB = pure $ VFun $ \a -> do
-    av <- force a
-    (_, len) <- bsValPayload av
-    pure (VCon (if len == 0 then "True" else "False") [])
-
-bsPackB :: IO Val
-bsPackB = pure $ VFun $ \a -> do
-    av <- force a
-    ws <- valToWord8List av
-    let len = length ws
-        bs  = BS.pack ws
-    fp <- BS.useAsCStringLen bs $ \(ptr, _) -> do
-        newfp <- mallocForeignPtrBytes len
-        withForeignPtr newfp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
-            copyBytes (castPtr dst) (castPtr src) l
-        pure newfp
-    mkBsVal fp len
 
 bsUnpackB :: IO Val
 bsUnpackB = pure $ VFun $ \a -> do
@@ -3491,24 +3361,6 @@ bsConcatB = pure $ VFun $ \a -> do
         (h :) <$> valToBsList tv
     valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
 
-bsTakeB :: IO Val
-bsTakeB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
-    nv <- force nT; av <- force aT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.take: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.take n bs)
-
-bsDropB :: IO Val
-bsDropB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
-    nv <- force nT; av <- force aT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.drop: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.drop n bs)
-
 bsSingletonB :: IO Val
 bsSingletonB = pure $ VFun $ \wT -> do
     wv <- force wT
@@ -3530,16 +3382,6 @@ bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
         _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
     bsFromBS (BS.replicate n w)
 
-bsHeadB :: IO Val
-bsHeadB = pure $ VFun $ \aT -> do
-    av <- force aT
-    (fp, len) <- bsValPayload av
-    if len <= 0
-        then error "BS.head: empty ByteString"
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
-            pure (VInt (fromIntegral w))
-
 bsIndexB :: IO Val
 bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
     av <- force aT; iv <- force iT
@@ -3553,66 +3395,11 @@ bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
             pure (VInt (fromIntegral w))
 
--- | Data.ByteString.Char8.pack — same runtime value as BS.pack but
--- input is a String ([Char]) with each Char lowered to a Word8 byte.
-bs8PackB :: IO Val
-bs8PackB = pure $ VFun $ \a -> do
-    av <- force a
-    s  <- valToString av
-    bsFromBS (BC.pack s)
-
--- | Data.ByteString.Char8.unpack — BS → String by reading each byte
--- as the corresponding Char (not UTF-8 decoded).
-bs8UnpackB :: IO Val
-bs8UnpackB = pure $ VFun $ \a -> do
-    av <- force a
-    bs <- bsValToBS av
-    stringToListValIO (BC.unpack bs)
-
-bs8SingletonB :: IO Val
-bs8SingletonB = pure $ VFun $ \cT -> do
-    cv <- force cT
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  n  -> pure (toEnum (fromIntegral n))
-        _        -> error ("BS.Char8.singleton: not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.singleton c)
-
-bs8ReplicateB :: IO Val
-bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
-    nv <- force nT; cv <- force cT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.Char8.replicate: first arg not an Int: " <> showValForDebug nv)
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  i  -> pure (toEnum (fromIntegral i))
-        _        -> error ("BS.Char8.replicate: second arg not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.replicate n c)
-
-bs8HeadB :: IO Val
-bs8HeadB = pure $ VFun $ \aT -> do
-    av <- force aT
-    (fp, len) <- bsValPayload av
-    if len <= 0
-        then error "BS.Char8.head: empty ByteString"
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
-            pure (VChar (toEnum (fromIntegral w)))
-
-bs8IndexB :: IO Val
-bs8IndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force aT; iv <- force iT
-    i <- case iv of
-        VInt n -> pure (fromIntegral n :: Int)
-        _      -> error ("BS.Char8.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
-    if i < 0 || i >= len
-        then error ("BS.Char8.index: out of bounds: " <> show i <> " vs length " <> show len)
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
-            pure (VChar (toEnum (fromIntegral w)))
-
+-- | Data.ByteString.Char8.putStrLn — kept as a host shim because
+-- source-loaded `Char8.hPutStrLn` calls Prelude `length` on a ByteString
+-- (the `Prelude hiding (Foldable(..))` import isn't honored yet by the
+-- interpreter's name resolution, so `length` doesn't get redirected to
+-- `Data.ByteString.length`). Remove once that's fixed at the Scheduler.
 bs8PutStrLnB :: IO Val
 bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force a
@@ -3620,22 +3407,6 @@ bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     BC.putStrLn bs
     hFlush stdout
     pure VUnit
-
-valToWord8List :: Val -> IO [Word8]
-valToWord8List v0 = go v0
-  where
-    go (VCon "[]" _)        = pure []
-    go (VStr s)             = pure (BS.unpack s)
-    go (VCon ":" [hT, tT])  = do
-        hv <- force hT
-        w  <- case hv of
-            VInt n  -> pure (fromIntegral n :: Word8)
-            VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-            _       -> error ("BS.pack: element not a Word8: " <> showValForDebug hv)
-        tv <- force tT
-        ws <- go tv
-        pure (w : ws)
-    go other = error ("BS.pack: expected [Word8] list, got " <> showValForDebug other)
 
 wordsToConsList :: [Word8] -> IO Val
 wordsToConsList []     = pure (VCon "[]" [])

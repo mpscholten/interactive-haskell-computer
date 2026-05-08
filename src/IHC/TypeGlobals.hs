@@ -186,4 +186,7 @@ seedBuiltinClassMethodSigs = do
             , ("return",     "Monad")
             -- Monoid / Semigroup
             , ("mempty",     "Monoid")
+            , ("mappend",    "Monoid")
+            , ("mconcat",    "Monoid")
+            , ("<>",         "Semigroup")
             ]
