@@ -368,9 +368,14 @@ builtins reg =
     -- existing primop boundary. See plan
     --     ~/.claude/plans/why-is-ihc-test-taking-silly-mango.md
     -- for the multi-slice arc.
-    , ("putStr",   putStrB)
+    --
+    -- Slice 2 (this commit): 'putStr' and 'putChar' graduate to source-
+    -- loaded under the same rule. Source bodies are
+    --     putStr s   =  hPutStr stdout s        -- System/IO.hs:278
+    --     putChar c  =  hPutChar stdout c       -- System/IO.hs:272
+    -- Both bottom out on host shims already pinned via 'ffiBuiltinNames'
+    -- in slice 1 (hPutStr, hPutChar, stdout).
     , ("print",    printDispatch reg)
-    , ("putChar",  putCharB)
     , ("getLine",  getLineB)
     -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
     -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
@@ -2286,13 +2291,11 @@ lengthB = pure $ VFun $ \a -> do
 -- See the comment next to the (now-deleted) "putStrLn" entry in
 -- 'builtins' above.
 
-putStrB :: IO Val
-putStrB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- valToString av
-    putStr s
-    hFlush stdout
-    pure VUnit
+-- 'putStrB' / 'putCharB' were removed in the slice-2 cleanup —
+-- 'putStr' and 'putChar' are now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:278 / :272.
+-- See the comment next to the (now-deleted) "putStr"/"putChar" entries
+-- in 'builtins' above.
 
 -- printB replaced by printDispatch in Phase 2.3
 
@@ -2303,14 +2306,6 @@ printDispatch reg = pure $ VFun $ \a -> pure $ VIO $ do
     putStrLn s
     hFlush stdout
     pure VUnit
-
-putCharB :: IO Val
-putCharB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    case av of
-        VChar c -> do { putChar c; hFlush stdout; pure VUnit }
-        VInt c  -> do { putChar (toEnum (fromIntegral c)); hFlush stdout; pure VUnit }
-        _ -> error ("putChar: not a Char: " <> showValForDebug av)
 
 -- | 'getLine' — zero-arity IO action. We register the VIO directly
 -- (no dummy-thunk wrapper like Phase 2.2/3). Reading from the env
