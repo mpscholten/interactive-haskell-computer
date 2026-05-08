@@ -424,7 +424,15 @@ builtins reg =
     , ("GHC.Internal.Base.<>", sappendDispatch reg)
     , ("Prelude.<>", sappendDispatch reg)
     , ("Data.Semigroup.<>", sappendDispatch reg)
-    , ("join",     joinB)
+    --
+    -- 'join' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
+    --     join :: Monad m => m (m a) -> m a
+    --     join x = x >>= id
+    -- The source dispatches via the Monad class — '>>=' is still
+    -- shimmed ('bindDispatch reg' below) so the IO/Maybe/Either
+    -- variants reach their existing dispatcher; user-defined Monad
+    -- instances flow through the registry the same way.
     --
     -- 'void' deliberately omitted: it has source at
     -- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211
@@ -2650,11 +2658,10 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                   <> BC.unpack (typeTagOf fv) <> "`" )
 
 -- | @join mm = do { m <- mm; m }@.
-joinB :: IO Val
-joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
-    mv <- force mmt
-    inner <- runIOVal mv
-    runIOVal inner
+-- 'joinB' was removed in slice 5b — 'join' is now interpreted from
+-- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
+-- ('join x = x >>= id'). See the comment next to the (now-deleted)
+-- "join" entry in 'builtins' above.
 
 -- 'voidB' was removed in slice 5a — 'void' is now interpreted from
 -- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211. See the
