@@ -716,12 +716,13 @@ buildBaseEnv = do
     -- 'resolveFallback' can reach builtins + class dispatchers.
     writeIORef envBaseForFallbackRef env3
     -- Install the core-instance load hook: on the first elaborator
-    -- lookup miss ('IHC.Eval.resolveTypedMethod'), force-load
-    -- GHC.Internal.Base / Maybe / … so their Applicative / Monad /
-    -- Functor dicts are in the registry.  One-shot (guarded by an
-    -- IORef flag); later calls are free.  Kept out of startup so the
-    -- bare REPL prompt stays fast for users who never use type
-    -- annotations.
+    -- lookup miss for a class ('IHC.Eval.resolveTypedMethod'), force-
+    -- load only the modules the manifest reports as providing
+    -- instances for THAT class (plus the modules defining its instance
+    -- head types) so the dict is in the registry.  Per-class one-shot
+    -- (guarded by an 'IORef (Set ByteString)'); later misses for the
+    -- same class are free.  Kept out of startup so the bare REPL
+    -- prompt stays fast for users who never use type annotations.
     installCoreInstanceLoadHook classReg env3
     -- Install the class-method fallback: if resolveTypedMethod can't
     -- find an instance even after loading core dicts, return the
@@ -735,75 +736,100 @@ buildBaseEnv = do
     setThExpToExpr thExpToExpr
     pure (env3, classReg)
 
--- | Install a one-shot hook that force-loads core instance modules
--- (@GHC.Internal.Base@ and friends) and registers their instance
--- dictionaries.  Keeps REPL startup fast: the modules aren't touched
--- until the elaborator's 'IHC.Eval.resolveTypedMethod' hits its first
--- lookup miss (e.g. @pure 42 :: Maybe Int@ at the bare prompt).  The
--- hook captures the REPL's 'ClassRegistry' so the registrations land in
--- the same reg the dispatcher reads.  After the first successful call
--- the flag is flipped and further invocations short-circuit.
+-- | Install a per-class hook that force-loads the modules the
+-- 'IHC.InstanceManifest' identifies as providing instances for the
+-- requested class, plus the modules that DEFINE the head types of
+-- those instances, and registers the resulting instance dictionaries.
+-- Keeps REPL startup fast: nothing is touched until the elaborator's
+-- 'IHC.Eval.resolveTypedMethod' hits its first lookup miss for a class
+-- (e.g. @pure 42 :: Maybe Int@ for 'Applicative', @show (Right 1)@ for
+-- 'Show').  The hook captures the REPL's 'ClassRegistry' so the
+-- registrations land in the same reg the dispatcher reads.  An
+-- @IORef (Set ByteString)@ in the hook closure tracks classes already
+-- loaded; subsequent misses for the same class short-circuit.
 installCoreInstanceLoadHook :: ClassRegistry -> Env -> IO ()
 installCoreInstanceLoadHook classReg baseEnv = do
-    doneRef <- newIORef False
-    let hook = do
+    doneRef <- newIORef Set.empty
+    let hook cls = do
             done <- readIORef doneRef
-            if done
+            if Set.member cls done
               then pure ()
               else do
-                  writeIORef doneRef True
-                  r <- try (loadCoreInstanceModules classReg baseEnv)
+                  -- Mark before the call so an exception inside the
+                  -- load doesn't loop us back through retry.  Same
+                  -- best-effort pattern the previous one-shot hook used.
+                  writeIORef doneRef (Set.insert cls done)
+                  r <- try (loadCoreInstanceModules classReg baseEnv cls)
                           :: IO (Either SomeException ())
                   case r of
                       Right () -> pure ()
                       Left  _  -> pure ()   -- best-effort
     setCoreInstanceLoadHook hook
 
--- | Force-load the canonical set of "instance-bearing" modules and
--- register the instances they declare.  Called at most once per REPL
+-- | Force-load the modules the 'IHC.InstanceManifest' reports as
+-- providing instances for a single class, plus the modules defining
+-- the head types of those instances, and register the resulting
+-- instance dictionaries.  Called at most once per class per REPL
 -- session via 'installCoreInstanceLoadHook'.
 --
--- The set of modules to load is derived from @Prelude.hs@ itself:
--- load @Prelude@, then walk its parsed import list and load each
--- imported module.  No hardcoded module names — what an
--- implicit-Prelude Haskell session sees IS what we load.  Instance
--- coverage automatically follows whatever @Prelude@ re-exports in the
--- installed @base@ version.
-loadCoreInstanceModules :: ClassRegistry -> Env -> IO ()
-loadCoreInstanceModules classReg baseEnv = do
-    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
-    let cacheDirs      = map fst cacheWithIncludes
-        includeMap     = Map.fromList cacheWithIncludes
-        fullSearchPath = cacheDirs
-    registry <- newIORef Map.empty
-    -- Load Prelude itself.  Its parsed header gives us the canonical
-    -- list of instance-bearing modules to force-load below.
-    rPrelude <- try (loadModule registry fullSearchPath includeMap (BC.pack "Prelude"))
-                    :: IO (Either SomeException LoadedModule)
-    case rPrelude of
-        Left _          -> pure ()       -- no source cache; hook is a no-op
-        Right preludeLm -> do
-            let preludeImports = map impModule (mhImports (lmHeader preludeLm))
-            loadedImports <- mapM
+-- The set of modules to load is derived from the manifest's
+-- 'miClassProviders' / 'miClassHeads' / 'miTypeProviders' — built
+-- from a one-time scan of @~/.cache/ihc/sources@ in
+-- 'IHC.InstanceManifest'.  No hardcoded module names; coverage
+-- automatically follows whatever the installed @base@ (and other
+-- packages) declare.
+--
+-- The 'GHC.Internal.*' filter mirrors the scope decision in
+-- 'loadProgramFromSource' — keeps the hook bounded to boot-library
+-- reach so an unrelated user package's 'instance Show ...' doesn't
+-- trigger a surprise cross-package fan-out at the prompt.
+-- User-imported packages are loaded through the ordinary import path,
+-- not this hook.
+--
+-- Empty providers (user-defined classes, classes outside
+-- 'GHC.Internal.*', or empty source cache) → no-op.  The caller
+-- ('resolveTypedMethod') falls through to the value-directed
+-- 'lookupClassMethodFallback'.
+loadCoreInstanceModules :: ClassRegistry -> Env -> ByteString -> IO ()
+loadCoreInstanceModules classReg baseEnv cls = do
+    let idx               = Manifest.manifestIndex
+        ghcInternalPrefix = BC.pack "GHC.Internal."
+        providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`)
+                               (Manifest.providersForClass idx cls)
+        headTypeMods = Set.fromList
+            [ definingMod
+            | tyName       <- Map.findWithDefault [] cls (Manifest.miClassHeads idx)
+            , Just definingMod <- [Map.lookup tyName (Manifest.miTypeProviders idx)]
+            , ghcInternalPrefix `BC.isPrefixOf` definingMod
+            ]
+        toLoad = Set.toList (providers `Set.union` headTypeMods)
+    case toLoad of
+        [] -> pure ()                     -- nothing manifest-known; fall through
+        _  -> do
+            cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+            let cacheDirs      = map fst cacheWithIncludes
+                includeMap     = Map.fromList cacheWithIncludes
+                fullSearchPath = cacheDirs
+            registry <- newIORef Map.empty
+            loaded <- mapMaybe id <$> mapM
                 (\m -> do
                     r <- try (loadModule registry fullSearchPath includeMap m)
                              :: IO (Either SomeException LoadedModule)
                     case r of
                         Right lm -> pure (Just lm)
                         Left  _  -> pure Nothing)
-                preludeImports
-            let lms = preludeLm : [lm | Just lm <- loadedImports]
-            unionInstanceScope (Set.fromList (map lmName lms))
-            classTable <- buildClassMethodTable lms
-            let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg lms)
+                toLoad
+            unionInstanceScope (Set.fromList (map lmName loaded))
+            classTable <- buildClassMethodTable loaded
+            let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg loaded)
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
-                                         classReg tyCtors classTable baseEnv) lms
+                                         classReg tyCtors classTable baseEnv) loaded
             -- Also mirror into the shared reg (matches the loadImport path).
             mSharedReg <- readIORef sharedClassRegRef
             case mSharedReg of
                 Just sharedReg | sharedReg /= classReg ->
                     mapM_ (registerInstancesFrom registry fullSearchPath includeMap
-                                                 sharedReg tyCtors classTable baseEnv) lms
+                                                 sharedReg tyCtors classTable baseEnv) loaded
                 _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,

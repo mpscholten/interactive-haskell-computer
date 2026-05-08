@@ -562,28 +562,34 @@ lookupClassMethodFallback cls method = do
 --------------------------------------------------------------------------------
 -- Core-instance load hook
 --
--- One-shot trigger for force-loading GHC.Internal.Base and friends so
--- their Applicative/Monad/Functor instance dicts are in the registry.
--- Bare REPL startup skips this (keeps prompt latency low); the elaborator's
--- 'resolveTypedMethod' fires it only when a type-annotation-driven
--- lookup misses (e.g. @pure 42 :: Maybe Int@ before any explicit import).
+-- Per-class trigger for force-loading the modules that provide instances
+-- for a specific class so its dict is in the registry.  Bare REPL
+-- startup skips this (keeps prompt latency low); the elaborator's
+-- 'resolveTypedMethod' fires it with the class name only when a
+-- type-annotation-driven lookup misses (e.g. @pure 42 :: Maybe Int@ for
+-- 'Applicative', @show (Right 1)@ for 'Show', etc.).
 --
 -- Installed by 'buildBaseEnv'; invoked by 'IHC.Eval.resolveTypedMethod'.
--- The hook itself maintains its own "already-loaded" flag so subsequent
--- calls are free (no re-scan).
+-- The hook itself maintains a per-class "already-loaded" set so
+-- subsequent calls for the same class are free (no re-scan).  Different
+-- classes load on first miss for each, scoped to the modules the
+-- 'IHC.InstanceManifest' says provide instances for that class.
 --------------------------------------------------------------------------------
 
 {-# NOINLINE coreInstanceLoadHookRef #-}
-coreInstanceLoadHookRef :: IORef (IO ())
-coreInstanceLoadHookRef = unsafePerformIO (newIORef (pure ()))
+coreInstanceLoadHookRef :: IORef (ByteString -> IO ())
+coreInstanceLoadHookRef = unsafePerformIO (newIORef (\_ -> pure ()))
 
-setCoreInstanceLoadHook :: IO () -> IO ()
+setCoreInstanceLoadHook :: (ByteString -> IO ()) -> IO ()
 setCoreInstanceLoadHook = writeIORef coreInstanceLoadHookRef
 
-triggerCoreInstanceLoad :: IO ()
-triggerCoreInstanceLoad = do
+-- | Trigger a core-instance load for the given class.  The hook tracks
+-- which classes it has already loaded and short-circuits subsequent
+-- calls for the same class.
+triggerCoreInstanceLoad :: ByteString -> IO ()
+triggerCoreInstanceLoad cls = do
     hook <- readIORef coreInstanceLoadHookRef
-    hook
+    hook cls
 
 --------------------------------------------------------------------------------
 -- Per-load instance-registration hook

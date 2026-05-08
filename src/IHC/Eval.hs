@@ -74,11 +74,13 @@ resolveTypedMethod reg cls method tag = do
         Nothing -> do
             -- First-miss retry: the REPL doesn't pre-load core instance
             -- dicts (keeps startup latency low). The hook force-loads
-            -- GHC.Internal.Base / Maybe / … once per session; subsequent
-            -- calls are free. ('lookupInstanceMethod' inside @tryResolve@
+            -- the modules the manifest reports as providers for THIS
+            -- class (and the modules defining its instance head types)
+            -- once per session per class; subsequent calls for the same
+            -- class are free. ('lookupInstanceMethod' inside @tryResolve@
             -- already drains the Stage-2 lazy-instance catalogue on
             -- miss, so a separate drain is unnecessary here.)
-            triggerCoreInstanceLoad
+            triggerCoreInstanceLoad cls
             resolved2 <- tryResolve
             case resolved2 of
                 Just v  -> forceMethodVal v
