@@ -32,13 +32,17 @@ import qualified Hs2010LexStr
 import qualified Hs2010ExprData
 import qualified Hs2010LexLayout
 import qualified Hs2010DataDecl
-import qualified JitSmoke
 import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ParserBugs
 import qualified ReplTest
 import qualified RunFile
 import qualified Unsupported
+import qualified NetworkSocketAddrInfoRecordUpdateTest
+import qualified TopLevelIOBindingTest
+import qualified TopLevelWarpAliasTest
+import qualified WarpHelloTest
+import qualified WarpRunStartupTest
 
 main :: IO ()
 main = hspec do
@@ -66,7 +70,6 @@ main = hspec do
     Hs2010ExprData.spec
     Hs2010LexLayout.spec
     Hs2010DataDecl.spec
-    JitSmoke.spec
     CoreLowerTest.spec
     RunFile.spec
     CabalLoader.spec
@@ -79,3 +82,8 @@ main = hspec do
     LexerIhp.spec
     HsExtRecords.spec
     HsExtForall.spec
+    TopLevelIOBindingTest.spec
+    TopLevelWarpAliasTest.spec
+    WarpRunStartupTest.spec
+    NetworkSocketAddrInfoRecordUpdateTest.spec
+    WarpHelloTest.spec

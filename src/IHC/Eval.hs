@@ -201,6 +201,16 @@ eval env ipm = go
                 a <- force xt
                 error ("IHC.Eval.go(EApp): VPrimObj in function position: "
                        <> showValForDebug fv <> " applied to " <> showValForDebug a)
+            VCon _ (_:_:_) -> do
+                a <- force xt
+                error ("IHC.Eval.go(EApp): not a function while evaluating `"
+                       <> show f <> "` applied to `" <> show x <> "`: "
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
+            VCon n [] | not (isStateTokenNewtypeCtor n) -> do
+                a <- force xt
+                error ("IHC.Eval.go(EApp): not a function while evaluating `"
+                       <> show f <> "` applied to `" <> show x <> "`: "
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
             _ -> applyIP ipm fv xt
 
     go (ELam name body) =
@@ -989,6 +999,11 @@ matchPat (PCon "ST" [p]) v@(VCon name _)
 matchPat (PCon "PS" [pFp, pOff, pLen]) (VCon "BS" [fpT, lenT]) = do
     offT <- newWHNFThunk (VInt 0)
     matchFields [(pFp, fpT), (pOff, offT), (pLen, lenT)] []
+matchPat pat@(PCon "PS" _) v = do
+    mBs <- charListToByteStringVal v
+    case mBs of
+        Just bsV -> matchPat pat bsV
+        Nothing  -> pure Nothing
 -- Lazy ST represents state-thread results as boxed pairs `(a, State s)`,
 -- while strict ST code pattern-matches on unboxed state tuples
 -- `(# State# s, a #)`. When those representations meet at
@@ -1250,6 +1265,12 @@ apply :: Val -> Thunk -> IO Val
 apply (VFun f)                    arg = f arg
 apply (VFunIP _ f)                arg = f Map.empty arg
 apply (VClassMethod _ _ tags go)  arg = go tags arg
+-- Source may see the compiler/runtime state-token newtype constructors
+-- as constructor-shaped values rather than the builtin constructor
+-- functions. Applying the nullary shell should build the one-field
+-- wrapper that matchPat/runIOVal already know how to deconstruct.
+apply (VCon n [])                 arg
+    | isStateTokenNewtypeCtor n = pure (VCon n [arg])
 -- Newtype-transparent application: a single-field 'VCon' built from a
 -- newtype constructor (e.g. @ParsecT body@) is operationally equivalent
 -- to its inner field at GHC runtime.  Some IHC code paths return the
@@ -1268,6 +1289,8 @@ applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _         (VFun f)                   arg = f arg
 applyIP callerIPM (VFunIP _ f)               arg = f callerIPM arg
 applyIP _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP _         (VCon n [])                arg
+    | isStateTokenNewtypeCtor n = pure (VCon n [arg])
 -- Newtype-transparent application: see note on 'apply' above.
 applyIP ipm       (VCon _ [innerT])          arg = do
     inner <- force innerT
@@ -1390,6 +1413,12 @@ runIOVal (VCon "STM" [ft]) = do
         VCon _ [_stT, resT] -> force resT
         other               -> pure other
 runIOVal v        = pure v
+
+isStateTokenNewtypeCtor :: Name -> Bool
+isStateTokenNewtypeCtor n =
+       n == BC.pack "IO"
+    || n == BC.pack "ST"
+    || n == BC.pack "STM"
 
 --------------------------------------------------------------------------------
 -- Phase 2.12: TemplateHaskellQuotes — [| expr |] evaluation

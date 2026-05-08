@@ -13,4 +13,8 @@ result-*
 /QuickCheck-*/
 
 # Claude Code worktrees + local session state
-.claude/worktrees/
+.claude/
+.hermes/
+
+# Throwaway reduction probes from interpreter debugging sessions
+tmp-probes/

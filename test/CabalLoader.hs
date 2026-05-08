@@ -12,7 +12,7 @@ module CabalLoader (spec) where
 
 import qualified Data.ByteString.Char8 as BC
 import Data.List (isPrefixOf, isInfixOf, isSuffixOf, nub)
-import Data.Maybe (isJust)
+import Data.Maybe (fromJust, isJust)
 import qualified Data.Map.Strict as Map
 import System.Directory (canonicalizePath, doesDirectoryExist, getCurrentDirectory, listDirectory, makeAbsolute)
 import System.Environment (lookupEnv)
@@ -99,7 +99,7 @@ spec = describe "Phase 2.7 — Cabal project loader" do
             rootAbs <- makeAbsolute simpleRoot
             mInfo <- parseCabalFile rootAbs cabalPath
             mInfo `shouldSatisfy` isJust
-            let Just info = mInfo
+            let info = fromJust mInfo
             pkgName info    `shouldBe` BC.pack "simple"
             pkgVersion info `shouldBe` BC.pack "0.1.0.0"
             pkgSourceDirs info `shouldBe` [rootAbs </> "lib"]
@@ -124,7 +124,7 @@ spec = describe "Phase 2.7 — Cabal project loader" do
             rootAbs <- makeAbsolute ghc2021Root
             mInfo   <- parseCabalFile rootAbs cabalPath
             mInfo `shouldSatisfy` isJust
-            let Just info = mInfo
+            let info = fromJust mInfo
                 exts      = pkgExtensions info
             -- Every GHC2021 staple must be on — this is the whole point
             -- of expanding default-language.
@@ -169,7 +169,7 @@ spec = describe "Phase 2.7 — Cabal project loader" do
                     rootAbs <- makeAbsolute bsRoot
                     mInfo   <- parseCabalFile rootAbs bsCabal
                     mInfo `shouldSatisfy` isJust
-                    let Just info = mInfo
+                    let info = fromJust mInfo
                     -- pkgIncludeDirs should contain rootAbs/include
                     pkgIncludeDirs info `shouldContain` [rootAbs </> "include"]
 

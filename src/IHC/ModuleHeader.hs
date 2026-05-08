@@ -463,7 +463,13 @@ parseImportList src cur0 = go [] cur0
                 --     entry-env builder) recognise to mean "any
                 --     constructor of @Type@".
                 (subs, curEnd) <- parseSubNames src curP
-                go (concat [n : subs, acc]) curEnd
+                let typedSubs =
+                        [ if sub == BC.pack "$dotdot"
+                            then BC.pack "$dotdot:" <> n
+                            else sub
+                        | sub <- subs
+                        ]
+                go (reverse (n : typedSubs) ++ acc) curEnd
             _ -> go (n : acc) cur
 
     -- Parse the contents of a @(...)@ trailing a name in an import list.
@@ -480,6 +486,7 @@ parseImportList src cur0 = go [] cur0
                 TkConId nm -> sub (nm : acc) cur1
                 TkIdent nm -> sub (nm : acc) cur1
                 TkPrimId nm -> sub (nm : acc) cur1
+                TkDotDot -> sub (BC.pack "$dotdot" : acc) cur1
                 TkDot -> do
                     -- @..@ — promote to wildcard sentinel.  Two TkDot
                     -- tokens land here back-to-back; consume the

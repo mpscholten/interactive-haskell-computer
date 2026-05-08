@@ -5,9 +5,8 @@
 -- strict in their numeric arguments (force first), since the
 -- arithmetic operators need actual numbers.
 --
--- These replace the Phase-1 'IHC.Stdlib' C-ABI shims. There is no
--- @foreign export@; the evaluator and the builtins are both Haskell
--- code in the same process, so calls are direct.
+-- The evaluator and the builtins are both Haskell code in the same
+-- process, so calls are direct (no @foreign export@ / FFI bridge).
 module IHC.Builtins
     ( builtinEnv
     , buildConEnv
@@ -67,7 +66,7 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, sizeOf)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
 import System.Exit (ExitCode(..), exitWith)
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -373,11 +372,6 @@ builtins reg =
     , ("Data.ByteString.Char8.head",      bs8HeadB)
     , ("Data.ByteString.Char8.index",     bs8IndexB)
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
-    -- Data.Functor.Identity.runIdentity: field accessor. The scanner
-    -- fails to register it (see Scheduler's field-accessor discovery
-    -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
-    , ("runIdentity",                        runIdentityB)
-    , ("Data.Functor.Identity.runIdentity",  runIdentityB)
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
@@ -514,6 +508,11 @@ builtins reg =
     , ("plusAddr#",   plusAddrB)
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
+    -- GHC.Prim-only raw-address Int access.  Source-loaded
+    -- GHC.Internal.Storable defines writeIntOffPtr/readIntOffPtr in terms of
+    -- these primops; there is no .hs implementation to interpret below them.
+    , ("readIntOffAddr#",  readIntOffAddrHashB)
+    , ("writeIntOffAddr#", writeIntOffAddrHashB)
     -- Phase 2.8: Ptr arithmetic
     , ("plusPtr",   plusPtrB)
     , ("minusPtr",  minusPtrB)
@@ -788,20 +787,14 @@ builtins reg =
     , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
     , ("Network.Socket.sendBuf", socketSendBufB)
     , ("Network.Socket.recvBuf", socketRecvBufB)
-    , ("settingsPort", warpSettingsPortB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsPort", warpSettingsPortB)
-    , ("settingsHost", warpSettingsHostB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsHost", warpSettingsHostB)
-    , ("settingsTimeout", warpSettingsTimeoutB)
-    , ("Network.Wai.Handler.Warp.Settings.settingsTimeout", warpSettingsTimeoutB)
-    , ("settingsFdCacheDuration", warpSettingsFdCacheDurationB)
-    , ( "Network.Wai.Handler.Warp.Settings.settingsFdCacheDuration"
-      , warpSettingsFdCacheDurationB
-      )
-    , ("settingsFileInfoCacheDuration", warpSettingsFileInfoCacheDurationB)
-    , ( "Network.Wai.Handler.Warp.Settings.settingsFileInfoCacheDuration"
-      , warpSettingsFileInfoCacheDurationB
-      )
+    -- Phase C.3 (builtins-removal): the @Settings@ field accessors
+    -- (settingsPort/Host/Timeout/FdCacheDuration/FileInfoCacheDuration)
+    -- used to live here as positional shims that indexed into a host-
+    -- constructed VCon.  They were removed once defaultSettings became
+    -- source-loaded via Scheduler.preludeDirectOwner: the loaded module
+    -- registers all Settings fields in lmFieldReg, and tryFieldSlot
+    -- synthesises the accessors automatically.  Helpers warpSettings*B
+    -- and settingsFieldB went with them.
     -- Network.Socket AddrInfo record-field accessors.  The host backing
     -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
     -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
@@ -1086,14 +1079,39 @@ builtins reg =
     , ("Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Exception.fromException", fromExceptionB)
-    -- unIO: inverse of the IO constructor. Source at
-    -- GHC.Internal.Base defines `unIO (IO a) = a`. At the Val level VIO
-    -- hides the state-transformer shape, so we reconstruct a fresh one:
-    -- take a State# token, run the VIO action, wrap the result as
-    -- (# State#, a #).
+    -- =================================================================
+    -- VIO <-> State# bridge -- RTS-exclusive
+    --
+    -- IHC's runtime represents IO as VIO (a host IO action that reduces
+    -- to Val).  Source-level GHC defines `newtype IO a = IO (State#
+    -- RealWorld -> (# State# RealWorld, a #))` -- a state-transformer
+    -- over an unboxed-tuple result.  The two shapes are not
+    -- interconvertible in Haskell source: there is no userland term
+    -- that can coerce between a host IO action and a function consuming
+    -- a State# token (the unboxed-tuple constructor `(#,#)` is a
+    -- wired-in primitive; State# is uninhabited at the source level).
+    -- These bridges sit at the boundary and are compiler-intrinsic in
+    -- the same way that `unsafeCoerce` is -- see the justification at
+    -- `isBuiltinBackedModule`'s `Unsafe.Coerce` clause
+    -- (Scheduler.hs:5493-5500).  Removing them would require giving Val
+    -- a real State#-token shape; that is out of scope.
+    -- =================================================================
+
+    -- unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)
+    -- Source defines `unIO (IO a) = a`; we reconstruct a fresh state
+    -- transformer from a VIO action.  RTS-exclusive: VIO's inner host
+    -- IO action cannot be expressed as a source-level State# function.
     , ("unIO",            unIOB)
     , ("GHC.IO.unIO",     unIOB)
     , ("GHC.Internal.IO.unIO", unIOB)
+    -- ioToST / unsafeIOToST :: IO a -> ST s a
+    -- Source body re-wraps a State# function in the ST newtype.  IHC's
+    -- ST is also a state-transformer at the source level, but the VIO
+    -- carrier needs unwrapping into the host IO before re-wrapping as
+    -- an ST runner -- this transformation crosses the VIO/State#
+    -- boundary and is not source-expressible.  unsafeIOToST is the
+    -- unchecked variant (source uses `unsafeCoerce`, itself compiler-
+    -- intrinsic; see Unsafe.Coerce clause).
     , ("ioToST",          ioToSTB)
     , ("GHC.IO.ioToST",   ioToSTB)
     , ("GHC.Internal.IO.ioToST", ioToSTB)
@@ -1101,6 +1119,11 @@ builtins reg =
     , ("GHC.IO.unsafeIOToST", ioToSTB)
     , ("GHC.Internal.IO.unsafeIOToST", ioToSTB)
     , ("Control.Monad.ST.Unsafe.unsafeIOToST", ioToSTB)
+    -- stToIO / unsafeSTToIO :: ST RealWorld a -> IO a
+    -- Inverse direction: takes an ST's State# function, runs it via
+    -- the host runStateTransformer, packages the result as VIO.  Same
+    -- RTS boundary as ioToST -- runs a source-level State# token
+    -- producer inside the host IO interpreter.
     , ("stToIO",          stToIOB)
     , ("GHC.IO.stToIO",   stToIOB)
     , ("GHC.Internal.IO.stToIO", stToIOB)
@@ -1108,6 +1131,9 @@ builtins reg =
     , ("GHC.IO.unsafeSTToIO", stToIOB)
     , ("GHC.Internal.IO.unsafeSTToIO", stToIOB)
     , ("Control.Monad.ST.Unsafe.unsafeSTToIO", stToIOB)
+    -- =================================================================
+    -- end VIO <-> State# bridge
+    -- =================================================================
     , ("catch",           catchB)
     , ("GHC.IO.catch",    catchB)
     , ("GHC.Internal.IO.catch", catchB)
@@ -2323,7 +2349,8 @@ undefinedB = pure (VIO (error "Prelude.undefined"))
 --------------------------------------------------------------------------------
 -- Monad core. Every builtin here is a plain global binding so Phase
 -- 2.3 class-dispatch can later overlay it with dictionary-threaded
--- versions. The only monad we actually handle here is IO — 'VIO'.
+-- versions. The IO monad appears either as host-backed 'VIO' or as the
+-- source-loaded @IO@ newtype, depending on how far evaluation has gone.
 --------------------------------------------------------------------------------
 
 -- | @return x = VIO (pure x)@. The @x@ thunk is not forced until the
@@ -2340,12 +2367,8 @@ bindDispatch :: ClassRegistry -> IO Val
 bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
     mv <- force ma
     case mv of
-        VIO _ -> pure $ VIO $ do
-            v  <- runIOVal mv
-            kv <- force kt
-            vT <- newWHNFThunk v
-            r  <- apply kv vT
-            runIOVal r
+        VIO _        -> ioBind mv kt
+        VCon "IO" [_] -> ioBind mv kt
         -- ST monad bind:
         -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
@@ -2407,16 +2430,21 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                         vT <- newWHNFThunk v
                         r  <- apply kv vT
                         runIOVal r
+  where
+    ioBind mv kt = pure $ VIO $ do
+        v  <- runIOVal mv
+        kv <- force kt
+        vT <- newWHNFThunk v
+        r  <- apply kv vT
+        runIOVal r
 
 -- | @m >> n@ = run m (discarding result), then run n.
 seqDispatch :: ClassRegistry -> IO Val
 seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
     mv <- force ma
     case mv of
-        VIO _ -> pure $ VIO $ do
-            _ <- runIOVal mv
-            nv <- force mb
-            runIOVal nv
+        VIO _         -> ioSeq mv mb
+        VCon "IO" [_] -> ioSeq mv mb
         -- ST monad seq:
         -- m >> n = m >>= \_ -> n  for ST
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
@@ -2464,6 +2492,11 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
                         _ <- runIOVal mv
                         nv <- force mb
                         runIOVal nv
+  where
+    ioSeq mv mb = pure $ VIO $ do
+        _ <- runIOVal mv
+        nv <- force mb
+        runIOVal nv
 
 -- Strict ST state functions produce unboxed tuples in state-first order,
 -- while lazy ST produces boxed pairs in value-first order. Constructor names
@@ -3105,6 +3138,36 @@ addr2IntB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
 
+-- | @readIntOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Int# #)@.
+-- GHC.Prim raw-address access used by source-loaded GHC.Internal.Storable.
+readIntOffAddrHashB :: IO Val
+readIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                      pure $ VFun $ \_stT -> do
+    addrV <- force addrT
+    idxV  <- force idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (castPtr p :: Ptr Int) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            nT  <- newWHNFThunk (VInt (fromIntegral n))
+            pure (VCon "(#,#)" [stT, nT])
+        _ -> error ("readIntOffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeIntOffAddr# :: Addr# -> Int# -> Int# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded GHC.Internal.Storable.
+writeIntOffAddrHashB :: IO Val
+writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                       pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force addrT
+    idxV  <- force idxT
+    valV  <- force valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
+            pokeElemOff (castPtr p :: Ptr Int) (fromIntegral i)
+                        (fromIntegral n :: Int)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: Ptr arithmetic
 --------------------------------------------------------------------------------
@@ -3327,17 +3390,6 @@ bsPackB = pure $ VFun $ \a -> do
             copyBytes (castPtr dst) (castPtr src) l
         pure newfp
     mkBsVal fp len
-
--- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
--- and forces the payload. Also accepts `Identity { runIdentity = x }`
--- record-constructor form since ihc lowers both to the same VCon shape.
-runIdentityB :: IO Val
-runIdentityB = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VCon "Identity" (tx : _) -> force tx
-        other -> error ("runIdentity: expected Identity wrapper, got "
-                         <> showValForDebug other)
 
 bsUnpackB :: IO Val
 bsUnpackB = pure $ VFun $ \a -> do
@@ -3849,7 +3901,10 @@ peekSockAddrVal p
                 scope <- peekByteOff (castPtr p :: Ptr Word32) 24 :: IO Word32
                 let port = byteSwap16 portRaw                     -- ntohs
                     flow = byteSwap32 flowRaw                     -- ntohl
-                    [a0,a1,a2,a3] = map byteSwap32 [a0Raw,a1Raw,a2Raw,a3Raw] -- ntohl each
+                    a0 = byteSwap32 a0Raw                         -- ntohl each
+                    a1 = byteSwap32 a1Raw
+                    a2 = byteSwap32 a2Raw
+                    a3 = byteSwap32 a3Raw
                 portT <- newWHNFThunk (VInt (fromIntegral port))
                 flowT <- newWHNFThunk (VInt (fromIntegral flow))
                 addrT <- newWHNFThunk =<< fourTupleVal (map (VInt . fromIntegral) [a0, a1, a2, a3])
@@ -4089,36 +4144,6 @@ freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
     p <- ptrValToPtr ptrV
     free p
     pure VUnit
-
-warpSettingsPortB :: IO Val
-warpSettingsPortB = settingsFieldB "settingsPort" 0
-
-warpSettingsHostB :: IO Val
-warpSettingsHostB = settingsFieldB "settingsHost" 1
-
--- warp's @Settings@ record field order (see
--- ~/.cache/ihc/sources/warp-3.4.12/Network/Wai/Handler/Warp/Settings.hs):
--- 0 settingsPort, 1 settingsHost, 2 settingsOnException,
--- 3 settingsOnExceptionResponse, 4 settingsOnOpen, 5 settingsOnClose,
--- 6 settingsTimeout, 7 settingsManager, 8 settingsFdCacheDuration,
--- 9 settingsFileInfoCacheDuration, ...
-warpSettingsTimeoutB :: IO Val
-warpSettingsTimeoutB = settingsFieldB "settingsTimeout" 6
-
-warpSettingsFdCacheDurationB :: IO Val
-warpSettingsFdCacheDurationB = settingsFieldB "settingsFdCacheDuration" 8
-
-warpSettingsFileInfoCacheDurationB :: IO Val
-warpSettingsFileInfoCacheDurationB =
-    settingsFieldB "settingsFileInfoCacheDuration" 9
-
-settingsFieldB :: String -> Int -> IO Val
-settingsFieldB label idx = pure $ VFun $ \settingsT -> do
-    settingsV <- force settingsT
-    case settingsV of
-        VCon "Settings" fields
-            | idx < length fields -> force (fields !! idx)
-        other -> error (label <> ": not Settings: " <> showValForDebug other)
 
 -- | Generic field accessor for the host-built @VCon "AddrInfo" [flags,
 -- family, socktype, protocol, addr, canonName]@ value.  Used to back
