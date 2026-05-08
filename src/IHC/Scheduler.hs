@@ -3535,6 +3535,19 @@ ffiBuiltinNames = Set.fromList
     -- pulling in 'GHC.IO.Handle.Text' (e.g. anything importing
     -- 'Control.Exception' or using a custom 'Show' instance).
     , "hPutStrLn", "hPutStr", "hPutChar"
+    -- Text-level handle input: same situation as the output-side names
+    -- above, mirrored for stdin reads.  Source-loading
+    -- 'System.IO.getLine = hGetLine stdin' / 'System.IO.getContents =
+    -- hGetContents stdin' must resolve 'hGetLine' / 'hGetContents' /
+    -- 'hGetChar' to the host shim that takes 'VPrimObj (PrimHandle h)';
+    -- otherwise the source bodies in 'GHC.IO.Handle.Text' fall back to
+    -- the FileHandle/DuplexHandle pattern-match path, which assumes the
+    -- source-level Handle ADT layer we haven't implemented.  'hGetLine'
+    -- already has a host shim; 'hGetContents' / 'hGetChar' do not yet,
+    -- but listing them here is harmless (the FQN forwarder only fires
+    -- when a builtin is registered) and future-proofs the routing for
+    -- when those shims land.
+    , "hGetLine", "hGetContents", "hGetChar"
     ]
 
 -- | Build a map from each locally-visible imported name to its

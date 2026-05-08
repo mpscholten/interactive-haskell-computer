@@ -376,12 +376,23 @@ builtins reg =
     -- Both bottom out on host shims already pinned via 'ffiBuiltinNames'
     -- in slice 1 (hPutStr, hPutChar, stdout).
     --
-    -- Slice 4 (this commit): 'print' graduates. Source body is
+    -- Slice 4: 'print' graduates. Source body is
     --     print x  =  putStrLn (show x)         -- System/IO.hs:296-297
     -- 'putStrLn' is source-loaded (slice 1).  'show' remains a shim
     -- ('showDispatch reg' below) because it's the entry point of the
     -- Show class registry — graduating it is slice 5+ territory.
-    , ("getLine",  getLineB)
+    --
+    -- Slice 3 (this commit): 'getLine' graduates. Source body is
+    --     getLine  =  hGetLine stdin            -- System/IO.hs:308-309
+    -- Bottoms out on 'hGetLine' (still a host shim — see
+    -- 'ffiBuiltinNames' in Scheduler.hs for why the shim must take
+    -- precedence over the source-level GHC.IO.Handle.Text definition
+    -- until the source-level Handle ADT layer is implemented).
+    --
+    -- 'getContents' is similarly source-loaded from
+    --     getContents  =  hGetContents stdin    -- System/IO.hs:316-317
+    -- It was never shimmed in the first place; documented here for
+    -- symmetry with 'getLine'.
     -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
     -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
     -- implementation for VIO values.
@@ -2308,13 +2319,11 @@ lengthB = pure $ VFun $ \a -> do
 -- in 'showDispatch reg' below; demand discovery on 'print x' resolves
 -- 'show' to that dispatcher, which walks the ClassRegistry as before.
 
--- | 'getLine' — zero-arity IO action. We register the VIO directly
--- (no dummy-thunk wrapper like Phase 2.2/3). Reading from the env
--- thus immediately yields the action; binding it in a do-block runs it.
-getLineB :: IO Val
-getLineB = pure $ VIO $ do
-    s <- getLine
-    stringToListValIO s
+-- 'getLineB' was removed in the "minimum surface only" cleanup —
+-- 'getLine' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:308-309.
+-- See the comment next to the (now-deleted) "getLine" entry in
+-- 'builtins' above.
 
 -- | B.1: debug-only probe of the global superclass-relation map.
 -- Takes a class name (as a [Char] list) and returns the list of
