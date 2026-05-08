@@ -399,6 +399,16 @@ builtins reg =
     , ("<*>",      apDispatch reg)
     , ("GHC.Internal.Base.<*>", apDispatch reg)
     , ("Prelude.<*>", apDispatch reg)
+    -- 'Semigroup.(<>)' — argument-directed dispatch keyed on the LHS
+    -- tag.  Source-loaded code (warp's HTTP response builders, blaze's
+    -- html builder, etc.) and user code (e.g. instance defining
+    -- '(<>)' in prefix form) reach for it as a bare 'EVar', so the
+    -- env must bind it directly rather than relying on whole-program
+    -- elaboration.
+    , ("<>",       sappendDispatch reg)
+    , ("GHC.Internal.Base.<>", sappendDispatch reg)
+    , ("Prelude.<>", sappendDispatch reg)
+    , ("Data.Semigroup.<>", sappendDispatch reg)
     , ("join",     joinB)
     , ("void",     voidB)
     , ("Control.Monad.void", voidB)
@@ -2536,6 +2546,52 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
             _ -> error
                 ( "fmap: no Functor instance registered for type `"
                   <> BC.unpack tag <> "`" )
+
+-- | Dispatching @<>@ — 'Semigroup' append.  Forces the LHS, picks an
+-- instance based on its type tag, and applies @<>@ to both args.
+-- Handles the host-string case ('VStr') with direct concatenation
+-- since IHC sometimes carries strings as 'VStr' rather than as a
+-- @VCon ":"@ chain (see 'charListToByteStringVal').
+sappendDispatch :: ClassRegistry -> IO Val
+sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
+    xv <- force xT
+    case xv of
+        -- Direct fast path for cons-list strings: avoid round-tripping
+        -- through Semigroup [] which is registered but cycles back here.
+        VCon ":" _ -> do
+            yv <- force yT
+            consAppend xv yv
+        VCon "[]" [] -> force yT
+        VStr _ -> do
+            yv <- force yT
+            consAppend xv yv
+        _ -> do
+            let tag = typeTagOf xv
+            mMethod <- lookupInstanceMethod reg
+                          (BC.pack "Semigroup") tag (BC.pack "<>")
+                          >>= forceInstanceMethod
+            case mMethod of
+                Just method -> do
+                    xT' <- newWHNFThunk xv
+                    r1 <- apply method xT'
+                    apply r1 yT
+                Nothing -> error
+                    ( "<>: no Semigroup instance registered for type `"
+                   <> BC.unpack tag <> "`" )
+  where
+    -- Cons-list / VStr concatenation.  Forces both as cons-lists.
+    consAppend (VCon ":" [hT, tT]) ys = do
+        tv <- force tT
+        rest <- consAppend tv ys
+        restT <- newWHNFThunk rest
+        pure (VCon ":" [hT, restT])
+    consAppend (VCon "[]" []) ys = pure ys
+    consAppend (VStr s) ys = do
+        -- Promote VStr to a cons-list so we can append onto it.
+        consList <- stringToListValIO (BC.unpack s)
+        consAppend consList ys
+    consAppend other _ =
+        error ("<>: unexpected list shape: " <> showValForDebug other)
 
 -- | @f <*> m = do { fun <- f; v <- m; return (fun v) }@.
 --
