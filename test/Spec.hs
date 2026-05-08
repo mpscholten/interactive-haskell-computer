@@ -38,6 +38,11 @@ import qualified ParserBugs
 import qualified ReplTest
 import qualified RunFile
 import qualified Unsupported
+import qualified NetworkSocketAddrInfoRecordUpdateTest
+import qualified TopLevelIOBindingTest
+import qualified TopLevelWarpAliasTest
+import qualified WarpHelloTest
+import qualified WarpRunStartupTest
 
 main :: IO ()
 main = hspec do
@@ -77,3 +82,8 @@ main = hspec do
     LexerIhp.spec
     HsExtRecords.spec
     HsExtForall.spec
+    TopLevelIOBindingTest.spec
+    TopLevelWarpAliasTest.spec
+    WarpRunStartupTest.spec
+    NetworkSocketAddrInfoRecordUpdateTest.spec
+    WarpHelloTest.spec

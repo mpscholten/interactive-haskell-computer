@@ -159,6 +159,11 @@ test-suite ihc-test
       , ReplTest
       , RunFile
       , Unsupported
+      , NetworkSocketAddrInfoRecordUpdateTest
+      , TopLevelIOBindingTest
+      , TopLevelWarpAliasTest
+      , WarpHelloTest
+      , WarpRunStartupTest
     build-depends:
         base
       , ihc
