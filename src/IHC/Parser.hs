@@ -375,6 +375,14 @@ parsePatsIn src fx (start, end) = do
     -- Each side is a full constructor-application pattern (parseTopPat
     -- absorbs ctor args), and the operator/backtick name in the middle
     -- is consumed without being kept as a pattern.
+    --
+    -- The skipped operator can be either a generic 'TkSymOp' or one of
+    -- the dedicated-op tokens carved out by the lexer (==, /=, <, <=,
+    -- etc.; see 'isDedicatedInfixOpKind').  Without skipping the
+    -- dedicated forms, an instance method whose LHS uses '==' (e.g.
+    -- @Status \{ statusCode = a } == ... = ...@) would treat the '==' as
+    -- not-a-pattern, stop at the first side, and produce the wrong LHS
+    -- pattern list / arity.
     loopInfix ctx cur acc = do
         let (tok, cur1) = nextSig ctx cur
         case tkKind tok of
@@ -388,6 +396,7 @@ parsePatsIn src fx (start, end) = do
                             _          -> pure (reverse acc)
                     Nothing -> pure (reverse acc)
             TkSymOp _ -> loopInfix ctx cur1 acc
+            k | isDedicatedInfixOpKind k -> loopInfix ctx cur1 acc
             TkAt ->
                 let (peek2, cur2) = nextSig ctx cur1
                 in case tkKind peek2 of
@@ -398,10 +407,36 @@ parsePatsIn src fx (start, end) = do
                 (p, cur') <- parseTopPat ctx cur
                 loopInfix ctx cur' (p : acc)
 
+-- | True for the dedicated-operator tokens the lexer carves out — the
+-- ones that can appear as the infix operator in a function/method LHS
+-- (==, /=, <, <=, >, >=, &&, ||, +, ++, *, :, $).  Used by the LHS
+-- parser to (a) decide that an LHS uses infix form and (b) skip the
+-- operator token between the two pattern arguments.
+--
+-- Mirrors the dedicated-op cases in 'IHC.Scan.findTopLevelOpBeforeEq'
+-- (the scanner that registers the binding under its operator name) so
+-- the parser and the scanner agree on which forms count as infix.
+isDedicatedInfixOpKind :: TokenKind -> Bool
+isDedicatedInfixOpKind k = case k of
+    TkEqEq     -> True
+    TkNeq      -> True
+    TkLt       -> True
+    TkLe       -> True
+    TkGt       -> True
+    TkGe       -> True
+    TkAnd      -> True
+    TkOr       -> True
+    TkPlus     -> True
+    TkPlusPlus -> True
+    TkStar     -> True
+    TkColon    -> True
+    TkDollar   -> True
+    _          -> False
+
 -- | Look ahead in @cur0..end@ for a top-level (paren-depth 0) infix
 -- operator before @=@ or @|@.  Mirrors 'IHC.Scan.findTopLevelOpBeforeEq'
 -- but operates on parser tokens.  Returns True for any @TkSymOp@ /
--- @TkBacktick@ at depth 0 before the RHS separator.
+-- @TkBacktick@ / dedicated-op token at depth 0 before the RHS separator.
 hasTopLevelInfixOp :: Ctx -> Cursor -> IO Bool
 hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int)
   where
@@ -409,8 +444,10 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int)
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
-            TkSymOp _ | depth == 0      -> pure True
+            TkSymOp _  | depth == 0     -> pure True
             TkBacktick | depth == 0     -> pure True
+            k | depth == 0
+              , isDedicatedInfixOpKind k -> pure True
             TkLParen                    -> go cur' (depth + 1)
             TkLBracket                  -> go cur' (depth + 1)
             TkLBrace                    -> go cur' (depth + 1)

@@ -1438,16 +1438,33 @@ eqVals reg av bv = case (av, bv) of
         ba <- bsValToBS av
         bb <- bsValToBS bv
         pure (boolVal (ba == bb))
-    (VCon n1 ts1, VCon n2 ts2)
-        | n1 /= n2  -> pure (boolVal False)
-        | otherwise -> do
-            -- Check field-by-field.
-            results <- mapM (\(t1, t2) -> do
-                v1 <- force t1
-                v2 <- force t2
-                eqVals reg v1 v2)
-                (zip ts1 ts2)
-            pure (boolVal (all isTruthy results))
+    (VCon n1 ts1, VCon n2 ts2) -> do
+        -- A user-defined @instance Eq T@ may override the default
+        -- structural equality (e.g. comparing only one field of a
+        -- record, or normalising before compare). Look up the
+        -- user instance first; structural compare is the fallback.
+        --
+        -- 'lookupInstanceMethod' drains the lazy-instance catalogue
+        -- on miss, so this is also the trigger that materialises
+        -- the user's instance the first time '==' fires on @T@.
+        let tag = typeTagOf av
+        mUser <- lookupInstanceMethod reg "Eq" tag "==" >>= forceInstanceMethod
+        case mUser of
+            Just eqMethod -> do
+                aT <- newWHNFThunk av
+                bT <- newWHNFThunk bv
+                r1 <- apply eqMethod aT
+                apply r1 bT
+            Nothing
+                | n1 /= n2  -> pure (boolVal False)
+                | otherwise -> do
+                    -- Default: structural field-by-field equality.
+                    results <- mapM (\(t1, t2) -> do
+                        v1 <- force t1
+                        v2 <- force t2
+                        eqVals reg v1 v2)
+                        (zip ts1 ts2)
+                    pure (boolVal (all isTruthy results))
     _ -> do
         -- Try user-defined instance.
         let tag = typeTagOf av

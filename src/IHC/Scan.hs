@@ -2519,9 +2519,21 @@ scanInstanceDeclsRaw src
                                         case mClause of
                                             Nothing -> scanMethods acc cur'
                                             Just (clause, curNext) -> do
-                                                let lhs  = BindingLhs [clause]
+                                                -- Multi-clause prefix-form
+                                                -- operator method: gather any
+                                                -- siblings of the form
+                                                -- @(opName) ... = body@ at the
+                                                -- same column.  Without this,
+                                                -- @(==) Low Low = True ; (==) _ _ = False@
+                                                -- only registers the last
+                                                -- clause and earlier matches
+                                                -- silently fall through to the
+                                                -- catch-all.
+                                                (moreClauses, curFinal) <-
+                                                    collectInstancePrefixOpClauses opName (tkCol tok) [clause] curNext
+                                                let lhs  = BindingLhs (reverse moreClauses)
                                                     acc' = Map.insert opName lhs acc
-                                                scanMethods acc' curNext
+                                                scanMethods acc' curFinal
                             -- `(pat ...)` introducing an infix method: e.g.
                             -- @(MySum a) <> (MySum b) = ...@ — opens with
                             -- `(` but the next non-close token is ident, not
@@ -2810,6 +2822,30 @@ scanInstanceDeclsRaw src
                     Nothing -> pure (acc, cur)
                     Just (cl, curNext) ->
                         collectInstanceClauses name bindCol (cl : acc) curNext
+            _ -> pure (acc, cur)
+
+    -- Sibling-clause collector for prefix-form operator methods, e.g.
+    -- @(==) A A = True ; (==) _ _ = False@.  At @bindCol@ a sibling
+    -- clause looks like @TkLParen TkSymOp@-or-dedicated-op-token
+    -- @TkRParen ...@.  Mirrors 'collectInstanceClauses' but matches the
+    -- @(opName)@ shape instead of a bare @TkIdent@.
+    collectInstancePrefixOpClauses opName bindCol acc cur = do
+        let (tok, curAfterParen) = peekSig cur
+        case tkKind tok of
+            TkLParen | tkCol tok == bindCol -> do
+                let (opTok, curAfterOp) = nextToken src curAfterParen
+                case tokenOpNameBS (tkKind opTok) of
+                    Just n | n == opName -> do
+                        let (closeTok, curAfterClose) = nextToken src curAfterOp
+                        case tkKind closeTok of
+                            TkRParen -> do
+                                mClause <- scanOneClauseAfterNameAtCol src bindCol curAfterClose
+                                case mClause of
+                                    Nothing -> pure (acc, cur)
+                                    Just (cl, curNext) ->
+                                        collectInstancePrefixOpClauses opName bindCol (cl : acc) curNext
+                            _ -> pure (acc, cur)
+                    _ -> pure (acc, cur)
             _ -> pure (acc, cur)
 
     peekSig cur0 =
