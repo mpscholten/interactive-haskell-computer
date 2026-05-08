@@ -425,9 +425,17 @@ builtins reg =
     , ("Prelude.<>", sappendDispatch reg)
     , ("Data.Semigroup.<>", sappendDispatch reg)
     , ("join",     joinB)
-    , ("void",     voidB)
-    , ("Control.Monad.void", voidB)
-    , ("GHC.Internal.Base.void", voidB)
+    --
+    -- 'void' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211
+    --     void :: Functor f => f a -> f ()
+    --     void x = () <$ x
+    -- Per CLAUDE.md "Builtin modules: minimum surface only". Source
+    -- dispatches via the Functor class ('<$' default body
+    -- '(<$) = fmap . const' from GHC.Internal.Base) which routes
+    -- through 'fmapDispatch' (still shimmed). The empty-data-decl
+    -- scanner fix at commit a1db2a6 was a prerequisite — without it
+    -- 'fmapDispatch' read the IO ctor's tag as "PrimMVar".
     -- @Control.Arrow.first@ / @second@ - for the @(->)@ arrow.  Warp's
     -- @runSettingsConnectionMaker@ uses
     -- @first ((,TCP) \<$\>)@ to lift @(,Transport)@ into the IO action and
@@ -2648,11 +2656,9 @@ joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
     inner <- runIOVal mv
     runIOVal inner
 
-voidB :: IO Val
-voidB = pure $ VFun $ \mt -> pure $ VIO $ do
-    mv <- force mt
-    _ <- runIOVal mv
-    pure VUnit
+-- 'voidB' was removed in slice 5a — 'void' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211. See the
+-- comment next to the (now-deleted) "void" entry in 'builtins' above.
 
 -- | @first f (a, b) = (f a, b)@ — the @Arrow (->)@ instance method.
 -- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
