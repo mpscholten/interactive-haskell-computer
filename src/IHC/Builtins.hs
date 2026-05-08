@@ -279,8 +279,10 @@ builtins reg =
     , ("/",        binOpFloat (/))
     , ("mod",      binOpInt mod)
     , ("div",      binOpInt div)
-    , ("abs",      unaryOpNum abs abs)
-    , ("signum",   unaryOpNum signum signum)
+    -- abs / signum: dropped — instance bodies in GHC.Internal.Num
+    -- (`abs n = if n `geInt` 0 then n else negate n`) source-load now
+    -- that GHC.Classes is no longer host-backed. Resolved via the
+    -- env-fallback class-method dispatcher.
     , ("min",      minDispatch reg)
     , ("max",      maxDispatch reg)
     , ("gcd",      binOpInt gcd)
@@ -1277,15 +1279,6 @@ binOpFloat op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         toD (VInt n)   = fromIntegral n
         toD v          = error ("binOpFloat: non-numeric: " <> showValForDebug v)
     pure (VFloat (op (toD av) (toD bv)))
-
--- | Polymorphic unary op for Int and Float.
-unaryOpNum :: (Int64 -> Int64) -> (Double -> Double) -> IO Val
-unaryOpNum intOp floatOp = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VInt n   -> pure (VInt   (intOp   n))
-        VFloat d -> pure (VFloat (floatOp d))
-        _ -> error ("unaryOpNum: non-numeric arg: " <> showValForDebug av)
 
 -- | Float-only unary op.
 unaryOpFloat :: (Double -> Double) -> IO Val
