@@ -1328,6 +1328,21 @@ scanDataDecls src
             TkEq    -> pure (TkEq, cur')
             TkWhere -> pure (TkWhere, cur')
             TkEof   -> pure (TkEof, cur)
+            -- Any column-1 non-trivia token starts a fresh top-level
+            -- declaration; the current data decl had no body (e.g.
+            -- @data PrimMVar@ — phantom type used to carry a @StablePtr@
+            -- target).  Treat as "no constructors" so we don't
+            -- mis-attribute the NEXT decl's '=' to this one.
+            --
+            -- Without this, @data PrimMVar@ in GHC.Internal.MVar slurps
+            -- @newStablePtrPrimMVar (MVar m) = IO $ \s0 -> ...@ as if
+            -- it were the data body, registering @IO@ as a constructor
+            -- of @PrimMVar@.  The ctor → type-name hook then maps every
+            -- @VCon "IO"@ to type @"PrimMVar"@ and breaks Functor IO
+            -- dispatch end-to-end.
+            _ | tkCol tok == 1
+              , tkKind tok /= TkNewline
+              -> pure (TkEof, cur)
             _       -> peekEqOrWhere cur'
 
     skipUntilEq :: Cursor -> IO Cursor
