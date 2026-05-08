@@ -1,4 +1,7 @@
--- Gap: `runST` + `newSTRef`/`readSTRef` — no `VSTRef` value, no `runST` primop. Seen in: hspec-core/Runner.hs, hspec-core/Shuffle.hs. Ref: hspec-dryrun-findings.md (blocker #3).
+-- Gap (graduated): `runST` + `newSTRef`/`readSTRef`/`writeSTRef`. ST is
+-- operationally identical to IO; the existing IORef bridge (matchPat ST/STRef
+-- in src/IHC/Eval.hs) covers this. Seen in: hspec-core/Runner.hs,
+-- hspec-core/Shuffle.hs.
 import Control.Monad.ST (runST)
 import Data.STRef (newSTRef, readSTRef, writeSTRef)
 
