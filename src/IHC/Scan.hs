@@ -3637,31 +3637,34 @@ collectTypeTokens src = go []
 -- malformation; callers skip the binding and move on.
 parseScheme :: [TTok] -> Maybe Scheme
 parseScheme toks0 = do
-    let (vars, toks1) = consumeForall toks0
-    (preds, toks2) <- Just (consumeContext toks1)
+    let (vars, toks1)  = consumeOptionalForall toks0
+    let (preds, toks2) = consumeOptionalContext toks1
     body <- parseType toks2
     let allVars = if null vars
                     then collectTypeVars body preds
                     else vars
     Just (Scheme allVars preds body)
-  where
-    -- forall a b c.  →  (["a","b","c"], rest)
-    consumeForall (TTForall : rest) =
-        let (vs, afterDot) = takeVars [] rest
-        in (vs, afterDot)
-    consumeForall rest = ([], rest)
 
-    takeVars acc (TTVar n : rest)     = takeVars (n : acc) rest
-    takeVars acc (TTDot    : rest)    = (reverse acc, rest)
-    takeVars acc rest                 = (reverse acc, rest)   -- malformed; proceed
+-- | Strip an optional leading @forall v1 v2 ... vN .@ prefix.
+-- Returns the bound vars (empty if no @forall@) and the tail.
+consumeOptionalForall :: [TTok] -> ([Name], [TTok])
+consumeOptionalForall (TTForall : rest) = takeForallVars [] rest
+consumeOptionalForall toks              = ([], toks)
 
-    -- Find @=>@ at depth 0.  Everything before is context.
-    consumeContext toks =
-        case splitDArrowDepth0 toks of
-            Nothing           -> ([], toks)
-            Just (ctxToks, rest) ->
-                let preds = parseContext ctxToks
-                in (preds, rest)
+-- | After an explicit @forall vs .@, gather the binders up to and
+-- including the dot.  Returns @(vars, afterDot)@.  Stops on malformed
+-- input (returns whatever was accumulated and the remaining tokens).
+takeForallVars :: [Name] -> [TTok] -> ([Name], [TTok])
+takeForallVars acc (TTVar n : rest) = takeForallVars (n : acc) rest
+takeForallVars acc (TTDot    : rest) = (reverse acc, rest)
+takeForallVars acc rest              = (reverse acc, rest)   -- malformed; proceed
+
+-- | Split off an optional @ctx => @ prefix.  Returns parsed predicates
+-- (empty list if no @=>@ at depth 0) and the tail past the @=>@.
+consumeOptionalContext :: [TTok] -> ([Pred], [TTok])
+consumeOptionalContext toks = case splitDArrowDepth0 toks of
+    Nothing              -> ([], toks)
+    Just (ctxToks, rest) -> (parseContext ctxToks, rest)
 
 parseContext :: [TTok] -> [Pred]
 parseContext [] = []
@@ -3699,7 +3702,20 @@ parsePred toks = case toks of
 
 -- | Parse a type expression.  Splits on top-level @->@ first
 -- (right-associative).
+--
+-- Accepts an optional leading @forall vs.@ prefix to support
+-- 'RankNTypes': a nested @forall@ in argument position
+-- (e.g.  @applyBoth :: (forall a. a -> a) -> ... @) parses as a
+-- 'TyForall' wrapping the inner body.  Inner @forall@ may also carry
+-- a constraint context (@forall a. C a => body@).  This is purely
+-- structural — the elaborator does not perform rank-N inference; it
+-- treats the wrapped body as an opaque polymorphic argument.
 parseType :: [TTok] -> Maybe Type
+parseType (TTForall : rest) = do
+    let (vs, afterDot)    = takeForallVars [] rest
+    let (preds, afterCtx) = consumeOptionalContext afterDot
+    body <- parseType afterCtx
+    Just (TyForall vs preds body)
 parseType toks = case splitArrowDepth0 toks of
     Just (lhs, rhs) -> do
         l <- parseTypeApp lhs
