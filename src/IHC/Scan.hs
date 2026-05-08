@@ -59,6 +59,9 @@ module IHC.Scan
       -- * Top-level type signatures + synonyms (for on-demand elaboration)
     , scanTypeSigs
     , scanTypeSynonyms
+      -- * Pattern synonym declarations (Phase 2.x: @pattern Name p \<- body@)
+    , scanPatternSynonyms
+    , PatternSynonymDecl(..)
     ) where
 
 import Data.ByteString (ByteString)
@@ -3972,6 +3975,91 @@ scanTypeSynonymsRaw src
 
 collectTypeVarsList :: Source -> Cursor -> IO ([ByteString], Cursor)
 collectTypeVarsList src cur0 = go [] cur0
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkIdent n -> go (n : acc) cur'
+            _         -> pure (reverse acc, cur)
+
+--------------------------------------------------------------------------------
+-- Pattern synonyms (Phase 2.x)
+--
+-- A top-level @pattern Name p1 p2 \<- body@ (unidirectional) or
+-- @pattern Name p1 p2 = body@ (bidirectional) declaration.  We collect
+-- the name, the spans for parameter patterns and the body pattern;
+-- the actual parsing of those spans into 'Pat' is done by the caller
+-- (Scheduler) which has access to the parser.  Type signatures for
+-- pattern synonyms (e.g. @pattern Head :: a -> [a]@) are ignored.
+--------------------------------------------------------------------------------
+
+data PatternSynonymDecl = PatternSynonymDecl
+    { psdName   :: !ByteString
+    , psdParams :: ![ByteString]   -- parameter identifiers (lowercase)
+    , psdBody   :: !Span           -- byte span containing the body pattern
+    }
+    deriving Show
+
+-- | Walk the source and collect every top-level pattern synonym
+-- declaration that has a body (either @<-@ or @=@).  Type signatures
+-- for pattern synonyms are skipped silently.
+scanPatternSynonyms :: Source -> IO [PatternSynonymDecl]
+scanPatternSynonyms src = memoiseScan "patternSynonyms" src (scanPatternSynonymsRaw src)
+
+scanPatternSynonymsRaw :: Source -> IO [PatternSynonymDecl]
+scanPatternSynonymsRaw src
+    | not (hasKeyword src patternKeyword) = pure []
+    | otherwise = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof     -> pure (reverse acc)
+            TkNewline -> go acc cur'
+            TkIdent name
+                | tkCol tok == 1 && name == patternKeyword -> do
+                    mDecl <- handlePatternDecl cur'
+                    case mDecl of
+                        Just (decl, curAfter) -> go (decl : acc) curAfter
+                        Nothing -> go acc cur'
+            _ -> go acc cur'
+
+    -- After the @pattern@ keyword: read name, collect parameter idents,
+    -- then look for either @<-@ or @=@ (signaling the body).  If we
+    -- only see @::@ followed by a type, this is a signature — skip it.
+    handlePatternDecl cur = do
+        let (nameTok, curAfterName) = nextToken src cur
+        case tkKind nameTok of
+            TkConId n -> handleAfterName n curAfterName
+            -- @pattern (:<) ...@ — ignore for now (operator-name
+            -- pattern synonyms are not supported in this phase).
+            _ -> pure Nothing
+
+    handleAfterName n curAfterName = do
+        (params, curAfterParams) <- collectPatParams src curAfterName
+        let (sepTok, curAfterSep) = nextToken src curAfterParams
+        case tkKind sepTok of
+            TkLArrow -> readBody n params curAfterSep
+            TkEq     -> readBody n params curAfterSep
+            -- Type signature @pattern Name :: T@: skip the rest of the
+            -- decl by reading until newline at col 1.
+            _        -> pure Nothing
+
+    readBody n params curBody = do
+        let bodyStart = cPos (skipTrivia src curBody)
+            bodyEnd   = findBodyEnd src bodyStart
+            decl      = PatternSynonymDecl
+                          { psdName   = n
+                          , psdParams = params
+                          , psdBody   = (bodyStart, bodyEnd)
+                          }
+        pure (Just (decl, Cursor bodyEnd 0 1))
+
+-- | Collect lowercase identifier parameters until we hit a separator
+-- (@<-@, @=@, or @::@).  Conservatively stops at the first non-ident
+-- token; the caller will then inspect that token.
+collectPatParams :: Source -> Cursor -> IO ([ByteString], Cursor)
+collectPatParams src cur0 = go [] cur0
   where
     go acc cur = do
         let (tok, cur') = nextToken src cur

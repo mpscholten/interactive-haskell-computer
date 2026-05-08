@@ -50,6 +50,7 @@ library
       , IHC.ModuleHeader
       , IHC.PackageStore
       , IHC.Parser
+      , IHC.PatSyn
       , IHC.Repl
       , IHC.Scan
       , IHC.Scheduler

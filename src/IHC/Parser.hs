@@ -30,6 +30,7 @@ module IHC.Parser
     , parseBodyExprWithFixity
     , parseExprOnly
     , parseExprAtEof
+    , parsePatIn
     , ParseError(..)
     , FixityTable
     , Assoc(..)
@@ -306,6 +307,18 @@ parseClause src fx (Clause patsSpan rhsSpan) = do
 --------------------------------------------------------------------------------
 -- LHS pattern parsing
 --------------------------------------------------------------------------------
+
+-- | Parse a single pattern from a pre-located source span.  Used by the
+-- pattern-synonym registration path (see "IHC.Scan.scanPatternSynonyms")
+-- to materialise the body pattern of a @pattern Name p \<- body@ decl.
+parsePatIn :: Source -> FixityTable -> Span -> IO Pat
+parsePatIn src fx (start, end) = do
+    let ctx  = Ctx src end 0 fx
+        (startLine, startCol) = offsetToPos src start
+        cur0 = Cursor start startLine startCol
+    liftLex $ do
+        (p, _) <- parseTopPat ctx cur0
+        pure p
 
 parsePatsIn :: Source -> FixityTable -> Span -> IO [Pat]
 parsePatsIn src fx (start, end) = do
