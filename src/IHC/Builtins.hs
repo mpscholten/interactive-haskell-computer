@@ -369,13 +369,18 @@ builtins reg =
     --     ~/.claude/plans/why-is-ihc-test-taking-silly-mango.md
     -- for the multi-slice arc.
     --
-    -- Slice 2 (this commit): 'putStr' and 'putChar' graduate to source-
-    -- loaded under the same rule. Source bodies are
+    -- Slice 2: 'putStr' and 'putChar' graduate to source-loaded under
+    -- the same rule. Source bodies are
     --     putStr s   =  hPutStr stdout s        -- System/IO.hs:278
     --     putChar c  =  hPutChar stdout c       -- System/IO.hs:272
     -- Both bottom out on host shims already pinned via 'ffiBuiltinNames'
     -- in slice 1 (hPutStr, hPutChar, stdout).
-    , ("print",    printDispatch reg)
+    --
+    -- Slice 4 (this commit): 'print' graduates. Source body is
+    --     print x  =  putStrLn (show x)         -- System/IO.hs:296-297
+    -- 'putStrLn' is source-loaded (slice 1).  'show' remains a shim
+    -- ('showDispatch reg' below) because it's the entry point of the
+    -- Show class registry — graduating it is slice 5+ territory.
     , ("getLine",  getLineB)
     -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
     -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
@@ -2297,15 +2302,11 @@ lengthB = pure $ VFun $ \a -> do
 -- See the comment next to the (now-deleted) "putStr"/"putChar" entries
 -- in 'builtins' above.
 
--- printB replaced by printDispatch in Phase 2.3
-
-printDispatch :: ClassRegistry -> IO Val
-printDispatch reg = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- showValWith reg av
-    putStrLn s
-    hFlush stdout
-    pure VUnit
+-- 'printDispatch' was removed in the slice-4 cleanup — 'print' is now
+-- interpreted from ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:296-297
+-- (`print x = putStrLn (show x)`).  The Show-class entry point lives
+-- in 'showDispatch reg' below; demand discovery on 'print x' resolves
+-- 'show' to that dispatcher, which walks the ClassRegistry as before.
 
 -- | 'getLine' — zero-arity IO action. We register the VIO directly
 -- (no dummy-thunk wrapper like Phase 2.2/3). Reading from the env
