@@ -352,7 +352,22 @@ builtins reg =
     -- import-hiding dispatch is fixed at the Scheduler level.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- IO
-    , ("putStrLn", putStrLnB)
+    --
+    -- 'putStrLn' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:282-283
+    --     putStrLn s = hPutStrLn stdout s
+    -- Per CLAUDE.md "Builtin modules: minimum surface only", any symbol
+    -- with .hs source must be interpreted, not shimmed. Keeping the shim
+    -- short-circuits demand discovery on 'putStrLn' (the most-typed name
+    -- in the suite), which causes the FV walk to record phantom misses
+    -- on whatever the source body would have referenced — the workaround
+    -- for those misses is the manifest-driven core load and the
+    -- eager-load-every-import phase in 'loadProgramFromSource'. The
+    -- source path bottoms out one level down on 'hPutStrLn' (still
+    -- shimmed), so demand discovery walks two AST nodes and reaches an
+    -- existing primop boundary. See plan
+    --     ~/.claude/plans/why-is-ihc-test-taking-silly-mango.md
+    -- for the multi-slice arc.
     , ("putStr",   putStrB)
     , ("print",    printDispatch reg)
     , ("putChar",  putCharB)
@@ -2265,18 +2280,11 @@ lengthB = pure $ VFun $ \a -> do
 -- IO
 --------------------------------------------------------------------------------
 
--- | Write a @[Char]@ plus newline. Accepts either a cons-chain of
--- VChar or a transitional VStr.
---
--- Returns @VIO action@ (Phase 2.4): the host IO is delayed until the
--- driver (or a do-block binding) actually runs the action.
-putStrLnB :: IO Val
-putStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- valToString av
-    putStrLn s
-    hFlush stdout
-    pure VUnit
+-- 'putStrLnB' was removed in the "minimum surface only" cleanup —
+-- 'putStrLn' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:282-283.
+-- See the comment next to the (now-deleted) "putStrLn" entry in
+-- 'builtins' above.
 
 putStrB :: IO Val
 putStrB = pure $ VFun $ \a -> pure $ VIO $ do

@@ -3522,6 +3522,19 @@ ffiBuiltinNames = Set.fromList
     -- don't FFI-back; force our host implementation that calls the
     -- ghc-internal PosixIO.setFdOption directly.
     , "setFdOption"
+    -- Text-level handle output: the source bodies in GHC.IO.Handle.Text
+    -- pattern-match on FileHandle/DuplexHandle and route through
+    -- 'wantWritableHandle' / 'wantReadableHandle' / etc., which require
+    -- the full source-level Handle ADT layer (a multi-week effort in
+    -- itself).  Until that layer exists, all paths to these names — bare
+    -- references inside source bodies, FQN-rewritten references via
+    -- import resolution, and re-exports through 'System.IO' — must
+    -- resolve to the host shim that takes 'VPrimObj (PrimHandle h)'.
+    -- Without this, source-loading 'System.IO.putStrLn = hPutStrLn
+    -- stdout s' breaks any fixture that also triggers a manifest cascade
+    -- pulling in 'GHC.IO.Handle.Text' (e.g. anything importing
+    -- 'Control.Exception' or using a custom 'Show' instance).
+    , "hPutStrLn", "hPutStr", "hPutChar"
     ]
 
 -- | Build a map from each locally-visible imported name to its
