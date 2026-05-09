@@ -430,6 +430,11 @@ isDedicatedInfixOpKind k = case k of
     TkPlus     -> True
     TkPlusPlus -> True
     TkStar     -> True
+    -- TkMinus IS dedicated infix when scanning a method LHS at depth 0
+    -- with preceding patterns (e.g. @I# x - I# y = …@ in Num Int).
+    -- Unary-minus in expressions is handled separately by the expression
+    -- parser via ENeg.
+    TkMinus    -> True
     TkColon    -> True
     TkDollar   -> True
     _          -> False
@@ -439,23 +444,33 @@ isDedicatedInfixOpKind k = case k of
 -- but operates on parser tokens.  Returns True for any @TkSymOp@ /
 -- @TkBacktick@ / dedicated-op token at depth 0 before the RHS separator.
 hasTopLevelInfixOp :: Ctx -> Cursor -> IO Bool
-hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int)
+hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
   where
-    go cur depth =
+    -- @sawPat@: at least one pattern-starting token has been seen at
+    -- depth 0.  TkMinus alone (no preceding pat) is unary-minus on a
+    -- negative literal pattern @-1@, NOT an infix operator.  All other
+    -- dedicated infix tokens are unambiguous from token zero so they
+    -- don't need the gate.
+    go cur depth !sawPat =
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
             TkSymOp _  | depth == 0     -> pure True
             TkBacktick | depth == 0     -> pure True
+            TkMinus    | depth == 0
+                       , sawPat         -> pure True
+            TkMinus    | depth == 0     -> go cur' depth sawPat
             k | depth == 0
               , isDedicatedInfixOpKind k -> pure True
-            TkLParen                    -> go cur' (depth + 1)
-            TkLBracket                  -> go cur' (depth + 1)
-            TkLBrace                    -> go cur' (depth + 1)
-            TkRParen                    -> go cur' (max 0 (depth - 1))
-            TkRBracket                  -> go cur' (max 0 (depth - 1))
-            TkRBrace                    -> go cur' (max 0 (depth - 1))
-            _                           -> go cur' depth
+            TkLParen                    -> go cur' (depth + 1) sawPat
+            TkLBracket                  -> go cur' (depth + 1) sawPat
+            TkLBrace                    -> go cur' (depth + 1) sawPat
+            TkRParen                    -> go cur' (max 0 (depth - 1)) True
+            TkRBracket                  -> go cur' (max 0 (depth - 1)) True
+            TkRBrace                    -> go cur' (max 0 (depth - 1)) True
+            _ | depth == 0
+              , startsPat (tkKind tok)  -> go cur' depth True
+            _                           -> go cur' depth sawPat
 
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do
@@ -2516,6 +2531,14 @@ collectArgs ctx name acc cur =
             if isWild
                 then pure (PRecordWild name, curEnd)
                 else pure (PRecord name fieldPats, curEnd)
+        -- TkMinus would otherwise look like the start of a negative-
+        -- literal pattern (@-1@), but as an unparenthesised arg of a
+        -- constructor it's actually the binary infix operator that
+        -- separates this constructor's pattern from the next infix-LHS
+        -- pattern, e.g. @I# x - I# y = …@ in Num Int.  Negative literal
+        -- args are written @C (-1)@, so the parens path in parseSubPat
+        -- still handles them correctly.
+        TkMinus -> pure (PCon name (reverse acc), cur)
         _ | startsPat (tkKind tok) -> do
             (sp, cur'') <- parseSubPat ctx cur
             collectArgs ctx name (sp : acc) cur''

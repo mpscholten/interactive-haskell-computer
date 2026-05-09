@@ -972,6 +972,16 @@ matchPat hooks (PCon "W8#" [p]) (VInt n) = do
 matchPat hooks (PCon "C#" [p]) (VChar c) = do
     t <- newWHNFThunk (VChar c)
     matchFields hooks [(p, t)] []
+-- F# / D#: source-loaded Num Float / Num Double instance bodies
+-- pattern-match on these to access the underlying Float# / Double#.
+-- The runtime stores both Float and Double as VFloat (Double internally),
+-- so the unwrap just exposes that VFloat for the primops to operate on.
+matchPat hooks (PCon "F#" [p]) (VFloat n) = do
+    t <- newWHNFThunk (VFloat n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "D#" [p]) (VFloat n) = do
+    t <- newWHNFThunk (VFloat n)
+    matchFields hooks [(p, t)] []
 -- Lazy ST's lifted state token is `data State s = S# (State# s)`.
 -- The interpreter represents all erased State# tokens as PrimRealWorld, so
 -- expose that raw token through the source constructor when lazy ST code
