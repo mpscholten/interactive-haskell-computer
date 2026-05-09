@@ -321,7 +321,6 @@ builtins reg =
     --
     -- Already graduated to pure source: empty, null, length, pack
     -- (Char8 siblings of all four also gone).
-    , ("Data.ByteString.unpack",    bsUnpackB)
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
@@ -3298,14 +3297,6 @@ runIdentityB = pure $ VFun $ \a -> do
         other -> error ("runIdentity: expected Identity wrapper, got "
                          <> showValForDebug other)
 
-bsUnpackB :: IO Val
-bsUnpackB = pure $ VFun $ \a -> do
-    av <- force a
-    (fp, len) <- bsValPayload av
-    ws <- withForeignPtr fp $ \ptr ->
-        mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
-    wordsToConsList ws
-
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString
 bsValToBS v = do
@@ -3410,14 +3401,6 @@ bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     BC.putStrLn bs
     hFlush stdout
     pure VUnit
-
-wordsToConsList :: [Word8] -> IO Val
-wordsToConsList []     = pure (VCon "[]" [])
-wordsToConsList (w:ws) = do
-    hT <- newWHNFThunk (VInt (fromIntegral w))
-    tV <- wordsToConsList ws
-    tT <- newWHNFThunk tV
-    pure (VCon ":" [hT, tT])
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
