@@ -289,7 +289,8 @@ builtins reg =
     --     gcd x y = gcd' (abs x) (abs y)
     --       where gcd' a 0 = a
     --             gcd' a b = gcd' b (a `rem` b)
-    -- abs already graduated in Phase E; rem is registered below.
+    -- abs already graduated in Phase E; rem source-loads from
+    -- 'Integral Int.rem' (Real.hs:452-455 → remInt → remInt#).
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
     , ("sqrt",     unaryOpFloat sqrt)
@@ -955,8 +956,11 @@ builtins reg =
     -- Phase 2.8: additional numeric ops needed by containers
     , ("fromInteger",  fromIntegralB)
     , ("toInteger",    fromIntegralB)
-    , ("quot",         binOpInt quot)
-    , ("rem",          binOpInt rem)
+    -- 'quot' / 'rem' graduated to source-loaded.  Bodies live at
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:445-455
+    -- and route through the quotInt / remInt Haskell wrappers in
+    -- GHC.Internal.Base, bottoming on the quotInt# / remInt# primops
+    -- registered above.
     -- 'div' graduated with the rest of the TODO 2.6 block: it now
     -- routes through the Integral Int instance (a `divInt` b) and
     -- bottoms on divInt# registered below.
@@ -1431,15 +1435,6 @@ builtins reg =
 --------------------------------------------------------------------------------
 -- Builders
 --------------------------------------------------------------------------------
-
-binOpInt :: (Int64 -> Int64 -> Int64) -> IO Val
-binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (VInt (op x y))
-        _ -> error ("binOp: non-Int args: "
-                    <> showValForDebug av <> ", " <> showValForDebug bv)
 
 -- | Float-only unary op.
 unaryOpFloat :: (Double -> Double) -> IO Val
