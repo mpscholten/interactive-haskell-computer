@@ -99,19 +99,37 @@ prettyStmt = \case
           <> "  Got: " <> takeShow 80 s )
 
 
--- | Pretty-print a 'Pat' to source bytes.  Slice 2.E covers the
--- minimal subset 'PVar' \/ 'PWild' so 'ECase' can generate
--- alternatives without dragging full pattern coverage in.  The
--- richer constructors ('PCon', 'PLit', 'PTuple', 'PAs', …) land
--- in the patterns slice that follows EIf \/ ECase \/ EDo.
+-- | Pretty-print a 'Pat' to source bytes.  Slice 2.F covers the
+-- bulk of the pattern grammar ('PVar', 'PWild', 'PLit', 'PCon',
+-- 'PTuple', 'PAs', 'PBang', 'PIrref').  The record-shaped
+-- constructors ('PRecord', 'PRecordWild', 'PView') land in a
+-- follow-up.
+--
+-- Defensive parens wrap every non-atom pattern.  Atoms ('PVar',
+-- 'PWild', 'PLit') emit bare.  'PTuple' is its own paren-bearing
+-- form, so we don't double-wrap it.
 prettyPat :: Pat -> ByteString
 prettyPat = \case
-    PWild  -> "_"
-    PVar n -> n
-    p      -> error
+    PWild           -> "_"
+    PVar n          -> n
+    PLit l          -> prettyLit l
+    PCon n args     ->
+        "(" <> n <> argsPart <> ")"
+      where
+        argsPart
+          | null args = BS.empty
+          | otherwise = " " <> bsIntercalate " " (map prettyPat args)
+    PTuple ps       ->
+        "(" <> bsIntercalate ", " (map prettyPat ps) <> ")"
+    PAs n p         -> n <> "@(" <> prettyPat p <> ")"
+    PBang p         -> "(!(" <> prettyPat p <> "))"
+    PIrref p        -> "(~(" <> prettyPat p <> "))"
+    p               -> error
         ( "IHC.Pretty.prettyPat: unsupported Pat constructor.\n"
-          <> "  Slice 2.E covers PVar / PWild only;\n"
-          <> "  richer patterns land in 2.F.  Got: " <> takeShow 80 p )
+          <> "  Slice 2.F covers PVar / PWild / PLit / PCon /\n"
+          <> "  PTuple / PAs / PBang / PIrref.  PRecord /\n"
+          <> "  PRecordWild / PView land in a follow-up.\n"
+          <> "  Got: " <> takeShow 80 p )
 
 
 -- | Pretty-print a 'let'-binding group.  Bindings are joined by

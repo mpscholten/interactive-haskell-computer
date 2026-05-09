@@ -25,14 +25,17 @@ module Properties.Generators
     ( genLit
     , genExpr
     , genIdent
+    , genConIdent
     , genPat
     ) where
 
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr)
 import Data.Int (Int64)
 import Data.Set (Set)
 import qualified Data.Set as Set
+import Data.Word (Word8)
 
 import Test.QuickCheck
     ( Gen
@@ -192,15 +195,107 @@ genAlts n = do
     vectorOf k (Alt <$> genPat <*> genExprSized n)
 
 
--- | Generator for 'Pat'.  Slice 2.E covers the minimal subset
--- 'PVar' \/ 'PWild' so 'ECase' can generate alternatives without
--- dragging full pattern coverage in.  Richer constructors land in
--- the patterns slice that follows.
+-- | Generator for 'Pat', size-bounded via QuickCheck's 'sized'.
+--
+-- Slice 2.F covers the bulk of the pattern grammar: 'PVar',
+-- 'PWild', 'PLit', 'PCon', 'PTuple', 'PAs', 'PBang', 'PIrref'.
+-- The record-shaped constructors ('PRecord', 'PRecordWild',
+-- 'PView') land in a follow-up — their syntax involves field
+-- listings (or view-pattern arrow expressions) that interact
+-- with extension flags and need their own design pass.
 genPat :: Gen Pat
-genPat = oneof
-    [ pure PWild
-    , PVar <$> genIdent
+genPat = sized genPatSized
+
+
+genPatSized :: Int -> Gen Pat
+genPatSized n
+    | n <= 0    = atom
+    | otherwise = frequency
+        [ (3, atom)
+        , (2, PCon   <$> genConIdent <*> genConArgs half)
+        , (2, PTuple <$> genTupleArgs half)
+        , (1, PAs    <$> genIdent <*> genPatSized sub)
+        , (1, PBang  <$> genPatSized sub)
+        , (1, PIrref <$> genPatSized sub)
+        ]
+  where
+    atom    = frequency
+        [ (3, pure PWild)
+        , (3, PVar <$> genIdent)
+        , (2, PLit <$> genPatLit)
+        , (1, PCon <$> genConIdent <*> pure [])
+        ]
+    half    = max 0 (n `div` 2 - 1)
+    sub     = n - 1
+
+
+-- | 0–3 sub-pattern arguments for a 'PCon'.
+genConArgs :: Int -> Gen [Pat]
+genConArgs n = do
+    k <- choose (0, 3)
+    vectorOf k (genPatSized n)
+
+
+-- | A 'PTuple' must have at least 2 elements.
+genTupleArgs :: Int -> Gen [Pat]
+genTupleArgs n = do
+    k <- choose (2, 3)
+    vectorOf k (genPatSized n)
+
+
+-- | Pattern-position 'Lit' generator.  'LStr' is included here
+-- — unlike at expression position, source-level @\"...\"@ inside
+-- a pattern produces @PLit (LStr ...)@ directly (see
+-- @src/IHC/Parser.hs:2560@), so it round-trips cleanly.  Bytes
+-- restricted to ASCII for the same reason as 'genLit' for 'LStr'
+-- once it lands at expression level: the lexer UTF-8-encodes
+-- @\\<n>@ escapes for codepoints > 0x7F, breaking the
+-- byte == codepoint invariant.
+genPatLit :: Gen Lit
+genPatLit = frequency
+    [ (3, LInt     <$> choose (0, maxBound :: Int64))
+    , (1, LInteger <$> genBigInteger)
+    , (2, LFloat   <$> genFiniteNonNegDouble)
+    , (2, LChar    <$> genUnicodeChar)
+    , (1, LStr     <$> genAsciiByteString)
     ]
+
+
+-- | A 'ByteString' of ASCII bytes (0x00..0x7F) with size scaled
+-- to QuickCheck's size parameter.  Empty strings reachable.
+genAsciiByteString :: Gen BS.ByteString
+genAsciiByteString = do
+    n  <- choose (0, 16)
+    BS.pack <$> vectorOf n genAsciiByte
+
+
+genAsciiByte :: Gen Word8
+genAsciiByte = frequency
+    [ (40, choose (0x20, 0x7E))    -- printable ASCII
+    , ( 5, choose (0x00, 0x1F))    -- C0 control bytes
+    , ( 1, pure 0x7F)              -- DEL
+    ]
+
+
+--------------------------------------------------------------------------------
+-- Constructor identifiers (PCon / data-tag names)
+--------------------------------------------------------------------------------
+
+-- | Generate an uppercase-starting identifier suitable for
+-- 'PCon' pattern heads (and, eventually, 'EVar' references to
+-- niladic constructors).  No filtering — Haskell does not reserve
+-- constructor names; the parser produces 'PCon' for any
+-- 'TkConId'.
+genConIdent :: Gen Name
+genConIdent = BC.pack <$> rawConIdent
+
+
+rawConIdent :: Gen String
+rawConIdent = do
+    c  <- elements ['A' .. 'Z']
+    n  <- choose (0, 7)
+    cs <- vectorOf n (elements identTailChars)
+    pure (c : cs)
 
 
 --------------------------------------------------------------------------------
