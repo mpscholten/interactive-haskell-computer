@@ -132,6 +132,7 @@ test-suite ihc-test
       , Coverage
       , Properties.Generators
       , Properties.RoundTrip
+      , Properties.SectionDesugar
       , Properties.Totality
       , HsExtTypeFams
       , HsExtMisc
