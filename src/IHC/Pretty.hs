@@ -71,6 +71,15 @@ prettyExpr = \case
           <> " })"
     EDo   stmts    ->
         "(do { " <> bsIntercalate "; " (map prettyStmt stmts) <> " })"
+    ENeg  e        ->
+        -- The space after @-@ is defensive: without it,
+        -- @-3@ is fine but @-x@ next to certain operators in
+        -- non-paren contexts could lex differently.  The outer
+        -- parens isolate the unary form from any surrounding
+        -- expression so re-parse always reaches 'parseUnary'.
+        "(- " <> prettyExpr e <> ")"
+    ETuple es      ->
+        "(" <> bsIntercalate ", " (map prettyExpr es) <> ")"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"

@@ -126,10 +126,11 @@ genUnicodeChar = chr <$> frequency
 
 -- | Generator for 'Expr', size-bounded via QuickCheck's 'sized'.
 --
--- Slice 2.E adds 'EIf' and 'ECase' on top of the 2.D baseline
--- ('EVar' \/ 'EApp' \/ 'ELam' \/ 'ELet' \/ 'ELit').  Subsequent
--- slices add full pattern coverage, then records \/ labels \/
--- sections, then the long tail.
+-- Slice 2.G adds 'ETuple' (≥2 elements) and 'ENeg' (unary
+-- minus) on top of the 2.E baseline.  'ENeg' notably enables
+-- /negative/ numerics in the round-trip — the parser shapes
+-- source-level @-5@ as @ENeg (ELit (LInt 5))@, so we keep the
+-- literal generators non-negative and wrap with 'ENeg' here.
 --
 -- 'EDo' is intentionally NOT generated.  'IHC.Parser.parseDo'
 -- (lines 1310-1403 in @src/IHC/Parser.hs@) desugars do-notation
@@ -149,10 +150,10 @@ genUnicodeChar = chr <$> frequency
 -- desugaring as its own equivalence property in a follow-up).
 --
 -- The size budget halves on multi-child constructors ('EApp',
--- 'EIf', 'ECase' alternatives) and decrements by one on single-
--- body constructors ('ELam', 'ELet'-body).  At @size <= 0@ only
--- atoms are returned, so depth is bounded by @log2 size@ in the
--- worst case.
+-- 'EIf', 'ECase' alternatives, 'ETuple') and decrements by one
+-- on single-body constructors ('ELam', 'ELet'-body, 'ENeg').
+-- At @size <= 0@ only atoms are returned, so depth is bounded by
+-- @log2 size@ in the worst case.
 genExpr :: Gen Expr
 genExpr = sized genExprSized
 
@@ -162,11 +163,13 @@ genExprSized n
     | n <= 0    = atom
     | otherwise = frequency
         [ (3, atom)
-        , (2, EApp  <$> half <*> half)
-        , (1, ELam  <$> genIdent <*> sub)
-        , (1, ELet  <$> genBindings half_n <*> sub)
-        , (1, EIf   <$> third <*> third <*> third)
-        , (1, ECase <$> half  <*> genAlts half_n)
+        , (2, EApp   <$> half <*> half)
+        , (1, ELam   <$> genIdent <*> sub)
+        , (1, ELet   <$> genBindings half_n <*> sub)
+        , (1, EIf    <$> third <*> third <*> third)
+        , (1, ECase  <$> half  <*> genAlts half_n)
+        , (1, ENeg   <$> sub)
+        , (1, ETuple <$> genTupleExprs half_n)
         ]
   where
     atom   = frequency
@@ -177,6 +180,14 @@ genExprSized n
     third   = genExprSized (n `div` 3)
     half_n  = max 0 (n `div` 2 - 1)
     sub     = genExprSized (n - 1)
+
+
+-- | An expression-level tuple: 2–3 elements (Haskell does not
+-- have 1-element tuples; @()@ would be the unit constructor).
+genTupleExprs :: Int -> Gen [Expr]
+genTupleExprs n = do
+    k <- choose (2, 3)
+    vectorOf k (genExprSized n)
 
 
 -- | A non-empty list of @let@-bindings (1–3 entries) sized at @n@.
