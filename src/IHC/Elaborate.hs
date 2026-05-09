@@ -32,6 +32,7 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, lookupInstance)
+import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef)
 import IHC.TypeUnify
@@ -489,8 +490,7 @@ parseRawTypeExpr bs = do
         [] -> Just t
         _  -> Just t   -- ignore trailing junk — best effort
   where
-    trimSpaces = BC.dropWhile isSpc
-    isSpc c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+    trimSpaces = BC.dropWhile isAsciiSpace
 
     -- One simple type = list of atoms folded into a TyApp chain.
     parseT toks = do

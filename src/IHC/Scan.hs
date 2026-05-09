@@ -83,6 +83,7 @@ import IHC.Classes (normalizeTyTag)
 import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
+import IHC.StringUtils (isAsciiSpace, trimAscii)
 import IHC.TypeAST (Type(..), Pred(..), Scheme(..))
 import qualified IHC.TypeReduce as TR
 
@@ -1286,27 +1287,24 @@ parseOneEquation line = do
 -- is a whitespace-delimited atom.
 parseArgList :: ByteString -> [TR.TyExpr]
 parseArgList raw0 =
-    let bs = trim raw0
+    let bs = trimAscii raw0
     in go [] bs
   where
-    trim s = BC.dropWhile isSp (BC.reverse (BC.dropWhile isSp (BC.reverse s)))
-    isSp c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
-
     go acc s
       | BS.null s = reverse acc
       | otherwise =
           let (argBs, rest) = takeOneArg s
           in if BS.null argBs
                then reverse acc
-               else go (TR.parseTypeExpr argBs : acc) (BC.dropWhile isSp rest)
+               else go (TR.parseTypeExpr argBs : acc) (BC.dropWhile isAsciiSpace rest)
 
     takeOneArg s = case BC.head s of
-        c | isSp c -> takeOneArg (BC.dropWhile isSp s)
+        c | isAsciiSpace c -> takeOneArg (BC.dropWhile isAsciiSpace s)
         '(' -> takeBalanced '(' ')' s
         '[' -> takeBalanced '[' ']' s
         '\'' -> takeTickPrefixed s
         '"' -> takeStringLit s
-        _   -> BC.span (\ch -> not (isSp ch)) s
+        _   -> BC.span (\ch -> not (isAsciiSpace ch)) s
 
     takeBalanced openCh closeCh s = goBal 0 0
       where
@@ -1327,7 +1325,7 @@ parseArgList raw0 =
                      in (BC.cons '\'' lst, rest)
               '(' -> let (tup, rest) = takeBalanced '(' ')' (BC.tail s)
                      in (BC.cons '\'' tup, rest)
-              _   -> BC.span (\ch -> not (isSp ch)) s
+              _   -> BC.span (\ch -> not (isAsciiSpace ch)) s
       | otherwise = (s, BC.empty)
 
     takeStringLit s =
