@@ -25,6 +25,7 @@ module Properties.Generators
     ( genLit
     , genExpr
     , genIdent
+    , genPat
     ) where
 
 import qualified Data.ByteString.Char8 as BC
@@ -39,6 +40,7 @@ import Test.QuickCheck
     , choose
     , elements
     , frequency
+    , oneof
     , sized
     , suchThat
     , vectorOf
@@ -121,12 +123,31 @@ genUnicodeChar = chr <$> frequency
 
 -- | Generator for 'Expr', size-bounded via QuickCheck's 'sized'.
 --
--- Slice 2.D covers leaves 'EVar' \/ 'ELit' and the binding\/
--- application constructors 'EApp' \/ 'ELam' \/ 'ELet'.  Subsequent
--- slices add 'EIf' \/ 'ECase' \/ 'EDo' \/ patterns \/ ….
+-- Slice 2.E adds 'EIf' and 'ECase' on top of the 2.D baseline
+-- ('EVar' \/ 'EApp' \/ 'ELam' \/ 'ELet' \/ 'ELit').  Subsequent
+-- slices add full pattern coverage, then records \/ labels \/
+-- sections, then the long tail.
 --
--- The size budget halves on 'EApp' (two children) and decrements
--- by one on 'ELam' \/ 'ELet' (single body).  At @size <= 0@ only
+-- 'EDo' is intentionally NOT generated.  'IHC.Parser.parseDo'
+-- (lines 1310-1403 in @src/IHC/Parser.hs@) desugars do-notation
+-- at parse time:
+--
+--   * @do { e }@                → @e@                           (collapse)
+--   * @do { e1; e2 }@           → @e1 >> e2@                    (>>-chain)
+--   * @do { x <- e1; e2 }@      → @e1 >>= \\x -> e2@            (>>=-chain)
+--   * @do { let bs; e }@        → @let bs in e@                 (ELet)
+--   * applicative-shape blocks  → @(\\x .. -> e) <$> a1 <*> ..@ (ApDo)
+--
+-- So 'EDo' as a parser /output/ only arises from the degenerate
+-- empty case @EDo []@ or from applicative-do; an 'EDo' built by
+-- this generator would never round-trip through the parser's
+-- desugarer.  Generating do-blocks for property testing requires
+-- emitting the /desugared/ shape directly (or testing the
+-- desugaring as its own equivalence property in a follow-up).
+--
+-- The size budget halves on multi-child constructors ('EApp',
+-- 'EIf', 'ECase' alternatives) and decrements by one on single-
+-- body constructors ('ELam', 'ELet'-body).  At @size <= 0@ only
 -- atoms are returned, so depth is bounded by @log2 size@ in the
 -- worst case.
 genExpr :: Gen Expr
@@ -138,18 +159,21 @@ genExprSized n
     | n <= 0    = atom
     | otherwise = frequency
         [ (3, atom)
-        , (2, EApp <$> half <*> half)
-        , (1, ELam <$> genIdent <*> sub)
-        , (1, ELet <$> genBindings half_n <*> sub)
+        , (2, EApp  <$> half <*> half)
+        , (1, ELam  <$> genIdent <*> sub)
+        , (1, ELet  <$> genBindings half_n <*> sub)
+        , (1, EIf   <$> third <*> third <*> third)
+        , (1, ECase <$> half  <*> genAlts half_n)
         ]
   where
     atom   = frequency
         [ (2, ELit <$> genLit)
         , (1, EVar <$> genIdent)
         ]
-    half   = genExprSized (n `div` 2)
-    half_n = max 0 (n `div` 2 - 1)
-    sub    = genExprSized (n - 1)
+    half    = genExprSized (n `div` 2)
+    third   = genExprSized (n `div` 3)
+    half_n  = max 0 (n `div` 2 - 1)
+    sub     = genExprSized (n - 1)
 
 
 -- | A non-empty list of @let@-bindings (1–3 entries) sized at @n@.
@@ -157,6 +181,26 @@ genBindings :: Int -> Gen [Bind]
 genBindings n = do
     k <- choose (1, 3)
     vectorOf k ((,) <$> genIdent <*> genExprSized n)
+
+
+-- | A non-empty list of 'case' alternatives.  At least one alt is
+-- required by Haskell syntax (modulo the EmptyCase extension,
+-- which we do not exercise here).
+genAlts :: Int -> Gen [Alt]
+genAlts n = do
+    k <- choose (1, 3)
+    vectorOf k (Alt <$> genPat <*> genExprSized n)
+
+
+-- | Generator for 'Pat'.  Slice 2.E covers the minimal subset
+-- 'PVar' \/ 'PWild' so 'ECase' can generate alternatives without
+-- dragging full pattern coverage in.  Richer constructors land in
+-- the patterns slice that follows.
+genPat :: Gen Pat
+genPat = oneof
+    [ pure PWild
+    , PVar <$> genIdent
+    ]
 
 
 --------------------------------------------------------------------------------

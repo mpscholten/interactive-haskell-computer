@@ -27,6 +27,7 @@
 module IHC.Pretty
     ( prettyExpr
     , prettyLit
+    , prettyPat
     ) where
 
 import Data.ByteString (ByteString)
@@ -60,11 +61,57 @@ prettyExpr = \case
         "(\\" <> x <> " -> " <> prettyExpr body <> ")"
     ELet  binds b  ->
         "(let { " <> prettyBinds binds <> " } in " <> prettyExpr b <> ")"
+    EIf   c t e    ->
+        "(if " <> prettyExpr c
+          <> " then " <> prettyExpr t
+          <> " else " <> prettyExpr e <> ")"
+    ECase scrut alts ->
+        "(case " <> prettyExpr scrut
+          <> " of { " <> bsIntercalate "; " (map prettyAlt alts)
+          <> " })"
+    EDo   stmts    ->
+        "(do { " <> bsIntercalate "; " (map prettyStmt stmts) <> " })"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"
           <> "  prettyExpr handles; extend both together.\n"
           <> "  Got: " <> takeShow 120 e )
+
+
+-- | Pretty-print a single 'case' alternative as @<pat> -> <body>@.
+-- Guards land alongside richer pattern coverage in a later slice.
+prettyAlt :: Alt -> ByteString
+prettyAlt (Alt p body) = prettyPat p <> " -> " <> prettyExpr body
+
+
+-- | Pretty-print a single 'do'-block statement.
+--
+-- @SBangBind@ \/ @SImplicitLet@ are deferred until BangPatterns
+-- and ImplicitParams enter the generator; an explicit @error@
+-- here keeps generator + pretty in lockstep.
+prettyStmt :: Stmt -> ByteString
+prettyStmt = \case
+    SExpr e        -> prettyExpr e
+    SBind n e      -> n <> " <- " <> prettyExpr e
+    SLet  binds    -> "let { " <> prettyBinds binds <> " }"
+    s              -> error
+        ( "IHC.Pretty.prettyStmt: unsupported Stmt constructor.\n"
+          <> "  Got: " <> takeShow 80 s )
+
+
+-- | Pretty-print a 'Pat' to source bytes.  Slice 2.E covers the
+-- minimal subset 'PVar' \/ 'PWild' so 'ECase' can generate
+-- alternatives without dragging full pattern coverage in.  The
+-- richer constructors ('PCon', 'PLit', 'PTuple', 'PAs', …) land
+-- in the patterns slice that follows EIf \/ ECase \/ EDo.
+prettyPat :: Pat -> ByteString
+prettyPat = \case
+    PWild  -> "_"
+    PVar n -> n
+    p      -> error
+        ( "IHC.Pretty.prettyPat: unsupported Pat constructor.\n"
+          <> "  Slice 2.E covers PVar / PWild only;\n"
+          <> "  richer patterns land in 2.F.  Got: " <> takeShow 80 p )
 
 
 -- | Pretty-print a 'let'-binding group.  Bindings are joined by
