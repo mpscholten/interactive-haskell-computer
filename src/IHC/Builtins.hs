@@ -285,7 +285,14 @@ builtins reg =
     -- dispatcher.
     [ ("min",      minDispatch reg)
     , ("max",      maxDispatch reg)
-    , ("gcd",      binOpInt gcd)
+    -- 'gcd' graduated to source-loaded.  Body lives at
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:928-930
+    --     gcd x y = gcd' (abs x) (abs y)
+    --       where gcd' a 0 = a
+    --             gcd' a b = gcd' b (a `rem` b)
+    -- abs already graduated in Phase E; rem is registered below.
+    -- The Phase F buildOwnerLocalEnv guard handles class-method
+    -- resolution inside the source-loaded body.
     , ("sqrt",     unaryOpFloat sqrt)
     , ("floor",    floatToIntB floor)
     , ("ceiling",  floatToIntB ceiling)
