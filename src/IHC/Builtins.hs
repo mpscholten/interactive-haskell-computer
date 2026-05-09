@@ -321,7 +321,10 @@ builtins reg =
     , ("Data.ByteString.empty",     bsEmptyB)
     , ("Data.ByteString.null",      bsNullB)
     , ("Data.ByteString.length",    bsLengthShimB)
-    , ("Data.ByteString.pack",      bsPackB)
+    -- 'Data.ByteString.pack' is no longer shimmed — source-loaded
+    -- 'unsafePackLenBytes' works for both '[Word8]' and '[Char]'
+    -- inputs now that 'pokeB' accepts 'VChar'.  Per CLAUDE.md rule 4,
+    -- prefer source over Hackage-library shim.
     , ("Data.ByteString.unpack",    bsUnpackB)
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
@@ -362,7 +365,10 @@ builtins reg =
     , ("Data.ByteString.Char8.empty",     bsEmptyB)
     , ("Data.ByteString.Char8.null",      bsNullB)
     , ("Data.ByteString.Char8.length",    bsLengthShimB)
-    , ("Data.ByteString.Char8.pack",      bs8PackB)
+    -- 'Data.ByteString.Char8.pack' is no longer shimmed — source-
+    -- loaded 'unsafePackLenChars' uses @c2w = fromIntegral . ord@ so
+    -- each element pokes as a 'VInt' (no 'VChar' coercion needed at
+    -- the FFI boundary; the conversion happens in interpreted code).
     , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
     , ("Data.ByteString.Char8.append",    bsAppendB)
     , ("Data.ByteString.Char8.concat",    bsConcatB)
@@ -3315,19 +3321,6 @@ bsNullB = pure $ VFun $ \a -> do
     (_, len) <- bsValPayload av
     pure (VCon (if len == 0 then "True" else "False") [])
 
-bsPackB :: IO Val
-bsPackB = pure $ VFun $ \a -> do
-    av <- force a
-    ws <- valToWord8List av
-    let len = length ws
-        bs  = BS.pack ws
-    fp <- BS.useAsCStringLen bs $ \(ptr, _) -> do
-        newfp <- mallocForeignPtrBytes len
-        withForeignPtr newfp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
-            copyBytes (castPtr dst) (castPtr src) l
-        pure newfp
-    mkBsVal fp len
-
 -- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
 -- and forces the payload. Also accepts `Identity { runIdentity = x }`
 -- record-constructor form since ihc lowers both to the same VCon shape.
@@ -3445,14 +3438,6 @@ bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
             w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
             pure (VInt (fromIntegral w))
 
--- | Data.ByteString.Char8.pack — same runtime value as BS.pack but
--- input is a String ([Char]) with each Char lowered to a Word8 byte.
-bs8PackB :: IO Val
-bs8PackB = pure $ VFun $ \a -> do
-    av <- force a
-    s  <- valToString av
-    bsFromBS (BC.pack s)
-
 -- | Data.ByteString.Char8.unpack — BS → String by reading each byte
 -- as the corresponding Char (not UTF-8 decoded).
 bs8UnpackB :: IO Val
@@ -3512,22 +3497,6 @@ bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     BC.putStrLn bs
     hFlush stdout
     pure VUnit
-
-valToWord8List :: Val -> IO [Word8]
-valToWord8List v0 = go v0
-  where
-    go (VCon "[]" _)        = pure []
-    go (VStr s)             = pure (BS.unpack s)
-    go (VCon ":" [hT, tT])  = do
-        hv <- force hT
-        w  <- case hv of
-            VInt n  -> pure (fromIntegral n :: Word8)
-            VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-            _       -> error ("BS.pack: element not a Word8: " <> showValForDebug hv)
-        tv <- force tT
-        ws <- go tv
-        pure (w : ws)
-    go other = error ("BS.pack: expected [Word8] list, got " <> showValForDebug other)
 
 wordsToConsList :: [Word8] -> IO Val
 wordsToConsList []     = pure (VCon "[]" [])
@@ -4256,16 +4225,15 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     p <- ptrValToPtr av
     case bv of
         VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-        -- Accept 'VChar' for the @Ptr Word8@ default. ihc skips type
-        -- checking, so a 'VChar' can flow into a Word8-typed slot when
-        -- a user writes e.g. @Data.ByteString.pack "test"@ — that's a
-        -- type error in stock Haskell, but the project's optimistic
-        -- semantics treats it as the Char8 path's @c2w = fromIntegral
-        -- . ord@ coercion and lets it through.  This used to be
-        -- handled by the 'bsPackB' shim's 'valToWord8List'; landing
-        -- the conversion at the FFI boundary lets source-loaded
+        -- Accept 'VChar' for the @Ptr Word8@ default.  ihc skips type
+        -- checking, so a 'VChar' can flow into a Word8-typed slot
+        -- when a user writes e.g. @Data.ByteString.pack "test"@ — a
+        -- type error in stock Haskell, but ihc's optimistic semantics
+        -- treats it as the Char8 path's @c2w = fromIntegral . ord@
+        -- coercion and lets it through.  Landing the conversion at
+        -- the FFI boundary lets source-loaded
         -- 'Data.ByteString.Internal.Type.unsafePackLenBytes' work
-        -- without a Hackage-library shim (CLAUDE.md rule 4).
+        -- without any Hackage-library shim (CLAUDE.md rule 4).
         VChar c -> do { poke (p :: Ptr Word8) (fromIntegral (fromEnum c)); pure VUnit }
         _ -> error ("poke: value not an Int or Char: " <> showValForDebug bv)
 
