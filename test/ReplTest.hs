@@ -111,12 +111,25 @@ spec = describe "REPL smoke tests" do
                 out `shouldContain` "3"
 
     it "import qualified Data.ByteString as BS: BS.length (BS.pack \"test\") = 4" do
-        -- User-reported: `BS.pack "test"` (a String literal, which is [Char])
-        -- hangs the REPL indefinitely.  Whereas `BS.pack [97,98,99]` (Word8
-        -- list) above succeeds, this String-via-OverloadedStrings path
-        -- currently doesn't complete.  Gated on IHC_REPL_SLOW=1 so the
-        -- default `cabal test ihc-test` run doesn't block for 20s just
-        -- to collect a known regression signal.
+        -- User-reported (originally as "hangs indefinitely"; the symptom
+        -- has changed but the underlying bug is still there): the REPL
+        -- evaluates `BS.pack "test"` against the *source-loaded*
+        -- `Data.ByteString.pack` from the bytestring package instead of
+        -- the FQN-keyed `bsPackB` shim in `IHC.Builtins`.  Source-loaded
+        -- `pack` happens to work for `BS.pack [97,98,99]` because each
+        -- element is a `VInt` that can be `poke`d as a `Word8`, but with
+        -- a String literal each element is a `VChar` and the poke path
+        -- aborts with @poke: value not an Int: 't'@
+        -- (`src/IHC/Builtins.hs:4260`).  The shim's `valToWord8List`
+        -- handles `VChar` correctly — it's just not reached in REPL mode.
+        --
+        -- Root cause is in 'IHC.Repl.ensureQualifiedNamesLoaded' /
+        -- 'loadImportIntoEnv' for non-builtin-backed modules: the
+        -- alias-prefixed key (`BS.pack`) is bound to a source-loaded
+        -- thunk and shadows the FQN-keyed shim (`Data.ByteString.pack`)
+        -- that 'builtinEnv' already installed.  Fix is non-trivial
+        -- (env-merge precedence or a per-FQN early-resolution pass);
+        -- gated on IHC_REPL_SLOW=1 so the default test run stays green.
         slow <- lookupEnv "IHC_REPL_SLOW"
         case slow of
             Nothing -> pendingWith "slow REPL path; set IHC_REPL_SLOW=1 to run"
