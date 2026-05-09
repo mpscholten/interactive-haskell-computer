@@ -6492,9 +6492,26 @@ resolveImport' registry searchPath includeMap lm name = do
                 followNamedReexportD 3 lm []
             | otherwise -> pure Nothing
   where
+    -- A spec @ImportOnly ["$dotdot:T", "T"]@ from `import M (T(..))`
+    -- can't be decided by 'specAllows' alone — to know whether @name@
+    -- is part of @T(..)@, we have to inspect M's exports.  'specAllows'
+    -- conservatively returns False for those, but if T(..) is the only
+    -- way name flows in we'd silently drop the import (e.g. warp's
+    -- @import Data.ByteString.Internal (ByteString(..))@ pulling in
+    -- the @PS@ pattern synonym).  When the cheap check fails AND the
+    -- spec carries a @\"$dotdot:T\"@ sentinel for some @T@, we accept
+    -- the import provisionally; the post-load 'exportsName' check
+    -- below filters out names that aren't actually re-exported.
+    specAllowsCheap spec n =
+        specAllows spec n
+        || case spec of
+            ImportOnly ns ->
+                any (BC.isPrefixOf (BC.pack "$dotdot:")) ns
+            _ -> False
+
     tryImports [] = pure Nothing
     tryImports (imp:rest)
-        | not (specAllows (impSpec imp) name) = tryImports rest
+        | not (specAllowsCheap (impSpec imp) name) = tryImports rest
         | otherwise = do
             -- Load-guard: don't eagerly load cache modules that could pull in
             -- large transitive dependency subgraphs (GHC.Base and friends).
