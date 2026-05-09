@@ -284,7 +284,14 @@ builtins reg =
     -- dispatcher.
     [ ("min",      minDispatch reg)
     , ("max",      maxDispatch reg)
-    , ("gcd",      binOpInt gcd)
+    -- 'gcd' graduated to source-loaded.  Body lives at
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:928-930
+    --     gcd x y = gcd' (abs x) (abs y)
+    --       where gcd' a 0 = a
+    --             gcd' a b = gcd' b (a `rem` b)
+    -- abs already graduated in Phase E; rem is registered below.
+    -- The Phase F buildOwnerLocalEnv guard handles class-method
+    -- resolution inside the source-loaded body.
     , ("sqrt",     unaryOpFloat sqrt)
     , ("floor",    floatToIntB floor)
     , ("ceiling",  floatToIntB ceiling)
@@ -304,22 +311,25 @@ builtins reg =
     , (">",        ordDispatch reg 2)
     , (">=",       ordDispatch reg 3)
     , ("compare",  compareDispatch reg)
-    , ("not",      notB)
-    -- Boolean
     --
-    -- (&&) is deliberately omitted: source body lives at
-    --   ~/.cache/ihc/sources/ghc-prim-0.12.0/GHC/Classes.hs:597-599
+    -- (&&), (||), and `not` are deliberately omitted — their
+    -- source bodies live at
+    --   ~/.cache/ihc/sources/ghc-prim-0.12.0/GHC/Classes.hs:597-609
     --     (&&) :: Bool -> Bool -> Bool
     --     True  && x  =  x
     --     False && _  =  False
-    -- which is interpretable by the source-loaded GHC.Classes path.
-    -- Per CLAUDE.md "Builtin modules: minimum surface only", any
+    --     (||) :: Bool -> Bool -> Bool
+    --     True  || _  =  True
+    --     False || x  =  x
+    --     not  :: Bool -> Bool
+    --     not True  = False
+    --     not False = True
+    -- which the source-loaded GHC.Classes path interprets.  Per
+    -- CLAUDE.md "Builtin modules: minimum surface only", any
     -- symbol with .hs source must be interpreted, not shimmed.
-    , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
-    , ("length",   lengthB)
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
     --   unpack    — internal recursive function "non-exhaustive patterns"
@@ -1487,20 +1497,6 @@ isTruthy (VInt 0)         = False
 isTruthy (VInt _)         = True
 isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
 
-notB :: IO Val
-notB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    pure (boolVal (not (isTruthy av)))
-
-orB :: IO Val
-orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    if isTruthy av
-        then pure (boolVal True)
-        else do
-            bv <- force legacyHooks b
-            pure (boolVal (isTruthy bv))
-
 --------------------------------------------------------------------------------
 -- Phase 2.3: type-class dispatch for Eq, Ord, Show
 --
@@ -2418,21 +2414,6 @@ stringToListValIO (c:cs) = do
     restV <- stringToListValIO cs
     tT   <- newWHNFThunk restV
     pure (VCon ":" [hT, tT])
-
--- | Generic @length@ — walks the spine of a list, forcing each cons
--- but not the elements.
-lengthB :: IO Val
-lengthB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- go av 0
-    pure (VInt n)
-  where
-    go (VStr s) !acc = pure (acc + fromIntegral (BC.length s))
-    go (VCon "[]" _) !acc = pure acc
-    go (VCon ":" [_, t]) !acc = do
-        tv <- force legacyHooks t
-        go tv (acc + 1)
-    go other _ = error ("length: not a list: " <> showValForDebug other)
 
 --------------------------------------------------------------------------------
 -- IO
