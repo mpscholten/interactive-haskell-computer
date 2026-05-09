@@ -135,6 +135,7 @@ test-suite ihc-test
       , Properties.Generators
       , Properties.RoundTrip
       , Properties.SectionDesugar
+      , Properties.StringDesugar
       , Properties.Totality
       , HsExtTypeFams
       , HsExtMisc
