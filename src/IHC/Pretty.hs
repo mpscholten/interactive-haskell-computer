@@ -172,12 +172,24 @@ prettyPat = \case
     PAs n p         -> n <> "@(" <> prettyPat p <> ")"
     PBang p         -> "(!(" <> prettyPat p <> "))"
     PIrref p        -> "(~(" <> prettyPat p <> "))"
-    p               -> error
-        ( "IHC.Pretty.prettyPat: unsupported Pat constructor.\n"
-          <> "  Slice 2.F covers PVar / PWild / PLit / PCon /\n"
-          <> "  PTuple / PAs / PBang / PIrref.  PRecord /\n"
-          <> "  PRecordWild / PView land in a follow-up.\n"
-          <> "  Got: " <> takeShow 80 p )
+    -- @Con { f1 = p1, f2 = p2 }@ — record pattern.  Parser
+    -- side at @IHC.Parser:2515@: parseSubPat sees TkConId,
+    -- then TkLBrace, calls parseRecordPatFields, returns
+    -- PRecord (or PRecordWild if @..@ appeared).
+    PRecord n fields ->
+        "(" <> n <> " { "
+          <> bsIntercalate ", " (map prettyFieldPat fields)
+          <> " })"
+    -- @Con {..}@ — RecordWildCards pattern.
+    PRecordWild n   -> "(" <> n <> " {..})"
+    -- @(<expr> -> <pat>)@ — ViewPatterns.  The outer parens
+    -- are required by the syntax; @peekViewArrow@ at
+    -- @IHC.Parser:2683@ tracks paren \/ bracket \/ brace depth
+    -- and matches the @->@ at depth 0 — every non-atom Expr in
+    -- 'prettyExpr' wraps itself in defensive parens, so any
+    -- inner @->@ (e.g. from a lambda LHS) is reliably at
+    -- depth ≥ 1 and does not confuse the view-arrow detection.
+    PView e p       -> "(" <> prettyExpr e <> " -> " <> prettyPat p <> ")"
 
 
 -- | Pretty-print a 'let'-binding group.  Bindings are joined by
@@ -205,6 +217,12 @@ prettyImpBind (n, e) = "?" <> n <> " = " <> prettyExpr e
 -- 'ERecordCon' or 'ERecordUpdate' brace block.
 prettyFieldExpr :: (Name, Expr) -> ByteString
 prettyFieldExpr (n, e) = n <> " = " <> prettyExpr e
+
+
+-- | Pretty-print one @field = pat@ entry inside a 'PRecord'
+-- brace block.
+prettyFieldPat :: (Name, Pat) -> ByteString
+prettyFieldPat (n, p) = n <> " = " <> prettyPat p
 
 
 -- | Local helper — 'BS.intercalate' is in @Data.ByteString@ but

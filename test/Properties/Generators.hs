@@ -257,11 +257,15 @@ genPatSized n
     | n <= 0    = atom
     | otherwise = frequency
         [ (3, atom)
-        , (2, PCon   <$> genConIdent <*> genConArgs half)
-        , (2, PTuple <$> genTupleArgs half)
-        , (1, PAs    <$> genIdent <*> genPatSized sub)
-        , (1, PBang  <$> genPatSized sub)
-        , (1, PIrref <$> genPatSized sub)
+        , (2, PCon         <$> genConIdent <*> genConArgs half)
+        , (2, PTuple       <$> genTupleArgs half)
+        , (1, PAs          <$> genIdent <*> genPatSized sub)
+        , (1, PBang        <$> genPatSized sub)
+        , (1, PIrref       <$> genPatSized sub)
+        -- @Con { f = p }@ \/ @Con {..}@ \/ @(<expr> -> <pat>)@
+        , (1, PRecord      <$> genConIdent <*> genPatRecordFields half)
+        , (1, PRecordWild  <$> genConIdent)
+        , (1, PView        <$> genExprSized half <*> genPatSized sub)
         ]
   where
     atom    = frequency
@@ -272,6 +276,13 @@ genPatSized n
         ]
     half    = max 0 (n `div` 2 - 1)
     sub     = n - 1
+
+
+-- | Record-pattern field list (1–3 entries).
+genPatRecordFields :: Int -> Gen [(Name, Pat)]
+genPatRecordFields n = do
+    k <- choose (1, 3)
+    vectorOf k ((,) <$> genIdent <*> genPatSized n)
 
 
 -- | 0–3 sub-pattern arguments for a 'PCon'.
