@@ -825,28 +825,6 @@ builtins reg =
     , ("setSocketOption", socketSetOptionB)
     , ("Network.Socket.setSocketOption", socketSetOptionB)
     , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
-    -- 'Network.Socket.Options' uses pattern synonyms for the common
-    -- 'SocketOption' constants (e.g. @pattern NoDelay = SockOpt 6 1@).
-    -- Our parser doesn't yet expand pattern synonyms; warp uses
-    -- @setSocketOption s NoDelay 1@ (and 'KeepAlive', 'ReuseAddr') so
-    -- we host them as plain VCon "SockOpt" values keyed by the
-    -- platform constants.  Values from
-    -- 'Network.Socket.Options' on macOS / Linux post-hsc.
-    , ("NoDelay",    sockOptB 6 1)              -- IPPROTO_TCP, TCP_NODELAY
-    , ("Network.Socket.NoDelay",            sockOptB 6 1)
-    , ("Network.Socket.Options.NoDelay",    sockOptB 6 1)
-    , ("ReuseAddr",  sockOptB 65535 4)          -- SOL_SOCKET, SO_REUSEADDR
-    , ("Network.Socket.ReuseAddr",          sockOptB 65535 4)
-    , ("Network.Socket.Options.ReuseAddr",  sockOptB 65535 4)
-    , ("KeepAlive",  sockOptB 65535 8)          -- SOL_SOCKET, SO_KEEPALIVE
-    , ("Network.Socket.KeepAlive",          sockOptB 65535 8)
-    , ("Network.Socket.Options.KeepAlive",  sockOptB 65535 8)
-    , ("Broadcast",  sockOptB 65535 32)         -- SOL_SOCKET, SO_BROADCAST
-    , ("Network.Socket.Broadcast",          sockOptB 65535 32)
-    , ("Network.Socket.Options.Broadcast",  sockOptB 65535 32)
-    , ("ReusePort",  sockOptB 65535 512)        -- SOL_SOCKET, SO_REUSEPORT
-    , ("Network.Socket.ReusePort",          sockOptB 65535 512)
-    , ("Network.Socket.Options.ReusePort",  sockOptB 65535 512)
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
     , ("Network.Socket.listen", socketListenB)
@@ -4156,15 +4134,6 @@ socketOptionField t = do
             opt <- intField "socket.option.name" optT
             pure (level, opt)
         other -> error ("setSocketOption: not a SocketOption: " <> showValForDebug other)
-
--- | Helper for the @Network.Socket.Options@ pattern-synonym constants
--- (e.g. @NoDelay = SockOpt 6 1@).  Returns the underlying
--- 'SockOpt' VCon directly so 'socketOptionField' can decode it.
-sockOptB :: Int64 -> Int64 -> IO Val
-sockOptB level opt = do
-    levelT <- newWHNFThunk (VInt level)
-    optT   <- newWHNFThunk (VInt opt)
-    pure (VCon "SockOpt" [levelT, optT])
 
 foreign import ccall unsafe "socket"
     c_socket_host :: CInt -> CInt -> CInt -> IO CInt
