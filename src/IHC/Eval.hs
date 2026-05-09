@@ -1040,6 +1040,22 @@ matchPat hooks (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
 matchPat hooks (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
     t <- newWHNFThunk prim
     matchFields hooks [(p, t)] []
+-- @data Ptr a = Ptr Addr#@ — when source code pattern-matches @Ptr a@
+-- against a host-primitive @VPrimObj (PrimPtr p)@ (returned by libffi
+-- primops like @memchr@ / @mallocBytes@, or by the @nullPtr@ builtin),
+-- bind the inner pattern to the same 'VPrimObj' so the body's
+-- @eqAddr#@ / @plusAddr#@ / @ltAddr#@ / etc. primops see the address
+-- they expect.  Without this bridge, the source-loaded
+-- @instance Eq (Ptr a) where Ptr a == Ptr b = isTrue# (eqAddr# a b)@
+-- (synthesized by 'IHC.Scheduler.registerDerivedEqInstances') would
+-- fail to match its first argument when the @==@ builtin shim is
+-- dropped and the dispatcher reaches the source instance.
+--
+-- The bridge is also exercised by user code that imports @GHC.Ptr@
+-- and writes pattern @case p of Ptr a -> ...@.
+matchPat hooks (PCon "Ptr" [p]) prim@(VPrimObj (PrimPtr _)) = do
+    t <- newWHNFThunk prim
+    matchFields hooks [(p, t)] []
 -- Data.Array.Byte lifted wrappers. The interpreter keeps both mutable and
 -- frozen byte arrays as the same host-backed PrimByteArray object, so the
 -- source constructors just expose that underlying primitive value.

@@ -221,4 +221,14 @@ seedBuiltinClassMethodSigs = do
             , ("mappend",    "Monoid")
             , ("mconcat",    "Monoid")
             , ("<>",         "Semigroup")
+            -- Pre-seed the @Eq@ method→class mapping for the
+            -- (currently still-builtin-shimmed) @==@ / @/=@ so that
+            -- the eventual builtin removal won't need a separate
+            -- TypeGlobals patch.  Today these names resolve via the
+            -- @eqDispatch@ / @neqDispatch@ builtins in
+            -- 'IHC.Builtins'; the seed is harmless until that shim is
+            -- dropped, at which point 'tryClassMethodFromRegistry'
+            -- starts using it.
+            , ("==",         "Eq")
+            , ("/=",         "Eq")
             ]

@@ -42,8 +42,10 @@ module IHC.Scan
     , FunctorCtor(..)
     , FunctorDerivDecl(..)
     , SimpleDerivDecl(..)
+    , StandaloneDerivDecl(..)
     , scanFunctorDerivings
     , scanSimpleDerivings
+    , scanStandaloneDerivings
       -- * Instance declarations
     , InstanceDecl(..)
     , scanInstanceDecls
@@ -2122,6 +2124,125 @@ scanSimpleDerivingsRaw src
                 TkRParen -> skipParensPure (d - 1) cur'
                 _        -> skipParensPure d cur'
 
+--------------------------------------------------------------------------------
+-- Standalone deriving (StandaloneDeriving)
+--------------------------------------------------------------------------------
+
+-- | One @deriving instance [Context =>] ClassName Head@ declaration.
+-- 'sddHeadName' is the principal head type (the first 'TkConId' in the
+-- head, after any constraint @=>@ and after any opening parenthesis,
+-- e.g. @Bool@ for @deriving instance Eq Bool@ and @(,)@ for
+-- @deriving instance (Eq a, Eq b) => Eq (a, b)@).
+--
+-- Used by 'IHC.Scheduler.registerDerivedEqInstances' to synthesize
+-- structural @==@ for the standalone-derived types in @GHC.Classes@
+-- (@Bool@, @Ordering@, @()@, tuples, @Solo@, @Module@) — none of which
+-- carry an in-line @deriving Eq@ on their @data@ declaration.
+data StandaloneDerivDecl = StandaloneDerivDecl
+    { sddClassName :: !ByteString
+    , sddHeadName  :: !ByteString
+    } deriving (Eq, Show)
+
+-- | Scan the whole source for top-level @deriving instance ...@
+-- declarations.  Returns one 'StandaloneDerivDecl' per declaration.
+-- Memoised per source like the sibling deriving scanners.
+scanStandaloneDerivings :: Source -> IO [StandaloneDerivDecl]
+scanStandaloneDerivings src =
+    memoiseScan "standaloneDerivings" src (scanStandaloneDerivingsRaw src)
+
+scanStandaloneDerivingsRaw :: Source -> IO [StandaloneDerivDecl]
+scanStandaloneDerivingsRaw src
+    | not (hasKeyword src (BC.pack "deriving")) = pure []
+    | otherwise = go [] startCursor
+  where
+    go !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse acc)
+            TkDeriving | tkCol tok == 1 -> do
+                let (next, cur'') = nextToken src cur'
+                case tkKind next of
+                    TkInstance -> handle acc cur''
+                    -- Not a standalone deriving; skip past the
+                    -- deriving keyword and continue scanning.
+                    _ -> go acc cur'
+            _ -> go acc cur'
+
+    -- After @deriving instance@: scan up to the end of the
+    -- declaration (column-1 token / EOF) collecting the class name and
+    -- the principal head type.  Skips an optional context @(...) =>@
+    -- prefix.
+    handle acc cur0 = do
+        result <- parseHead cur0 Nothing Nothing False
+        case result of
+            (Just cls, Just hd, curEnd) ->
+                go (StandaloneDerivDecl cls hd : acc) curEnd
+            (_, _, curEnd) ->
+                go acc curEnd
+
+    -- @parseHead cur mCls mHead seenArrow@: walk tokens, capturing the
+    -- first 'TkConId' as the class name (after any @=>@), then the
+    -- next 'TkConId' as the principal head type.  Stops at EOF or
+    -- column-1 (next decl).
+    parseHead cur mCls mHead seenArrow = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof    -> pure (mCls, mHead, cur')
+            TkNewline ->
+                let (peek, _) = nextToken src cur'
+                in case tkKind peek of
+                    TkEof              -> pure (mCls, mHead, cur')
+                    _ | tkCol peek == 1 -> pure (mCls, mHead, cur)
+                      | otherwise      -> parseHead cur' mCls mHead seenArrow
+            TkArrow  -> parseHead cur' mCls mHead True   -- '=>' (post-context)
+            TkLParen -> do
+                -- Look inside the parens for a 'TkConId' as the head
+                -- name (e.g. @Eq (Solo a)@, @Eq (a, b)@) — the first
+                -- TkConId we see; for tuples the head is the comma-
+                -- ctor synthesised below.
+                let (mNested, curAfter) = peekHeadInsideParens cur'
+                let mHead' = case mHead of
+                                Just _  -> mHead   -- already set
+                                Nothing -> case mCls of
+                                    Just _  -> mNested
+                                    Nothing -> mHead
+                parseHead curAfter mCls mHead' seenArrow
+            TkConId n -> do
+                let (mCls', mHead') = case (mCls, mHead) of
+                        (Nothing, _) -> (Just n, mHead)
+                        (Just _, Nothing) -> (mCls, Just n)
+                        _ -> (mCls, mHead)
+                parseHead cur' mCls' mHead' seenArrow
+            _ -> parseHead cur' mCls mHead seenArrow
+
+    -- Walk a parenthesised head, returning the first 'TkConId' inside
+    -- (the head's principal type) and the cursor positioned just
+    -- after the matching ')'.  Tuples are recognised by counting
+    -- commas at depth 1 and synthesising the corresponding @(,)@ /
+    -- @(,,)@ … name.
+    peekHeadInsideParens cur0 = loop cur0 1 Nothing 0
+      where
+        loop cur depth mFirst commas
+            | depth <= 0 = (firstName mFirst commas, cur)
+            | otherwise =
+                let (tok, cur') = nextToken src cur
+                in case tkKind tok of
+                    TkEof     -> (firstName mFirst commas, cur)
+                    TkLParen  -> loop cur' (depth + 1) mFirst commas
+                    TkRParen  -> loop cur' (depth - 1) mFirst commas
+                    TkComma | depth == 1 -> loop cur' depth mFirst (commas + 1)
+                    TkConId n
+                        | depth == 1
+                        , Nothing <- mFirst -> loop cur' depth (Just n) commas
+                        | otherwise         -> loop cur' depth mFirst commas
+                    _ -> loop cur' depth mFirst commas
+
+        firstName _ commas
+          | commas > 0 = Just (BC.pack ("(" <> replicate commas ',' <> ")"))
+        firstName mName _ = mName
+
+--------------------------------------------------------------------------------
+
 -- | Scan the whole source for top-level @data@ / @newtype@ declarations
 -- that carry @deriving Functor@ (in any position of the deriving list,
 -- with or without a stock/newtype strategy, with or without
@@ -3421,15 +3542,40 @@ scanClassDeclsRaw src
                             let sigs' = foldr (`Map.insert` ()) sigs names
                             scanBody sigs' defs curAfter
                         Nothing -> do
-                            -- Default-method body: `name pat* = rhs` (or guards).
+                            -- Default-method body: handle both prefix
+                            -- form @name pat* = rhs@ and infix form
+                            -- @lhs op rhs@.  The infix form is what
+                            -- @class Eq@'s defaults use:
+                            --   x /= y = not (x == y)
+                            --   x == y = not (x /= y)
+                            -- 'peekInfixOp' returns @Just op@ when the
+                            -- token after @name@ is a backticked /
+                            -- symbolic operator followed by a second
+                            -- argument; in that case the binding's
+                            -- real name is the operator, not @name@.
+                            -- Mirror what 'handleTopIdent' does for
+                            -- top-level bindings.
+                            let mInfixOp = peekInfixOp src cur'
+                                methodName = case mInfixOp of
+                                    Just op -> op
+                                    Nothing -> name
                             mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'
                             case mClause of
                                 Nothing -> scanBody sigs defs cur'
                                 Just (clause, curNext) -> do
+                                    -- For infix bindings, extend the LHS
+                                    -- span leftward to include the first
+                                    -- argument (the col-N identifier @name@)
+                                    -- so 'parsePatsIn' sees both arguments
+                                    -- as patterns.  Mirrors 'handleTopIdent'.
+                                    let clause' = case mInfixOp of
+                                            Just _ -> clause { clausePats =
+                                                (tkStart tok, snd (clausePats clause)) }
+                                            Nothing -> clause
                                     (moreClauses, curFinal) <-
-                                        collectClassClauses name (tkCol tok) [clause] curNext
+                                        collectClassClauses methodName (tkCol tok) [clause'] curNext
                                     let lhs  = BindingLhs (reverse moreClauses)
-                                        defs' = Map.insert name lhs defs
+                                        defs' = Map.insert methodName lhs defs
                                     scanBody sigs defs' curFinal
                 -- Operator methods: `(<>) :: ...` or `(<>) x y = ...`.
                 -- Also handles comma-separated operator sig lists like

@@ -49,6 +49,8 @@ module IHC.Scheduler
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try, finally)
 import Control.Applicative ((<|>))
+import Foreign.Ptr (nullPtr)
+import qualified Foreign.Ptr as FP
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -323,7 +325,19 @@ loadProgramFromSource searchPath src0 = do
     -- and semantically pointless, because the evaluator resolves to the
     -- builtin anyway.
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
+    let earlyBuiltinNames =
+            -- Class methods that no longer have a bare-name builtin
+            -- shim (their dispatchers come from env-fallback) must
+            -- still short-circuit discovery — every body that mentions
+            -- @==@ / @/=@ / @compare@ / @show@ / @<>@ otherwise
+            -- triggers a transitive Prelude walk that eagerly drags in
+            -- much of base+ghc-internal (PR #133, PR #141 same trick).
+            Set.union extraDiscoverShortCircuit
+                     (Set.fromList (HashMap.keys earlyBuiltins))
+    -- Make the FULL set visible to per-FV chase callers (instance
+    -- registration, class-default registration) that don't have
+    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
+    setGlobalEarlyBuiltins earlyBuiltinNames
 
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
@@ -627,6 +641,7 @@ loadProgramFromSource searchPath src0 = do
     -- registrar skips types that already have a Functor dict).
     registerDerivedFunctorInstances classReg loadedModules'
     registerDerivedEnumBoundedInstances classReg loadedModules'
+    registerDerivedEqInstances        classReg loadedModules'
 
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
@@ -969,7 +984,19 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- resolved by IHC.Builtins (see 'discoverInModuleWith' for why this
     -- matters for the implicit-Prelude walk).
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
+    let earlyBuiltinNames =
+            -- Class methods that no longer have a bare-name builtin
+            -- shim (their dispatchers come from env-fallback) must
+            -- still short-circuit discovery — every body that mentions
+            -- @==@ / @/=@ / @compare@ / @show@ / @<>@ otherwise
+            -- triggers a transitive Prelude walk that eagerly drags in
+            -- much of base+ghc-internal (PR #133, PR #141 same trick).
+            Set.union extraDiscoverShortCircuit
+                     (Set.fromList (HashMap.keys earlyBuiltins))
+    -- Make the FULL set visible to per-FV chase callers (instance
+    -- registration, class-default registration) that don't have
+    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
+    setGlobalEarlyBuiltins earlyBuiltinNames
     -- Load the entry module.
     entry <- loadEntryModule registry src
     -- Determine which names to bring into scope.
@@ -1026,6 +1053,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     registerDerivedFunctorInstances classReg loadedModules
     registerDerivedEnumInstances    classReg loadedModules
     registerDerivedBoundedInstances classReg loadedModules
+    registerDerivedEqInstances      classReg loadedModules
     -- If the file has no `main` binding, inject `main = ()` so that the
     -- REPL user can type `main` without getting "unbound variable main".
     -- This matches the old :load behaviour and keeps the no_main regression
@@ -1274,7 +1302,19 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     classReg <- newClassRegistry
     targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
     earlyBuiltins <- builtinEnv classReg
-    let earlyBuiltinNames = Set.fromList (HashMap.keys earlyBuiltins)
+    let earlyBuiltinNames =
+            -- Class methods that no longer have a bare-name builtin
+            -- shim (their dispatchers come from env-fallback) must
+            -- still short-circuit discovery — every body that mentions
+            -- @==@ / @/=@ / @compare@ / @show@ / @<>@ otherwise
+            -- triggers a transitive Prelude walk that eagerly drags in
+            -- much of base+ghc-internal (PR #133, PR #141 same trick).
+            Set.union extraDiscoverShortCircuit
+                     (Set.fromList (HashMap.keys earlyBuiltins))
+    -- Make the FULL set visible to per-FV chase callers (instance
+    -- registration, class-default registration) that don't have
+    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
+    setGlobalEarlyBuiltins earlyBuiltinNames
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
     -- Preload direct imports of targetLm so class declarations in
     -- re-export chains become visible to 'buildClassMethodEnv'.
@@ -1509,6 +1549,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     registerClassDefaults registry fullSearchPath includeMap classReg innerEnv instanceScope
     registerDerivedFunctorInstances classReg instanceScope
     registerDerivedEnumBoundedInstances classReg instanceScope
+    registerDerivedEqInstances        classReg instanceScope
     -- ALSO mirror instance registrations into the REPL's shared class
     -- registry so the dispatcher (closed over the shared reg via
     -- 'sharedClassRegRef') can find them on later dispatch calls.
@@ -1522,6 +1563,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv instanceScope
             registerDerivedFunctorInstances sharedReg instanceScope
             registerDerivedEnumBoundedInstances sharedReg instanceScope
+            registerDerivedEqInstances        sharedReg instanceScope
         _ -> pure ()
     let additions  = HashMap.difference aliasEnv existingEnv
         merged     = HashMap.union existingEnv additions
@@ -2202,6 +2244,204 @@ applyRoleOne classReg fT (FRRec, t) = do
                     newWHNFThunk r2
                 _ -> pure t   -- no Functor instance; leave field untouched
         _ -> pure t
+
+--------------------------------------------------------------------------------
+-- Deriving Eq synthesis
+--
+-- Mechanically equivalent to what GHC emits for an in-line
+-- @data T ... = ... deriving Eq@: the synthesized @(==)@ tests that
+-- both arguments share a constructor and then recurses through @==@
+-- on each field via the class-method dispatcher.  Different
+-- constructors compare unequal; same constructor with arity mismatch
+-- (impossible for a well-typed program but defensive against
+-- corrupted runtimes) also returns 'False'.
+--
+-- Standalone @deriving instance Eq T@ — used in @GHC.Classes@ for
+-- @Bool@, @Ordering@, @()@, tuples, @Solo@, @Module@ — is handled by
+-- 'registerStandaloneDerivedEqInstances' below.
+--
+-- Field-level recursion goes through the dispatcher rather than
+-- 'eqVals' so that primitive types (Int, Char, Float, …) reach their
+-- source-loaded @Eq@ instance from @GHC.Classes@; nested derived
+-- types reach the next derived synthesis we registered; user
+-- @instance Eq T@ overrides win because they're already in the
+-- registry and 'classMethodDispatcher' looks them up first.
+--------------------------------------------------------------------------------
+
+registerDerivedEqInstances :: ClassRegistry -> [LoadedModule] -> IO ()
+registerDerivedEqInstances classReg loadedModules = do
+    -- Stage 2: drain any catalogued explicit @instance Eq T@ closures
+    -- before our synthesis so the user's hand-written instance wins
+    -- via the 'lookupInstance' check below.  Mirrors what
+    -- 'registerDerivedFunctorInstances' does for @Functor@.
+    _ <- drainCataloguedInstancesForClass (BC.pack "Eq")
+    mapM_ oneModuleInline loadedModules
+    -- Standalone @deriving instance Eq T@ — used in @GHC.Classes@ for
+    -- @Bool@, @Ordering@, @()@, tuples, @Solo@, @Module@.  The data
+    -- declaration of @T@ may live in a different loaded module
+    -- (e.g. @data Bool@ in @GHC.Types@, @deriving instance Eq Bool@ in
+    -- @GHC.Classes@), so we cross-reference the standalone-deriving
+    -- decl with the union of every loaded module's 'lmTypeCtorReg' to
+    -- find @T@'s constructors.
+    let unionedTyCtors =
+            foldr (Map.unionWith (\a b -> a ++ filter (`notElem` a) b))
+                  Map.empty
+                  (map lmTypeCtorReg loadedModules)
+        unionedDataReg =
+            foldr Map.union Map.empty (map lmDataReg loadedModules)
+    mapM_ (oneModuleStandalone unionedTyCtors unionedDataReg) loadedModules
+  where
+    oneModuleInline lm = do
+        decls <- scanFunctorDerivings (lmSource lm)
+        let hits = filter (elem (BC.pack "Eq") . fdDerivClasses) decls
+        mapM_ (registerOneEq classReg) hits
+
+    oneModuleStandalone tyCtors dataReg lm = do
+        decls <- scanStandaloneDerivings (lmSource lm)
+        let hits = filter ((BC.pack "Eq" ==) . sddClassName) decls
+        mapM_ (registerOneStandaloneEq classReg tyCtors dataReg) hits
+
+-- | Register one in-line-derived @Eq T@ instance.  Skipped if a
+-- user-written or earlier-registered @instance Eq T@ already exists.
+--
+-- Unlike the sibling Functor/Enum/Bounded registrars (which also key
+-- the dictionary under every ctor name of @T@), Eq is only keyed
+-- under the type name.  The 'typeTagOf' hook installed by
+-- 'installCtorTypeHook' already maps any @VCon ctor _@ value to its
+-- defining type name via 'lmDataReg', so a @VCon "MkPt" [..]@ value
+-- dispatches as @"Pt"@ — the type-name key is sufficient.
+--
+-- Why differ from Functor here?  Constructor-keyed registration is
+-- safe for Functor (a ctor name collision with a primitive type is
+-- unlikely and the worst case is a stale fmap on a runtime VInt that
+-- would fail anyway), but for @Eq@ a primitive collision is fatal:
+-- @data Lexeme = Char Char | String String | …@ in
+-- @GHC.Internal.Text.Read.Lex@ has a ctor named @Char@.  Keying
+-- @Eq Lexeme@ under @"Char"@ would shadow the legitimate
+-- @Eq Char@ from @GHC.Classes@ for any @VChar _@ comparison
+-- (@'a' == 'b'@ would route to Lexeme's structural compare and
+-- error on the non-VCon argument).
+registerOneEq :: ClassRegistry -> FunctorDerivDecl -> IO ()
+registerOneEq classReg decl = do
+    let eqVal     = synthStructuralEq classReg (fdTyName decl)
+        methods   = HashMap.singleton (BC.pack "==") eqVal
+        eqCls     = BC.pack "Eq"
+    existing <- lookupInstance classReg eqCls (fdTyName decl)
+    case existing of
+        Just _  -> pure ()    -- user / earlier instance wins
+        Nothing -> registerInstance classReg eqCls (fdTyName decl) methods
+
+-- | Register one standalone-derived @Eq T@ instance.  Mirrors
+-- 'registerOneEq' but the constructor list comes from the union of
+-- 'lmTypeCtorReg' across all loaded modules (the standalone deriving
+-- declaration and the data declaration of @T@ generally live in
+-- different files — e.g. @data Bool@ in @GHC.Types@ vs
+-- @deriving instance Eq Bool@ in @GHC.Classes@).
+--
+-- If @T@'s data declaration isn't (yet) in any loaded module, the
+-- standalone deriving registration is a no-op — the dispatcher will
+-- error on first call which is the same behaviour as if the deriving
+-- clause were missing entirely.
+registerOneStandaloneEq
+    :: ClassRegistry
+    -> Map ByteString [ByteString]   -- ^ unioned 'lmTypeCtorReg'
+    -> Map ByteString (ByteString, Int, Int)
+                                     -- ^ unioned 'lmDataReg' (for arity)
+    -> StandaloneDerivDecl
+    -> IO ()
+registerOneStandaloneEq classReg _tyCtors _dataReg (StandaloneDerivDecl _cls tyName) = do
+    let eqCls = BC.pack "Eq"
+    existing <- lookupInstance classReg eqCls tyName
+    case existing of
+        Just _  -> pure ()
+        Nothing -> do
+            let eqVal   = synthStructuralEq classReg tyName
+                methods = HashMap.singleton (BC.pack "==") eqVal
+            -- Only key under the type name (see 'registerOneEq' for
+            -- why we don't also key under every constructor — Lexeme's
+            -- @Char@ ctor would shadow the legit @Eq Char@).
+            registerInstance classReg eqCls tyName methods
+
+-- | Build the @==@ method 'Val' for a derived-Eq type.  Forces both
+-- arguments, requires matching 'VCon' constructors, then recurses
+-- through @==@ on each field pair via the class-method dispatcher.
+--
+-- Mirrors the source-equivalent body GHC emits for
+-- @data T = MkT a b c deriving Eq@:
+--
+-- > MkT x1 y1 z1 == MkT x2 y2 z2 = x1 == x2 && y1 == y2 && z1 == z2
+--
+-- Short-circuits on the first 'False' (mapM_ over @&&@-folded
+-- thunks would force everything; explicit early exit reads better).
+--
+-- @tyName@ is used for error messages only; the synthesis is purely
+-- structural and doesn't depend on the data declaration's field
+-- types.  Used by both 'registerOneEq' (in-line @data ... deriving
+-- Eq@) and 'registerOneStandaloneEq' (@deriving instance Eq T@).
+synthStructuralEq :: ClassRegistry -> ByteString -> Val
+synthStructuralEq classReg tyName =
+    let eqDispatcher = classMethodDispatcher classReg (BC.pack "Eq") (BC.pack "==")
+    in VFun $ \xT -> pure $ VFun $ \yT -> do
+        xv <- force legacyHooks xT
+        yv <- force legacyHooks yT
+        case (xv, yv) of
+            -- Cross-representation @Ptr@: the dispatcher routed here
+            -- because 'typeTagOf (VCon "Ptr" _)' returned "Ptr", but
+            -- one of the operands may be a libffi-backed
+            -- 'VPrimObj (PrimPtr p)' (typeTagOf "<Ptr>"; not
+            -- dispatchable, walked past).  Pattern: same as the
+            -- source-derived @Ptr a == Ptr b = isTrue# (eqAddr# a b)@
+            -- that GHC emits.  Promote either operand to its inner
+            -- 'Addr#' (already a 'VPrimObj PrimPtr' regardless of
+            -- shape) and compare.
+            _ | tyName == BC.pack "Ptr" -> do
+                let asPtr (VPrimObj (PrimPtr p)) = Just p
+                    asPtr (VCon "Ptr" [t]) = unsafePerformIO $ do
+                        v <- force legacyHooks t
+                        case v of
+                            VPrimObj (PrimPtr p) -> pure (Just p)
+                            VInt n     -> pure (Just (FP.intPtrToPtr (fromIntegral n)))
+                            VInteger n -> pure (Just (FP.intPtrToPtr (fromIntegral n)))
+                            VUnit      -> pure (Just nullPtr)
+                            _          -> pure Nothing
+                    asPtr _ = Nothing
+                case (asPtr xv, asPtr yv) of
+                    (Just p1, Just p2) -> pure (if p1 == p2 then boolTrueV else boolFalseV)
+                    _ -> error
+                        ( "derived Eq for Ptr: not a pointer-shaped value: "
+                          <> shortShow xv <> " vs " <> shortShow yv )
+            (VCon n1 fs1, VCon n2 fs2)
+                | n1 /= n2 -> pure (boolFalseV)
+                | length fs1 /= length fs2 -> pure (boolFalseV)
+                | otherwise -> compareFields eqDispatcher fs1 fs2
+            -- VUnit (the canonical runtime unit) is the @VCon ()@ value
+            -- shape after evaluation.  Two units are always equal.
+            (VUnit, VUnit) -> pure boolTrueV
+            _ -> error
+                ( "derived Eq for " <> BC.unpack tyName
+                  <> ": expected constructor values, got "
+                  <> shortShow xv <> " and " <> shortShow yv )
+  where
+    boolTrueV  = VCon (BC.pack "True")  []
+    boolFalseV = VCon (BC.pack "False") []
+
+    compareFields _ [] [] = pure boolTrueV
+    compareFields eqDispatcher (xfT : xs) (yfT : ys) = do
+        -- Apply (==) to this field pair via the dispatcher.  Two
+        -- 'apply' calls because @(==)@ is binary.  The dispatcher is
+        -- a 'VClassMethod' so the first 'apply' enters its inner
+        -- closure with @tags=[]@; that runs 'argDirectedDispatch'
+        -- which walks the args and resolves the per-field @Eq@
+        -- instance.
+        v1     <- apply legacyHooks eqDispatcher xfT
+        result <- apply legacyHooks v1 yfT
+        case result of
+            VCon n _ | n == BC.pack "True"  -> compareFields eqDispatcher xs ys
+                     | n == BC.pack "False" -> pure boolFalseV
+            _ -> error
+                ( "derived Eq for " <> BC.unpack tyName
+                  <> ": field (==) returned non-Bool: " <> shortShow result )
+    compareFields _ _ _ = pure boolFalseV   -- arity mismatch (defensive)
 
 --------------------------------------------------------------------------------
 -- Deriving Enum / Bounded synthesis
@@ -4807,6 +5047,28 @@ setGlobalSearchPath sp im = do
     writeIORef globalSearchPathRef sp
     writeIORef globalIncludeMapRef im
 
+-- | Snapshot of the @earlyBuiltinNames@ set computed by
+-- 'loadProgramFromSource' / 'loadProgramFromSourceREPL' / etc.  Stored
+-- here so the per-FV chase callers ('discoverInModule' inside
+-- 'registerInstancesFrom' and friends) can short-circuit on the FULL
+-- builtin set, not just on @extraDiscoverShortCircuit@'s 15 entries.
+--
+-- Without this, dropping a heavily-used builtin shim (@==@, @show@,
+-- @print@) makes every per-FV chase walk through Prelude →
+-- ghc-internal looking for the dropped name, transitively dragging in
+-- @base@ + @ghc-internal@ until the heap exhausts.  The main entry-
+-- point discovery already had access to this set; the per-FV chase
+-- callers (instance registration, class-default registration) ran with
+-- @Set.empty@ on master because @==@ was a builtin so the chase
+-- terminated naturally.  After @==@ is dropped, they need the same
+-- short-circuit set as the entry-point discovery.
+{-# NOINLINE globalEarlyBuiltinsRef #-}
+globalEarlyBuiltinsRef :: IORef (Set ByteString)
+globalEarlyBuiltinsRef = unsafePerformIO (newIORef Set.empty)
+
+setGlobalEarlyBuiltins :: Set ByteString -> IO ()
+setGlobalEarlyBuiltins = writeIORef globalEarlyBuiltinsRef
+
 -- | Memoised slots produced by the env fallback hook.  Keeps one
 -- 'Thunk' per FQN so successive demand-lookups share evaluation +
 -- memoisation, matching the normal import-driven env layer.
@@ -6336,7 +6598,20 @@ discoverInModule
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModule = discoverInModuleWith Set.empty
+-- Read the FULL @earlyBuiltinNames@ set from 'globalEarlyBuiltinsRef'
+-- so per-FV chase callers (instance registration / class-default
+-- registration / re-export resolution) short-circuit on every builtin
+-- name, not just the @extraDiscoverShortCircuit@ subset.  Without
+-- this, dropping a heavily-used builtin shim (@==@/@show@) makes the
+-- per-FV chase walk through Prelude → ghc-internal looking for
+-- @print@/@putStrLn@/etc. (still builtins, but absent from the chase
+-- caller's tiny shortcut set), transitively dragging in @base@ +
+-- @ghc-internal@ until the heap exhausts.  Master worked with
+-- @Set.empty@ here because @==@ was a builtin and per-FV chases for
+-- @==@ never fired; once @==@ is dropped, the chase becomes hot.
+discoverInModule registry searchPath includeMap lm name = do
+    builtins <- readIORef globalEarlyBuiltinsRef
+    discoverInModuleWith builtins registry searchPath includeMap lm name
 
 -- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
 -- pairs that have already been walked once — regardless of whether the
@@ -7633,6 +7908,23 @@ discoveryFreeVars = go []
         case BC.elemIndexEnd (toEnum (fromEnum '.')) name of
             Just idx -> BC.drop (idx + 1) name
             Nothing  -> name
+
+-- | Discovery short-circuit names for class methods whose bare-name
+-- builtin shim has been dropped (PR #133 @compare@, PR #141 @show@,
+-- PR #?? @==@/@/=@, …).  These names are resolved at eval time via
+-- 'tryClassMethodFromRegistry'; treating them as already-resolved at
+-- discovery time prevents 'discoverInModule' from cascading through
+-- the (large) @class@-declaring module's source as if the name were a
+-- normal binding.  Without this set, dropping the @==@ builtin makes
+-- every body that uses @==@ trigger an eager Prelude walk that drags
+-- in much of @base@ + @ghc-internal@ — the OOM that prompted this
+-- carve-out.
+extraDiscoverShortCircuit :: Set ByteString
+extraDiscoverShortCircuit = Set.fromList $ map BC.pack
+    [ "==", "/=", "compare", "show", "showsPrec"
+    , "<>", "mappend", "mconcat", "mempty"
+    , "fmap", "<*>", ">>=", ">>", "pure", "return"
+    ]
 
 -- | Small demand hints for library entry points whose operationally strict
 -- calls sit behind top-level lambdas. The main discovery walk intentionally
