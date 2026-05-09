@@ -38,6 +38,7 @@ import qualified ParserBugs
 import qualified Properties.DoDesugar
 import qualified Properties.RoundTrip
 import qualified Properties.SectionDesugar
+import qualified Properties.StringDesugar
 import qualified Properties.Totality
 import qualified ReplTest
 import qualified RunFile
@@ -55,6 +56,7 @@ main = hspec do
     Properties.RoundTrip.spec
     Properties.SectionDesugar.spec
     Properties.DoDesugar.spec
+    Properties.StringDesugar.spec
     HsExtMisc.spec
     Hs2010LexNum.spec
     Hs2010Fixity.spec
