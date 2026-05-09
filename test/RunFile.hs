@@ -57,10 +57,6 @@ captureStdout action = do
     removeFile path
     pure (r, out)
 
-isSubstring :: String -> String -> Bool
-isSubstring needle haystack =
-    any (needle ==) [take (length needle) (drop i haystack) | i <- [0..length haystack]]
-
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     -- Regression: the scheduler used to leak state between consecutive

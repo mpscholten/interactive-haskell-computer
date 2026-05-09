@@ -3138,15 +3138,12 @@ parseRecordUpdateFields ctx cur acc = do
         TkEof -> pure (reverse acc, cur')
         _ -> parseErr ctx "expected field name or `}` in record update" tok
 
--- | Skip one type-argument after @\@@ in a type application.
+-- | Skip one type-argument after @\@@ in a type application, returning
+-- the cursor advanced past the consumed argument and the raw source-byte
+-- slice that spans it (opening bracket/tick through closing token).
 -- Handles: plain ident/conid (@\@Int@, @\@a@), promoted (@\@\'Foo@),
 -- and balanced paren/bracket groups (@\@(Maybe Int)@, @\@[Int]@).
-skipTypeArg :: Ctx -> Cursor -> IO Cursor
-skipTypeArg ctx cur0 = snd <$> captureTypeArg ctx cur0
-
--- | Like 'skipTypeArg', but also returns the raw source-byte slice that
--- spans the consumed type argument (opening bracket/tick through closing
--- token). Used to produce 'ETyApp' nodes that retain the type for later
+-- Used to produce 'ETyApp' nodes that retain the type for later
 -- inspection. Returns an empty string if nothing was consumed.
 captureTypeArg :: Ctx -> Cursor -> IO (Name, Cursor)
 captureTypeArg ctx cur0 =

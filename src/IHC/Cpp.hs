@@ -476,14 +476,6 @@ isSystemHeader p =
     || ".H"    `isSuffixOf` p
     || not (".hs"  `isSuffixOf` p || ".lhs" `isSuffixOf` p)
 
--- | Read a file, throwing 'IncludeMissing' if it doesn't exist.
-readFileOrThrow :: FilePath -> FilePath -> IO ByteString
-readFileOrThrow resolved original = do
-    result <- tryReadFile resolved
-    case result of
-        Just bs -> pure bs
-        Nothing -> throwIO (IncludeMissing original resolved)
-
 -- | Search ancestor directories for @include\/<incPath>@.
 -- Many Hackage packages place their @.h@ headers in a top-level
 -- @include\/@ directory rather than co-located with the @.hs@ source.
