@@ -248,6 +248,17 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                 curSkipped <- skipThroughBinding src name cur'
                 let acc' = if bindName `elem` acc then acc else bindName : acc
                 go acc' curSkipped
+            -- Constructor at col 1 only counts as a binding LHS when it
+            -- is the FIRST argument of an infix-operator binding, e.g.
+            -- @True && x = x@ in ghc-prim's GHC.Classes (see the matching
+            -- comment on 'findBinding' below).  Skip otherwise.
+            TkConId _ | tkCol tok == 1 ->
+                case peekInfixOp src cur' of
+                    Just opName -> do
+                        curSkipped <- skipThroughPrefixOpBinding src opName cur'
+                        let acc' = if opName `elem` acc then acc else opName : acc
+                        go acc' curSkipped
+                    Nothing -> go acc cur'
             -- Prefix operator binding: @(|>) x f = ...@.
             -- Or paren-wrapped pattern + backtick infix: @(I# x) \`eqInt\` (I# y) = ...@.
             TkLParen | tkCol tok == 1 -> do
@@ -374,6 +385,16 @@ skipThroughPrefixOpBinding src opName curAfterClose = do
                             _ -> pure cur
             -- Next clause in infix form: `x op y = ...`
             TkIdent _ | tkCol peek == 1 ->
+                case peekInfixOp src curAfterPeek of
+                    Just op' | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterPeek
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
+            -- Constructor-led infix continuation: `Con op arg = ...`,
+            -- e.g. `False && _ = False` after a `True && x = x` head.
+            TkConId _ | tkCol peek == 1 ->
                 case peekInfixOp src curAfterPeek of
                     Just op' | op' == opName -> do
                         mClause' <- scanOneClauseAfterName src curAfterPeek
@@ -593,6 +614,19 @@ findBinding src ref target = do
                 | tkCol tok == 1 && primIdIsValueLevel name ->
                     handleTopIdent acc name tok cur'
                 | otherwise -> go acc cur'
+            -- Constructor at col 1 only counts as a binding LHS when it
+            -- is the FIRST argument of an infix-operator binding, e.g.
+            --   True  && x = x
+            --   False && _ = False
+            -- (ghc-prim's GHC.Classes (&&) / (||) / not have this shape).
+            -- A standalone @True = ...@ would be ill-typed Haskell, and a
+            -- pattern binding like @Just x = expr@ has its own dispatch
+            -- elsewhere (this scanner only registers function-binding
+            -- LHSs).  Skip when no infix operator follows.
+            TkConId _ | tkCol tok == 1 ->
+                case peekInfixOp src cur' of
+                    Just opName -> handleConIdInfixLhs acc opName tok cur'
+                    Nothing     -> go acc cur'
             -- Prefix-form operator binding: @(|>) x f = ...@
             -- Or paren-wrapped-pattern infix binding: @(I# x) \`eqInt\` (I# y) = ...@
             TkLParen | tkCol tok == 1 ->
@@ -681,8 +715,17 @@ findBinding src ref target = do
 
     -- After an operator-binding clause body ends, peek for another
     -- clause of the SAME operator (in either prefix or infix form).
+    --
+    -- 'cur' here is positioned at the newline that ended the previous
+    -- clause's body (see 'scanOneClauseAfterNameAtCol' / 'curAfter =
+    -- Cursor bodyEnd 0 1').  'peekSigTok' skips over those newlines and
+    -- returns both the next meaningful token AND the cursor positioned
+    -- AFTER it; the infix-continuation branches need that
+    -- post-meaningful-token cursor (@curAfterTok@) when calling
+    -- 'peekInfixOp' / 'scanOneClauseAfterName', or the operator-detect
+    -- step would re-read the newline as the "first" token.
     collectMoreOpClauses opName acc cur = do
-        let (tok, _curAfter) = peekSigTok cur
+        let (tok, curAfterTok) = peekSigTok cur
         case tkKind tok of
             -- Another prefix clause `(op) ... = ...`
             -- Or paren-pat infix continuation `(pat) `op` ... = ...`
@@ -707,22 +750,56 @@ findBinding src ref target = do
                                         in collectMoreOpClauses opName (cl' : acc) curNext
                             _ -> pure (acc, cur)
             -- Infix clause `arg op arg = ...`
-            TkIdent _ | tkCol tok == 1 -> do
-                let (identTok, curAfterIdent) = nextToken src cur
-                case tkKind identTok of
-                    TkIdent _ ->
-                        case peekInfixOp src curAfterIdent of
-                            Just op' | op' == opName -> do
-                                mClause <- scanOneClauseAfterName src curAfterIdent
-                                case mClause of
-                                    Nothing -> pure (acc, cur)
-                                    Just (cl, curNext) ->
-                                        let cl' = cl { clausePats =
-                                                (tkStart identTok, snd (clausePats cl)) }
-                                        in collectMoreOpClauses opName (cl' : acc) curNext
-                            _ -> pure (acc, cur)
+            TkIdent _ | tkCol tok == 1 ->
+                case peekInfixOp src curAfterTok of
+                    Just op' | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterTok
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                let cl' = cl { clausePats =
+                                        (tkStart tok, snd (clausePats cl)) }
+                                in collectMoreOpClauses opName (cl' : acc) curNext
+                    _ -> pure (acc, cur)
+            -- Constructor-led infix continuation `Con op arg = ...`,
+            -- e.g. `False && _ = False` after a `True && x = x` head.
+            -- Mirrors the TkIdent branch with a constructor pattern as
+            -- the first argument.
+            TkConId _ | tkCol tok == 1 ->
+                case peekInfixOp src curAfterTok of
+                    Just op' | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterTok
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                let cl' = cl { clausePats =
+                                        (tkStart tok, snd (clausePats cl)) }
+                                in collectMoreOpClauses opName (cl' : acc) curNext
                     _ -> pure (acc, cur)
             _ -> pure (acc, cur)
+
+    -- Variant of 'handleTopIdent' for the case where the col-1 token is a
+    -- constructor (TkConId) acting as the left arg of an infix-operator
+    -- binding LHS, e.g. @True && x = x@ in ghc-prim's GHC.Classes.  The
+    -- caller has already verified that 'peekInfixOp' returns @Just opName@,
+    -- so we register exclusively under the operator name and never fall
+    -- back to using the constructor as a binding name.
+    handleConIdInfixLhs acc opName startTok cur = do
+        mClause <- scanOneClauseAfterName src cur
+        case mClause of
+            Nothing      -> skipBadBinding acc startTok cur
+            Just (clause, curAfter) -> do
+                let clause' = clause { clausePats =
+                        (tkStart startTok, snd (clausePats clause)) }
+                (moreClauses, curFinal) <-
+                    collectMoreOpClauses opName [clause'] curAfter
+                let lhs  = BindingLhs (reverse moreClauses)
+                    acc' = Map.insert opName (SpanOnly lhs) acc
+                if opName == target
+                    then do
+                        writeIORef ref (acc', curFinal)
+                        pure (Just lhs)
+                    else go acc' curFinal
 
     -- We saw `name` at column 1. Scan through its params+rhs to find
     -- the clause boundaries, then peek ahead: if the next column-1
