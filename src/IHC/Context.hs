@@ -75,18 +75,18 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 
-import IHC.Classes
-    ( ClassRegistry
-    , EnvFallbackHook
-    , RegisterInstancesHook
-    , ScanHook
-    , ThExpToExprHook
-    )
+-- 'IHCHooks(..)' is defined in 'IHC.Classes' and re-exported from here
+-- (see the export list above).  Keeping the data declaration in
+-- 'IHC.Classes' avoids the
+-- 'IHC.Context → IHC.Loader.Types → IHC.FFI → IHC.Eval → IHC.Context'
+-- import cycle that would otherwise fire when 'IHC.Eval' takes an
+-- 'IHCHooks' parameter through 'eval'/'force'/'apply'.
+import IHC.Classes (IHCHooks(..))
 import IHC.Loader.Types (LoadedModule)
 import IHC.ModuleHeader (ModuleName)
 import qualified IHC.TypeAST
 import qualified IHC.TypeReduce as TR
-import IHC.Val (Env, Thunk, Val)
+import IHC.Val (Env, Thunk)
 
 --------------------------------------------------------------------------------
 -- Top-level context
@@ -105,21 +105,12 @@ data IHCContext = IHCContext
 
 --------------------------------------------------------------------------------
 -- Hooks (write-once-per-session)
+--
+-- The 'IHCHooks' data declaration lives in 'IHC.Classes' for the
+-- import-cycle reason explained in the import block above.  It is
+-- re-exported here so the rest of the codebase keeps importing the
+-- bundle from 'IHC.Context'.
 --------------------------------------------------------------------------------
-
--- | Install-once hooks that survive run boundaries.  All of these are
--- currently backed by module-level 'unsafePerformIO' IORefs in
--- 'IHC.Classes'; PR 1 moves the storage here without changing the
--- behavioural contract.
-data IHCHooks = IHCHooks
-    { hkEnvFallback         :: !(IORef EnvFallbackHook)
-    , hkClassMethodFallback :: !(IORef (ByteString -> ByteString -> IO (Maybe Val)))
-    , hkCoreInstanceLoad    :: !(IORef (IO ()))
-    , hkRegisterInstances   :: !(IORef RegisterInstancesHook)
-    , hkScan                :: !(IORef (Maybe ScanHook))
-    , hkSharedClassReg      :: !(IORef (Maybe ClassRegistry))
-    , hkThExpToExpr         :: !(IORef ThExpToExprHook)
-    }
 
 --------------------------------------------------------------------------------
 -- Per-run state
@@ -204,7 +195,8 @@ newIHCContext = do
 --
 --   * 'hkEnvFallback'         → @\\_ _ -> pure Nothing@
 --   * 'hkClassMethodFallback' → @\\_ _ -> pure Nothing@
---   * 'hkCoreInstanceLoad'    → @pure ()@
+--   * 'hkCoreInstanceLoad'    → @\\_ -> pure ()@
+--   * 'hkCtorType'            → @const Nothing@
 --   * 'hkRegisterInstances'   → @\\_ -> pure ()@
 --   * 'hkScan'                → 'Nothing'
 --   * 'hkSharedClassReg'      → 'Nothing'
@@ -214,7 +206,8 @@ freshHooks :: IO IHCHooks
 freshHooks = do
     envFb       <- newIORef (\_ _ -> pure Nothing)
     classMethFb <- newIORef (\_ _ -> pure Nothing)
-    coreLoad    <- newIORef (pure ())
+    coreLoad    <- newIORef (\_ -> pure ())
+    ctorType    <- newIORef (const Nothing)
     regInsts    <- newIORef (\_ -> pure ())
     scan        <- newIORef Nothing
     sharedReg   <- newIORef Nothing
@@ -224,6 +217,7 @@ freshHooks = do
         { hkEnvFallback         = envFb
         , hkClassMethodFallback = classMethFb
         , hkCoreInstanceLoad    = coreLoad
+        , hkCtorType            = ctorType
         , hkRegisterInstances   = regInsts
         , hkScan                = scan
         , hkSharedClassReg      = sharedReg

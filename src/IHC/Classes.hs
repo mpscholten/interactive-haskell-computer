@@ -76,6 +76,8 @@ module IHC.Classes
     , clearSuperclasses
     , allSuperclasses
     , checkSuperclassCoverage
+      -- * PR 1: per-session hook bundle
+    , IHCHooks(..)
     ) where
 
 import Control.Exception (SomeException, catch)
@@ -697,6 +699,41 @@ runThExpToExpr :: Val -> IO Expr
 runThExpToExpr v = do
     hook <- readIORef thExpToExprRef
     hook v
+
+--------------------------------------------------------------------------------
+-- IHCHooks bundle (PR 1 of the IHCContext refactor)
+--
+-- 'IHCHooks' is the per-session bundle of all eight write-once hooks
+-- declared above (env fallback, class-method fallback, core-instance
+-- load trigger, ctor-type lookup, per-load instance registration,
+-- legacy scan hook, shared 'ClassRegistry', and TH-Exp decoder).
+--
+-- The data type is intentionally defined HERE in 'IHC.Classes' rather
+-- than in 'IHC.Context' so that 'IHC.Eval' (which sits below
+-- 'IHC.Context' in the import DAG via 'IHC.FFI' → 'IHC.Loader.Types' →
+-- 'IHC.Context') can take an 'IHCHooks' parameter through 'eval' /
+-- 'force' / 'apply' without forcing the cycle:
+--
+--   IHC.Context → IHC.Loader.Types → IHC.FFI → IHC.Eval → IHC.Context
+--
+-- 'IHC.Context' re-exports 'IHCHooks' (see 'IHC.Context.IHCHooks') so
+-- the rest of the codebase can keep importing the bundle from there.
+--
+-- During PR 1 the legacy module-level @IORef@s above remain the
+-- source of truth and the bundle is unused; later steps in PR 1
+-- migrate the storage into 'IHCHooks' fields and delete the globals.
+--------------------------------------------------------------------------------
+
+data IHCHooks = IHCHooks
+    { hkEnvFallback         :: !(IORef EnvFallbackHook)
+    , hkClassMethodFallback :: !(IORef (ByteString -> ByteString -> IO (Maybe Val)))
+    , hkCoreInstanceLoad    :: !(IORef (ByteString -> IO ()))
+    , hkCtorType            :: !(IORef (ByteString -> Maybe ByteString))
+    , hkRegisterInstances   :: !(IORef RegisterInstancesHook)
+    , hkScan                :: !(IORef (Maybe ScanHook))
+    , hkSharedClassReg      :: !(IORef (Maybe ClassRegistry))
+    , hkThExpToExpr         :: !(IORef ThExpToExprHook)
+    }
 
 --------------------------------------------------------------------------------
 -- B.1: superclass tracking (Haskell Report §4.3.1)
