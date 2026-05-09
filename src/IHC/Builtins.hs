@@ -352,14 +352,11 @@ builtins reg =
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
-    -- empty/null/length/pack: graduated to pure source (rule 4).
-    , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
+    -- Graduated to pure source: empty/null/length/pack/unpack/head/index.
     , ("Data.ByteString.Char8.append",    bsAppendB)
     , ("Data.ByteString.Char8.concat",    bsConcatB)
     , ("Data.ByteString.Char8.singleton", bs8SingletonB)
     , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
-    , ("Data.ByteString.Char8.head",      bs8HeadB)
-    , ("Data.ByteString.Char8.index",     bs8IndexB)
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
@@ -3342,14 +3339,6 @@ bsSingletonB = pure $ VFun $ \wT -> do
         _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
     bsFromBS (BS.singleton w)
 
--- | Data.ByteString.Char8.unpack — BS → String by reading each byte
--- as the corresponding Char (not UTF-8 decoded).
-bs8UnpackB :: IO Val
-bs8UnpackB = pure $ VFun $ \a -> do
-    av <- force a
-    bs <- bsValToBS av
-    stringToListValIO (BC.unpack bs)
-
 bs8SingletonB :: IO Val
 bs8SingletonB = pure $ VFun $ \cT -> do
     cv <- force cT
@@ -3370,29 +3359,6 @@ bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
         VInt  i  -> pure (toEnum (fromIntegral i))
         _        -> error ("BS.Char8.replicate: second arg not a Char: " <> showValForDebug cv)
     bsFromBS (BC.replicate n c)
-
-bs8HeadB :: IO Val
-bs8HeadB = pure $ VFun $ \aT -> do
-    av <- force aT
-    (fp, len) <- bsValPayload av
-    if len <= 0
-        then error "BS.Char8.head: empty ByteString"
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
-            pure (VChar (toEnum (fromIntegral w)))
-
-bs8IndexB :: IO Val
-bs8IndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force aT; iv <- force iT
-    i <- case iv of
-        VInt n -> pure (fromIntegral n :: Int)
-        _      -> error ("BS.Char8.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
-    if i < 0 || i >= len
-        then error ("BS.Char8.index: out of bounds: " <> show i <> " vs length " <> show len)
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
-            pure (VChar (toEnum (fromIntegral w)))
 
 bs8PutStrLnB :: IO Val
 bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
