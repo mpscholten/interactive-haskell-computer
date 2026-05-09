@@ -6598,20 +6598,19 @@ discoverInModule
     -> LoadedModule
     -> ByteString
     -> IO ()
--- Read the FULL @earlyBuiltinNames@ set from 'globalEarlyBuiltinsRef'
--- so per-FV chase callers (instance registration / class-default
--- registration / re-export resolution) short-circuit on every builtin
--- name, not just the @extraDiscoverShortCircuit@ subset.  Without
--- this, dropping a heavily-used builtin shim (@==@/@show@) makes the
--- per-FV chase walk through Prelude → ghc-internal looking for
--- @print@/@putStrLn@/etc. (still builtins, but absent from the chase
--- caller's tiny shortcut set), transitively dragging in @base@ +
--- @ghc-internal@ until the heap exhausts.  Master worked with
--- @Set.empty@ here because @==@ was a builtin and per-FV chases for
--- @==@ never fired; once @==@ is dropped, the chase becomes hot.
-discoverInModule registry searchPath includeMap lm name = do
-    builtins <- readIORef globalEarlyBuiltinsRef
-    discoverInModuleWith builtins registry searchPath includeMap lm name
+-- Stays @Set.empty@ to match master's per-FV chase semantics.  An
+-- earlier attempt threaded the full @earlyBuiltinNames@ set in via
+-- 'globalEarlyBuiltinsRef' to fix a discovery cascade after the
+-- eventual @==@ removal — but it short-circuited too much:
+-- class-method names like @pure@ / @return@ that need a per-FV walk
+-- through Prelude (so 'registerInstancesFrom' can register their
+-- 'Applicative' / 'Monad' instances) got skipped, and
+-- @pure 99 :: [Int]@ regressed to @<IO>@ via the result-polymorphic
+-- fallback.  Restore @Set.empty@ until a finer-grained shortcut is
+-- worked out alongside the actual @==@ removal.
+-- 'globalEarlyBuiltinsRef' itself stays — it's harmless on its own
+-- and gives the follow-up the data it needs.
+discoverInModule = discoverInModuleWith Set.empty
 
 -- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
 -- pairs that have already been walked once — regardless of whether the
