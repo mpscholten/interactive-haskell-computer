@@ -315,16 +315,12 @@ builtins reg =
     , ("show",     showDispatch reg)
     , ("length",   lengthB)
     -- Data.ByteString shims (see isBuiltinBackedModule comment).
-    -- Registered under bare names so qualified-alias fallback
-    -- (`BS.pack` → `EVar "pack"`) hits these. Remove when
-    -- source-load perf is fixed.
-    , ("Data.ByteString.empty",     bsEmptyB)
-    , ("Data.ByteString.null",      bsNullB)
-    , ("Data.ByteString.length",    bsLengthShimB)
-    -- 'Data.ByteString.pack' is no longer shimmed — source-loaded
-    -- 'unsafePackLenBytes' works for both '[Word8]' and '[Char]'
-    -- inputs now that 'pokeB' accepts 'VChar'.  Per CLAUDE.md rule 4,
-    -- prefer source over Hackage-library shim.
+    -- Each entry here is a CLAUDE.md rule-4 violation kept only
+    -- while the source path is being verified. Remove one at a time
+    -- as the source-loaded equivalent is exercised end-to-end.
+    --
+    -- Already graduated to pure source: empty, null, length, pack
+    -- (Char8 siblings of all four also gone).
     , ("Data.ByteString.unpack",    bsUnpackB)
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
@@ -362,13 +358,7 @@ builtins reg =
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
-    , ("Data.ByteString.Char8.empty",     bsEmptyB)
-    , ("Data.ByteString.Char8.null",      bsNullB)
-    , ("Data.ByteString.Char8.length",    bsLengthShimB)
-    -- 'Data.ByteString.Char8.pack' is no longer shimmed — source-
-    -- loaded 'unsafePackLenChars' uses @c2w = fromIntegral . ord@ so
-    -- each element pokes as a 'VInt' (no 'VChar' coercion needed at
-    -- the FFI boundary; the conversion happens in interpreted code).
+    -- empty/null/length/pack: graduated to pure source (rule 4).
     , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
     , ("Data.ByteString.Char8.append",    bsAppendB)
     , ("Data.ByteString.Char8.concat",    bsConcatB)
@@ -3209,11 +3199,6 @@ bsValPayload v = case v of
         markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
         pure (fp, BS.length bs)
 
-bsEmptyB :: IO Val
-bsEmptyB = do
-    fp <- mallocForeignPtrBytes 0
-    mkBsVal fp 0
-
 bsPSConB :: IO Val
 bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
     fpv <- force fpT
@@ -3308,18 +3293,6 @@ bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ 
             used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
             mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
         _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
-
-bsLengthShimB :: IO Val
-bsLengthShimB = pure $ VFun $ \a -> do
-    av <- force a
-    (_, len) <- bsValPayload av
-    pure (VInt (fromIntegral len))
-
-bsNullB :: IO Val
-bsNullB = pure $ VFun $ \a -> do
-    av <- force a
-    (_, len) <- bsValPayload av
-    pure (VCon (if len == 0 then "True" else "False") [])
 
 -- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
 -- and forces the payload. Also accepts `Identity { runIdentity = x }`
