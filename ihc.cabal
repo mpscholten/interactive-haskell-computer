@@ -51,6 +51,7 @@ library
       , IHC.PackageStore
       , IHC.Parser
       , IHC.PatSyn
+      , IHC.Pretty
       , IHC.Repl
       , IHC.Scan
       , IHC.Scheduler
@@ -129,6 +130,9 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Properties.Generators
+      , Properties.RoundTrip
+      , Properties.Totality
       , HsExtTypeFams
       , HsExtMisc
       , HsExtRecords
@@ -176,6 +180,10 @@ test-suite ihc-test
       , filepath
       , hspec            >= 2.10
       , process          >= 1.6
+      -- Property-based parser totality fuzz suite (Phase 1 of the
+      -- "random Haskell programs" plan — see
+      -- plans/can-we-convert-the-temporal-castle.md).
+      , QuickCheck       >= 2.14
     -- Tests run sequentially under hspec.  Pin the RTS to a single
     -- capability so parallel GC doesn't spin on every core while the
     -- actual workload is single-threaded.  The user-facing interpreter
