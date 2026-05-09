@@ -96,6 +96,29 @@ prettyExpr = \case
     EImplicitLet binds b ->
         "(let { " <> bsIntercalate "; " (map prettyImpBind binds)
           <> " } in " <> prettyExpr b <> ")"
+    -- Record construction: @Con { f1 = e1, f2 = e2 }@.  The
+    -- parser disambiguates record-construction from
+    -- record-update by checking whether the head is a
+    -- 'recordConstructorName' (uppercase-starting) — see
+    -- @IHC.Parser:3282@.
+    ERecordCon n fields ->
+        "(" <> n <> " { "
+          <> bsIntercalate ", " (map prettyFieldExpr fields)
+          <> " })"
+    -- @Con {..}@ — RecordWildCards.  Parser side at
+    -- @IHC.Parser:3286@: parseRecordFields detects @..@ and
+    -- returns isWild=True.
+    ERecordWild n  ->
+        "(" <> n <> " {..})"
+    -- Record update: @<expr> { f1 = e1, f2 = e2 }@.  Parsed by
+    -- the parseApp loop at @IHC.Parser:3043@; the head can be
+    -- any 'Expr', which is what 'isRecordUpdateBrace' lets us
+    -- distinguish from record /construction/ (where the head
+    -- must be a 'TkConId').
+    ERecordUpdate e fields ->
+        "(" <> prettyExpr e <> " { "
+          <> bsIntercalate ", " (map prettyFieldExpr fields)
+          <> " })"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"
@@ -176,6 +199,12 @@ prettyBind (n, e) = n <> " = " <> prettyExpr e
 -- 'parseOneIPBind' recognises the binding.
 prettyImpBind :: (Name, Expr) -> ByteString
 prettyImpBind (n, e) = "?" <> n <> " = " <> prettyExpr e
+
+
+-- | Pretty-print one @field = expr@ entry inside an
+-- 'ERecordCon' or 'ERecordUpdate' brace block.
+prettyFieldExpr :: (Name, Expr) -> ByteString
+prettyFieldExpr (n, e) = n <> " = " <> prettyExpr e
 
 
 -- | Local helper — 'BS.intercalate' is in @Data.ByteString@ but

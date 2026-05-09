@@ -180,6 +180,13 @@ genExprSized n
         -- @let ?x = e1; ?y = e2 in body@ — implicit-param let.
         -- Bindings are 1-2 entries to keep counterexamples small.
         , (1, EImplicitLet <$> genIPBindings half_n <*> sub)
+        -- Record construction \/ wildcard \/ update.  The parser
+        -- disambiguates record-construction from record-update
+        -- by whether the head is a 'TkConId' — see
+        -- 'recordConstructorName' at @IHC.Parser:3327@.
+        , (1, ERecordCon    <$> genConIdent <*> genRecordFields half_n)
+        , (1, ERecordWild   <$> genConIdent)
+        , (1, ERecordUpdate <$> sub <*> genRecordFields half_n)
         ]
   where
     atom   = frequency
@@ -206,6 +213,14 @@ genTupleExprs n = do
 genIPBindings :: Int -> Gen [(Name, Expr)]
 genIPBindings n = do
     k <- choose (1, 2)
+    vectorOf k ((,) <$> genIdent <*> genExprSized n)
+
+
+-- | Record-field list (1–3 entries).  Both 'ERecordCon' and
+-- 'ERecordUpdate' share this shape; 'ERecordWild' has no fields.
+genRecordFields :: Int -> Gen [(Name, Expr)]
+genRecordFields n = do
+    k <- choose (1, 3)
     vectorOf k ((,) <$> genIdent <*> genExprSized n)
 
 
