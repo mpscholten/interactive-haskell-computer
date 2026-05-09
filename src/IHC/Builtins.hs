@@ -282,8 +282,14 @@ builtins reg =
     -- abs / signum dropped earlier (same mechanism): instance bodies
     -- in GHC.Internal.Num resolve via the env-fallback class-method
     -- dispatcher.
-    [ ("min",      minDispatch reg)
-    , ("max",      maxDispatch reg)
+    -- @min@ and @max@ deliberately omitted: source bodies live in
+    -- @GHC.Classes@'s @class Ord@ defaults
+    --   max x y = if x <= y then y else x
+    --   min x y = if x <= y then x else y
+    -- and resolve through the @<=@ builtin (registered below as slot 1
+    -- of 'ordDispatch') plus the source-loaded class-method dispatcher
+    -- via the env-fallback's 'tryClassMethodFromRegistry'.
+    --
     -- 'gcd' graduated to source-loaded.  Body lives at
     --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:928-930
     --     gcd x y = gcd' (abs x) (abs y)
@@ -292,7 +298,7 @@ builtins reg =
     -- abs already graduated in Phase E; rem is registered below.
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
-    , ("sqrt",     unaryOpFloat sqrt)
+    [ ("sqrt",     unaryOpFloat sqrt)
     , ("floor",    floatToIntB floor)
     , ("ceiling",  floatToIntB ceiling)
     , ("round",    floatToIntB round)
@@ -1777,8 +1783,9 @@ ordCmp _reg slot av bv = case (av, bv) of
 
     -- Map a host 'Ordering' into the comparison result the caller's
     -- dispatch slot expects. Slot 0 = (<), 1 = (<=), 2 = (>), 3 = (>=).
-    -- Slot 4 is unused at this level (compareDispatch calls slot 0 then
-    -- consults Eq for EQ), but we handle it defensively.
+    -- Slot 4 is unused at this level (the source-loaded @compare@
+    -- default in @GHC.Classes@ triangulates via slot 1 + Eq), but we
+    -- handle it defensively.
     ordSlot 0 o = o == LT
     ordSlot 1 o = o == LT || o == EQ
     ordSlot 2 o = o == GT
@@ -1792,13 +1799,13 @@ ordCmp _reg slot av bv = case (av, bv) of
 -- the same type need to be compared.
 --
 -- We use a module-level 'IORef' (via 'unsafePerformIO') because
--- 'structuralOrdering' is invoked through a long chain of Ord-dispatch
--- helpers (ordCmp, valOrdering, compareDispatch, …) and threading an
--- extra registry through every one of them for a purely-derived
--- fallback would touch far too many call sites. The ref is written
--- once per module load and read many times per comparison; races
--- aren't a concern because the scheduler only rebuilds the env
--- single-threaded.
+-- 'structuralOrdering' is invoked through the Ord-dispatch chain
+-- (ordCmp → structuralOrdering → compareFields → valOrdering → …)
+-- and threading an extra registry through every one of them for a
+-- purely-derived fallback would touch far too many call sites. The
+-- ref is written once per module load and read many times per
+-- comparison; races aren't a concern because the scheduler only
+-- rebuilds the env single-threaded.
 {-# NOINLINE ctorIndexRegistry #-}
 ctorIndexRegistry :: IORef (Map.Map ByteString (ByteString, Int))
 ctorIndexRegistry = unsafePerformIO (newIORef Map.empty)
@@ -1896,8 +1903,9 @@ structuralOrdering reg av bv = case (av, bv) of
     compareFields _ _ = pure EQ   -- unreachable (arity equal check above)
 
 -- | Run the full Ord dispatch and distil the result into a host
--- 'Ordering'. Used by 'structuralOrdering' and 'compareDispatch' so
--- every code path shares the same ordering logic.
+-- 'Ordering'. Used by 'compareFields' inside 'structuralOrdering' so
+-- the recursive field walk hits the primitive Ord fast paths
+-- (Int/Float/Char/String/Ptr) before bottoming out on 'ordCmp'.
 valOrdering :: ClassRegistry -> Val -> Val -> IO Ordering
 valOrdering reg av bv = case (av, bv) of
     (VInt x,   VInt y)   -> pure (compare x y)
@@ -1939,30 +1947,6 @@ valOrdering reg av bv = case (av, bv) of
     orderingFromVCon other = error ("valOrdering: user Ord `compare` "
                                     <> "returned non-Ordering: "
                                     <> showValForDebug other)
-
--- | @min x y@ dispatched through 'valOrdering': returns @x@ when
--- @compare x y /= GT@, otherwise @y@. Works for every type 'ordCmp'
--- supports (numeric, primitive, and any VCon via the structural
--- fallback), not just numbers.
-minDispatch :: ClassRegistry -> IO Val
-minDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    o  <- valOrdering reg av bv
-    case o of
-        GT -> pure bv
-        _  -> pure av
-
--- | @max x y@ dispatched through 'valOrdering'. Counterpart to
--- 'minDispatch'.
-maxDispatch :: ClassRegistry -> IO Val
-maxDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    o  <- valOrdering reg av bv
-    case o of
-        LT -> pure bv
-        _  -> pure av
 
 -- | Show dispatch: look up "show" in the Show class registry.
 -- Slot 0 = show. Falls back to built-in showVal for base types.
