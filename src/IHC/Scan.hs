@@ -70,6 +70,7 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
+import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Dynamic (fromDynamic, toDyn)
 import Data.Typeable (Typeable)
@@ -620,7 +621,16 @@ findBinding src ref target = do
                 case mClause of
                     Nothing -> skipBadBinding acc startTok curAfterName
                     Just (clause, curAfter) -> do
-                        let lhs  = BindingLhs [clause]
+                        -- Bidirectional pattern syn `pattern Name p1 p2 <- pat
+                        -- where Name q1 q2 = body`: scanOneClauseAfterName
+                        -- captures a malformed LHS that includes the `<-` and
+                        -- the `where Name` prefix.  Narrow the LHS span to
+                        -- start at the where-clause's args (after `where Name`)
+                        -- so the parser sees just `q1 q2` for the binding's
+                        -- params.  No-op for the simple `pattern Name p = body`
+                        -- form (no `<-` in span).
+                        clause' <- narrowBidirectionalPatSynSpan src patName clause
+                        let lhs  = BindingLhs [clause']
                             acc' = Map.insert patName (SpanOnly lhs) acc
                         if patName == target
                             then do
@@ -819,6 +829,53 @@ scanOneClauseAfterNameAtCol src minBodyCol curAfterName = do
                 clause    = Clause (patsStart, patsEnd) (bodyStart, bodyEnd)
                 curAfter  = Cursor bodyEnd 0 1
             pure (Just (clause, curAfter))
+
+-- | Narrow a pattern-synonym clause's LHS span to skip any
+-- @\<- ... where Name@ prefix, so a bidirectional explicit-form
+-- declaration
+--
+-- > pattern Name p1 p2 <- pat where
+-- >     Name q1 q2 = body
+--
+-- registers @Name q1 q2 = body@ as the binding (matching the
+-- expression direction of the synonym), instead of the whole
+-- @"p1 p2 \<- pat where    Name q1 q2"@ junk that
+-- 'scanOneClauseAfterName' captures (because 'findEqOrBarOnLine' picks
+-- the where-clause\'s @=@).
+--
+-- No-op for the simple @pattern Name p = body@ form: in that case
+-- there is no @\<-@ token in the captured span and the function returns
+-- the input unchanged.
+narrowBidirectionalPatSynSpan :: Source -> ByteString -> Clause -> IO Clause
+narrowBidirectionalPatSynSpan src patName clause0@(Clause (start, end) _) = do
+    let (startLine, startCol) = offsetToPos src start
+        cur0 = Cursor start startLine startCol
+    walk cur0 False
+  where
+    rhs = clauseRhs clause0
+    -- @sawArrow@ tracks whether we've passed @<-@.  Only @where Name@
+    -- AFTER @<-@ counts; an earlier @where@ (e.g. inside a guard view
+    -- pattern, though pattern-syn bodies don\'t legally have one) would
+    -- not be the bidirectional builder marker.
+    walk cur sawArrow
+        | cPos cur >= end = pure clause0
+        | otherwise = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkLArrow -> walk cur' True
+                TkWhere | sawArrow -> do
+                    let (nextTok, cur'') = nextToken src cur'
+                    -- Skip a leading newline so the where-keyword's
+                    -- inner clause (which is on the next, indented
+                    -- line) is reachable.
+                    let (nextTok', cur''') = case tkKind nextTok of
+                            TkNewline -> nextToken src cur''
+                            _         -> (nextTok, cur'')
+                    case tkKind nextTok' of
+                        TkConId n | n == patName ->
+                            pure (Clause (cPos cur''', end) rhs)
+                        _ -> walk cur' True
+                _ -> walk cur' sawArrow
 
 -- | Braced-layout variant of 'scanOneClauseAfterNameAtCol'.  The body ends
 -- at a top-level @;@ or @}@ rather than at a layout-column boundary.
