@@ -6856,11 +6856,21 @@ exportsNameDirect lm n = case mhExports (lmHeader lm) of
     ExportList xs -> any matchDirect xs
   where
     tCtors = lmTypeCtorReg lm
+    -- Pattern synonyms attached to type @T@ are part of @T(..)@.  Without
+    -- including them here, a re-export of @T(..)@ silently drops every
+    -- patsyn — surfaced by warp's
+    -- @import Data.ByteString.Internal (ByteString(..))@ failing to bring
+    -- @PS@ into scope.  We don't have per-patsyn-type-association yet, so
+    -- treat all patsyns in @lm@ as candidates for any @T(..)@.  See the
+    -- 'typeLikeRuntimeNames' note for the over-broadness caveat.
+    patSynNamesPure = unsafePerformIO (map psdName <$> scanPatternSynonyms (lmSource lm))
 
     matchDirect (ExportName m)            = n == m
     matchDirect (ExportType m Nothing)    = n == m
     matchDirect (ExportType m (Just [])) =
-        n == m || n `elem` Map.findWithDefault [] m tCtors
+        n == m
+        || n `elem` Map.findWithDefault [] m tCtors
+        || n `elem` patSynNamesPure
     matchDirect (ExportType m (Just subs)) =
         n == m || n `elem` subs
     matchDirect (ExportModule _) = False
@@ -6884,6 +6894,14 @@ exportsName lm n = case mhExports (lmHeader lm) of
   where
     tCtors = lmTypeCtorReg lm
     fields = lmFieldReg lm  -- field name → [(ctor, idx)]
+    -- Pattern synonyms attached to type @T@ are part of @T(..)@.  Same
+    -- caveat as 'exportsNameDirect' / 'typeLikeRuntimeNames': we don't
+    -- track per-patsyn type-association so all patsyns in @lm@ are
+    -- candidates for any @T(..)@.  Without this, a module re-exporting
+    -- @T(..)@ silently drops every patsyn — surfaced by warp's
+    -- @import Data.ByteString.Internal (ByteString(..))@ failing to
+    -- bring @PS@ into scope.
+    patSynNamesPure = unsafePerformIO (map psdName <$> scanPatternSynonyms (lmSource lm))
 
     -- Is @n@ a record-field accessor for any constructor of @typeHead@?
     -- Used for the @T(..)@ export form, which implicitly exports every
@@ -6900,10 +6918,12 @@ exportsName lm n = case mhExports (lmHeader lm) of
     matchExport (ExportType m (Just [])) =
         -- The `T(..)` form: the type head plus every constructor of T
         -- that the scanner saw in this module's source, plus every
-        -- record-field accessor defined by those constructors.
+        -- record-field accessor defined by those constructors, plus any
+        -- pattern synonym declared in this module.
         n == m
         || n `elem` Map.findWithDefault [] m tCtors
         || isFieldOfType m
+        || n `elem` patSynNamesPure
     matchExport (ExportType m (Just subs)) =
         -- The `T(Ctor1, Ctor2, field1, ...)` form: the type head plus
         -- every explicitly-listed sub-name.
