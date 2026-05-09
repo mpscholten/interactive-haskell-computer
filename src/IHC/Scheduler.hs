@@ -96,6 +96,7 @@ import IHC.Classes
     , catalogueHasClass
     , legacyHooks
     , IHCHooks(..)
+    , resetSessionHooks
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -4571,12 +4572,16 @@ resetPerRunGlobals = do
     -- Clear the catalogue too so closures captured against this
     -- run's 'LoadedModule' state don't fire on the next run.
     resetInstanceCatalogue
-    -- Drop the per-load instance-registration hook installed by the
-    -- previous 'loadProgramFromSource' run.  Without this, any
-    -- 'loadModule' call before the new run's hook is reinstalled would
-    -- fire the previous run's closure — referencing its
-    -- now-defunct ClassRegistry / Env / typeCtors and corrupting state.
-    setRegisterInstancesHook legacyHooks (\_ -> pure ())
+    -- Wipe the entire 'IHCHooks' bundle to its no-op defaults.  This
+    -- guarantees no closure captured by a hook in the previous run
+    -- (registerInstances closure capturing the prior run's
+    -- ClassRegistry / Env / typeCtors, env fallback closure capturing
+    -- the prior run's module catalogue, thExp decoder capturing the
+    -- prior run's TH state, …) survives into the next run.  Boot code
+    -- below ('installEnvFallbackHook', 'setSharedClassReg',
+    -- 'IHC.TH.installThExpToExprHook', …) overwrites the relevant
+    -- fields with real per-run implementations.
+    resetSessionHooks legacyHooks
     -- Drop the (lm, name) → resolveImport memo from the prior run so
     -- a fresh 'lmName' doesn't see stale resolutions captured against
     -- the previous registry.
