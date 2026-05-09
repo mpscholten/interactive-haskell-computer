@@ -186,3 +186,32 @@ spec = describe "Parser/lexer bug regressions (audit 2026-04-27)" $ do
                     items `shouldNotContain` [ExportName "bar"]
                 _ -> expectationFailure
                     ("unexpected header: " <> show mh)
+
+    -- Bug 6 — found by Properties.Totality fixture-mutation fuzz, seed
+    -- 1067065700 / shrunk input "Gg\SID@'".  An unexpected ASCII
+    -- control byte (0x00..0x1F minus whitespace) hit the fall-through
+    -- branch in 'IHC.Lexer.nextToken' and was raised via 'error',
+    -- which surfaces as 'ErrorCall' rather than 'ParseError' — a
+    -- totality violation: callers that 'try @ParseError' would let
+    -- the exception escape uncaught.  Fix: throw 'LexError' which
+    -- 'parseExprOnly' bridges to 'ParseError' via @liftLex@.
+    describe "bug6: control bytes must surface as ParseError, not ErrorCall" $ do
+        -- "\x0F\&D" — \& terminates the hex escape so the literal is
+        -- exactly bytes [G, g, 0x0F, D, @, '], the QuickCheck-shrunk
+        -- repro; without it GHC reads "\x0FD" as the single byte 0xFD.
+        it "rejects byte 0x0F mid-token without an uncaught ErrorCall" $ do
+            r <- parseExpr "Gg\x0F\&D@'"
+            case r of
+                Left e | isParseError e -> pure ()
+                Left e -> expectationFailure
+                    ("expected ParseError, got " <> show e)
+                Right _ -> expectationFailure
+                    "expected ParseError, parse succeeded"
+        it "rejects bare byte 0x01 without an uncaught ErrorCall" $ do
+            r <- parseExpr "\x01"
+            case r of
+                Left e | isParseError e -> pure ()
+                Left e -> expectationFailure
+                    ("expected ParseError, got " <> show e)
+                Right _ -> expectationFailure
+                    "expected ParseError, parse succeeded"

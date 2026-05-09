@@ -320,11 +320,16 @@ nextToken s c0 =
             -- ASCII-centric, so treat an unexpected non-ASCII codepoint as
             -- ignorable trivia rather than aborting the whole load.
             | b >= 0x80         -> nextToken s (stepN (utf8CharLen b) c)
+            -- ASCII control byte (0x00..0x1F minus the whitespace
+            -- handled above) or 0x7F that no other branch claimed.
+            -- Surface as a 'LexError' so 'parseExprOnly' can bridge
+            -- it to a 'ParseError' via @liftLex@; an 'error' call
+            -- here would propagate as an 'ErrorCall' and break
+            -- parser totality (caught by 'Properties.Totality').
             | otherwise        ->
-                error ("IHC.Lexer: unexpected byte 0x"
-                       <> showHex b
-                       <> " at "
-                       <> show (lineCol s (cPos c)))
+                let (line, col) = lineCol s (cPos c)
+                in throw (LexError (srcName s) line col
+                       ("unexpected byte 0x" <> showHex b))
   where
     mkTok k start end = Token k (cPos start) (cPos end) (cLine start) (cCol start)
 

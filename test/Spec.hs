@@ -35,6 +35,7 @@ import qualified Hs2010DataDecl
 import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ParserBugs
+import qualified Properties.Totality
 import qualified ReplTest
 import qualified RunFile
 import qualified Unsupported
@@ -47,6 +48,7 @@ import qualified WarpRunStartupTest
 main :: IO ()
 main = hspec do
     ParserBugs.spec
+    Properties.Totality.spec
     HsExtMisc.spec
     Hs2010LexNum.spec
     Hs2010Fixity.spec
