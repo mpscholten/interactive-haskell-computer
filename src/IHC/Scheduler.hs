@@ -277,10 +277,13 @@ loadProgram = loadProgramFromSource []
 --      'namesFromModule' walking inherited fully-populated
 --      'lmBodies').
 --
--- Cheap incremental win still on the table: drop
--- @Text.Megaparsec.Internal@ \/ @Text.Megaparsec.Class@ from
--- 'coreInstanceModules' (used by exactly one HSX fixture but force-
--- loaded for every other program).
+-- Note: the predecessor of the eager scope, 'coreInstanceModules',
+-- used to also hardcode Hackage entries (e.g. @Text.Megaparsec.*@)
+-- that every program paid for. Commit @8aac0cc@ retired that
+-- pattern in favour of the per-package instance manifest, and
+-- 'preludeScope' (the current shape, see definition below) is
+-- base\/ghc-internal only. See the @preludeScope@ rule in CLAUDE.md
+-- before adding anything here.
 loadProgramFromSource :: [FilePath] -> Source -> IO (Env, Thunk)
 loadProgramFromSource searchPath src0 = do
     -- Drop accumulated state from any prior 'loadProgramFromSource'
@@ -5012,9 +5015,9 @@ resolveFallbackSource mOwner name = do
                         ]
                     -- Implicit Prelude.  Approximate "what Prelude
                     -- exports" by the set of modules IHC pre-loads as
-                    -- core Prelude scope (see 'coreInstanceModules' in
-                    -- 'loadProgramFromSource').  Skipped only when the
-                    -- owner module sets @NoImplicitPrelude@.
+                    -- core Prelude scope (see 'preludeScope' below).
+                    -- Skipped only when the owner module sets
+                    -- @NoImplicitPrelude@.
                     implicit
                         | hasNoImplicitPrelude (lmSource owner) = []
                         | otherwise = preludeScope

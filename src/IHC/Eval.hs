@@ -440,12 +440,13 @@ eval env ipm = go
                             -- body, name in 'globalClassMethodNamesRef').
                             -- That heuristic mis-fires for top-level
                             -- functions that happen to share a name with
-                            -- a class method elsewhere — the canonical
-                            -- example is 'Control.Exception.try' getting
-                            -- routed through 'MonadParsec.try''s
-                            -- dispatcher because megaparsec's
-                            -- 'Text.Megaparsec.Class' is on the
-                            -- core-instance load list.
+                            -- a class method elsewhere — e.g. a
+                            -- top-level 'try' shadowed by a
+                            -- 'MonadParsec.try'-style class-method
+                            -- dispatcher whenever the megaparsec class
+                            -- ends up in scope (historically: when
+                            -- @Text.Megaparsec.Class@ was eagerly
+                            -- loaded; today: only if the user imports it).
                             --
                             -- If the rewritten expression contains an
                             -- 'ETypedMethod' whose resolved
