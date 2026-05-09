@@ -591,9 +591,21 @@ loadProgramFromSource searchPath src0 = do
     setRegisterInstancesHook legacyHooks $ \modName -> do
         globalMods <- readIORef globalLoadedModulesRef
         case Map.lookup modName globalMods of
-            Just lm ->
+            Just lm -> do
                 registerInstancesFrom registry fullSearchPath includeMap
                                       classReg unionedTypeCtors classTable env lm
+                -- Also catalogue this module's @class C where m = ...@
+                -- defaults under the @<default>@ sentinel tag.  Without
+                -- this, a class declared in a lazily-loaded module
+                -- (e.g. @class Ord@ in ghc-prim's @GHC.Classes@,
+                -- pulled in on first reference to @(||)@ / @compare@)
+                -- never has its default body registered, so the
+                -- dispatcher's fallback to @defaultTypeTag@ for
+                -- (cls, tag) misses errors instead of running
+                -- @compare x y = if x == y then EQ else if x <= y
+                -- then LT else GT@.
+                registerClassDefaults registry fullSearchPath includeMap
+                                      classReg env [lm]
             Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
@@ -4653,6 +4665,31 @@ registerGlobalLoadedModule lm = do
     -- module-scoped in source).
     modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
+    -- Mirror per-module class declarations into the global
+    -- method->class registry so the env-fallback's
+    -- 'tryClassMethodFromRegistry' can synthesise a
+    -- 'classMethodDispatcher' for any class method whose declaring
+    -- module is loaded — even when that module loaded LATER than the
+    -- initial 'buildClassMethodEnv' pass.  Without this, dropping a
+    -- bare-name builtin shim for a class method (e.g. @compare@)
+    -- leaves it unbound until 'buildClassMethodEnv' runs again,
+    -- because lazy discovery of @GHC.Classes@ doesn't otherwise touch
+    -- 'globalMethodClassRef'.
+    --
+    -- 'scanClassDecls' is the same parse the startup pass uses; it
+    -- caches via 'lmKnown' so a re-run is cheap.  Errors are
+    -- swallowed: a class-decl scan failure on one module must not
+    -- block its bodies / type sigs from registering globally.
+    classDecls <- (scanClassDecls (lmSource lm))
+        `catch` (\(_ :: SomeException) -> pure [])
+    let allMethodNames = Set.fromList
+            [ m | ClassDecl _ ms _ _ <- classDecls, m <- ms ]
+        methodClassPairs =
+            [ (m, [cls]) | ClassDecl cls ms _ _ <- classDecls, m <- ms ]
+    modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
+    modifyIORef' globalMethodClassRef
+        (Map.unionWith (\a b -> a ++ filter (`notElem` a) b)
+                       (Map.fromListWith (++) methodClassPairs))
 
 -- | Ensure every module referenced by a cached 'LoadedModule''s bodies
 -- is present in the per-run registry.  See the comment at the cache-hit
@@ -5124,9 +5161,31 @@ resolveFallbackSource mOwner name = do
                                                         [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
                                                 mergeGlobalLoadedModules newMods
                                                 mods' <- readIORef globalLoadedModulesRef
-                                                buildSlotFromOwner mods'
+                                                mSlot <- buildSlotFromOwner mods'
                                                     (Map.findWithDefault preludeLm ownerName mods')
                                                     bareName
+                                                case mSlot of
+                                                    Just _ -> pure mSlot
+                                                    -- Class-method retry: the
+                                                    -- 'discoverInModule' walk above
+                                                    -- transitively loaded ghc-prim's
+                                                    -- @GHC.Classes@ (Prelude
+                                                    -- re-exports its @Eq@/@Ord@
+                                                    -- methods), and
+                                                    -- 'registerGlobalLoadedModule'
+                                                    -- mirrored its class decls into
+                                                    -- 'globalMethodClassRef'.  Re-
+                                                    -- probe so a class method that
+                                                    -- missed the first attempt now
+                                                    -- resolves; without this, bare
+                                                    -- references to a class method
+                                                    -- declared in a lazily-loaded
+                                                    -- module (e.g. @compare@ from
+                                                    -- @GHC.Classes@) report "unbound
+                                                    -- variable" even though the
+                                                    -- dispatcher could be
+                                                    -- synthesised.
+                                                    Nothing -> tryClassMethodFromRegistry bareName
 
     -- | Scan every loaded module's 'lmBodies' for @bareName@.  If the
     -- body isn't materialised yet but the source contains a top-level

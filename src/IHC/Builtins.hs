@@ -310,7 +310,13 @@ builtins reg =
     , ("<=",       ordDispatch reg 1)
     , (">",        ordDispatch reg 2)
     , (">=",       ordDispatch reg 3)
-    , ("compare",  compareDispatch reg)
+    --
+    -- @compare@ is deliberately omitted: source body lives in
+    -- @GHC.Classes@'s @class Ord@ default
+    --   compare x y = if x == y then EQ else if x <= y then LT else GT
+    -- and per-instance overrides (e.g. @compare = compareInt@ for Int).
+    -- The source-loaded class-method dispatcher binds @compare@ on
+    -- demand via the env-fallback's @tryClassMethodFromRegistry@.
     --
     -- (&&), (||), and `not` are deliberately omitted — their
     -- source bodies live at
@@ -1933,22 +1939,6 @@ valOrdering reg av bv = case (av, bv) of
     orderingFromVCon other = error ("valOrdering: user Ord `compare` "
                                     <> "returned non-Ordering: "
                                     <> showValForDebug other)
-
--- | @compare@ returns an Ordering constructor: LT, EQ, or GT.
---
--- Shared path with ordCmp via 'valOrdering', so user-defined ADTs
--- (including 'deriving Ord') pick up the same structural fallback
--- that drives @<@, @<=@, @>@, @>=@.
-compareDispatch :: ClassRegistry -> IO Val
-compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    o  <- valOrdering reg av bv
-    pure (VCon (orderingName o) [])
-  where
-    orderingName LT = "LT"
-    orderingName EQ = "EQ"
-    orderingName GT = "GT"
 
 -- | @min x y@ dispatched through 'valOrdering': returns @x@ when
 -- @compare x y /= GT@, otherwise @y@. Works for every type 'ordCmp'
