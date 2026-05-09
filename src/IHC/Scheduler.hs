@@ -5639,7 +5639,7 @@ resolveFallbackSource mOwner name = do
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
                 slot <- newIORef (BlackHole "<fallback-placeholder>")
                 let selfKey = lmName owner <> BC.pack "." <> bareName
-                ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot
+                ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot baseEnv
                 -- Stamp the closure's env with the owning module via
                 -- the @"$$owner"@ sentinel so 'IHC.Eval.currentOwner'
                 -- can scope unqualified-name fallback to this module's
@@ -5719,22 +5719,34 @@ resolveFallbackSource mOwner name = do
                         visibleFields <-
                             if needsRecordFields expr0
                                 then visibleFieldRegistryFor transientReg searchPath includeMap owner
-                                        (recordSyntaxFieldNames expr0)
+                                        (recordSyntaxFieldNames (lmFieldReg owner) expr0)
                                 else pure (lmFieldReg owner)
                         let expr = desugarRecordPats visibleFields
                                      (desugarRecordCons visibleFields expr0)
                         modifyIORef' (lmBodies owner) (Map.insert bareName expr)
                         buildSlotFromOwner mods owner bareName
 
-    buildOwnerLocalEnv owner bodies bareName selfSlot = do
+    buildOwnerLocalEnv owner bodies bareName selfSlot baseEnv = do
         scanned <- scanAllTopLevelNames (lmSource owner)
             `catch` (\(_ :: SomeException) -> pure [])
         classDecls <- scanClassDecls (lmSource owner)
             `catch` (\(_ :: SomeException) -> pure [])
-        let classMethods =
+        let -- Class-method names declared in the owner module are added
+            -- so that bodies inside the owner can reach the
+            -- class-method-dispatcher slot for them via the FQN
+            -- 'resolveFallback' path.  However, if the bare name already
+            -- has a working binding in 'baseEnv' (a builtin), DO NOT
+            -- shadow it: the source-loaded body's call site (e.g.
+            -- @n `rem` 2@ inside source-loaded @even@) needs the
+            -- builtin's monomorphic Int implementation, not a
+            -- class-method dispatcher whose instance manifest may not
+            -- have been force-loaded yet (instance discovery is
+            -- elaborator-driven; raw 'EVar' bodies skip elaboration).
+            classMethods =
                 [ method
                 | ClassDecl _ methods _ _ <- classDecls
                 , method <- methods
+                , not (HashMap.member method baseEnv)
                 ]
             localNames = nubBS (Map.keys bodies ++ scanned ++ classMethods)
         pairs <- concat <$> mapM mkLocal localNames
@@ -6524,7 +6536,7 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                 visibleFields <-
                                     if needsRecordFields expr0
                                         then visibleFieldRegistryFor registry searchPath includeMap lm
-                                                (recordSyntaxFieldNames expr0)
+                                                (recordSyntaxFieldNames (lmFieldReg lm) expr0)
                                         else pure (lmFieldReg lm)
                                 let expr = desugarRecordPats visibleFields
                                              (desugarRecordCons visibleFields expr0)
@@ -7444,10 +7456,31 @@ needsRecordFields = goExpr
         PRecordWild{} -> True
         PView e p     -> goExpr e || goPat p
 
-recordSyntaxFieldNames :: Expr -> Maybe [ByteString]
-recordSyntaxFieldNames = fmap nubBS . goExpr
+-- | The first 'FieldRegistry' parameter is the OWNER module's local field
+-- registry — consulted to resolve @Con {..}@ wildcards to a concrete set
+-- of field names without falling back to the unrestricted transitive
+-- walk inside 'visibleFieldRegistryFor'.
+--
+-- Without this, ANY @Con {..}@ in a body forces 'mWanted = Nothing' and
+-- 'visibleFieldRegistryFor' fans out an 'exportedFieldRegistry' walk
+-- across every transitively-imported module — for an entry program with
+-- a single record-wildcard pattern that means walking the full Prelude
+-- + base re-export chain, observed as a multi-minute hang on simple
+-- fixtures (RecordWildCards in QuickWins).  When the constructor is
+-- defined locally (or in any already-loaded module by the time the
+-- caller looks it up) we can substitute its concrete field list and
+-- keep the bounded fast path.
+recordSyntaxFieldNames :: FieldRegistry -> Expr -> Maybe [ByteString]
+recordSyntaxFieldNames localFldReg = fmap nubBS . goExpr
   where
     combine xs = fmap concat (sequence xs)
+
+    -- Resolve @Con {..}@ to its field names if the constructor is in
+    -- the supplied local registry; fall back to 'Nothing' so the caller
+    -- triggers the wider re-export walk only when truly needed.
+    wildFields conName = case map fst (conFields localFldReg conName) of
+        []  -> Nothing
+        fns -> Just fns
 
     goExpr = \case
         EVar _       -> Just []
@@ -7462,7 +7495,7 @@ recordSyntaxFieldNames = fmap nubBS . goExpr
         ETuple es    -> combine (map goExpr es)
         ERecordCon _ fields ->
             combine (Just (map fst fields) : map (goExpr . snd) fields)
-        ERecordWild{} -> Nothing
+        ERecordWild conName -> wildFields conName
         ERecordUpdate base updates ->
             combine (goExpr base : Just (map fst updates) : map (goExpr . snd) updates)
         EImplicitRef _ -> Just []
@@ -7494,7 +7527,7 @@ recordSyntaxFieldNames = fmap nubBS . goExpr
         PIrref p      -> goPat p
         PTuple ps     -> combine (map goPat ps)
         PRecord _ fps -> combine (Just (map fst fps) : map (goPat . snd) fps)
-        PRecordWild{} -> Nothing
+        PRecordWild conName -> wildFields conName
         PView e p     -> combine [goExpr e, goPat p]
 
 -- | Free variables that must be available to start evaluating a binding.
