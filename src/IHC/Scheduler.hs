@@ -47,7 +47,7 @@ module IHC.Scheduler
     , desugarRecordPats
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try)
+import Control.Exception (throwIO, Exception, catch, SomeException, try, finally)
 import Control.Applicative ((<|>))
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
@@ -187,6 +187,15 @@ instance Exception ModuleNotFound
 -- | Raised when a qualified reference can't be resolved to any import.
 newtype UnresolvedName = UnresolvedName String deriving Show
 instance Exception UnresolvedName
+
+-- | Raised when 'discoverInModuleWith' has been entered more than
+-- 'discoveryCallCap' times across this process — a runaway loop that
+-- would otherwise OOM the heap.  Carries the count, latest module,
+-- and latest name so the failure log identifies what was being
+-- chased when the cap tripped.
+data DiscoveryCallCapExceeded = DiscoveryCallCapExceeded Int ByteString ByteString
+    deriving Show
+instance Exception DiscoveryCallCapExceeded
 
 --------------------------------------------------------------------------------
 -- Public entry points
@@ -6329,19 +6338,47 @@ discoverInModule
     -> IO ()
 discoverInModule = discoverInModuleWith Set.empty
 
--- | Negative-result memo for 'discoverInModuleWith'.  Holds
--- @(lmName, name)@ pairs that previously walked to a Nothing result
--- (no local binding, no builtin alias, no import resolution).  The
--- entry-time check turns retry calls (common from runtime env-fallback
--- paths) into O(1) Set lookups instead of repeating the
+-- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
+-- pairs that have already been walked once — regardless of whether the
+-- walk yielded a body, a foreign-alias sentinel, or a "no resolution"
+-- result.  The entry-time check turns retry calls (common from runtime
+-- env-fallback paths) into O(1) Set lookups instead of repeating the
 -- findOrResolveLhs+resolveImport chain.  Cleared per run by
 -- 'resetDiscoveryNegCache' (wired into 'resetPerRunGlobals').
+--
+-- == Why \"any walk\", not just \"miss\"
+--
+-- The qualified path of 'discoverInModuleWith'' (split-by-dot) does not
+-- check 'Map.member name (lmBodies lm)' for an early return — it always
+-- runs 'qualifiedBuiltinAlias' / 'resolveQualifiedName' and recurses
+-- into the target module before calling 'insertLmBody'.  When the
+-- env-fallback hook keeps demanding the same FQN (every reference to
+-- @GHC.Internal.Base.a@ from a 'main = a + b' program after
+-- 'GHC.Internal.Base' is loaded re-fires this path), the body is
+-- already there but the work runs again.  The recursive
+-- @discoverInModuleWith targetLm bareName@ inside that path then keeps
+-- re-entering 'discoverInModuleWith'' for @(GHC.Internal.Base, "a")@:
+-- @"a"@ is a parser-reported but-not-real binding produced by the
+-- @a `shiftL#` b = ...@ infix-binding lines in
+-- @ghc-internal/.../GHC/Internal/Base.hs@ — the body insertion fires
+-- with no recursion (lambda body), the negCache stays empty for that
+-- pair, and every future env-fallback for the same name walks it
+-- again.  Linux CI's @nix flake check@ trips on this and OOMs at
+-- 4 GB / >7 M discover calls (see the 'Heap exhausted' tail in the
+-- failing run).  Marking the pair done after every successful walk
+-- collapses the cascade to one walk per @(lm, name)@ per run.
 discoverNegCacheRef :: IORef (Set (ByteString, ByteString))
 discoverNegCacheRef = lsrsDiscoverNegCache legacySchedulerRunState
 
 resetDiscoveryNegCache :: IO ()
 resetDiscoveryNegCache = writeIORef discoverNegCacheRef Set.empty
 
+-- | Mark @(lmName lm, name)@ as walked.  Called both on negative
+-- results (no local binding, no resolution) and on successful walks
+-- (body inserted, foreign-alias sentinel, qualified-path body) so the
+-- outer cache check at 'discoverInModuleWith' covers every code path
+-- through 'discoverInModuleWith'' uniformly.  Set.insert is idempotent
+-- so multiple calls on the same pair are safe.
 recordDiscoveryMiss :: LoadedModule -> ByteString -> IO ()
 recordDiscoveryMiss lm name =
     modifyIORef' discoverNegCacheRef (Set.insert (lmName lm, name))
@@ -6369,18 +6406,42 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
             ("[ihc:discover] total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
         System.IO.hFlush System.IO.stderr
 
-    -- Negative-result memo.  Both the unqualified-import-not-found and
-    -- the Set.member-name-builtins paths return without recording
-    -- anything in @lmBodies@, so a subsequent call to
-    -- @discoverInModule lm name@ re-runs 'findOrResolveLhs' (which
-    -- walks lm's source) AND 'resolveImport' (which loadModules every
-    -- unqualified import).  For warp-shaped programs that's hundreds
-    -- of redundant module loads per name across many lm's.  A small
-    -- @(lmName, name)@ Set short-circuits on retry.
+    -- Safety net: if the counter blows past a generous cap, abort
+    -- fast with a useful trace.  The expected workload across the full
+    -- ihc-test suite is well under a million calls; anything past
+    -- 'discoveryCallCap' is a runaway loop (e.g. an env-fallback
+    -- repeatedly re-entering the qualified-path of
+    -- 'discoverInModuleWith'' without populating the negCache — this
+    -- guard is what made the leak that motivated the negCache
+    -- semantics change above survivable for CI rather than OOMing the
+    -- 4 GB nix-sandbox heap).
+    when (cntT >= discoveryCallCap) $ do
+        when (cntT == discoveryCallCap) $ do
+            System.IO.hPutStrLn System.IO.stderr
+                ( "[ihc:discover] runaway: total=" <> show cntT
+                  <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name
+                  <> " — capping (suspected env-fallback loop; see "
+                  <> "discoverNegCacheRef comment in Scheduler.hs)" )
+            System.IO.hFlush System.IO.stderr
+        throwIO (DiscoveryCallCapExceeded cntT (lmName lm) name)
+
+    -- Memo: skip pairs we've already walked.  See the
+    -- 'discoverNegCacheRef' Haddock for why this covers ALL outcomes
+    -- (success, miss, foreign alias, qualified body insertion), not
+    -- just the no-resolution case its name suggests.
     cache <- readIORef discoverNegCacheRef
     if Set.member (lmName lm, name) cache
         then pure ()
         else discoverInModuleWith' builtins registry searchPath includeMap lm name
+                `finally` recordDiscoveryMiss lm name
+
+-- | Cap on total 'discoverInModuleWith' calls per process.  Trips a
+-- 'DiscoveryCallCapExceeded' rather than letting a runaway loop OOM
+-- the heap.  Generous (2 M): the full test suite under the negCache
+-- fix lands well under 200 K calls, so a 10× headroom is safe while
+-- still catching regressions before they hit Linux CI's 4 GB sandbox.
+discoveryCallCap :: Int
+discoveryCallCap = 2_000_000
 
 {-# NOINLINE _discoverTotalRef #-}
 _discoverTotalRef :: IORef Int
