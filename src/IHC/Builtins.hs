@@ -324,11 +324,14 @@ builtins reg =
     , ("Data.ByteString.unpack",    bsUnpackB)
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
-    , ("Data.ByteString.take",      bsTakeB)
-    , ("Data.ByteString.drop",      bsDropB)
     , ("Data.ByteString.singleton", bsSingletonB)
     , ("Data.ByteString.replicate", bsReplicateB)
-    , ("Data.ByteString.head",      bsHeadB)
+    -- 'head' kept shimmed pending source-loaded path validation.
+    -- 'index' kept shimmed: source-loaded body uses bare 'length ps'
+    -- which the elaborator mis-routes to 'Foldable.length' (no
+    -- @Foldable BS@ instance), exactly the heuristic mis-fire
+    -- 'tryElaborateTyAnn' is documented to handle.  Source path
+    -- needs that pass to fire correctly before the shim can go.
     , ("Data.ByteString.index",     bsIndexB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
     -- allocation boundaries; the caller-supplied fill action is still
@@ -362,8 +365,6 @@ builtins reg =
     , ("Data.ByteString.Char8.unpack",    bs8UnpackB)
     , ("Data.ByteString.Char8.append",    bsAppendB)
     , ("Data.ByteString.Char8.concat",    bsConcatB)
-    , ("Data.ByteString.Char8.take",      bsTakeB)
-    , ("Data.ByteString.Char8.drop",      bsDropB)
     , ("Data.ByteString.Char8.singleton", bs8SingletonB)
     , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
     , ("Data.ByteString.Char8.head",      bs8HeadB)
@@ -3349,24 +3350,6 @@ bsConcatB = pure $ VFun $ \a -> do
         (h :) <$> valToBsList tv
     valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
 
-bsTakeB :: IO Val
-bsTakeB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
-    nv <- force nT; av <- force aT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.take: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.take n bs)
-
-bsDropB :: IO Val
-bsDropB = pure $ VFun $ \nT -> pure $ VFun $ \aT -> do
-    nv <- force nT; av <- force aT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.drop: not an Int: " <> showValForDebug nv)
-    bs <- bsValToBS av
-    bsFromBS (BS.drop n bs)
-
 bsSingletonB :: IO Val
 bsSingletonB = pure $ VFun $ \wT -> do
     wv <- force wT
@@ -3387,16 +3370,6 @@ bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
         _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
     bsFromBS (BS.replicate n w)
-
-bsHeadB :: IO Val
-bsHeadB = pure $ VFun $ \aT -> do
-    av <- force aT
-    (fp, len) <- bsValPayload av
-    if len <= 0
-        then error "BS.head: empty ByteString"
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) 0
-            pure (VInt (fromIntegral w))
 
 bsIndexB :: IO Val
 bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
