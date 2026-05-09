@@ -27,11 +27,19 @@
 -- block and routes it to monadicDo — exactly the path mirrored
 -- by 'desugarDo' below.
 --
--- Slice 2.N covers 'SExpr' \/ 'SBind' only.  'SLet' \/
--- 'SBangBind' \/ 'SImplicitLet' come in a follow-up — each
--- requires its own pretty arm and brings additional generator
--- subtleties (binding scope, BangPatterns extension, implicit
--- params).
+-- Slice 2.N covered 'SExpr' \/ 'SBind' only.  This follow-up
+-- broadens to 'SLet' \/ 'SBangBind' \/ 'SImplicitLet' so the
+-- spec covers every 'Stmt' constructor the parser produces from
+-- a do-block.  Notes on the bang-bind shape:
+--
+--   * Source @do { !x <- m }@ parses to @SBangBind \"x\" m@
+--     via 'lowerDoPatBind' at @IHC.Parser:1604@.
+--   * Source @do { let !x = m }@ parses to @SBangBind \"x\"
+--     (EApp (EVar \"pure\") m)@ via 'parseDoLet' at line 1664.
+--
+-- The generator emits the @!x <- e@ shape, which is the simpler
+-- of the two.  The @let !x = e@ form requires tracking which
+-- syntactic form the AST was produced from and is a follow-up.
 module Properties.DoDesugar (spec) where
 
 import Control.Exception (SomeException, fromException, try)
@@ -53,7 +61,7 @@ import Test.QuickCheck
     , (===)
     )
 
-import IHC.AST (Expr(..), Stmt(..))
+import IHC.AST (Bind, Expr(..), Name, Stmt(..))
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Pretty (prettyExpr)
 import IHC.Source (mkSource)
@@ -91,12 +99,26 @@ desugarDo (SImplicitLet bs : rest) = EImplicitLet bs (desugarDo rest)
 -- Generator
 --------------------------------------------------------------------------------
 
--- | Slice 2.N: 'SExpr' and 'SBind' only.
+-- | Every 'Stmt' constructor the parser produces from a
+-- do-block.  See the parser-side mapping summary in this
+-- module's header.
 genStmt :: Gen Stmt
 genStmt = oneof
-    [ SExpr <$> genExpr
-    , SBind <$> genIdent <*> genExpr
+    [ SExpr        <$> genExpr
+    , SBind        <$> genIdent <*> genExpr
+    , SBangBind    <$> genIdent <*> genExpr
+    , SLet         <$> genLetBindings
+    , SImplicitLet <$> genLetBindings
     ]
+
+
+-- | A 1-2 element let-binding group, shared by 'SLet' and
+-- 'SImplicitLet' (both carry @[(Name, Expr)]@; the @?@ prefix
+-- is added in the pretty-printer for the implicit form).
+genLetBindings :: Gen [Bind]
+genLetBindings = do
+    k <- choose (1, 2)
+    vectorOf k ((,) <$> genIdent <*> genExpr)
 
 
 -- | A 'Stmt' list shaped to bypass applicative-do.  Structure:
@@ -130,12 +152,21 @@ prettyDo stmts =
 
 prettyStmt :: Stmt -> ByteString
 prettyStmt = \case
-    SExpr e   -> prettyExpr e
-    SBind n e -> n <> " <- " <> prettyExpr e
-    s         -> error
-        ( "Properties.DoDesugar.prettyStmt: unsupported Stmt.\n"
-          <> "  Slice 2.N covers SExpr / SBind only.\n"
-          <> "  Got: " <> take 80 (show s) )
+    SExpr        e   -> prettyExpr e
+    SBind        n e -> n <> " <- " <> prettyExpr e
+    SBangBind    n e -> "!" <> n <> " <- " <> prettyExpr e
+    SLet         bs  ->
+        "let { " <> BS.intercalate "; " (map prettyBind bs) <> " }"
+    SImplicitLet bs  ->
+        "let { " <> BS.intercalate "; " (map prettyImpBind bs) <> " }"
+
+
+prettyBind :: Bind -> ByteString
+prettyBind (n, e) = n <> " = " <> prettyExpr e
+
+
+prettyImpBind :: (Name, Expr) -> ByteString
+prettyImpBind (n, e) = "?" <> n <> " = " <> prettyExpr e
 
 
 --------------------------------------------------------------------------------
@@ -181,6 +212,6 @@ formatExn e = case fromException e of
 spec :: Spec
 spec =
     describe "Property — do-block desugaring (Phase 2.N)" $
-        modifyMaxSuccess (const 200) $
+        modifyMaxSuccess (const 500) $
             prop "do { ...; e } desugars to the documented >>= / >> chain"
                 prop_do_desugar

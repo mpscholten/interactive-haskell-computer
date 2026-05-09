@@ -182,6 +182,6 @@ formatExn e = case fromException e of
 spec :: Spec
 spec =
     describe "Property — section desugaring (Phase 2.M)" $
-        modifyMaxSuccess (const 200) $
+        modifyMaxSuccess (const 500) $
             prop "(op e), (e op), (`f` e), (e `f`), (op) all desugar to the documented lambda forms"
                 prop_section_desugar

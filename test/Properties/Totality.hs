@@ -209,7 +209,7 @@ spec = do
     -- Re-reading from disk per case would dominate the runtime.
     corpus <- runIO loadCorpus
     describe "Property — parser totality (Phase 1)" $
-        modifyMaxSuccess (const 200) $ do
+        modifyMaxSuccess (const 500) $ do
             prop "random ByteString — Right or Left ParseError"
                 prop_random_bytes_no_crash
             prop "fixture mutation — Right or Left ParseError"
