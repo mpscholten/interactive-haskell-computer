@@ -709,6 +709,35 @@ builtins reg =
     , ("uncheckedIShiftL#", uncheckedShiftLB)
     , ("uncheckedShiftRL#", uncheckedShiftRLB)
     , ("uncheckedIShiftRA#", uncheckedIShiftRAB)
+    -- Bitwise Int# primops: aliased to the boxed bit ops since
+    -- IHC represents Int# as VInt (Int64-backed).  Required by
+    -- the Int64-encoding helpers in 'GHC.Num.Integer' that
+    -- 'integerDecodeDouble#' rides through.
+    , ("andI#",             bitAndB)
+    , ("orI#",              bitOrB)
+    , ("xorI#",             bitXorB)
+    -- Int64# primops: IHC stores both Int# and Int64# as
+    -- 'VInt' (Int64-backed Haskell), so conversions are
+    -- identity functions and arithmetic dispatches to the
+    -- regular Int# implementations.  Required by
+    -- 'GHC.Num.Integer.integerFromInt64#' and friends, which
+    -- the source-loaded 'integerDecodeDouble#' uses to lift
+    -- the @Int64#@ mantissa returned by 'decodeDouble_Int64#'
+    -- back into 'Integer'.
+    , ("leInt64#",          leIntHashB)
+    , ("ltInt64#",          ltIntHashB)
+    , ("eqInt64#",          eqIntHashB)
+    , ("geInt64#",          geIntHashB)
+    , ("gtInt64#",          gtIntHashB)
+    , ("neInt64#",          neIntHashB)
+    , ("plusInt64#",        plusIntHashB)
+    , ("minusInt64#",       minusIntHashB)
+    , ("timesInt64#",       timesIntHashB)
+    , ("negateInt64#",      negateIntB)
+    , ("intToInt64#",       identityIntPrimop)
+    , ("int64ToInt#",       identityIntPrimop)
+    , ("int64ToWord64#",    identityIntPrimop)
+    , ("word64ToInt64#",    identityIntPrimop)
     , ("timesInt2#",        timesInt2B)
     , ("timesWord2#",       timesWord2B)
     , ("ltChar#",           ltCharHashB)
@@ -761,6 +790,13 @@ builtins reg =
     , ("-##",          minusDoubleHashB)
     , ("*##",          timesDoubleHashB)
     , ("/##",          divideDoubleHashB)
+    -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
+    -- Bottom-of-stack primop for 'decodeFloat' on Double:
+    -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
+    -- (ghc-bignum-1.3/src/GHC/Num/Integer.hs:1046).  Required by
+    -- the source-loaded RealFrac Double / properFractionFloat
+    -- chain, which 'floor'\/'ceiling'\/'round'\/'truncate' ride.
+    , ("decodeDouble_Int64#", decodeDoubleInt64HashB)
     -- Phase 2.8: misc
     , ("cstringLength#",  cstringLengthB)
     , ("unpackCString#",  unpackCStringB)
@@ -1422,15 +1458,6 @@ unaryOpFloat op = pure $ VFun $ \a -> do
         VFloat d -> pure (VFloat (op d))
         VInt n   -> pure (VFloat (op (fromIntegral n)))
         _ -> error ("unaryOpFloat: non-numeric arg: " <> showValForDebug av)
-
--- | floor/ceiling/round/truncate — Float -> Int.
-floatToIntB :: (Double -> Int64) -> IO Val
-floatToIntB op = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VFloat d -> pure (VInt (op d))
-        VInt n   -> pure (VInt n)
-        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
 
 -- cmpInt removed in Phase 2.3 — replaced by eqDispatch/ordDispatch
 
@@ -4922,6 +4949,53 @@ divideDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     case (av, bv) of
         (VFloat x, VFloat y) -> pure (VFloat (x / y))
         _ -> error ("/##: bad args: " <> showValForDebug av)
+
+-- | floor/ceiling/round/truncate — Float -> Int.
+floatToIntB :: (Double -> Int64) -> IO Val
+floatToIntB op = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VInt (op d))
+        VInt n   -> pure (VInt n)
+        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
+
+
+-- | Identity primop for representation-shared conversions.
+-- IHC stores @Int#@, @Int64#@, @Word64#@ all as 'VInt'
+-- (Int64-backed); the @intToInt64#@ \/ @int64ToInt#@ \/
+-- @int64ToWord64#@ \/ @word64ToInt64#@ primops are therefore
+-- runtime no-ops on the value side.
+identityIntPrimop :: IO Val
+identityIntPrimop = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt _ -> pure av
+        _      -> error ("identityIntPrimop: not an Int#: " <> showValForDebug av)
+
+
+-- | @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@
+-- GHC primop: decompose a Double into mantissa (Int64) and
+-- base-2 exponent (Int).  For finite non-zero @d@,
+-- @d = m * 2^e@ with @m@ in Int64 range (Double mantissa is
+-- 53 bits) and @e@ in Int range.  Edge cases — zero, +/-Inf,
+-- NaN, denormals — follow Haskell's 'decodeFloat', which
+-- returns @(0, 0)@ for zero and unspecified values for the
+-- non-finite cases.
+--
+-- IHC represents both Int# and Int64# as 'VInt' (storage type
+-- 'Int64'), and the unboxed pair @(# a, b #)@ as
+-- @VCon \"(#,#)\" [aT, bT]@.
+decodeDoubleInt64HashB :: IO Val
+decodeDoubleInt64HashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> do
+            let (m, e) = decodeFloat d   -- (Integer, Int) per RealFloat Double
+            mT <- newWHNFThunk (VInt (fromInteger m))
+            eT <- newWHNFThunk (VInt (fromIntegral e))
+            pure (VCon "(#,#)" [mT, eT])
+        _ -> error
+            ("decodeDouble_Int64#: not a Double: " <> showValForDebug av)
 
 quotRemIntB :: IO Val
 quotRemIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
