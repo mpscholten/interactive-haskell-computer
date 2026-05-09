@@ -89,6 +89,13 @@ prettyExpr = \case
     -- (@\@(Maybe Int)@) carry the parens too, which the
     -- generator does not yet emit.
     ETyApp e n     -> "(" <> prettyExpr e <> " @" <> n <> ")"
+    -- @let ?x = e1; ?y = e2 in body@.  Bindings carry the
+    -- implicit-param name /without/ the leading @?@ — that
+    -- prefix is part of the syntax, not the AST name.  See
+    -- 'IHC.Parser.parseOneIPBind'.
+    EImplicitLet binds b ->
+        "(let { " <> bsIntercalate "; " (map prettyImpBind binds)
+          <> " } in " <> prettyExpr b <> ")"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"
@@ -161,6 +168,14 @@ prettyBinds = bsIntercalate "; " . map prettyBind
 
 prettyBind :: Bind -> ByteString
 prettyBind (n, e) = n <> " = " <> prettyExpr e
+
+
+-- | Pretty-print one implicit-let binding (@?name = expr@).
+-- 'EImplicitLet' carries the implicit-param name without the
+-- leading @?@; we add it back here so the parser's
+-- 'parseOneIPBind' recognises the binding.
+prettyImpBind :: (Name, Expr) -> ByteString
+prettyImpBind (n, e) = "?" <> n <> " = " <> prettyExpr e
 
 
 -- | Local helper — 'BS.intercalate' is in @Data.ByteString@ but

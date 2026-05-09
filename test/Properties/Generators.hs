@@ -177,6 +177,9 @@ genExprSized n
         -- (@\@(Maybe Int)@) would need to carry their parens
         -- inside the Name field and are deferred.
         , (1, ETyApp <$> sub <*> genConIdent)
+        -- @let ?x = e1; ?y = e2 in body@ — implicit-param let.
+        -- Bindings are 1-2 entries to keep counterexamples small.
+        , (1, EImplicitLet <$> genIPBindings half_n <*> sub)
         ]
   where
     atom   = frequency
@@ -197,6 +200,13 @@ genTupleExprs :: Int -> Gen [Expr]
 genTupleExprs n = do
     k <- choose (2, 3)
     vectorOf k (genExprSized n)
+
+
+-- | Implicit-let binding group: 1–2 entries.
+genIPBindings :: Int -> Gen [(Name, Expr)]
+genIPBindings n = do
+    k <- choose (1, 2)
+    vectorOf k ((,) <$> genIdent <*> genExprSized n)
 
 
 -- | A non-empty list of @let@-bindings (1–3 entries) sized at @n@.
