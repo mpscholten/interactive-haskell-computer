@@ -39,10 +39,9 @@ import System.Directory
     ( createDirectoryIfMissing
     , doesDirectoryExist
     , getHomeDirectory
-    , getDirectoryContents
     )
 import System.Exit (ExitCode(..))
-import System.FilePath ((</>), takeExtension)
+import System.FilePath ((</>))
 import System.IO (hPutStrLn, stderr)
 import System.Process (proc, readCreateProcessWithExitCode, CreateProcess(..))
 

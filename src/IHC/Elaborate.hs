@@ -31,7 +31,7 @@ import qualified Data.Set as Set
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, lookupInstance)
+import IHC.Classes (ClassRegistry)
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef)

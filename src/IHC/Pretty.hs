@@ -33,7 +33,7 @@ module IHC.Pretty
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (chr, ord)
+import Data.Char (ord)
 import Data.Word (Word8)
 
 import IHC.AST

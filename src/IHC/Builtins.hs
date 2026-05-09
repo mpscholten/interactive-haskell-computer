@@ -28,17 +28,14 @@ import Control.Concurrent.MVar
     , withMVar, swapMVar
     )
 import Control.Concurrent.STM
-    ( TVar, atomically, retry, orElse, check
-    , newTVar, newTVarIO, readTVar, writeTVar, modifyTVar, modifyTVar', readTVarIO
-    , STM
+    ( TVar, atomically, retry, check
+    , newTVarIO, readTVar, writeTVar, readTVarIO
     )
-import GHC.Conc.Sync (unsafeIOToSTM)
 import qualified Control.Exception as CE
 import Control.Exception
     ( throwIO, catch, try, evaluate, mask, mask_
     , bracket, bracket_, bracketOnError, finally, onException, throwTo
-    , SomeException, IOException
-    , Exception(..)
+    , SomeException
     )
 import Foreign.C.Error (Errno(..), getErrno, eAGAIN, eWOULDBLOCK, eINTR)
 import Foreign.C.Types (CInt(..), CSize(..))
@@ -68,7 +65,7 @@ import Foreign.Marshal.Utils (copyBytes, fillBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
-import System.Exit (ExitCode(..), exitWith)
+import System.Exit (ExitCode(..))
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
     ( BufferMode(..)

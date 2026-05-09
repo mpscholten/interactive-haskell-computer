@@ -71,7 +71,7 @@ import IHC.Builtins
     , clearCtorIndex, clearForeignPtrWord8Ranges, valOrdering
     )
 import IHC.CabalProject
-    ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
+    ( cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
     )
 import IHC.Diagnostics (warnStub)
@@ -93,7 +93,6 @@ import IHC.Classes
     , addCataloguedInstance
     , drainCataloguedInstancesForClass
     , resetInstanceCatalogue
-    , catalogueHasClass
     , legacyHooks
     , IHCHooks(..)
     , resetSessionHooks
@@ -111,7 +110,6 @@ import qualified IHC.PatSyn as PatSyn
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
-import qualified IHC.TypeAST
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
