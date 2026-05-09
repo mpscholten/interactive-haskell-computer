@@ -3091,7 +3091,28 @@ parseApp ctx cur0 = do
             _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseAtomPostfix ctx cur
                     loop (EApp fn arg) curA
+            -- NegativeLiterals (always-on): @TkMinus@ /immediately/
+            -- followed by a numeric literal in argument position is a
+            -- single negative literal, not binary subtraction.  The
+            -- adjacency check (no whitespace between '-' and the
+            -- digit) preserves the standard Haskell behaviour for
+            -- @f - 1@ (subtraction) — only @f -1@ becomes @f (-1)@.
+            -- Required by ghc-bignum's source, which uses this form
+            -- pervasively (e.g. @intToInt64# INT_MINBOUND#@ where
+            -- @INT_MINBOUND@ expands to @-0x8000000000000000@).
+            TkMinus
+              | tkCol tok > ctxMinCol ctx
+              , let (litTok, _) = nextToken (ctxSrc ctx) cur'
+              , tkStart litTok == tkEnd tok
+              , case tkKind litTok of
+                  TkInt _   -> True
+                  TkFloat _ -> True
+                  _         -> False
+              -> do
+                    (arg, curA) <- parseAtomPostfix ctx cur'
+                    loop (EApp fn (ENeg arg)) curA
               | otherwise -> pure (fn, cur)
+            _ | otherwise -> pure (fn, cur)
 
     isBlockArgStart k = case k of
         TkDo        -> True

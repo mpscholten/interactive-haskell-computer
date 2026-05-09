@@ -14,7 +14,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.List (isPrefixOf, isInfixOf, isSuffixOf, nub)
 import Data.Maybe (fromJust, isJust)
 import qualified Data.Map.Strict as Map
-import System.Directory (canonicalizePath, doesDirectoryExist, getCurrentDirectory, listDirectory, makeAbsolute)
+import System.Directory (canonicalizePath, doesDirectoryExist, listDirectory, makeAbsolute)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import Test.Hspec

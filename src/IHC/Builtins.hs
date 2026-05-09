@@ -4908,7 +4908,23 @@ divideDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VFloat x, VFloat y) -> pure (VFloat (x / y))
         _ -> error ("/##: bad args: " <> showValForDebug av)
 
--- | floor/ceiling/round/truncate — Float -> Int.
+
+-- | Identity primop for representation-shared conversions.
+-- IHC stores @Int#@, @Int64#@, @Word64#@ all as 'VInt'
+-- (Int64-backed); the @intToInt64#@ \/ @int64ToInt#@ \/
+-- @int64ToWord64#@ \/ @word64ToInt64#@ primops are therefore
+-- runtime no-ops on the value side.
+-- | floor/ceiling/round/truncate — Float -> Int.  Tracked
+-- carve-out: the source-loaded RealFrac Double / properFractionFloat
+-- chain in GHC.Internal.Float reaches into ghc-bignum's Integer
+-- (IS \/ IP \/ IN VCon constructors) for arithmetic, which IHC's
+-- runtime arithmetic primops (quotRem, +, -, etc.) don't yet
+-- speak.  The decodeDouble_Int64# primop, the Int64# / Int#
+-- bitwise aliases, the WordSize.h CPP macros, the NegativeLiterals
+-- parser support, and 'asInt64' are all in place from earlier
+-- commits — the remaining layer is teaching the Int arithmetic
+-- primops to coerce \/ unwrap source-loaded Integer ('VCon \"IS\"
+-- [...]') to 'VInt' on the boundary.  Until then, stay shimmed.
 floatToIntB :: (Double -> Int64) -> IO Val
 floatToIntB op = pure $ VFun $ \a -> do
     av <- force legacyHooks a
@@ -4918,17 +4934,28 @@ floatToIntB op = pure $ VFun $ \a -> do
         _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
 
 
--- | Identity primop for representation-shared conversions.
--- IHC stores @Int#@, @Int64#@, @Word64#@ all as 'VInt'
--- (Int64-backed); the @intToInt64#@ \/ @int64ToInt#@ \/
--- @int64ToWord64#@ \/ @word64ToInt64#@ primops are therefore
--- runtime no-ops on the value side.
 identityIntPrimop :: IO Val
 identityIntPrimop = pure $ VFun $ \a -> do
     av <- force legacyHooks a
-    case av of
-        VInt _ -> pure av
-        _      -> error ("identityIntPrimop: not an Int#: " <> showValForDebug av)
+    case asInt64 av of
+        Just n -> pure (VInt n)
+        Nothing -> error ("identityIntPrimop: not an Int#: "
+                         <> showValForDebug av)
+
+
+-- | Coerce a 'Val' into an 'Int64' if its representation
+-- supports it.  Both 'VInt' (Int64-backed) and 'VInteger'
+-- whose value fits in Int64 are accepted.  Used by primop
+-- shims that need Int64 args but may receive 'VInteger' from
+-- source-loaded code where literal overflow routed an
+-- in-range value through 'LInteger' (e.g. @-2^63@ via
+-- NegativeLiterals on @-0x8000000000000000@).
+asInt64 :: Val -> Maybe Int64
+asInt64 (VInt n) = Just n
+asInt64 (VInteger n)
+  | n >= toInteger (minBound :: Int64)
+  , n <= toInteger (maxBound :: Int64) = Just (fromInteger n)
+asInt64 _ = Nothing
 
 
 -- | @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@
@@ -5117,12 +5144,13 @@ divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 quotRemB :: IO Val
 quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> do
+    case (asInt64 av, asInt64 bv) of
+        (Just x, Just y) -> do
             let (q, r) = x `quotRem` y
             qT <- newWHNFThunk (VInt q); rT <- newWHNFThunk (VInt r)
             pure (VCon "(,)" [qT, rT])
-        _ -> error "quotRem: bad args"
+        _ -> error ("quotRem: bad args: a=" <> showValForDebug av
+                   <> " b=" <> showValForDebug bv)
 
 shiftLB :: IO Val
 shiftLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do

@@ -99,6 +99,23 @@ defaultCppContext = Map.fromList
     , ("HS_cstringLength_AND_FinalPtr_AVAILABLE", MObj "1")
     , ("HS_unsafeWithForeignPtr_AVAILABLE",       MObj "1")
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
+    -- ghc-bignum WordSize.h macros for 64-bit aarch64.
+    -- Pre-defined here as a fallback for sources that
+    -- @#include "WordSize.h"@ but where IHC's per-package
+    -- include-dirs resolution doesn't surface the header.
+    -- Required by 'GHC.Num.Integer.integerFromInt64#' which the
+    -- source-loaded float→Int chain (floor / ceiling / round /
+    -- truncate) routes through.  IHC's parser supports
+    -- NegativeLiterals (parseApp recognises 'TkMinus' followed
+    -- by a numeric literal as a single negative-literal arg),
+    -- so the bare @-0x...@ macro values parse cleanly inside
+    -- @intToInt64# INT_MINBOUND#@ shapes.
+    , ("WORD_SIZE_IN_BITS",  MObj "64")
+    , ("INT_MINBOUND",       MObj "-0x8000000000000000")
+    , ("INT_MAXBOUND",       MObj "0x7fffffffffffffff")
+    , ("ABS_INT_MINBOUND",   MObj "0x8000000000000000")
+    , ("WORD_MAXBOUND",      MObj "0xffffffffffffffff")
+    , ("SQRT_INT_MAXBOUND",  MObj "0xb504f333")
     ]
 
 -- | Hard cap on include nesting depth to prevent infinite recursion.

@@ -265,10 +265,11 @@ eval hooks env ipm = go
     go (ENeg e) = do
         v <- go e
         case v of
-            VInt n   -> pure (VInt (negate n))
-            VFloat d -> pure (VFloat (negate d))
-            other    -> error ("IHC.Eval: negate of non-numeric: "
-                               <> showValForDebug other)
+            VInt n     -> pure (VInt (negate n))
+            VInteger n -> pure (VInteger (negate n))
+            VFloat d   -> pure (VFloat (negate d))
+            other      -> error ("IHC.Eval: negate of non-numeric: "
+                                 <> showValForDebug other)
 
     go (ETuple es) = do
         -- Build the right tuple constructor name for this arity.
