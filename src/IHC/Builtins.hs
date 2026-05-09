@@ -15,7 +15,6 @@ module IHC.Builtins
     , stringToListValIO
     , clearCtorIndex
     , clearForeignPtrWord8Ranges
-    , valOrdering
     ) where
 
 import Control.Concurrent
@@ -311,20 +310,7 @@ builtins reg =
     , ("<=",       ordDispatch reg 1)
     , (">",        ordDispatch reg 2)
     , (">=",       ordDispatch reg 3)
-    -- compare: dropped — bare-name @compare@ now flows through the
-    -- env-fallback class-method dispatcher.  'TypeGlobals' seeds
-    -- @("compare", "Ord")@ into 'globalMethodClassRef' so
-    -- 'tryClassMethodFromRegistry' can synthesise a
-    -- 'classMethodDispatcher' on demand.  The dispatcher first tries a
-    -- user / source-loaded @Ord T@ instance; on miss it consults the
-    -- @class Ord@ default body @if x == y then EQ else if x <= y then
-    -- LT else GT@; on a final miss 'IHC.Scheduler.hostOrdCompareFallback'
-    -- runs the same primitive / structural pipeline ('valOrdering')
-    -- that drives @<@/@<=@/@>@/@>=@.  The primitive fast paths and the
-    -- VCon structural fallback come from 'valOrdering' directly, so
-    -- @compare 'a' 'b'@, @compare "abc" "abd"@, and @compare Red Blue@
-    -- on @deriving Ord@ types all keep working.  Per CLAUDE.md's
-    -- "Builtin modules: minimum surface only" rule.
+    , ("compare",  compareDispatch reg)
     --
     -- (&&), (||), and `not` are deliberately omitted — their
     -- source bodies live at
@@ -1759,9 +1745,8 @@ ordCmp _reg slot av bv = case (av, bv) of
 
     -- Map a host 'Ordering' into the comparison result the caller's
     -- dispatch slot expects. Slot 0 = (<), 1 = (<=), 2 = (>), 3 = (>=).
-    -- Slot 4 is unused at this level (the source-loaded `compare`
-    -- default body calls (<=)/(==), not us), but we handle it
-    -- defensively.
+    -- Slot 4 is unused at this level (compareDispatch calls slot 0 then
+    -- consults Eq for EQ), but we handle it defensively.
     ordSlot 0 o = o == LT
     ordSlot 1 o = o == LT || o == EQ
     ordSlot 2 o = o == GT
@@ -1776,9 +1761,9 @@ ordCmp _reg slot av bv = case (av, bv) of
 --
 -- We use a module-level 'IORef' (via 'unsafePerformIO') because
 -- 'structuralOrdering' is invoked through a long chain of Ord-dispatch
--- helpers (ordCmp, valOrdering, …) and threading an extra registry
--- through every one of them for a purely-derived fallback would touch
--- far too many call sites. The ref is written
+-- helpers (ordCmp, valOrdering, compareDispatch, …) and threading an
+-- extra registry through every one of them for a purely-derived
+-- fallback would touch far too many call sites. The ref is written
 -- once per module load and read many times per comparison; races
 -- aren't a concern because the scheduler only rebuilds the env
 -- single-threaded.
@@ -1922,6 +1907,22 @@ valOrdering reg av bv = case (av, bv) of
     orderingFromVCon other = error ("valOrdering: user Ord `compare` "
                                     <> "returned non-Ordering: "
                                     <> showValForDebug other)
+
+-- | @compare@ returns an Ordering constructor: LT, EQ, or GT.
+--
+-- Shared path with ordCmp via 'valOrdering', so user-defined ADTs
+-- (including 'deriving Ord') pick up the same structural fallback
+-- that drives @<@, @<=@, @>@, @>=@.
+compareDispatch :: ClassRegistry -> IO Val
+compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
+    o  <- valOrdering reg av bv
+    pure (VCon (orderingName o) [])
+  where
+    orderingName LT = "LT"
+    orderingName EQ = "EQ"
+    orderingName GT = "GT"
 
 -- | @min x y@ dispatched through 'valOrdering': returns @x@ when
 -- @compare x y /= GT@, otherwise @y@. Works for every type 'ordCmp'
