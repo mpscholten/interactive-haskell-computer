@@ -4561,6 +4561,7 @@ resetPerRunGlobals = do
     clearCtorIndex
     clearForeignPtrWord8Ranges
     resetNewNameCounter
+    resetLocateModuleNegCache
     TR.setGlobalRegistry Map.empty
     -- Stage 2 of the lazy-registration plan: 'registerInstancesFrom'
     -- now stashes per-instance closures under each class name in
@@ -6014,16 +6015,52 @@ emptyHeader = ModuleHeader Nothing ExportAll []
 -- 'loadProgramFromSource' and 'loadImportIntoEnv').  Raises
 -- 'ModuleNotFound' only when the entire search path misses.
 locateModule :: [FilePath] -> ModuleName -> IO FilePath
-locateModule searchPath name = go searchPath
+locateModule searchPath name = do
+    -- Negative-result memo.  Without this, every caller that wraps
+    -- 'locateModule' in @try (... :: ModuleNotFound)@ — i.e.
+    -- 'isLocalCacheModule' (no cache), 'resolveImport' (cached per
+    -- (lm, name) but the same @name@ shows up from dozens of @lm@s) —
+    -- pays the full @stat()@ cost of walking the entire search path
+    -- for every retry.  In a warp-shaped program with ~140 search-
+    -- path entries, a missing-module name like @\"Backend\"@ ate ~14k
+    -- @stat()@ syscalls per second under the request handling
+    -- cascade, leaving the request-handler thread completely
+    -- CPU-bound.
+    --
+    -- Cache only NEGATIVE results: once a name has missed every entry
+    -- on the search path, subsequent calls are guaranteed to miss
+    -- again (the search path is fixed for the duration of a
+    -- 'loadProgramFromSource' run) so an O(1) Set lookup avoids the
+    -- @path-length@ stat fan-out.  Positive results are already
+    -- effectively cached one level up by 'loadModule'\\'s registry.
+    --
+    -- The cache is reset between 'loadProgramFromSource' calls (see
+    -- 'resetLocateModuleNegCache' wired into 'resetPerRunGlobals') so
+    -- a fresh run that adjusts the search path gets a fresh slate.
+    negCache <- readIORef _locateModuleNegCacheRef
+    if Set.member name negCache
+        then throwIO (ModuleNotFound name)
+        else go searchPath
   where
     candidates = modulePathCandidates name
-    go []     = throwIO (ModuleNotFound name)
+    go []     = do
+        modifyIORef' _locateModuleNegCacheRef (Set.insert name)
+        throwIO (ModuleNotFound name)
     go (d:ds) = tryCands d candidates ds
     tryCands _ []     rest = go rest
     tryCands d (c:cs) rest = do
         let p = d </> c
         exists <- doesFileExist p
         if exists then pure p else tryCands d cs rest
+
+{-# NOINLINE _locateModuleNegCacheRef #-}
+_locateModuleNegCacheRef :: IORef (Set ModuleName)
+_locateModuleNegCacheRef = unsafePerformIO (newIORef Set.empty)
+
+-- | Reset the locateModule negative-result cache.  Wired into
+-- 'resetPerRunGlobals'.
+resetLocateModuleNegCache :: IO ()
+resetLocateModuleNegCache = writeIORef _locateModuleNegCacheRef Set.empty
 
 -- | Return 'True' if @name@ is safe to load: either it's a local (non-cache)
 -- file OR it's a cache file that is NOT inside the GHC-internal subdirectory
@@ -6155,6 +6192,14 @@ discoverInModuleWith
     -> ByteString
     -> IO ()
 discoverInModuleWith builtins registry searchPath includeMap lm name = do
+    -- INSTRUMENTATION: total discover-call counter.  Logs every 1000.
+    modifyIORef' _discoverTotalRef (+1)
+    cntT <- readIORef _discoverTotalRef
+    when (cntT `mod` 1000 == 0) $ do
+        System.IO.hPutStrLn System.IO.stderr
+            ("[ihc:discover] total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
+        System.IO.hFlush System.IO.stderr
+
     -- Negative-result memo.  Both the unqualified-import-not-found and
     -- the Set.member-name-builtins paths return without recording
     -- anything in @lmBodies@, so a subsequent call to
@@ -6167,6 +6212,10 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
     if Set.member (lmName lm, name) cache
         then pure ()
         else discoverInModuleWith' builtins registry searchPath includeMap lm name
+
+{-# NOINLINE _discoverTotalRef #-}
+_discoverTotalRef :: IORef Int
+_discoverTotalRef = unsafePerformIO (newIORef 0)
 
 discoverInModuleWith'
     :: Set ByteString -> ModuleRegistry -> [FilePath]
