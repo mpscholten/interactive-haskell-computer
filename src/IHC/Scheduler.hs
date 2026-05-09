@@ -4574,6 +4574,55 @@ loadModuleSlow registry searchPath includeMap name = do
                             triggerRegisterInstances legacyHooks name
                             pure lm
 
+-- | Bundle of the nine module-level per-run scheduler state IORefs:
+-- the loaded-module catalogue, search path / include map, the four
+-- env-fallback caches, and the two import-resolution negative caches.
+--
+-- Allocated once via the 'legacySchedulerRunState' CAF below.  The
+-- nine legacy ref names that the rest of the codebase uses
+-- ('globalLoadedModulesRef', 'globalSearchPathRef', etc.) are now
+-- field-projection accessors on this single record, so the nine
+-- separate 'unsafePerformIO + IORef + NOINLINE' globals collapse
+-- into one allocation.
+data LegacySchedulerRunState = LegacySchedulerRunState
+    { lsrsLoadedModules       :: !(IORef (Map ModuleName LoadedModule))
+    , lsrsSearchPath          :: !(IORef [FilePath])
+    , lsrsIncludeMap          :: !(IORef (Map FilePath [FilePath]))
+    , lsrsEnvFallbackCache    :: !(IORef (Map ByteString Thunk))
+    , lsrsEnvBaseForFallback  :: !(IORef Env)
+    , lsrsEnvFallbackNegCache :: !(IORef (Int, Set (Maybe ByteString, ByteString)))
+    , lsrsEnvFallbackCacheGen :: !(IORef Int)
+    , lsrsDiscoverNegCache    :: !(IORef (Set (ByteString, ByteString)))
+    , lsrsResolveImportCache  :: !(IORef (Map (ByteString, ByteString) (Maybe ModuleName)))
+    }
+
+-- | One-shot allocation of the nine scheduler per-run IORefs.  Same
+-- defaults the legacy individual @{-# NOINLINE #-}@ refs used: empty
+-- 'Map'/'Set'/'List'/'HashMap' or 'Int' 0 as appropriate.
+{-# NOINLINE legacySchedulerRunState #-}
+legacySchedulerRunState :: LegacySchedulerRunState
+legacySchedulerRunState = unsafePerformIO $ do
+    loadedMods   <- newIORef Map.empty
+    searchPath   <- newIORef []
+    includeMap   <- newIORef Map.empty
+    fbCache      <- newIORef Map.empty
+    fbBase       <- newIORef HashMap.empty
+    fbNeg        <- newIORef (0, Set.empty)
+    fbGen        <- newIORef 0
+    discoverNeg  <- newIORef Set.empty
+    resolveCache <- newIORef Map.empty
+    pure LegacySchedulerRunState
+        { lsrsLoadedModules       = loadedMods
+        , lsrsSearchPath          = searchPath
+        , lsrsIncludeMap          = includeMap
+        , lsrsEnvFallbackCache    = fbCache
+        , lsrsEnvBaseForFallback  = fbBase
+        , lsrsEnvFallbackNegCache = fbNeg
+        , lsrsEnvFallbackCacheGen = fbGen
+        , lsrsDiscoverNegCache    = discoverNeg
+        , lsrsResolveImportCache  = resolveCache
+        }
+
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
 -- 'IHC.Eval.eval''s demand-driven env fallback: when a closure's frozen
 -- env misses a fully-qualified name, the fallback hook consults this
@@ -4581,9 +4630,8 @@ loadModuleSlow registry searchPath includeMap name = do
 -- on-demand.  Transient per-import 'ModuleRegistry' values that
 -- 'loadImportOnlyIntoEnv' allocates are now ALSO mirrored here so the
 -- REPL can see modules loaded by earlier imports.
-{-# NOINLINE globalLoadedModulesRef #-}
 globalLoadedModulesRef :: IORef (Map ModuleName LoadedModule)
-globalLoadedModulesRef = unsafePerformIO (newIORef Map.empty)
+globalLoadedModulesRef = lsrsLoadedModules legacySchedulerRunState
 
 -- | Drop every per-run global the scheduler accumulates so a second
 -- 'loadProgramFromSource' call starts from a clean slate.  Caches that
@@ -4739,13 +4787,11 @@ hydrateTransitiveImports registry searchPath includeMap lm = do
 -- fallback hook can trigger 'discoverInModule' for FQNs whose bodies
 -- haven't been demand-loaded yet.  Populated by 'buildBaseEnv' and
 -- 'loadProgramFromSource'.
-{-# NOINLINE globalSearchPathRef #-}
 globalSearchPathRef :: IORef [FilePath]
-globalSearchPathRef = unsafePerformIO (newIORef [])
+globalSearchPathRef = lsrsSearchPath legacySchedulerRunState
 
-{-# NOINLINE globalIncludeMapRef #-}
 globalIncludeMapRef :: IORef (Map FilePath [FilePath])
-globalIncludeMapRef = unsafePerformIO (newIORef Map.empty)
+globalIncludeMapRef = lsrsIncludeMap legacySchedulerRunState
 
 setGlobalSearchPath :: [FilePath] -> Map FilePath [FilePath] -> IO ()
 setGlobalSearchPath sp im = do
@@ -4755,9 +4801,8 @@ setGlobalSearchPath sp im = do
 -- | Memoised slots produced by the env fallback hook.  Keeps one
 -- 'Thunk' per FQN so successive demand-lookups share evaluation +
 -- memoisation, matching the normal import-driven env layer.
-{-# NOINLINE envFallbackCache #-}
 envFallbackCache :: IORef (Map ByteString Thunk)
-envFallbackCache = unsafePerformIO (newIORef Map.empty)
+envFallbackCache = lsrsEnvFallbackCache legacySchedulerRunState
 
 -- | Install the demand-driven env-fallback hook that 'IHC.Eval.eval'
 -- consults when an 'EVar' lookup misses.  Given a fully-qualified name
@@ -4777,9 +4822,8 @@ envFallbackCache = unsafePerformIO (newIORef Map.empty)
 -- This replaces the "augment env at registration time" approach with a
 -- truly lazy resolution: no FV pre-discovery walks, no eager
 -- materialisation of bodies the user's expression never touches.
-{-# NOINLINE envBaseForFallbackRef #-}
 envBaseForFallbackRef :: IORef Env
-envBaseForFallbackRef = unsafePerformIO (newIORef HashMap.empty)
+envBaseForFallbackRef = lsrsEnvBaseForFallback legacySchedulerRunState
 
 -- | Negative-result memo for the env-fallback hook.  When 'resolveFallback'
 -- returns 'Nothing' for some @(owner, name)@ pair, that result is recorded
@@ -4794,13 +4838,11 @@ envBaseForFallbackRef = unsafePerformIO (newIORef HashMap.empty)
 -- lookup to Just, so the negative cache from before the bump must not be
 -- consulted.  The check compares the cache's stored generation against the
 -- current one; on mismatch we treat the cache as empty.
-{-# NOINLINE envFallbackNegCacheRef #-}
 envFallbackNegCacheRef :: IORef (Int, Set (Maybe ByteString, ByteString))
-envFallbackNegCacheRef = unsafePerformIO (newIORef (0, Set.empty))
+envFallbackNegCacheRef = lsrsEnvFallbackNegCache legacySchedulerRunState
 
-{-# NOINLINE envFallbackCacheGenRef #-}
 envFallbackCacheGenRef :: IORef Int
-envFallbackCacheGenRef = unsafePerformIO (newIORef 0)
+envFallbackCacheGenRef = lsrsEnvFallbackCacheGen legacySchedulerRunState
 
 bumpEnvFallbackGen :: IO ()
 bumpEnvFallbackGen = modifyIORef' envFallbackCacheGenRef (+1)
@@ -6294,9 +6336,8 @@ discoverInModule = discoverInModuleWith Set.empty
 -- paths) into O(1) Set lookups instead of repeating the
 -- findOrResolveLhs+resolveImport chain.  Cleared per run by
 -- 'resetDiscoveryNegCache' (wired into 'resetPerRunGlobals').
-{-# NOINLINE discoverNegCacheRef #-}
 discoverNegCacheRef :: IORef (Set (ByteString, ByteString))
-discoverNegCacheRef = unsafePerformIO (newIORef Set.empty)
+discoverNegCacheRef = lsrsDiscoverNegCache legacySchedulerRunState
 
 resetDiscoveryNegCache :: IO ()
 resetDiscoveryNegCache = writeIORef discoverNegCacheRef Set.empty
@@ -6624,9 +6665,8 @@ resolveImport registry searchPath includeMap lm name = do
 resetResolveImportCache :: IO ()
 resetResolveImportCache = writeIORef resolveImportCacheRef Map.empty
 
-{-# NOINLINE resolveImportCacheRef #-}
 resolveImportCacheRef :: IORef (Map (ByteString, ByteString) (Maybe ModuleName))
-resolveImportCacheRef = unsafePerformIO (newIORef Map.empty)
+resolveImportCacheRef = lsrsResolveImportCache legacySchedulerRunState
 
 resolveImport'
     :: ModuleRegistry
