@@ -84,7 +84,7 @@ import IHC.Classes
     , clearSuperclasses
     , setEnvFallback
     , setCtorTypeHook
-    , setCoreInstanceLoadHook
+    , setCoreInstanceLoadHook, triggerCoreInstanceLoad
     , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
     , setThExpToExpr
@@ -2559,14 +2559,35 @@ classMethodDispatcher reg cls methodName = selfVal
                               case mHost of
                                 Just hostVal -> pure hostVal
                                 Nothing -> do
-                                  -- Lazy-scan in-scope modules once and retry.
-                                  didScan <- lazyInstanceRetry cls tag
-                                  mMethod2 <- if didScan
-                                      then do
-                                          a <- lookupInstanceMethodForced reg cls tag methodName
-                                          b <- lookupInSharedRegForced cls tag methodName
-                                          pure (preferMethod a b)
-                                      else pure mMethod
+                                  -- First-miss path: when the user's program
+                                  -- (or REPL) hasn't imported the module that
+                                  -- provides this class's instances yet, the
+                                  -- registry is empty.  Trigger the core-
+                                  -- instance load hook which force-loads the
+                                  -- providers from the manifest (e.g. Num →
+                                  -- GHC.Internal.Num).  Idempotent per class
+                                  -- per session.  Mirrors the same hook
+                                  -- 'IHC.Eval.resolveTypedMethod' calls.
+                                  triggerCoreInstanceLoad cls
+                                  -- Re-lookup after the core-load hook may
+                                  -- have populated the registry.  If still
+                                  -- nothing, fall through to lazyInstanceRetry
+                                  -- for in-scope module re-scans.
+                                  postLoad <- do
+                                      a <- lookupInstanceMethodForced reg cls tag methodName
+                                      b <- lookupInSharedRegForced cls tag methodName
+                                      pure (preferMethod a b)
+                                  didScan <- if isJust postLoad
+                                      then pure False
+                                      else lazyInstanceRetry cls tag
+                                  mMethod2 <- if isJust postLoad
+                                      then pure postLoad
+                                      else if didScan
+                                          then do
+                                              a <- lookupInstanceMethodForced reg cls tag methodName
+                                              b <- lookupInSharedRegForced cls tag methodName
+                                              pure (preferMethod a b)
+                                          else pure mMethod
                                   case mMethod2 of
                                       Just methodVal
                                         | not (isMethodPlaceholder methodVal) ->

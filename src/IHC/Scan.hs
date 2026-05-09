@@ -2914,17 +2914,32 @@ scanInstanceDeclsRaw src
                 -- and the real method body is lost.
                 TkSymOp op | depth == 0
                            , op /= BC.pack "~" -> pure (Just op)
+                -- Backtick infix: @a `name` b@ at depth 0 names @name@
+                -- as the method.  Used by source bodies like
+                --   !a `mod` b | ... = …
+                -- in Integral Int's default-method block.
+                TkBacktick | depth == 0 ->
+                    let (nameTok, curN) = nextToken s cur'
+                    in case tkKind nameTok of
+                        TkIdent n   -> pure (Just n)
+                        TkConId n   -> pure (Just n)
+                        TkPrimId n  -> pure (Just n)
+                        _           -> go curN depth
                 -- Dedicated-op tokens the lexer carves out (==, /=, <, <=,
-                -- >, >=, &&, ||, +, ++, *, :, $) are unambiguously infix
-                -- binary operators when seen at depth 0 between two LHS
-                -- patterns, so treat them as method names too. Without
+                -- >, >=, &&, ||, +, ++, *, -, :, $) are unambiguously
+                -- infix binary operators when seen at depth 0 between two
+                -- LHS patterns, so treat them as method names too. Without
                 -- this, infix instance methods whose operator is a
-                -- dedicated token — e.g. @Eq@'s @==@ — never register,
-                -- and the scanner falls back to mis-identifying a later
-                -- @TkIdent@ inside a record pattern as the method.
-                -- We intentionally skip TkMinus / TkBang / TkDot because
-                -- those can appear in prefix position (negative literal,
-                -- bang pattern, qualified name).
+                -- dedicated token — e.g. @Eq@'s @==@ or @Num@'s @-@ —
+                -- never register, and the scanner falls back to
+                -- mis-identifying a later @TkIdent@ inside a record
+                -- pattern as the method.
+                -- We intentionally skip TkBang / TkDot because those can
+                -- appear in prefix position (bang pattern, qualified
+                -- name).  TkMinus IS included: at depth 0 with a
+                -- preceding LHS pattern (we only enter this scan from a
+                -- context that already saw such a pattern) it is
+                -- unambiguously binary subtraction.
                 TkEqEq    | depth == 0 -> pure (Just (BC.pack "=="))
                 TkNeq     | depth == 0 -> pure (Just (BC.pack "/="))
                 TkLt      | depth == 0 -> pure (Just (BC.pack "<"))
@@ -2936,6 +2951,7 @@ scanInstanceDeclsRaw src
                 TkPlus    | depth == 0 -> pure (Just (BC.pack "+"))
                 TkPlusPlus| depth == 0 -> pure (Just (BC.pack "++"))
                 TkStar    | depth == 0 -> pure (Just (BC.pack "*"))
+                TkMinus   | depth == 0 -> pure (Just (BC.pack "-"))
                 TkColon   | depth == 0 -> pure (Just (BC.pack ":"))
                 TkDollar  | depth == 0 -> pure (Just (BC.pack "$"))
                 TkLParen                 -> go cur' (depth + 1)
@@ -2964,6 +2980,13 @@ scanInstanceDeclsRaw src
                 TkRBrace  | depth == 0   -> pure Nothing
                 TkSymOp op | depth == 0
                            , op /= BC.pack "~" -> pure (Just op)
+                TkBacktick | depth == 0 ->
+                    let (nameTok, curN) = nextToken s cur'
+                    in case tkKind nameTok of
+                        TkIdent n   -> pure (Just n)
+                        TkConId n   -> pure (Just n)
+                        TkPrimId n  -> pure (Just n)
+                        _           -> go curN depth
                 TkEqEq    | depth == 0 -> pure (Just (BC.pack "=="))
                 TkNeq     | depth == 0 -> pure (Just (BC.pack "/="))
                 TkLt      | depth == 0 -> pure (Just (BC.pack "<"))
@@ -2975,6 +2998,7 @@ scanInstanceDeclsRaw src
                 TkPlus    | depth == 0 -> pure (Just (BC.pack "+"))
                 TkPlusPlus| depth == 0 -> pure (Just (BC.pack "++"))
                 TkStar    | depth == 0 -> pure (Just (BC.pack "*"))
+                TkMinus   | depth == 0 -> pure (Just (BC.pack "-"))
                 TkColon   | depth == 0 -> pure (Just (BC.pack ":"))
                 TkDollar  | depth == 0 -> pure (Just (BC.pack "$"))
                 TkLParen                 -> go cur' (depth + 1)
@@ -3334,7 +3358,11 @@ scanClassDeclsRaw src
                                     let lhs  = BindingLhs (reverse moreClauses)
                                         defs' = Map.insert name lhs defs
                                     scanBody sigs defs' curFinal
-                -- Operator methods: `(<>) :: ...` or `(<>) x y = ...`
+                -- Operator methods: `(<>) :: ...` or `(<>) x y = ...`.
+                -- Also handles comma-separated operator sig lists like
+                -- `(+), (-), (*) :: a -> a -> a` (Num's standard sig
+                -- form): peek past the closing `)` for `,` and walk
+                -- the rest with 'collectSigNames'.
                 TkLParen | tkCol tok > 1 -> do
                     let (opTok, cur'') = nextToken src cur'
                     case tokenOpNameBS (tkKind opTok) of
@@ -3342,8 +3370,10 @@ scanClassDeclsRaw src
                             let (closeTok, cur''') = nextToken src cur''
                             case tkKind closeTok of
                                 TkRParen -> do
-                                    -- Peek: `::` means type sig, otherwise default.
-                                    let (peek, _) = peekSigC cur'''
+                                    -- Peek: `::` means type sig, `,` means
+                                    -- comma-separated sig list, otherwise
+                                    -- default-method body.
+                                    let (peek, cur4) = peekSigC cur'''
                                     case tkKind peek of
                                         TkDColon -> do
                                             mNames <- trySkipClassSig (tkCol tok) opName cur'''
@@ -3352,6 +3382,13 @@ scanClassDeclsRaw src
                                                     let sigs' = foldr (`Map.insert` ()) sigs names
                                                     scanBody sigs' defs curAfter
                                                 Nothing -> scanBody sigs defs cur'
+                                        TkComma -> do
+                                            (names, curAfter) <- collectSigNames (tkCol tok) [opName] cur4
+                                            case names of
+                                                [] -> scanBody sigs defs cur'
+                                                _  -> do
+                                                    let sigs' = foldr (`Map.insert` ()) sigs names
+                                                    scanBody sigs' defs curAfter
                                         _ -> do
                                             mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'''
                                             case mClause of
@@ -3390,21 +3427,21 @@ scanClassDeclsRaw src
                 pure (Just ([firstName], curAfter))
             TkComma -> do
                 -- Walk a comma-separated list of names.
-                (names, curAfter) <- collectSigNames [firstName] c
+                (names, curAfter) <- collectSigNames bindCol [firstName] c
                 case names of
                     [] -> pure Nothing
                     _  -> pure (Just (names, curAfter))
             _ -> pure Nothing
 
-    collectSigNames acc cur = do
+    collectSigNames bindCol acc cur = do
         let (t, c) = peekSigC cur
         case tkKind t of
             TkIdent n -> do
                 let (t2, c2) = peekSigC c
                 case tkKind t2 of
-                    TkComma  -> collectSigNames (n : acc) c2
+                    TkComma  -> collectSigNames bindCol (n : acc) c2
                     TkDColon -> do
-                        curAfter <- skipClassSigType 0 c2
+                        curAfter <- skipClassSigType bindCol c2
                         pure (reverse (n : acc), curAfter)
                     _ -> pure ([], cur)
             TkLParen -> do
@@ -3417,9 +3454,9 @@ scanClassDeclsRaw src
                             TkRParen -> do
                                 let (t4, c4) = peekSigC c3
                                 case tkKind t4 of
-                                    TkComma  -> collectSigNames (opName : acc) c4
+                                    TkComma  -> collectSigNames bindCol (opName : acc) c4
                                     TkDColon -> do
-                                        curAfter <- skipClassSigType 0 c4
+                                        curAfter <- skipClassSigType bindCol c4
                                         pure (reverse (opName : acc), curAfter)
                                     _ -> pure ([], cur)
                             _ -> pure ([], cur)
