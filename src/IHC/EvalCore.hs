@@ -4,7 +4,7 @@
 -- using the same 'Thunk' / 'Env' machinery as 'IHC.Eval.eval'.
 -- This is the read-only half of the dispatcher swap: it lets us
 -- run the lowered Core through a tiny tree-walker so we can prove
--- (in 'CoreLowerTest') that @eval (lower e) ≡ eval e@ on simple
+-- (in 'CoreLowerTest') that  (lower e) ≡ eval e@ on simple
 -- programs, without yet touching the production dispatcher.
 --
 -- Coverage at this slice:
@@ -40,6 +40,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 
 import IHC.AST   (Lit(..))
+import IHC.Classes (legacyHooks)
 import IHC.Core
 import IHC.Eval  (apply, force, matchPat)
 import IHC.Val
@@ -58,7 +59,7 @@ evalCore env ipm = go
             LStr s     -> stringLitToList s
 
         CVar name _ -> case lookupEnv name env of
-            Just t  -> force t
+            Just t  -> force legacyHooks t
             Nothing -> error
                 ( "IHC.EvalCore.evalCore: unbound variable `"
                   <> BC.unpack name <> "`" )
@@ -68,7 +69,7 @@ evalCore env ipm = go
             -- Argument is wrapped in a Thunk so callee-site forcing
             -- preserves laziness.
             xT <- newThunkFromCore env ipm x
-            apply fv xT
+            apply legacyHooks fv xT
 
         CLam pat _ body -> do
             -- Build a single-argument lambda.  Multi-arg shapes
@@ -76,8 +77,8 @@ evalCore env ipm = go
             -- multi-arg ELams), so we don't need to handle them
             -- specially here.
             pure $ VFun $ \argT -> do
-                argV <- force argT
-                m <- matchPat pat argV
+                argV <- force legacyHooks argT
+                m <- matchPat legacyHooks pat argV
                 case m of
                     Nothing ->
                         error ("IHC.EvalCore.evalCore: lambda pattern-match "
@@ -136,7 +137,7 @@ evalCore env ipm = go
     tryAlts _ [] =
         error "IHC.EvalCore.evalCore: non-exhaustive case alternatives"
     tryAlts v (CAlt p _ body : rest) = do
-        m <- matchPat p v
+        m <- matchPat legacyHooks p v
         case m of
             Just bindings ->
                 evalCore (extendEnvMany bindings env) ipm body

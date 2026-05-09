@@ -18,6 +18,7 @@ import Control.Exception (SomeException, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 
+import IHC.Classes (IHCHooks)
 import IHC.Eval (force)
 import IHC.Val
 
@@ -26,8 +27,8 @@ import IHC.Val
 -- Safe to call on any 'Val':
 --  * never executes 'VIO' actions
 --  * catches exceptions from forcing nested thunks
-describeType :: Val -> IO ByteString
-describeType = go
+describeType :: IHCHooks -> Val -> IO ByteString
+describeType hooks = go
   where
     go :: Val -> IO ByteString
     go (VInt   _)   = pure "Int"
@@ -115,14 +116,15 @@ describeType = go
         argTys <- mapM (\t -> safeForce t >>= go) args
         pure (name <> " " <> BC.intercalate " " (map wrapIfCompound argTys))
 
--- | Force a thunk safely, catching any exception (loop, error, etc.).
--- Returns a sentinel 'VStr "<error>"' on failure.
-safeForce :: Thunk -> IO Val
-safeForce t = do
-    r <- try (force t) :: IO (Either SomeException Val)
-    case r of
-        Right v -> pure v
-        Left  _ -> pure (VStr "<error>")
+    -- | Force a thunk safely, catching any exception (loop, error, etc.).
+    -- Returns a sentinel 'VStr "<error>"' on failure.  Captures the
+    -- enclosing 'describeType' 'hooks' parameter lexically.
+    safeForce :: Thunk -> IO Val
+    safeForce t = do
+        r <- try (force hooks t) :: IO (Either SomeException Val)
+        case r of
+            Right v -> pure v
+            Left  _ -> pure (VStr "<error>")
 
 -- | Wrap a type description in parentheses if it contains a space
 -- (i.e. it is a compound/applied type like "Maybe Int") so it parses

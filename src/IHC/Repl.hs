@@ -32,6 +32,7 @@ import System.Console.Haskeline
 import IHC.AST (Expr)
 import IHC.Builtins (showValWith, buildConEnv, buildFieldEnv)
 import IHC.Classes (ClassRegistry, registerInstance, registerInstanceMulti)
+import IHC.Classes (legacyHooks)
 import IHC.Driver (resolveSearchPathFor)
 import IHC.Eval (eval, force, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
@@ -160,8 +161,8 @@ doTypeOf envRef loadedRef importsRef expr = do
 -- IO actions are NOT executed — we stop at the first 'VIO' and report "IO a".
 typeOfExpr :: Env -> Expr -> IO String
 typeOfExpr env ast = do
-    v  <- eval env emptyIPMap ast
-    ty <- describeType v
+    v  <- eval legacyHooks env emptyIPMap ast
+    ty <- describeType legacyHooks v
     pure (BC.unpack ty)
 
 --------------------------------------------------------------------------------
@@ -421,7 +422,7 @@ mkDefault env src decl methodName =
                         expr <- parseBodyExprWithFixity src defaultFixityTable
                                     (lhsClauses lhs)
                         t <- newThunk env expr
-                        force t)
+                        force legacyHooks t)
                     :: IO (Either SomeException Val)
             case r of
                 Right v -> pure v
@@ -485,7 +486,7 @@ evalInstanceMethods src env methods =
     evalOne (methodName, lhs) = do
         expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
         t    <- newThunk env expr
-        v    <- force t
+        v    <- force legacyHooks t
         pure (methodName, v)
 
 --------------------------------------------------------------------------------
@@ -574,8 +575,8 @@ tryEvalSessionBind loadedRef importsRef fldReg env name rhs = do
             let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
             r2 <- try (do
-                        v  <- eval env' emptyIPMap expr
-                        runIOVal v)
+                        v  <- eval legacyHooks env' emptyIPMap expr
+                        runIOVal legacyHooks v)
                     :: IO (Either SomeException Val)
             case r2 of
                 Left  e   -> pure (Left (show e))
@@ -744,7 +745,7 @@ ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
 
 evalAndPrint :: Env -> ClassRegistry -> Expr -> IO ()
 evalAndPrint env classReg expr = do
-    v <- eval env emptyIPMap expr
+    v <- eval legacyHooks env emptyIPMap expr
     case v of
         VIO _ -> do
             v2 <- runIO v

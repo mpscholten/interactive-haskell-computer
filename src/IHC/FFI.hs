@@ -69,6 +69,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import qualified System.IO
 import qualified System.Posix.DynamicLinker as DL
 
+import IHC.Classes (legacyHooks)
 import IHC.Eval (force)
 import IHC.Val
 
@@ -295,9 +296,9 @@ asFloat other      = error ("IHC.FFI: expected floating value, got " <> showValF
 ptrFromVal :: Val -> IO (Ptr ())
 ptrFromVal v = case v of
     VPrimObj (PrimPtr p)              -> pure (castPtr p)
-    VCon "Ptr" [t]                    -> force t >>= ptrFromVal
-    VCon "FunPtr" [t]                 -> force t >>= ptrFromVal
-    VCon "ForeignPtr" (addrT : _)     -> force addrT >>= ptrFromVal
+    VCon "Ptr" [t]                    -> force legacyHooks t >>= ptrFromVal
+    VCon "FunPtr" [t]                 -> force legacyHooks t >>= ptrFromVal
+    VCon "ForeignPtr" (addrT : _)     -> force legacyHooks addrT >>= ptrFromVal
     VInt 0                            -> pure nullPtr
     -- ByteArray# / MutableByteArray# passed to C: our PrimByteArray
     -- wraps a ByteString.  Pin its bytes and hand out a raw pointer.
@@ -333,8 +334,8 @@ byteStringFromVal v = case v of
       where
         go acc (VCon "[]" _) = pure (BS.pack (reverse acc))
         go acc (VCon ":" [hT, tT]) = do
-            h <- force hT
-            t <- force tT
+            h <- force legacyHooks hT
+            t <- force legacyHooks tT
             case h of
                 VChar c -> go (fromIntegral (fromEnum c) : acc) t
                 VInt  n -> go (fromIntegral n          : acc) t
@@ -450,5 +451,5 @@ makeForeignVal decl
               let call = callForeign decl (reverse acc)
               if fdIsIO decl then pure (VIO call) else call
         | otherwise = pure $ VFun $ \t -> do
-              v <- force t
+              v <- force legacyHooks t
               collect (v : acc)

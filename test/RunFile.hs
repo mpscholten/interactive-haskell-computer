@@ -10,6 +10,7 @@ import System.Environment (lookupEnv)
 
 import Test.Hspec
 
+import IHC.Classes (legacyHooks)
 import IHC.Driver
 import IHC.Eval (force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
@@ -27,7 +28,7 @@ runFileWithSearch :: [FilePath] -> FilePath -> IO Int
 runFileWithSearch searchPath path = do
     src <- readSourceFile path
     (_env, mainT) <- loadProgramFromSource searchPath src
-    v             <- force mainT
+    v             <- force legacyHooks mainT
     final         <- runIO v
     case final of
         VInt n -> pure (fromIntegral n)

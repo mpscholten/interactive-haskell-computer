@@ -94,6 +94,7 @@ import IHC.Classes
     , drainCataloguedInstancesForClass
     , resetInstanceCatalogue
     , catalogueHasClass
+    , legacyHooks
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -1217,7 +1218,7 @@ loadImportIntoEnv searchPath imp existingEnv
                 (env', _) <- loadImportIntoEnv searchPath (importOne n) existingEnv
                 let mThunk = mapMaybe (`HashMap.lookup` env') (lookupKeys n)
                 case mThunk of
-                    (t:_) -> force t
+                    (t:_) -> force legacyHooks t
                     []    -> error
                         ( "loadImportIntoEnv: failed to materialize `"
                           <> BC.unpack (impModule imp) <> "."
@@ -2128,7 +2129,7 @@ registerOneFunctor classReg decl = do
 -- @f field@, or the result of a recursive fmap dispatch.
 synthFmapForDecl :: ClassRegistry -> FunctorDerivDecl -> Val
 synthFmapForDecl classReg decl = VFun $ \fT -> pure $ VFun $ \xT -> do
-    xv <- force xT
+    xv <- force legacyHooks xT
     case xv of
         VCon ctorName oldThunks -> do
             let roles = lookupCtorRoles ctorName decl oldThunks
@@ -2157,26 +2158,26 @@ applyRoleOne :: ClassRegistry -> Thunk -> (FunctorFieldRole, Thunk) -> IO Thunk
 applyRoleOne _classReg _fT (FRNone, t) = pure t
 applyRoleOne _classReg fT  (FRVar,  t) = do
     -- f field
-    fv <- force fT
-    v  <- apply fv t
+    fv <- force legacyHooks fT
+    v  <- apply legacyHooks fv t
     newWHNFThunk v
 applyRoleOne classReg fT (FRRec, t) = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VCon innerTag _ -> do
             mInnerFmap0 <- lookupInstanceMethod classReg (BC.pack "Functor") innerTag (BC.pack "fmap")
             mInnerFmap <- case mInnerFmap0 of
                 Nothing -> pure Nothing
                 Just v' -> do
-                    r <- try (forceMethodVal v') :: IO (Either SomeException Val)
+                    r <- try (forceMethodVal legacyHooks v') :: IO (Either SomeException Val)
                     case r of
                         Right v'' -> pure (Just v'')
                         Left _    -> pure Nothing
             case mInnerFmap of
                 Just innerFmap -> do
                     stepT <- newWHNFThunk v
-                    r1 <- apply innerFmap fT
-                    r2 <- apply r1 stepT
+                    r1 <- apply legacyHooks innerFmap fT
+                    r2 <- apply legacyHooks r1 stepT
                     newWHNFThunk r2
                 _ -> pure t   -- no Functor instance; leave field untouched
         _ -> pure t
@@ -2247,7 +2248,7 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
         in map snd (sortOn fst annotated)
 
     derivedFromEnum ctorIndex = VFun $ \xT -> do
-        xv <- force xT
+        xv <- force legacyHooks xT
         case xv of
             VCon ctor _ ->
                 case Map.lookup ctor ctorIndex of
@@ -2258,7 +2259,7 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                           <> showValForDebug other)
 
     derivedToEnum ctors = VFun $ \iT -> do
-        iv <- force iT
+        iv <- force legacyHooks iT
         case iv of
             VInt n
                 | n >= 0
@@ -2371,7 +2372,7 @@ registerOneBounded classReg (tyName, ctors) = do
 -- the ctor list, and returns the 0-based index as a 'VInt'.
 synthFromEnumForCtors :: [ByteString] -> Val
 synthFromEnumForCtors ctors = VFun $ \t -> do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VCon n _ -> case indexOf n ctors 0 of
             Just i  -> pure (VInt (fromIntegral i))
@@ -2391,7 +2392,7 @@ synthFromEnumForCtors ctors = VFun $ \t -> do
 -- matching GHC's semantics.
 synthToEnumForCtors :: [ByteString] -> Val
 synthToEnumForCtors ctors = VFun $ \t -> do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VInt i ->
             let idx = fromIntegral i
@@ -2439,7 +2440,7 @@ lookupInstanceMethodForced reg cls tag methodName = do
     traverse forceSafely mv
   where
     forceSafely v = do
-        r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+        r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
         case r of
             Right v' -> pure v'
             Left  _  -> pure methodPlaceholder
@@ -2453,7 +2454,7 @@ lookupInSharedRegForced cls tag methodName = do
     traverse forceSafely mv
   where
     forceSafely v = do
-        r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+        r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
         case r of
             Right v' -> pure v'
             Left  _  -> pure methodPlaceholder
@@ -2503,7 +2504,7 @@ classMethodDispatcher reg cls methodName = selfVal
     dispatch remaining accArgs
         | remaining <= 0 = fallback accArgs
         | otherwise = VFun $ \argT -> do
-            av <- force argT
+            av <- force legacyHooks argT
             -- 'typeTagOf' returns "<IO>" for host-built 'VIO' values, but
             -- type-class instances are keyed under "IO" (the source ctor
             -- name).  For methods of monadic classes (Functor, Applicative,
@@ -2782,8 +2783,8 @@ classMethodDispatcher reg cls methodName = selfVal
         | otherwise = pure Nothing
 
     ixBoundsTag (VCon "(,)" [loT, hiT]) = do
-        lo <- force loT
-        hi <- force hiT
+        lo <- force legacyHooks loT
+        hi <- force legacyHooks hiT
         let loTag = typeTagOf lo
             hiTag = typeTagOf hi
         pure $
@@ -2814,13 +2815,13 @@ classMethodDispatcher reg cls methodName = selfVal
                     pure (Just (VInt (hi - lo + 1)))
                 | methodName == BC.pack "index" || methodName == BC.pack "unsafeIndex" ->
                     pure (Just (VFun $ \iT -> do
-                        i <- force iT
+                        i <- force legacyHooks iT
                         case i of
                             VInt n -> pure (VInt (n - lo))
                             _      -> error "Ix Int.index: non-Int index"))
                 | methodName == BC.pack "inRange" ->
                     pure (Just (VFun $ \iT -> do
-                        i <- force iT
+                        i <- force legacyHooks iT
                         case i of
                             VInt n -> pure (if n >= lo && n <= hi
                                             then VCon (BC.pack "True") []
@@ -2829,8 +2830,8 @@ classMethodDispatcher reg cls methodName = selfVal
                 | otherwise -> pure Nothing
 
     ixIntBounds (VCon "(,)" [loT, hiT]) = do
-        lo <- force loT
-        hi <- force hiT
+        lo <- force legacyHooks loT
+        hi <- force legacyHooks hiT
         case (lo, hi) of
             (VInt l, VInt h) -> pure (Just (l, h))
             _                -> pure Nothing
@@ -2848,8 +2849,8 @@ classMethodDispatcher reg cls methodName = selfVal
 
     charListString (VCon "[]" _) = pure (Just "")
     charListString (VCon ":" [hT, tT]) = do
-        hv <- force hT
-        tv <- force tT
+        hv <- force legacyHooks hT
+        tv <- force legacyHooks tT
         case hv of
             VChar c -> fmap (c :) <$> charListString tv
             _       -> pure Nothing
@@ -2859,7 +2860,7 @@ classMethodDispatcher reg cls methodName = selfVal
     applyAll :: Val -> [Thunk] -> IO Val
     applyAll v []     = pure v
     applyAll v (t:ts) = do
-        v' <- apply v t
+        v' <- apply legacyHooks v t
         applyAll v' ts
 
     -- A tag like "<function>", "<IO>", "()" is not dispatchable: no
@@ -3123,7 +3124,7 @@ evalDefaultMethodWith env lm rewrites lhs = do
                  (desugarRecordCons (lmFieldReg lm) expr0)
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     t <- newThunk env expr
-    force t
+    force legacyHooks t
 
 -- | For each loaded module, read its collected bodies out of the
 -- IORef and key them by either the unqualified local name (entry
@@ -3806,7 +3807,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
         slot <- newLazyBuiltinThunk $ do
             mSlot <- resolveFallback Nothing targetKey
             case mSlot of
-                Just targetSlot -> force targetSlot
+                Just targetSlot -> force legacyHooks targetSlot
                 Nothing -> error
                     ("import alias: unresolved target "
                      <> BC.unpack targetKey)
@@ -5466,7 +5467,7 @@ resolveFallbackSource mOwner name = do
                 slot <- newLazyBuiltinThunk $ do
                     mSlot <- resolveFallback (Just ownerName) fqn
                     case mSlot of
-                        Just targetSlot -> force targetSlot
+                        Just targetSlot -> force legacyHooks targetSlot
                         Nothing -> error
                             ("fallback: unresolved same-module binding "
                              <> BC.unpack fqn)
