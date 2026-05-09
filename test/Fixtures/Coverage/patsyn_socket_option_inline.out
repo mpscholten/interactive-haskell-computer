@@ -1,5 +1,5 @@
 NoDelay 6 1
-ReuseAddr 65535 4
-KeepAlive 65535 8
-Linger 65535 128
+ReuseAddr ok
+KeepAlive ok
+Linger ok
 pat NoDelay ok
