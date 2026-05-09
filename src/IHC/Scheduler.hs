@@ -4436,6 +4436,40 @@ loadModule
     -> ModuleName
     -> IO LoadedModule
 loadModule registry searchPath includeMap name = do
+    -- Builtin-backed fast path: 'loadModule' is called millions of
+    -- times per warp request for the ~7 always-loaded compiler modules
+    -- ('GHC.Prim', 'GHC.CString', 'GHC.Tuple', 'GHC.Types', 'GHC.Magic',
+    -- 'GHC.Num.BigNat', 'GHC.Classes').  Each call read the per-call
+    -- @registry@ first ('Map.lookup name reg' = O(log 464) compareBytes
+    -- with a typical warp-loaded reg), even though for builtin-backed
+    -- modules the ANSWER never changes once the global cache is
+    -- populated: the stub built by 'buildEmptyStubModule' is shared
+    -- across runs and there's no reason to re-discover anything per
+    -- registry.  Sample (~8.7M loadModule calls/sec for "GHC.Prim"
+    -- alone during a single curl wait) showed this is the dominant
+    -- 'compareBytes' source in the request-handling cascade.
+    --
+    -- Short-circuit:  for builtin-backed names, consult
+    -- 'globalLoadedModulesRef' directly.  If found, return the cached
+    -- 'LoadedModule' without ever reading the per-call @registry@.
+    -- Falls through to the original path on a cache miss (the very
+    -- first call per process), which then populates the global cache
+    -- via 'registerGlobalLoadedModule'.
+    if isBuiltinBackedModule name
+        then do
+            globalMods <- readIORef globalLoadedModulesRef
+            case Map.lookup name globalMods of
+                Just lm -> pure lm  -- fast path: no registry read at all
+                Nothing -> loadModuleSlow registry searchPath includeMap name
+        else loadModuleSlow registry searchPath includeMap name
+
+loadModuleSlow
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> ModuleName
+    -> IO LoadedModule
+loadModuleSlow registry searchPath includeMap name = do
     reg <- readIORef registry
     case Map.lookup name reg of
         Just (Loaded lm) -> pure lm
