@@ -189,4 +189,11 @@ test-suite ihc-test
     -- capability so parallel GC doesn't spin on every core while the
     -- actual workload is single-threaded.  The user-facing interpreter
     -- binary (exe:ihc) still gets -N.
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M4G"
+    --
+    -- -M8G (was 4G): the suite ran cleanly at 4G on macOS, but the
+    -- linux-test job heap-exhausted during hspec finalisation on x86_64
+    -- (run 25599719381: 593 examples / 0 failures / 72 pending, then
+    -- ran out of heap shutting down).  8G is a safe ceiling on both
+    -- runners — it's a max, not a reservation, so macOS keeps its
+    -- usual sub-4G footprint.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M8G"
