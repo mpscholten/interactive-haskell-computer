@@ -117,7 +117,7 @@ formatExn e = case fromException e of
 spec :: Spec
 spec =
     describe "Property — parser round-trip (Phase 2)" $
-        modifyMaxSuccess (const 200) $ do
+        modifyMaxSuccess (const 500) $ do
             prop "parseExprAtEof . prettyExpr accepts every generated Expr"
                 prop_acceptance
             prop "parseExprAtEof . prettyExpr recovers the input AST"
