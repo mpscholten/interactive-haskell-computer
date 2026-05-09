@@ -40,7 +40,7 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
@@ -81,7 +81,7 @@ resolveTypedMethod hooks reg cls method tag = do
             -- class are free. ('lookupInstanceMethod' inside @tryResolve@
             -- already drains the Stage-2 lazy-instance catalogue on
             -- miss, so a separate drain is unnecessary here.)
-            triggerCoreInstanceLoad cls
+            triggerCoreInstanceLoad legacyHooks cls
             resolved2 <- tryResolve
             case resolved2 of
                 Just v  -> forceMethodVal hooks v
@@ -92,7 +92,7 @@ resolveTypedMethod hooks reg cls method tag = do
                     -- resolved tag points at an instance we haven't
                     -- loaded (e.g. @Monad (ST s)@: we don't force-load
                     -- @GHC.Internal.ST@ on startup).
-                    mFallback <- lookupClassMethodFallback cls method
+                    mFallback <- lookupClassMethodFallback legacyHooks cls method
                     case mFallback of
                         Just v  -> forceMethodVal hooks v
                         Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
@@ -190,7 +190,7 @@ eval hooks env ipm = go
             -- Haskell 2010 §5.5.  'Nothing' falls back to the unscoped
             -- search (entry boundary, builtins, transient lookups).
             owner <- currentOwner hooks env
-            mT    <- lookupEnvFallback owner name
+            mT    <- lookupEnvFallback legacyHooks owner name
             case mT of
                 Just t  -> force hooks t
                 Nothing -> error ("IHC.Eval: unbound variable `"
@@ -340,7 +340,7 @@ eval hooks env ipm = go
         bodyT      <- newWHNFThunk =<< stringLiteralToListVal body
         qExp       <- applyIP hooks ipm quoteExpFn bodyT
         thExpVal   <- runIOVal hooks qExp
-        eval hooks env ipm =<< runThExpToExpr thExpVal
+        eval hooks env ipm =<< runThExpToExpr legacyHooks thExpVal
 
     -- Value-level TypeApplications (@T). ihc is optimistic about types:
     -- the type argument is retained by the parser as AST metadata, but
@@ -370,7 +370,7 @@ eval hooks env ipm = go
     -- (class, tag, method) isn't in the shared class registry —
     -- that's a bug (elaborator shouldn't emit an unresolvable tag).
     go (ETypedMethod cls method tag) = do
-        mReg <- readIORef sharedClassRegRef
+        mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
                               <> "(elaborator fired before buildBaseEnv?)")
@@ -410,7 +410,7 @@ eval hooks env ipm = go
             EVar method
                 | method == BC.pack "maxBound"
                || method == BC.pack "minBound" -> do
-                    mReg <- readIORef sharedClassRegRef
+                    mReg <- getSharedClassReg legacyHooks
                     case mReg of
                         Nothing -> pure Nothing
                         Just classReg -> do
@@ -433,7 +433,7 @@ eval hooks env ipm = go
     -- Returns 'Just' if elaboration rewrote something; 'Nothing'
     -- otherwise.
     tryElaborateTyAnn e ty = do
-        mReg <- readIORef sharedClassRegRef
+        mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing -> pure Nothing
             Just classReg -> case Elab.parseRawTypeExpr ty of

@@ -79,7 +79,7 @@ import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
     , lookupInstance
     , lookupInstanceMethod, typeTagOf
-    , scanHookRef, sharedClassRegRef, setSharedClassReg
+    , setSharedClassReg, getSharedClassReg
     , unionInstanceScope, currentInstanceScope, clearInstanceScope
     , clearSuperclasses
     , setEnvFallback
@@ -95,6 +95,7 @@ import IHC.Classes
     , resetInstanceCatalogue
     , catalogueHasClass
     , legacyHooks
+    , IHCHooks(..)
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
@@ -295,12 +296,12 @@ loadProgramFromSource searchPath src0 = do
     classReg <- newClassRegistry
     -- Install as the shared reg so the ETypedMethod evaluator path +
     -- on-demand elaborator can consult it at runtime.
-    setSharedClassReg classReg
+    setSharedClassReg legacyHooks classReg
     -- Fallback: if 'resolveTypedMethod' can't resolve (cls, tag, method)
     -- it consults this hook to get a value-directed dispatcher, so
     -- ambiguous type annotations don't hard-error when the tag points
     -- at an instance we haven't loaded (e.g. @return 42 :: ST s Int@).
-    setClassMethodFallback (\cls method ->
+    setClassMethodFallback legacyHooks (\cls method ->
         pure (Just (classMethodDispatcher classReg cls method)))
     -- Seed the type-sig registry with canonical class method sigs
     -- (pure, return, mempty, minBound, maxBound).
@@ -588,7 +589,7 @@ loadProgramFromSource searchPath src0 = do
     -- env the explicit pass above used.  Without this, a module loaded
     -- on demand after the knot has been tied would have its instances
     -- ignored entirely.
-    setRegisterInstancesHook $ \modName -> do
+    setRegisterInstancesHook legacyHooks $ \modName -> do
         globalMods <- readIORef globalLoadedModulesRef
         case Map.lookup modName globalMods of
             Just lm ->
@@ -645,7 +646,7 @@ buildBaseEnv = do
     -- registered by subsequent imports are written here so the
     -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
     -- instances from the transitive import closure are in scope).
-    setSharedClassReg classReg
+    setSharedClassReg legacyHooks classReg
     -- Seed canonical class method sigs (pure/return/mempty/...).
     seedBuiltinClassMethodSigs
     -- Install the demand-driven env-fallback hook so that
@@ -701,13 +702,13 @@ buildBaseEnv = do
     -- Install the class-method fallback: if resolveTypedMethod can't
     -- find an instance even after loading core dicts, return the
     -- dispatcher so value-directed lookup can still run.
-    setClassMethodFallback (\cls method ->
+    setClassMethodFallback legacyHooks (\cls method ->
         pure (Just (classMethodDispatcher classReg cls method)))
     -- Install the TH Exp -> Expr decoder so that QuasiQuoter dispatch
     -- in 'IHC.Eval' can convert the Val produced by @quoteExp@ into an
     -- 'Expr' to evaluate.  Lives in 'IHC.TH' which already depends on
     -- 'IHC.Eval'; the hook breaks the would-be cycle.
-    setThExpToExpr thExpToExpr
+    setThExpToExpr legacyHooks thExpToExpr
     pure (env3, classReg)
 
 -- | Install a per-class hook that force-loads the modules the
@@ -738,7 +739,7 @@ installCoreInstanceLoadHook classReg baseEnv = do
                   case r of
                       Right () -> pure ()
                       Left  _  -> pure ()   -- best-effort
-    setCoreInstanceLoadHook hook
+    setCoreInstanceLoadHook legacyHooks hook
 
 -- | Force-load the modules the 'IHC.InstanceManifest' reports as
 -- providing instances for a single class, plus the modules defining
@@ -799,7 +800,7 @@ loadCoreInstanceModules classReg baseEnv cls = do
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                          classReg tyCtors classTable baseEnv) loaded
             -- Also mirror into the shared reg (matches the loadImport path).
-            mSharedReg <- readIORef sharedClassRegRef
+            mSharedReg <- getSharedClassReg legacyHooks
             case mSharedReg of
                 Just sharedReg | sharedReg /= classReg ->
                     mapM_ (registerInstancesFrom registry fullSearchPath includeMap
@@ -1493,7 +1494,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     -- 'sharedClassRegRef') can find them on later dispatch calls.
     -- Without this, instances registered here into the per-call
     -- 'classReg' are invisible to the REPL's dispatcher thunks.
-    mSharedReg <- readIORef sharedClassRegRef
+    mSharedReg <- getSharedClassReg legacyHooks
     case mSharedReg of
         Just sharedReg | sharedReg /= classReg -> do
             ct <- buildClassMethodTable instanceScope
@@ -2937,7 +2938,7 @@ hostShowFallback reg cls tag methodName av
 -- installed or if no method is registered under @(cls, tag)@.
 lookupInSharedReg :: ByteString -> ByteString -> ByteString -> IO (Maybe Val)
 lookupInSharedReg cls tag methodName = do
-    mReg <- readIORef sharedClassRegRef
+    mReg <- getSharedClassReg legacyHooks
     case mReg of
         Just sharedReg -> lookupInstanceMethod sharedReg cls tag methodName
         Nothing        -> pure Nothing
@@ -2970,7 +2971,7 @@ lazyInstanceRetry cls _tag = do
         else legacyHookRetry
   where
     legacyHookRetry = do
-        mHook <- readIORef scanHookRef
+        mHook <- readIORef (hkScan legacyHooks)
         case mHook of
             Nothing   -> pure False
             Just hook -> do
@@ -4440,7 +4441,7 @@ loadModule registry searchPath includeMap name = do
                                       -- instances; a missing hook fire
                                       -- left the new run's class
                                       -- registry incomplete).
-                                      triggerRegisterInstances name
+                                      triggerRegisterInstances legacyHooks name
                                       -- Hydrate the per-run registry
                                       -- with all transitively-referenced
                                       -- modules from the cached lm's
@@ -4504,7 +4505,7 @@ loadModule registry searchPath includeMap name = do
                             -- Catalogues this module's instance decls into
                             -- the Stage-2 InstanceCatalogue so dispatcher
                             -- misses can drain them.
-                            triggerRegisterInstances name
+                            triggerRegisterInstances legacyHooks name
                             pure lm
 
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
@@ -4574,7 +4575,7 @@ resetPerRunGlobals = do
     -- 'loadModule' call before the new run's hook is reinstalled would
     -- fire the previous run's closure — referencing its
     -- now-defunct ClassRegistry / Env / typeCtors and corrupting state.
-    setRegisterInstancesHook (\_ -> pure ())
+    setRegisterInstancesHook legacyHooks (\_ -> pure ())
     -- Drop the (lm, name) → resolveImport memo from the prior run so
     -- a fresh 'lmName' doesn't see stale resolutions captured against
     -- the previous registry.
@@ -4729,7 +4730,7 @@ insertLmBody lm name expr = do
 
 installEnvFallbackHook :: IO ()
 installEnvFallbackHook =
-    setEnvFallback $ \mOwner name -> do
+    setEnvFallback legacyHooks $ \mOwner name -> do
         cache <- readIORef envFallbackCache
         case Map.lookup name cache of
             Just t  -> pure (Just t)
@@ -4766,7 +4767,7 @@ installEnvFallbackHook =
 -- modules loaded after install time are still consulted.
 installCtorTypeHook :: IO ()
 installCtorTypeHook =
-    setCtorTypeHook $ \ctor -> unsafePerformIO $ do
+    setCtorTypeHook legacyHooks $ \ctor -> unsafePerformIO $ do
         mods <- readIORef globalLoadedModulesRef
         let walk [] = Nothing
             walk (lm : rest) =
@@ -5106,7 +5107,7 @@ resolveFallbackSource mOwner name = do
         m <- readIORef globalMethodClassRef
         case Map.lookup bareName m of
             Just (cls : _) -> do
-                mReg <- readIORef sharedClassRegRef
+                mReg <- getSharedClassReg legacyHooks
                 case mReg of
                     Just reg -> do
                         let v = classMethodDispatcher reg cls bareName
@@ -5252,7 +5253,7 @@ resolveFallbackSource mOwner name = do
         | otherwise = Nothing
 
     registerSharedDerivedEnumBounded loaded = do
-        mReg <- readIORef sharedClassRegRef
+        mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing  -> pure ()
             Just reg -> registerDerivedEnumBoundedInstances reg loaded
@@ -5570,7 +5571,7 @@ resolveFallbackSource mOwner name = do
         case [ cls | ClassDecl cls methods _ _ <- decls, bareName `elem` methods ] of
             []      -> pure Nothing
             (cls:_) -> do
-                mSharedReg <- readIORef sharedClassRegRef
+                mSharedReg <- getSharedClassReg legacyHooks
                 case mSharedReg of
                     Nothing -> pure Nothing
                     Just classReg -> do
