@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [master, main]
 
+# A new push to a branch supersedes any in-flight runs for the same ref.
+# We *don't* cancel master pushes — every merge gets a full CI pass — but
+# PR/feature branches get the latest run only.  Without this block, the
+# 5-concurrent macOS-14 runner pool gets clogged by stale-commit duplicates.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     # macos-14 is Apple Silicon — IHC currently only targets Apple Silicon.
@@ -19,7 +27,11 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      # NOTE: DeterminateSystems/magic-nix-cache-action@v8 was removed —
+      # its hosted backend has been flapping (HTTP 400 on save, SIGABRT on
+      # post-phase) and is being deprecated in favour of FlakeHub Cache.
+      # We accept cold Nix builds for now; the Linux compile-check job below
+      # gives fast PR feedback while macOS slots are busy.
 
       # Pure-interpreter tests run hermetically via `nix flake check`.
       # The check derivation builds against the nix-pinned source root
@@ -57,3 +69,28 @@ jobs:
           name: test-log
           path: /tmp/ihc-cabal.log
           retention-days: 7
+
+  # Linux smoke-test job — runs the same `nix flake check` as macOS, but
+  # on the much-larger Linux runner pool (free-tier: 20 concurrent vs 5
+  # for macOS).  IHC's primary target is macOS/aarch64, but the
+  # interpreter and most cbits build fine on Linux now that the flake's
+  # cbits derivation produces .so on Linux and .dylib on Darwin
+  # (sharedExt/undefinedSymbolsFlag in flake.nix), and FFI.registerCbitsDylibs
+  # globs both extensions.
+  #
+  # This job almost always finishes first when the macOS pool is busy,
+  # giving sub-30-min PR feedback even during burst pushes.  The macOS
+  # job remains the source of truth for any Mach-O / Darwin-specific
+  # behaviour we discover.
+  linux-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Run pure-interpreter tests (nix flake check)
+        run: nix flake check --print-build-logs

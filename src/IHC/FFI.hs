@@ -152,13 +152,20 @@ symbolCache = unsafePerformIO (newIORef Map.empty)
 -- declared @extra-libraries:@ doesn't abort interpreter startup when a
 -- user hasn't installed the dev package for it — the error only shows
 -- up later when an actual FFI symbol from that library is invoked.
--- | Auto-discover per-package cbits dylibs.  The nix build emits one
--- @libhs<pkg>-cbits.dylib@ per Hackage source package that declares
--- @c-sources:@ in its @.cabal@, and exposes the directory containing
--- them via the @IHC_CBITS_DIR@ environment variable.  This function
--- dlopens every @*.dylib@ in that directory at interpreter startup
--- so that @foreign import ccall@ declarations resolve via
+-- | Auto-discover per-package cbits shared libraries.  The nix build
+-- emits one @libhs<pkg>-cbits.dylib@ (Darwin) or @libhs<pkg>-cbits.so@
+-- (Linux) per Hackage source package that declares @c-sources:@ in its
+-- @.cabal@, and exposes the directory containing them via the
+-- @IHC_CBITS_DIR@ environment variable.  This function dlopens every
+-- shared library in that directory at interpreter startup so that
+-- @foreign import ccall@ declarations resolve via
 -- @dlsym(RTLD_DEFAULT, …)@ without any package-specific wiring.
+--
+-- We accept both @.dylib@ and @.so@ rather than CPP-gating on the host
+-- OS because the IHC binary itself is portable Haskell — the only thing
+-- that varies is what file extension the nix derivation produced for the
+-- *current* host.  Globbing both means a single source tree builds &
+-- runs on macOS and Linux without #ifdef.
 --
 -- Running outside a dev shell (@IHC_CBITS_DIR@ unset, or directory
 -- absent) is silent — user's code that actually exercises one of the
@@ -175,10 +182,9 @@ registerCbitsDylibs = do
                 then pure ()
                 else do
                     entries <- listDirectory dir
-                    let dylibs = [ dir </> e
-                                 | e <- entries
-                                 , takeExtension e == ".dylib"
-                                 ]
+                    let isShared e = takeExtension e == ".dylib"
+                                  || takeExtension e == ".so"
+                        dylibs = [ dir </> e | e <- entries, isShared e ]
                     mapM_ (\p -> registerLibrary (BC.pack p)) dylibs
 
 registerLibrary :: ByteString -> IO ()

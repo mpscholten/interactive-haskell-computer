@@ -279,22 +279,39 @@
         '';
 
         # ────────────────────────────────────────────────────────────────
-        # ihcCbitsRoot — auto-discovered per-package cbits dylibs.
+        # ihcCbitsRoot — auto-discovered per-package cbits shared libraries.
         #
         # Scans every package directory under ihcSourceRootWithHsc for a
         # cbits/ subdir, discovers every .c source file under it, and
-        # compiles them into @lib<pkg>-cbits.dylib@.  Rather than parsing
-        # cabal's @c-sources:@ (which is tangled in @if arch()@/@os()@
-        # conditionals that vary per package version), we use a simpler
-        # heuristic that works for every package tested so far:
+        # compiles them into a per-package shared library:
+        #   * @lib<pkg>-cbits.dylib@ on Darwin
+        #   * @lib<pkg>-cbits.so@   on Linux
+        #
+        # Rather than parsing cabal's @c-sources:@ (which is tangled in
+        # @if arch()@/@os()@ conditionals that vary per package version),
+        # we use a simpler heuristic that works for every package tested
+        # so far:
         #   * Compile every .c under cbits/ individually.
-        #   * Prefer arch-specific variants (cbits/aarch64/foo.c beats
-        #     cbits/foo.c) so symbols aren't defined twice.
+        #   * On aarch64 hosts, prefer arch-specific variants
+        #     (cbits/aarch64/foo.c beats cbits/foo.c) so symbols aren't
+        #     defined twice.  On non-aarch64 hosts, skip aarch64-only
+        #     sources entirely (they'd fail to compile with intrinsics).
         #   * Skip files whose compile fails (Windows-only helpers,
         #     flag-gated C++ simdutf, etc.).
-        # Output layout: $out/lib/lib<pkg>-cbits.dylib per package that
-        # produced at least one object file.  Per-package build logs are
-        # kept at $out/lib/<pkg>.err for diagnosis.
+        #
+        # Output layout: $out/lib/lib<pkg>-cbits.{dylib,so} per package
+        # that produced at least one object file.  Per-package build logs
+        # are kept at $out/lib/<pkg>.err for diagnosis.
+        sharedExt = if pkgs.stdenv.isDarwin then "dylib" else "so";
+        # Linker flag that lets a shared library defer symbol resolution
+        # to runtime dlopen — Darwin's "dynamic lookup" semantics.  On
+        # Linux ld, --unresolved-symbols=ignore-all does the same thing.
+        # Without this, cbits libraries that reference Haskell RTS or
+        # peer-package symbols would fail to link as shared objects.
+        undefinedSymbolsFlag = if pkgs.stdenv.isDarwin
+          then "-undefined dynamic_lookup"
+          else "-Wl,--unresolved-symbols=ignore-all";
+        hostIsAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
         ihcCbitsRoot = pkgs.runCommand "ihc-cbits-dylibs" {
           buildInputs = [ pkgs.stdenv.cc ];
         } ''
@@ -326,22 +343,28 @@
             [ -d "$pkg_dir/cbits" ]       && incs="$incs -I$pkg_dir/cbits"
             [ -d "$pkg_dir/cbits/include" ] && incs="$incs -I$pkg_dir/cbits/include"
 
-            # Discover all .c files under cbits/.  Give arch-specific
-            # variants priority over generic ones (keep aarch64/foo.c,
-            # drop cbits/foo.c if the same basename exists under
-            # aarch64/).
+            # Discover all .c files under cbits/.  On aarch64 hosts we
+            # prefer cbits/aarch64/foo.c over cbits/foo.c; on other hosts
+            # we skip aarch64-specific variants entirely (they'd fail to
+            # compile due to ARM intrinsics).
             tmp_list=$(mktemp)
             find "$pkg_dir/cbits" -name '*.c' -print > "$tmp_list"
 
-            # Build a basename→path map preferring aarch64/ paths.
             declare -A chosen
             while IFS= read -r f; do
               base=$(basename "$f")
-              if [ -n "''${chosen[$base]:-}" ]; then
-                case "$f" in *aarch64*) chosen[$base]="$f" ;; esac
-              else
-                chosen[$base]="$f"
-              fi
+              case "$f" in
+                *aarch64*)
+                  ${if hostIsAarch64
+                    then ''chosen[$base]="$f"''
+                    else '': # skip aarch64-only source on non-aarch64 host''}
+                  ;;
+                *)
+                  if [ -z "''${chosen[$base]:-}" ]; then
+                    chosen[$base]="$f"
+                  fi
+                  ;;
+              esac
             done < "$tmp_list"
             rm "$tmp_list"
 
@@ -366,8 +389,8 @@
               continue
             fi
 
-            out_dylib="$out/lib/lib$pkg-cbits.dylib"
-            if cc -fPIC -shared -O -undefined dynamic_lookup \
+            out_dylib="$out/lib/lib$pkg-cbits.${sharedExt}"
+            if cc -fPIC -shared -O ${undefinedSymbolsFlag} \
                   -o "$out_dylib" $objs 2>>"$log"; then
               rm -f "$log"
               echo "cbits: built $out_dylib" >&2
@@ -410,8 +433,12 @@
               export IHC_NIX_SOURCE_DIR=${ihcSourceRootWithHsc}
               export IHC_GHC_INCLUDE_DIRS=${ghcIncludeDirs}
               export IHC_CBITS_DIR=${ihcCbitsRoot}/lib
+              ${if pkgs.stdenv.isDarwin then ''
               export DYLD_LIBRARY_PATH=${ihcCbitsRoot}/lib
               export DYLD_FALLBACK_LIBRARY_PATH=${ihcCbitsRoot}/lib
+              '' else ''
+              export LD_LIBRARY_PATH=${ihcCbitsRoot}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+              ''}
               ./dist/build/ihc-test/ihc-test \
                 --skip "REPL smoke tests" \
                 --skip "qualified class methods" \
@@ -446,9 +473,9 @@
             # command substitutions ($()) stay clean.
             if [ -t 1 ]; then
               echo "IHC dev shell — GHC $(ghc --version), cabal $(cabal --version | head -1)" >&2
-              echo "Target: macOS / aarch64 only." >&2
-              if [ "$(uname -sm)" != "Darwin arm64" ]; then
-                echo "WARNING: not on Darwin arm64 — IHC currently only targets Apple Silicon." >&2
+              echo "Primary target: macOS / aarch64.  Linux is supported for CI smoke runs." >&2
+              if [ "$(uname -sm)" != "Darwin arm64" ] && [ "$(uname -s)" != "Linux" ]; then
+                echo "WARNING: not on Darwin arm64 or Linux — IHC may not build cleanly here." >&2
               fi
             fi
 
@@ -471,19 +498,21 @@
             export IHC_CACHE="$HOME/.cache/ihc/sources"
             mkdir -p "$IHC_CACHE"
 
-            # libhsnet.dylib — native cbits for the `network` package.
-            # Expose its directory on DYLD_LIBRARY_PATH (and the Apple
-            # fallback equivalent) so that a later dlopen("libhsnet.dylib")
-            # from the FFI dispatcher can resolve without an absolute path.
-            # IHC_LIBHSNET_DIR is also set so future code can reference the
-            # exact store path directly.
-            # Auto-discovered per-package cbits dylibs: one
-            # lib<pkg>-cbits.dylib per Hackage package that declares
-            # @c-sources:@ in its cabal.  FFI.registerCbitsDylibs at
-            # interpreter startup dlopens every *.dylib in this dir.
+            # Auto-discovered per-package cbits shared libraries: one
+            # lib<pkg>-cbits.dylib (Darwin) or .so (Linux) per Hackage
+            # package that declares @c-sources:@ in its cabal.
+            # FFI.registerCbitsDylibs at interpreter startup dlopens every
+            # *.dylib / *.so in this dir.  Expose the directory on the
+            # platform's dynamic-linker search path so a bare
+            # dlopen("libhsnet.dylib") (or .so) resolves without an
+            # absolute path.
             export IHC_CBITS_DIR="${ihcCbitsRoot}/lib"
+            ${if pkgs.stdenv.isDarwin then ''
             export DYLD_LIBRARY_PATH="$IHC_CBITS_DIR''${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
             export DYLD_FALLBACK_LIBRARY_PATH="$IHC_CBITS_DIR''${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+            '' else ''
+            export LD_LIBRARY_PATH="$IHC_CBITS_DIR''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            ''}
           '';
         };
 
