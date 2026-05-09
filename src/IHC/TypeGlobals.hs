@@ -6,10 +6,14 @@
 -- and the evaluator (which triggers inference) can access the refs
 -- without introducing a cycle.
 module IHC.TypeGlobals
-    ( globalTypeSigsRef
+    ( -- * Legacy registry refs (now field accessors over 'legacyTypeState')
+      globalTypeSigsRef
     , globalTypeSynonymsRef
     , globalClassMethodNamesRef
     , globalMethodClassRef
+      -- * Bundle that backs the four legacy registries
+    , LegacyTypeState(..)
+    , legacyTypeState
     , seedBuiltinClassMethodSigs
     ) where
 
@@ -24,21 +28,51 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
 
+-- | Bundle of the four module-level type registries that the
+-- elaborator and scheduler share: top-level signatures, type
+-- synonyms, the set of names declared as class methods, and the
+-- method → declaring-class map.
+--
+-- Allocated once via the 'legacyTypeState' CAF below.  The
+-- @global*Ref@ accessors that the rest of the codebase still uses
+-- are now field-projections on this single record, so the four
+-- separate @unsafePerformIO + IORef + NOINLINE@ globals collapse
+-- into one allocation.
+data LegacyTypeState = LegacyTypeState
+    { ltsTypeSigs           :: !(IORef (Map ByteString Scheme))
+    , ltsTypeSynonyms       :: !(IORef (Map ByteString (Int, Type)))
+    , ltsClassMethodNames   :: !(IORef (Set ByteString))
+    , ltsMethodClass        :: !(IORef (Map ByteString [ByteString]))
+    }
+
+-- | One-shot allocation of the four type-registry IORefs.
+{-# NOINLINE legacyTypeState #-}
+legacyTypeState :: LegacyTypeState
+legacyTypeState = unsafePerformIO $ do
+    sigs        <- newIORef Map.empty
+    synonyms    <- newIORef Map.empty
+    classNames  <- newIORef Set.empty
+    methodClass <- newIORef Map.empty
+    pure LegacyTypeState
+        { ltsTypeSigs         = sigs
+        , ltsTypeSynonyms     = synonyms
+        , ltsClassMethodNames = classNames
+        , ltsMethodClass      = methodClass
+        }
+
 -- | Flat union of every loaded module's top-level type signatures.
 -- Used by 'IHC.Elaborate' to look up a binding's type when inference
 -- needs it.  Last-writer-wins on name collisions across modules
 -- (uncommon in practice — sigs are module-scoped in source).
-{-# NOINLINE globalTypeSigsRef #-}
 globalTypeSigsRef :: IORef (Map ByteString Scheme)
-globalTypeSigsRef = unsafePerformIO (newIORef Map.empty)
+globalTypeSigsRef = ltsTypeSigs legacyTypeState
 
 -- | Flat union of type synonym declarations (@type Name v1 v2 … =
 -- RHS@).  One-hop expansion is all the elaborator does today:
 -- @State s a@ → @StateT s Identity a@ is expanded once during
 -- unification.  Multi-level chains would need a fixed-point pass.
-{-# NOINLINE globalTypeSynonymsRef #-}
 globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
-globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
+globalTypeSynonymsRef = ltsTypeSynonyms legacyTypeState
 
 -- | Names that really appear as methods in a @class C where m1 :: ...@
 -- declaration somewhere in the loaded modules.  Populated by the
@@ -51,9 +85,8 @@ globalTypeSynonymsRef = unsafePerformIO (newIORef Map.empty)
 -- @array :: Ix i => (i, i) -> [(i, e)] -> Array i e@ and routes calls
 -- to them through the class dispatcher ("no instance of Ix for type
 -- `(,)`").
-{-# NOINLINE globalClassMethodNamesRef #-}
 globalClassMethodNamesRef :: IORef (Set ByteString)
-globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
+globalClassMethodNamesRef = ltsClassMethodNames legacyTypeState
 
 -- | Method-name → declaring-class-names. Used by the env-fallback to
 -- lazily synthesise a class-method dispatcher when a bare reference
@@ -63,9 +96,8 @@ globalClassMethodNamesRef = unsafePerformIO (newIORef Set.empty)
 -- a custom @Foldable@-shadowing class); we keep the list in
 -- registration order and the fallback tries each class until one's
 -- dispatcher resolves.
-{-# NOINLINE globalMethodClassRef #-}
 globalMethodClassRef :: IORef (Map ByteString [ByteString])
-globalMethodClassRef = unsafePerformIO (newIORef Map.empty)
+globalMethodClassRef = ltsMethodClass legacyTypeState
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
