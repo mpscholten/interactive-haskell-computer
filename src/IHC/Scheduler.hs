@@ -2255,10 +2255,11 @@ buildImportRewritesForNames registry lm needed = do
                  | n <- allScanned
                  , Set.member n needed
                  ]
-    -- Import pairs take priority over self-rewrites: if a name is both
-    -- locally defined and imported from elsewhere, the import wins
-    -- (GHC semantics).  Map.fromList keeps the last occurrence.
-    pure (Map.fromList (selfPairs ++ filteredImportPairs))
+    -- H2010 §5.5.1 (same fix as in 'buildImportRewrites'): local
+    -- bindings shadow imports.  Drop qualified names from selfPairs
+    -- since those are foreign-alias sentinels, not real local defs.
+    let cleanedSelf = filter (\(n, _) -> not (BC.elem '.' n)) selfPairs
+    pure (Map.fromList (filteredImportPairs ++ cleanedSelf))
   where
     rewritesForImport reg needed' imp
         = case Map.lookup (impModule imp) reg of
@@ -3550,11 +3551,19 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
             (\(n, _) -> not (Set.member n ffiBuiltinNames)
                     && not (Set.member n builtinNames))
             importPairs
-    -- Self-rewrites take lower priority than import-rewrites (an import
-    -- that brings in the same name shadows the local self-rewrite).
-    -- Data.Map.fromList keeps the LAST occurrence for duplicate keys, so
-    -- selfPairs must come first and importPairs second for imports to win.
-    pure (Map.fromList (selfPairs ++ filteredImportPairs))
+    -- H2010 §5.5.1: a local top-level binding shadows any imported
+    -- entity of the same name.  Map.fromList keeps the LAST entry
+    -- for duplicate keys, so 'cleanedSelf' must come SECOND.
+    --
+    -- 'cleanedSelf' drops qualified names (containing '.') because
+    -- a name like @H.greet@ in 'lmBodies' is a foreign-alias
+    -- sentinel left behind by the qualified-import resolver, NOT
+    -- a local definition of the current module — letting it into
+    -- selfPairs would shadow the real import-rewrite
+    -- @H.greet -> Helper.greet@ with the bogus
+    -- @H.greet -> <ThisModule>.H.greet@.
+    let cleanedSelf = filter (\(n, _) -> not (BC.elem '.' n)) selfPairs
+    pure (Map.fromList (filteredImportPairs ++ cleanedSelf))
   where
     rewritesForImport needed imp
         = do

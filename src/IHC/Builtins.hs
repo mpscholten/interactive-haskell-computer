@@ -325,13 +325,6 @@ builtins reg =
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
-    -- 'head' kept shimmed pending source-loaded path validation.
-    -- 'index' kept shimmed: source-loaded body uses bare 'length ps'
-    -- which the elaborator mis-routes to 'Foldable.length' (no
-    -- @Foldable BS@ instance), exactly the heuristic mis-fire
-    -- 'tryElaborateTyAnn' is documented to handle.  Source path
-    -- needs that pass to fire correctly before the shim can go.
-    , ("Data.ByteString.index",     bsIndexB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
     -- allocation boundaries; the caller-supplied fill action is still
     -- interpreted, but the mutable memory it writes into must be host-managed.
@@ -3357,19 +3350,6 @@ bsSingletonB = pure $ VFun $ \wT -> do
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
         _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
     bsFromBS (BS.singleton w)
-
-bsIndexB :: IO Val
-bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force aT; iv <- force iT
-    i <- case iv of
-        VInt n -> pure (fromIntegral n :: Int)
-        _      -> error ("BS.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
-    if i < 0 || i >= len
-        then error ("BS.index: out of bounds: " <> show i <> " vs length " <> show len)
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
-            pure (VInt (fromIntegral w))
 
 -- | Data.ByteString.Char8.unpack — BS → String by reading each byte
 -- as the corresponding Char (not UTF-8 decoded).
