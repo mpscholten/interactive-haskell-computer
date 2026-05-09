@@ -68,7 +68,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
-    , clearCtorIndex, clearForeignPtrWord8Ranges
+    , clearCtorIndex, clearForeignPtrWord8Ranges, valOrdering
     )
 import IHC.CabalProject
     ( cachedPackageSearchPath, cachedPackageSearchPathWithIncludes
@@ -2586,13 +2586,31 @@ classMethodDispatcher reg cls methodName = selfVal
                                                   mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
                                                   let mDef = preferMethod mDef0 mDefShared
                                                   case mDef of
-                                                      Just defVal ->
+                                                      Just defVal | not (isMethodPlaceholder defVal) ->
                                                           applyAll defVal (reverse (argT : accArgs))
-                                                      _ -> error
-                                                          ( "class-method dispatch: no instance of `"
-                                                           <> BC.unpack cls
-                                                           <> "` for type `" <> BC.unpack tag
-                                                           <> "` (method `" <> BC.unpack methodName <> "`)" )
+                                                      _ -> do
+                                                          -- Default body absent (or registered as a
+                                                          -- placeholder because parsing/evaluation
+                                                          -- failed): try the host @Ord.compare@
+                                                          -- structural pipeline before giving up.
+                                                          -- See 'hostOrdCompareFallback' for the
+                                                          -- rationale; only fires for the
+                                                          -- specific (cls, method) pair, otherwise
+                                                          -- returns Nothing.
+                                                          mHostCmp <- hostOrdCompareFallback reg cls methodName av accArgs
+                                                          case mHostCmp of
+                                                              -- 'cmpVal' already encodes "first arg
+                                                              -- consumed, expecting second" — it's a
+                                                              -- 'VFun' over the right operand.  Just
+                                                              -- return it so the dispatcher's caller
+                                                              -- chains the next argument naturally
+                                                              -- via 'apply'.
+                                                              Just cmpVal -> pure cmpVal
+                                                              Nothing -> error
+                                                                  ( "class-method dispatch: no instance of `"
+                                                                   <> BC.unpack cls
+                                                                   <> "` for type `" <> BC.unpack tag
+                                                                   <> "` (method `" <> BC.unpack methodName <> "`)" )
                 else if isUnaryResultPolymorphicMethod cls methodName
                     then do
                         -- Arity-1 methods like @Applicative.pure@ /
@@ -2933,6 +2951,62 @@ hostShowFallback reg cls tag methodName av
         t == BC.pack "Int32" || t == BC.pack "Int64" ||
         t == BC.pack "Word8" || t == BC.pack "Word16" ||
         t == BC.pack "Word32" || t == BC.pack "Word64"
+
+-- | Last-resort host fallback for @Ord.compare@.  Mirrors
+-- 'hostShowFallback' for 'Show.show': only fires when @cls=="Ord"@
+-- and @methodName=="compare"@, runs the structural / primitive Ord
+-- pipeline ('valOrdering') from 'IHC.Builtins', and packages the
+-- result as the @Ordering@ constructor the dispatcher's caller
+-- expects.
+--
+-- Why a host fallback for @compare@ at all?  The bare-name @compare@
+-- builtin shim was dropped (see the comment on the @compare@ line in
+-- 'IHC.Builtins.builtins').  Source-loaded @compare@ now flows through
+-- the env-fallback class-method dispatcher.  The dispatcher works for
+-- types whose @Ord@ instance has been registered (either via explicit
+-- source-load of @GHC.Classes@ for primitives, or 'instance Ord T' in
+-- a user / loaded module), and for cases where the class default
+-- @compare x y = if x == y then EQ else if x <= y then LT else GT@
+-- has been registered.  But we don't eagerly load @GHC.Classes@
+-- (ghc-prim is excluded from the manifest's @GHC.Internal.*@ filter),
+-- and the default-body materialisation can produce a method
+-- placeholder when its closure can't be evaluated cleanly — both
+-- regress @compare@ on @Char@, @[Char]@ string compares (which
+-- recurse to @Char@), and types with @deriving Ord@.
+--
+-- Rather than expanding the eager-load filter or wiring a
+-- specialised default-body materialiser, we keep parity with the
+-- old @compareDispatch@ semantics: invoke the structural / primitive
+-- pipeline that drives 'ordDispatch' for @<@, @<=@, @>@, @>=@.
+-- 'valOrdering' itself first consults a user @Ord@ instance via
+-- 'lookupInstanceMethod', so user overrides still win — this fallback
+-- only fires when the dispatcher's own lookups (instance + drained
+-- catalogue + default body) all miss.
+--
+-- The dispatcher passes @av@ (already-forced first arg) plus any
+-- @accArgs@ collected from a non-dispatchable LHS.  For the canonical
+-- binary @compare av bv@ shape, @accArgs == []@; we return a 'VFun'
+-- that consumes @bv@ via 'valOrdering' and yields the @Ordering@
+-- constructor the caller chained the second argument into.
+hostOrdCompareFallback
+    :: ClassRegistry
+    -> ByteString    -- ^ class
+    -> ByteString    -- ^ method name
+    -> Val           -- ^ first (already-forced) argument
+    -> [Thunk]       -- ^ collected accArgs (LHS-of-current arg)
+    -> IO (Maybe Val)
+hostOrdCompareFallback reg cls methodName av accArgs
+    | cls == BC.pack "Ord"
+    , methodName == BC.pack "compare"
+    , null accArgs = pure (Just (VFun $ \rightT -> do
+        rightV <- force legacyHooks rightT
+        o <- valOrdering reg av rightV
+        pure (VCon (orderingCtor o) [])))
+    | otherwise = pure Nothing
+  where
+    orderingCtor LT = BC.pack "LT"
+    orderingCtor EQ = BC.pack "EQ"
+    orderingCtor GT = BC.pack "GT"
 
 -- | Look up a class method in the shared (REPL-level) class registry
 -- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is
