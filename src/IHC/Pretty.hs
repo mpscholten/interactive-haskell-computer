@@ -59,16 +59,21 @@ prettyExpr = \case
 -- negative payload inside 'LInt' \/ 'LInteger' \/ 'LFloat'.
 prettyLit :: Lit -> ByteString
 prettyLit = \case
-    LInt n     -> BC.pack (show n)
-    -- Subsequent slices add LInteger / LFloat / LChar / LStr.
-    -- They are intentionally absent from the first slice so the
-    -- generator can be bounded to a single literal flavour while
-    -- the round-trip pipeline is validated end-to-end.
+    LInt     n -> BC.pack (show n)
+    LInteger n -> BC.pack (show n)
+    -- 'show' for 'Double' is round-trippable per Haskell Report
+    -- (read . show === id) and emits decimal forms ("0.0", "1.5",
+    -- "1.0e-3") that 'IHC.Lexer.lexFloat' accepts.  Generator
+    -- excludes NaN \/ Infinity so this branch stays inside the
+    -- finite-double subset the parser handles.
+    LFloat   d -> BC.pack (show d)
+    -- LChar / LStr land in slice 2.C.  Until then they are
+    -- unreachable through 'genLit'; an explicit @error@ here keeps
+    -- generator + pretty in lockstep.
     l          -> error
         ( "IHC.Pretty.prettyLit: unsupported Lit constructor.\n"
-          <> "  Phase 2.A generates only LInt; extend pretty +\n"
-          <> "  generator together when broadening Lit coverage.\n"
-          <> "  Got: " <> takeShow 80 l )
+          <> "  Slice 2.B covers LInt / LInteger / LFloat;\n"
+          <> "  LChar / LStr land in 2.C.  Got: " <> takeShow 80 l )
 
 
 -- | Truncate a 'Show' rendering to keep error messages bounded
