@@ -72,6 +72,7 @@ module IHC.Classes
       -- * PR 1: per-session hook bundle
     , IHCHooks(..)
     , legacyHooks
+    , resetSessionHooks
     ) where
 
 import Control.Exception (SomeException, catch)
@@ -725,6 +726,33 @@ legacyHooks = unsafePerformIO $ do
         , hkSharedClassReg      = sharedReg
         , hkThExpToExpr         = thExp
         }
+
+-- | Reset every hook field of an 'IHCHooks' bundle to its no-op
+-- default.  Called by 'IHC.Scheduler.resetPerRunGlobals' at session
+-- boot so a per-run reset wipes the entire bundle in one place
+-- instead of scattering per-hook reset calls across the loader.
+--
+-- Defaults match 'legacyHooks''s initial values byte-for-byte (the
+-- same lambdas/Nothing values that 'unsafePerformIO' wrote in at
+-- module-init time).  After this returns, every hook field reads as
+-- if the session had just started: 'lookupEnvFallback' returns
+-- 'Nothing', 'triggerCoreInstanceLoad' is a no-op, etc.
+--
+-- Boot code (e.g. 'IHC.Scheduler.installEnvFallbackHook',
+-- 'setSharedClassReg', 'IHC.TH.installThExpToExprHook') is expected
+-- to overwrite the relevant fields with real implementations after
+-- 'resetSessionHooks' runs.
+resetSessionHooks :: IHCHooks -> IO ()
+resetSessionHooks hooks = do
+    writeIORef (hkEnvFallback         hooks) (\_ _ -> pure Nothing)
+    writeIORef (hkClassMethodFallback hooks) (\_ _ -> pure Nothing)
+    writeIORef (hkCoreInstanceLoad    hooks) (\_   -> pure ())
+    writeIORef (hkCtorType            hooks) (const Nothing)
+    writeIORef (hkRegisterInstances   hooks) (\_   -> pure ())
+    writeIORef (hkScan                hooks) Nothing
+    writeIORef (hkSharedClassReg      hooks) Nothing
+    writeIORef (hkThExpToExpr         hooks)
+        (\_ -> error "IHC.Classes: thExpToExpr hook not installed")
 
 --------------------------------------------------------------------------------
 -- B.1: superclass tracking (Haskell Report §4.3.1)
