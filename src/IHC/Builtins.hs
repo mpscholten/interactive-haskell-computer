@@ -354,7 +354,22 @@ builtins reg =
     -- CLAUDE.md "Builtin modules: minimum surface only", any
     -- symbol with .hs source must be interpreted, not shimmed.
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
-    , ("show",     showDispatch reg)
+    --
+    -- 'show' is deliberately omitted — it's a class method on the
+    -- @Show@ class declared in
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Show.hs:113
+    -- with default body
+    --     show x = shows x ""        -- shows = showsPrec 0
+    -- and per-type instances for Int/Char/[a]/Bool/(,)/etc.  Per
+    -- CLAUDE.md "Builtin modules: minimum surface only", any symbol
+    -- with .hs source must be interpreted.  Resolution flows through
+    -- the demand-driven 'classMethodDispatcher' (see
+    -- 'IHC.Scheduler.tryClassMethodFromRegistry'), with
+    -- 'IHC.Scheduler.hostShowFallback' delegating to 'showValWith'
+    -- below whenever the source-loaded instance method is missing or
+    -- a placeholder (e.g. @instance Show Int.showsPrec = showSignedInt@,
+    -- whose body uses primop unboxing patterns @(I# n)@ that the
+    -- parser doesn't yet handle).
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
     --   unpack    — internal recursive function "non-exhaustive patterns"
@@ -418,9 +433,10 @@ builtins reg =
     --
     -- Slice 4: 'print' graduates. Source body is
     --     print x  =  putStrLn (show x)         -- System/IO.hs:296-297
-    -- 'putStrLn' is source-loaded (slice 1).  'show' remains a shim
-    -- ('showDispatch reg' below) because it's the entry point of the
-    -- Show class registry — graduating it is slice 5+ territory.
+    -- 'putStrLn' is source-loaded (slice 1).  'show' is now source-
+    -- loaded too (see the @show@ omission note above) — both calls
+    -- inside @print@ resolve through the demand-driven Prelude /
+    -- class-method dispatcher.
     --
     -- Slice 3 (this commit): 'getLine' graduates. Source body is
     --     getLine  =  hGetLine stdin            -- System/IO.hs:308-309
@@ -1965,15 +1981,16 @@ valOrdering reg av bv = case (av, bv) of
                                     <> "returned non-Ordering: "
                                     <> showValForDebug other)
 
--- | Show dispatch: look up "show" in the Show class registry.
--- Slot 0 = show. Falls back to built-in showVal for base types.
-showDispatch :: ClassRegistry -> IO Val
-showDispatch reg = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    s  <- showValWith reg av
-    stringToListValIO s
-
 -- | Show a value, consulting the ClassRegistry for user-defined Show.
+--
+-- This is the workhorse formatter that backs the source-loaded
+-- @class Show a@ machinery via 'IHC.Scheduler.hostShowFallback' (called
+-- by 'classMethodDispatcher' on a registry miss / placeholder).  The
+-- bare-name @show@ shim was removed per CLAUDE.md "Builtin modules:
+-- minimum surface only"; resolution now flows through
+-- 'tryClassMethodFromRegistry' to the demand-driven dispatcher, which
+-- delegates here whenever the source-loaded @Show.show@ instance isn't
+-- a working method (e.g. parser gaps on primop unboxing patterns).
 showValWith :: ClassRegistry -> Val -> IO String
 showValWith reg av = case av of
     VLabel name -> pure ("#" <> BC.unpack name)   -- Phase 3.5: #name
@@ -2389,7 +2406,13 @@ listValToBS = go []
     go _   other               = error
         ("listValToBS: expected a String, got: " <> showValForDebug other)
 
--- showB replaced by showDispatch in Phase 2.3
+-- 'showB' was the original Phase 2.2 single-implementation shim;
+-- replaced in Phase 2.3 by 'showDispatch reg' (Show-class registry
+-- entry point), then removed entirely in the "minimum surface only"
+-- cleanup — @show@ now resolves through the demand-driven
+-- 'classMethodDispatcher' for the source-loaded @class Show a@ in
+-- @GHC.Internal.Show@, with 'IHC.Scheduler.hostShowFallback'
+-- delegating back to 'showValWith' above for placeholder cases.
 
 -- | Build a cons-chain of VChar from a host 'String' (in IO — needs
 -- to allocate thunks).
@@ -2419,9 +2442,10 @@ stringToListValIO (c:cs) = do
 
 -- 'printDispatch' was removed in the slice-4 cleanup — 'print' is now
 -- interpreted from ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:296-297
--- (`print x = putStrLn (show x)`).  The Show-class entry point lives
--- in 'showDispatch reg' below; demand discovery on 'print x' resolves
--- 'show' to that dispatcher, which walks the ClassRegistry as before.
+-- (`print x = putStrLn (show x)`).  Both the @putStrLn@ and the @show@
+-- inside the source body resolve through the demand-driven Prelude
+-- and 'classMethodDispatcher' respectively (see the @show@ omission
+-- comment in 'builtins' above).
 
 -- 'getLineB' was removed in the "minimum surface only" cleanup —
 -- 'getLine' is now interpreted from
