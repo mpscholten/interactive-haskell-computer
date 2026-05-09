@@ -4255,8 +4255,19 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force a; bv <- force b
     p <- ptrValToPtr av
     case bv of
-        VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-        _ -> error ("poke: value not an Int: " <> showValForDebug bv)
+        VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        -- Accept 'VChar' for the @Ptr Word8@ default. ihc skips type
+        -- checking, so a 'VChar' can flow into a Word8-typed slot when
+        -- a user writes e.g. @Data.ByteString.pack "test"@ — that's a
+        -- type error in stock Haskell, but the project's optimistic
+        -- semantics treats it as the Char8 path's @c2w = fromIntegral
+        -- . ord@ coercion and lets it through.  This used to be
+        -- handled by the 'bsPackB' shim's 'valToWord8List'; landing
+        -- the conversion at the FFI boundary lets source-loaded
+        -- 'Data.ByteString.Internal.Type.unsafePackLenBytes' work
+        -- without a Hackage-library shim (CLAUDE.md rule 4).
+        VChar c -> do { poke (p :: Ptr Word8) (fromIntegral (fromEnum c)); pure VUnit }
+        _ -> error ("poke: value not an Int or Char: " <> showValForDebug bv)
 
 peekByteOffB :: IO Val
 peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
