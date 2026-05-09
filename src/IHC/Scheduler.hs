@@ -1671,7 +1671,25 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     requestedStandard0 <- forM requested $ \n ->
         case HashMap.lookup n baseForImport of
             Just slot | Set.member n ffiBuiltinNames -> pure (Just (n, slot))
-            _ -> resolveRequestedPair targetLm qualPairs slots n
+            _ -> do
+                -- Prefer an FQN-keyed shim from 'builtinEnv' (e.g.
+                -- @Data.ByteString.pack -> bsPackB@) over the source-
+                -- loaded export. Without this, an @import qualified
+                -- Data.ByteString as BS@ + @BS.pack "test"@ at the REPL
+                -- routes to source-loaded @Data.ByteString.pack@, which
+                -- pokes each list element through a @Ptr Word8@ — fine
+                -- for @[Word8]@ inputs (each element is a 'VInt'), but
+                -- aborts on a @[Char]@ input (each element is a 'VChar')
+                -- at @poke: value not an Int@ in 'pokeB'.  The shim's
+                -- 'valToWord8List' handles 'VChar' correctly via
+                -- @fromEnum@; routing through it makes the REPL match
+                -- the entry-source path, where the FQN shim has been
+                -- winning for a while via 'synthFromBuiltin'.  We keep
+                -- 'synthFromBuiltin' for the no-source-export case below.
+                let fqn = lmName targetLm <> BC.pack "." <> n
+                case HashMap.lookup fqn baseForImport of
+                    Just slot -> pure (Just (n, slot))
+                    Nothing   -> resolveRequestedPair targetLm qualPairs slots n
     let preferBuiltinRequested n resolved
             | Set.member n ffiBuiltinNames
             , Just slot <- HashMap.lookup n baseForImport
