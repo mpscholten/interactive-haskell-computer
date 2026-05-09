@@ -40,6 +40,7 @@ import qualified Properties.RoundTrip
 import qualified Properties.SectionDesugar
 import qualified Properties.StringDesugar
 import qualified Properties.Totality
+import qualified Properties.TupleSectionDesugar
 import qualified ReplTest
 import qualified RunFile
 import qualified Unsupported
@@ -57,6 +58,7 @@ main = hspec do
     Properties.SectionDesugar.spec
     Properties.DoDesugar.spec
     Properties.StringDesugar.spec
+    Properties.TupleSectionDesugar.spec
     HsExtMisc.spec
     Hs2010LexNum.spec
     Hs2010Fixity.spec

@@ -137,6 +137,7 @@ test-suite ihc-test
       , Properties.SectionDesugar
       , Properties.StringDesugar
       , Properties.Totality
+      , Properties.TupleSectionDesugar
       , HsExtTypeFams
       , HsExtMisc
       , HsExtRecords
