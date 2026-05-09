@@ -325,7 +325,6 @@ builtins reg =
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
-    , ("Data.ByteString.replicate", bsReplicateB)
     -- 'head' kept shimmed pending source-loaded path validation.
     -- 'index' kept shimmed: source-loaded body uses bare 'length ps'
     -- which the elaborator mis-routes to 'Foldable.length' (no
@@ -3358,18 +3357,6 @@ bsSingletonB = pure $ VFun $ \wT -> do
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
         _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
     bsFromBS (BS.singleton w)
-
-bsReplicateB :: IO Val
-bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
-    nv <- force nT; wv <- force wT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.replicate: first arg not an Int: " <> showValForDebug nv)
-    w <- case wv of
-        VInt i  -> pure (fromIntegral i :: Word8)
-        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-        _       -> error ("BS.replicate: second arg not a Word8: " <> showValForDebug wv)
-    bsFromBS (BS.replicate n w)
 
 bsIndexB :: IO Val
 bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
