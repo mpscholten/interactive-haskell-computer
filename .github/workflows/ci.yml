@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [master, main]
 
+# A new push to a branch supersedes any in-flight runs for the same ref.
+# We *don't* cancel master pushes — every merge gets a full CI pass — but
+# PR/feature branches get the latest run only.  Without this block, the
+# 5-concurrent macOS-14 runner pool gets clogged by stale-commit duplicates.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     # macos-14 is Apple Silicon — IHC currently only targets Apple Silicon.
@@ -19,7 +27,11 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      # NOTE: DeterminateSystems/magic-nix-cache-action@v8 was removed —
+      # its hosted backend has been flapping (HTTP 400 on save, SIGABRT on
+      # post-phase) and is being deprecated in favour of FlakeHub Cache.
+      # We accept cold Nix builds for now; the Linux compile-check job below
+      # gives fast PR feedback while macOS slots are busy.
 
       # Pure-interpreter tests run hermetically via `nix flake check`.
       # The check derivation builds against the nix-pinned source root
@@ -57,3 +69,42 @@ jobs:
           name: test-log
           path: /tmp/ihc-cabal.log
           retention-days: 7
+
+  # Fast compile-only smoke check on Linux.  IHC targets macOS/aarch64 at
+  # runtime (libSystem dlopen, Mach-O cbits dylibs, etc.), so we can't run
+  # the full test suite here — the FFI/cbits path won't resolve.  But the
+  # interpreter source itself is portable Haskell, so a `cabal build all`
+  # on ubuntu-latest catches type errors, unused-binds (-Werror'd) and
+  # API breakage in ~5 minutes — versus 30-90 minutes waiting for a
+  # macOS-14 slot to free up.
+  #
+  # Linux runners on the GitHub free tier have ~20-concurrent capacity vs
+  # 5 for macOS, so this job almost always returns first and gives early
+  # PR feedback when the macOS pool is saturated.
+  linux-compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: '9.10.1'
+          cabal-version: '3.12'
+
+      - name: Install libffi (IHC depends on libffi via Foreign.LibFFI)
+        run: sudo apt-get update && sudo apt-get install -y libffi-dev
+
+      - name: Restore cabal store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: ${{ runner.os }}-ghc-${{ steps.setup.outputs.ghc-version }}-cabal-${{ hashFiles('ihc.cabal', 'cabal.project*') }}
+          restore-keys: |
+            ${{ runner.os }}-ghc-${{ steps.setup.outputs.ghc-version }}-cabal-
+
+      - name: cabal update
+        run: cabal update
+
+      - name: cabal build all (compile smoke check)
+        run: cabal build all --enable-tests
