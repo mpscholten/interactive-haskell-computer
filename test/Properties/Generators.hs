@@ -24,17 +24,24 @@
 module Properties.Generators
     ( genLit
     , genExpr
+    , genIdent
     ) where
 
+import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr)
 import Data.Int (Int64)
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 import Test.QuickCheck
     ( Gen
     , arbitrary
     , choose
+    , elements
     , frequency
+    , sized
     , suchThat
+    , vectorOf
     )
 
 import IHC.AST
@@ -112,8 +119,90 @@ genUnicodeChar = chr <$> frequency
     ]
 
 
--- | Generator for 'Expr'.  Slice 2.A returns 'ELit' only.  The
--- recursion budget will land alongside the first non-leaf
--- constructor (likely 'EApp' / 'ELam').
+-- | Generator for 'Expr', size-bounded via QuickCheck's 'sized'.
+--
+-- Slice 2.D covers leaves 'EVar' \/ 'ELit' and the binding\/
+-- application constructors 'EApp' \/ 'ELam' \/ 'ELet'.  Subsequent
+-- slices add 'EIf' \/ 'ECase' \/ 'EDo' \/ patterns \/ ….
+--
+-- The size budget halves on 'EApp' (two children) and decrements
+-- by one on 'ELam' \/ 'ELet' (single body).  At @size <= 0@ only
+-- atoms are returned, so depth is bounded by @log2 size@ in the
+-- worst case.
 genExpr :: Gen Expr
-genExpr = ELit <$> genLit
+genExpr = sized genExprSized
+
+
+genExprSized :: Int -> Gen Expr
+genExprSized n
+    | n <= 0    = atom
+    | otherwise = frequency
+        [ (3, atom)
+        , (2, EApp <$> half <*> half)
+        , (1, ELam <$> genIdent <*> sub)
+        , (1, ELet <$> genBindings half_n <*> sub)
+        ]
+  where
+    atom   = frequency
+        [ (2, ELit <$> genLit)
+        , (1, EVar <$> genIdent)
+        ]
+    half   = genExprSized (n `div` 2)
+    half_n = max 0 (n `div` 2 - 1)
+    sub    = genExprSized (n - 1)
+
+
+-- | A non-empty list of @let@-bindings (1–3 entries) sized at @n@.
+genBindings :: Int -> Gen [Bind]
+genBindings n = do
+    k <- choose (1, 3)
+    vectorOf k ((,) <$> genIdent <*> genExprSized n)
+
+
+--------------------------------------------------------------------------------
+-- Identifiers
+--------------------------------------------------------------------------------
+
+-- | Generate a lowercase-starting identifier.  Filters Haskell
+-- reserved keywords so the parser does not reinterpret the name
+-- as control-flow syntax (@if@, @case@, @let@, …).  Uppercase
+-- (@TkConId@) names are deferred — the parser routes them through
+-- a separate atom path that may produce 'EVar' or a constructor
+-- application depending on context, and that distinction lands
+-- alongside data\/constructor coverage in a later slice.
+genIdent :: Gen Name
+genIdent = (BC.pack <$> rawIdent) `suchThat` (`Set.notMember` reservedKeywords)
+
+
+-- | Raw identifier characters: @[a-z][a-zA-Z0-9'_]*@.  Bounded
+-- length so error counterexamples stay readable.
+rawIdent :: Gen String
+rawIdent = do
+    c  <- elements ['a' .. 'z']
+    n  <- choose (0, 7)
+    cs <- vectorOf n (elements identTailChars)
+    pure (c : cs)
+
+
+identTailChars :: [Char]
+identTailChars = ['a' .. 'z'] ++ ['A' .. 'Z'] ++ ['0' .. '9'] ++ "'_"
+
+
+-- | Hard reserved keywords that the lexer recognises as their own
+-- token kind ('TkIf', 'TkCase', …) and therefore cannot appear as
+-- 'EVar' \/ 'ELam' \/ 'ELet' bound names.  @forall@ \/ @as@ are
+-- soft keywords (per @test/ParserBugs.hs:117@) and could in
+-- principle appear as identifiers, but we exclude them here to
+-- keep the property focused on round-trip mechanics rather than
+-- the soft-keyword carve-outs.
+reservedKeywords :: Set Name
+reservedKeywords = Set.fromList
+    [ "if", "then", "else", "case", "of"
+    , "let", "in", "where", "do"
+    , "data", "module", "import", "qualified", "hiding"
+    , "newtype", "type", "class", "instance", "deriving"
+    , "infixl", "infixr", "infix"
+    , "forall"        -- soft, but excluded conservatively
+    , "as"            -- soft, but excluded conservatively
+    , "_"             -- wildcard token, not a binder
+    ]

@@ -40,18 +40,53 @@ import IHC.AST
 
 -- | Pretty-print an 'Expr' to source bytes the parser will accept.
 --
--- Phase 2.A first slice: only 'ELit' is reachable.  Constructors
--- the generator does not yet produce raise an explicit @error@ so
--- a future generator extension that forgets to update this
--- function fails loudly instead of silently emitting bogus source.
+-- Constructors the generator does not yet produce raise an
+-- explicit @error@ so a future generator extension that forgets
+-- to update this function fails loudly instead of silently
+-- emitting bogus source.
+--
+-- Slice 2.D additionally covers 'EVar' \/ 'EApp' \/ 'ELam' \/
+-- 'ELet'.  Defensive parens wrap every non-atom: 'EApp' becomes
+-- @(f x)@, 'ELam' becomes @(\\x -> body)@, 'ELet' becomes
+-- @(let { x = e1; y = e2 } in body)@.  Atoms ('EVar', 'ELit')
+-- are emitted bare — they are unambiguous tokens.
 prettyExpr :: Expr -> ByteString
 prettyExpr = \case
-    ELit l -> prettyLit l
-    e      -> error
+    ELit  l        -> prettyLit l
+    EVar  n        -> n
+    EApp  f x      ->
+        "(" <> prettyExpr f <> " " <> prettyExpr x <> ")"
+    ELam  x body   ->
+        "(\\" <> x <> " -> " <> prettyExpr body <> ")"
+    ELet  binds b  ->
+        "(let { " <> prettyBinds binds <> " } in " <> prettyExpr b <> ")"
+    e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"
           <> "  prettyExpr handles; extend both together.\n"
           <> "  Got: " <> takeShow 120 e )
+
+
+-- | Pretty-print a 'let'-binding group.  Bindings are joined by
+-- @\"; \"@ and the whole group is wrapped in @\"{ ... }\"@ at the
+-- 'ELet' call site.  Explicit braces are used in lieu of the
+-- offside rule so the pretty-printer does not have to reason about
+-- column boundaries.
+prettyBinds :: [Bind] -> ByteString
+prettyBinds = bsIntercalate "; " . map prettyBind
+
+
+prettyBind :: Bind -> ByteString
+prettyBind (n, e) = n <> " = " <> prettyExpr e
+
+
+-- | Local helper — 'BS.intercalate' is in @Data.ByteString@ but
+-- we only have @Data.ByteString.Char8@ in scope, and importing
+-- one extra module just for this is heavier than spelling it out.
+bsIntercalate :: ByteString -> [ByteString] -> ByteString
+bsIntercalate _   []       = BS.empty
+bsIntercalate _   [b]      = b
+bsIntercalate sep (b : bs) = b <> sep <> bsIntercalate sep bs
 
 -- | Pretty-print a 'Lit' to its source-level form.
 --
