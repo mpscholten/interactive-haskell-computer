@@ -392,9 +392,14 @@ typeTagOf (VLabel _)                     = BC.pack "Label"
 type InstanceScopeRef = IORef (Set ByteString)
 type ScanHook = ByteString -> IO ()
 
-{-# NOINLINE instanceScopeRef #-}
+-- 'instanceScopeRef' is now a field-projection accessor over
+-- 'legacyClassRunState' (see below).  The four legacy module-level
+-- @IORef@s for per-run class state ('instanceScope',
+-- 'instanceCatalogue', 'superclasses') were collapsed into a single
+-- bundle CAF in PR 3; the names below stay public so existing
+-- callers don't have to update.
 instanceScopeRef :: InstanceScopeRef
-instanceScopeRef = unsafePerformIO (newIORef Set.empty)
+instanceScopeRef = lcrsInstanceScope legacyClassRunState
 
 setSharedClassReg :: IHCHooks -> ClassRegistry -> IO ()
 setSharedClassReg hooks reg = writeIORef (hkSharedClassReg hooks) (Just reg)
@@ -449,9 +454,8 @@ clearInstanceScope = writeIORef instanceScopeRef Set.empty
 -- the eager 'registerOne' would have done up front.
 type InstanceCatalogue = Map ByteString [IO ()]
 
-{-# NOINLINE instanceCatalogueRef #-}
 instanceCatalogueRef :: IORef InstanceCatalogue
-instanceCatalogueRef = unsafePerformIO (newIORef Map.empty)
+instanceCatalogueRef = lcrsInstanceCatalogue legacyClassRunState
 
 -- | Stash a "register one instance of @cls@" closure into the catalogue.
 -- Cheap: just an 'IORef' update. The expensive work (parsing instance
@@ -692,6 +696,36 @@ data IHCHooks = IHCHooks
     , hkThExpToExpr         :: !(IORef ThExpToExprHook)
     }
 
+-- | Bundle of the three module-level per-run class-state IORefs:
+-- the in-scope module set for instance dispatch, the lazy instance
+-- catalogue, and the superclass map.
+--
+-- Allocated once via the 'legacyClassRunState' CAF below.  The three
+-- legacy @global*Ref@-style accessors ('instanceScopeRef',
+-- 'instanceCatalogueRef', 'superclassesRef') are now field
+-- projections on this single record, collapsing three separate
+-- 'unsafePerformIO + IORef + NOINLINE' globals into one allocation.
+data LegacyClassRunState = LegacyClassRunState
+    { lcrsInstanceScope     :: !(IORef (Set ByteString))
+    , lcrsInstanceCatalogue :: !(IORef InstanceCatalogue)
+    , lcrsSuperclasses      :: !(IORef (Map ByteString [ByteString]))
+    }
+
+-- | One-shot allocation of the three per-run class-state IORefs.
+-- Same defaults the legacy individual @{-# NOINLINE #-}@ refs used:
+-- empty 'Set', empty 'Map', empty 'Map'.
+{-# NOINLINE legacyClassRunState #-}
+legacyClassRunState :: LegacyClassRunState
+legacyClassRunState = unsafePerformIO $ do
+    scope     <- newIORef Set.empty
+    catalogue <- newIORef Map.empty
+    supers    <- newIORef Map.empty
+    pure LegacyClassRunState
+        { lcrsInstanceScope     = scope
+        , lcrsInstanceCatalogue = catalogue
+        , lcrsSuperclasses      = supers
+        }
+
 -- | A package of the legacy module-level hook 'IORef's into an
 -- 'IHCHooks' record.  Used while PR 1B threads 'IHCHooks' through
 -- 'eval' / 'force' / 'apply' and every caller without yet migrating
@@ -771,9 +805,8 @@ resetSessionHooks hooks = do
 -- to would require a real type AST and is deferred.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE superclassesRef #-}
 superclassesRef :: IORef (Map ByteString [ByteString])
-superclassesRef = unsafePerformIO (newIORef Map.empty)
+superclassesRef = lcrsSuperclasses legacyClassRunState
 
 -- | Register a class's superclass list.  Idempotent: subsequent
 -- registrations for the same class name overwrite (later modules win,
