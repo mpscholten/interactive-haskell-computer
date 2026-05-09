@@ -80,6 +80,8 @@ prettyExpr = \case
         "(- " <> prettyExpr e <> ")"
     ETuple es      ->
         "(" <> bsIntercalate ", " (map prettyExpr es) <> ")"
+    ELabel n       -> "#" <> n
+    EImplicitRef n -> "?" <> n
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"

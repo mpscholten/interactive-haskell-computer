@@ -173,8 +173,10 @@ genExprSized n
         ]
   where
     atom   = frequency
-        [ (2, ELit <$> genLit)
-        , (1, EVar <$> genIdent)
+        [ (2, ELit         <$> genLit)
+        , (1, EVar         <$> genIdent)
+        , (1, ELabel       <$> genIdent)   -- @#name@ overloaded label
+        , (1, EImplicitRef <$> genIdent)   -- @?name@ implicit ref
         ]
     half    = genExprSized (n `div` 2)
     third   = genExprSized (n `div` 3)
