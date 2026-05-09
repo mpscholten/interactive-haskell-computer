@@ -51,6 +51,7 @@ library
       , IHC.PackageStore
       , IHC.Parser
       , IHC.PatSyn
+      , IHC.Pretty
       , IHC.Repl
       , IHC.Scan
       , IHC.Scheduler
@@ -129,6 +130,8 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Properties.Generators
+      , Properties.RoundTrip
       , Properties.Totality
       , HsExtTypeFams
       , HsExtMisc
