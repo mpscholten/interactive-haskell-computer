@@ -35,6 +35,7 @@ import qualified Hs2010DataDecl
 import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ParserBugs
+import qualified Properties.DoDesugar
 import qualified Properties.RoundTrip
 import qualified Properties.SectionDesugar
 import qualified Properties.Totality
@@ -53,6 +54,7 @@ main = hspec do
     Properties.Totality.spec
     Properties.RoundTrip.spec
     Properties.SectionDesugar.spec
+    Properties.DoDesugar.spec
     HsExtMisc.spec
     Hs2010LexNum.spec
     Hs2010Fixity.spec
