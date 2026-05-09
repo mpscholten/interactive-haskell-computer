@@ -46,6 +46,7 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Int (Int64)
+import Data.List (foldl')
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (Ptr)
@@ -239,8 +240,16 @@ emptyEnv = HashMap.empty
 extendEnv :: Name -> Thunk -> Env -> Env
 extendEnv = HashMap.insert
 
+-- | Strict left fold so the chain of intermediate 'HashMap.insert'
+-- thunks doesn't accumulate. Called after every successful pattern
+-- match (Eval.tryAlts), every let-binding allocation, every module-
+-- import qualified-slot install, etc. — small per call, but in the
+-- hot path. Semantics match 'foldr' for our callers because every
+-- caller builds 'kvs' from a unique-name source ('zip names slots'
+-- for pattern bindings; 'qualPairs' for imports) so no internal
+-- duplicates exist where left-vs-right fold direction would matter.
 extendEnvMany :: [(Name, Thunk)] -> Env -> Env
-extendEnvMany kvs env = foldr (\(k, v) e -> HashMap.insert k v e) env kvs
+extendEnvMany kvs env = foldl' (\e (k, v) -> HashMap.insert k v e) env kvs
 
 lookupEnv :: Name -> Env -> Maybe Thunk
 lookupEnv = HashMap.lookup

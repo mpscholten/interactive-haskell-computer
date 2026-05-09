@@ -53,11 +53,13 @@ import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
+import qualified Data.HashSet as HashSet
+import Data.HashSet (HashSet)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Data.List (isPrefixOf, sortOn)
+import Data.List (isPrefixOf, sortOn, foldl')
 import Control.Monad (forM, forM_, foldM, when)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import System.Directory (doesFileExist)
@@ -6657,62 +6659,83 @@ syntheticClassMethodNames = goExpr
 
     goAlt (Alt _ e) = goExpr e
 
+-- | Phase 2.18 perf: internal accumulator is a 'HashSet ByteString'.
+-- The original used '[ByteString]' with '++' and 'elem'-membership,
+-- which is O(n × k²) when the binding-discovery walker calls
+-- 'freeVars' on every binding it materialises. Switching to a hash
+-- set makes membership O(1) per check and the unions allocation-
+-- bounded by unique-element count instead of total expression size.
+-- Public type stays '[ByteString]'; the result is now deduplicated
+-- (callers that wrap with 'nubBS' don't need to anymore — the wraps
+-- are still correct, just no-ops).
 freeVars :: Expr -> [ByteString]
-freeVars = goAll []
+freeVars e = HashSet.toList (goAll HashSet.empty e)
   where
+    goAll :: HashSet ByteString -> Expr -> HashSet ByteString
     goAll bound = \case
         EVar n
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELit _      -> []
-        EApp f x    -> goAll bound f ++ goAll bound x
-        ELam n e    -> goAll (n : bound) e
-        ELet bs e   ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-               ++ goAll bound' e
-        ECase s as  -> goAll bound s ++ concatMap (goAlt bound) as
-        EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
+            | HashSet.member n bound -> HashSet.empty
+            | otherwise              -> HashSet.singleton n
+        ELit _      -> HashSet.empty
+        EApp f x    -> HashSet.union (goAll bound f) (goAll bound x)
+        ELam n e'   -> goAll (HashSet.insert n bound) e'
+        ELet bs e'  ->
+            let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+            in HashSet.union
+                   (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+                   (goAll bound' e')
+        ECase s as  -> HashSet.union
+                           (goAll bound s)
+                           (HashSet.unions [ goAlt bound a | a <- as ])
+        EIf c t e'  -> HashSet.unions [goAll bound c, goAll bound t, goAll bound e']
         EDo stmts   -> goStmts bound stmts
-        ENeg e      -> goAll bound e
-        ETuple es   -> concatMap (goAll bound) es
-        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
-        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
-        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
-        EImplicitRef _  -> []
-        EImplicitLet bs e ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
+        ENeg e'     -> goAll bound e'
+        ETuple es   -> HashSet.unions [ goAll bound x | x <- es ]
+        ERecordCon _ fields -> HashSet.unions [ goAll bound x | (_, x) <- fields ]
+        ERecordWild _   -> HashSet.empty   -- fields resolved by scheduler; no expr free vars
+        ERecordUpdate e' fields ->
+            HashSet.union
+                (goAll bound e')
+                (HashSet.unions [ goAll bound x | (_, x) <- fields ])
+        EImplicitRef _  -> HashSet.empty
+        EImplicitLet bs e' ->
+            let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+            in HashSet.union
+                   (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+                   (goAll bound' e')
         ESplice inner   -> goAll bound inner
-        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        EQuote _        -> HashSet.empty   -- Phase 2.12: quote body is not evaluated; treat as no free vars
         -- QuasiQuoter: the QQ function name is a free var that must be
         -- discovered so the dispatch sees the imported QuasiQuoter value.
         EQuasiQuote n _
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELabel _        -> []   -- Phase 3.5: labels have no free variables
+            | HashSet.member n bound -> HashSet.empty
+            | otherwise              -> HashSet.singleton n
+        ELabel _        -> HashSet.empty   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
-        ETypedMethod{}  -> []   -- elaborator product; no EVar refs
-        EGuardFail      -> []
+        ETypedMethod{}  -> HashSet.empty   -- elaborator product; no EVar refs
+        EGuardFail      -> HashSet.empty
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
-    goStmts _     []                  = []
-    goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
-    goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
-    goStmts bound (SBangBind n e : rest) = goAll bound e ++ goStmts (n : bound) rest
+    goStmts :: HashSet ByteString -> [Stmt] -> HashSet ByteString
+    goStmts _     []                  = HashSet.empty
+    goStmts bound (SExpr e'  : rest)  = HashSet.union (goAll bound e') (goStmts bound rest)
+    goStmts bound (SBind n e' : rest) = HashSet.union (goAll bound e') (goStmts (HashSet.insert n bound) rest)
+    goStmts bound (SBangBind n e' : rest) = HashSet.union (goAll bound e') (goStmts (HashSet.insert n bound) rest)
     goStmts bound (SLet bs   : rest)  =
-        let names  = map fst bs
-            bound' = names ++ bound
-        in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-           ++ goStmts bound' rest
+        let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+        in HashSet.union
+               (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+               (goStmts bound' rest)
     goStmts bound (SImplicitLet bs : rest) =
-        concatMap (\(_, rhs) -> goAll bound rhs) bs
-           ++ goStmts bound rest
+        HashSet.union
+            (HashSet.unions [ goAll bound rhs | (_, rhs) <- bs ])
+            (goStmts bound rest)
 
-    goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
+    goAlt :: HashSet ByteString -> Alt -> HashSet ByteString
+    goAlt bound (Alt p e') =
+        let bound' = foldl' (flip HashSet.insert) bound (patBound p)
+        in goAll bound' e'
 
     patBound :: Pat -> [ByteString]
     patBound (PVar n)            = [n]
