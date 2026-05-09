@@ -323,7 +323,15 @@ builtins reg =
     -- "Builtin modules: minimum surface only" rule.
     , ("not",      notB)
     -- Boolean
-    , ("&&",       andB)
+    --
+    -- (&&) is deliberately omitted: source body lives at
+    --   ~/.cache/ihc/sources/ghc-prim-0.12.0/GHC/Classes.hs:597-599
+    --     (&&) :: Bool -> Bool -> Bool
+    --     True  && x  =  x
+    --     False && _  =  False
+    -- which is interpretable by the source-loaded GHC.Classes path.
+    -- Per CLAUDE.md "Builtin modules: minimum surface only", any
+    -- symbol with .hs source must be interpreted, not shimmed.
     , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("concatMap", concatMapB)
@@ -1500,15 +1508,6 @@ notB :: IO Val
 notB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
     pure (boolVal (not (isTruthy av)))
-
-andB :: IO Val
-andB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    if isTruthy av
-        then do
-            bv <- force legacyHooks b
-            pure (boolVal (isTruthy bv))
-        else pure (boolVal False)
 
 orB :: IO Val
 orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do

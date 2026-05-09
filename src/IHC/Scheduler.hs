@@ -5304,6 +5304,15 @@ resolveFallbackSource mOwner name = do
         , BC.pack "GHC.Internal.Maybe"
         , BC.pack "GHC.Internal.IO"
         , BC.pack "GHC.Maybe"
+        -- ghc-prim's GHC.Classes is the actual definer of (&&), (||),
+        -- (==), (/=), Ord helpers, etc.  Prelude/GHC.Internal.Base only
+        -- re-export them; their own .hs source has no LHS that
+        -- 'findOrResolveLhs' could match for these names.  Without
+        -- GHC.Classes in scope, an unbound bare reference to (&&) from
+        -- a NoImport / implicit-Prelude entry program (the typical test
+        -- fixture shape) walks the re-exporters, finds no LHS, and
+        -- ends up reporting `unbound variable '&&'`.
+        , BC.pack "GHC.Classes"
         ]
 
     -- Shared body-or-discover walker used by both the scoped and
