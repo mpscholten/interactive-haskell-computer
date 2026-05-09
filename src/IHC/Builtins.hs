@@ -318,18 +318,22 @@ builtins reg =
     -- @compare 'a' 'b'@, @compare "abc" "abd"@, and @compare Red Blue@
     -- on @deriving Ord@ types all keep working.  Per CLAUDE.md's
     -- "Builtin modules: minimum surface only" rule.
-    , ("not",      notB)
-    -- Boolean
     --
-    -- (&&) is deliberately omitted: source body lives at
-    --   ~/.cache/ihc/sources/ghc-prim-0.12.0/GHC/Classes.hs:597-599
+    -- (&&), (||), and `not` are deliberately omitted — their
+    -- source bodies live at
+    --   ~/.cache/ihc/sources/ghc-prim-0.12.0/GHC/Classes.hs:597-609
     --     (&&) :: Bool -> Bool -> Bool
     --     True  && x  =  x
     --     False && _  =  False
-    -- which is interpretable by the source-loaded GHC.Classes path.
-    -- Per CLAUDE.md "Builtin modules: minimum surface only", any
+    --     (||) :: Bool -> Bool -> Bool
+    --     True  || _  =  True
+    --     False || x  =  x
+    --     not  :: Bool -> Bool
+    --     not True  = False
+    --     not False = True
+    -- which the source-loaded GHC.Classes path interprets.  Per
+    -- CLAUDE.md "Builtin modules: minimum surface only", any
     -- symbol with .hs source must be interpreted, not shimmed.
-    , ("||",       orB)
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
@@ -1499,20 +1503,6 @@ isTruthy (VCon "False" _) = False
 isTruthy (VInt 0)         = False
 isTruthy (VInt _)         = True
 isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
-
-notB :: IO Val
-notB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    pure (boolVal (not (isTruthy av)))
-
-orB :: IO Val
-orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    if isTruthy av
-        then pure (boolVal True)
-        else do
-            bv <- force legacyHooks b
-            pure (boolVal (isTruthy bv))
 
 --------------------------------------------------------------------------------
 -- Phase 2.3: type-class dispatch for Eq, Ord, Show
