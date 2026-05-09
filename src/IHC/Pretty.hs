@@ -30,7 +30,10 @@ module IHC.Pretty
     ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Char (chr, ord)
+import Data.Word (Word8)
 
 import IHC.AST
 
@@ -67,13 +70,56 @@ prettyLit = \case
     -- excludes NaN \/ Infinity so this branch stays inside the
     -- finite-double subset the parser handles.
     LFloat   d -> BC.pack (show d)
-    -- LChar / LStr land in slice 2.C.  Until then they are
-    -- unreachable through 'genLit'; an explicit @error@ here keeps
-    -- generator + pretty in lockstep.
-    l          -> error
-        ( "IHC.Pretty.prettyLit: unsupported Lit constructor.\n"
-          <> "  Slice 2.B covers LInt / LInteger / LFloat;\n"
-          <> "  LChar / LStr land in 2.C.  Got: " <> takeShow 80 l )
+    LChar    c -> "'" <> BC.pack (escapeCharLit c) <> "'"
+    LStr    bs -> "\"" <> BS.concatMap escapeStrByte bs <> "\""
+
+
+-- | Escape a 'Char' for use inside a single-quote 'LChar' literal.
+-- Printable ASCII (except @'@, @\\@, and the three TkTick
+-- triggers — see below) is emitted verbatim; the standard
+-- whitespace escapes ('\n' \/ '\t' \/ '\r') get their named
+-- forms; everything else (control bytes, non-ASCII Unicode up to
+-- 'maxBound :: Char') uses the @\\<decimal>@ form, which the
+-- lexer accepts up to 0x10FFFF (see @test/ParserBugs.hs:55@).
+--
+-- Three printable-ASCII chars need numeric escaping despite
+-- otherwise being legal char-literal contents: @(@, @[@, @{@.
+-- The lexer disambiguates @\'(@ \/ @\'[@ \/ @\'{@ as a
+-- 'IHC.Lexer.TkTick' (DataKinds-style promoted-tuple\/list\/
+-- record literal), not as the start of a 'Char' literal — see
+-- @src/IHC/Lexer.hs:618-635@.  Without escaping, @prettyLit
+-- (LChar '(') = "'('"@ would be lexed as @TkTick TkLParen
+-- TkChar@ and the parser would reject it.
+escapeCharLit :: Char -> String
+escapeCharLit c
+    | c == '\\'                    = "\\\\"
+    | c == '\''                    = "\\'"
+    | c == '\n'                    = "\\n"
+    | c == '\t'                    = "\\t"
+    | c == '\r'                    = "\\r"
+    -- TkTick disambiguation triggers — must escape numerically.
+    | c == '('                     = "\\" <> show (ord c)
+    | c == '['                     = "\\" <> show (ord c)
+    | c == '{'                     = "\\" <> show (ord c)
+    | ord c >= 0x20 && ord c < 0x7F = [c]            -- printable ASCII
+    | otherwise                    = "\\" <> show (ord c)
+
+
+-- | Escape a single byte for use inside a 'LStr' double-quote
+-- literal.  Always appends @\\&@ after a numeric escape so the
+-- next character (whatever it is) cannot extend the digit run —
+-- @\\65A@ is unambiguous, but @\\65@ followed by another digit
+-- @5@ in source would re-parse as @\\655@.  @\\&@ is a
+-- zero-width separator that solves it cheaply.
+escapeStrByte :: Word8 -> ByteString
+escapeStrByte b
+    | b == 0x5C                = "\\\\"           -- '\\'
+    | b == 0x22                = "\\\""           -- '\"'
+    | b == 0x0A                = "\\n"
+    | b == 0x09                = "\\t"
+    | b == 0x0D                = "\\r"
+    | b >= 0x20 && b < 0x7F    = BS.singleton b   -- printable ASCII
+    | otherwise                = BC.pack ("\\" <> show b <> "\\&")
 
 
 -- | Truncate a 'Show' rendering to keep error messages bounded

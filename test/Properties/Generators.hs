@@ -26,15 +26,35 @@ module Properties.Generators
     , genExpr
     ) where
 
+import Data.Char (chr)
 import Data.Int (Int64)
 
-import Test.QuickCheck (Gen, arbitrary, choose, frequency, suchThat)
+import Test.QuickCheck
+    ( Gen
+    , arbitrary
+    , choose
+    , frequency
+    , suchThat
+    )
 
 import IHC.AST
 
 
--- | Generator for 'Lit'.  Slice 2.B covers 'LInt' \/ 'LInteger'
--- \/ 'LFloat'; 'LChar' \/ 'LStr' land in 2.C.
+-- | Generator for 'Lit' /at expression position/.  Slice 2.C
+-- covers 'LInt' \/ 'LInteger' \/ 'LFloat' \/ 'LChar'.
+--
+-- Notably absent: 'LStr'.  Source-level string literals like
+-- @\"hello\"@ are desugared by the parser to a cons-chain of
+-- 'LChar' values — @EApp (EApp (EVar \":\") (ELit (LChar 'h')))
+-- ...@ — see @src/IHC/Parser.hs:3248@.  @ELit (LStr ...)@
+-- therefore never arises from a source-level expression; it
+-- survives only at /pattern/ position (see
+-- @src/IHC/Parser.hs:2560@).  Emitting an 'LStr' from this
+-- expression-level generator produces an AST shape no source can
+-- map to, so round-trip would always fail.  Generating proper
+-- string literals in expression position requires the cons-chain
+-- machinery in 'IHC.Pretty' \/ 'genExpr' and lands once 'EApp' \/
+-- 'EVar' enter the generator.
 --
 -- All payloads are non-negative — the parser shapes source-level
 -- @-5@ as @ENeg (ELit (LInt 5))@ etc., so emitting a negative
@@ -52,6 +72,7 @@ genLit = frequency
     [ (3, LInt     <$> choose (0, maxBound :: Int64))
     , (1, LInteger <$> genBigInteger)
     , (2, LFloat   <$> genFiniteNonNegDouble)
+    , (2, LChar    <$> genUnicodeChar)
     ]
 
 
@@ -75,6 +96,20 @@ genBigInteger = do
 genFiniteNonNegDouble :: Gen Double
 genFiniteNonNegDouble =
     abs <$> arbitrary `suchThat` (\d -> not (isNaN d || isInfinite d))
+
+
+-- | A 'Char' across the full Unicode range the parser accepts —
+-- @[0, 0x10FFFF]@ inclusive — biased toward printable ASCII so
+-- the bulk of generated programs look like real Haskell.
+-- 'IHC.Lexer' rejects escapes @> 0x10FFFF@ (see
+-- @test/ParserBugs.hs:55@), so 'maxBound :: Char' is the cap.
+genUnicodeChar :: Gen Char
+genUnicodeChar = chr <$> frequency
+    [ (50, choose (0x20, 0x7E))            -- printable ASCII
+    , ( 5, choose (0x00, 0x1F))            -- C0 control bytes
+    , ( 5, choose (0x80, 0xFFFF))          -- BMP non-ASCII
+    , ( 2, choose (0x10000, 0x10FFFF))     -- supplementary planes
+    ]
 
 
 -- | Generator for 'Expr'.  Slice 2.A returns 'ELit' only.  The
