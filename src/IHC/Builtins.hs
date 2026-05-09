@@ -337,18 +337,25 @@ builtins reg =
     , ("show",     showDispatch reg)
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
-    --   unpack    — internal recursive function "non-exhaustive patterns"
-    --   append    — `append = mappend`, Monoid dispatch yields a
-    --               <<ihc-method-placeholder>> rather than the BS instance
-    --   concat    — `concat = mconcat`, same Monoid dispatch gap
+    --   append    — `append = mappend`; dispatcher routes the strict
+    --               ByteString through Data.ByteString.Lazy's Monoid
+    --               instance and falls into Empty/Chunk pattern match.
+    --   concat    — `concat = mconcat`; resolves to Foldable.concat
+    --               (`concatMap id`) and crashes with
+    --               `concatMap: not a list: <BS...>`.
     --   singleton — uses `allBytes` 256-byte static buffer; hits
-    --               `expected Ptr: <:>` on the Ptr cons
-    --   replicate — silent wrong output ("/\NUL\NUL" for `replicate 3 65`)
+    --               `expected Ptr: <:>` on the Ptr cons.
+    --   replicate — silent wrong output ("/\NUL\NUL" for `replicate 3 65`).
     --   index     — body calls `length ps`; the polymorphic `length`
-    --               routes to Foldable.length, which has no BS instance
-    -- The other 7 entries (empty, null, length, pack, take, drop, head)
-    -- source-load cleanly and are dropped in this change.
-    , ("Data.ByteString.unpack",    bsUnpackB)
+    --               routes to Foldable.length, which has no BS instance.
+    -- Graduated to source-loaded:
+    --   unpack    — needed `plusPtrCore`/`minusPtrCore` cross-rep handling
+    --               (mirrors the `eqVals` fix in commit f902b59) so
+    --               `Data.ByteString.foldr`'s pointer arithmetic works on
+    --               `VCon "Ptr" [VPrimObj (PrimPtr _)]` produced by the
+    --               source body of `unsafeForeignPtrToPtr`.
+    --   The 7 entries (empty, null, length, pack, take, drop, head)
+    --   graduated cleanly in commit e9d99f0.
     , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
@@ -3311,24 +3318,50 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
 plusPtrB :: IO Val
 plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VInt n) ->
-            pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-        -- A ForeignPtr flowing through plusPtr must advance by @n@
-        -- bytes just like a raw Ptr would; dropping @n@ silently
-        -- breaks callers that derive subsequent reads off the
-        -- offset pointer (memchr/memcmp/peek).
-        (VPrimObj (PrimForeignPtr fp), VInt n) ->
-            pure (VPrimObj (PrimForeignPtr (plusForeignPtr fp (fromIntegral n))))
-        _ -> error ("plusPtr: bad args: " <> showValForDebug av)
+    plusPtrCore av bv
+
+-- | Cross-representation 'plusPtr': unwraps source-loaded
+-- @VCon \"Ptr\" [t]@ wrappers around a host-primitive 'PrimPtr'
+-- before recursing.  Same gap addressed for 'Eq Ptr' by commit
+-- @f902b59@ ('eqVals' cross-rep cases) — repeated here for
+-- 'plusPtr' so 'Data.ByteString.foldr' (and thus 'unpack') can run
+-- under interpretation: the source body @unsafeForeignPtrToPtr
+-- (ForeignPtr fo _) = Ptr fo@ wraps the extracted primitive Ptr in
+-- a 'VCon \"Ptr\" [_]', because source-loaded 'Ptr' resolves to the
+-- ordinary data constructor, not the special-cased 'ptrCtorV' in
+-- the global env.
+plusPtrCore :: Val -> Val -> IO Val
+plusPtrCore av bv = case (av, bv) of
+    (VPrimObj (PrimPtr p), VInt n) ->
+        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
+    -- A ForeignPtr flowing through plusPtr must advance by @n@
+    -- bytes just like a raw Ptr would; dropping @n@ silently
+    -- breaks callers that derive subsequent reads off the
+    -- offset pointer (memchr/memcmp/peek).
+    (VPrimObj (PrimForeignPtr fp), VInt n) ->
+        pure (VPrimObj (PrimForeignPtr (plusForeignPtr fp (fromIntegral n))))
+    (VCon "Ptr" [t], _) -> do
+        t' <- force legacyHooks t
+        plusPtrCore t' bv
+    _ -> error ("plusPtr: bad args: " <> showValForDebug av)
 
 minusPtrB :: IO Val
 minusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
-            pure (VInt (fromIntegral (p `minusPtr` q)))
-        _ -> error ("minusPtr: bad args: " <> showValForDebug av)
+    minusPtrCore av bv
+
+-- | Cross-representation 'minusPtr'; see 'plusPtrCore'.
+minusPtrCore :: Val -> Val -> IO Val
+minusPtrCore av bv = case (av, bv) of
+    (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
+        pure (VInt (fromIntegral (p `minusPtr` q)))
+    (VCon "Ptr" [t], _) -> do
+        t' <- force legacyHooks t
+        minusPtrCore t' bv
+    (_, VCon "Ptr" [t]) -> do
+        t' <- force legacyHooks t
+        minusPtrCore av t'
+    _ -> error ("minusPtr: bad args: " <> showValForDebug av)
 
 nullPtrB :: IO Val
 nullPtrB = pure (VPrimObj (PrimPtr nullPtr))
@@ -3421,14 +3454,6 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
 
-bsUnpackB :: IO Val
-bsUnpackB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    (fp, len) <- bsValPayload av
-    ws <- withForeignPtr fp $ \ptr ->
-        mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
-    wordsToConsList ws
-
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString
 bsValToBS v = do
@@ -3504,14 +3529,6 @@ bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
     BC.putStrLn bs
     hFlush stdout
     pure VUnit
-
-wordsToConsList :: [Word8] -> IO Val
-wordsToConsList []     = pure (VCon "[]" [])
-wordsToConsList (w:ws) = do
-    hT <- newWHNFThunk (VInt (fromIntegral w))
-    tV <- wordsToConsList ws
-    tT <- newWHNFThunk tV
-    pure (VCon ":" [hT, tT])
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
