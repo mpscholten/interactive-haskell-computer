@@ -30,9 +30,18 @@
 --
 --   * @(-1)@ is @ENeg@, not a right section — so @-@ is excluded
 --     from the operator pool.
---   * Record-dot sections (@(.field)@) and composition sections
---     (@(.)@, @(. f)@, @(f .)@) follow a different desugaring
---     path and are not exercised here.
+--
+-- Composition sections (@(.)@, @(. f)@, @(f .)@) ARE covered:
+-- the parser at @IHC.Parser:3354@ branches on 'TkDot' and routes
+-- to a path whose result shape matches the generic left\/right
+-- section desugaring, so we just include @.@ in the operator
+-- pool.
+--
+-- Record-dot sections (@(.field)@, with no space between @.@
+-- and @field@) are also covered as a dedicated 'RecordDot'
+-- shape — the parser desugars them to
+-- @\\\$s -> \$fldProj\$field \$s@ where @\$fldProj\$@ is the
+-- synthetic key from 'IHC.Parser.recordDotProjName'.
 module Properties.SectionDesugar (spec) where
 
 import Control.Exception (SomeException, fromException, try)
@@ -65,11 +74,12 @@ import Properties.Generators (genExpr, genIdent)
 --------------------------------------------------------------------------------
 
 data SectionShape
-    = RightOp       !Name !Expr   -- (op e)   → \$s -> $s op e
-    | LeftOp        !Expr !Name   -- (e op)   → \$s -> e op $s
-    | RightBacktick !Name !Expr   -- (`f` e)  → \$s -> f $s e
-    | LeftBacktick  !Expr !Name   -- (e `f`)  → \$s -> f e $s
-    | OpAsValue     !Name         -- (op)     → EVar op
+    = RightOp       !Name !Expr   -- (op e)    → \$s -> $s op e
+    | LeftOp        !Expr !Name   -- (e op)    → \$s -> e op $s
+    | RightBacktick !Name !Expr   -- (`f` e)   → \$s -> f $s e
+    | LeftBacktick  !Expr !Name   -- (e `f`)   → \$s -> f e $s
+    | OpAsValue     !Name         -- (op)      → EVar op
+    | RecordDot     !Name         -- (.field)  → \$s -> $fldProj$field $s
     deriving Show
 
 
@@ -83,11 +93,16 @@ sectionParam = "$s"
 --
 --   * @-@      — @(-1)@ is @ENeg (ELit (LInt 1))@, not a right
 --                section (see @IHC.Parser:3391@).
---   * @.@      — special-cased for record-dot \/ composition
---                sections via their own parser arms.
 --   * @!@, @$@ — overloaded with BangPatterns and TH splice; the
 --                parser handles them but the section path has
 --                edge cases we don't exercise yet.
+--
+-- @.@ /is/ included: although the parser at @IHC.Parser:3354@
+-- routes 'TkDot' through a record-dot \/ composition-section
+-- branch instead of the generic operator path, all three
+-- composition shapes (@(.)@, @(. f)@, @(f .)@) produce results
+-- that match the generic 'OpAsValue' \/ 'RightOp' \/ 'LeftOp'
+-- desugaring.
 safeOpNames :: [Name]
 safeOpNames =
     [ "+", "*", "++"
@@ -95,6 +110,7 @@ safeOpNames =
     , "&&", "||"
     , ":"
     , "<>", "<$>", "<*>", ">>=", ">>"
+    , "."
     ]
 
 
@@ -109,6 +125,7 @@ genSectionShape = oneof
     , RightBacktick <$> genIdent <*> genExpr
     , LeftBacktick  <$> genExpr <*> genIdent
     , OpAsValue     <$> elements safeOpNames
+    , RecordDot     <$> genIdent
     ]
 
 
@@ -119,6 +136,10 @@ prettySection = \case
     RightBacktick f e  -> "(`" <> f <> "` " <> prettyExpr e <> ")"
     LeftBacktick  e f  -> "(" <> prettyExpr e <> " `" <> f <> "`)"
     OpAsValue     op   -> "(" <> op <> ")"
+    -- Record-dot section: NO space between '.' and field name.
+    -- Adjacency is what triggers the record-dot path at
+    -- @IHC.Parser:3358@ (vs. composition at line 3374).
+    RecordDot     n    -> "(." <> n <> ")"
 
 
 -- | The AST shape the parser /should/ produce for the given
@@ -139,6 +160,9 @@ expectedDesugar = \case
             (EApp (EApp (EVar f) e) (EVar sectionParam))
     OpAsValue op ->
         EVar op
+    RecordDot n ->
+        ELam sectionParam
+            (EApp (EVar ("$fldProj$" <> n)) (EVar sectionParam))
 
 
 --------------------------------------------------------------------------------
@@ -183,5 +207,5 @@ spec :: Spec
 spec =
     describe "Property — section desugaring (Phase 2.M)" $
         modifyMaxSuccess (const 500) $
-            prop "(op e), (e op), (`f` e), (e `f`), (op) all desugar to the documented lambda forms"
+            prop "(op e), (e op), (`f` e), (e `f`), (op), (.field) all desugar to the documented lambda forms"
                 prop_section_desugar
