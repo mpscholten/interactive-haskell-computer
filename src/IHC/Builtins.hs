@@ -328,7 +328,6 @@ builtins reg =
     -- CLAUDE.md "Builtin modules: minimum surface only", any
     -- symbol with .hs source must be interpreted, not shimmed.
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
-    , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
@@ -2152,38 +2151,6 @@ isUnboxedTupleConName bs = case BC.unpack bs of
            in not (null inner) && last inner == '#'
               && all (\c -> c == ',' || c == '#') inner
     _ -> False
-
--- | @concatMap :: (a -> [b]) -> [a] -> [b]@ — builtin so that our
--- list-comprehension desugar ('IHC.Parser.parseListComp') and the
--- @Monad []@ instance body in @GHC.Internal.Base@ ('>>=' via the
--- list comprehension desugar) don't depend on @concatMap@ being in
--- the caller's env.  @GHC.Internal.Base@ does not import
--- @GHC.Internal.List@ (where concatMap is defined in source), so
--- without a builtin the Monad [] method body throws "unbound" at
--- force time and the dispatcher falls through to IO.
-concatMapB :: IO Val
-concatMapB = pure $ VFun $ \ft -> pure $ VFun $ \xst -> do
-    f  <- force legacyHooks ft
-    xs <- force legacyHooks xst
-    go f xs
-  where
-    go _ (VCon "[]" _) = pure (VCon "[]" [])
-    go f (VCon ":" [h, t]) = do
-        -- @f h@ is a list; concatenate with recursion on tail.
-        fhv   <- apply legacyHooks f h
-        tv    <- force legacyHooks t
-        rest  <- go f tv
-        append fhv rest
-    go _ other = error ("concatMap: not a list: " <> showValForDebug other)
-
-    append (VCon "[]" _)     ys = pure ys
-    append (VCon ":" [h, t]) ys = do
-        tv    <- force legacyHooks t
-        rest  <- append tv ys
-        restT <- newWHNFThunk rest
-        pure (VCon ":" [h, restT])
-    append other _ =
-        error ("concatMap.append: not a list: " <> showValForDebug other)
 
 -- Phase 3.5: OverloadedLabels ------------------------------------------------
 
