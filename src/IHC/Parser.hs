@@ -2116,7 +2116,20 @@ parseLet ctx cur0 = do
                 case tkKind eqTok of
                     TkEq -> do
                         (e, cur4) <- parseExpr rhsCtx cur3
-                        pure (Right (pat, e), cur4)
+                        -- @let !x = e@ is just a strict simple-name binding;
+                        -- since IHC currently ignores the strictness annotation
+                        -- (Parser.hs:20) we strip the bang and treat it as a
+                        -- normal @Left (x, e)@ binding.  This matters for
+                        -- mixed multi-binding lets like
+                        --   @let !d = ...; go_up x = ... d ... in ...@
+                        -- (e.g. @GHC.Enum.efdtIntUp@): pattern bindings are
+                        -- desugared via a @case@-projection that only binds the
+                        -- pattern's variables inside the alt's body, not in
+                        -- the surrounding @ELet@ siblings, so without this
+                        -- strip the inner @go_up@ would see @d@ as unbound.
+                        case pat of
+                            PBang (PVar n) -> pure (Left (n, e), cur4)
+                            _              -> pure (Right (pat, e), cur4)
                     _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
               | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
 

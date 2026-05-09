@@ -973,12 +973,10 @@ builtins reg =
     , ("testBit",      testBitB)
     , ("clearBit",     clearBitB)
     , ("setBit",       setBitB)
-    -- Power operator and range
+    -- Power operator
     , ("^",            powOpB)
     , ("^^",           powFloatOpB)
     , ("**",           powFloatOpB)
-    , ("enumFromTo",   enumFromToB)
-    , ("enumFromThenTo", enumFromThenToB)
     -- Phase 2.10a: concurrency primitives.  forkIO is backed by GHC's
     -- RTS thread primitive (`fork#` in GHC.Internal.Conc.Sync), so the
     -- module-qualified names forward to the same host operation as the bare
@@ -5276,65 +5274,6 @@ powFloatOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         toD (VInt n)   = fromIntegral n
         toD v          = error ("(^^)/(** ): non-numeric: " <> showValForDebug v)
     pure (VFloat (toD av ** toD bv))
-
---------------------------------------------------------------------------------
--- Arithmetic sequences: enumFromTo, enumFromThenTo
---------------------------------------------------------------------------------
-
--- | @enumFromTo lo hi@ builds @[lo..hi]@. Works for Int and Char.
-enumFromToB :: IO Val
-enumFromToB = pure $ VFun $ \loT -> pure $ VFun $ \hiT -> do
-    lov <- force legacyHooks loT
-    hiv <- force legacyHooks hiT
-    case (lov, hiv) of
-        (VInt lo, VInt hi) -> buildIntList lo hi
-        (VChar lo, VChar hi) ->
-            buildIntList (fromIntegral (fromEnum lo)) (fromIntegral (fromEnum hi))
-            >>= charifyList
-        _ -> error ("enumFromTo: non-Int/Char args: "
-                    <> showValForDebug lov <> " " <> showValForDebug hiv)
-  where
-    buildIntList :: Int64 -> Int64 -> IO Val
-    buildIntList lo hi
-        | lo > hi   = pure (VCon "[]" [])
-        | otherwise = do
-            hT   <- newWHNFThunk (VInt lo)
-            rest <- buildIntList (lo + 1) hi
-            tT   <- newWHNFThunk rest
-            pure (VCon ":" [hT, tT])
-    charifyList :: Val -> IO Val
-    charifyList (VCon "[]" _) = pure (VCon "[]" [])
-    charifyList (VCon ":" [hT, tT]) = do
-        hv <- force legacyHooks hT
-        case hv of
-            VInt n -> do
-                cT   <- newWHNFThunk (VChar (toEnum (fromIntegral n)))
-                rest <- force legacyHooks tT >>= charifyList
-                rT   <- newWHNFThunk rest
-                pure (VCon ":" [cT, rT])
-            _ -> error "charifyList: expected VInt"
-    charifyList v = error ("charifyList: bad list: " <> showValForDebug v)
-
--- | @enumFromThenTo lo step hi@ builds @[lo, step..hi]@. Works for Int and Char.
-enumFromThenToB :: IO Val
-enumFromThenToB = pure $ VFun $ \loT -> pure $ VFun $ \stepT -> pure $ VFun $ \hiT -> do
-    lov  <- force legacyHooks loT
-    stepv <- force legacyHooks stepT
-    hiv  <- force legacyHooks hiT
-    case (lov, stepv, hiv) of
-        (VInt lo, VInt step, VInt hi) -> buildStepList lo step hi
-        _ -> error ("enumFromThenTo: non-Int args")
-  where
-    buildStepList :: Int64 -> Int64 -> Int64 -> IO Val
-    buildStepList lo step hi
-        | step > 0 && lo > hi = pure (VCon "[]" [])
-        | step < 0 && lo < hi = pure (VCon "[]" [])
-        | step == 0            = pure (VCon "[]" [])  -- avoid infinite loop
-        | otherwise = do
-            hT   <- newWHNFThunk (VInt lo)
-            rest <- buildStepList (lo + step) step hi
-            tT   <- newWHNFThunk rest
-            pure (VCon ":" [hT, tT])
 
 --------------------------------------------------------------------------------
 -- Simple file IO: readFile, writeFile, appendFile
