@@ -274,18 +274,19 @@ builtinEnv reg = do
 
 builtins :: ClassRegistry -> [(Name, IO Val)]
 builtins reg =
-    -- Arithmetic (TODO 2.6: replace with Num class dispatch)
-    [ ("+",        binOpNum (+) (+))
-    , ("-",        binOpNum (-) (-))
-    , ("*",        binOpNum (*) (*))
-    , ("/",        binOpFloat (/))
-    , ("mod",      binOpInt mod)
-    , ("div",      binOpInt div)
-    -- abs / signum: dropped — instance bodies in GHC.Internal.Num
-    -- (`abs n = if n `geInt` 0 then n else negate n`) source-load now
-    -- that GHC.Classes is no longer host-backed. Resolved via the
-    -- env-fallback class-method dispatcher.
-    , ("min",      minDispatch reg)
+    -- Arithmetic: +, -, *, /, mod, div graduated to source-loaded.
+    --
+    -- Num/Integral/Fractional instance bodies in GHC.Internal.Num,
+    -- GHC.Internal.Real, GHC.Internal.Float bottom out on the +#,
+    -- -#, *#, modInt#, divInt# (Int) / plusFloat#, minusFloat#,
+    -- timesFloat#, divideFloat# (Float) / +##, -##, *##, /## (Double)
+    -- primops (all registered below) via the I#, F#, D# pattern
+    -- unwraps in Eval.hs:matchPat.
+    --
+    -- abs / signum dropped earlier (same mechanism): instance bodies
+    -- in GHC.Internal.Num resolve via the env-fallback class-method
+    -- dispatcher.
+    [ ("min",      minDispatch reg)
     , ("max",      maxDispatch reg)
     , ("gcd",      binOpInt gcd)
     , ("sqrt",     unaryOpFloat sqrt)
@@ -557,6 +558,13 @@ builtins reg =
     , ("W#",  wHashB)
     , ("W8#", w8HashB)
     , ("C#",  cHashB)
+    -- Float / Double boxing constructors.  Source-loaded Num Float /
+    -- Num Double instance bodies wrap unboxed primop results with
+    -- F# / D# (see plusFloatHashB / plusDoubleHashB).  The runtime
+    -- represents both Float and Double as VFloat (Double internally),
+    -- so the boxing is a no-op force.
+    , ("F#",  fHashB)
+    , ("D#",  dHashB)
     -- Phase 2.8: Addr# primitives
     , ("nullAddr#",   nullAddrB)
     , ("plusAddr#",   plusAddrB)
@@ -715,6 +723,29 @@ builtins reg =
     , ("addIntC#",     addIntCB)
     , ("subIntC#",     subIntCB)
     , ("mulIntMayOflo#", mulIntMayOfloB)
+    -- Int# division primops (GHC.Prim, no .hs source).
+    -- Backing source-loaded Integral Int.{div,mod} which route
+    -- through divInt/modInt (in GHC.Internal.Base) and bottom on
+    -- these.  Carried in the same family as quotInt#/remInt# above.
+    , ("divInt#",      divIntHashB)
+    , ("modInt#",      modIntHashB)
+    -- Float# arithmetic primops (GHC.Prim, no .hs source).
+    -- Backing source-loaded Num Float / Fractional Float instances:
+    --   instance Num Float where (+) x y = plusFloat x y
+    --   plusFloat (F# x) (F# y) = F# (plusFloat# x y)
+    -- (Eval.hs:matchPat wires F# to expose VFloat through the unwrap.)
+    , ("plusFloat#",   plusFloatHashB)
+    , ("minusFloat#",  minusFloatHashB)
+    , ("timesFloat#",  timesFloatHashB)
+    , ("divideFloat#", divideFloatHashB)
+    -- Double# arithmetic primops (GHC.Prim, no .hs source).
+    -- Backing source-loaded Num Double / Fractional Double instances:
+    --   instance Num Double where (+) x y = plusDouble x y
+    --   plusDouble (D# x) (D# y) = D# (x +## y)
+    , ("+##",          plusDoubleHashB)
+    , ("-##",          minusDoubleHashB)
+    , ("*##",          timesDoubleHashB)
+    , ("/##",          divideDoubleHashB)
     -- Phase 2.8: misc
     , ("cstringLength#",  cstringLengthB)
     , ("unpackCString#",  unpackCStringB)
@@ -884,7 +915,9 @@ builtins reg =
     , ("toInteger",    fromIntegralB)
     , ("quot",         binOpInt quot)
     , ("rem",          binOpInt rem)
-    , ("div",          binOpInt div)
+    -- 'div' graduated with the rest of the TODO 2.6 block: it now
+    -- routes through the Integral Int instance (a `divInt` b) and
+    -- bottoms on divInt# registered below.
     , ("divMod",       divModB)
     , ("quotRem",      quotRemB)
     , ("shiftL",       shiftLB)
@@ -1365,30 +1398,6 @@ binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VInt x, VInt y) -> pure (VInt (op x y))
         _ -> error ("binOp: non-Int args: "
                     <> showValForDebug av <> ", " <> showValForDebug bv)
-
--- | Polymorphic binary op for Int and Float.
--- If either argument is a Float, both are promoted.
-binOpNum :: (Int64 -> Int64 -> Int64) -> (Double -> Double -> Double) -> IO Val
-binOpNum intOp floatOp = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x,   VInt y)   -> pure (VInt   (intOp   x y))
-        (VFloat x, VFloat y) -> pure (VFloat (floatOp x y))
-        (VInt x,   VFloat y) -> pure (VFloat (floatOp (fromIntegral x) y))
-        (VFloat x, VInt y)   -> pure (VFloat (floatOp x (fromIntegral y)))
-        _ -> error ("binOpNum: non-numeric args: "
-                    <> showValForDebug av <> ", " <> showValForDebug bv)
-
--- | Float-only binary op (division etc.).
-binOpFloat :: (Double -> Double -> Double) -> IO Val
-binOpFloat op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    let toD (VFloat d) = d
-        toD (VInt n)   = fromIntegral n
-        toD v          = error ("binOpFloat: non-numeric: " <> showValForDebug v)
-    pure (VFloat (op (toD av) (toD bv)))
 
 -- | Float-only unary op.
 unaryOpFloat :: (Double -> Double) -> IO Val
@@ -3263,6 +3272,15 @@ w8HashB = pure $ VFun $ \a -> do
 cHashB :: IO Val
 cHashB = pure $ VFun $ \a -> force legacyHooks a
 
+-- F# / D#: source-loaded Num Float / Num Double instance bodies wrap
+-- unboxed primop results in F# x / D# x.  The runtime stores both
+-- Float and Double as VFloat, so boxing is a no-op force.
+fHashB :: IO Val
+fHashB = pure $ VFun $ \a -> force legacyHooks a
+
+dHashB :: IO Val
+dHashB = pure $ VFun $ \a -> force legacyHooks a
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: Addr# primitives
 --------------------------------------------------------------------------------
@@ -4853,6 +4871,80 @@ remIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x `rem` y))
         _ -> error "remInt#: bad args"
+
+divIntHashB :: IO Val
+divIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (VInt (x `div` y))
+        _ -> error "divInt#: bad args"
+
+modIntHashB :: IO Val
+modIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) -> pure (VInt (x `mod` y))
+        _ -> error "modInt#: bad args"
+
+-- Float# / Double# arithmetic primops.  The runtime represents both
+-- Float and Double as VFloat (Double precision internally) — same
+-- conflation the deleted binOpNum/binOpFloat performed — so each
+-- primop is a single Haskell op on Double.
+plusFloatHashB :: IO Val
+plusFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x + y))
+        _ -> error ("plusFloat#: bad args: " <> showValForDebug av)
+
+minusFloatHashB :: IO Val
+minusFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x - y))
+        _ -> error ("minusFloat#: bad args: " <> showValForDebug av)
+
+timesFloatHashB :: IO Val
+timesFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x * y))
+        _ -> error ("timesFloat#: bad args: " <> showValForDebug av)
+
+divideFloatHashB :: IO Val
+divideFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x / y))
+        _ -> error ("divideFloat#: bad args: " <> showValForDebug av)
+
+plusDoubleHashB :: IO Val
+plusDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x + y))
+        _ -> error ("+##: bad args: " <> showValForDebug av)
+
+minusDoubleHashB :: IO Val
+minusDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x - y))
+        _ -> error ("-##: bad args: " <> showValForDebug av)
+
+timesDoubleHashB :: IO Val
+timesDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x * y))
+        _ -> error ("*##: bad args: " <> showValForDebug av)
+
+divideDoubleHashB :: IO Val
+divideDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x / y))
+        _ -> error ("/##: bad args: " <> showValForDebug av)
 
 quotRemIntB :: IO Val
 quotRemIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
