@@ -1497,6 +1497,32 @@ eqVals reg av bv = case (av, bv) of
         pure (boolVal ((n == 0 && p == nullPtr)))
     (VPrimObj (PrimPtr p), VInt n) ->
         pure (boolVal ((n == 0 && p == nullPtr)))
+    -- Cross-representation Ptr equality: one side is a host-primitive
+    -- pointer (VPrimObj PrimPtr from a libffi/primop call like memchr),
+    -- the other is a source-loaded @Ptr addr#@ (@VCon "Ptr" [_]@).
+    -- Without these cases the comparison falls through to the class-
+    -- method dispatcher, which has no @Eq Ptr@ instance registered for
+    -- the @<Ptr>@ tag and bombs.  Surfaced by warp's parseRequestLine
+    -- doing @pathptr0 == nullPtr@ where one operand is libffi-backed
+    -- (memchr) and the other is the source-loaded
+    -- @Foreign.Ptr.nullPtr@ which scope-resolves to @VCon "Ptr" [VInt 0]@
+    -- inside the warp module's import scope.
+    (VPrimObj (PrimPtr p), VCon "Ptr" [t]) -> do
+        v <- force t
+        case v of
+            VPrimObj (PrimPtr p2) -> pure (boolVal (p == p2))
+            VInt n                -> pure (boolVal (p == nullPtr && n == 0))
+            VInteger n            -> pure (boolVal (p == nullPtr && n == 0))
+            VUnit                 -> pure (boolVal (p == nullPtr))
+            _                     -> pure (boolVal False)
+    (VCon "Ptr" [t], VPrimObj (PrimPtr p)) -> do
+        v <- force t
+        case v of
+            VPrimObj (PrimPtr p2) -> pure (boolVal (p2 == p))
+            VInt n                -> pure (boolVal (p == nullPtr && n == 0))
+            VInteger n            -> pure (boolVal (p == nullPtr && n == 0))
+            VUnit                 -> pure (boolVal (p == nullPtr))
+            _                     -> pure (boolVal False)
     (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
         pure (boolVal (fp1 == fp2))
     (VUnit, VUnit)      -> pure (boolVal True)
