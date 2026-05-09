@@ -549,6 +549,23 @@ builtins reg =
     -- Bool.  Our Int# is VInt, so it's a plain @/= 0@.
     , ("isTrue#",     isTrueHashB)
     , ("fromIntegral", fromIntegralB)
+    -- Phase 1: BigNat# runtime representation (first slice of the
+    -- full source-loaded Integer roadmap, see
+    -- @plans/full-ghc-bignum-source-load.md@).  Source-loading the
+    -- ghc-bignum primop suite from 'GHC.Num.BigNat' would bottom out
+    -- in WordArray# / ByteArray# limb manipulation that doesn't
+    -- match the 'PrimBigNat !Natural' runtime chosen in Phase 1.  Per
+    -- the roadmap, the entire @bigNat*#@ family is intentionally
+    -- host-shimmed as thin wrappers over host 'Natural' arithmetic.
+    -- This is a tracked carve-out (NOT a "minimum surface" violation
+    -- per CLAUDE.md): the representation mismatch makes source-load
+    -- semantically wrong, not just slow.
+    --
+    -- First primop landed: @bigNatFromWord#@.  Phase 2.A adds the
+    -- comparison tranche (@bigNatEq#@, @bigNatLt#@, …); Phase 2.B–F
+    -- add arithmetic / bit-ops / remaining conversions / show /
+    -- long-tail.
+    , ("bigNatFromWord#",          bigNatFromWordB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -2121,6 +2138,7 @@ showVal (VPrimObj PrimRealWorld)       = pure "<RealWorld#>"
 showVal (VPrimObj (PrimMVar _))        = pure "<MVar>"
 showVal (VPrimObj (PrimTVar _))        = pure "<TVar>"
 showVal (VPrimObj (PrimThreadId tid))  = pure ("ThreadId " <> show tid)
+showVal (VPrimObj (PrimBigNat n))      = pure ("<BigNat# " <> show n <> ">")
 
 -- | Tuple constructors are named @(,)@, @(,,)@, @(,,,)@, etc. — any
 -- @(@ followed by @n@ commas and @)@.
@@ -3163,6 +3181,30 @@ fromIntegralB = pure $ VFun $ \a -> do
         -- as the Int it wraps.
         , "IS"
         ]
+
+--------------------------------------------------------------------------------
+-- Phase 1: BigNat# runtime representation
+--------------------------------------------------------------------------------
+
+-- | @bigNatFromWord# :: Word# -> BigNat#@ — first of the
+-- ghc-bignum BigNat# primop suite (Phase 2.D conversion tranche),
+-- landed early to enable the Phase 1 'PrimBigNat' runtime smoke
+-- fixture.  Source-level definition lives in 'GHC.Num.BigNat' but
+-- bottoms out in WordArray# / ByteArray# limb manipulation that
+-- doesn't match IHC's chosen 'Natural'-backed runtime; host-shimming
+-- the whole @bigNat*#@ family is intentional per
+-- @plans/full-ghc-bignum-source-load.md@.
+--
+-- 'Word#' is stored as 'VInt' per IHC convention.  We reinterpret
+-- the Int64 bits as 'Word' (handling the high-bit-set case) before
+-- widening to host 'Natural'.
+bigNatFromWordB :: IO Val
+bigNatFromWordB = pure $ VFun $ \w -> do
+    wv <- force legacyHooks w
+    case wv of
+        VInt n ->
+            pure (VPrimObj (PrimBigNat (fromIntegral (fromIntegral n :: Word))))
+        _ -> error ("bigNatFromWord#: not a Word#: " <> showValForDebug wv)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops

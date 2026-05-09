@@ -55,6 +55,7 @@ describeType hooks = go
     go (VPrimObj (PrimMVar _))       = pure "MVar a"
     go (VPrimObj (PrimTVar _))       = pure "TVar a"
     go (VPrimObj (PrimThreadId _))   = pure "ThreadId"
+    go (VPrimObj (PrimBigNat _))     = pure "BigNat#"
     go (VLabel name)                 = pure ("Label \"" <> name <> "\"")
 
     -- Booleans

@@ -380,6 +380,7 @@ typeTagOf (VPrimObj PrimRealWorld)       = BC.pack "<RealWorld#>"
 typeTagOf (VPrimObj (PrimMVar _))        = BC.pack "<MVar>"
 typeTagOf (VPrimObj (PrimTVar _))        = BC.pack "<TVar>"
 typeTagOf (VPrimObj (PrimThreadId _))    = BC.pack "<ThreadId>"
+typeTagOf (VPrimObj (PrimBigNat _))      = BC.pack "<BigNat>"
 typeTagOf (VLabel _)                     = BC.pack "Label"
 
 --------------------------------------------------------------------------------
