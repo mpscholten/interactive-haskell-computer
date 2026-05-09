@@ -1816,8 +1816,27 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     Just targetLm ->
                         findRuntimeCtorsForType registry searchPath includeMap Set.empty targetLm bareTy
                     Nothing -> pure []
-            Nothing ->
-                pure (Map.findWithDefault [] ty typeCtors)
+            Nothing -> do
+                -- Prefer the owning module's local type-ctor registry
+                -- before falling back to the cross-module union.  Two
+                -- modules can declare types with the same bare name
+                -- (the canonical case being strict @Data.ByteString@
+                -- vs lazy @Data.ByteString.Lazy@: both have
+                -- @data ByteString = ...@ but with disjoint constructor
+                -- sets — @BS@ vs @Empty | Chunk@).  The unioned map
+                -- collapses both into a single @"ByteString"@ key, so
+                -- registering an instance in the strict module via
+                -- the union would per-ctor-register under the lazy
+                -- ctors (or vice versa, depending on union order).
+                -- Looking at @lm@'s own @lmTypeCtorReg@ first guarantees
+                -- the per-ctor registration matches the type the
+                -- instance head meant.  Falls back to the unioned
+                -- map when the instance head names an imported type
+                -- (orphan / re-export).
+                let localCtors = Map.findWithDefault [] ty (lmTypeCtorReg lm)
+                if not (null localCtors)
+                    then pure localCtors
+                    else pure (Map.findWithDefault [] ty typeCtors)
 
 findRuntimeCtorsForType
     :: ModuleRegistry

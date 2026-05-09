@@ -337,26 +337,39 @@ builtins reg =
     , ("show",     showDispatch reg)
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
-    --   append    — `append = mappend`; dispatcher routes the strict
-    --               ByteString through Data.ByteString.Lazy's Monoid
-    --               instance and falls into Empty/Chunk pattern match.
-    --   concat    — `concat = mconcat`; resolves to Foldable.concat
-    --               (`concatMap id`) and crashes with
-    --               `concatMap: not a list: <BS...>`.
+    --   concat    — `concat = mconcat`; for the input @[bs1, bs2]@ the
+    --               class-method dispatcher keys on the list (tag
+    --               @"[]"@) and picks @Monoid [a].mconcat@'s list
+    --               comprehension, which then crashes with
+    --               @"concatMap: not a list: <BS...>"@.  The class
+    --               variable for @mconcat :: Monoid a => [a] -> a@
+    --               lives at the element position, not the input head;
+    --               the dispatcher needs element-type peeling for
+    --               container-polymorphic methods.
     --   singleton — uses `allBytes` 256-byte static buffer; hits
     --               `expected Ptr: <:>` on the Ptr cons.
     --   replicate — silent wrong output ("/\NUL\NUL" for `replicate 3 65`).
     --   index     — body calls `length ps`; the polymorphic `length`
     --               routes to Foldable.length, which has no BS instance.
     -- Graduated to source-loaded:
-    --   unpack    — needed `plusPtrCore`/`minusPtrCore` cross-rep handling
-    --               (mirrors the `eqVals` fix in commit f902b59) so
-    --               `Data.ByteString.foldr`'s pointer arithmetic works on
-    --               `VCon "Ptr" [VPrimObj (PrimPtr _)]` produced by the
-    --               source body of `unsafeForeignPtrToPtr`.
+    --   unpack    — needed `plusPtrCore`/`minusPtrCore` cross-rep
+    --               handling (mirrors the `eqVals` fix in commit
+    --               f902b59).  See its commit for the full story.
+    --   append    — needed two pieces:
+    --               (1) `typeTagOf (VCon n _) = n` (drop the
+    --                   `lookupCtorType` name-hop) so source-loaded
+    --                   `VCon "BS" _` dispatches under @"BS"@ rather
+    --                   than under the bare @"ByteString"@ key shared
+    --                   with the lazy @Data.ByteString.Lazy@ type;
+    --               (2) `instanceRuntimeCtors` prefers the owning
+    --                   module's local `lmTypeCtorReg` before the
+    --                   cross-module union, so the strict instance's
+    --                   per-ctor registrations land on @"BS"@ rather
+    --                   than getting cross-stamped onto the lazy
+    --                   @"Empty"@/@"Chunk"@ ctors via the unioned
+    --                   "ByteString" key.
     --   The 7 entries (empty, null, length, pack, take, drop, head)
     --   graduated cleanly in commit e9d99f0.
-    , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
     , ("Data.ByteString.replicate", bsReplicateB)
@@ -3469,12 +3482,6 @@ bsFromBS bs = do
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
     mkBsVal fp len
-
-bsAppendB :: IO Val
-bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    ba <- bsValToBS av; bb <- bsValToBS bv
-    bsFromBS (BS.append ba bb)
 
 bsConcatB :: IO Val
 bsConcatB = pure $ VFun $ \a -> do

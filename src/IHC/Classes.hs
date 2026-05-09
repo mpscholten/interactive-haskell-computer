@@ -356,14 +356,20 @@ typeTagOf (VCon "Nothing" _) = BC.pack "Maybe"
 typeTagOf (VCon "Left"    _) = BC.pack "Either"
 typeTagOf (VCon "Right"   _) = BC.pack "Either"
 typeTagOf (VCon n _) =
-    -- For source-loaded ADTs (e.g. warp's @StdMethod = GET | POST | ...@),
-    -- consult the scheduler-installed ctor->type hook so dispatch keys
-    -- on the type name, not the ctor name.  Falls back to the ctor
-    -- name when the hook hasn't been installed (boot, REPL transient
-    -- lookups) or doesn't know about @n@.
-    case unsafePerformIO (lookupCtorType legacyHooks n) of
-        Just ty -> ty
-        Nothing -> n
+    -- For source-loaded ADTs we now key dispatch on the constructor
+    -- name directly. 'IHC.Scheduler.registerOne' (line ~1779) registers
+    -- every instance under each runtime constructor of the type, so a
+    -- @VCon \"BS\" _@ value finds the strict @Monoid ByteString@ via
+    -- the @\"BS\"@ key — even when a separately loaded
+    -- @Data.ByteString.Lazy.Internal.Monoid ByteString@ instance has
+    -- shipped the bare @\"ByteString\"@ key from under it.  The
+    -- previous behaviour (consulting 'lookupCtorType' to map @n@ ->
+    -- the bare type name) caused the strict-vs-lazy ByteString
+    -- collision: both registered under @\"ByteString\"@ and last-write
+    -- won.  See typeTagOf's special cases above for the hand-coded
+    -- common types (@Just@, @Nothing@, @Left@, @Right@, @True@, etc.)
+    -- whose instances are only keyed under the type name.
+    n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
