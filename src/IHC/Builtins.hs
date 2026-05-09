@@ -333,7 +333,6 @@ builtins reg =
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
-    , ("length",   lengthB)
     -- Data.ByteString shims kept as documented carve-outs because
     -- source-loading bytestring exposes interpreter gaps:
     --   unpack    — internal recursive function "non-exhaustive patterns"
@@ -2417,21 +2416,6 @@ stringToListValIO (c:cs) = do
     restV <- stringToListValIO cs
     tT   <- newWHNFThunk restV
     pure (VCon ":" [hT, tT])
-
--- | Generic @length@ — walks the spine of a list, forcing each cons
--- but not the elements.
-lengthB :: IO Val
-lengthB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- go av 0
-    pure (VInt n)
-  where
-    go (VStr s) !acc = pure (acc + fromIntegral (BC.length s))
-    go (VCon "[]" _) !acc = pure acc
-    go (VCon ":" [_, t]) !acc = do
-        tv <- force legacyHooks t
-        go tv (acc + 1)
-    go other _ = error ("length: not a list: " <> showValForDebug other)
 
 --------------------------------------------------------------------------------
 -- IO
