@@ -221,10 +221,4 @@ seedBuiltinClassMethodSigs = do
             , ("mappend",    "Monoid")
             , ("mconcat",    "Monoid")
             , ("<>",         "Semigroup")
-            -- Ord: only @compare@ — the comparison operators are still
-            -- intercepted by 'eqDispatch'/'ordDispatch' directly in
-            -- 'Builtins'.  Without this seed, dropping the @compare@
-            -- builtin shim leaves bare references unresolved when no
-            -- caller has triggered a load of @GHC.Classes@.
-            , ("compare",    "Ord")
             ]
