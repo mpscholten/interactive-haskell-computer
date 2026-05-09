@@ -2940,15 +2940,28 @@ peekOp ctx cur =
 
 -- | Parse an identifier-like name inside backticks, allowing qualified
 -- segments such as @B.snoc@ or @Data.List.elem@.
+--
+-- 'TkPrimId' is accepted alongside 'TkIdent' / 'TkConId' so that
+-- MagicHash primops can be used in backticked-operator position, e.g.
+-- @x \`eqChar#\` y@ in @ghc-prim-0.12.0/GHC/Classes.hs:301@:
+--
+-- > (C# x) \`eqChar\` (C# y) = isTrue# (x \`eqChar#\` y)
+--
+-- Without this, the parser bails on the inner backtick, the body parse
+-- of @eqChar@ throws 'ParseError', and 'discoverInModuleWith'' silently
+-- records @eqChar@ as a discovery miss — which then surfaces as
+-- @IHC.Eval: unbound variable \`eqChar\`@ when the source-loaded
+-- @instance Eq Char where (==) = eqChar@ method body is forced.
 readBacktickName :: Ctx -> Cursor -> Maybe (Name, Cursor)
 readBacktickName ctx = goFirst
   where
     goFirst cur =
         let (tok, cur1) = nextSig ctx cur
         in case tkKind tok of
-            TkIdent n -> goRest n cur1
-            TkConId n -> goRest n cur1
-            _         -> Nothing
+            TkIdent  n -> goRest n cur1
+            TkConId  n -> goRest n cur1
+            TkPrimId n -> goRest n cur1
+            _          -> Nothing
 
     goRest acc cur =
         let (dotTok, curDot) = nextSig ctx cur
