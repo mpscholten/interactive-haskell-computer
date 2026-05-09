@@ -23,7 +23,6 @@
 module Properties.RoundTrip (spec) where
 
 import Control.Exception (SomeException, fromException, try)
-import qualified Data.ByteString.Char8 as BC
 
 import Test.Hspec (Spec, describe)
 import Test.Hspec.QuickCheck (modifyMaxSuccess, prop)

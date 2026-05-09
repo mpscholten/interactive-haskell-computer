@@ -43,7 +43,6 @@ import Test.QuickCheck
     , choose
     , elements
     , frequency
-    , oneof
     , sized
     , suchThat
     , vectorOf
