@@ -78,6 +78,7 @@ module IHC.Classes
     , checkSuperclassCoverage
       -- * PR 1: per-session hook bundle
     , IHCHooks(..)
+    , legacyHooks
     ) where
 
 import Control.Exception (SomeException, catch)
@@ -722,6 +723,31 @@ data IHCHooks = IHCHooks
     , hkScan                :: !(IORef (Maybe ScanHook))
     , hkSharedClassReg      :: !(IORef (Maybe ClassRegistry))
     , hkThExpToExpr         :: !(IORef ThExpToExprHook)
+    }
+
+-- | A package of the legacy module-level hook 'IORef's into an
+-- 'IHCHooks' record.  Used while PR 1B threads 'IHCHooks' through
+-- 'eval' / 'force' / 'apply' and every caller without yet migrating
+-- the storage off the legacy globals.  Reading any field of
+-- 'legacyHooks' returns the SAME 'IORef' the legacy accessors
+-- ('lookupEnvFallback', 'triggerCoreInstanceLoad', …) read from, so
+-- semantics carry over verbatim during this slice.
+--
+-- PR 1C deletes 'legacyHooks' alongside the eight module-level
+-- @IORef@s, rewires the hook accessors to take 'IHCHooks' explicitly,
+-- and constructs a fresh 'IHCHooks' per session via 'freshHooks' in
+-- 'IHC.Context'.
+{-# NOINLINE legacyHooks #-}
+legacyHooks :: IHCHooks
+legacyHooks = IHCHooks
+    { hkEnvFallback         = envFallbackRef
+    , hkClassMethodFallback = classMethodFallbackRef
+    , hkCoreInstanceLoad    = coreInstanceLoadHookRef
+    , hkCtorType            = ctorTypeHookRef
+    , hkRegisterInstances   = registerInstancesHookRef
+    , hkScan                = scanHookRef
+    , hkSharedClassReg      = sharedClassRegRef
+    , hkThExpToExpr         = thExpToExprRef
     }
 
 --------------------------------------------------------------------------------

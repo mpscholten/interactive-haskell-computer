@@ -94,6 +94,7 @@ import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
     , mkTypeRep, typeRepEq
     , drainCataloguedInstancesForClass
+    , legacyHooks
     )
 import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal, runIOVal)
@@ -133,13 +134,13 @@ isMarkedWord8Ptr p =
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
-ptrValToPtr (VCon "Ptr" [pT]) = force pT >>= ptrValToPtr
+ptrValToPtr (VCon "Ptr" [pT]) = force legacyHooks pT >>= ptrValToPtr
 ptrValToPtr other = error ("expected Ptr: " <> showValForDebug other)
 
 foreignPtrValToForeignPtr :: Val -> IO (ForeignPtr Word8)
 foreignPtrValToForeignPtr (VPrimObj (PrimForeignPtr fp)) = pure fp
 foreignPtrValToForeignPtr (VCon "ForeignPtr" [addrT, gutsT]) = do
-    gv <- force gutsT
+    gv <- force legacyHooks gutsT
     case gv of
         VPrimObj (PrimForeignPtr fp) -> pure fp
         -- Source-loaded code can construct ForeignPtr values whose guts are
@@ -147,7 +148,7 @@ foreignPtrValToForeignPtr (VCon "ForeignPtr" [addrT, gutsT]) = do
         -- Rebuild an equivalent host ForeignPtr from the raw address so the
         -- RTS-backed pointer builtins can still operate on it.
         _ -> do
-            addrV <- force addrT
+            addrV <- force legacyHooks addrT
             p <- ptrValToPtr addrV
             newForeignPtr_ (castPtr p)
 foreignPtrValToForeignPtr other = error ("expected ForeignPtr: " <> showValForDebug other)
@@ -218,14 +219,14 @@ builtinEnv reg = do
     -- Deferred: the VFun isn't needed until the source actually constructs an IO
     -- value from a state-passing function (most programs go through primops).
     ioCtorT <- newLazyBuiltinThunk (pure (VFun $ \fThunk -> do
-        f <- force fThunk
+        f <- force legacyHooks fThunk
         pure (VIO (do
             let stok = VPrimObj PrimRealWorld
             stokT <- newWHNFThunk stok
-            r <- apply f stokT
+            r <- apply legacyHooks f stokT
             case r of
                 VCon "(#,#)" [_stT, aT] -> do
-                    v <- force aT
+                    v <- force legacyHooks aT
                     pure v
                 other                    -> pure other))))
     -- Ptr smart constructor: `Ptr addr#` wraps an Addr# (PrimPtr) back into PrimPtr.
@@ -265,7 +266,7 @@ builtinEnv reg = do
     -- Ptr constructor: `Ptr addr#` => VPrimObj (PrimPtr p).
     -- The Addr# is already a VPrimObj PrimPtr internally.
     ptrCtorV = VFun $ \addrT -> do
-        v <- force addrT
+        v <- force legacyHooks addrT
         case v of
             VPrimObj (PrimPtr p) -> pure (VPrimObj (PrimPtr p))
             _                   -> pure (VCon "Ptr" [addrT])  -- fallback
@@ -1344,8 +1345,8 @@ builtins reg =
 
 binOpInt :: (Int64 -> Int64 -> Int64) -> IO Val
 binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (op x y))
         _ -> error ("binOp: non-Int args: "
@@ -1355,8 +1356,8 @@ binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- If either argument is a Float, both are promoted.
 binOpNum :: (Int64 -> Int64 -> Int64) -> (Double -> Double -> Double) -> IO Val
 binOpNum intOp floatOp = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     case (av, bv) of
         (VInt x,   VInt y)   -> pure (VInt   (intOp   x y))
         (VFloat x, VFloat y) -> pure (VFloat (floatOp x y))
@@ -1368,8 +1369,8 @@ binOpNum intOp floatOp = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | Float-only binary op (division etc.).
 binOpFloat :: (Double -> Double -> Double) -> IO Val
 binOpFloat op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     let toD (VFloat d) = d
         toD (VInt n)   = fromIntegral n
         toD v          = error ("binOpFloat: non-numeric: " <> showValForDebug v)
@@ -1378,7 +1379,7 @@ binOpFloat op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | Float-only unary op.
 unaryOpFloat :: (Double -> Double) -> IO Val
 unaryOpFloat op = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VFloat d -> pure (VFloat (op d))
         VInt n   -> pure (VFloat (op (fromIntegral n)))
@@ -1387,7 +1388,7 @@ unaryOpFloat op = pure $ VFun $ \a -> do
 -- | floor/ceiling/round/truncate — Float -> Int.
 floatToIntB :: (Double -> Int64) -> IO Val
 floatToIntB op = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VFloat d -> pure (VInt (op d))
         VInt n   -> pure (VInt n)
@@ -1414,25 +1415,25 @@ isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
 
 notB :: IO Val
 notB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     pure (boolVal (not (isTruthy av)))
 
 andB :: IO Val
 andB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
+    av <- force legacyHooks a
     if isTruthy av
         then do
-            bv <- force b
+            bv <- force legacyHooks b
             pure (boolVal (isTruthy bv))
         else pure (boolVal False)
 
 orB :: IO Val
 orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
+    av <- force legacyHooks a
     if isTruthy av
         then pure (boolVal True)
         else do
-            bv <- force b
+            bv <- force legacyHooks b
             pure (boolVal (isTruthy bv))
 
 --------------------------------------------------------------------------------
@@ -1446,15 +1447,15 @@ orB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- Method slot 0 = (==), slot 1 = (/=).
 eqDispatch :: ClassRegistry -> IO Val
 eqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     eqVals reg av bv
 
 -- | /= dispatch.
 neqDispatch :: ClassRegistry -> IO Val
 neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     r <- eqVals reg av bv
     pure (boolVal (not (isTruthy r)))
 
@@ -1467,7 +1468,7 @@ neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 forceInstanceMethod :: Maybe Val -> IO (Maybe Val)
 forceInstanceMethod Nothing  = pure Nothing
 forceInstanceMethod (Just v) = do
-    r <- try (forceMethodVal v) :: IO (Either SomeException Val)
+    r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
     case r of
         Right v'
           | isPlaceholder v' -> pure Nothing   -- treat placeholder as miss
@@ -1508,7 +1509,7 @@ eqVals reg av bv = case (av, bv) of
     -- @Foreign.Ptr.nullPtr@ which scope-resolves to @VCon "Ptr" [VInt 0]@
     -- inside the warp module's import scope.
     (VPrimObj (PrimPtr p), VCon "Ptr" [t]) -> do
-        v <- force t
+        v <- force legacyHooks t
         case v of
             VPrimObj (PrimPtr p2) -> pure (boolVal (p == p2))
             VInt n                -> pure (boolVal (p == nullPtr && n == 0))
@@ -1516,7 +1517,7 @@ eqVals reg av bv = case (av, bv) of
             VUnit                 -> pure (boolVal (p == nullPtr))
             _                     -> pure (boolVal False)
     (VCon "Ptr" [t], VPrimObj (PrimPtr p)) -> do
-        v <- force t
+        v <- force legacyHooks t
         case v of
             VPrimObj (PrimPtr p2) -> pure (boolVal (p2 == p))
             VInt n                -> pure (boolVal (p == nullPtr && n == 0))
@@ -1553,15 +1554,15 @@ eqVals reg av bv = case (av, bv) of
             Just eqMethod -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
-                r1 <- apply eqMethod aT
-                apply r1 bT
+                r1 <- apply legacyHooks eqMethod aT
+                apply legacyHooks r1 bT
             Nothing
                 | n1 /= n2  -> pure (boolVal False)
                 | otherwise -> do
                     -- Default: structural field-by-field equality.
                     results <- mapM (\(t1, t2) -> do
-                        v1 <- force t1
-                        v2 <- force t2
+                        v1 <- force legacyHooks t1
+                        v2 <- force legacyHooks t2
                         eqVals reg v1 v2)
                         (zip ts1 ts2)
                     pure (boolVal (all isTruthy results))
@@ -1573,8 +1574,8 @@ eqVals reg av bv = case (av, bv) of
             Just eqMethod -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
-                r1 <- apply eqMethod aT
-                apply r1 bT
+                r1 <- apply legacyHooks eqMethod aT
+                apply legacyHooks r1 bT
             _ -> error ("(==): no Eq instance for type tag `"
                         <> BC.unpack tag <> "`: "
                         <> showValForDebug av
@@ -1586,8 +1587,8 @@ eqVals reg av bv = case (av, bv) of
 -- registry lookup for user-defined types.
 ordDispatch :: ClassRegistry -> Int -> IO Val
 ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     ordCmp reg slot av bv
 
 ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
@@ -1627,8 +1628,8 @@ ordCmp _reg slot av bv = case (av, bv) of
             Just method -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
-                r1 <- apply method aT
-                apply r1 bT
+                r1 <- apply legacyHooks method aT
+                apply legacyHooks r1 bT
             _ -> do
                 -- No user Ord instance registered. Try the structural
                 -- fallback: if both values are VCon, derive an Ord by
@@ -1790,8 +1791,8 @@ structuralOrdering reg av bv = case (av, bv) of
   where
     compareFields []     []     = pure EQ
     compareFields (t1:r1) (t2:r2) = do
-        v1 <- force t1
-        v2 <- force t2
+        v1 <- force legacyHooks t1
+        v2 <- force legacyHooks t2
         -- Recurse through the full Ord dispatch (user instances +
         -- structural fallback) rather than structuralOrdering directly,
         -- so primitive fields (Int, Char, etc.) hit their fast paths.
@@ -1824,8 +1825,8 @@ valOrdering reg av bv = case (av, bv) of
             Just cmpMethod -> do
                 aT <- newWHNFThunk av
                 bT <- newWHNFThunk bv
-                r1 <- apply cmpMethod aT
-                cv <- apply r1 bT
+                r1 <- apply legacyHooks cmpMethod aT
+                cv <- apply legacyHooks r1 bT
                 pure (orderingFromVCon cv)
             _ -> do
                 mo <- structuralOrdering reg av bv
@@ -1853,8 +1854,8 @@ valOrdering reg av bv = case (av, bv) of
 -- that drives @<@, @<=@, @>@, @>=@.
 compareDispatch :: ClassRegistry -> IO Val
 compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     o  <- valOrdering reg av bv
     pure (VCon (orderingName o) [])
   where
@@ -1868,8 +1869,8 @@ compareDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- fallback), not just numbers.
 minDispatch :: ClassRegistry -> IO Val
 minDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     o  <- valOrdering reg av bv
     case o of
         GT -> pure bv
@@ -1879,8 +1880,8 @@ minDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- 'minDispatch'.
 maxDispatch :: ClassRegistry -> IO Val
 maxDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     o  <- valOrdering reg av bv
     case o of
         LT -> pure bv
@@ -1890,7 +1891,7 @@ maxDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- Slot 0 = show. Falls back to built-in showVal for base types.
 showDispatch :: ClassRegistry -> IO Val
 showDispatch reg = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     s  <- showValWith reg av
     stringToListValIO s
 
@@ -1928,7 +1929,7 @@ showValWith reg av = case av of
             Just showMethod -> do
                 shown <- CE.try @SomeException $ do
                     aT <- newWHNFThunk av
-                    rv <- apply showMethod aT
+                    rv <- apply legacyHooks showMethod aT
                     valToString rv
                 case shown of
                     Right s -> pure s
@@ -1951,8 +1952,8 @@ showValWith reg av = case av of
 forceList :: Val -> IO [Val]
 forceList (VCon "[]" _) = pure []
 forceList (VCon ":"  [h, t]) = do
-    hv <- force h
-    tv <- force t
+    hv <- force legacyHooks h
+    tv <- force legacyHooks t
     rest <- forceList tv
     pure (hv : rest)
 forceList other =
@@ -1977,7 +1978,7 @@ isCharList :: Val -> IO Bool
 isCharList (VStr _) = pure True
 isCharList (VCon "[]" _) = pure True
 isCharList (VCon ":"  [h, _]) = do
-    hv <- force h
+    hv <- force legacyHooks h
     case hv of
         VChar _ -> pure True
         _       -> pure False
@@ -2013,17 +2014,17 @@ showVal v@(VCon ":" _) = do
 showVal (VStr s)    = pure (show (BC.unpack s))
 showVal (VCon name thunks)
     | isUnboxedTupleConName name = do
-        parts <- mapM (\t -> do v <- force t; showVal v) thunks
+        parts <- mapM (\t -> do v <- force legacyHooks t; showVal v) thunks
         pure ("(#" <> intercalate "," parts <> "#)")
     | isTupleConName name = do
-        parts <- mapM (\t -> do v <- force t; showVal v) thunks
+        parts <- mapM (\t -> do v <- force legacyHooks t; showVal v) thunks
         pure ("(" <> intercalate "," parts <> ")")
     -- @Proxy@ is rendered as just "Proxy" regardless of any DataKinds
     -- payload the evaluator attached from an 'ETyApp' annotation
     -- (GHC's @show (Proxy :: Proxy "foo") = "Proxy"@).
     | name == "Proxy" = pure "Proxy"
     | otherwise = do
-        parts <- mapM (\t -> do v <- force t; showVal v) thunks
+        parts <- mapM (\t -> do v <- force legacyHooks t; showVal v) thunks
         case parts of
             [] -> pure (BC.unpack name)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
@@ -2074,22 +2075,22 @@ isUnboxedTupleConName bs = case BC.unpack bs of
 -- force time and the dispatcher falls through to IO.
 concatMapB :: IO Val
 concatMapB = pure $ VFun $ \ft -> pure $ VFun $ \xst -> do
-    f  <- force ft
-    xs <- force xst
+    f  <- force legacyHooks ft
+    xs <- force legacyHooks xst
     go f xs
   where
     go _ (VCon "[]" _) = pure (VCon "[]" [])
     go f (VCon ":" [h, t]) = do
         -- @f h@ is a list; concatenate with recursion on tail.
-        fhv   <- apply f h
-        tv    <- force t
+        fhv   <- apply legacyHooks f h
+        tv    <- force legacyHooks t
         rest  <- go f tv
         append fhv rest
     go _ other = error ("concatMap: not a list: " <> showValForDebug other)
 
     append (VCon "[]" _)     ys = pure ys
     append (VCon ":" [h, t]) ys = do
-        tv    <- force t
+        tv    <- force legacyHooks t
         rest  <- append tv ys
         restT <- newWHNFThunk rest
         pure (VCon ":" [h, restT])
@@ -2123,7 +2124,7 @@ concatMapB = pure $ VFun $ \ft -> pure $ VFun $ \xst -> do
 -- instance is in scope.
 fromLabelB :: ClassRegistry -> IO Val
 fromLabelB reg = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VLabel lbl -> do
             mMethod <- lookupUserIsLabel reg lbl
@@ -2136,9 +2137,9 @@ fromLabelB reg = pure $ VFun $ \a -> do
                     -- method is a function, apply it to the label; otherwise
                     -- return the stored value directly.
                     case fromLabelM of
-                        VFun _               -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
-                        VFunIP _ _           -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
-                        VClassMethod _ _ _ _ -> do { aT <- newWHNFThunk av; apply fromLabelM aT }
+                        VFun _               -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
+                        VFunIP _ _           -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
+                        VClassMethod _ _ _ _ -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
                         v                    -> pure v
                 _ -> pure (VCon "Proxy" [])   -- default: Proxy IsLabel instance
         other -> error ("fromLabel: expected a Label value, got: "
@@ -2203,7 +2204,7 @@ lookupUserIsLabel reg lbl = do
     -- so the caller ('fromLabelB') can pattern-match against the
     -- concrete Val (VCon, VFun, etc.) without having to unwrap.
     let forceFirst [] = pure Nothing
-        forceFirst (ms : _) = fmap Just (forceMethodVal ms)
+        forceFirst (ms : _) = fmap Just (forceMethodVal legacyHooks ms)
     case symbolMatches of
         hit@(_ : _) -> forceFirst hit
         []          -> forceFirst polymorphicMatches
@@ -2225,7 +2226,7 @@ lookupUserIsLabel reg lbl = do
 --     returns the empty string rather than crashing.
 symbolValB :: IO Val
 symbolValB = pure $ VFun $ \p -> do
-    pv <- force p
+    pv <- force legacyHooks p
     bs <- proxySymbolPayload pv
     stringToListValIO (BC.unpack bs)
 
@@ -2235,10 +2236,10 @@ symbolValB = pure $ VFun $ \p -> do
 -- user-provided proxies may carry labels).
 natValB :: IO Val
 natValB = pure $ VFun $ \p -> do
-    pv <- force p
+    pv <- force legacyHooks p
     case pv of
         VCon "Proxy" (t : _) -> do
-            x <- force t
+            x <- force legacyHooks t
             case x of
                 VInt n   -> pure (VInt n)
                 VLabel s -> case BC.readInteger s of
@@ -2254,10 +2255,10 @@ natValB = pure $ VFun $ \p -> do
 -- | @charVal :: Proxy (n :: Char) -> Char@.
 charValB :: IO Val
 charValB = pure $ VFun $ \p -> do
-    pv <- force p
+    pv <- force legacyHooks p
     case pv of
         VCon "Proxy" (t : _) -> do
-            x <- force t
+            x <- force legacyHooks t
             case x of
                 VChar c  -> pure (VChar c)
                 VLabel s | BC.length s == 1 -> pure (VChar (BC.head s))
@@ -2272,7 +2273,7 @@ charValB = pure $ VFun $ \p -> do
 -- @VLabel@ so 'symbolVal' round-trips.
 someSymbolValB :: IO Val
 someSymbolValB = pure $ VFun $ \s -> do
-    sv <- force s
+    sv <- force legacyHooks s
     bs <- listValToBS sv
     lblT <- newWHNFThunk (VLabel bs)
     proxyT <- newWHNFThunk (VCon "Proxy" [lblT])
@@ -2282,7 +2283,7 @@ someSymbolValB = pure $ VFun $ \s -> do
 -- negatives, @Just (SomeNat (Proxy \@n))@ otherwise.
 someNatValB :: IO Val
 someNatValB = pure $ VFun $ \n -> do
-    nv <- force n
+    nv <- force legacyHooks n
     case nv of
         VInt k | k < 0 -> pure (VCon "Nothing" [])
                | otherwise -> do
@@ -2296,7 +2297,7 @@ someNatValB = pure $ VFun $ \n -> do
 -- | @someCharVal :: Char -> SomeChar@.
 someCharValB :: IO Val
 someCharValB = pure $ VFun $ \c -> do
-    cv <- force c
+    cv <- force legacyHooks c
     case cv of
         VChar ch -> do
             chT <- newWHNFThunk (VChar ch)
@@ -2310,7 +2311,7 @@ someCharValB = pure $ VFun $ \c -> do
 -- accepted shapes.
 proxySymbolPayload :: Val -> IO ByteString
 proxySymbolPayload (VCon "Proxy" (t : _)) = do
-    x <- force t
+    x <- force legacyHooks t
     case x of
         VLabel s -> pure s
         VInt   n -> pure (BC.pack (show n))
@@ -2319,7 +2320,7 @@ proxySymbolPayload (VCon "Proxy" (t : _)) = do
 proxySymbolPayload (VCon "Proxy" []) = pure BC.empty
 proxySymbolPayload (VLabel s) = pure s
 proxySymbolPayload (VCon "SomeSymbol" [t]) = do
-    x <- force t
+    x <- force legacyHooks t
     proxySymbolPayload x
 proxySymbolPayload other = error
     ("symbolVal: expected a Proxy or SomeSymbol, got: "
@@ -2331,8 +2332,8 @@ listValToBS = go []
   where
     go acc (VCon "[]" _)       = pure (BC.pack (reverse acc))
     go acc (VCon ":"  [h, t])  = do
-        hv <- force h
-        tv <- force t
+        hv <- force legacyHooks h
+        tv <- force legacyHooks t
         case hv of
             VChar c -> go (c : acc) tv
             _       -> error ("listValToBS: list element is not a Char: "
@@ -2357,14 +2358,14 @@ stringToListValIO (c:cs) = do
 -- but not the elements.
 lengthB :: IO Val
 lengthB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     n  <- go av 0
     pure (VInt n)
   where
     go (VStr s) !acc = pure (acc + fromIntegral (BC.length s))
     go (VCon "[]" _) !acc = pure acc
     go (VCon ":" [_, t]) !acc = do
-        tv <- force t
+        tv <- force legacyHooks t
         go tv (acc + 1)
     go other _ = error ("length: not a list: " <> showValForDebug other)
 
@@ -2402,7 +2403,7 @@ lengthB = pure $ VFun $ \a -> do
 -- that @class Eq a => Ord a@ et al. are captured by the scanner.
 classSupersProbeB :: IO Val
 classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av    <- force aT
+    av    <- force legacyHooks aT
     cls   <- valToString av
     supers <- IHC.Classes.lookupSuperclasses (BC.pack cls)
     -- Build a Haskell-level [String] cons list from the result.
@@ -2417,7 +2418,7 @@ classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
 
 errorB :: IO Val
 errorB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     s  <- valToString av
     hPutStrLn stderr ("ihc error called: " <> s)
     hFlush stderr
@@ -2436,7 +2437,7 @@ undefinedB = pure (VIO (error "Prelude.undefined"))
 -- | @return x = VIO (pure x)@. The @x@ thunk is not forced until the
 -- receiver runs the action (preserving Haskell laziness).
 returnB :: IO Val
-returnB = pure $ VFun $ \a -> pure (VIO (force a))
+returnB = pure $ VFun $ \a -> pure (VIO (force legacyHooks a))
 
 -- | Class-dispatched @>>=@.  For 'VIO' values (the common IO case) this
 -- is the same as the old 'bindB'.  For ST computations (VCon "ST" _), the
@@ -2445,7 +2446,7 @@ returnB = pure $ VFun $ \a -> pure (VIO (force a))
 -- registry is consulted.
 bindDispatch :: ClassRegistry -> IO Val
 bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
-    mv <- force ma
+    mv <- force legacyHooks ma
     case mv of
         VIO _        -> ioBind mv kt
         VCon "IO" [_] -> ioBind mv kt
@@ -2456,22 +2457,22 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         -- we run it eagerly and wrap the result in a new (# s', a #) tuple --
         -- the ST ≈ IO bridge (CLAUDE.md: ST is compiler-intrinsic, IO machinery reused).
         VCon "ST" [mFuncT] -> do
-            mFuncV <- force mFuncT
-            ktV    <- force kt
+            mFuncV <- force legacyHooks mFuncT
+            ktV    <- force legacyHooks kt
             stFunc <- newWHNFThunk $ VFun $ \sT -> do
-                resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
-                resV   <- runIOVal resRaw    -- run VIO if needed (primop results)
+                resRaw <- apply legacyHooks mFuncV sT    -- apply :: Val -> Thunk -> IO Val
+                resV   <- runIOVal legacyHooks resRaw    -- run VIO if needed (primop results)
                 case stResultComponents resV of
                     Just (newST, rT) -> do
-                        stkRaw <- apply ktV rT   -- k applied to r; may be ST or VIO
+                        stkRaw <- apply legacyHooks ktV rT   -- k applied to r; may be ST or VIO
                         -- DO NOT runIOVal here unconditionally: that would strip a
                         -- `VIO (pure x)` (from `return`/`pure`) down to a bare x and
                         -- lose the state-threading shape. Branch on stkRaw first.
                         case stkRaw of
                             VCon "ST" [k2FuncT] -> do
-                                k2FuncV  <- force k2FuncT
-                                resRaw2  <- apply k2FuncV newST
-                                runIOVal resRaw2
+                                k2FuncV  <- force legacyHooks k2FuncT
+                                resRaw2  <- apply legacyHooks k2FuncV newST
+                                runIOVal legacyHooks resRaw2
                             -- VIO from `return`/`pure` in ST: run it, wrap as (# s, a #)
                             VIO io -> do
                                 r  <- io
@@ -2481,12 +2482,12 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
                                 -- Run any outstanding VIO layers; wrap as (# s, a #).
                                 -- This keeps `stkRaw = VIO (VIO ...)` and other
                                 -- deeply-wrapped results compatible with the ST shape.
-                                v  <- runIOVal other
+                                v  <- runIOVal legacyHooks other
                                 case v of
                                     VCon "ST" [k2FuncT] -> do
-                                        k2FuncV <- force k2FuncT
-                                        resRaw2 <- apply k2FuncV newST
-                                        runIOVal resRaw2
+                                        k2FuncV <- force legacyHooks k2FuncT
+                                        resRaw2 <- apply legacyHooks k2FuncV newST
+                                        runIOVal legacyHooks resRaw2
                                     _ -> do
                                         vT <- newWHNFThunk v
                                         pure (VCon "(#,#)" [newST, vT])
@@ -2499,29 +2500,29 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
             case mBindMethod of
                 Just bindMethod -> do
                     maT <- newWHNFThunk mv
-                    r1  <- apply bindMethod maT
-                    apply r1 kt
+                    r1  <- apply legacyHooks bindMethod maT
+                    apply legacyHooks r1 kt
                 _ ->
                     -- No instance found; fall back to IO bind (will error at
                     -- runtime if mv is not VIO, but gives a sensible message).
                     pure $ VIO $ do
-                        v  <- runIOVal mv
-                        kv <- force kt
+                        v  <- runIOVal legacyHooks mv
+                        kv <- force legacyHooks kt
                         vT <- newWHNFThunk v
-                        r  <- apply kv vT
-                        runIOVal r
+                        r  <- apply legacyHooks kv vT
+                        runIOVal legacyHooks r
   where
     ioBind mv kt = pure $ VIO $ do
-        v  <- runIOVal mv
-        kv <- force kt
+        v  <- runIOVal legacyHooks mv
+        kv <- force legacyHooks kt
         vT <- newWHNFThunk v
-        r  <- apply kv vT
-        runIOVal r
+        r  <- apply legacyHooks kv vT
+        runIOVal legacyHooks r
 
 -- | @m >> n@ = run m (discarding result), then run n.
 seqDispatch :: ClassRegistry -> IO Val
 seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
-    mv <- force ma
+    mv <- force legacyHooks ma
     case mv of
         VIO _         -> ioSeq mv mb
         VCon "IO" [_] -> ioSeq mv mb
@@ -2530,30 +2531,30 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
         -- If n is VIO (from `return`/`pure`), we run it and wrap as (# s', a #).
         VCon "ST" [mFuncT] -> do
-            mFuncV <- force mFuncT
+            mFuncV <- force legacyHooks mFuncT
             stFunc <- newWHNFThunk $ VFun $ \sT -> do
-                resRaw <- apply mFuncV sT    -- apply :: Val -> Thunk -> IO Val
-                resV   <- runIOVal resRaw    -- run VIO if needed
+                resRaw <- apply legacyHooks mFuncV sT    -- apply :: Val -> Thunk -> IO Val
+                resV   <- runIOVal legacyHooks resRaw    -- run VIO if needed
                 case stResultComponents resV of
                     Just (newST, _) -> do
-                        nbV <- force mb
+                        nbV <- force legacyHooks mb
                         case nbV of
                             VCon "ST" [k2FuncT] -> do
-                                k2FuncV  <- force k2FuncT
-                                resRaw2  <- apply k2FuncV newST
-                                runIOVal resRaw2
+                                k2FuncV  <- force legacyHooks k2FuncT
+                                resRaw2  <- apply legacyHooks k2FuncV newST
+                                runIOVal legacyHooks resRaw2
                             -- VIO from `return`/`pure`: run and wrap as (# s, a #)
                             VIO io -> do
                                 r  <- io
                                 rT <- newWHNFThunk r
                                 pure (VCon "(#,#)" [newST, rT])
                             other -> do
-                                v <- runIOVal other
+                                v <- runIOVal legacyHooks other
                                 case v of
                                     VCon "ST" [k2FuncT] -> do
-                                        k2FuncV <- force k2FuncT
-                                        resRaw2 <- apply k2FuncV newST
-                                        runIOVal resRaw2
+                                        k2FuncV <- force legacyHooks k2FuncT
+                                        resRaw2 <- apply legacyHooks k2FuncV newST
+                                        runIOVal legacyHooks resRaw2
                                     _ -> do
                                         vT <- newWHNFThunk v
                                         pure (VCon "(#,#)" [newST, vT])
@@ -2565,18 +2566,18 @@ seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
             case mSeqMethod of
                 Just seqMethod -> do
                     maT <- newWHNFThunk mv
-                    r1  <- apply seqMethod maT
-                    apply r1 mb
+                    r1  <- apply legacyHooks seqMethod maT
+                    apply legacyHooks r1 mb
                 _ ->
                     pure $ VIO $ do
-                        _ <- runIOVal mv
-                        nv <- force mb
-                        runIOVal nv
+                        _ <- runIOVal legacyHooks mv
+                        nv <- force legacyHooks mb
+                        runIOVal legacyHooks nv
   where
     ioSeq mv mb = pure $ VIO $ do
-        _ <- runIOVal mv
-        nv <- force mb
-        runIOVal nv
+        _ <- runIOVal legacyHooks mv
+        nv <- force legacyHooks mb
+        runIOVal legacyHooks nv
 
 -- Strict ST state functions produce unboxed tuples in state-first order,
 -- while lazy ST produces boxed pairs in value-first order. Constructor names
@@ -2596,7 +2597,7 @@ stResultComponents _                               = Nothing
 -- path rather than silently misbehaving.
 fmapDispatch :: ClassRegistry -> IO Val
 fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
-    mv <- force mt
+    mv <- force legacyHooks mt
     let tag = typeTagOf mv
     mFmapMethod <- lookupInstanceMethod reg (BC.pack "Functor") tag (BC.pack "fmap") >>= forceInstanceMethod
     case mFmapMethod of
@@ -2604,15 +2605,15 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
             -- Re-supply the original thunks; the instance implementation
             -- is free to evaluate @mv@ lazily via its own pattern match.
             mT <- newWHNFThunk mv
-            r1 <- apply fmapMethod ft
-            apply r1 mT
+            r1 <- apply legacyHooks fmapMethod ft
+            apply legacyHooks r1 mT
         _ -> case mv of
             VIO _ -> pure $ VIO $ do
-                v  <- runIOVal mv
-                fv <- force ft
+                v  <- runIOVal legacyHooks mv
+                fv <- force legacyHooks ft
                 vT <- newWHNFThunk v
-                r  <- apply fv vT
-                runIOVal r
+                r  <- apply legacyHooks fv vT
+                runIOVal legacyHooks r
             _ -> error
                 ( "fmap: no Functor instance registered for type `"
                   <> BC.unpack tag <> "`" )
@@ -2624,16 +2625,16 @@ fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
 -- @VCon ":"@ chain (see 'charListToByteStringVal').
 sappendDispatch :: ClassRegistry -> IO Val
 sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
-    xv <- force xT
+    xv <- force legacyHooks xT
     case xv of
         -- Direct fast path for cons-list strings: avoid round-tripping
         -- through Semigroup [] which is registered but cycles back here.
         VCon ":" _ -> do
-            yv <- force yT
+            yv <- force legacyHooks yT
             consAppend xv yv
-        VCon "[]" [] -> force yT
+        VCon "[]" [] -> force legacyHooks yT
         VStr _ -> do
-            yv <- force yT
+            yv <- force legacyHooks yT
             consAppend xv yv
         _ -> do
             let tag = typeTagOf xv
@@ -2643,15 +2644,15 @@ sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
             case mMethod of
                 Just method -> do
                     xT' <- newWHNFThunk xv
-                    r1 <- apply method xT'
-                    apply r1 yT
+                    r1 <- apply legacyHooks method xT'
+                    apply legacyHooks r1 yT
                 Nothing -> error
                     ( "<>: no Semigroup instance registered for type `"
                    <> BC.unpack tag <> "`" )
   where
     -- Cons-list / VStr concatenation.  Forces both as cons-lists.
     consAppend (VCon ":" [hT, tT]) ys = do
-        tv <- force tT
+        tv <- force legacyHooks tT
         rest <- consAppend tv ys
         restT <- newWHNFThunk rest
         pure (VCon ":" [hT, restT])
@@ -2673,27 +2674,27 @@ sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
 -- implementation so existing IO uses keep working.
 apDispatch :: ClassRegistry -> IO Val
 apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
-    fv <- force ft
+    fv <- force legacyHooks ft
     let tryTag tag = lookupInstanceMethod reg (BC.pack "Applicative") tag (BC.pack "<*>")
                        >>= forceInstanceMethod
     mApMethod <- tryTag (typeTagOf fv)
     mApMethod2 <- case mApMethod of
         Just _  -> pure mApMethod
         Nothing -> do
-            mv <- force mt
+            mv <- force legacyHooks mt
             tryTag (typeTagOf mv)
     case mApMethod2 of
         Just apMethod -> do
             fT <- newWHNFThunk fv
-            r1 <- apply apMethod fT
-            apply r1 mt
+            r1 <- apply legacyHooks apMethod fT
+            apply legacyHooks r1 mt
         Nothing -> case fv of
             VIO _ -> pure $ VIO $ do
-                f1 <- runIOVal fv
-                mv <- force mt
-                v  <- runIOVal mv
+                f1 <- runIOVal legacyHooks fv
+                mv <- force legacyHooks mt
+                v  <- runIOVal legacyHooks mv
                 vT <- newWHNFThunk v
-                apply f1 vT
+                apply legacyHooks f1 vT
             _ -> error
                 ( "<*>: no Applicative instance registered for type `"
                   <> BC.unpack (typeTagOf fv) <> "`" )
@@ -2712,11 +2713,11 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
 -- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
 firstFnB :: IO Val
 firstFnB = pure $ VFun $ \fT -> pure $ VFun $ \tupT -> do
-    fv  <- force fT
-    tupV <- force tupT
+    fv  <- force legacyHooks fT
+    tupV <- force legacyHooks tupT
     case tupV of
         VCon "(,)" [aT, bT] -> do
-            r  <- apply fv aT
+            r  <- apply legacyHooks fv aT
             rT <- newWHNFThunk r
             pure (VCon "(,)" [rT, bT])
         _ -> error ("first: not a tuple: " <> showValForDebug tupV)
@@ -2724,11 +2725,11 @@ firstFnB = pure $ VFun $ \fT -> pure $ VFun $ \tupT -> do
 -- | @second g (a, b) = (a, g b)@ — counterpart to 'firstFnB'.
 secondFnB :: IO Val
 secondFnB = pure $ VFun $ \gT -> pure $ VFun $ \tupT -> do
-    gv  <- force gT
-    tupV <- force tupT
+    gv  <- force legacyHooks gT
+    tupV <- force legacyHooks tupT
     case tupV of
         VCon "(,)" [aT, bT] -> do
-            r  <- apply gv bT
+            r  <- apply legacyHooks gv bT
             rT <- newWHNFThunk r
             pure (VCon "(,)" [aT, rT])
         _ -> error ("second: not a tuple: " <> showValForDebug tupV)
@@ -2751,16 +2752,16 @@ newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
 
 readIORefB :: IO Val
 readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimIORef rf) -> do
             t <- readIORef rf
-            force t
+            force legacyHooks t
         _ -> error ("readIORef: not an IORef: " <> showValForDebug av)
 
 writeIORefB :: IO Val
 writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimIORef rf) -> do
             -- Install the thunk directly; readers force on demand.
@@ -2773,12 +2774,12 @@ writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 -- (Phase 2.4 does not differentiate beyond that).
 modifyIORefB :: IO Val
 modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimIORef rf) -> do
-            fv <- force f
+            fv <- force legacyHooks f
             curT <- readIORef rf
-            new <- apply fv curT
+            new <- apply legacyHooks fv curT
             newT <- newWHNFThunk new
             writeIORef rf newT
             pure VUnit
@@ -2790,15 +2791,15 @@ modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
 -- @new@, and return @result@.
 atomicModifyIORefB :: IO Val
 atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimIORef rf) -> do
-            fv <- force f
+            fv <- force legacyHooks f
             curT <- readIORef rf
-            pair <- apply fv curT >>= runIOVal
+            pair <- apply legacyHooks fv curT >>= runIOVal legacyHooks
             case pair of
                 VCon _ [newT, resultT] -> do
-                    result <- force resultT
+                    result <- force legacyHooks resultT
                     writeIORef rf newT
                     pure result
                 _ -> error ("atomicModifyIORef': function did not return a pair: "
@@ -2807,7 +2808,7 @@ atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
 
 mkWeakIORefB :: IO Val
 mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $ do
-    refV <- force refT
+    refV <- force legacyHooks refT
     weakPayload <- newWHNFThunk refV
     pure (VCon "Weak" [weakPayload])
 
@@ -2840,7 +2841,7 @@ newMutVarB = pure $ VFun $ \initThunk -> pure $ VFun $ \_st -> do
 -- Returns the unboxed tuple directly (no VIO wrapper).
 readMutVarB :: IO Val
 readMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             vT  <- readIORef rf
@@ -2853,7 +2854,7 @@ readMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_st -> do
 writeMutVarB :: IO Val
 writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
                pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             writeIORef rf valThunk
@@ -2864,14 +2865,14 @@ writeMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \valThunk ->
 atomicModifyMutVarB :: IO Val
 atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
                       pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            fv   <- force fThunk
+            fv   <- force legacyHooks fThunk
             curT <- readIORef rf
             -- f cur returns a (a, b) pair
-            res  <- apply fv curT
-            resV <- runIOVal res
+            res  <- apply legacyHooks fv curT
+            resV <- runIOVal legacyHooks res
             case resV of
                 VCon _ [newT, bT] -> do
                     writeIORef rf newT
@@ -2885,13 +2886,13 @@ atomicModifyMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
 atomicModifyMutVar2B :: IO Val
 atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
                        pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            fv   <- force fThunk
+            fv   <- force legacyHooks fThunk
             curT <- readIORef rf
-            res  <- apply fv curT
-            resV <- runIOVal res
+            res  <- apply legacyHooks fv curT
+            resV <- runIOVal legacyHooks res
             case resV of
                 VCon _ [newT, bT] -> do
                     writeIORef rf newT
@@ -2907,12 +2908,12 @@ atomicModifyMutVar2B = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
 atomicModifyMutVarUB :: IO Val
 atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
                        pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
-            fv   <- force fThunk
+            fv   <- force legacyHooks fThunk
             oldT <- readIORef rf
-            new  <- apply fv oldT
+            new  <- apply legacyHooks fv oldT
             newT <- newWHNFThunk new
             writeIORef rf newT
             stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -2925,7 +2926,7 @@ atomicModifyMutVarUB = pure $ VFun $ \mvThunk -> pure $ VFun $ \fThunk ->
 atomicSwapMutVarB :: IO Val
 atomicSwapMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \newThunk ->
                     pure $ VFun $ \_st -> do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             oldT <- readIORef rf
@@ -2939,7 +2940,7 @@ atomicSwapMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \newThunk ->
 casMutVarB :: IO Val
 casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
              pure $ VFun $ \newThunk -> pure $ VFun $ \_st -> pure $ VIO $ do
-    mvV <- force mvThunk
+    mvV <- force legacyHooks mvThunk
     case mvV of
         VPrimObj (PrimIORef rf) -> do
             writeIORef rf newThunk
@@ -2951,14 +2952,14 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
 
 mkWeakHashB :: IO Val
 mkWeakHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_finalizerT -> pure $ VFun $ \_stT -> do
-    valV <- force valT
+    valV <- force legacyHooks valT
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
 
 mkWeakNoFinalizerHashB :: IO Val
 mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
-    valV <- force valT
+    valV <- force legacyHooks valT
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
@@ -2988,51 +2989,51 @@ bufferModeFromVal v = error ("hSetBuffering: not a BufferMode: "
 
 openFileB :: IO Val
 openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv  <- force a
+    pv  <- force legacyHooks a
     path <- valToString pv
-    mv  <- force b
+    mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
     pure (VPrimObj (PrimHandle h))
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hClose"
+    h <- force legacyHooks a >>= requireHandle "hClose"
     hClose h
     pure VUnit
 
 hPutStrB :: IO Val
 hPutStrB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hPutStr"
-    sv <- force b
+    h <- force legacyHooks a >>= requireHandle "hPutStr"
+    sv <- force legacyHooks b
     s  <- valToString sv
     hPutStr h s
     pure VUnit
 
 hPutStrLnB :: IO Val
 hPutStrLnB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hPutStrLn"
-    sv <- force b
+    h <- force legacyHooks a >>= requireHandle "hPutStrLn"
+    sv <- force legacyHooks b
     s  <- valToString sv
     hPutStrLn h s
     pure VUnit
 
 hGetLineB :: IO Val
 hGetLineB = pure $ VFun $ \a -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hGetLine"
+    h <- force legacyHooks a >>= requireHandle "hGetLine"
     s <- hGetLine h
     stringToListValIO s
 
 hFlushB :: IO Val
 hFlushB = pure $ VFun $ \a -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hFlush"
+    h <- force legacyHooks a >>= requireHandle "hFlush"
     hFlush h
     pure VUnit
 
 hSetBufferingB :: IO Val
 hSetBufferingB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    h <- force a >>= requireHandle "hSetBuffering"
-    mv <- force b
+    h <- force legacyHooks a >>= requireHandle "hSetBuffering"
+    mv <- force legacyHooks b
     hSetBuffering h (bufferModeFromVal mv)
     pure VUnit
 
@@ -3043,21 +3044,21 @@ hSetBufferingB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 -- | @seq a b@: force @a@ to WHNF, then return @b@.
 seqB :: IO Val
 seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    _ <- force a
-    force b
+    _ <- force legacyHooks a
+    force legacyHooks b
 
 -- | @assert cond x = x@.  Like GHC's default (assertions ignored) behaviour.
 assertB :: IO Val
-assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force x
+assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force legacyHooks x
 
 -- | @exitWith code@: throws 'ExitCode'. Wrapped in VIO so it's delayed.
 exitWithB :: IO Val
 exitWithB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VCon "ExitSuccess" _ -> throwIO ExitSuccess
         VCon "ExitFailure" [nT] -> do
-            nv <- force nT
+            nv <- force legacyHooks nT
             case nv of
                 VInt n -> throwIO (ExitFailure (fromIntegral n))
                 _ -> error ("exitWith ExitFailure: not an Int: "
@@ -3075,14 +3076,14 @@ exitSuccessB = pure $ VIO (throwIO ExitSuccess)
 
 ordB :: IO Val
 ordB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VChar c -> pure (VInt (fromIntegral (ord c)))
         _ -> error ("ord: not a Char: " <> showValForDebug av)
 
 chrB :: IO Val
 chrB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VChar (chr (fromIntegral n)))
         _ -> error ("chr: not an Int: " <> showValForDebug av)
@@ -3092,7 +3093,7 @@ chrB = pure $ VFun $ \a -> do
 -- @isTrue#@ is how Haskell-level code observes that bit.
 isTrueHashB :: IO Val
 isTrueHashB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt 0 -> pure (VCon (BC.pack "False") [])
         VInt _ -> pure (VCon (BC.pack "True")  [])
@@ -3114,7 +3115,7 @@ minBoundB = pure (VInt minBound)
 
 fromIntegralB :: IO Val
 fromIntegralB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n   -> pure (VInt n)
         VFloat d -> pure (VFloat d)
@@ -3123,7 +3124,7 @@ fromIntegralB = pure $ VFun $ \a -> do
         -- every single-field constructor (ST, Identity, Maybe-Just, …).
         VCon c [t]
           | c `elem` numericNewtypeCons -> do
-              inner <- force t
+              inner <- force legacyHooks t
               case inner of
                   VInt n   -> pure (VInt n)
                   VFloat d -> pure (VFloat d)
@@ -3166,26 +3167,26 @@ noDuplicateB = pure $ VFun $ \_ -> pure (VPrimObj PrimRealWorld)
 -- runtime effect here is to return the state token unchanged.
 touchHashB :: IO Val
 touchHashB = pure $ VFun $ \aT -> pure $ VFun $ \sT -> do
-    _ <- force aT
-    force sT
+    _ <- force legacyHooks aT
+    force legacyHooks sT
 
 -- | runRW# :: (State# RealWorld -> (# State# RealWorld, a #)) -> a
 -- Apply the function to the RealWorld token, run any bridged VIO layer,
 -- then extract and return the result component of the unboxed tuple.
 runRWB :: IO Val
 runRWB = pure $ VFun $ \ft -> do
-    fv <- force ft
+    fv <- force legacyHooks ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     -- runRW# :: (State# RealWorld -> o) -> o
     -- Just apply the function to the RealWorld token and return the raw
     -- result.  The *caller* (e.g. runST) does any unboxed-tuple matching.
-    resRaw <- apply fv rwT
+    resRaw <- apply legacyHooks fv rwT
     -- If the result is a VIO action (ST-VIO bridge), execute it so that
     -- the caller sees the concrete value / unboxed tuple.
-    runIOVal resRaw
+    runIOVal legacyHooks resRaw
 
 lazyB :: IO Val
-lazyB = pure $ VFun $ \a -> force a
+lazyB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: unsafePerformIO family
@@ -3193,28 +3194,28 @@ lazyB = pure $ VFun $ \a -> force a
 
 unsafePerformIOB :: IO Val
 unsafePerformIOB = pure $ VFun $ \a -> do
-    av <- force a
-    runIOVal av
+    av <- force legacyHooks a
+    runIOVal legacyHooks av
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: boxing/unboxing constructors
 --------------------------------------------------------------------------------
 
 iHashB :: IO Val
-iHashB = pure $ VFun $ \a -> force a
+iHashB = pure $ VFun $ \a -> force legacyHooks a
 
 wHashB :: IO Val
-wHashB = pure $ VFun $ \a -> force a
+wHashB = pure $ VFun $ \a -> force legacyHooks a
 
 w8HashB :: IO Val
 w8HashB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (n .&. 0xff))
-        _      -> force a
+        _      -> force legacyHooks a
 
 cHashB :: IO Val
-cHashB = pure $ VFun $ \a -> force a
+cHashB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: Addr# primitives
@@ -3225,7 +3226,7 @@ nullAddrB = pure (VPrimObj (PrimPtr nullPtr))
 
 plusAddrB :: IO Val
 plusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VPrimObj (PrimPtr p), VInt n) ->
             pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
@@ -3233,7 +3234,7 @@ plusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 minusAddrB :: IO Val
 minusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
             pure (VInt (fromIntegral (p `minusPtr` q)))
@@ -3241,7 +3242,7 @@ minusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 addr2IntB :: IO Val
 addr2IntB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimPtr p) ->
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
@@ -3252,8 +3253,8 @@ addr2IntB = pure $ VFun $ \a -> do
 readIntOffAddrHashB :: IO Val
 readIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                       pure $ VFun $ \_stT -> do
-    addrV <- force addrT
-    idxV  <- force idxT
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
     case (addrV, idxV) of
         (VPrimObj (PrimPtr p), VInt i) -> do
             n   <- peekElemOff (castPtr p :: Ptr Int) (fromIntegral i)
@@ -3267,9 +3268,9 @@ readIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
 writeIntOffAddrHashB :: IO Val
 writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                        pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
-    addrV <- force addrT
-    idxV  <- force idxT
-    valV  <- force valT
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV  <- force legacyHooks valT
     case (addrV, idxV, valV) of
         (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
             pokeElemOff (castPtr p :: Ptr Int) (fromIntegral i)
@@ -3283,7 +3284,7 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
 
 plusPtrB :: IO Val
 plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VPrimObj (PrimPtr p), VInt n) ->
             pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
@@ -3297,7 +3298,7 @@ plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 minusPtrB :: IO Val
 minusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
             pure (VInt (fromIntegral (p `minusPtr` q)))
@@ -3307,7 +3308,7 @@ nullPtrB :: IO Val
 nullPtrB = pure (VPrimObj (PrimPtr nullPtr))
 
 castPtrB :: IO Val
-castPtrB = pure $ VFun $ \a -> force a
+castPtrB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: ForeignPtr
@@ -3315,7 +3316,7 @@ castPtrB = pure $ VFun $ \a -> force a
 
 mallocForeignPtrBytesB :: IO Val
 mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> do
             fp <- mallocForeignPtrBytes (fromIntegral n)
@@ -3348,16 +3349,16 @@ mkBsVal fp len = do
 bsValPayload :: Val -> IO (ForeignPtr Word8, Int)
 bsValPayload v = case v of
     VCon "PS" [fpT, offT, lenT] -> do
-        fpv  <- force fpT
-        offv <- force offT
-        lenv <- force lenT
+        fpv  <- force legacyHooks fpT
+        offv <- force legacyHooks offT
+        lenv <- force legacyHooks lenT
         fp0  <- foreignPtrValToForeignPtr fpv
         case (offv, lenv) of
             (VInt off, VInt n) -> pure (plusForeignPtr fp0 (fromIntegral off), fromIntegral n)
             _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
     VCon "BS" [fpT, lenT] -> do
-        fpv  <- force fpT
-        lenv <- force lenT
+        fpv  <- force legacyHooks fpT
+        lenv <- force legacyHooks lenT
         fp   <- foreignPtrValToForeignPtr fpv
         case lenv of
             VInt n -> pure (fp, fromIntegral n)
@@ -3388,15 +3389,15 @@ newUniqueB = pure $ VIO $ do
 
 hashUniqueB :: IO Val
 hashUniqueB = pure $ VFun $ \uT -> do
-    uv <- force uT
+    uv <- force legacyHooks uT
     case uv of
-        VCon "Unique" [nT] -> force nT
+        VCon "Unique" [nT] -> force legacyHooks nT
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
 
 bsUnpackB :: IO Val
 bsUnpackB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     (fp, len) <- bsValPayload av
     ws <- withForeignPtr fp $ \ptr ->
         mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
@@ -3420,27 +3421,27 @@ bsFromBS bs = do
 
 bsAppendB :: IO Val
 bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     ba <- bsValToBS av; bb <- bsValToBS bv
     bsFromBS (BS.append ba bb)
 
 bsConcatB :: IO Val
 bsConcatB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     xs <- valToBsList av
     bsFromBS (BS.concat xs)
   where
     valToBsList (VCon "[]" _)       = pure []
     valToBsList (VCon ":" [hT, tT]) = do
-        hv <- force hT
+        hv <- force legacyHooks hT
         h  <- bsValToBS hv
-        tv <- force tT
+        tv <- force legacyHooks tT
         (h :) <$> valToBsList tv
     valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
 
 bsSingletonB :: IO Val
 bsSingletonB = pure $ VFun $ \wT -> do
-    wv <- force wT
+    wv <- force legacyHooks wT
     w <- case wv of
         VInt i  -> pure (fromIntegral i :: Word8)
         VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
@@ -3449,7 +3450,7 @@ bsSingletonB = pure $ VFun $ \wT -> do
 
 bsReplicateB :: IO Val
 bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
-    nv <- force nT; wv <- force wT
+    nv <- force legacyHooks nT; wv <- force legacyHooks wT
     n <- case nv of
         VInt i -> pure (fromIntegral i :: Int)
         _      -> error ("BS.replicate: first arg not an Int: " <> showValForDebug nv)
@@ -3461,7 +3462,7 @@ bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
 
 bsIndexB :: IO Val
 bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force aT; iv <- force iT
+    av <- force legacyHooks aT; iv <- force legacyHooks iT
     i <- case iv of
         VInt n -> pure (fromIntegral n :: Int)
         _      -> error ("BS.index: not an Int: " <> showValForDebug iv)
@@ -3479,7 +3480,7 @@ bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
 -- `Data.ByteString.length`). Remove once that's fixed at the Scheduler.
 bs8PutStrLnB :: IO Val
 bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     bs <- bsValToBS av
     BC.putStrLn bs
     hFlush stdout
@@ -3495,18 +3496,18 @@ wordsToConsList (w:ws) = do
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    fpv <- force fpT; fv <- force fT
+    fpv <- force legacyHooks fpT; fv <- force legacyHooks fT
     fp <- foreignPtrValToForeignPtr fpv
     markForeignPtrWord8 fp
     withForeignPtr fp $ \ptr -> do
         markWord8Ptr (castPtr ptr)
         pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-        rv <- apply fv pT
-        runIOVal rv
+        rv <- apply legacyHooks fv pT
+        runIOVal legacyHooks rv
 
 plusForeignPtrB :: IO Val
 plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
-    fpv <- force fpT; nv <- force nT
+    fpv <- force legacyHooks fpT; nv <- force legacyHooks nT
     case (fpv, nv) of
         -- ForeignPtr is RTS-backed and has no pure-Haskell storage model in IHC,
         -- so this builtin must preserve the host pointer offset exactly.
@@ -3524,7 +3525,7 @@ plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
 -- subtraction directly.
 minusForeignPtrB :: IO Val
 minusForeignPtrB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
-    av <- force aT; bv <- force bT
+    av <- force legacyHooks aT; bv <- force legacyHooks bT
     fpA <- foreignPtrValToForeignPtr av
     fpB <- foreignPtrValToForeignPtr bv
     let pA = unsafeForeignPtrToPtr fpA
@@ -3533,28 +3534,28 @@ minusForeignPtrB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
-    fpv <- force fpT
+    fpv <- force legacyHooks fpT
     fp <- foreignPtrValToForeignPtr fpv
     touchForeignPtr fp
     pure VUnit
 
 newForeignPtr_B :: IO Val
 newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force pT
+    pv <- force legacyHooks pT
     p <- ptrValToPtr pv
     fp <- newForeignPtr_ (castPtr p)
     mkForeignPtrVal fp
 
 newForeignPtrB :: IO Val
 newForeignPtrB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force pT
+    pv <- force legacyHooks pT
     p <- ptrValToPtr pv
     fp <- newForeignPtr_ (castPtr p)
     mkForeignPtrVal fp
 
 addForeignPtrFinalizerB :: IO Val
 addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pure $ VIO $ do
-    fpv <- force fpT
+    fpv <- force legacyHooks fpT
     _ <- foreignPtrValToForeignPtr fpv
     pure VUnit
 
@@ -3564,7 +3565,7 @@ addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pu
 
 peekB :: IO Val
 peekB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
+    av <- force legacyHooks a
     p <- ptrValToPtr av
     isWord8 <- isMarkedWord8Ptr p
     if isWord8
@@ -3631,9 +3632,9 @@ peekFullAddrInfoVal p = do
 -- per-attempt churn is wasted work.
 getAddrInfoB :: IO Val
 getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
-    hintsV <- force hintsT
-    hostV <- force hostT
-    serviceV <- force serviceT
+    hintsV <- force legacyHooks hintsT
+    hostV <- force legacyHooks hostT
+    serviceV <- force legacyHooks serviceT
     withMaybeCString hostV $ \hostP ->
         withMaybeCString serviceV $ \serviceP ->
             withHintsPtr hintsV $ \hintsP ->
@@ -3666,7 +3667,7 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
     withMaybeCString v action = case v of
         VCon "Nothing" []   -> action nullPtr
         VCon "Just" [innerT] -> do
-            inner <- force innerT
+            inner <- force legacyHooks innerT
             s <- valToString inner
             withCString s (action . castPtr)
         other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
@@ -3683,7 +3684,7 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
     withHintsPtr v action = case v of
         VCon "Nothing" [] -> action nullPtr
         VCon "Just" [innerT] -> do
-            inner <- force innerT
+            inner <- force legacyHooks innerT
             (flags, family, socktype, protocol) <- extractHintsFields inner
             allocaBytes 48 $ \p -> do
                 fillBytes p 0 48
@@ -3703,10 +3704,10 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
     extractHintsFields :: Val -> IO (Word32, Word32, Word32, Word32)
     extractHintsFields val = case val of
         VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
-            flagsV    <- force flagsT
-            familyV   <- force familyT
-            socktypeV <- force socktypeT
-            protocolV <- force protocolT
+            flagsV    <- force legacyHooks flagsT
+            familyV   <- force legacyHooks familyT
+            socktypeV <- force legacyHooks socktypeT
+            protocolV <- force legacyHooks protocolT
             flags    <- foldFlagBits flagsV
             family   <- conIntField "addrFamily" familyV
             socktype <- conIntField "addrSocketType" socktypeV
@@ -3721,8 +3722,8 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
         go !acc v = case v of
             VCon "[]" []        -> pure acc
             VCon ":" [hT, tT]   -> do
-                hV <- force hT
-                tV <- force tT
+                hV <- force legacyHooks hT
+                tV <- force legacyHooks tT
                 let bit = case hV of
                         VCon "AI_ADDRCONFIG" _ -> 1024
                         VCon "AI_ALL" _        -> 256
@@ -3738,7 +3739,7 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
     conIntField :: String -> Val -> IO Word32
     conIntField name v = case v of
         VCon _ [innerT] -> do
-            inner <- force innerT
+            inner <- force legacyHooks innerT
             case inner of
                 VInt n -> pure (fromIntegral n)
                 _      -> error (name <> ": inner not VInt: " <> showValForDebug inner)
@@ -3847,8 +3848,8 @@ htonl32 = byteSwap32
 
 socketBindB :: IO Val
 socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
-    sockV <- force sockT
-    addrV <- force addrT
+    sockV <- force legacyHooks sockT
+    addrV <- force legacyHooks addrT
     fd <- socketFdFromVal sockV
     (sz, pokeAddr) <- sockAddrPoke addrV
     allocaBytes sz $ \p -> do
@@ -3877,7 +3878,7 @@ socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $
 
 socketSetOptionB :: IO Val
 socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ \valueT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
     (level, opt) <- socketOptionField optT
     value <- intField "setSocketOption.value" valueT
@@ -3890,7 +3891,7 @@ socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ 
 
 socketListenB :: IO Val
 socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
     backlog <- intField "listen.backlog" backlogT
     rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
@@ -3900,7 +3901,7 @@ socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ 
 
 socketAcceptB :: IO Val
 socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
     allocaBytes 128 $ \addrP ->
       allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
@@ -3942,7 +3943,7 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
 
 socketGetNameB :: IO Val
 socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
     allocaBytes 128 $ \addrP ->
       allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
@@ -3962,29 +3963,29 @@ socketFdFromVal v = do
 
 socketCurrentFdVal :: Val -> IO Val
 socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
-    refV <- force refT
+    refV <- force legacyHooks refT
     case refV of
-        VPrimObj (PrimIORef rf) -> readIORef rf >>= force
+        VPrimObj (PrimIORef rf) -> readIORef rf >>= force legacyHooks
         other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
 socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
 
 socketFdB :: IO Val
 socketFdB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
     pure (VInt fd)
 
 socketCloseB :: Bool -> (IO Val)
 socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     case sockV of
         VCon "Socket" [refT, _fdT] -> do
-            refV <- force refT
+            refV <- force legacyHooks refT
             case refV of
                 VPrimObj (PrimIORef rf) -> do
                     sentinelT <- newWHNFThunk (VInt (-1))
                     oldT <- atomicModifyIORef' rf $ \cur -> (sentinelT, cur)
-                    oldFdV <- force oldT
+                    oldFdV <- force legacyHooks oldT
                     case oldFdV of
                         VInt oldFd
                             | oldFd == -1 -> pure VUnit
@@ -3999,18 +4000,18 @@ socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
 
 withFdSocketB :: IO Val
 withFdSocketB = pure $ VFun $ \sockT -> pure $ VFun $ \fnT -> pure $ VIO $ do
-    sockV <- force sockT
+    sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
-    fnV <- force fnT
+    fnV <- force legacyHooks fnT
     fdT <- newWHNFThunk (VInt fd)
-    r <- apply fnV fdT
-    runIOVal r
+    r <- apply legacyHooks fnV fdT
+    runIOVal legacyHooks r
 
 socketSendBufB :: IO Val
 socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force sockT
-    ptrV <- force ptrT
-    lenV <- force lenT
+    sockV <- force legacyHooks sockT
+    ptrV <- force legacyHooks ptrT
+    lenV <- force legacyHooks lenT
     fd <- socketFdFromVal sockV
     ptr <- ptrValToPtr ptrV
     case lenV of
@@ -4023,9 +4024,9 @@ socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \l
 
 socketRecvBufB :: IO Val
 socketRecvBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force sockT
-    ptrV <- force ptrT
-    lenV <- force lenT
+    sockV <- force legacyHooks sockT
+    ptrV <- force legacyHooks ptrT
+    lenV <- force legacyHooks lenT
     fd <- socketFdFromVal sockV
     ptr <- ptrValToPtr ptrV
     case lenV of
@@ -4044,7 +4045,7 @@ mallocBytesB = pure $ VFun $ \nT -> pure $ VIO $ do
 
 freeB :: IO Val
 freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
-    ptrV <- force ptrT
+    ptrV <- force legacyHooks ptrT
     p <- ptrValToPtr ptrV
     free p
     pure VUnit
@@ -4055,10 +4056,10 @@ freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
 -- record fields on a host-constructed AddrInfo.
 addrInfoFieldB :: String -> Int -> IO Val
 addrInfoFieldB label idx = pure $ VFun $ \aiT -> do
-    aiV <- force aiT
+    aiV <- force legacyHooks aiT
     case aiV of
         VCon "AddrInfo" fields
-            | idx < length fields -> force (fields !! idx)
+            | idx < length fields -> force legacyHooks (fields !! idx)
         other -> error (label <> ": not AddrInfo: " <> showValForDebug other)
 
 sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
@@ -4094,7 +4095,7 @@ sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug ot
 
 hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)
 hostAddress6Fields addrT = do
-    addrV <- force addrT
+    addrV <- force legacyHooks addrT
     case addrV of
         VCon "(,,,)" [aT, bT, cT, dT] -> do
             a <- intField "HostAddress6.0" aT
@@ -4106,14 +4107,14 @@ hostAddress6Fields addrT = do
 
 intField :: String -> Thunk -> IO Int64
 intField label t = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VInt n -> pure n
         other  -> error (label <> " is not an Int: " <> showValForDebug other)
 
 familyField :: Thunk -> IO Int64
 familyField t = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VCon "Family" [nT] -> intField "socket.family" nT
         VInt n             -> pure n
@@ -4121,7 +4122,7 @@ familyField t = do
 
 socketTypeField :: Thunk -> IO Int64
 socketTypeField t = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VCon "SocketType" [nT] -> intField "socket.type" nT
         VInt n                 -> pure n
@@ -4129,7 +4130,7 @@ socketTypeField t = do
 
 socketOptionField :: Thunk -> IO (Int64, Int64)
 socketOptionField t = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VCon "SockOpt" [levelT, optT] -> do
             level <- intField "socket.option.level" levelT
@@ -4181,7 +4182,7 @@ foreign import ccall unsafe "freeaddrinfo"
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     p <- ptrValToPtr av
     case bv of
         VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
@@ -4189,7 +4190,7 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 
 peekByteOffB :: IO Val
 peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     p <- ptrValToPtr av
     case bv of
         VInt off -> do
@@ -4209,7 +4210,7 @@ peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 
 pokeByteOffB :: IO Val
 pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    av <- force a; bv <- force b; cv <- force c
+    av <- force legacyHooks a; bv <- force legacyHooks b; cv <- force legacyHooks c
     p <- ptrValToPtr av
     case bv of
         VInt off ->
@@ -4231,7 +4232,7 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
 
 newByteArrayB :: IO Val
 newByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; stv <- force stT
+    av <- force legacyHooks a; stv <- force legacyHooks stT
     let n = case av of { VInt i -> fromIntegral i; _ -> 0 }
     ref  <- newIORef (BS.replicate n 0)
     baT  <- newWHNFThunk (VPrimObj (PrimByteArray ref))
@@ -4244,11 +4245,11 @@ newPinnedByteArrayB = newByteArrayB
 newAlignedPinnedByteArrayB :: IO Val
 newAlignedPinnedByteArrayB = pure $ VFun $ \nT -> pure $ VFun $ \_alignT -> do
     newPinned <- newPinnedByteArrayB
-    apply newPinned nT
+    apply legacyHooks newPinned nT
 
 writeWord8ArrayB :: IO Val
 writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; bv <- force b; cv <- force c; stv <- force stT
+    av <- force legacyHooks a; bv <- force legacyHooks b; cv <- force legacyHooks c; stv <- force legacyHooks stT
     case av of
         VPrimObj (PrimByteArray ref) ->
             case (bv, cv) of
@@ -4266,7 +4267,7 @@ writeWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> p
 
 readWord8ArrayB :: IO Val
 readWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; bv <- force b; stv <- force stT
+    av <- force legacyHooks a; bv <- force legacyHooks b; stv <- force legacyHooks stT
     case av of
         VPrimObj (PrimByteArray ref) ->
             case bv of
@@ -4281,7 +4282,7 @@ readWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> 
 
 indexWord8ArrayB :: IO Val
 indexWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case av of
         VPrimObj (PrimByteArray ref) ->
             case bv of
@@ -4293,7 +4294,7 @@ indexWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 unsafeFreezeByteArrayB :: IO Val
 unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; stv <- force stT
+    av <- force legacyHooks a; stv <- force legacyHooks stT
     case av of
         VPrimObj (PrimByteArray _) -> do
             aT   <- newWHNFThunk av
@@ -4307,8 +4308,8 @@ unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ 
 
 newArrayHashB :: IO Val
 newArrayHashB = pure $ VFun $ \nT -> pure $ VFun $ \initT -> pure $ VFun $ \stT -> do
-    nv <- force nT
-    stv <- force stT
+    nv <- force legacyHooks nT
+    stv <- force legacyHooks stT
     let n = case nv of
             VInt i -> max 0 (fromIntegral i)
             _      -> 0
@@ -4319,9 +4320,9 @@ newArrayHashB = pure $ VFun $ \nT -> pure $ VFun $ \initT -> pure $ VFun $ \stT 
 
 writeArrayHashB :: IO Val
 writeArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \valT -> pure $ VFun $ \stT -> do
-    arrV <- force arrT
-    idxV <- force idxT
-    stv <- force stT
+    arrV <- force legacyHooks arrT
+    idxV <- force legacyHooks idxT
+    stv <- force legacyHooks stT
     case (arrV, idxV) of
         (VPrimObj (PrimArray ref), VInt idx) -> do
             cells <- readIORef ref
@@ -4335,9 +4336,9 @@ writeArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \v
 
 readArrayHashB :: IO Val
 readArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \stT -> do
-    arrV <- force arrT
-    idxV <- force idxT
-    stv <- force stT
+    arrV <- force legacyHooks arrT
+    idxV <- force legacyHooks idxT
+    stv <- force legacyHooks stT
     case (arrV, idxV) of
         (VPrimObj (PrimArray ref), VInt idx) -> do
             cell <- readArrayCell ref idx "readArray#"
@@ -4347,8 +4348,8 @@ readArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> pure $ VFun $ \st
 
 indexArrayHashB :: IO Val
 indexArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> do
-    arrV <- force arrT
-    idxV <- force idxT
+    arrV <- force legacyHooks arrT
+    idxV <- force legacyHooks idxT
     case (arrV, idxV) of
         (VPrimObj (PrimArray ref), VInt idx) -> do
             cell <- readArrayCell ref idx "indexArray#"
@@ -4357,8 +4358,8 @@ indexArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \idxT -> do
 
 unsafeFreezeArrayHashB :: IO Val
 unsafeFreezeArrayHashB = pure $ VFun $ \arrT -> pure $ VFun $ \stT -> do
-    arrV <- force arrT
-    stv <- force stT
+    arrV <- force legacyHooks arrT
+    stv <- force legacyHooks stT
     case arrV of
         VPrimObj (PrimArray _) -> do
             arrT' <- newWHNFThunk arrV
@@ -4371,7 +4372,7 @@ unsafeThawArrayHashB = unsafeFreezeArrayHashB
 
 sizeofArrayHashB :: IO Val
 sizeofArrayHashB = pure $ VFun $ \arrT -> do
-    arrV <- force arrT
+    arrV <- force legacyHooks arrT
     case arrV of
         VPrimObj (PrimArray ref) -> VInt . fromIntegral . length <$> readIORef ref
         _ -> error ("sizeofArray#: not an Array#: " <> showValForDebug arrV)
@@ -4396,7 +4397,7 @@ replaceAt i x xs =
 
 byteArrayContentsB :: IO Val
 byteArrayContentsB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimByteArray ref) -> do
             bs <- readIORef ref
@@ -4411,7 +4412,7 @@ mutableByteArrayContentsB = byteArrayContentsB
 
 getSizeofMutableByteArrayB :: IO Val
 getSizeofMutableByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; stv <- force stT
+    av <- force legacyHooks a; stv <- force legacyHooks stT
     case av of
         VPrimObj (PrimByteArray ref) -> do
             bs   <- readIORef ref
@@ -4422,7 +4423,7 @@ getSizeofMutableByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VI
 
 sizeofByteArrayB :: IO Val
 sizeofByteArrayB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimByteArray ref) -> do
             bs <- readIORef ref
@@ -4432,7 +4433,7 @@ sizeofByteArrayB = pure $ VFun $ \a -> do
 resizeMutableByteArrayB :: IO Val
 resizeMutableByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; bv <- force b; stv <- force stT
+    av <- force legacyHooks a; bv <- force legacyHooks b; stv <- force legacyHooks stT
     case (av, bv) of
         (VPrimObj (PrimByteArray ref), VInt n) -> do
             bs <- readIORef ref
@@ -4450,7 +4451,7 @@ resizeMutableByteArrayB = pure
 shrinkMutableByteArrayB :: IO Val
 shrinkMutableByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; bv <- force b; stv <- force stT
+    av <- force legacyHooks a; bv <- force legacyHooks b; stv <- force legacyHooks stT
     case (av, bv) of
         (VPrimObj (PrimByteArray ref), VInt n) -> do
             bs <- readIORef ref
@@ -4461,7 +4462,7 @@ shrinkMutableByteArrayB = pure
 setByteArrayB :: IO Val
 setByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \stT -> pure $ VIO $ do
-    av <- force a; offV <- force b; lenV <- force c; valV <- force d; stv <- force stT
+    av <- force legacyHooks a; offV <- force legacyHooks b; lenV <- force legacyHooks c; valV <- force legacyHooks d; stv <- force legacyHooks stT
     case (av, offV, lenV, valV) of
         (VPrimObj (PrimByteArray ref), VInt off, VInt len, VInt val) -> do
             bs <- readIORef ref
@@ -4480,8 +4481,8 @@ setByteArrayB = pure
 copyMutableByteArrayB :: IO Val
 copyMutableByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> pure $ VFun $ \stT -> pure $ VIO $ do
-    srcV <- force a; srcOffV <- force b; dstV <- force c
-    dstOffV <- force d; lenV <- force e; stv <- force stT
+    srcV <- force legacyHooks a; srcOffV <- force legacyHooks b; dstV <- force legacyHooks c
+    dstOffV <- force legacyHooks d; lenV <- force legacyHooks e; stv <- force legacyHooks stT
     case (srcV, srcOffV, dstV, dstOffV, lenV) of
         (VPrimObj (PrimByteArray srcRef), VInt srcOff, VPrimObj (PrimByteArray dstRef), VInt dstOff, VInt len) -> do
             srcBs <- readIORef srcRef
@@ -4502,8 +4503,8 @@ copyMutableByteArrayB = pure
 copyByteArrayB :: IO Val
 copyByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> pure $ VFun $ \stT -> pure $ VIO $ do
-    srcV <- force a; srcOffV <- force b; dstV <- force c
-    dstOffV <- force d; lenV <- force e; stv <- force stT
+    srcV <- force legacyHooks a; srcOffV <- force legacyHooks b; dstV <- force legacyHooks c
+    dstOffV <- force legacyHooks d; lenV <- force legacyHooks e; stv <- force legacyHooks stT
     case (srcV, srcOffV, dstV, dstOffV, lenV) of
         (VPrimObj (PrimByteArray srcRef), VInt srcOff, VPrimObj (PrimByteArray dstRef), VInt dstOff, VInt len) -> do
             srcBs <- readIORef srcRef
@@ -4524,8 +4525,8 @@ copyByteArrayB = pure
 copyAddrToByteArrayB :: IO Val
 copyAddrToByteArrayB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \stT -> pure $ VIO $ do
-    srcV    <- force a; baV <- force b
-    dstOffV <- force c; lenV <- force d; stv <- force stT
+    srcV    <- force legacyHooks a; baV <- force legacyHooks b
+    dstOffV <- force legacyHooks c; lenV <- force legacyHooks d; stv <- force legacyHooks stT
     case (srcV, baV, dstOffV, lenV) of
         (VPrimObj (PrimPtr src), VPrimObj (PrimByteArray ref), VInt dstOff, VInt len) -> do
             bs    <- readIORef ref
@@ -4542,8 +4543,8 @@ copyAddrToByteArrayB = pure
 copyByteArrayToAddrB :: IO Val
 copyByteArrayToAddrB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \stT -> pure $ VIO $ do
-    baV     <- force a; srcOffV <- force b
-    dstV    <- force c; lenV    <- force d; stv <- force stT
+    baV     <- force legacyHooks a; srcOffV <- force legacyHooks b
+    dstV    <- force legacyHooks c; lenV    <- force legacyHooks d; stv <- force legacyHooks stT
     case (baV, srcOffV, dstV, lenV) of
         (VPrimObj (PrimByteArray ref), VInt srcOff, VPrimObj (PrimPtr dst), VInt len) -> do
             bs <- readIORef ref
@@ -4556,7 +4557,7 @@ copyByteArrayToAddrB = pure
 compareByteArraysB :: IO Val
 compareByteArraysB = pure
     $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VFun $ \d -> pure $ VFun $ \e -> do
-    aV <- force a; bV <- force b; cV <- force c; dV <- force d; eV <- force e
+    aV <- force legacyHooks a; bV <- force legacyHooks b; cV <- force legacyHooks c; dV <- force legacyHooks d; eV <- force legacyHooks e
     case (aV, bV, cV, dV, eV) of
         (VPrimObj (PrimByteArray lhsRef), VInt lhsOff, VPrimObj (PrimByteArray rhsRef), VInt rhsOff, VInt len) -> do
             lhsBs <- readIORef lhsRef
@@ -4577,7 +4578,7 @@ compareByteArraysB = pure
 
 memcpyB :: IO Val
 memcpyB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    dstV <- force a; srcV <- force b; lenV <- force c
+    dstV <- force legacyHooks a; srcV <- force legacyHooks b; lenV <- force legacyHooks c
     case (dstV, srcV, lenV) of
         (VPrimObj (PrimPtr dst), VPrimObj (PrimPtr src), VInt n) -> do
             copyBytes dst src (fromIntegral n)
@@ -4586,7 +4587,7 @@ memcpyB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO
 
 memcpyFpB :: IO Val
 memcpyFpB = pure $ VFun $ \fpT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure $ VIO $ do
-    fpv <- force fpT; pv <- force pT; nv <- force nT
+    fpv <- force legacyHooks fpT; pv <- force legacyHooks pT; nv <- force legacyHooks nT
     case (fpv, pv, nv) of
         (VPrimObj (PrimForeignPtr fp), VPrimObj (PrimPtr src), VInt n) ->
             withForeignPtr fp $ \dst -> do
@@ -4598,7 +4599,7 @@ memcpyFpB = pure $ VFun $ \fpT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure
 -- Foreign.Marshal.Utils.copyBytes — wraps copyAddrToAddrNonOverlapping# primop.
 copyBytesB :: IO Val
 copyBytesB = pure $ VFun $ \destT -> pure $ VFun $ \srcT -> pure $ VFun $ \nT -> pure $ VIO $ do
-    dv <- force destT; sv <- force srcT; nv <- force nT
+    dv <- force legacyHooks destT; sv <- force legacyHooks srcT; nv <- force legacyHooks nT
     case (dv, sv, nv) of
         (VPrimObj (PrimPtr dest), VPrimObj (PrimPtr src), VInt n) -> do
             copyBytes dest src (fromIntegral n)
@@ -4611,7 +4612,7 @@ copyBytesB = pure $ VFun $ \destT -> pure $ VFun $ \srcT -> pure $ VFun $ \nT ->
 
 hPutBufB :: IO Val
 hPutBufB = pure $ VFun $ \hT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure $ VIO $ do
-    hv <- force hT; pv <- force pT; nv <- force nT
+    hv <- force legacyHooks hT; pv <- force legacyHooks pT; nv <- force legacyHooks nT
     h  <- requireHandle "hPutBuf" hv
     p <- ptrValToPtr pv
     case nv of
@@ -4626,56 +4627,56 @@ hPutBufB = pure $ VFun $ \hT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure $
 
 int2WordB :: IO Val
 int2WordB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word64)))
-        _      -> force a
+        _      -> force legacyHooks a
 
 word2IntB :: IO Val
 word2IntB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word64)))
-        _      -> force a
+        _      -> force legacyHooks a
 
 orHashB :: IO Val
 orHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x .|. y))
         _ -> error ("or#: bad args: " <> showValForDebug av)
 
 andHashB :: IO Val
 andHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x .&. y))
         _ -> error ("and#: bad args: " <> showValForDebug av)
 
 xorHashB :: IO Val
 xorHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x `xor` y))
         _ -> error ("xor#: bad args: " <> showValForDebug av)
 
 notHashB :: IO Val
 notHashB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt x -> pure (VInt (complement x))
         _      -> error ("not#: bad arg: " <> showValForDebug av)
 
 uncheckedShiftLB :: IO Val
 uncheckedShiftLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x `shiftL` fromIntegral n))
         _ -> error ("uncheckedShiftL#: bad args: " <> showValForDebug av)
 
 uncheckedShiftRLB :: IO Val
 uncheckedShiftRLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) ->
             pure (VInt (fromIntegral (fromIntegral x `shiftR` fromIntegral n :: Word64)))
@@ -4683,102 +4684,102 @@ uncheckedShiftRLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 uncheckedIShiftRAB :: IO Val
 uncheckedIShiftRAB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x `shiftR` fromIntegral n))
         _ -> error ("uncheckedIShiftRA#: bad args: " <> showValForDebug av)
 
 plusIntHashB :: IO Val
 plusIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x + y))
         _ -> error ("+#: bad args: " <> showValForDebug av)
 
 minusIntHashB :: IO Val
 minusIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x - y))
         _ -> error ("-#: bad args: " <> showValForDebug av)
 
 timesIntHashB :: IO Val
 timesIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x * y))
         _ -> error ("*#: bad args: " <> showValForDebug av)
 
 ltIntHashB :: IO Val
 ltIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x < y))
         _ -> error ("<#: bad args: " <> showValForDebug av)
 
 leIntHashB :: IO Val
 leIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x <= y))
         _ -> error ("<=#: bad args: " <> showValForDebug av)
 
 eqIntHashB :: IO Val
 eqIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x == y))
         _ -> error ("==#: bad args: " <> showValForDebug av)
 
 gtIntHashB :: IO Val
 gtIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x > y))
         _ -> error (">#: bad args: " <> showValForDebug av)
 
 geIntHashB :: IO Val
 geIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x >= y))
         _ -> error (">=#: bad args: " <> showValForDebug av)
 
 neIntHashB :: IO Val
 neIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x /= y))
         _ -> error ("/=#: bad args: " <> showValForDebug av)
 
 ltCharHashB :: IO Val
 ltCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av < charPrimOrd bv))
 
 leCharHashB :: IO Val
 leCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av <= charPrimOrd bv))
 
 eqCharHashB :: IO Val
 eqCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av == charPrimOrd bv))
 
 gtCharHashB :: IO Val
 gtCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av > charPrimOrd bv))
 
 geCharHashB :: IO Val
 geCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av >= charPrimOrd bv))
 
 neCharHashB :: IO Val
 neCharHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     pure (primBoolVal (charPrimOrd av /= charPrimOrd bv))
 
 charPrimOrd :: Val -> Int
@@ -4788,7 +4789,7 @@ charPrimOrd v         = error ("char primop: bad arg: " <> showValForDebug v)
 
 timesInt2B :: IO Val
 timesInt2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             let r   = x * y
@@ -4800,7 +4801,7 @@ timesInt2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 timesWord2B :: IO Val
 timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             let r = x * y
@@ -4815,42 +4816,42 @@ timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 ltWordB :: IO Val
 ltWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) < fromIntegral y))
         _ -> error "ltWord#: bad args"
 
 leWordB :: IO Val
 leWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) <= fromIntegral y))
         _ -> error "leWord#: bad args"
 
 eqWordB :: IO Val
 eqWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal (x == y))
         _ -> error "eqWord#: bad args"
 
 gtWordB :: IO Val
 gtWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) > fromIntegral y))
         _ -> error "gtWord#: bad args"
 
 geWordB :: IO Val
 geWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (primBoolVal ((fromIntegral x :: Word64) >= fromIntegral y))
         _ -> error "geWord#: bad args"
 
 minusWordB :: IO Val
 minusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VInt (fromIntegral (fromIntegral x - fromIntegral y :: Word64)))
@@ -4858,7 +4859,7 @@ minusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 plusWordB :: IO Val
 plusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VInt (fromIntegral (fromIntegral x + fromIntegral y :: Word64)))
@@ -4866,7 +4867,7 @@ plusWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 timesWordB :: IO Val
 timesWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VInt (fromIntegral (fromIntegral x * fromIntegral y :: Word64)))
@@ -4874,7 +4875,7 @@ timesWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 quotWordB :: IO Val
 quotWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VInt (fromIntegral ((fromIntegral x :: Word64) `quot` fromIntegral y)))
@@ -4882,7 +4883,7 @@ quotWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 remWordB :: IO Val
 remWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) ->
             pure (VInt (fromIntegral ((fromIntegral x :: Word64) `rem` fromIntegral y)))
@@ -4890,14 +4891,14 @@ remWordB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 popCntB :: IO Val
 popCntB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
         _      -> error ("popCnt#: bad arg: " <> showValForDebug av)
 
 indexOfTheOnlyBitB :: IO Val
 indexOfTheOnlyBitB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n ->
             let w   = fromIntegral n :: Word64
@@ -4912,28 +4913,28 @@ indexOfTheOnlyBitB = pure $ VFun $ \a -> do
 
 negateIntB :: IO Val
 negateIntB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (negate n))
         _      -> error ("negateInt#: bad arg: " <> showValForDebug av)
 
 quotIntB :: IO Val
 quotIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x `quot` y))
         _ -> error "quotInt#: bad args"
 
 remIntB :: IO Val
 remIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x `rem` y))
         _ -> error "remInt#: bad args"
 
 quotRemIntB :: IO Val
 quotRemIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             let (q, r) = x `quotRem` y
@@ -4944,7 +4945,7 @@ quotRemIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 addIntCB :: IO Val
 addIntCB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             rT <- newWHNFThunk (VInt (x + y))
@@ -4954,7 +4955,7 @@ addIntCB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 subIntCB :: IO Val
 subIntCB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             rT <- newWHNFThunk (VInt (x - y))
@@ -4964,7 +4965,7 @@ subIntCB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 mulIntMayOfloB :: IO Val
 mulIntMayOfloB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt _, VInt _) -> pure (VInt 0)
         _ -> error "mulIntMayOflo#: bad args"
@@ -4975,7 +4976,7 @@ mulIntMayOfloB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 cstringLengthB :: IO Val
 cstringLengthB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimPtr p) -> do
             let go i = do
@@ -4987,7 +4988,7 @@ cstringLengthB = pure $ VFun $ \a -> do
 
 unpackCStringB :: IO Val
 unpackCStringB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VPrimObj (PrimPtr p) -> do
             s <- peekCAString (castPtr p)
@@ -5003,12 +5004,12 @@ unpackCStringB = pure $ VFun $ \a -> do
 -- CChar' to the callback.
 withCStringB :: IO Val
 withCStringB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
-    sv <- force sT
+    sv <- force legacyHooks sT
     s  <- valToString sv
-    kv <- force kT
+    kv <- force legacyHooks kT
     BS.useAsCString (BC.pack s) $ \p -> do
         argT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr p)))
-        r    <- apply kv argT
+        r    <- apply legacyHooks kv argT
         case r of
             VIO io -> io
             _      -> pure r
@@ -5019,15 +5020,15 @@ withCStringB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
 -- derived here.
 withCStringLenB :: IO Val
 withCStringLenB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
-    sv <- force sT
+    sv <- force legacyHooks sT
     s  <- valToString sv
-    kv <- force kT
+    kv <- force legacyHooks kT
     let bs = BC.pack s
     BS.useAsCString bs $ \p -> do
         ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr p)))
         lenT <- newWHNFThunk (VInt (fromIntegral (BS.length bs)))
         tupT <- newWHNFThunk (VCon "(,)" [ptrT, lenT])
-        r    <- apply kv tupT
+        r    <- apply legacyHooks kv tupT
         case r of
             VIO io -> io
             _      -> pure r
@@ -5035,7 +5036,7 @@ withCStringLenB = pure $ VFun $ \sT -> pure $ VFun $ \kT -> pure $ VIO $ do
 -- Pure pointer peek — materialise a 'Ptr CChar' as a Haskell @String@.
 peekCStringB :: IO Val
 peekCStringB = pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force pT
+    pv <- force legacyHooks pT
     p  <- ptrValToPtr pv
     s  <- peekCAString (castPtr p)
     stringToListValIO s
@@ -5044,7 +5045,7 @@ peekCStringB = pure $ VFun $ \pT -> pure $ VIO $ do
 -- return its raw pointer.  Caller is responsible for freeing.
 newCStringB :: IO Val
 newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
-    sv <- force sT
+    sv <- force legacyHooks sT
     s  <- valToString sv
     let bs  = BC.pack s
         len = BS.length bs
@@ -5055,16 +5056,16 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
 
 withB :: IO Val
 withB = pure $ VFun $ \valT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    valV <- force valT
-    fV <- force fT
+    valV <- force legacyHooks valT
+    fV <- force legacyHooks fT
     p <- mallocBytes 8
     fillBytes p 0 8
     case valV of
         VInt n -> poke (castPtr p :: Ptr CInt) (fromIntegral n)
         _      -> pure ()
     ptrT <- newWHNFThunk (VPrimObj (PrimPtr p))
-    r <- apply fV ptrT
-    runIOVal r
+    r <- apply legacyHooks fV ptrT
+    runIOVal legacyHooks r
 
 sizeOfB :: IO Val
 sizeOfB = pure $ VFun $ \a -> do
@@ -5082,7 +5083,7 @@ alignmentB = pure $ VFun $ \a -> do
 
 divModB :: IO Val
 divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             let (d, m) = x `divMod` y
@@ -5092,7 +5093,7 @@ divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 quotRemB :: IO Val
 quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
             let (q, r) = x `quotRem` y
@@ -5102,77 +5103,77 @@ quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 shiftLB :: IO Val
 shiftLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x `shiftL` fromIntegral n))
         _ -> error "shiftL: bad args"
 
 shiftRB :: IO Val
 shiftRB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x `shiftR` fromIntegral n))
         _ -> error "shiftR: bad args"
 
 bitAndB :: IO Val
 bitAndB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x .&. y))
         _ -> error "(.&.): bad args"
 
 bitOrB :: IO Val
 bitOrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x .|. y))
         _ -> error "(.|.): bad args"
 
 bitXorB :: IO Val
 bitXorB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> pure (VInt (x `xor` y))
         _ -> error "xor: bad args"
 
 bitComplementB :: IO Val
 bitComplementB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt x -> pure (VInt (complement x))
         _ -> error "complement: bad arg"
 
 popCountB :: IO Val
 popCountB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
         _ -> error "popCount: bad arg"
 
 bitB :: IO Val
 bitB = pure $ VFun $ \a -> do
-    av <- force a
+    av <- force legacyHooks a
     case av of
         VInt n -> pure (VInt (1 `shiftL` fromIntegral n))
         _ -> error "bit: bad arg"
 
 testBitB :: IO Val
 testBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (boolVal ((x `shiftR` fromIntegral n) .&. 1 /= 0))
         _ -> error "testBit: bad args"
 
 clearBitB :: IO Val
 clearBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x .&. complement (1 `shiftL` fromIntegral n)))
         _ -> error "clearBit: bad args"
 
 setBitB :: IO Val
 setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n) -> pure (VInt (x .|. (1 `shiftL` fromIntegral n)))
         _ -> error "setBit: bad args"
@@ -5186,8 +5187,8 @@ setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- Double ^ Int → Double via Haskell's (^^).
 powOpB :: IO Val
 powOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt n)
             | n < 0    -> error ("(^): negative exponent: " <> show n)
@@ -5205,8 +5206,8 @@ powOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | @(^^) :: Fractional a => a -> Int -> a@  and  @(**) :: Floating a => a -> a -> a@.
 powFloatOpB :: IO Val
 powFloatOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a
-    bv <- force b
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
     let toD (VFloat d) = d
         toD (VInt n)   = fromIntegral n
         toD v          = error ("(^^)/(** ): non-numeric: " <> showValForDebug v)
@@ -5219,8 +5220,8 @@ powFloatOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | @enumFromTo lo hi@ builds @[lo..hi]@. Works for Int and Char.
 enumFromToB :: IO Val
 enumFromToB = pure $ VFun $ \loT -> pure $ VFun $ \hiT -> do
-    lov <- force loT
-    hiv <- force hiT
+    lov <- force legacyHooks loT
+    hiv <- force legacyHooks hiT
     case (lov, hiv) of
         (VInt lo, VInt hi) -> buildIntList lo hi
         (VChar lo, VChar hi) ->
@@ -5240,11 +5241,11 @@ enumFromToB = pure $ VFun $ \loT -> pure $ VFun $ \hiT -> do
     charifyList :: Val -> IO Val
     charifyList (VCon "[]" _) = pure (VCon "[]" [])
     charifyList (VCon ":" [hT, tT]) = do
-        hv <- force hT
+        hv <- force legacyHooks hT
         case hv of
             VInt n -> do
                 cT   <- newWHNFThunk (VChar (toEnum (fromIntegral n)))
-                rest <- force tT >>= charifyList
+                rest <- force legacyHooks tT >>= charifyList
                 rT   <- newWHNFThunk rest
                 pure (VCon ":" [cT, rT])
             _ -> error "charifyList: expected VInt"
@@ -5253,9 +5254,9 @@ enumFromToB = pure $ VFun $ \loT -> pure $ VFun $ \hiT -> do
 -- | @enumFromThenTo lo step hi@ builds @[lo, step..hi]@. Works for Int and Char.
 enumFromThenToB :: IO Val
 enumFromThenToB = pure $ VFun $ \loT -> pure $ VFun $ \stepT -> pure $ VFun $ \hiT -> do
-    lov  <- force loT
-    stepv <- force stepT
-    hiv  <- force hiT
+    lov  <- force legacyHooks loT
+    stepv <- force legacyHooks stepT
+    hiv  <- force legacyHooks hiT
     case (lov, stepv, hiv) of
         (VInt lo, VInt step, VInt hi) -> buildStepList lo step hi
         _ -> error ("enumFromThenTo: non-Int args")
@@ -5278,7 +5279,7 @@ enumFromThenToB = pure $ VFun $ \loT -> pure $ VFun $ \stepT -> pure $ VFun $ \h
 -- | @readFile path@ — read the entire file as a String ([Char]).
 readFileB :: IO Val
 readFileB = pure $ VFun $ \a -> pure $ VIO $ do
-    pv   <- force a
+    pv   <- force legacyHooks a
     path <- valToString pv
     contents <- readFile path
     stringToListValIO contents
@@ -5286,9 +5287,9 @@ readFileB = pure $ VFun $ \a -> pure $ VIO $ do
 -- | @writeFile path contents@ — write a String to the file (truncating).
 writeFileB :: IO Val
 writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force a
+    pv   <- force legacyHooks a
     path <- valToString pv
-    cv   <- force b
+    cv   <- force legacyHooks b
     s    <- valToString cv
     writeFile path s
     pure VUnit
@@ -5296,9 +5297,9 @@ writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
 -- | @appendFile path contents@ — append a String to the file.
 appendFileB :: IO Val
 appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force a
+    pv   <- force legacyHooks a
     path <- valToString pv
-    cv   <- force b
+    cv   <- force legacyHooks b
     s    <- valToString cv
     appendFile path s
     pure VUnit
@@ -5357,7 +5358,7 @@ buildConEnv reg = do
     forceStrictFields []         _      = pure ()
     forceStrictFields _          []     = pure ()
     forceStrictFields (s : ss) (t : ts) = do
-        when s (() <$ force t)
+        when s (() <$ force legacyHooks t)
         forceStrictFields ss ts
 
 -- | Build an environment binding each record-field name to an accessor
@@ -5400,7 +5401,7 @@ buildFieldEnv reg = do
 
     -- Build a function that, given a VCon, extracts the right field.
     access fieldName clauses argThunk = do
-        v <- force argThunk
+        v <- force legacyHooks argThunk
         case v of
             -- 'SomeException' is the universal exception wrapper; it
             -- holds the real exception in its single field.  Code that
@@ -5414,7 +5415,7 @@ buildFieldEnv reg = do
             VCon conName args ->
                 case lookup conName clauses of
                     Just idx | idx < length args ->
-                        force (args !! idx)
+                        force legacyHooks (args !! idx)
                     Just idx ->
                         throwIO (userError
                             ("record accessor `" <> BC.unpack fieldName
@@ -5489,9 +5490,9 @@ buildFieldEnv reg = do
     -- Drive 'listVal' to its '[]' tail, prepending each cons cell onto
     -- the supplied tail thunk.  Returns the result as a fully-forced
     -- cons chain of 'VChar's.  Only used by 'charListAppender'.
-    appendCharList (VCon "[]" []) tailT = force tailT
+    appendCharList (VCon "[]" []) tailT = force legacyHooks tailT
     appendCharList (VCon ":" [hT, restT]) tailT = do
-        restV  <- force restT
+        restV  <- force legacyHooks restT
         rest'  <- appendCharList restV tailT
         rest'T <- newWHNFThunk rest'
         pure (VCon ":" [hT, rest'T])
@@ -5513,9 +5514,9 @@ buildFieldEnv reg = do
 -- | @forkIO action@ - fork a new thread running the IO action.
 forkIOB :: IO Val
 forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
+    av <- force legacyHooks aT
     tid <- forkIO $ do
-        _ <- runIOVal av
+        _ <- runIOVal legacyHooks av
         pure ()
     pure (VPrimObj (PrimThreadId tid))
 
@@ -5527,9 +5528,9 @@ forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
 -- @case fork# io s of (# s', tid #) -> ...@ matches our pattern bridge.
 forkHashB :: IO Val
 forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
-    av <- force aT
+    av <- force legacyHooks aT
     tid <- forkIO $ do
-        _ <- runIOVal av
+        _ <- runIOVal legacyHooks av
         pure ()
     rwT  <- newWHNFThunk (VPrimObj PrimRealWorld)
     tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
@@ -5538,7 +5539,7 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
 -- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
 killThreadB :: IO Val
 killThreadB = pure $ VFun $ \tidT -> pure $ VIO $ do
-    tidV <- force tidT
+    tidV <- force legacyHooks tidT
     case tidV of
         VPrimObj (PrimThreadId tid) -> do
             killThread tid
@@ -5553,7 +5554,7 @@ myThreadIdB = pure $ VIO $ do
 
 fromThreadIdB :: IO Val
 fromThreadIdB = pure $ VFun $ \tidT -> do
-    tidV <- force tidT
+    tidV <- force legacyHooks tidT
     case tidV of
         VPrimObj (PrimThreadId tid) ->
             pure (VInt (fromIntegral (threadIdKey tid)))
@@ -5581,7 +5582,7 @@ labelThreadByteArrayHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
 -- | @threadDelay microseconds@ - sleep.
 threadDelayB :: IO Val
 threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
-    nv <- force nT
+    nv <- force legacyHooks nT
     case nv of
         VInt n -> do { threadDelay (fromIntegral n); pure VUnit }
         _ -> error ("threadDelay: not an Int: " <> showValForDebug nv)
@@ -5590,9 +5591,9 @@ closeFdWithB :: IO Val
 closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do
     CE.catch
         (do
-            closeV <- force closeT
-            r <- apply closeV fdT
-            _ <- runIOVal r
+            closeV <- force legacyHooks closeT
+            r <- apply legacyHooks closeV fdT
+            _ <- runIOVal legacyHooks r
             pure VUnit)
         (\(LoopException _) -> pure VUnit)
 
@@ -5615,11 +5616,11 @@ threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
 -- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
 fdArgToInt :: Thunk -> String -> IO Int64
 fdArgToInt t primName = do
-    v <- force t
+    v <- force legacyHooks t
     case v of
         VInt n          -> pure n
         VCon _ [inner] -> do
-            iv <- force inner
+            iv <- force legacyHooks inner
             case iv of
                 VInt n -> pure n
                 _ -> error (primName <> ": Fd payload not VInt: " <> showValForDebug iv)
@@ -5642,13 +5643,13 @@ getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
 -- a fixture starts depending on real cancellation.
 registerTimeoutB :: IO Val
 registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \cbT -> pure $ VIO $ do
-    usecV <- force usecT
+    usecV <- force legacyHooks usecT
     case usecV of
         VInt usec -> do
-            cbV <- force cbT
+            cbV <- force legacyHooks cbT
             _ <- forkIO $ do
                 threadDelay (fromIntegral usec)
-                _ <- runIOVal cbV
+                _ <- runIOVal legacyHooks cbV
                 pure ()
             n <- atomicModifyIORef' uniqueCounterRef $ \x ->
                 let x' = x + 1 in (x', x')
@@ -5663,7 +5664,7 @@ unregisterTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT ->
 updateTimeoutB :: IO Val
 updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \usecT ->
     pure $ VIO $ do
-        usecV <- force usecT
+        usecV <- force legacyHooks usecT
         case usecV of
             VInt _ -> pure VUnit
             _ -> error ("updateTimeout: timeout is not an Int: " <> showValForDebug usecV)
@@ -5671,11 +5672,11 @@ updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \
 timeManagerWithHandleB :: IO Val
 timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT -> pure $ VFun $ \actionT ->
     pure $ VIO $ do
-        actionV <- force actionT
+        actionV <- force legacyHooks actionT
         h <- emptyTimeManagerHandle
         hT <- newWHNFThunk h
-        r <- apply actionV hT
-        runIOVal r
+        r <- apply legacyHooks actionV hT
+        runIOVal legacyHooks r
   where
     emptyTimeManagerHandle = do
         timeoutT <- newWHNFThunk (VInt 0)
@@ -5693,7 +5694,7 @@ timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT 
 -- the payload, so any well-formed @VCon "Manager" [VInt n]@ is fine.
 timeManagerInitializeB :: IO Val
 timeManagerInitializeB = pure $ VFun $ \timeoutT -> pure $ VIO $ do
-    timeoutV <- force timeoutT
+    timeoutV <- force legacyHooks timeoutT
     case timeoutV of
         VInt n -> do
             nT <- newWHNFThunk (VInt (max 0 n))
@@ -5708,8 +5709,8 @@ timeManagerStopManagerB = pure $ VFun $ \_mgrT -> pure $ VIO $ pure VUnit
 
 setFdOptionB :: IO Val
 setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
-    fdV <- force fdT
-    enabledV <- force enabledT
+    fdV <- force legacyHooks fdT
+    enabledV <- force legacyHooks enabledT
     fd <- unwrapFd fdV
     PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
     pure VUnit
@@ -5720,7 +5721,7 @@ setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enab
     -- the constructor).
     unwrapFd (VInt n) = pure n
     unwrapFd (VCon "Fd" [innerT]) = do
-        innerV <- force innerT
+        innerV <- force legacyHooks innerT
         unwrapFd innerV
     unwrapFd other = error ("setFdOption: not an fd: " <> showValForDebug other)
 
@@ -5739,7 +5740,7 @@ requireMVar fn v = case v of
 
 newMVarB :: IO Val
 newMVarB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
+    av <- force legacyHooks aT
     mv <- newMVar av
     pure (VPrimObj (PrimMVar mv))
 
@@ -5750,55 +5751,55 @@ newEmptyMVarB = pure $ VIO $ do
 
 takeMVarB :: IO Val
 takeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "takeMVar" mvv
     takeMVar mv
 
 putMVarB :: IO Val
 putMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "putMVar" mvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     putMVar mv av
     pure VUnit
 
 readMVarB :: IO Val
 readMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "readMVar" mvv
     readMVar mv
 
 modifyMVar_B :: IO Val
 modifyMVar_B = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "modifyMVar_" mvv
-    fv  <- force fT
+    fv  <- force legacyHooks fT
     modifyMVar_ mv $ \cur -> do
         curT <- newWHNFThunk cur
-        rv   <- apply fv curT
-        runIOVal rv
+        rv   <- apply legacyHooks fv curT
+        runIOVal legacyHooks rv
     pure VUnit
 
 modifyMVarB :: IO Val
 modifyMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "modifyMVar" mvv
-    fv  <- force fT
+    fv  <- force legacyHooks fT
     modifyMVar mv $ \cur -> do
         curT  <- newWHNFThunk cur
-        rv    <- apply fv curT
-        pairV <- runIOVal rv
+        rv    <- apply legacyHooks fv curT
+        pairV <- runIOVal legacyHooks rv
         case pairV of
             VCon _ [newT, extraT] -> do
-                newV   <- force newT
-                extraV <- force extraT
+                newV   <- force legacyHooks newT
+                extraV <- force legacyHooks extraT
                 pure (newV, extraV)
             _ -> error ("modifyMVar: f did not return a pair: "
                         <> showValForDebug pairV)
 
 tryTakeMVarB :: IO Val
 tryTakeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "tryTakeMVar" mvv
     r   <- tryTakeMVar mv
     case r of
@@ -5807,34 +5808,34 @@ tryTakeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
 
 tryPutMVarB :: IO Val
 tryPutMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "tryPutMVar" mvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     ok  <- tryPutMVar mv av
     pure (boolVal ok)
 
 isEmptyMVarB :: IO Val
 isEmptyMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "isEmptyMVar" mvv
     b   <- isEmptyMVar mv
     pure (boolVal b)
 
 withMVarB :: IO Val
 withMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "withMVar" mvv
-    fv  <- force fT
+    fv  <- force legacyHooks fT
     withMVar mv $ \cur -> do
         curT <- newWHNFThunk cur
-        rv   <- apply fv curT
-        runIOVal rv
+        rv   <- apply legacyHooks fv curT
+        runIOVal legacyHooks rv
 
 swapMVarB :: IO Val
 swapMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVar "swapMVar" mvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     swapMVar mv av
 
 --------------------------------------------------------------------------------
@@ -5843,65 +5844,65 @@ swapMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
 
 atomicallyB :: IO Val
 atomicallyB = pure $ VFun $ \stmT -> pure $ VIO $ do
-    stmV <- force stmT
-    runIOVal stmV
+    stmV <- force legacyHooks stmT
+    runIOVal legacyHooks stmV
 
 retryB :: IO Val
 retryB = pure $ VIO $ atomically retry
 
 orElseB :: IO Val
 orElseB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VIO $ do
-    av <- force aT
-    bv <- force bT
+    av <- force legacyHooks aT
+    bv <- force legacyHooks bT
     -- Approximate: try av first, fall back to bv on exception
-    CE.catch (runIOVal av) (\(_ :: CE.SomeException) -> runIOVal bv)
+    CE.catch (runIOVal legacyHooks av) (\(_ :: CE.SomeException) -> runIOVal legacyHooks bv)
 
 checkB :: IO Val
 checkB = pure $ VFun $ \bT -> pure $ VIO $ do
-    bv <- force bT
+    bv <- force legacyHooks bT
     atomically (check (isTruthy bv))
     pure VUnit
 
 newTVarB :: IO Val
 newTVarB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
+    av <- force legacyHooks aT
     tv <- newTVarIO av
     pure (VPrimObj (PrimTVar tv))
 
 newTVarIOB :: IO Val
 newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
+    av <- force legacyHooks aT
     tv <- newTVarIO av
     pure (VPrimObj (PrimTVar tv))
 
 readTVarB :: IO Val
 readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force tvT
+    tvv <- force legacyHooks tvT
     tv  <- requireTVarPrim "readTVar" tvv
     atomically (readTVar tv)
 
 writeTVarB :: IO Val
 writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    tvv <- force tvT
-    av  <- force aT
+    tvv <- force legacyHooks tvT
+    av  <- force legacyHooks aT
     tv  <- requireTVarPrim "writeTVar" tvv
     atomically (writeTVar tv av)
     pure VUnit
 
 modifyTVar'B :: IO Val
 modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    tvv <- force tvT
-    fv  <- force fT
+    tvv <- force legacyHooks tvT
+    fv  <- force legacyHooks fT
     tv  <- requireTVarPrim "modifyTVar'" tvv
     cur  <- atomically (readTVar tv)
     curT <- newWHNFThunk cur
-    new  <- apply fv curT
+    new  <- apply legacyHooks fv curT
     atomically (writeTVar tv new)
     pure VUnit
 
 readTVarIOB :: IO Val
 readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force tvT
+    tvv <- force legacyHooks tvT
     tv  <- requireTVarPrim "readTVarIO" tvv
     readTVarIO tv
 
@@ -5924,7 +5925,7 @@ readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
 requireTVarPrim :: String -> Val -> IO (TVar Val)
 requireTVarPrim fn v = case v of
     VPrimObj (PrimTVar tv) -> pure tv
-    VCon "TVar" [tvT]      -> force tvT >>= requireTVarPrim fn
+    VCon "TVar" [tvT]      -> force legacyHooks tvT >>= requireTVarPrim fn
     _ -> error (fn <> ": not a TVar#: " <> showValForDebug v)
 
 -- | Wrap a 'Val' as an unboxed-pair @(# State#, a #)@ result. Used by
@@ -5947,9 +5948,9 @@ ensureStatePair v = case v of
 -- IO action in our world — we just apply the state-transformer.
 atomicallyHashB :: IO Val
 atomicallyHashB = pure $ VFun $ \stmT -> pure $ VFun $ \sT -> do
-    stmV <- force stmT
-    rRaw <- apply stmV sT
-    v    <- runIOVal rRaw
+    stmV <- force legacyHooks stmT
+    rRaw <- apply legacyHooks stmV sT
+    v    <- runIOVal legacyHooks rRaw
     ensureStatePair v
 
 -- | @retry# :: State# RealWorld -> (# State# RealWorld, a #)@.
@@ -5971,11 +5972,11 @@ retryHashB = pure $ VFun $ \_sT -> atomically retry
 -- back to the second.
 catchRetryHashB :: IO Val
 catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT -> do
-    aV <- force aT
-    bV <- force bT
+    aV <- force legacyHooks aT
+    bV <- force legacyHooks bT
     let runAction stm = do
-            rRaw <- apply stm sT
-            runIOVal rRaw
+            rRaw <- apply legacyHooks stm sT
+            runIOVal legacyHooks rRaw
     r <- CE.try @CE.SomeException (runAction aV)
     case r of
         Right v -> ensureStatePair v
@@ -5993,11 +5994,11 @@ catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT ->
 -- STM-as-IO bridge the implementation is identical.
 catchSTMHashB :: IO Val
 catchSTMHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
-    ioV <- force ioT
-    hV  <- force hT
+    ioV <- force legacyHooks ioT
+    hV  <- force legacyHooks hT
     let runAction = do
-            rRaw <- apply ioV sT
-            runIOVal rRaw
+            rRaw <- apply legacyHooks ioV sT
+            runIOVal legacyHooks rRaw
     rRes <- CE.try @IhcException (CE.try @SomeException runAction)
     case rRes of
         Right (Right v) -> ensureStatePair v
@@ -6011,22 +6012,22 @@ catchSTMHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> 
             invokeHandler hV excT
   where
     invokeHandler hV excT = do
-        r1 <- apply hV excT
+        r1 <- apply legacyHooks hV excT
         case r1 of
             VFun _ -> do
                 sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
-                rRaw <- apply r1 sT'
-                v    <- runIOVal rRaw
+                rRaw <- apply legacyHooks r1 sT'
+                v    <- runIOVal legacyHooks rRaw
                 ensureStatePair v
             _ -> do
-                v <- runIOVal r1
+                v <- runIOVal legacyHooks r1
                 ensureStatePair v
 
 -- | @newTVar# :: a -> State# s -> (# State# s, TVar# s a #)@.
 -- Source-loaded @newTVar@ / @newTVarIO@ bottom out here.
 newTVarHashB :: IO Val
 newTVarHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
-    av  <- force aT
+    av  <- force legacyHooks aT
     tv  <- newTVarIO av
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
     tvT <- newWHNFThunk (VPrimObj (PrimTVar tv))
@@ -6035,7 +6036,7 @@ newTVarHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
 -- | @readTVar# :: TVar# s a -> State# s -> (# State# s, a #)@.
 readTVarHashB :: IO Val
 readTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
-    tvv <- force tvT
+    tvv <- force legacyHooks tvT
     tv  <- requireTVarPrim "readTVar#" tvv
     v   <- atomically (readTVar tv)
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6046,7 +6047,7 @@ readTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
 -- Like readTVar# but without a surrounding transaction.
 readTVarIOHashB :: IO Val
 readTVarIOHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
-    tvv <- force tvT
+    tvv <- force legacyHooks tvT
     tv  <- requireTVarPrim "readTVarIO#" tvv
     v   <- readTVarIO tv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6056,9 +6057,9 @@ readTVarIOHashB = pure $ VFun $ \tvT -> pure $ VFun $ \_sT -> do
 -- | @writeTVar# :: TVar# s a -> a -> State# s -> State# s@.
 writeTVarHashB :: IO Val
 writeTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
-    tvv <- force tvT
+    tvv <- force legacyHooks tvT
     tv  <- requireTVarPrim "writeTVar#" tvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     atomically (writeTVar tv av)
     pure (VPrimObj PrimRealWorld)
 
@@ -6081,7 +6082,7 @@ extractExceptionMessage :: Val -> IO ByteString
 extractExceptionMessage val = case val of
     VStr s -> pure s
     VCon "SomeException" [innerT] -> do
-        inner <- force innerT
+        inner <- force legacyHooks innerT
         extractExceptionMessage inner
     VCon "ErrorCall" [msgT] ->
         tryValToString msgT (BC.pack "ErrorCall")
@@ -6097,18 +6098,18 @@ extractExceptionMessage val = case val of
   where
     tryValToString :: Thunk -> ByteString -> IO ByteString
     tryValToString t fallback = do
-        r <- CE.try @SomeException (force t >>= valToString)
+        r <- CE.try @SomeException (force legacyHooks t >>= valToString)
         pure $ case r of
             Right s -> BC.pack s
             Left  _ -> fallback
 
 -- | Extract the 'Val' from an 'IhcException'.
 ihcExceptionToVal :: IhcException -> IO Val
-ihcExceptionToVal (IhcException _ t) = force t
+ihcExceptionToVal (IhcException _ t) = force legacyHooks t
 
 throwIOB :: IO Val
 throwIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av  <- force aT
+    av  <- force legacyHooks aT
     exc <- valToIhcException av
     throwIO exc
 
@@ -6146,7 +6147,7 @@ raiseHashB = pure $ VFun $ \eT -> do
 -- Used pervasively by @typerep-map@, @Data.Vault@, @bytestring@/@text@
 -- internals, and many other libraries.
 unsafeCoerceB :: IO Val
-unsafeCoerceB = pure $ VFun $ \t -> force t
+unsafeCoerceB = pure $ VFun $ \t -> force legacyHooks t
 
 -- | @raiseIO# :: a -> State# RealWorld -> (# State# RealWorld, b #)@.
 -- Backs source-loaded @throwIO e = IO (raiseIO# (toException e))@. We
@@ -6181,7 +6182,7 @@ forceToException t = do
         Just (msg, payloadT) ->
             pure (IhcException msg payloadT)
         Nothing -> do
-            r <- CE.try @SomeException (force t)
+            r <- CE.try @SomeException (force legacyHooks t)
             case r of
                 Right v  -> valToIhcException v
                 Left  se -> do
@@ -6207,7 +6208,7 @@ tryShortcutMessage t = do
                 Just msgExpr -> do
                     r <- CE.try @SomeException (do
                         msgT <- newThunkIP env ipm msgExpr
-                        v    <- force msgT
+                        v    <- force legacyHooks msgT
                         pure (v, msgT))
                     case r of
                         Right (v, msgT) -> case v of
@@ -6292,11 +6293,11 @@ raiseUnderflowB = pure $ VFun $ \_ -> do
 -- @(# State#, a #)@ matching the primop signature.
 catchHashB :: IO Val
 catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
-    ioV <- force ioT
-    hV  <- force hT
+    ioV <- force legacyHooks ioT
+    hV  <- force legacyHooks hT
     let runAction = do
-            rRaw <- apply ioV sT
-            runIOVal rRaw
+            rRaw <- apply legacyHooks ioV sT
+            runIOVal legacyHooks rRaw
     rRes <- CE.try @IhcException (CE.try @SomeException runAction)
     case rRes of
         Right (Right v) -> ensurePair v
@@ -6321,15 +6322,15 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
             pure (VCon "(#,#)" [sT', vT])
     invokeHandler hV excT = do
         -- Handler' signature: exc -> State# -> (# State#, a #)
-        r1 <- apply hV excT
+        r1 <- apply legacyHooks hV excT
         case r1 of
             VFun _ -> do
                 sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
-                rRaw <- apply r1 sT'
-                v    <- runIOVal rRaw
+                rRaw <- apply legacyHooks r1 sT'
+                v    <- runIOVal legacyHooks rRaw
                 ensurePair v
             _ -> do
-                v <- runIOVal r1
+                v <- runIOVal legacyHooks r1
                 ensurePair v
 
 -- | @newMVar# :: State# s -> (# State# s, MVar# s a #)@
@@ -6352,13 +6353,13 @@ newMVarHashB = pure $ VFun $ \_sT -> do
 requireMVarPrim :: String -> Val -> IO (MVar Val)
 requireMVarPrim fn v = case v of
     VPrimObj (PrimMVar mv) -> pure mv
-    VCon "MVar" [tvT]      -> force tvT >>= requireMVarPrim fn
+    VCon "MVar" [tvT]      -> force legacyHooks tvT >>= requireMVarPrim fn
     _ -> error (fn <> ": not an MVar#: " <> showValForDebug v)
 
 -- | @takeMVar# :: MVar# s a -> State# s -> (# State# s, a #)@
 takeMVarHashB :: IO Val
 takeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "takeMVar#" mvv
     v   <- takeMVar mv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6368,16 +6369,16 @@ takeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
 -- | @putMVar# :: MVar# s a -> a -> State# s -> State# s@
 putMVarHashB :: IO Val
 putMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "putMVar#" mvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     putMVar mv av
     pure (VPrimObj PrimRealWorld)
 
 -- | @readMVar# :: MVar# s a -> State# s -> (# State# s, a #)@
 readMVarHashB :: IO Val
 readMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "readMVar#" mvv
     v   <- readMVar mv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6388,7 +6389,7 @@ readMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
 -- where the Int# is 0 if empty (a undefined) and non-zero otherwise.
 tryTakeMVarHashB :: IO Val
 tryTakeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "tryTakeMVar#" mvv
     r   <- tryTakeMVar mv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6405,9 +6406,9 @@ tryTakeMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
 -- | @tryPutMVar# :: MVar# s a -> a -> State# s -> (# State# s, Int# #)@
 tryPutMVarHashB :: IO Val
 tryPutMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "tryPutMVar#" mvv
-    av  <- force aT
+    av  <- force legacyHooks aT
     ok  <- tryPutMVar mv av
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
     okT <- newWHNFThunk (VInt (if ok then 1 else 0))
@@ -6416,7 +6417,7 @@ tryPutMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT 
 -- | @tryReadMVar# :: MVar# s a -> State# s -> (# State# s, Int#, a #)@
 tryReadMVarHashB :: IO Val
 tryReadMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "tryReadMVar#" mvv
     r   <- tryTakeMVar mv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6435,7 +6436,7 @@ tryReadMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
 -- | @isEmptyMVar# :: MVar# s a -> State# s -> (# State# s, Int# #)@
 isEmptyMVarHashB :: IO Val
 isEmptyMVarHashB = pure $ VFun $ \mvT -> pure $ VFun $ \_sT -> do
-    mvv <- force mvT
+    mvv <- force legacyHooks mvT
     mv  <- requireMVarPrim "isEmptyMVar#" mvv
     b   <- isEmptyMVar mv
     sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
@@ -6461,10 +6462,10 @@ keepAliveHashB = pure $ VFun $ \keepT -> pure $ VFun $ \sT -> pure $ VFun $ \kT 
     -- for the duration of the continuation. Our PrimForeignPtr / PrimPtr
     -- values hold the underlying allocation via a host ForeignPtr, so
     -- touching them here is sufficient.
-    _   <- force keepT
-    kV  <- force kT
-    rRaw <- apply kV sT
-    runIOVal rRaw
+    _   <- force legacyHooks keepT
+    kV  <- force legacyHooks kT
+    rRaw <- apply legacyHooks kV sT
+    runIOVal legacyHooks rRaw
 
 -- | @getMaskingState# :: State# RealWorld -> (# State# RealWorld, Int# #)@
 --
@@ -6488,9 +6489,9 @@ getMaskingStateHashB = pure $ VFun $ \_sT -> do
 -- do not deliver async exceptions via masking primitives.
 maskAsyncExceptionsHashB :: IO Val
 maskAsyncExceptionsHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
-    ioV  <- force ioT
-    rRaw <- apply ioV sT
-    v    <- runIOVal rRaw
+    ioV  <- force legacyHooks ioT
+    rRaw <- apply legacyHooks ioV sT
+    v    <- runIOVal legacyHooks rRaw
     case v of
         VCon "(#,#)" _ -> pure v
         _ -> do
@@ -6513,7 +6514,7 @@ maskAsyncExceptionsHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
 -- already unwraps 'SomeException'.
 toExceptionWithBacktraceB :: IO Val
 toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
-    ev <- force eT
+    ev <- force legacyHooks eT
     case ev of
         VCon "SomeException" _ -> pure ev
         _                       -> do
@@ -6526,7 +6527,7 @@ toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
 -- path (@throwIO e = IO (raiseIO# (toException e))@).
 toExceptionB :: IO Val
 toExceptionB = pure $ VFun $ \eT -> do
-    ev <- force eT
+    ev <- force legacyHooks eT
     case ev of
         VCon "SomeException" _ -> pure ev
         _                       -> do
@@ -6557,8 +6558,8 @@ fromExceptionB = pure $ VFun $ \eT -> do
     -- code.  Code that genuinely wants the wrapped value can pattern
     -- match @SomeException e <- ...@ directly (we wrap host
     -- exceptions in 'VCon "SomeException" [innerT]', and the record-
-    -- accessor / matchPat paths already descend through the wrap).
-    _ <- force eT
+    -- accessor / matchPat legacyHooks paths already descend through the wrap).
+    _ <- force legacyHooks eT
     pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
@@ -6567,76 +6568,76 @@ fromExceptionB = pure $ VFun $ \eT -> do
 -- hides the state-transformer shape, so we reconstruct it.
 unIOB :: IO Val
 unIOB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
-    ioV <- force ioT
+    ioV <- force legacyHooks ioT
     case ioV of
         VCon "IO" [stateFnT] -> do
-            stateFn <- force stateFnT
-            apply stateFn sT
+            stateFn <- force legacyHooks stateFnT
+            apply legacyHooks stateFn sT
         _ -> do
-            v   <- runIOVal ioV
+            v   <- runIOVal legacyHooks ioV
             sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
             vT  <- newWHNFThunk v
             pure (VCon "(#,#)" [sT', vT])
 
 ioToSTB :: IO Val
 ioToSTB = pure $ VFun $ \ioT -> do
-    ioV <- force ioT
+    ioV <- force legacyHooks ioT
     case ioV of
         VCon "IO" [stateFnT] -> pure (VIO (runStateTransformer stateFnT))
         _                   -> pure ioV
 
 stToIOB :: IO Val
 stToIOB = pure $ VFun $ \stT -> do
-    stV <- force stT
+    stV <- force legacyHooks stT
     case stV of
         VCon "ST" [stateFnT] -> pure (VIO (runStateTransformer stateFnT))
         _                   -> pure stV
 
 runStateTransformer :: Thunk -> IO Val
 runStateTransformer stateFnT = do
-    stateFn <- force stateFnT
+    stateFn <- force legacyHooks stateFnT
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    raw <- apply stateFn stT
-    res <- runIOVal raw
+    raw <- apply legacyHooks stateFn stT
+    res <- runIOVal legacyHooks raw
     case res of
-        VCon "(#,#)" [_stateT, resultT] -> force resultT
+        VCon "(#,#)" [_stateT, resultT] -> force legacyHooks resultT
         _ -> pure res
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
-    av <- force aT
-    hv <- force hT
+    av <- force legacyHooks aT
+    hv <- force legacyHooks hT
     catch
         (catch
-            (runIOVal av)
+            (runIOVal legacyHooks av)
             (\(exc :: IhcException) -> do
                 excVal <- ihcExceptionToVal exc
                 excT   <- newWHNFThunk excVal
-                rv     <- apply hv excT
-                runIOVal rv))
+                rv     <- apply legacyHooks hv excT
+                runIOVal legacyHooks rv))
         (\(exc :: SomeException) -> do
             excVal <- hostExceptionToVal exc
             excT   <- newWHNFThunk excVal
-            rv     <- apply hv excT
-            runIOVal rv)
+            rv     <- apply legacyHooks hv excT
+            runIOVal legacyHooks rv)
 
 handleB :: IO Val
 handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    hv <- force hT
-    av <- force aT
+    hv <- force legacyHooks hT
+    av <- force legacyHooks aT
     catch
         (catch
-            (runIOVal av)
+            (runIOVal legacyHooks av)
             (\(exc :: IhcException) -> do
                 excVal <- ihcExceptionToVal exc
                 excT   <- newWHNFThunk excVal
-                rv     <- apply hv excT
-                runIOVal rv))
+                rv     <- apply legacyHooks hv excT
+                runIOVal legacyHooks rv))
         (\(exc :: SomeException) -> do
             let msg = BC.pack (show exc)
             excT <- newWHNFThunk (VStr msg)
-            rv   <- apply hv excT
-            runIOVal rv)
+            rv   <- apply legacyHooks hv excT
+            runIOVal legacyHooks rv)
 
 -- | @Control.Exception.try :: Exception e => IO a -> IO (Either e a)@.
 --
@@ -6658,8 +6659,8 @@ handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
 --     fields like 'ioe_errno' doesn't blow up.
 tryB :: IO Val
 tryB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
-    r  <- CE.try @SomeException (runIOVal av)
+    av <- force legacyHooks aT
+    r  <- CE.try @SomeException (runIOVal legacyHooks av)
     case r of
         Right v -> do
             vT <- newWHNFThunk v
@@ -6698,98 +6699,98 @@ hostExceptionToVal e = do
 
 evaluateB :: IO Val
 evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
+    av <- force legacyHooks aT
     _  <- evaluate av
     pure av
 
 mask_B :: IO Val
 mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
-    mask_ (runIOVal av)
+    av <- force legacyHooks aT
+    mask_ (runIOVal legacyHooks av)
 
 allowInterruptB :: IO Val
 allowInterruptB = pure $ VIO $ pure VUnit
 
 interruptibleB :: IO Val
 interruptibleB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force aT
-    runIOVal av
+    av <- force legacyHooks aT
+    runIOVal legacyHooks av
 
 maskB :: IO Val
 maskB = pure $ VFun $ \fT -> pure $ VIO $ do
-    fv <- force fT
+    fv <- force legacyHooks fT
     mask $ \restore -> do
         let restoreVal = VFun $ \aT -> pure $ VIO $ do
-                av <- force aT
-                restore (runIOVal av)
+                av <- force legacyHooks aT
+                restore (runIOVal legacyHooks av)
         restoreT <- newWHNFThunk restoreVal
-        rv <- apply fv restoreT
-        runIOVal rv
+        rv <- apply legacyHooks fv restoreT
+        runIOVal legacyHooks rv
 
 bracketB :: IO Val
 bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
-    acqV <- force acqT
-    relV <- force relT
-    useV <- force useT
+    acqV <- force legacyHooks acqT
+    relV <- force legacyHooks relT
+    useV <- force legacyHooks useT
     bracket
-        (runIOVal acqV)
+        (runIOVal legacyHooks acqV)
         (\res -> do
             resT <- newWHNFThunk res
-            rv   <- apply relV resT
-            _    <- runIOVal rv
+            rv   <- apply legacyHooks relV resT
+            _    <- runIOVal legacyHooks rv
             pure ())
         (\res -> do
             resT <- newWHNFThunk res
-            rv   <- apply useV resT
-            runIOVal rv)
+            rv   <- apply legacyHooks useV resT
+            runIOVal legacyHooks rv)
 
 bracketOnErrorB :: IO Val
 bracketOnErrorB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
-    acqV <- force acqT
-    relV <- force relT
-    useV <- force useT
+    acqV <- force legacyHooks acqT
+    relV <- force legacyHooks relT
+    useV <- force legacyHooks useT
     bracketOnError
-        (runIOVal acqV)
+        (runIOVal legacyHooks acqV)
         (\res -> do
             resT <- newWHNFThunk res
-            rv   <- apply relV resT
-            _    <- runIOVal rv
+            rv   <- apply legacyHooks relV resT
+            _    <- runIOVal legacyHooks rv
             pure ())
         (\res -> do
             resT <- newWHNFThunk res
-            rv   <- apply useV resT
-            runIOVal rv)
+            rv   <- apply legacyHooks useV resT
+            runIOVal legacyHooks rv)
 
 bracket_B :: IO Val
 bracket_B = pure $ VFun $ \befT -> pure $ VFun $ \aftT -> pure $ VFun $ \thingT -> pure $ VIO $ do
-    befV   <- force befT
-    aftV   <- force aftT
-    thingV <- force thingT
+    befV   <- force legacyHooks befT
+    aftV   <- force legacyHooks aftT
+    thingV <- force legacyHooks thingT
     bracket_
-        (runIOVal befV >> pure ())
-        (runIOVal aftV >> pure ())
-        (runIOVal thingV)
+        (runIOVal legacyHooks befV >> pure ())
+        (runIOVal legacyHooks aftV >> pure ())
+        (runIOVal legacyHooks thingV)
 
 finallyB :: IO Val
 finallyB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
-    av     <- force aT
-    cleanV <- force cleanT
+    av     <- force legacyHooks aT
+    cleanV <- force legacyHooks cleanT
     finally
-        (runIOVal av)
-        (runIOVal cleanV >> pure ())
+        (runIOVal legacyHooks av)
+        (runIOVal legacyHooks cleanV >> pure ())
 
 onExceptionB :: IO Val
 onExceptionB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
-    av     <- force aT
-    cleanV <- force cleanT
+    av     <- force legacyHooks aT
+    cleanV <- force legacyHooks cleanT
     onException
-        (runIOVal av)
-        (runIOVal cleanV >> pure ())
+        (runIOVal legacyHooks av)
+        (runIOVal legacyHooks cleanV >> pure ())
 
 throwToB :: IO Val
 throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
-    tidV <- force tidT
-    excV <- force excT
+    tidV <- force legacyHooks tidT
+    excV <- force legacyHooks excT
     case tidV of
         VPrimObj (PrimThreadId tid) -> do
             exc <- valToIhcException excV
@@ -6799,7 +6800,7 @@ throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
 
 displayExceptionB :: IO Val
 displayExceptionB = pure $ VFun $ \eT -> do
-    ev <- force eT
+    ev <- force legacyHooks eT
     let s = case ev of
                 VStr msg  -> BC.unpack msg
                 VCon n _  -> BC.unpack n
@@ -6817,18 +6818,18 @@ displayExceptionB = pure $ VFun $ \eT -> do
 
 typeRepB :: IO Val
 typeRepB = pure $ VFun $ \dictT -> pure $ VFun $ \_proxyT -> do
-    dictV <- force dictT
+    dictV <- force legacyHooks dictT
     extractTypeRep dictV
 
 typeOfB :: IO Val
 typeOfB = pure $ VFun $ \dictT -> pure $ VFun $ \_valT -> do
-    dictV <- force dictT
+    dictV <- force legacyHooks dictT
     extractTypeRep dictV
 
 castB :: IO Val
 castB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> pure $ VFun $ \valT -> do
-    dictAV <- force dictAT
-    dictBV <- force dictBT
+    dictAV <- force legacyHooks dictAT
+    dictBV <- force legacyHooks dictBT
     trA    <- extractTypeRep dictAV
     trB    <- extractTypeRep dictBV
     eq     <- typeRepEq trA trB
@@ -6837,8 +6838,8 @@ castB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> pure $ VFun $ \valT ->
 
 eqTB :: IO Val
 eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
-    dictAV <- force dictAT
-    dictBV <- force dictBT
+    dictAV <- force legacyHooks dictAT
+    dictBV <- force legacyHooks dictBT
     trA    <- extractTypeRep dictAV
     trB    <- extractTypeRep dictBV
     eq     <- typeRepEq trA trB
@@ -6848,87 +6849,87 @@ eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
 
 toDynB :: IO Val
 toDynB = pure $ VFun $ \dictT -> pure $ VFun $ \valT -> do
-    dictV <- force dictT
+    dictV <- force legacyHooks dictT
     tr    <- extractTypeRep dictV
     trT   <- newWHNFThunk tr
     pure (VCon "Dynamic" [trT, valT])
 
 fromDynamicB :: IO Val
 fromDynamicB = pure $ VFun $ \dictBT -> pure $ VFun $ \dynT -> do
-    dictBV <- force dictBT
-    dynV   <- force dynT
+    dictBV <- force legacyHooks dictBT
+    dynV   <- force legacyHooks dynT
     trB    <- extractTypeRep dictBV
     case dynV of
         VCon "Dynamic" [trAT, storedT] -> do
-            trA <- force trAT
+            trA <- force legacyHooks trAT
             eq  <- typeRepEq trA trB
             pure (if eq then VCon "Just" [storedT] else VCon "Nothing" [])
         _ -> pure (VCon "Nothing" [])
 
 fromDynB :: IO Val
 fromDynB = pure $ VFun $ \dictT -> pure $ VFun $ \dynT -> pure $ VFun $ \defT -> do
-    dictV <- force dictT
-    dynV  <- force dynT
+    dictV <- force legacyHooks dictT
+    dynV  <- force legacyHooks dynT
     trB   <- extractTypeRep dictV
     case dynV of
         VCon "Dynamic" [trAT, storedT] -> do
-            trA <- force trAT
+            trA <- force legacyHooks trAT
             eq  <- typeRepEq trA trB
-            if eq then force storedT else force defT
-        _ -> force defT
+            if eq then force legacyHooks storedT else force legacyHooks defT
+        _ -> force legacyHooks defT
 
 dynTypeRepB :: IO Val
 dynTypeRepB = pure $ VFun $ \dynT -> do
-    dynV <- force dynT
+    dynV <- force legacyHooks dynT
     case dynV of
-        VCon "Dynamic" [trT, _] -> force trT
+        VCon "Dynamic" [trT, _] -> force legacyHooks trT
         _ -> mkTypeRep "Unknown"
 
 mkTyCon3B :: IO Val
 mkTyCon3B = pure $ VFun $ \_ -> pure $ VFun $ \_ -> pure $ VFun $ \nameT -> do
-    nameV    <- force nameT
+    nameV    <- force legacyHooks nameT
     nameStrT <- newWHNFThunk nameV
     pure (VCon "TyCon" [nameStrT])
 
 mkTyConAppB :: IO Val
 mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
-    tyConV     <- force tyConT
-    argsV      <- force argsT
+    tyConV     <- force legacyHooks tyConT
+    argsV      <- force legacyHooks argsT
     tyConThunk <- newWHNFThunk tyConV
     argsThunk  <- newWHNFThunk argsV
     pure (VCon "TypeRep" [tyConThunk, argsThunk])
 
 tyConNameB :: IO Val
 tyConNameB = pure $ VFun $ \tyConT -> do
-    tyConV <- force tyConT
+    tyConV <- force legacyHooks tyConT
     case tyConV of
-        VCon "TyCon" [nameT] -> force nameT
+        VCon "TyCon" [nameT] -> force legacyHooks nameT
         _ -> pure (VCon "[]" [])
 
 typeRepTyConB :: IO Val
 typeRepTyConB = pure $ VFun $ \trT -> do
-    trV <- force trT
+    trV <- force legacyHooks trT
     case trV of
-        VCon "TypeRep" [tcT, _] -> force tcT
+        VCon "TypeRep" [tcT, _] -> force legacyHooks tcT
         _ -> pure (VCon "TyCon" [])
 
 typeRepArgsB :: IO Val
 typeRepArgsB = pure $ VFun $ \trT -> do
-    trV <- force trT
+    trV <- force legacyHooks trT
     case trV of
-        VCon "TypeRep" [_, argsT] -> force argsT
+        VCon "TypeRep" [_, argsT] -> force legacyHooks argsT
         _ -> pure (VCon "[]" [])
 
 -- | Extract a TypeRep from a Typeable dict or raw TypeRep value.
 extractTypeRep :: Val -> IO Val
-extractTypeRep (VCon "Dict_Typeable" [trT]) = force trT
+extractTypeRep (VCon "Dict_Typeable" [trT]) = force legacyHooks trT
 extractTypeRep v@(VCon "TypeRep" _)         = pure v
 extractTypeRep _                            = mkTypeRep "Unknown"
 
 -- | Dynamic constructor as a curried function value.
 dynamicCtorB :: IO Val
 dynamicCtorB = pure $ VFun $ \trT -> pure $ VFun $ \valT -> do
-    trV    <- force trT
+    trV    <- force legacyHooks trT
     trThunk <- newWHNFThunk trV
     pure (VCon "Dynamic" [trThunk, valT])
 

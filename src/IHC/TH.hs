@@ -39,6 +39,7 @@ import Data.IORef
 import Data.Int (Int64)
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
+import IHC.Classes (legacyHooks)
 import IHC.Eval (eval, force)
 import IHC.Val
 
@@ -141,16 +142,16 @@ buildThunkList (x:xs) = do
 liftVal :: Val -> IO Val
 liftVal (VInt n)  = do
     litT <- integerL n
-    force =<< litE litT
+    force legacyHooks =<< litE litT
 liftVal (VChar c) = do
     litT <- charL c
-    force =<< litE litT
+    force legacyHooks =<< litE litT
 liftVal (VStr bs) = do
     -- VStr is a raw ByteString; convert to [Char] list, then StringL
     let chars = BC.unpack bs
     charListVal <- buildCharList chars
     litT <- stringL charListVal
-    force =<< litE litT
+    force legacyHooks =<< litE litT
   where
     buildCharList []     = pure (VCon "[]" [])
     buildCharList (c:cs) = do
@@ -160,57 +161,57 @@ liftVal (VStr bs) = do
         pure (VCon ":" [h, t])
 liftVal VUnit = do
     -- () -> ConE "()"
-    force =<< conE "()"
-liftVal (VCon "True" []) = force =<< conE "True"
-liftVal (VCon "False" []) = force =<< conE "False"
+    force legacyHooks =<< conE "()"
+liftVal (VCon "True" []) = force legacyHooks =<< conE "True"
+liftVal (VCon "False" []) = force legacyHooks =<< conE "False"
 liftVal (VCon "[]" []) = do
     -- [] -> ListE []
-    force =<< listE []
+    force legacyHooks =<< listE []
 liftVal (VCon ":" [hT, tT]) = do
     -- list: collect all elements and build ListE
-    hV <- force hT
-    tV <- force tT
+    hV <- force legacyHooks hT
+    tV <- force legacyHooks tT
     elems <- collectList hV tV
     elemTs <- mapM (newWHNFThunk <=< liftVal) elems
-    force =<< listE elemTs
+    force legacyHooks =<< listE elemTs
   where
     collectList h (VCon "[]" []) = pure [h]
     collectList h (VCon ":" [hT', tT']) = do
-        h' <- force hT'
-        t' <- force tT'
+        h' <- force legacyHooks hT'
+        t' <- force legacyHooks tT'
         rest <- collectList h' t'
         pure (h : rest)
     collectList h other =
         throwTH ("liftVal: unexpected list tail: " <> showValForDebug other)
-liftVal (VCon "Nothing" []) = force =<< conE "Nothing"
+liftVal (VCon "Nothing" []) = force legacyHooks =<< conE "Nothing"
 liftVal (VCon "Just" [xT]) = do
-    xV <- force xT
+    xV <- force legacyHooks xT
     xLifted <- liftVal xV
     xE <- newWHNFThunk xLifted
     jE <- conE "Just"
-    force =<< appE jE xE
+    force legacyHooks =<< appE jE xE
 liftVal (VCon "Left" [xT]) = do
-    xV <- force xT
+    xV <- force legacyHooks xT
     xLifted <- liftVal xV
     xE <- newWHNFThunk xLifted
     lE <- conE "Left"
-    force =<< appE lE xE
+    force legacyHooks =<< appE lE xE
 liftVal (VCon "Right" [xT]) = do
-    xV <- force xT
+    xV <- force legacyHooks xT
     xLifted <- liftVal xV
     xE <- newWHNFThunk xLifted
     rE <- conE "Right"
-    force =<< appE rE xE
+    force legacyHooks =<< appE rE xE
 liftVal v@(VCon name args)
     | isTupleName name = do
         -- Tuple: TupE [lift a, lift b, ...]
-        argVals <- mapM force args
+        argVals <- mapM (force legacyHooks) args
         argLifted <- mapM liftVal argVals
         argTs <- mapM newWHNFThunk argLifted
-        force =<< tupE argTs
+        force legacyHooks =<< tupE argTs
     | otherwise = do
         -- User-defined constructor: AppE (AppE (ConE "Foo") arg1) arg2 ...
-        argVals <- mapM force args
+        argVals <- mapM (force legacyHooks) args
         argExprs <- mapM liftVal argVals
         argTs <- mapM newWHNFThunk argExprs
         baseT <- conE name
@@ -221,7 +222,7 @@ liftVal v@(VCon name args)
         BC.head n == '(' &&
         BC.last n == ')' &&
         BC.all (\c -> c == ',' || c == '(' || c == ')') n
-    applyArgs acc [] = force acc
+    applyArgs acc [] = force legacyHooks acc
     applyArgs acc (t:ts) = do
         newAcc <- appE acc t
         applyArgs newAcc ts
@@ -230,7 +231,7 @@ liftVal v = throwTH ("liftVal: unsupported value: " <> showValForDebug v)
 -- | The builtin @lift@ VFun.
 liftBuiltin :: IO Val
 liftBuiltin = pure $ VFun $ \argThunk -> do
-    v <- force argThunk
+    v <- force legacyHooks argThunk
     liftVal v
 
 --------------------------------------------------------------------------------
@@ -241,38 +242,38 @@ liftBuiltin = pure $ VFun $ \argThunk -> do
 -- constructors throw a 'THError'.
 thExpToExpr :: Val -> IO Expr
 thExpToExpr (VCon "LitE" [litT]) = do
-    litV <- force litT
+    litV <- force legacyHooks litT
     decodeLit litV
 thExpToExpr (VCon "VarE" [nameT]) = do
-    nameV <- force nameT
+    nameV <- force legacyHooks nameT
     n <- decodeName nameV
     pure (EVar n)
 thExpToExpr (VCon "ConE" [nameT]) = do
-    nameV <- force nameT
+    nameV <- force legacyHooks nameT
     n <- decodeName nameV
     pure (EVar n)
 thExpToExpr (VCon "AppE" [fT, xT]) = do
-    fV <- force fT
-    xV <- force xT
+    fV <- force legacyHooks fT
+    xV <- force legacyHooks xT
     fE <- thExpToExpr fV
     xE <- thExpToExpr xV
     pure (EApp fE xE)
 thExpToExpr (VCon "ListE" [listT]) = do
-    listV <- force listT
+    listV <- force legacyHooks listT
     exprs <- decodeList listV thExpToExpr
     pure (buildListExpr exprs)
   where
     buildListExpr []     = EVar "[]"
     buildListExpr (e:es) = EApp (EApp (EVar ":") e) (buildListExpr es)
 thExpToExpr (VCon "TupE" [listT]) = do
-    listV <- force listT
+    listV <- force legacyHooks listT
     exprs <- decodeList listV (thMaybeExpToExpr "TupE")
     pure (ETuple exprs)
 thExpToExpr (VCon "InfixE" [mLT, opT, mRT]) = do
     -- InfixE (Just l) op (Just r) = l `op` r
-    mLV <- force mLT
-    opV <- force opT
-    mRV <- force mRT
+    mLV <- force legacyHooks mLT
+    opV <- force legacyHooks opT
+    mRV <- force legacyHooks mRT
     lE  <- decodeMaybeExpr "InfixE left" mLV
     opE <- thExpToExpr opV
     rE  <- decodeMaybeExpr "InfixE right" mRV
@@ -289,13 +290,13 @@ thExpToExpr v =
 -- and InfixE). In TH, 'TupE' takes @[Maybe Exp]@.
 thMaybeExpToExpr :: String -> Val -> IO Expr
 thMaybeExpToExpr _ctx (VCon "Just" [eT]) = do
-    eV <- force eT
+    eV <- force legacyHooks eT
     thExpToExpr eV
 thMaybeExpToExpr _ctx v = thExpToExpr v  -- tolerate plain Exp too
 
 decodeMaybeExpr :: String -> Val -> IO Expr
 decodeMaybeExpr ctx (VCon "Just" [eT]) = do
-    eV <- force eT
+    eV <- force legacyHooks eT
     thExpToExpr eV
 decodeMaybeExpr ctx (VCon "Nothing" []) =
     throwTH ("decodeMaybeExpr: Nothing in " <> ctx)
@@ -305,18 +306,18 @@ decodeMaybeExpr ctx v = do
 
 decodeLit :: Val -> IO Expr
 decodeLit (VCon "IntegerL" [nT]) = do
-    nV <- force nT
+    nV <- force legacyHooks nT
     case nV of
         VInt n  -> pure (ELit (LInt n))
         VFloat d -> pure (ELit (LInt (round d)))
         other    -> throwTH ("IntegerL: expected VInt, got " <> showValForDebug other)
 decodeLit (VCon "CharL" [cT]) = do
-    cV <- force cT
+    cV <- force legacyHooks cT
     case cV of
         VChar c -> pure (ELit (LChar c))
         other   -> throwTH ("CharL: expected VChar, got " <> showValForDebug other)
 decodeLit (VCon "StringL" [sT]) = do
-    sV <- force sT
+    sV <- force legacyHooks sT
     case sV of
         VStr bs     -> pure (stringToConsList (BC.unpack bs))
         VCon "[]" _ -> pure (EVar "[]")
@@ -334,25 +335,25 @@ decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
 decodeName (VCon "Name" [nT]) = do
     -- @VCon "Name" [VStr bs]@ — the shape produced by 'mkNameBuiltin'.
-    nV <- force nT
+    nV <- force legacyHooks nT
     case nV of
         VStr bs    -> pure bs
         VCon bs [] -> pure bs
         other      -> decodeName other
 decodeName (VCon "NameU" [nT]) = do
-    nV <- force nT; decodeName nV
+    nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon "NameS" [nT]) = do
-    nV <- force nT; decodeName nV
+    nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon "OccName" [nT]) = do
-    nV <- force nT; decodeName nV
+    nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon n _) = pure n   -- sometimes names are stored as VCon tag
 decodeName v = throwTH ("decodeName: expected VStr, got " <> showValForDebug v)
 
 decodeList :: Val -> (Val -> IO a) -> IO [a]
 decodeList (VCon "[]" []) _ = pure []
 decodeList (VCon ":" [hT, tT]) f = do
-    hV <- force hT
-    tV <- force tT
+    hV <- force legacyHooks hT
+    tV <- force legacyHooks tT
     x  <- f hV
     xs <- decodeList tV f
     pure (x : xs)
@@ -362,8 +363,8 @@ decodeList v _ =
 extractChars :: Val -> IO String
 extractChars (VCon "[]" []) = pure []
 extractChars (VCon ":" [hT, tT]) = do
-    hV <- force hT
-    tV <- force tT
+    hV <- force legacyHooks hT
+    tV <- force legacyHooks tT
     case hV of
         VChar c -> (c :) <$> extractChars tV
         other   -> throwTH ("extractChars: expected VChar, got " <> showValForDebug other)
@@ -391,7 +392,7 @@ expandSplicesInExpr env ipm depth expr
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval env ipm innerExpanded
+        thVal <- eval legacyHooks env ipm innerExpanded
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -464,21 +465,21 @@ exprToVal (EVar n)
     -- Capitalised name → ConE; lowercase/operator → VarE.
     | not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z' = do
         nt <- thName n
-        force =<< newWHNFThunk (VCon "ConE" [nt])
+        force legacyHooks =<< newWHNFThunk (VCon "ConE" [nt])
     | otherwise = do
         nt <- thName n
-        force =<< newWHNFThunk (VCon "VarE" [nt])
+        force legacyHooks =<< newWHNFThunk (VCon "VarE" [nt])
 exprToVal (ELit (LInt n)) = do
     litT <- integerL n
-    force =<< litE litT
+    force legacyHooks =<< litE litT
 exprToVal (ELit (LFloat d)) = do
     -- Encode floating-point as IntegerL (round) — RationalL needs more infra.
     litT <- integerL (round d)
-    force =<< litE litT
+    force legacyHooks =<< litE litT
 exprToVal (ELit (LStr bs)) = do
     charListVal <- buildCharList (BC.unpack bs)
     litT <- stringL charListVal
-    force =<< litE litT
+    force legacyHooks =<< litE litT
   where
     buildCharList []     = pure (VCon "[]" [])
     buildCharList (c:cs) = do
@@ -488,17 +489,17 @@ exprToVal (ELit (LStr bs)) = do
         pure (VCon ":" [h, t])
 exprToVal (ELit (LChar c)) = do
     litT <- charL c
-    force =<< litE litT
+    force legacyHooks =<< litE litT
 exprToVal (EApp f x) = do
     fV  <- exprToVal f
     xV  <- exprToVal x
     fT  <- newWHNFThunk fV
     xT  <- newWHNFThunk xV
-    force =<< appE fT xT
+    force legacyHooks =<< appE fT xT
 exprToVal (ETuple es) = do
     elemVals <- mapM exprToVal es
     elemTs   <- mapM newWHNFThunk elemVals
-    force =<< tupE elemTs
+    force legacyHooks =<< tupE elemTs
 exprToVal (ENeg e) = do
     -- negate x  =  AppE (VarE "negate") x
     negT <- do
@@ -506,14 +507,14 @@ exprToVal (ENeg e) = do
         newWHNFThunk (VCon "VarE" [nt])
     xV   <- exprToVal e
     xT   <- newWHNFThunk xV
-    force =<< appE negT xT
+    force legacyHooks =<< appE negT xT
 -- Value-level @T: the type argument is opaque metadata. Encode the inner
 -- expression as the TH Exp; a future splice pass that cares about type
 -- applications can inspect the 'ETyApp' node before reaching here.
 exprToVal (ETyApp e _ty) = exprToVal e
 -- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
 exprToVal _ =
-    force =<< newWHNFThunk (VCon "VarE" [])
+    force legacyHooks =<< newWHNFThunk (VCon "VarE" [])
 
 --------------------------------------------------------------------------------
 -- Builtin name pairs to register in the environment
@@ -702,7 +703,7 @@ resetNewNameCounter = writeIORef newNameCounterRef 0
 -- | @mkName :: String -> Name@.  Returns @VCon "Name" [VStr bytes]@.
 mkNameBuiltin :: IO Val
 mkNameBuiltin = pure $ VFun $ \argT -> do
-    v <- force argT
+    v <- force legacyHooks argT
     bs <- valToBytes v
     bsT <- newWHNFThunk (VStr bs)
     pure (VCon "Name" [bsT])
@@ -710,7 +711,7 @@ mkNameBuiltin = pure $ VFun $ \argT -> do
 -- | @newName :: String -> Q Name@.  Gensym by appending @_N@.
 newNameBuiltin :: IO Val
 newNameBuiltin = pure $ VFun $ \argT -> do
-    v <- force argT
+    v <- force legacyHooks argT
     base <- valToBytes v
     pure $ VIO $ do
         n <- atomicModifyIORef' newNameCounterRef (\c -> (c + 1, c))
@@ -721,7 +722,7 @@ newNameBuiltin = pure $ VFun $ \argT -> do
 -- | @runQ :: Quasi m => Q a -> m a@.  Identity on 'VIO' values.
 runQBuiltin :: IO Val
 runQBuiltin = pure $ VFun $ \argT -> do
-    v <- force argT
+    v <- force legacyHooks argT
     case v of
         VIO _ -> pure v
         other -> pure (VIO (pure other))
@@ -765,7 +766,7 @@ extsEnabledBuiltin = pure $ VIO $ pure (VCon "[]" [])
 -- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
 reifyBuiltin :: IO Val
 reifyBuiltin = pure $ VFun $ \argT -> do
-    _ <- force argT
+    _ <- force legacyHooks argT
     pure $ VIO $ do
         nameT  <- thName (BC.pack "<reify-stub>")
         let nameV = VCon "Name" [nameT]
@@ -784,7 +785,7 @@ reifyBuiltin = pure $ VFun $ \argT -> do
 valToBytes :: Val -> IO ByteString
 valToBytes (VStr bs) = pure bs
 valToBytes (VCon "Name" [nT]) = do
-    nV <- force nT
+    nV <- force legacyHooks nT
     case nV of
         VStr bs -> pure bs
         _       -> valToBytes nV
@@ -794,8 +795,8 @@ valToBytes v = do
   where
     collectChars (VCon "[]" []) = pure []
     collectChars (VCon ":" [hT, tT]) = do
-        hV <- force hT
-        tV <- force tT
+        hV <- force legacyHooks hT
+        tV <- force legacyHooks tT
         case hV of
             VChar c -> (c :) <$> collectChars tV
             _       -> throwTH ("valToBytes: expected VChar, got "
@@ -812,7 +813,7 @@ valToBytes v = do
 -- a list of @(name, body)@ top-level bindings.
 thExpandSpliceDecl :: Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
 thExpandSpliceDecl env ipm spliceExpr = do
-    v0 <- eval env ipm spliceExpr
+    v0 <- eval legacyHooks env ipm spliceExpr
     decsVal <- unwrapQ v0
     thDecsToBindings decsVal
 
@@ -825,8 +826,8 @@ unwrapQ v         = pure v
 thDecsToBindings :: Val -> IO [(Name, Expr)]
 thDecsToBindings (VCon "[]" []) = pure []
 thDecsToBindings (VCon ":" [hT, tT]) = do
-    hV <- force hT
-    tV <- force tT
+    hV <- force legacyHooks hT
+    tV <- force legacyHooks tT
     mThis <- thDecToBinding hV
     rest  <- thDecsToBindings tV
     pure $ case mThis of
@@ -840,15 +841,15 @@ thDecsToBindings v =
 thDecToBinding :: Val -> IO (Maybe (Name, Expr))
 thDecToBinding dec = case dec of
     VCon "ValD" [patT, bodyT, _decsT] -> do
-        patV <- force patT
-        bodyV <- force bodyT
+        patV <- force legacyHooks patT
+        bodyV <- force legacyHooks bodyT
         name <- decodeVarP patV
         body <- decodeBody bodyV
         pure (Just (name, body))
     VCon "FunD" [nameT, clausesT] -> do
-        nameV <- force nameT
+        nameV <- force legacyHooks nameT
         name <- decodeName nameV
-        clausesV <- force clausesT
+        clausesV <- force legacyHooks clausesT
         body <- decodeClauses clausesV
         pure (Just (name, body))
     VCon "SigD" _ -> pure Nothing
@@ -864,14 +865,14 @@ thDecToBinding dec = case dec of
                  <> showValForDebug other)
   where
     decodeVarP (VCon "VarP" [nameT]) = do
-        nameV <- force nameT
+        nameV <- force legacyHooks nameT
         decodeName nameV
     decodeVarP v =
         throwTH ("thDecToBinding: ValD LHS must be VarP, got "
                  <> showValForDebug v)
 
     decodeBody (VCon "NormalB" [eT]) = do
-        eV <- force eT
+        eV <- force legacyHooks eT
         thExpToExpr eV
     decodeBody (VCon "GuardedB" _) =
         throwTH "thDecToBinding: GuardedB (guards) not yet supported"
@@ -881,8 +882,8 @@ thDecToBinding dec = case dec of
     decodeClauses (VCon "[]" []) =
         throwTH "thDecToBinding: FunD has no clauses"
     decodeClauses (VCon ":" [clT, restT]) = do
-        clV <- force clT
-        restV <- force restT
+        clV <- force legacyHooks clT
+        restV <- force legacyHooks restT
         case restV of
             VCon "[]" [] -> decodeOneClause clV
             _ -> throwTH "thDecToBinding: FunD with multiple clauses not yet supported"
@@ -891,8 +892,8 @@ thDecToBinding dec = case dec of
                  <> showValForDebug v)
 
     decodeOneClause (VCon "Clause" [patsT, bodyT, _decsT]) = do
-        patsV <- force patsT
-        bodyV <- force bodyT
+        patsV <- force legacyHooks patsT
+        bodyV <- force legacyHooks bodyT
         pats <- decodePats patsV
         body <- decodeBody bodyV
         pure (foldr wrapLam body pats)
@@ -906,8 +907,8 @@ thDecToBinding dec = case dec of
 
     decodePats (VCon "[]" []) = pure []
     decodePats (VCon ":" [hT, tT]) = do
-        hV <- force hT
-        tV <- force tT
+        hV <- force legacyHooks hT
+        tV <- force legacyHooks tT
         p  <- decodePat hV
         ps <- decodePats tV
         pure (p : ps)
@@ -915,19 +916,19 @@ thDecToBinding dec = case dec of
         throwTH ("thDecToBinding: expected [Pat], got " <> showValForDebug v)
 
     decodePat (VCon "VarP" [nT]) = do
-        nV <- force nT
+        nV <- force legacyHooks nT
         PVar <$> decodeName nV
     decodePat (VCon "WildP" []) = pure PWild
     decodePat (VCon "LitP" [lT]) = do
-        lV <- force lT
+        lV <- force legacyHooks lT
         case lV of
             VCon "IntegerL" [iT] -> do
-                iV <- force iT
+                iV <- force legacyHooks iT
                 case iV of
                     VInt n -> pure (PLit (LInt n))
                     _ -> throwTH "LitP: IntegerL payload must be VInt"
             VCon "CharL" [cT] -> do
-                cV <- force cT
+                cV <- force legacyHooks cT
                 case cV of
                     VChar c -> pure (PLit (LChar c))
                     _ -> throwTH "LitP: CharL payload must be VChar"
