@@ -32,9 +32,8 @@ module IHC.Classes
     , InstanceScopeRef
     , ScanHook
     , instanceScopeRef
-    , scanHookRef
-    , sharedClassRegRef
     , setSharedClassReg
+    , getSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
     , clearInstanceScope
@@ -45,29 +44,23 @@ module IHC.Classes
     , catalogueHasClass
       -- * Demand-driven env fallback
     , EnvFallbackHook
-    , envFallbackRef
     , setEnvFallback
     , lookupEnvFallback
       -- * Core-instance load hook
-    , coreInstanceLoadHookRef
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
       -- * Ctor -> type-name lookup (for source-loaded ADTs)
-    , ctorTypeHookRef
     , setCtorTypeHook
     , lookupCtorType
       -- * Per-load instance-registration hook
     , RegisterInstancesHook
-    , registerInstancesHookRef
     , setRegisterInstancesHook
     , triggerRegisterInstances
       -- * Class-method dispatcher fallback
-    , classMethodFallbackRef
     , setClassMethodFallback
     , lookupClassMethodFallback
       -- * TH Exp -> Expr decoder hook
     , ThExpToExprHook
-    , thExpToExprRef
     , setThExpToExpr
     , runThExpToExpr
       -- * B.1: superclass tracking
@@ -370,7 +363,7 @@ typeTagOf (VCon n _) =
     -- on the type name, not the ctor name.  Falls back to the ctor
     -- name when the hook hasn't been installed (boot, REPL transient
     -- lookups) or doesn't know about @n@.
-    case unsafePerformIO (lookupCtorType n) of
+    case unsafePerformIO (lookupCtorType legacyHooks n) of
         Just ty -> ty
         Nothing -> n
 typeTagOf (VFun _)      = BC.pack "<function>"
@@ -402,16 +395,14 @@ type ScanHook = ByteString -> IO ()
 instanceScopeRef :: InstanceScopeRef
 instanceScopeRef = unsafePerformIO (newIORef Set.empty)
 
-{-# NOINLINE scanHookRef #-}
-scanHookRef :: IORef (Maybe ScanHook)
-scanHookRef = unsafePerformIO (newIORef Nothing)
+setSharedClassReg :: IHCHooks -> ClassRegistry -> IO ()
+setSharedClassReg hooks reg = writeIORef (hkSharedClassReg hooks) (Just reg)
 
-{-# NOINLINE sharedClassRegRef #-}
-sharedClassRegRef :: IORef (Maybe ClassRegistry)
-sharedClassRegRef = unsafePerformIO (newIORef Nothing)
-
-setSharedClassReg :: ClassRegistry -> IO ()
-setSharedClassReg reg = writeIORef sharedClassRegRef (Just reg)
+-- | Read the currently-installed shared 'ClassRegistry', if any.
+-- Replaces the @readIORef sharedClassRegRef@ idiom that the
+-- evaluator and scheduler used to do directly.
+getSharedClassReg :: IHCHooks -> IO (Maybe ClassRegistry)
+getSharedClassReg hooks = readIORef (hkSharedClassReg hooks)
 
 unionInstanceScope :: Set ByteString -> IO ()
 unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
@@ -534,16 +525,12 @@ catalogueHasClass cls = do
 -- 'currentOwner' in 'IHC.Eval').
 type EnvFallbackHook = Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 
-{-# NOINLINE envFallbackRef #-}
-envFallbackRef :: IORef EnvFallbackHook
-envFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+setEnvFallback :: IHCHooks -> EnvFallbackHook -> IO ()
+setEnvFallback hooks = writeIORef (hkEnvFallback hooks)
 
-setEnvFallback :: EnvFallbackHook -> IO ()
-setEnvFallback = writeIORef envFallbackRef
-
-lookupEnvFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
-lookupEnvFallback owner name = do
-    hook <- readIORef envFallbackRef
+lookupEnvFallback :: IHCHooks -> Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+lookupEnvFallback hooks owner name = do
+    hook <- readIORef (hkEnvFallback hooks)
     hook owner name
 
 --------------------------------------------------------------------------------
@@ -559,16 +546,12 @@ lookupEnvFallback owner name = do
 -- had before the elaborator existed.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE classMethodFallbackRef #-}
-classMethodFallbackRef :: IORef (ByteString -> ByteString -> IO (Maybe Val))
-classMethodFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+setClassMethodFallback :: IHCHooks -> (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
+setClassMethodFallback hooks = writeIORef (hkClassMethodFallback hooks)
 
-setClassMethodFallback :: (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
-setClassMethodFallback = writeIORef classMethodFallbackRef
-
-lookupClassMethodFallback :: ByteString -> ByteString -> IO (Maybe Val)
-lookupClassMethodFallback cls method = do
-    hook <- readIORef classMethodFallbackRef
+lookupClassMethodFallback :: IHCHooks -> ByteString -> ByteString -> IO (Maybe Val)
+lookupClassMethodFallback hooks cls method = do
+    hook <- readIORef (hkClassMethodFallback hooks)
     hook cls method
 
 --------------------------------------------------------------------------------
@@ -588,19 +571,15 @@ lookupClassMethodFallback cls method = do
 -- 'IHC.InstanceManifest' says provide instances for that class.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE coreInstanceLoadHookRef #-}
-coreInstanceLoadHookRef :: IORef (ByteString -> IO ())
-coreInstanceLoadHookRef = unsafePerformIO (newIORef (\_ -> pure ()))
-
-setCoreInstanceLoadHook :: (ByteString -> IO ()) -> IO ()
-setCoreInstanceLoadHook = writeIORef coreInstanceLoadHookRef
+setCoreInstanceLoadHook :: IHCHooks -> (ByteString -> IO ()) -> IO ()
+setCoreInstanceLoadHook hooks = writeIORef (hkCoreInstanceLoad hooks)
 
 -- | Trigger a core-instance load for the given class.  The hook tracks
 -- which classes it has already loaded and short-circuits subsequent
 -- calls for the same class.
-triggerCoreInstanceLoad :: ByteString -> IO ()
-triggerCoreInstanceLoad cls = do
-    hook <- readIORef coreInstanceLoadHookRef
+triggerCoreInstanceLoad :: IHCHooks -> ByteString -> IO ()
+triggerCoreInstanceLoad hooks cls = do
+    hook <- readIORef (hkCoreInstanceLoad hooks)
     hook cls
 
 --------------------------------------------------------------------------------
@@ -621,16 +600,12 @@ triggerCoreInstanceLoad cls = do
 -- @typeTagOf@ peeks via @unsafePerformIO@.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE ctorTypeHookRef #-}
-ctorTypeHookRef :: IORef (ByteString -> Maybe ByteString)
-ctorTypeHookRef = unsafePerformIO (newIORef (const Nothing))
+setCtorTypeHook :: IHCHooks -> (ByteString -> Maybe ByteString) -> IO ()
+setCtorTypeHook hooks = writeIORef (hkCtorType hooks)
 
-setCtorTypeHook :: (ByteString -> Maybe ByteString) -> IO ()
-setCtorTypeHook = writeIORef ctorTypeHookRef
-
-lookupCtorType :: ByteString -> IO (Maybe ByteString)
-lookupCtorType ctor = do
-    f <- readIORef ctorTypeHookRef
+lookupCtorType :: IHCHooks -> ByteString -> IO (Maybe ByteString)
+lookupCtorType hooks ctor = do
+    f <- readIORef (hkCtorType hooks)
     pure (f ctor)
 
 --------------------------------------------------------------------------------
@@ -653,16 +628,12 @@ lookupCtorType ctor = do
 
 type RegisterInstancesHook = ByteString -> IO ()
 
-{-# NOINLINE registerInstancesHookRef #-}
-registerInstancesHookRef :: IORef RegisterInstancesHook
-registerInstancesHookRef = unsafePerformIO (newIORef (\_ -> pure ()))
+setRegisterInstancesHook :: IHCHooks -> RegisterInstancesHook -> IO ()
+setRegisterInstancesHook hooks = writeIORef (hkRegisterInstances hooks)
 
-setRegisterInstancesHook :: RegisterInstancesHook -> IO ()
-setRegisterInstancesHook = writeIORef registerInstancesHookRef
-
-triggerRegisterInstances :: ByteString -> IO ()
-triggerRegisterInstances modName = do
-    hook <- readIORef registerInstancesHookRef
+triggerRegisterInstances :: IHCHooks -> ByteString -> IO ()
+triggerRegisterInstances hooks modName = do
+    hook <- readIORef (hkRegisterInstances hooks)
     hook modName
 
 --------------------------------------------------------------------------------
@@ -677,17 +648,12 @@ triggerRegisterInstances modName = do
 
 type ThExpToExprHook = Val -> IO Expr
 
-{-# NOINLINE thExpToExprRef #-}
-thExpToExprRef :: IORef ThExpToExprHook
-thExpToExprRef = unsafePerformIO (newIORef (\_ ->
-    error "IHC.Classes: thExpToExpr hook not installed"))
+setThExpToExpr :: IHCHooks -> ThExpToExprHook -> IO ()
+setThExpToExpr hooks = writeIORef (hkThExpToExpr hooks)
 
-setThExpToExpr :: ThExpToExprHook -> IO ()
-setThExpToExpr = writeIORef thExpToExprRef
-
-runThExpToExpr :: Val -> IO Expr
-runThExpToExpr v = do
-    hook <- readIORef thExpToExprRef
+runThExpToExpr :: IHCHooks -> Val -> IO Expr
+runThExpToExpr hooks v = do
+    hook <- readIORef (hkThExpToExpr hooks)
     hook v
 
 --------------------------------------------------------------------------------
@@ -739,16 +705,26 @@ data IHCHooks = IHCHooks
 -- 'IHC.Context'.
 {-# NOINLINE legacyHooks #-}
 legacyHooks :: IHCHooks
-legacyHooks = IHCHooks
-    { hkEnvFallback         = envFallbackRef
-    , hkClassMethodFallback = classMethodFallbackRef
-    , hkCoreInstanceLoad    = coreInstanceLoadHookRef
-    , hkCtorType            = ctorTypeHookRef
-    , hkRegisterInstances   = registerInstancesHookRef
-    , hkScan                = scanHookRef
-    , hkSharedClassReg      = sharedClassRegRef
-    , hkThExpToExpr         = thExpToExprRef
-    }
+legacyHooks = unsafePerformIO $ do
+    envFb       <- newIORef (\_ _ -> pure Nothing)
+    classMethFb <- newIORef (\_ _ -> pure Nothing)
+    coreLoad    <- newIORef (\_ -> pure ())
+    ctorType    <- newIORef (const Nothing)
+    regInsts    <- newIORef (\_ -> pure ())
+    scan        <- newIORef Nothing
+    sharedReg   <- newIORef Nothing
+    thExp       <- newIORef
+        (\_ -> error "IHC.Classes: thExpToExpr hook not installed")
+    pure IHCHooks
+        { hkEnvFallback         = envFb
+        , hkClassMethodFallback = classMethFb
+        , hkCoreInstanceLoad    = coreLoad
+        , hkCtorType            = ctorType
+        , hkRegisterInstances   = regInsts
+        , hkScan                = scan
+        , hkSharedClassReg      = sharedReg
+        , hkThExpToExpr         = thExp
+        }
 
 --------------------------------------------------------------------------------
 -- B.1: superclass tracking (Haskell Report §4.3.1)
