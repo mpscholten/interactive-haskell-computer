@@ -350,11 +350,47 @@ builtins reg =
     -- import-hiding dispatch is fixed at the Scheduler level.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- IO
-    , ("putStrLn", putStrLnB)
-    , ("putStr",   putStrB)
-    , ("print",    printDispatch reg)
-    , ("putChar",  putCharB)
-    , ("getLine",  getLineB)
+    --
+    -- 'putStrLn' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:282-283
+    --     putStrLn s = hPutStrLn stdout s
+    -- Per CLAUDE.md "Builtin modules: minimum surface only", any symbol
+    -- with .hs source must be interpreted, not shimmed. Keeping the shim
+    -- short-circuits demand discovery on 'putStrLn' (the most-typed name
+    -- in the suite), which causes the FV walk to record phantom misses
+    -- on whatever the source body would have referenced — the workaround
+    -- for those misses is the manifest-driven core load and the
+    -- eager-load-every-import phase in 'loadProgramFromSource'. The
+    -- source path bottoms out one level down on 'hPutStrLn' (still
+    -- shimmed), so demand discovery walks two AST nodes and reaches an
+    -- existing primop boundary. See plan
+    --     ~/.claude/plans/why-is-ihc-test-taking-silly-mango.md
+    -- for the multi-slice arc.
+    --
+    -- Slice 2: 'putStr' and 'putChar' graduate to source-loaded under
+    -- the same rule. Source bodies are
+    --     putStr s   =  hPutStr stdout s        -- System/IO.hs:278
+    --     putChar c  =  hPutChar stdout c       -- System/IO.hs:272
+    -- Both bottom out on host shims already pinned via 'ffiBuiltinNames'
+    -- in slice 1 (hPutStr, hPutChar, stdout).
+    --
+    -- Slice 4: 'print' graduates. Source body is
+    --     print x  =  putStrLn (show x)         -- System/IO.hs:296-297
+    -- 'putStrLn' is source-loaded (slice 1).  'show' remains a shim
+    -- ('showDispatch reg' below) because it's the entry point of the
+    -- Show class registry — graduating it is slice 5+ territory.
+    --
+    -- Slice 3 (this commit): 'getLine' graduates. Source body is
+    --     getLine  =  hGetLine stdin            -- System/IO.hs:308-309
+    -- Bottoms out on 'hGetLine' (still a host shim — see
+    -- 'ffiBuiltinNames' in Scheduler.hs for why the shim must take
+    -- precedence over the source-level GHC.IO.Handle.Text definition
+    -- until the source-level Handle ADT layer is implemented).
+    --
+    -- 'getContents' is similarly source-loaded from
+    --     getContents  =  hGetContents stdin    -- System/IO.hs:316-317
+    -- It was never shimmed in the first place; documented here for
+    -- symmetry with 'getLine'.
     -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
     -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
     -- implementation for VIO values.
@@ -386,10 +422,26 @@ builtins reg =
     , ("GHC.Internal.Base.<>", sappendDispatch reg)
     , ("Prelude.<>", sappendDispatch reg)
     , ("Data.Semigroup.<>", sappendDispatch reg)
-    , ("join",     joinB)
-    , ("void",     voidB)
-    , ("Control.Monad.void", voidB)
-    , ("GHC.Internal.Base.void", voidB)
+    --
+    -- 'join' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
+    --     join :: Monad m => m (m a) -> m a
+    --     join x = x >>= id
+    -- The source dispatches via the Monad class — '>>=' is still
+    -- shimmed ('bindDispatch reg' below) so the IO/Maybe/Either
+    -- variants reach their existing dispatcher; user-defined Monad
+    -- instances flow through the registry the same way.
+    --
+    -- 'void' deliberately omitted: it has source at
+    -- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211
+    --     void :: Functor f => f a -> f ()
+    --     void x = () <$ x
+    -- Per CLAUDE.md "Builtin modules: minimum surface only". Source
+    -- dispatches via the Functor class ('<$' default body
+    -- '(<$) = fmap . const' from GHC.Internal.Base) which routes
+    -- through 'fmapDispatch' (still shimmed). The empty-data-decl
+    -- scanner fix at commit a1db2a6 was a prerequisite — without it
+    -- 'fmapDispatch' read the IO ctor's tag as "PrimMVar".
     -- @Control.Arrow.first@ / @second@ - for the @(->)@ arrow.  Warp's
     -- @runSettingsConnectionMaker@ uses
     -- @first ((,TCP) \<$\>)@ to lift @(,Transport)@ into the IO action and
@@ -2294,52 +2346,29 @@ lengthB = pure $ VFun $ \a -> do
 -- IO
 --------------------------------------------------------------------------------
 
--- | Write a @[Char]@ plus newline. Accepts either a cons-chain of
--- VChar or a transitional VStr.
---
--- Returns @VIO action@ (Phase 2.4): the host IO is delayed until the
--- driver (or a do-block binding) actually runs the action.
-putStrLnB :: IO Val
-putStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- valToString av
-    putStrLn s
-    hFlush stdout
-    pure VUnit
+-- 'putStrLnB' was removed in the "minimum surface only" cleanup —
+-- 'putStrLn' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:282-283.
+-- See the comment next to the (now-deleted) "putStrLn" entry in
+-- 'builtins' above.
 
-putStrB :: IO Val
-putStrB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- valToString av
-    putStr s
-    hFlush stdout
-    pure VUnit
+-- 'putStrB' / 'putCharB' were removed in the slice-2 cleanup —
+-- 'putStr' and 'putChar' are now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:278 / :272.
+-- See the comment next to the (now-deleted) "putStr"/"putChar" entries
+-- in 'builtins' above.
 
--- printB replaced by printDispatch in Phase 2.3
+-- 'printDispatch' was removed in the slice-4 cleanup — 'print' is now
+-- interpreted from ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:296-297
+-- (`print x = putStrLn (show x)`).  The Show-class entry point lives
+-- in 'showDispatch reg' below; demand discovery on 'print x' resolves
+-- 'show' to that dispatcher, which walks the ClassRegistry as before.
 
-printDispatch :: ClassRegistry -> IO Val
-printDispatch reg = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    s  <- showValWith reg av
-    putStrLn s
-    hFlush stdout
-    pure VUnit
-
-putCharB :: IO Val
-putCharB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    case av of
-        VChar c -> do { putChar c; hFlush stdout; pure VUnit }
-        VInt c  -> do { putChar (toEnum (fromIntegral c)); hFlush stdout; pure VUnit }
-        _ -> error ("putChar: not a Char: " <> showValForDebug av)
-
--- | 'getLine' — zero-arity IO action. We register the VIO directly
--- (no dummy-thunk wrapper like Phase 2.2/3). Reading from the env
--- thus immediately yields the action; binding it in a do-block runs it.
-getLineB :: IO Val
-getLineB = pure $ VIO $ do
-    s <- getLine
-    stringToListValIO s
+-- 'getLineB' was removed in the "minimum surface only" cleanup —
+-- 'getLine' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/System/IO.hs:308-309.
+-- See the comment next to the (now-deleted) "getLine" entry in
+-- 'builtins' above.
 
 -- | B.1: debug-only probe of the global superclass-relation map.
 -- Takes a class name (as a [Char] list) and returns the list of
@@ -2658,17 +2687,14 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                   <> BC.unpack (typeTagOf fv) <> "`" )
 
 -- | @join mm = do { m <- mm; m }@.
-joinB :: IO Val
-joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
-    mv <- force mmt
-    inner <- runIOVal mv
-    runIOVal inner
+-- 'joinB' was removed in slice 5b — 'join' is now interpreted from
+-- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
+-- ('join x = x >>= id'). See the comment next to the (now-deleted)
+-- "join" entry in 'builtins' above.
 
-voidB :: IO Val
-voidB = pure $ VFun $ \mt -> pure $ VIO $ do
-    mv <- force mt
-    _ <- runIOVal mv
-    pure VUnit
+-- 'voidB' was removed in slice 5a — 'void' is now interpreted from
+-- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211. See the
+-- comment next to the (now-deleted) "void" entry in 'builtins' above.
 
 -- | @first f (a, b) = (f a, b)@ — the @Arrow (->)@ instance method.
 -- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
