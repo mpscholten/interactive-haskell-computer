@@ -170,6 +170,13 @@ genExprSized n
         , (1, ECase  <$> half  <*> genAlts half_n)
         , (1, ENeg   <$> sub)
         , (1, ETuple <$> genTupleExprs half_n)
+        -- @f \@T@ — type application.  The Name carries the raw
+        -- source bytes of the type argument; we emit a single
+        -- ConId so the captured bytes are exactly the ConId text
+        -- and round-trip cleanly.  Parenthesised type args
+        -- (@\@(Maybe Int)@) would need to carry their parens
+        -- inside the Name field and are deferred.
+        , (1, ETyApp <$> sub <*> genConIdent)
         ]
   where
     atom   = frequency

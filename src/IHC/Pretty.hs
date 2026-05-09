@@ -82,6 +82,13 @@ prettyExpr = \case
         "(" <> bsIntercalate ", " (map prettyExpr es) <> ")"
     ELabel n       -> "#" <> n
     EImplicitRef n -> "?" <> n
+    -- @f \@T@ — value-level TypeApplications.  The Name field is
+    -- the raw source bytes of the type argument as captured by
+    -- 'IHC.Parser.captureTypeArg'.  For a bare ConId the bytes
+    -- are just the ConId text; parenthesised forms
+    -- (@\@(Maybe Int)@) carry the parens too, which the
+    -- generator does not yet emit.
+    ETyApp e n     -> "(" <> prettyExpr e <> " @" <> n <> ")"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"
