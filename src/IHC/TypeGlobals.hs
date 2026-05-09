@@ -189,6 +189,7 @@ seedBuiltinClassMethodSigs = do
             -- the 3-step probe→load→discover cascade.)
             , ("quot",       "Integral")
             , ("rem",        "Integral")
+            , ("toInteger",  "Integral")
             -- Fractional
             , ("/",          "Fractional")
             , ("recip",      "Fractional")

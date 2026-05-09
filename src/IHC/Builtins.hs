@@ -299,7 +299,6 @@ builtins reg =
     , ("round",    floatToIntB round)
     , ("truncate", floatToIntB truncate)
     , ("fromIntegral", fromIntegralB)
-    , ("fromInteger",  fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
@@ -953,14 +952,19 @@ builtins reg =
     , ("getAddrInfo",     getAddrInfoB)
     , ("Network.Socket.getAddrInfo", getAddrInfoB)
     , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
-    -- Phase 2.8: additional numeric ops needed by containers
-    , ("fromInteger",  fromIntegralB)
-    , ("toInteger",    fromIntegralB)
-    -- 'quot' / 'rem' graduated to source-loaded.  Bodies live at
-    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:445-455
-    -- and route through the quotInt / remInt Haskell wrappers in
-    -- GHC.Internal.Base, bottoming on the quotInt# / remInt# primops
-    -- registered above.
+    -- Phase 2.8: additional numeric ops needed by containers (graduated)
+    --   * 'fromInteger' (Num class) → 'Num Int.fromInteger'
+    --     at GHC/Internal/Num.hs:115 — body @fromInteger i = I# (integerToInt# i)@.
+    --     The IS/IP/IN matchPat bridge in Eval.hs (PR #136) lets the
+    --     source-loaded @integerToInt# (IS i) = i@ unwrap a 'VInt'.
+    --   * 'toInteger' (Integral class) → 'Integral Int.toInteger'
+    --     at GHC/Internal/Real.hs:442 — body @toInteger (I# i) = IS i@.
+    --     Returns 'VCon "IS" [VInt n]'; downstream consumers either
+    --     pattern-match through the IS bridge or call 'fromIntegral'
+    --     (line 301), whose 'numericNewtypeCons' covers IS.
+    --   * 'quot' / 'rem' (Integral class) → 'Integral Int.{quot,rem}'
+    --     at Real.hs:445-455, routed through quotInt / remInt
+    --     (Base.hs:2376-2390) bottoming on quotInt# / remInt# primops.
     -- 'div' graduated with the rest of the TODO 2.6 block: it now
     -- routes through the Integral Int instance (a `divInt` b) and
     -- bottoms on divInt# registered below.
