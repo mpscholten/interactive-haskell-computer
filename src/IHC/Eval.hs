@@ -14,6 +14,7 @@
 -- Phase 3.6: ImplicitParamMap is threaded alongside Env. Implicit params
 -- (?x) live in a separate namespace; closures capture the map at creation
 -- time (lexical scoping).
+{-# LANGUAGE ScopedTypeVariables #-}
 module IHC.Eval
     ( eval
     , force
@@ -29,6 +30,7 @@ import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Int (Int64)
 import Data.IORef
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
@@ -982,6 +984,42 @@ matchPat hooks (PCon "F#" [p]) (VFloat n) = do
 matchPat hooks (PCon "D#" [p]) (VFloat n) = do
     t <- newWHNFThunk (VFloat n)
     matchFields hooks [(p, t)] []
+-- ghc-bignum's @Integer@ data constructors:
+--
+--     data Integer = IS !Int# | IP !BigNat# | IN !BigNat#
+--
+-- IHC's runtime represents Integer as 'VInt' (Int64 range) or
+-- 'VInteger' (arbitrary precision).  Source-loaded code that
+-- pattern-matches @case n of IS k -> ...@ needs to see the
+-- underlying primitive — the same transparent-constructor trick
+-- as I# / F# / D# above.
+--
+-- @IS k@ binds k to an @Int#@-shaped 'VInt'.  Matches:
+--   * 'VInt n'                          (already Int-range)
+--   * 'VInteger n' iff @n@ fits in Int64 (parser-routed overflow
+--                                         that fits after a sign flip)
+matchPat hooks (PCon "IS" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IS" [p]) (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInt (fromInteger n))
+        matchFields hooks [(p, t)] []
+-- @IP bn@ / @IN bn@ bind bn to a @BigNat#@.  IHC has no
+-- BigNat# runtime yet, so we expose the underlying 'VInteger'
+-- (positive value for IP, magnitude for IN) directly.  Source
+-- code that does arithmetic on the BigNat# will fail until the
+-- BigNat# primop suite lands; pattern matching alone works for
+-- the common @case n of IS k -> ... ; _ -> defaultBig@ shape.
+matchPat hooks (PCon "IP" [p]) (VInteger n)
+    | n > toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInteger n)
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IN" [p]) (VInteger n)
+    | n < toInteger (minBound :: Int64) = do
+        t <- newWHNFThunk (VInteger (negate n))
+        matchFields hooks [(p, t)] []
 -- Lazy ST's lifted state token is `data State s = S# (State# s)`.
 -- The interpreter represents all erased State# tokens as PrimRealWorld, so
 -- expose that raw token through the source constructor when lazy ST code

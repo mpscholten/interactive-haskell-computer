@@ -4914,26 +4914,6 @@ divideDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- (Int64-backed); the @intToInt64#@ \/ @int64ToInt#@ \/
 -- @int64ToWord64#@ \/ @word64ToInt64#@ primops are therefore
 -- runtime no-ops on the value side.
--- | floor/ceiling/round/truncate — Float -> Int.  Tracked
--- carve-out: the source-loaded RealFrac Double / properFractionFloat
--- chain in GHC.Internal.Float reaches into ghc-bignum's Integer
--- (IS \/ IP \/ IN VCon constructors) for arithmetic, which IHC's
--- runtime arithmetic primops (quotRem, +, -, etc.) don't yet
--- speak.  The decodeDouble_Int64# primop, the Int64# / Int#
--- bitwise aliases, the WordSize.h CPP macros, the NegativeLiterals
--- parser support, and 'asInt64' are all in place from earlier
--- commits — the remaining layer is teaching the Int arithmetic
--- primops to coerce \/ unwrap source-loaded Integer ('VCon \"IS\"
--- [...]') to 'VInt' on the boundary.  Until then, stay shimmed.
-floatToIntB :: (Double -> Int64) -> IO Val
-floatToIntB op = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VFloat d -> pure (VInt (op d))
-        VInt n   -> pure (VInt n)
-        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
-
-
 identityIntPrimop :: IO Val
 identityIntPrimop = pure $ VFun $ \a -> do
     av <- force legacyHooks a
@@ -4950,12 +4930,43 @@ identityIntPrimop = pure $ VFun $ \a -> do
 -- source-loaded code where literal overflow routed an
 -- in-range value through 'LInteger' (e.g. @-2^63@ via
 -- NegativeLiterals on @-0x8000000000000000@).
+-- | floor/ceiling/round/truncate — Float -> Int.  Tracked
+-- carve-out: the source-loaded RealFrac Double / properFractionFloat
+-- chain reaches Num Integer class-method dispatch which still
+-- bottoms out at @<<ihc-method-placeholder>>@ — even with the
+-- IS\/IP\/IN matchPat bridge below in place.  Lifting the rest
+-- requires class-dispatch work for Num Integer \/ Integral
+-- Integer instances; a separate workstream.
+floatToIntB :: (Double -> Int64) -> IO Val
+floatToIntB op = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VInt (op d))
+        VInt n   -> pure (VInt n)
+        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
+
+
 asInt64 :: Val -> Maybe Int64
 asInt64 (VInt n) = Just n
 asInt64 (VInteger n)
   | n >= toInteger (minBound :: Int64)
   , n <= toInteger (maxBound :: Int64) = Just (fromInteger n)
 asInt64 _ = Nothing
+
+
+-- | IO-aware coercion of a 'Val' to 'Int64'.  Like 'asInt64'
+-- but additionally peeks through @VCon \"IS\" [thunk]@ — the
+-- source-loaded ghc-bignum 'Integer' small-Int constructor —
+-- by forcing the inner thunk.  See @IHC.Eval.matchPat@'s @IS@
+-- pattern arm for the symmetric pattern-direction bridge.
+coerceInt64 :: Val -> IO (Maybe Int64)
+coerceInt64 v = case asInt64 v of
+    Just n -> pure (Just n)
+    Nothing -> case v of
+        VCon "IS" [t] -> do
+            v' <- force legacyHooks t
+            coerceInt64 v'
+        _ -> pure Nothing
 
 
 -- | @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@
@@ -5144,7 +5155,9 @@ divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 quotRemB :: IO Val
 quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (asInt64 av, asInt64 bv) of
+    mx <- coerceInt64 av
+    my <- coerceInt64 bv
+    case (mx, my) of
         (Just x, Just y) -> do
             let (q, r) = x `quotRem` y
             qT <- newWHNFThunk (VInt q); rT <- newWHNFThunk (VInt r)
