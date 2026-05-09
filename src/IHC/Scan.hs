@@ -70,12 +70,10 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.IORef
-import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Dynamic (fromDynamic, toDyn)
 import Data.Typeable (Typeable)
 import Control.Monad (when)
-import Debug.Trace (traceIO)
 import Foreign.Ptr (Ptr)
 
 import IHC.AST (Name)

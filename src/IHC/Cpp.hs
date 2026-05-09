@@ -49,7 +49,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import Data.Char (isDigit, isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.List (isSuffixOf)
 import System.Environment (lookupEnv)

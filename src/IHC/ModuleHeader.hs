@@ -41,10 +41,8 @@ module IHC.ModuleHeader
     ) where
 
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Word (Word8)
-import System.FilePath ((</>), (<.>))
+import System.FilePath ((<.>))
 
 import IHC.Lexer
 import IHC.Source

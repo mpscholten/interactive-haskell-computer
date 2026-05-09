@@ -66,7 +66,6 @@ import System.Directory (doesDirectoryExist, listDirectory)
 import qualified System.Environment as Env
 import System.FilePath ((</>), takeExtension)
 import System.IO.Unsafe (unsafePerformIO)
-import qualified System.IO
 import qualified System.Posix.DynamicLinker as DL
 
 import IHC.Classes (legacyHooks)

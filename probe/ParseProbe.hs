@@ -10,7 +10,7 @@
 -- Output: tab-separated records + summary table.
 module Main (main) where
 
-import Control.Exception (Exception, SomeException, fromException, try, evaluate)
+import Control.Exception (SomeException, fromException, try, evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef

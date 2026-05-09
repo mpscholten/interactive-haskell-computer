@@ -20,7 +20,6 @@ module IHC.TypeAST
     , isMonoType
     ) where
 
-import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
