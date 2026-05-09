@@ -2555,7 +2555,17 @@ parseSubPat ctx cur = do
             | primIdStartsCon n -> pure (PCon n [], cur1)
             | otherwise         -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
-        TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
+        -- Mirror the expression-side routing at parseAtom (see
+        -- IHC.Parser § "TkInt n | n <= maxBound :: Int64") — keep
+        -- arbitrary-precision values as 'LInteger' instead of
+        -- silently truncating via 'fromInteger' into a wrapped Int64.
+        -- Otherwise @case x of 9223372036854775808 -> ...@ would
+        -- match against @-9223372036854775808@ — a soundness bug.
+        TkInt n
+            | n <= toInteger (maxBound :: Int64)
+                -> pure (PLit (LInt (fromInteger n)), cur1)
+            | otherwise
+                -> pure (PLit (LInteger n), cur1)
         TkFloat d    -> pure (PLit (LFloat d), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
         TkChar c     -> pure (PLit (LChar c), cur1)
@@ -2583,7 +2593,16 @@ parseSubPat ctx cur = do
         TkMinus -> do
             let (n, cur2) = nextSig ctx cur1
             case tkKind n of
-                TkInt i   -> pure (PLit (LInt (fromInteger (negate i))), cur2)
+                -- Same routing as the unsigned arm above, applied to
+                -- the negated value: stay in 'LInt' when the Int64
+                -- range can hold it (note that @minBound :: Int64@ is
+                -- one slot below @-(maxBound :: Int64)@, so the
+                -- comparison must be against @minBound@ post-negate).
+                TkInt i ->
+                    let neg = negate i in
+                    if neg >= toInteger (minBound :: Int64)
+                        then pure (PLit (LInt (fromInteger neg)), cur2)
+                        else pure (PLit (LInteger neg), cur2)
                 TkFloat d -> pure (PLit (LFloat (negate d)), cur2)
                 _         -> parseErr ctx "expected number after `-` in pattern" n
         _ -> parseErr ctx "expected pattern (Int, String, _, ident, or constructor)" tok

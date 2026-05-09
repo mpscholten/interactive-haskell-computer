@@ -577,19 +577,26 @@ nextToken s c0 =
         -- Phase 2: build the decoded payload. Same shape as the original
         -- scanner; kept as a separate function so it stays lazy relative
         -- to lexString's caller.
+        --
+        -- @\\&@ (empty separator) is consulted /before/ 'readEscape'
+        -- because it has no 'Char' payload — it just advances past the
+        -- escape without contributing bytes to the decoded payload.
+        -- See 'tryEmptySep' and the note in 'readEscape'.
         scanStrBytes p acc = case peekByte s p of
             Nothing   -> BS.pack (reverse acc)
             Just 0x22 -> BS.pack (reverse acc)
             Just 0x5C ->
                 case tryStringGap s (p + 1) of
                     Just p' -> scanStrBytes p' acc
-                    Nothing -> case readEscape s (p + 1) of
-                        Just (c, p') ->
-                            scanStrBytes p' (reverse (encodeCharUtf8 c) ++ acc)
-                        Nothing ->
-                            case peekByte s (p + 1) of
-                                Just b' -> scanStrBytes (p + 2) (b' : acc)
-                                Nothing -> BS.pack (reverse acc)
+                    Nothing -> case tryEmptySep s (p + 1) of
+                        Just p' -> scanStrBytes p' acc
+                        Nothing -> case readEscape s (p + 1) of
+                            Just (c, p') ->
+                                scanStrBytes p' (reverse (encodeCharUtf8 c) ++ acc)
+                            Nothing ->
+                                case peekByte s (p + 1) of
+                                    Just b' -> scanStrBytes (p + 2) (b' : acc)
+                                    Nothing -> BS.pack (reverse acc)
             Just b    -> scanStrBytes (p + 1) (b : acc)
 
     -- Starts at the opening single-quote. One logical character, possibly
@@ -963,6 +970,19 @@ tryStringGap src p0 = case peekByte src p0 of
         Just b | isGapWs b -> scan (p + 1)
         _                  -> Nothing
 
+
+-- | Haskell 2010 §2.6 empty string-separator: @\\&@ between two
+-- escapes produces no output but terminates the preceding escape
+-- so adjacent digits do not extend it (e.g. @"\\65\\&5"@ is two
+-- bytes @[0x41, '5']@, not the single byte @\\655@).  Must be
+-- consulted /before/ 'readEscape' in string scanners — see
+-- 'lexString' — because @\\&@ has no 'Char' payload and cannot
+-- flow through @Maybe (Char, Pos)@.
+tryEmptySep :: Source -> Pos -> Maybe Pos
+tryEmptySep src p = case peekByte src p of
+    Just 0x26 -> Just (p + 1)   -- '&'
+    _         -> Nothing
+
 readEscape :: Source -> Pos -> Maybe (Char, Pos)
 readEscape src p = case peekByte src p of
     Nothing   -> Nothing
@@ -976,7 +996,20 @@ readEscape src p = case peekByte src p of
     Just 0x5C -> Just ('\\', p + 1)   -- \\
     Just 0x27 -> Just ('\'', p + 1)   -- '
     Just 0x22 -> Just ('"',  p + 1)   -- "
-    Just 0x26 -> Just ('\0', p + 1)   -- &  (null sep — treated as empty; use '\0')
+    -- @\\&@ is the Haskell 2010 §2.6 empty string-separator: it
+    -- produces /no/ character output and exists solely to
+    -- terminate a preceding numeric escape so adjacent digits do
+    -- not extend it (e.g. @"\\65\\&5"@ is two bytes [0x41, '5'],
+    -- not @\\655@).  It is NOT a 'Char' escape at all and must
+    -- not flow through 'readEscape', which has signature
+    -- @Maybe (Char, Pos)@.  Returning here would force callers
+    -- to invent a 'Char' (the previous code returned '\\0', which
+    -- inserted a NUL into the decoded 'TkStr' — caught by
+    -- 'Properties.RoundTrip' on @PLit (LStr ...)@ inputs).
+    -- Callers that care about strings consult 'tryEmptySep'
+    -- /before/ 'readEscape' and skip the bytes without producing
+    -- output; callers that don't (e.g. char literals) reject
+    -- @'\\&'@ as malformed via the unknown-escape fallback.
     -- Hex escape: \x followed by hex digits.
     Just 0x78 -> readNumEscape 16 isHexDigit hexVal (p + 1)
     -- Octal escape: \o followed by octal digits.
