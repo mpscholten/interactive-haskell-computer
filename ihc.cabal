@@ -131,8 +131,10 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Properties.DoDesugar
       , Properties.Generators
       , Properties.RoundTrip
+      , Properties.SectionDesugar
       , Properties.Totality
       , HsExtTypeFams
       , HsExtMisc
