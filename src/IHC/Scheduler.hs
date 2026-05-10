@@ -4447,11 +4447,30 @@ exportedFieldRegistry
     -> IO FieldRegistry
 exportedFieldRegistry registry searchPath includeMap lm visited
     | lmName lm `elem` visited = pure Map.empty
-    | otherwise = case mhExports (lmHeader lm) of
+    | otherwise = do
+        -- Memoise: 'exportedFieldRegistry' walks each module's full
+        -- transitive re-export chain.  For warp's import-graph diamond
+        -- (~500 modules, dense Re-exports), without memoisation each
+        -- top-level @visibleFieldRegistryFor@ call fans out to ~1.1M
+        -- recursive calls (8 vfr → 8.8M efr observed).  The result
+        -- depends only on @lm@'s exports + its imports' exports, both
+        -- of which are run-stable, so memoising on @lmName lm@ is
+        -- safe for acyclic import graphs (Haskell's source-level
+        -- module graph is always acyclic).  'resetExportedFieldRegistryMemo'
+        -- clears the cache between runs.
+        memo <- readIORef _exportedFieldRegistryMemoRef
+        case Map.lookup (lmName lm) memo of
+            Just r -> pure r
+            Nothing -> do
+                r <- compute
+                modifyIORef' _exportedFieldRegistryMemoRef
+                    (Map.insert (lmName lm) r)
+                pure r
+  where
+    compute = case mhExports (lmHeader lm) of
         ExportAll -> pure (lmFieldReg lm)
         ExportList items ->
             unionFieldRegistries <$> mapM exportItem items
-  where
     visited' = lmName lm : visited
 
     exportItem (ExportName n) =
@@ -4949,6 +4968,10 @@ resetPerRunGlobals = do
     -- the previous registry.
     resetResolveImportCache
     resetDiscoveryNegCache
+    -- Drop the exportedFieldRegistry memo built during the prior run
+    -- so a fresh module graph doesn't see stale field registries
+    -- captured against the previous registry.
+    resetExportedFieldRegistryMemo
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
@@ -6720,6 +6743,17 @@ discoveryCallCap = 2_000_000
 {-# NOINLINE _discoverTotalRef #-}
 _discoverTotalRef :: IORef Int
 _discoverTotalRef = unsafePerformIO (newIORef 0)
+
+{-# NOINLINE _exportedFieldRegistryMemoRef #-}
+_exportedFieldRegistryMemoRef :: IORef (Map ByteString FieldRegistry)
+_exportedFieldRegistryMemoRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Clear the 'exportedFieldRegistry' memo between runs so a stale
+-- 'lmName' from a prior run doesn't shadow a fresh resolution.  Wired
+-- alongside 'resetResolveImportCache' in 'loadProgramFromSource'.
+resetExportedFieldRegistryMemo :: IO ()
+resetExportedFieldRegistryMemo =
+    writeIORef _exportedFieldRegistryMemoRef Map.empty
 
 discoverInModuleWith'
     :: Set ByteString -> ModuleRegistry -> [FilePath]
