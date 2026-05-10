@@ -1040,6 +1040,13 @@ matchPat hooks (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
 matchPat hooks (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
     t <- newWHNFThunk prim
     matchFields hooks [(p, t)] []
+-- (PCon "Ptr" against VPrimObj PrimPtr is already handled by the
+-- existing clause further down in this file — the source-loaded
+-- @data Ptr a = Ptr Addr#@'s derived @Eq@ body
+-- @Ptr a == Ptr b = isTrue# (eqAddr# a b)@ relies on it once the
+-- synthesised @Eq Ptr@ instance from
+-- 'IHC.Scheduler.registerDerivedEqInstances' fires.  Adding a second
+-- clause here would shadow that existing handler.)
 -- Data.Array.Byte lifted wrappers. The interpreter keeps both mutable and
 -- frozen byte arrays as the same host-backed PrimByteArray object, so the
 -- source constructors just expose that underlying primitive value.

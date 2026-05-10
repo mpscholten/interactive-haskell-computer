@@ -304,6 +304,20 @@ builtins reg =
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
+    --
+    -- TODO (slice-2 follow-up): drop @==@ / @/=@ once the per-FV
+    -- discovery cascade triggered by their absence is fully mapped.
+    -- The infrastructure to support source-loaded @Eq@ is in place
+    -- (registerDerivedEqInstances + scanStandaloneDerivings + the
+    -- @PCon "Ptr" [_]@ matchPat bridge + eqAddr# / etc. primops),
+    -- but a per-FV @discoverInModule@ chase from
+    -- @registerInstancesFrom@ / @registerClassDefaults@ still
+    -- transitively walks @base@ + @ghc-internal@ until the heap
+    -- exhausts.  Reproducer: @main = print (compare 1 2 == LT)@.
+    -- Master baseline: discovery total ~1000, runs in seconds; with
+    -- @==@ dropped: discovery total >2400, OOM at 4GB.  See
+    -- 'globalEarlyBuiltinsRef' for the partial fix that wasn't
+    -- enough.
     , ("==",       eqDispatch reg)
     , ("/=",       neqDispatch reg)
     , ("<",        ordDispatch reg 0)
@@ -576,6 +590,17 @@ builtins reg =
     , ("plusAddr#",   plusAddrB)
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
+    -- Addr# comparison primops — RTS-exclusive (Addr# is unboxed; no
+    -- source 'Eq Addr#' instance).  Used by the derived
+    -- @instance Eq (Ptr a)@ from @data Ptr a = Ptr Addr#@'s synthesis
+    -- of @Ptr a == Ptr b = isTrue# (eqAddr# a b)@ once the @==@
+    -- builtin shim is dropped.
+    , ("eqAddr#",     addrCmpHashB (==))
+    , ("neAddr#",     addrCmpHashB (/=))
+    , ("ltAddr#",     addrCmpHashB (<))
+    , ("leAddr#",     addrCmpHashB (<=))
+    , ("gtAddr#",     addrCmpHashB (>))
+    , ("geAddr#",     addrCmpHashB (>=))
     -- GHC.Prim-only raw-address Int access.  Source-loaded
     -- GHC.Internal.Storable defines writeIntOffPtr/readIntOffPtr in terms of
     -- these primops; there is no .hs implementation to interpret below them.
@@ -3273,6 +3298,38 @@ addr2IntB = pure $ VFun $ \a -> do
         VPrimObj (PrimPtr p) ->
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
+
+-- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
+-- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
+-- All six produce @Int#@ in source semantics (1 / 0); we map to the
+-- isomorphic 'VInt' representation since 'isTrue#' converts to 'Bool'
+-- via @tagToEnum#@ at the source level.
+--
+-- Cross-representation note: when one operand is a libffi-backed
+-- 'VPrimObj (PrimPtr p)' and the other is a source-loaded
+-- 'VCon "Ptr" [VInt n]' (the @Ptr 0@ pattern), we still want a
+-- meaningful comparison.  These primops are reached through the
+-- derived @instance Eq (Ptr a)@ body @isTrue# (eqAddr# a b)@, which
+-- runs after 'matchPat' has bridged @PCon \"Ptr\" [_]@ to extract
+-- both shapes — so by the time this builtin fires the two arguments
+-- already share the @VPrimObj PrimPtr@ form.  We still tolerate
+-- lingering 'VInt' / 'VInteger' / 'VUnit' inputs (the addr might be
+-- @0@ from a literal, @nullPtr@ from a 'VUnit' alias, etc.) by
+-- converting to the corresponding host @Ptr@ for the comparison.
+addrCmpHashB :: (Ptr Word8 -> Ptr Word8 -> Bool) -> IO Val
+addrCmpHashB cmp = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a
+    bv <- force legacyHooks b
+    let p1 = ptrOf av
+        p2 = ptrOf bv
+    pure (VInt (if cmp p1 p2 then 1 else 0))
+  where
+    ptrOf (VPrimObj (PrimPtr p)) = p
+    ptrOf (VInt n)               = FP.intPtrToPtr (fromIntegral n)
+    ptrOf (VInteger n)           = FP.intPtrToPtr (fromIntegral n)
+    ptrOf VUnit                  = nullPtr
+    ptrOf other = error ("Addr# compare: not an address: "
+                          <> showValForDebug other)
 
 -- | @readIntOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Int# #)@.
 -- GHC.Prim raw-address access used by source-loaded GHC.Internal.Storable.
