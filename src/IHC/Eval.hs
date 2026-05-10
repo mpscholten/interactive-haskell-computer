@@ -1020,6 +1020,19 @@ matchPat hooks (PCon "IN" [p]) (VInteger n)
     | n < toInteger (minBound :: Int64) = do
         t <- newWHNFThunk (VInteger (negate n))
         matchFields hooks [(p, t)] []
+-- Phase 1: BigNat# is now backed by 'VPrimObj (PrimBigNat n)'.
+-- Source-loaded code that pattern-matches @case n of IP bn -> ...@
+-- against an Integer whose runtime is the new BigNat# representation
+-- binds 'bn' to the underlying VPrimObj directly so Phase 2 BigNat#
+-- primops can dispatch on it.  Sign-direction (IP vs IN) is encoded
+-- in the source-level constructor used to build the Integer; the
+-- BigNat# itself is always an unsigned magnitude.
+matchPat hooks (PCon "IP" [p]) v@(VPrimObj (PrimBigNat _)) = do
+    t <- newWHNFThunk v
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IN" [p]) v@(VPrimObj (PrimBigNat _)) = do
+    t <- newWHNFThunk v
+    matchFields hooks [(p, t)] []
 -- Lazy ST's lifted state token is `data State s = S# (State# s)`.
 -- The interpreter represents all erased State# tokens as PrimRealWorld, so
 -- expose that raw token through the source constructor when lazy ST code

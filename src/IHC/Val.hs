@@ -49,6 +49,7 @@ import Data.Int (Int64)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (Ptr)
+import Numeric.Natural (Natural)
 import System.IO (Handle)
 
 import IHC.AST (Expr, Name)
@@ -136,6 +137,18 @@ data PrimObj
     | PrimMVar     !(MVar Val)
     | PrimTVar     !(TVar Val)
     | PrimThreadId !ThreadId
+    -- ghc-bignum 'BigNat#' runtime representation (Phase 1 of the
+    -- full source-loaded Integer roadmap, see
+    -- @plans/full-ghc-bignum-source-load.md@).  ghc-bignum's
+    -- canonical layout is @type BigNat# = WordArray#@ — a ByteArray#
+    -- of Word#-sized limbs in little-endian order with the high
+    -- limb non-zero.  We deliberately choose host 'Natural'
+    -- (unsigned arbitrary precision) instead, because the entire
+    -- BigNat# primop suite (Phase 2) is intentionally host-shimmed
+    -- as thin wrappers over Natural arithmetic.  Sign-direction
+    -- (IP vs IN) is encoded in the surrounding 'Integer' constructor;
+    -- the 'PrimBigNat' itself is always an unsigned magnitude.
+    | PrimBigNat !Natural
 
 showValForDebug :: Val -> String
 showValForDebug (VInt n)    = show n
@@ -159,6 +172,7 @@ showValForDebug (VPrimObj PrimRealWorld)      = "<RealWorld#>"
 showValForDebug (VPrimObj (PrimMVar _))       = "<MVar>"
 showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
 showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
+showValForDebug (VPrimObj (PrimBigNat n))     = "<BigNat# " <> show n <> ">"
 showValForDebug (VLabel name)                = "#" <> BC.unpack name
 showValForDebug (VClassMethod m _ tags _)     =
     "<classMethod " <> BC.unpack m
