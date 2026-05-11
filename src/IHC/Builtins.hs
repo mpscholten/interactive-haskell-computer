@@ -5711,12 +5711,19 @@ identityIntPrimop = pure $ VFun $ \a -> do
 -- in-range value through 'LInteger' (e.g. @-2^63@ via
 -- NegativeLiterals on @-0x8000000000000000@).
 -- | floor/ceiling/round/truncate — Float -> Int.  Tracked
--- carve-out: the source-loaded RealFrac Double / properFractionFloat
--- chain reaches Num Integer class-method dispatch which still
--- bottoms out at @<<ihc-method-placeholder>>@ — even with the
--- IS\/IP\/IN matchPat bridge below in place.  Lifting the rest
--- requires class-dispatch work for Num Integer \/ Integral
--- Integer instances; a separate workstream.
+-- carve-out: even with the Phase 1-4 BigNat# runtime in place,
+-- the source-loaded RealFrac Double / properFractionFloat chain
+-- still bottoms out at @<<ihc-method-placeholder>>@ because the
+-- Num Integer dispatcher hits the same placeholder issue that
+-- blocks @import GHC.Num.Integer (integerMul)@ (see PR #156's
+-- "Deferred" section — 'integerMul' specifically fails to
+-- resolve through the env-fallback class-method dispatcher).
+--
+-- Phase 5 cannot fully graduate this chain until the dispatcher
+-- workstream lands.  We pin the current behaviour (host shims
+-- give the right answer for all in-Int64 cases) as a Coverage
+-- fixture ('phase5_floor_smoke') so any regression here is
+-- caught.
 floatToIntB :: (Double -> Int64) -> IO Val
 floatToIntB op = pure $ VFun $ \a -> do
     av <- force legacyHooks a
