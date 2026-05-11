@@ -252,6 +252,8 @@ prettyLit = \case
     LFloat   d -> BC.pack (show d)
     LChar    c -> "'" <> BC.pack (escapeCharLit c) <> "'"
     LStr    bs -> "\"" <> BS.concatMap escapeStrByte bs <> "\""
+    -- @\"...\"#@ unboxed string literal (Addr#).
+    LAddrStr bs -> "\"" <> BS.concatMap escapeStrByte bs <> "\"#"
 
 
 -- | Escape a 'Char' for use inside a single-quote 'LChar' literal.

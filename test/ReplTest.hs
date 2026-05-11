@@ -6,7 +6,6 @@
 -- have the binary on PATH.
 module ReplTest (spec) where
 
-import System.Environment (lookupEnv)
 import System.IO (hPutStr, hFlush, hClose, openTempFile)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
@@ -116,39 +115,40 @@ spec = describe "REPL smoke tests" do
         out `shouldContain` "imported Data.ByteString (deferred)"
 
     it "import qualified Data.ByteString as BS: BS.length (BS.pack [97,98,99]) = 3" do
-        -- This interprets Data.ByteString.pack from source (no shim).
-        -- The first call to BS.pack materialises a large chunk of the
-        -- bytestring package, so the default 20s REPL timeout isn't
-        -- enough on a cold cache.  Gated on IHC_REPL_SLOW=1 so the
-        -- default `cabal test ihc-test` run stays fast.
-        slow <- lookupEnv "IHC_REPL_SLOW"
-        case slow of
-            Nothing -> pendingWith "slow REPL path; set IHC_REPL_SLOW=1 to run"
-            Just _ -> do
-                (code, out, _err) <- runRepl
-                    ( "import qualified Data.ByteString as BS\n"
-                   <> "BS.length (BS.pack [97,98,99])\n"
-                   <> ":q\n" )
-                code `shouldBe` ExitSuccess
-                out `shouldContain` "3"
+        -- REPL imports route this through source-loaded
+        -- 'Data.ByteString.pack' (the 'bsPackB' shim only fires on
+        -- the file-mode entry-source path).  Source path goes
+        -- 'pack' → 'unsafePackLenBytes' → 'pokeFp p w8' for each
+        -- element.  Was gated on IHC_REPL_SLOW=1 when source-load
+        -- couldn't keep up with the 20s REPL timeout; current
+        -- measurement is ~1.7s wall, so ungated.
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length (BS.pack [97,98,99])\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "3"
 
     it "import qualified Data.ByteString as BS: BS.length (BS.pack \"test\") = 4" do
-        -- User-reported: `BS.pack "test"` (a String literal, which is [Char])
-        -- hangs the REPL indefinitely.  Whereas `BS.pack [97,98,99]` (Word8
-        -- list) above succeeds, this String-via-OverloadedStrings path
-        -- currently doesn't complete.  Gated on IHC_REPL_SLOW=1 so the
-        -- default `cabal test ihc-test` run doesn't block for 20s just
-        -- to collect a known regression signal.
-        slow <- lookupEnv "IHC_REPL_SLOW"
-        case slow of
-            Nothing -> pendingWith "slow REPL path; set IHC_REPL_SLOW=1 to run"
-            Just _ -> do
-                (code, out, _err) <- runRepl
-                    ( "import qualified Data.ByteString as BS\n"
-                   <> "BS.length (BS.pack \"test\")\n"
-                   <> ":q\n" )
-                code `shouldBe` ExitSuccess
-                out `shouldContain` "4"
+        -- User-reported regression: @BS.pack "test"@ used to error
+        -- with @poke: value not an Int: 't'@ at
+        -- @src/IHC/Builtins.hs:4260@. ihc skips type checking, so a
+        -- @[Char]@ flowed unchanged into source-loaded
+        -- 'unsafePackLenBytes' which 'poke's each element through
+        -- @Ptr Word8@; 'pokeB' previously only accepted 'VInt'.  Fix
+        -- in 'pokeB': also accept 'VChar' via @fromIntegral . fromEnum@,
+        -- matching the explicit @c2w@ coercion used by
+        -- 'Data.ByteString.Char8.pack' for the strict-typed Char
+        -- path.  Source-loaded 'Data.ByteString.pack' now handles
+        -- both inputs without the 'bsPackB' shim being preferred (the
+        -- shim still exists, but is a separate clean-up — CLAUDE.md
+        -- rule 4 wants no Hackage shims at all).
+        (code, out, _err) <- runRepl
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length (BS.pack \"test\")\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "4"
 
     it "import parse error is reported gracefully, REPL continues" do
         -- A malformed import should print an error but not crash.

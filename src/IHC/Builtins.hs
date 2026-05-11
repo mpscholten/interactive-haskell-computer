@@ -140,7 +140,21 @@ foreignPtrValToForeignPtr (VPrimObj (PrimForeignPtr fp)) = pure fp
 foreignPtrValToForeignPtr (VCon "ForeignPtr" [addrT, gutsT]) = do
     gv <- force legacyHooks gutsT
     case gv of
-        VPrimObj (PrimForeignPtr fp) -> pure fp
+        VPrimObj (PrimForeignPtr fp) -> do
+            -- Source-loaded @plusForeignPtr (ForeignPtr addr c) (I# d)
+            -- = ForeignPtr (plusAddr# addr d) c@ stores the NEW
+            -- address in 'addrT' but keeps the ORIGINAL
+            -- 'PrimForeignPtr' as the finalizer-carrying 'gutsT'
+            -- stand-in.  If we returned the original fp directly,
+            -- the offset would be lost.  Apply the address
+            -- difference via the host's 'plusForeignPtr' so the
+            -- returned 'ForeignPtr' points at the right byte AND
+            -- shares the finalizer of the underlying allocation.
+            addrV <- force legacyHooks addrT
+            newP <- ptrValToPtr addrV
+            let origPtr = unsafeForeignPtrToPtr fp
+                offset  = newP `minusPtr` origPtr
+            pure (plusForeignPtr fp offset)
         -- Source-loaded code can construct ForeignPtr values whose guts are
         -- constructors like FinalPtr rather than our host PrimForeignPtr.
         -- Rebuild an equivalent host ForeignPtr from the raw address so the
@@ -354,42 +368,18 @@ builtins reg =
     -- which the source-loaded GHC.Classes path interprets.  Per
     -- CLAUDE.md "Builtin modules: minimum surface only", any
     -- symbol with .hs source must be interpreted, not shimmed.
-    -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     --
-    -- 'show' is deliberately omitted — it's a class method on the
-    -- @Show@ class declared in
-    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Show.hs:113
-    -- with default body
-    --     show x = shows x ""        -- shows = showsPrec 0
-    -- and per-type instances for Int/Char/[a]/Bool/(,)/etc.  Per
-    -- CLAUDE.md "Builtin modules: minimum surface only", any symbol
-    -- with .hs source must be interpreted.  Resolution flows through
-    -- the demand-driven 'classMethodDispatcher' (see
-    -- 'IHC.Scheduler.tryClassMethodFromRegistry'), with
-    -- 'IHC.Scheduler.hostShowFallback' delegating to 'showValWith'
-    -- below whenever the source-loaded instance method is missing or
-    -- a placeholder (e.g. @instance Show Int.showsPrec = showSignedInt@,
-    -- whose body uses primop unboxing patterns @(I# n)@ that the
-    -- parser doesn't yet handle).
-    -- Data.ByteString shims kept as documented carve-outs because
-    -- source-loading bytestring exposes interpreter gaps:
-    --   unpack    — internal recursive function "non-exhaustive patterns"
-    --   append    — `append = mappend`, Monoid dispatch yields a
-    --               <<ihc-method-placeholder>> rather than the BS instance
-    --   concat    — `concat = mconcat`, same Monoid dispatch gap
-    --   singleton — uses `allBytes` 256-byte static buffer; hits
-    --               `expected Ptr: <:>` on the Ptr cons
-    --   replicate — silent wrong output ("/\NUL\NUL" for `replicate 3 65`)
-    --   index     — body calls `length ps`; the polymorphic `length`
-    --               routes to Foldable.length, which has no BS instance
-    -- The other 7 entries (empty, null, length, pack, take, drop, head)
-    -- source-load cleanly and are dropped in this change.
-    , ("Data.ByteString.unpack",    bsUnpackB)
-    , ("Data.ByteString.append",    bsAppendB)
-    , ("Data.ByteString.concat",    bsConcatB)
-    , ("Data.ByteString.singleton", bsSingletonB)
-    , ("Data.ByteString.replicate", bsReplicateB)
-    , ("Data.ByteString.index",     bsIndexB)
+    -- 'show', 'concatMap', 'length', and the entire @Data.ByteString.*@
+    -- shim block (pack, empty, null, length, head, take, drop, replicate,
+    -- unpack, append, index, concat, singleton, Char8.putStrLn, create,
+    -- createFp, createAndTrim, createFpAndTrim, PS, minusForeignPtr) all
+    -- graduated to pure source — see CLAUDE.md rule 4.  Resolution flows
+    -- through the demand-driven 'classMethodDispatcher' for class methods
+    -- (show, length via Foldable), through source-loaded module bodies
+    -- for plain Haskell functions (concatMap from GHC.Internal.List,
+    -- everything in Data.ByteString.Internal.Type), and through the
+    -- RTS-level primitives still shimmed below (mallocPlainForeignPtrBytes,
+    -- minusAddr#, etc.) for actual allocation/pointer boundaries.
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
@@ -399,14 +389,15 @@ builtins reg =
     , ("Data.Unique.hashUnique", hashUniqueB)
     , ("Data.Unique.Really.newUnique", newUniqueB)
     , ("Data.Unique.Really.hashUnique", hashUniqueB)
-    -- Data.ByteString.Char8.putStrLn: kept as a host shim because
-    -- source-loaded `hPutStrLn` calls `length ps` against a ByteString,
-    -- but the interpreter's `Prelude hiding (Foldable(..))` handling
-    -- doesn't yet remove `Prelude.length` from scope, so the call
-    -- routes to the polymorphic `length` and fails with
-    -- "length: not a list: <BS...>". Remove this shim once the
-    -- import-hiding dispatch is fixed at the Scheduler level.
-    , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
+    -- Data.ByteString.Char8: graduated to pure source (empty/null/
+    -- length/pack/unpack/head/index/singleton/replicate/concat/
+    -- append/putStrLn).  'Char8.putStrLn' was the last hold-out —
+    -- its source path uses bare 'length ps' on a 'BS' value, which
+    -- used to route to the builtin list-walking 'lengthB'.  Dropping
+    -- 'lengthB' from the builtin registry above lets
+    -- 'buildImportRewrites' honour Char8's explicit
+    -- @import Data.ByteString (length, …)@ and route 'length' to
+    -- 'Data.ByteString.length' (the BS-specific function).
     -- IO
     --
     -- 'putStrLn' deliberately omitted: it has source at
@@ -491,29 +482,12 @@ builtins reg =
     -- variants reach their existing dispatcher; user-defined Monad
     -- instances flow through the registry the same way.
     --
-    -- 'void' deliberately omitted: it has source at
-    -- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211
-    --     void :: Functor f => f a -> f ()
-    --     void x = () <$ x
-    -- Per CLAUDE.md "Builtin modules: minimum surface only". Source
-    -- dispatches via the Functor class ('<$' default body
-    -- '(<$) = fmap . const' from GHC.Internal.Base) which routes
-    -- through 'fmapDispatch' (still shimmed). The empty-data-decl
-    -- scanner fix at commit a1db2a6 was a prerequisite — without it
-    -- 'fmapDispatch' read the IO ctor's tag as "PrimMVar".
-    -- @Control.Arrow.first@ / @second@ - for the @(->)@ arrow.  Warp's
-    -- @runSettingsConnectionMaker@ uses
-    -- @first ((,TCP) \<$\>)@ to lift @(,Transport)@ into the IO action and
-    -- map it over the @(connectionMaker, sockAddr)@ tuple.  Our class
-    -- dispatcher mis-classifies the call: arg-direction lands on the
-    -- tuple (since the function is non-dispatchable) and looks up
-    -- @Arrow (,) first@, which doesn't exist (Arrow is for arrows, not
-    -- tuples).  Host directly under the (->)-instance semantics:
-    -- @first f (a, b) = (f a, b)@.
-    , ("first",   firstFnB)
-    , ("Control.Arrow.first", firstFnB)
-    , ("second",  secondFnB)
-    , ("Control.Arrow.second", secondFnB)
+    -- 'void', 'first', 'second', 'runIdentity' all graduated to
+    -- pure source.  Their definitions are:
+    --   void x = () <$ x          -- Functor class method via <$
+    --   first  f (a, b) = (f a, b) -- Arrow (->) instance method
+    --   second g (a, b) = (a, g b) -- ditto
+    --   runIdentity (Identity x) = x  -- newtype field accessor
     -- IORef
     , ("newIORef",    newIORefB)
     , ("GHC.IORef.newIORef", newIORefB)
@@ -678,9 +652,8 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("plusForeignPtr",             plusForeignPtrB)
-    , ("minusForeignPtr",            minusForeignPtrB)
-    , ("GHC.ForeignPtr.minusForeignPtr", minusForeignPtrB)
+    -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
+    -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -762,6 +735,8 @@ builtins reg =
     -- Phase 2.8: Int/Word coercions + bit ops
     , ("int2Word#",         int2WordB)
     , ("word2Int#",         word2IntB)
+    , ("word8ToWord#",      word8ToWordB)
+    , ("setAddrRange#",     setAddrRangeB)
     , ("or#",               orHashB)
     , ("and#",              andHashB)
     , ("xor#",              xorHashB)
@@ -1566,14 +1541,6 @@ makeWordArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 extractIORef :: String -> Val -> IO (IORef Thunk)
 extractIORef _   (VPrimObj (PrimIORef rf)) = pure rf
 extractIORef ctx v = error (ctx <> ": not an IORef: " <> showValForDebug v)
-
--- | Coerce a 'Val' (either 'VInt' or 'VChar') to a host 'Word8'.
--- Used by ByteString primops that accept either a numeric literal
--- or a character literal.
-valToWord8 :: String -> Val -> IO Word8
-valToWord8 _   (VInt i)  = pure (fromIntegral i)
-valToWord8 _   (VChar c) = pure (fromIntegral (fromEnum c))
-valToWord8 ctx v         = error (ctx <> ": not a Word8: " <> showValForDebug v)
 
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
@@ -2776,34 +2743,9 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
 -- ('join x = x >>= id'). See the comment next to the (now-deleted)
 -- "join" entry in 'builtins' above.
 
--- 'voidB' was removed in slice 5a — 'void' is now interpreted from
--- ~/.cache/ihc/sources/base-4.19.0.0/Data/Functor.hs:210-211. See the
--- comment next to the (now-deleted) "void" entry in 'builtins' above.
-
--- | @first f (a, b) = (f a, b)@ — the @Arrow (->)@ instance method.
--- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
-firstFnB :: IO Val
-firstFnB = pure $ VFun $ \fT -> pure $ VFun $ \tupT -> do
-    fv  <- force legacyHooks fT
-    tupV <- force legacyHooks tupT
-    case tupV of
-        VCon "(,)" [aT, bT] -> do
-            r  <- apply legacyHooks fv aT
-            rT <- newWHNFThunk r
-            pure (VCon "(,)" [rT, bT])
-        _ -> error ("first: not a tuple: " <> showValForDebug tupV)
-
--- | @second g (a, b) = (a, g b)@ — counterpart to 'firstFnB'.
-secondFnB :: IO Val
-secondFnB = pure $ VFun $ \gT -> pure $ VFun $ \tupT -> do
-    gv  <- force legacyHooks gT
-    tupV <- force legacyHooks tupT
-    case tupV of
-        VCon "(,)" [aT, bT] -> do
-            r  <- apply legacyHooks gv bT
-            rT <- newWHNFThunk r
-            pure (VCon "(,)" [aT, rT])
-        _ -> error ("second: not a tuple: " <> showValForDebug tupV)
+-- 'voidB', 'firstFnB', 'secondFnB' removed — 'void', 'first',
+-- 'second' graduated to pure source.  See the comment next to the
+-- (now-deleted) builtins-table entries above.
 
 -- runIOVal lives in 'IHC.Eval' (and now also covers STM, which used to
 -- be a separate copy here).  We import it from there.
@@ -3399,6 +3341,31 @@ addr2IntB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
 
+-- | @setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld@
+-- Memset primop used by source-loaded @fillBytes@.  The state value
+-- IS the side-effect carrier in our interpreter: the runIOVal IO
+-- unwrapper now forces the state thunk to trigger primop side
+-- effects (see IHC.Eval.runIOVal).  Returns the state value passed
+-- in (semantically the "new" State#) so threading continues.
+setAddrRangeB :: IO Val
+setAddrRangeB = pure $ VFun $ \addrT -> pure $ VFun $ \sizeT -> pure $ VFun $ \byteT -> pure $ VFun $ \stT -> do
+    addrV <- force legacyHooks addrT
+    sizeV <- force legacyHooks sizeT
+    byteV <- force legacyHooks byteT
+    stV   <- force legacyHooks stT
+    case (addrV, sizeV, byteV) of
+        (VPrimObj (PrimPtr p), VInt size, VInt byte) -> do
+            fillBytes (p :: Ptr Word8) (fromIntegral byte) (fromIntegral size)
+            pure stV
+        _ -> error ("setAddrRange#: bad args: addr=" <> showValForDebug addrV
+                    <> " size=" <> showValForDebug sizeV
+                    <> " byte=" <> showValForDebug byteV)
+
+-- | @word8ToWord# :: Word8# -> Word#@ — widening; no-op on our Val
+-- (we represent both Word8# and Word# as 'VInt').
+word8ToWordB :: IO Val
+word8ToWordB = pure $ VFun $ \t -> force legacyHooks t
+
 -- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
 -- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
 -- All six produce @Int#@ in source semantics (1 / 0); we map to the
@@ -3520,14 +3487,6 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
 -- matching Data.ByteString.Internal.Type.ByteString's real constructor.
 --------------------------------------------------------------------------------
 
--- | Build a fresh bytestring value with the given ForeignPtr and length.
-mkBsVal :: ForeignPtr Word8 -> Int -> IO Val
-mkBsVal fp len = do
-    markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) len
-    fpT  <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
-    lenT <- newWHNFThunk (VInt (fromIntegral len))
-    pure (VCon "BS" [fpT, lenT])
-
 -- | Unpack a bytestring into its '(ForeignPtr Word8, Int)' payload.
 bsValPayload :: Val -> IO (ForeignPtr Word8, Int)
 bsValPayload v = case v of
@@ -3578,97 +3537,12 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
 
-bsUnpackB :: IO Val
-bsUnpackB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    (fp, len) <- bsValPayload av
-    ws <- withForeignPtr fp $ \ptr ->
-        mapM (peekElemOff (castPtr ptr :: Ptr Word8)) [0 .. len - 1]
-    wordsToConsList ws
-
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString
 bsValToBS v = do
     (fp, len) <- bsValPayload v
     withForeignPtr fp $ \ptr ->
         BS.packCStringLen (castPtr ptr, len)
-
--- | Build a 'VCon "BS"' from a host ByteString by copying into a fresh ForeignPtr.
-bsFromBS :: BS.ByteString -> IO Val
-bsFromBS bs = do
-    let len = BS.length bs
-    fp <- mallocForeignPtrBytes len
-    withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
-        copyBytes (castPtr dst) (castPtr src) l
-    mkBsVal fp len
-
-bsAppendB :: IO Val
-bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    ba <- bsValToBS av; bb <- bsValToBS bv
-    bsFromBS (BS.append ba bb)
-
-bsConcatB :: IO Val
-bsConcatB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    xs <- valToBsList av
-    bsFromBS (BS.concat xs)
-  where
-    valToBsList (VCon "[]" _)       = pure []
-    valToBsList (VCon ":" [hT, tT]) = do
-        hv <- force legacyHooks hT
-        h  <- bsValToBS hv
-        tv <- force legacyHooks tT
-        (h :) <$> valToBsList tv
-    valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
-
-bsSingletonB :: IO Val
-bsSingletonB = pure $ VFun $ \wT -> do
-    w <- force legacyHooks wT >>= valToWord8 "BS.singleton"
-    bsFromBS (BS.singleton w)
-
-bsReplicateB :: IO Val
-bsReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \wT -> do
-    nv <- force legacyHooks nT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.replicate: first arg not an Int: " <> showValForDebug nv)
-    w <- force legacyHooks wT >>= valToWord8 "BS.replicate: second arg"
-    bsFromBS (BS.replicate n w)
-
-bsIndexB :: IO Val
-bsIndexB = pure $ VFun $ \aT -> pure $ VFun $ \iT -> do
-    av <- force legacyHooks aT; iv <- force legacyHooks iT
-    i <- case iv of
-        VInt n -> pure (fromIntegral n :: Int)
-        _      -> error ("BS.index: not an Int: " <> showValForDebug iv)
-    (fp, len) <- bsValPayload av
-    if i < 0 || i >= len
-        then error ("BS.index: out of bounds: " <> show i <> " vs length " <> show len)
-        else do
-            w <- withForeignPtr fp $ \ptr -> peekElemOff (castPtr ptr :: Ptr Word8) i
-            pure (VInt (fromIntegral w))
-
--- | Data.ByteString.Char8.putStrLn — kept as a host shim because
--- source-loaded `Char8.hPutStrLn` calls Prelude `length` on a ByteString
--- (the `Prelude hiding (Foldable(..))` import isn't honored yet by the
--- interpreter's name resolution, so `length` doesn't get redirected to
--- `Data.ByteString.length`). Remove once that's fixed at the Scheduler.
-bs8PutStrLnB :: IO Val
-bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force legacyHooks a
-    bs <- bsValToBS av
-    BC.putStrLn bs
-    hFlush stdout
-    pure VUnit
-
-wordsToConsList :: [Word8] -> IO Val
-wordsToConsList []     = pure (VCon "[]" [])
-wordsToConsList (w:ws) = do
-    hT <- newWHNFThunk (VInt (fromIntegral w))
-    tV <- wordsToConsList ws
-    tT <- newWHNFThunk tV
-    pure (VCon ":" [hT, tT])
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
@@ -3680,33 +3554,6 @@ withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
         pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
         rv <- apply legacyHooks fv pT
         runIOVal legacyHooks rv
-
-plusForeignPtrB :: IO Val
-plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
-    fpv <- force legacyHooks fpT; nv <- force legacyHooks nT
-    case (fpv, nv) of
-        -- ForeignPtr is RTS-backed and has no pure-Haskell storage model in IHC,
-        -- so this builtin must preserve the host pointer offset exactly.
-        (_, VInt n) -> do
-            fp <- foreignPtrValToForeignPtr fpv
-            mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
-        _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
-
--- | @minusForeignPtr :: ForeignPtr a -> ForeignPtr b -> Int@.  bytestring's
--- own definition pattern-matches on the @ForeignPtr@ data constructor to
--- pull out raw addresses, but in IHC @ForeignPtr@ is RTS-backed
--- ('VPrimObj (PrimForeignPtr _)') with no exposed constructor, so the
--- pattern match silently fails and the function returns @()@ instead of
--- the byte difference.  Register a host shim that does the host-side
--- subtraction directly.
-minusForeignPtrB :: IO Val
-minusForeignPtrB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
-    av <- force legacyHooks aT; bv <- force legacyHooks bT
-    fpA <- foreignPtrValToForeignPtr av
-    fpB <- foreignPtrValToForeignPtr bv
-    let pA = unsafeForeignPtrToPtr fpA
-        pB = unsafeForeignPtrToPtr fpB
-    pure (VInt (fromIntegral (pA `minusPtr` pB)))
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
@@ -4352,8 +4199,27 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force legacyHooks a; bv <- force legacyHooks b
     p <- ptrValToPtr av
     case bv of
-        VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-        _ -> error ("poke: value not an Int: " <> showValForDebug bv)
+        VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
+        -- values reaching @poke@ via the Char8 path arrive as
+        -- 'VCon "IS" [VInt n]' rather than the bare 'VInt' the
+        -- type-correct path would land — accept both shapes.
+        VCon "IS" [t] -> do
+            inner <- force legacyHooks t
+            case inner of
+                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+                _      -> error ("poke: IS inner not an Int: " <> showValForDebug inner)
+        -- Accept 'VChar' for the @Ptr Word8@ default.  ihc skips type
+        -- checking, so a 'VChar' can flow into a Word8-typed slot
+        -- when a user writes e.g. @Data.ByteString.pack "test"@ — a
+        -- type error in stock Haskell, but ihc's optimistic semantics
+        -- treats it as the Char8 path's @c2w = fromIntegral . ord@
+        -- coercion and lets it through.  Landing the conversion at
+        -- the FFI boundary lets source-loaded
+        -- 'Data.ByteString.Internal.Type.unsafePackLenBytes' work
+        -- without any Hackage-library shim (CLAUDE.md rule 4).
+        VChar c -> do { poke (p :: Ptr Word8) (fromIntegral (fromEnum c)); pure VUnit }
+        _ -> error ("poke: value not an Int or Char: " <> showValForDebug bv)
 
 peekByteOffB :: IO Val
 peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do

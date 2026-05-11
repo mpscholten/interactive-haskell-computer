@@ -494,6 +494,34 @@ parseImportList src cur0 = go [] cur0
                         TkDot -> sub (BC.pack "$dotdot" : acc) cur2
                         _     -> sub acc cur1
                 TkEof -> pure (reverse acc, cur1)
+                -- Operator-group inside an exposed-ctor list:
+                -- @Type(Op1, (:|), (+))@ shapes up the same as the
+                -- top-level @ImportList@ TkLParen branch — extract the
+                -- inner op via 'operatorTokenName', consume the
+                -- matching @)@, and continue.  Without this, the
+                -- catch-all below would advance past only the inner @(@
+                -- and then return at the FIRST @)@ it saw (the op's
+                -- closing paren), leaving the cursor one paren shallow
+                -- and corrupting every subsequent import parse — the
+                -- exact failure mode behind 'NonEmpty ((:|))' on
+                -- bytestring's @Data.ByteString.Internal.Type@ line 149,
+                -- which silently dropped every @import GHC.ForeignPtr@
+                -- below it.
+                TkLParen -> do
+                    let (inner, cur2) = nextSigTok s cur1
+                    case operatorTokenName (tkKind inner) of
+                        Just op -> do
+                            let (close, cur3) = nextSigTok s cur2
+                            let cur' = case tkKind close of
+                                    TkRParen -> cur3
+                                    _        -> cur2
+                            sub (op : acc) cur'
+                        Nothing -> do
+                            -- Unknown inner form: balance-skip to
+                            -- matching @)@ so we don't bleed past
+                            -- the import list's terminator.
+                            curSkip <- skipToCloseParen s cur1 1
+                            sub acc curSkip
                 _     -> sub acc cur1
 
 operatorTokenName :: TokenKind -> Maybe ByteString

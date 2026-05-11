@@ -828,7 +828,18 @@ parseBindingsIn src fx (start, end) = do
     --   a    = case $wh0 of { (a, _) -> a }
     --   b    = case $wh0 of { (_, b) -> b }
     parseWherePatBind ctx accLen cur = do
-        (pat, cur2) <- parseSubPat ctx cur
+        -- Use 'parseTopPat' so constructor-application LHS patterns
+        -- like @BS _ m = bs@ (i.e. PCon with arguments) and infix
+        -- @x : xs = ys@ are accepted.  'parseSubPat' only consumes
+        -- a single atomic pattern token — for @BS _ m = bs@ it
+        -- consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
+        -- with @expected `=`; saw TkUnderscore@.  This had been
+        -- silently failing inside 'discoverInModule' (the error was
+        -- caught and turned into 'unbound variable Data.ByteString.
+        -- Internal.Type.concat' downstream), which was the root
+        -- cause keeping the 'Data.ByteString.concat' shim alive
+        -- (rule 4).
+        (pat, cur2) <- parseTopPat ctx cur
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> do
@@ -3295,6 +3306,7 @@ startsAtom :: TokenKind -> Bool
 startsAtom TkInt{}         = True
 startsAtom TkFloat{}       = True
 startsAtom TkStr{}         = True
+startsAtom TkAddrStr{}     = True   -- Phase 2.x: "..."# Addr# literal
 startsAtom TkChar{}        = True
 startsAtom TkLabel{}       = True  -- Phase 3.5: #name is a valid argument
 startsAtom TkLParen        = True
@@ -3332,6 +3344,11 @@ parseAtom ctx cur0 = do
             | otherwise -> pure (ELit (LInteger n), cur1)
         TkFloat d  -> pure (ELit (LFloat d), cur1)
         TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
+        -- @\"...\"#@ — unboxed string literal (Addr#).  Evaluator
+        -- produces a 'VPrimObj (PrimPtr ptr)' pointing at a leaked
+        -- malloc-backed copy of the bytes; bytestring's
+        -- 'unsafePackLenLiteral' / 'allBytes' rely on this shape.
+        TkAddrStr s -> pure (ELit (LAddrStr s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
         TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference

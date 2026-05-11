@@ -34,6 +34,7 @@ import Data.Int (Int64)
 import Data.IORef
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
@@ -169,6 +170,18 @@ eval hooks env ipm = go
     -- recurse over them normally instead of tripping over the transitional
     -- VStr representation.
     go (ELit (LStr s))   = stringLiteralToListVal s
+    -- @\"...\"#@ Addr# literal: allocate a leaked malloc-backed
+    -- buffer of the bytes and return as 'VPrimObj (PrimPtr p)'.
+    -- The literal lives for the program's lifetime — typical use
+    -- is in a top-level @bytes = unsafePackLenLiteral N "..."#@
+    -- whose result thunk caches the BS — so the leak is bounded
+    -- by the number of distinct literals, not by call count.
+    go (ELit (LAddrStr s)) = do
+        let len = BS.length s
+        ptr <- mallocBytes len
+        BS.useAsCStringLen s $ \(srcPtr, _) ->
+            copyBytes (castPtr ptr) (castPtr srcPtr) len
+        pure (VPrimObj (PrimPtr (castPtr ptr)))
     go (ELit (LChar c))  = pure (VChar c)
     go (ELabel name)     = pure (VLabel name)  -- Phase 3.5: OverloadedLabels
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
@@ -455,12 +468,13 @@ eval hooks env ipm = go
                             -- body, name in 'globalClassMethodNamesRef').
                             -- That heuristic mis-fires for top-level
                             -- functions that happen to share a name with
-                            -- a class method elsewhere — the canonical
-                            -- example is 'Control.Exception.try' getting
-                            -- routed through 'MonadParsec.try''s
-                            -- dispatcher because megaparsec's
-                            -- 'Text.Megaparsec.Class' is on the
-                            -- core-instance load list.
+                            -- a class method elsewhere — e.g. a
+                            -- top-level 'try' shadowed by a
+                            -- 'MonadParsec.try'-style class-method
+                            -- dispatcher whenever the megaparsec class
+                            -- ends up in scope (historically: when
+                            -- @Text.Megaparsec.Class@ was eagerly
+                            -- loaded; today: only if the user imports it).
                             --
                             -- If the rewritten expression contains an
                             -- 'ETypedMethod' whose resolved
@@ -949,7 +963,11 @@ matchPat hooks (PLit (LStr _)) _       = pure Nothing
 matchPat hooks (PLit (LChar c)) (VChar d)
     | c == d    = pure (Just [])
     | otherwise = pure Nothing
-matchPat hooks (PLit (LChar _)) _      = pure Nothing
+matchPat _hooks (PLit (LChar _)) _      = pure Nothing
+-- LAddrStr is only used to construct VPrimObj at eval time; it
+-- never appears as a pattern in source code (Addr# literals don't
+-- have pattern syntax), so a non-match catch-all is correct.
+matchPat _hooks (PLit (LAddrStr _)) _   = pure Nothing
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
 matchPat hooks (PCon "()" []) VUnit = pure (Just [])
 -- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@
@@ -964,6 +982,23 @@ matchPat hooks (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
 -- first use after discovery succeeds.
 matchPat hooks (PCon "I#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
+    matchFields hooks [(p, t)] []
+-- Cross-rep match: source-loaded code that destructures a boxed
+-- scalar via @I# d@ / @W# d@ / @W8# d@ can be handed a value
+-- originally constructed through the 'Integer' path — small Integers
+-- live in 'VCon "IS" [VInt n]' and carry the same underlying 'Int#'
+-- as 'VInt'.  This shows up after 'fromIntegral' or implicit
+-- 'fromInteger' chains reach e.g. source-loaded
+-- @plusForeignPtr (ForeignPtr addr c) (I# d) = …@ or
+-- @poke (W8# byte#)@-shaped lambdas in @Data.ByteString.Char8@.
+-- Without these cases the function falls through to "Non-exhaustive
+-- patterns" even though the runtime value semantically IS an
+-- Int#-shaped boxed scalar.
+matchPat hooks (PCon "I#" [p]) (VCon "IS" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
@@ -1488,7 +1523,19 @@ runIOVal hooks (VCon "IO" [ft]) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 -- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
 -- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
@@ -1501,7 +1548,19 @@ runIOVal hooks (VCon "STM" [ft]) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 -- Unwrapped State#-passing function: an @IO a@ that has been
 -- pattern-matched via @IO f = ...@ to extract the underlying
@@ -1521,13 +1580,37 @@ runIOVal hooks (VFun fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 runIOVal hooks (VFunIP _ipm fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv Map.empty rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 runIOVal _     v        = pure v
 

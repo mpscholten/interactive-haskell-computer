@@ -42,10 +42,24 @@ Before adding anything to `isBuiltinBackedModule` or the primop catalog in `IHC.
 
 If interpreting a module from source reveals a missing language extension, primop, or class-dispatch case, the correct response is to **implement the missing feature**, not to add another shim. This keeps the interpreter honest and exercises the full parser/evaluator path.
 
+## `preludeScope`: minimum surface, same discipline as builtins
+
+`preludeScope` in `src/IHC/Scheduler.hs` is the implicit "what every program sees before its own imports" list — the modules whose contents must be in scope regardless of what the user imports. It is NOT a place to hardcode Hackage library modules. Hackage instances are discovered via the per-package instance manifest (introduced in commit `8aac0cc`); user-imported modules contribute via `instanceScope`, computed from the user's import closure.
+
+A module belongs in `preludeScope` only if ALL of the following hold:
+
+1. **In `base`, `ghc-internal`, or `ghc-prim`** — never a Hackage library.
+2. **Defines instances every program needs eagerly** — i.e. the canonical Prelude/Base instances (`Show Int`, `Eq Char`, `Num Int`, `Functor Maybe`, …). "This one fixture happens to use it" is not a valid reason.
+3. **Documented inline.** New entries must carry a comment naming the specific instance and why it must be eagerly visible.
+
+Symptom of misuse: a Hackage library appears in `preludeScope` but only one fixture transitively touches it. Every program then pays the discovery cost (parsing class default methods, walking instance bodies for free-var deps) — and you also create heuristic mis-fires elsewhere (e.g. a top-level function shadowed by a similarly-named class method that is now eagerly in scope; see `src/IHC/Eval.hs` `tryElaborateTyAnn` for the validation pass kept around because of exactly this failure mode).
+
+If you find such an entry, remove it and route the library through the manifest. Do not add new ones.
+
 ### Tracked carve-outs (known violations, blocked on separate work)
 
-- **`Data.ByteString` shims** at `src/IHC/Builtins.hs:317-375` — source-loading `Data.ByteString` works correctly but takes ~9 minutes to complete because Scheduler discovery cascades through `GHC.Internal.Show`'s transitive closure (see the inline comment at `Builtins.hs:3155-3161`). Tolerated until Scheduler discovery latency is bounded; then the shims graduate by deletion.
-- **VIO ↔ State# bridges** at `src/IHC/Builtins.hs:1089-1140` (`unIO`, `ioToST`/`unsafeIOToST`, `stToIO`/`unsafeSTToIO`) — truly RTS-exclusive. The VIO runtime representation cannot be expressed as a source-level `State# RealWorld -> (# State# RealWorld, a #)` function; these bridges are compiler-intrinsic in the same way `unsafeCoerce` is (see the `Unsafe.Coerce` justification at `Scheduler.hs:5493-5500`). Documented inline; not for removal.
+- **VIO ↔ State# bridges** in `src/IHC/Builtins.hs` (`unIO`, `ioToST`/`unsafeIOToST`, `stToIO`/`unsafeSTToIO`) — truly RTS-exclusive. The VIO runtime representation cannot be expressed as a source-level `State# RealWorld -> (# State# RealWorld, a #)` function; these bridges are compiler-intrinsic in the same way `unsafeCoerce` is (see the `Unsafe.Coerce` justification in `Scheduler.hs`'s `isBuiltinBackedModule`). Documented inline; not for removal.
+- *(Historical: `plusForeignPtr` carve-out resolved.* The shim was caused by two compounding bugs — (a) `parseSubNames` corrupting import lists on operator-group sub-imports like `NonEmpty ((:|))`, silently dropping every `import GHC.ForeignPtr (plusForeignPtr)` below it; (b) `runIOVal` only forcing the result thunk of `(# state, value #)`-shaped IO results, leaving side-effecting primops wired into the state slot completely un-evaluated. Both fixed; shim removed.*)
 
 ## Fixing interpreter bugs: reproduce → fixture → fix → verify
 

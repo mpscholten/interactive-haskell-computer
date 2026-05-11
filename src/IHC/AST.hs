@@ -111,6 +111,10 @@ data Lit
     | LFloat  !Double
     | LStr    !ByteString
     | LChar   !Char
+    | LAddrStr !ByteString  -- @\"...\"#@ unboxed string literal (Addr#).
+                            -- The bytes are exposed as a Ptr-shaped runtime
+                            -- value pointing at heap-resident memory; used by
+                            -- bytestring's 'unsafePackLenLiteral' / 'allBytes'.
     deriving (Eq, Show)
 
 -- | Strip a module qualifier from a name, returning only the final segment.

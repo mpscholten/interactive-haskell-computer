@@ -55,6 +55,8 @@ import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
+import qualified Data.HashSet as HashSet
+import Data.HashSet (HashSet)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -278,6 +280,14 @@ loadProgram = loadProgramFromSource []
 --      'namesFromModule' walking inherited fully-populated
 --      'lmBodies').
 --
+-- Note: the predecessor of the eager scope, 'coreInstanceModules',
+-- used to also hardcode Hackage entries (e.g. @Text.Megaparsec.*@)
+-- that every program paid for. Commit @8aac0cc@ retired that
+-- pattern in favour of the per-package instance manifest, and
+-- 'preludeScope' (the current shape, see definition below) is
+-- base\/ghc-internal only. See the @preludeScope@ rule in CLAUDE.md
+-- before adding anything here.
+--
 -- Cross-fixture amortization is gated on the @envFallbackCache@
 -- stale-Closure issue documented in 'resetPerRunGlobals' below; the
 -- per-run reset is a correctness fix, not a perf knob.
@@ -475,9 +485,11 @@ loadProgramFromSource searchPath src0 = do
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
 
     -- Union data registries and field registries across all modules.
+    -- 'unionedTypeCtors' is rebuilt from the post-splice / post-discovery
+    -- 'loadedModules'' below; the earlier-snapshot version is intentionally
+    -- not bound here so we don't accidentally use a stale type-ctor map.
     let unionedData  = unionDataRegistries (map lmDataReg loadedModules)
         (publicFields, unionedFields) = partitionFieldRegistries loadedModules
-        unionedTypeCtors = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules)
         -- Union type-family registries across all loaded modules and
         -- publish the merged result into the global 'TR.globalRegistry'
         -- so the ETyApp path in 'IHC.Eval' can look up reductions for
@@ -624,8 +636,23 @@ loadProgramFromSource searchPath src0 = do
     -- in the registration pass.
     regAfterSplices <- readIORef registry
     let loadedModules' = [ lm | (_, Loaded lm) <- Map.toList regAfterSplices ]
+    -- Rebuild 'unionedTypeCtors' from the post-splice module list.  The
+    -- earlier 'unionedTypeCtors' at the top of this function was computed
+    -- from a stale snapshot taken before 'expandSplicesInModule' and the
+    -- per-FV demand-loading inside the instance-discovery pass had a
+    -- chance to pull in deeper transitive deps (e.g.
+    -- 'Data.ByteString.Internal.Type' which is where @data ByteString =
+    -- BS ...@ actually lives).  Without this refresh, the type-ctor
+    -- registry passed to 'registerInstancesFrom' is missing
+    -- @ByteString -> [BS]@; 'instanceRuntimeCtors "ByteString"' returns
+    -- [], the @Semigroup ByteString@ / @Monoid ByteString@ instances are
+    -- only registered under the type-name tag @"ByteString"@ and never
+    -- under the runtime-ctor tag @"BS"@, and class dispatch on a real
+    -- ByteString value falls through to 'methodPlaceholder' and aborts at
+    -- the next 'apply'.
+    let unionedTypeCtors' = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules')
     classTable <- buildClassMethodTable loadedModules'
-    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules'
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors' classTable env) loadedModules'
     -- Install the per-load instance-registration hook now that the env
     -- is fully tied.  Any subsequent 'loadModule' call (typically a lazy
     -- fallback load via 'resolveFallback') will fire this hook, which
@@ -638,7 +665,7 @@ loadProgramFromSource searchPath src0 = do
         case Map.lookup modName globalMods of
             Just lm -> do
                 registerInstancesFrom registry fullSearchPath includeMap
-                                      classReg unionedTypeCtors classTable env lm
+                                      classReg unionedTypeCtors' classTable env lm
                 -- Also catalogue this module's @class C where m = ...@
                 -- defaults under the @<default>@ sentinel tag.  Without
                 -- this, a class declared in a lazily-loaded module
@@ -1881,7 +1908,19 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                         findRuntimeCtorsForType registry searchPath includeMap Set.empty targetLm bareTy
                     Nothing -> pure []
             Nothing ->
-                pure (Map.findWithDefault [] ty typeCtors)
+                -- Two modules can declare different @data ByteString@
+                -- (strict in @Data.ByteString.Internal.Type@, lazy in
+                -- @Data.ByteString.Lazy.Internal@); a global union over
+                -- both 'lmTypeCtorReg's collapses them to one constructor
+                -- set and the wrong instance methods end up dispatched on
+                -- the wrong runtime ctor.  For bare type names, prefer
+                -- the owning module's local view first — that's the
+                -- @ByteString@ the instance head actually refers to —
+                -- and fall back to the global union for types only
+                -- visible through re-exports.
+                case Map.findWithDefault [] ty (lmTypeCtorReg lm) of
+                    [] -> pure (Map.findWithDefault [] ty typeCtors)
+                    ctors -> pure ctors
 
 findRuntimeCtorsForType
     :: ModuleRegistry
@@ -2022,10 +2061,11 @@ buildImportRewritesForNames registry lm needed = do
                  | n <- allScanned
                  , Set.member n needed
                  ]
-    -- Import pairs take priority over self-rewrites: if a name is both
-    -- locally defined and imported from elsewhere, the import wins
-    -- (GHC semantics).  Map.fromList keeps the last occurrence.
-    pure (Map.fromList (selfPairs ++ filteredImportPairs))
+    -- H2010 §5.5.1 (same fix as in 'buildImportRewrites'): local
+    -- bindings shadow imports.  Drop qualified names from selfPairs
+    -- since those are foreign-alias sentinels, not real local defs.
+    let cleanedSelf = filter (\(n, _) -> not (BC.elem '.' n)) selfPairs
+    pure (Map.fromList (filteredImportPairs ++ cleanedSelf))
   where
     rewritesForImport reg needed' imp
         = case Map.lookup (impModule imp) reg of
@@ -2798,11 +2838,31 @@ classMethodDispatcher reg cls methodName = selfVal
             -- with @foldr f z xs@ where @z@ might happen to be @VIO@)
             -- keep the raw "<IO>" tag and walk past — IO isn't a
             -- Foldable instance.
+            let rawTag0 = typeTagOf av
+            -- 'Monoid.mconcat :: Monoid a => [a] -> a' is list-
+            -- ELEMENT-polymorphic: the type variable @a@ is the
+            -- list's element type, not the list type itself.  Vanilla
+            -- arg-directed dispatch picks up "[]" from the list arg
+            -- and routes to the @Monoid []@ instance, whose default
+            -- body 'concatMap'-walks the list — mis-typed when the
+            -- elements aren't lists themselves (e.g. @mconcat [bs1,
+            -- bs2] :: [ByteString] -> ByteString@).  Peek the
+            -- first element to recover the element's tag so the
+            -- right @Monoid <element>@ instance is reached.  Empty
+            -- list keeps the "[]" tag and the existing
+            -- result-polymorphic / default chain handles it
+            -- (@mconcat [] = mempty@).
+            rawTag <- if rawTag0 == BC.pack "[]"
+                        && cls == BC.pack "Monoid"
+                        && methodName == BC.pack "mconcat"
+                      then case av of
+                              VCon ":" (hT : _) -> typeTagOf <$> force legacyHooks hT
+                              _                 -> pure rawTag0
+                      else pure rawTag0
             -- Then 'dispatchTagForValue' applies a second normalisation:
             -- for arrow-style classes (Category, Arrow, ArrowChoice,
             -- ArrowLoop) a function value dispatches as @(->)@.
-            let rawTag = typeTagOf av
-                normTag
+            let normTag
                     | rawTag == BC.pack "<IO>" && isMonadicClass cls
                         = BC.pack "IO"
                     | otherwise
@@ -3515,7 +3575,10 @@ ffiBuiltinNames = Set.fromList
     , "free"
     , "newUnique", "hashUnique", "fromThreadId"
     , "settingsHost", "settingsPort"
-    , "plusForeignPtr", "minusForeignPtr", "plusPtr", "minusPtr", "castPtr"
+    , "plusPtr", "minusPtr", "castPtr"
+    -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
+    -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
+    -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
     , "mkWeakIORef"  -- wraps mkWeak#, which has no Haskell implementation
     , "stdout", "stdin", "stderr"  -- RTS pre-built handles
     -- unix package: setFdOption uses c_fcntl_read internally, which we
@@ -3610,11 +3673,19 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
             (\(n, _) -> not (Set.member n ffiBuiltinNames)
                     && not (Set.member n builtinNames))
             importPairs
-    -- Self-rewrites take lower priority than import-rewrites (an import
-    -- that brings in the same name shadows the local self-rewrite).
-    -- Data.Map.fromList keeps the LAST occurrence for duplicate keys, so
-    -- selfPairs must come first and importPairs second for imports to win.
-    pure (Map.fromList (selfPairs ++ filteredImportPairs))
+    -- H2010 §5.5.1: a local top-level binding shadows any imported
+    -- entity of the same name.  Map.fromList keeps the LAST entry
+    -- for duplicate keys, so 'cleanedSelf' must come SECOND.
+    --
+    -- 'cleanedSelf' drops qualified names (containing '.') because
+    -- a name like @H.greet@ in 'lmBodies' is a foreign-alias
+    -- sentinel left behind by the qualified-import resolver, NOT
+    -- a local definition of the current module — letting it into
+    -- selfPairs would shadow the real import-rewrite
+    -- @H.greet -> Helper.greet@ with the bogus
+    -- @H.greet -> <ThisModule>.H.greet@.
+    let cleanedSelf = filter (\(n, _) -> not (BC.elem '.' n)) selfPairs
+    pure (Map.fromList (filteredImportPairs ++ cleanedSelf))
   where
     rewritesForImport needed imp
         = do
@@ -7700,62 +7771,83 @@ syntheticClassMethodNames = goExpr
 
     goAlt (Alt _ e) = goExpr e
 
+-- | Phase 2.18 perf: internal accumulator is a 'HashSet ByteString'.
+-- The original used '[ByteString]' with '++' and 'elem'-membership,
+-- which is O(n × k²) when the binding-discovery walker calls
+-- 'freeVars' on every binding it materialises. Switching to a hash
+-- set makes membership O(1) per check and the unions allocation-
+-- bounded by unique-element count instead of total expression size.
+-- Public type stays '[ByteString]'; the result is now deduplicated
+-- (callers that wrap with 'nubBS' don't need to anymore — the wraps
+-- are still correct, just no-ops).
 freeVars :: Expr -> [ByteString]
-freeVars = goAll []
+freeVars e = HashSet.toList (goAll HashSet.empty e)
   where
+    goAll :: HashSet ByteString -> Expr -> HashSet ByteString
     goAll bound = \case
         EVar n
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELit _      -> []
-        EApp f x    -> goAll bound f ++ goAll bound x
-        ELam n e    -> goAll (n : bound) e
-        ELet bs e   ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-               ++ goAll bound' e
-        ECase s as  -> goAll bound s ++ concatMap (goAlt bound) as
-        EIf c t e   -> goAll bound c ++ goAll bound t ++ goAll bound e
+            | HashSet.member n bound -> HashSet.empty
+            | otherwise              -> HashSet.singleton n
+        ELit _      -> HashSet.empty
+        EApp f x    -> HashSet.union (goAll bound f) (goAll bound x)
+        ELam n e'   -> goAll (HashSet.insert n bound) e'
+        ELet bs e'  ->
+            let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+            in HashSet.union
+                   (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+                   (goAll bound' e')
+        ECase s as  -> HashSet.union
+                           (goAll bound s)
+                           (HashSet.unions [ goAlt bound a | a <- as ])
+        EIf c t e'  -> HashSet.unions [goAll bound c, goAll bound t, goAll bound e']
         EDo stmts   -> goStmts bound stmts
-        ENeg e      -> goAll bound e
-        ETuple es   -> concatMap (goAll bound) es
-        ERecordCon _ fields -> concatMap (goAll bound . snd) fields
-        ERecordWild _   -> []   -- fields resolved by scheduler; no expr free vars
-        ERecordUpdate e fields -> goAll bound e ++ concatMap (goAll bound . snd) fields
-        EImplicitRef _  -> []
-        EImplicitLet bs e ->
-            let names = map fst bs
-                bound' = names ++ bound
-            in concatMap (\(_, rhs) -> goAll bound' rhs) bs ++ goAll bound' e
+        ENeg e'     -> goAll bound e'
+        ETuple es   -> HashSet.unions [ goAll bound x | x <- es ]
+        ERecordCon _ fields -> HashSet.unions [ goAll bound x | (_, x) <- fields ]
+        ERecordWild _   -> HashSet.empty   -- fields resolved by scheduler; no expr free vars
+        ERecordUpdate e' fields ->
+            HashSet.union
+                (goAll bound e')
+                (HashSet.unions [ goAll bound x | (_, x) <- fields ])
+        EImplicitRef _  -> HashSet.empty
+        EImplicitLet bs e' ->
+            let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+            in HashSet.union
+                   (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+                   (goAll bound' e')
         ESplice inner   -> goAll bound inner
-        EQuote _        -> []   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        EQuote _        -> HashSet.empty   -- Phase 2.12: quote body is not evaluated; treat as no free vars
         -- QuasiQuoter: the QQ function name is a free var that must be
         -- discovered so the dispatch sees the imported QuasiQuoter value.
         EQuasiQuote n _
-            | n `elem` bound -> []
-            | otherwise      -> [n]
-        ELabel _        -> []   -- Phase 3.5: labels have no free variables
+            | HashSet.member n bound -> HashSet.empty
+            | otherwise              -> HashSet.singleton n
+        ELabel _        -> HashSet.empty   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
-        ETypedMethod{}  -> []   -- elaborator product; no EVar refs
-        EGuardFail      -> []
+        ETypedMethod{}  -> HashSet.empty   -- elaborator product; no EVar refs
+        EGuardFail      -> HashSet.empty
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
     -- extends the bound set for subsequent stmts.
-    goStmts _     []                  = []
-    goStmts bound (SExpr e   : rest)  = goAll bound e ++ goStmts bound rest
-    goStmts bound (SBind n e : rest)  = goAll bound e ++ goStmts (n : bound) rest
-    goStmts bound (SBangBind n e : rest) = goAll bound e ++ goStmts (n : bound) rest
+    goStmts :: HashSet ByteString -> [Stmt] -> HashSet ByteString
+    goStmts _     []                  = HashSet.empty
+    goStmts bound (SExpr e'  : rest)  = HashSet.union (goAll bound e') (goStmts bound rest)
+    goStmts bound (SBind n e' : rest) = HashSet.union (goAll bound e') (goStmts (HashSet.insert n bound) rest)
+    goStmts bound (SBangBind n e' : rest) = HashSet.union (goAll bound e') (goStmts (HashSet.insert n bound) rest)
     goStmts bound (SLet bs   : rest)  =
-        let names  = map fst bs
-            bound' = names ++ bound
-        in concatMap (\(_, rhs) -> goAll bound' rhs) bs
-           ++ goStmts bound' rest
+        let bound' = foldl' (\b (n, _) -> HashSet.insert n b) bound bs
+        in HashSet.union
+               (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
+               (goStmts bound' rest)
     goStmts bound (SImplicitLet bs : rest) =
-        concatMap (\(_, rhs) -> goAll bound rhs) bs
-           ++ goStmts bound rest
+        HashSet.union
+            (HashSet.unions [ goAll bound rhs | (_, rhs) <- bs ])
+            (goStmts bound rest)
 
-    goAlt bound (Alt p e) = goAll (patBound p ++ bound) e
+    goAlt :: HashSet ByteString -> Alt -> HashSet ByteString
+    goAlt bound (Alt p e') =
+        let bound' = foldl' (flip HashSet.insert) bound (patBound p)
+        in goAll bound' e'
 
     patBound :: Pat -> [ByteString]
     patBound (PVar n)            = [n]
