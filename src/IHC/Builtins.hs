@@ -328,7 +328,6 @@ builtins reg =
     -- memory; ihc currently parses it as an ordinary @[Char]@
     -- cons-list, which 'unsafePackLenLiteral' then mis-handles as a
     -- 'Ptr' arg and aborts with @expected Ptr: <:...>@ in 'pokeB'.
-    , ("Data.ByteString.singleton", bsSingletonB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
     -- allocation boundaries; the caller-supplied fill action is still
     -- interpreted, but the mutable memory it writes into must be host-managed.
@@ -365,8 +364,11 @@ builtins reg =
     -- stdout' which has its own gap (a Handle-shape pattern-match
     -- non-exhaustive on @FileHandle@/@DuplexHandle@ in source-loaded
     -- 'GHC.Internal.IO.Handle.Text.hPutStrLn').
-    , ("Data.ByteString.Char8.singleton", bs8SingletonB)
-    , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
+    -- 'Char8.putStrLn' = 'hPutStrLn stdout' calls into source-loaded
+    -- code that uses bare 'length' on a 'BS' value; that resolves to
+    -- 'Foldable.length' (no instance for 'BS') and aborts.  Needs
+    -- the same per-FQN preference applied to 'length' as we have
+    -- for module-local bindings — leaving shimmed for now.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
@@ -3319,36 +3321,6 @@ bsFromBS bs = do
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
     mkBsVal fp len
-
-bsSingletonB :: IO Val
-bsSingletonB = pure $ VFun $ \wT -> do
-    wv <- force wT
-    w <- case wv of
-        VInt i  -> pure (fromIntegral i :: Word8)
-        VChar c -> pure (fromIntegral (fromEnum c) :: Word8)
-        _       -> error ("BS.singleton: not a Word8: " <> showValForDebug wv)
-    bsFromBS (BS.singleton w)
-
-bs8SingletonB :: IO Val
-bs8SingletonB = pure $ VFun $ \cT -> do
-    cv <- force cT
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  n  -> pure (toEnum (fromIntegral n))
-        _        -> error ("BS.Char8.singleton: not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.singleton c)
-
-bs8ReplicateB :: IO Val
-bs8ReplicateB = pure $ VFun $ \nT -> pure $ VFun $ \cT -> do
-    nv <- force nT; cv <- force cT
-    n <- case nv of
-        VInt i -> pure (fromIntegral i :: Int)
-        _      -> error ("BS.Char8.replicate: first arg not an Int: " <> showValForDebug nv)
-    c <- case cv of
-        VChar ch -> pure ch
-        VInt  i  -> pure (toEnum (fromIntegral i))
-        _        -> error ("BS.Char8.replicate: second arg not a Char: " <> showValForDebug cv)
-    bsFromBS (BC.replicate n c)
 
 bs8PutStrLnB :: IO Val
 bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do

@@ -68,6 +68,11 @@ data TokenKind
                               --   that only need the token KIND don't pay
                               --   the cost of decoding multi-megabyte
                               --   string literals — see 'lexString'.
+    | TkAddrStr ByteString    -- ^ @\"...\"#@ unboxed string literal
+                              --   (Addr# in GHC). Used by bytestring's
+                              --   'unsafePackLenLiteral' and similar to
+                              --   pin a static blob to a 'ByteString'.
+                              --   Field is lazy like 'TkStr'.
     | TkChar  !Char           -- ^ @\'c\'@ character literal
     | TkTick                  -- ^ promoted-list/tuple tick — the bare @\'@
                               --   when followed by @[@, @(@, or @{@. The
@@ -547,12 +552,17 @@ nextToken s c0 =
     -- nothing for the 3M-element decoded payload. The 'TkStr' constructor
     -- field is lazy specifically so this thunk survives without forcing.
     lexString openCur =
-        let openP = cPos openCur + 1 in      -- past the opening quote
-        let endP  = findStrEnd openP in
-        let end   = Cursor (endP + 1) (cLine openCur)
-                           (cCol openCur + (endP + 1 - cPos openCur)) in
-        let bs    = scanStrBytes openP [] in -- lazy; only forced on demand
-        (mkTok (TkStr bs) openCur end, end)
+        let openP    = cPos openCur + 1     -- past the opening quote
+            endP     = findStrEnd openP
+            -- Detect Addr# unboxed string literal:  "..."#
+            -- (the closing quote is at endP; the '#' would be at endP+1).
+            isAddr   = peekByte s (endP + 1) == Just 0x23  -- '#'
+            consumed = if isAddr then endP + 2 else endP + 1
+            end      = Cursor consumed (cLine openCur)
+                              (cCol openCur + (consumed - cPos openCur))
+            bs       = scanStrBytes openP [] -- lazy; only forced on demand
+            tok      = if isAddr then TkAddrStr bs else TkStr bs
+        in (mkTok tok openCur end, end)
       where
         -- Phase 1: walk the bytes until the closing quote / EOF without
         -- allocating. Same escape shapes as the decoder — '\\"' inside a

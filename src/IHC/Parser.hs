@@ -3166,6 +3166,7 @@ startsAtom :: TokenKind -> Bool
 startsAtom TkInt{}         = True
 startsAtom TkFloat{}       = True
 startsAtom TkStr{}         = True
+startsAtom TkAddrStr{}     = True   -- Phase 2.x: "..."# Addr# literal
 startsAtom TkChar{}        = True
 startsAtom TkLabel{}       = True  -- Phase 3.5: #name is a valid argument
 startsAtom TkLParen        = True
@@ -3203,6 +3204,11 @@ parseAtom ctx cur0 = do
             | otherwise -> pure (ELit (LInteger n), cur1)
         TkFloat d  -> pure (ELit (LFloat d), cur1)
         TkStr s    -> pure (stringToConsList (BC.unpack s), cur1)
+        -- @\"...\"#@ — unboxed string literal (Addr#).  Evaluator
+        -- produces a 'VPrimObj (PrimPtr ptr)' pointing at a leaked
+        -- malloc-backed copy of the bytes; bytestring's
+        -- 'unsafePackLenLiteral' / 'allBytes' rely on this shape.
+        TkAddrStr s -> pure (ELit (LAddrStr s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
         TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference

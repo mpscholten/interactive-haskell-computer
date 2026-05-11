@@ -33,6 +33,7 @@ import Data.IORef
 import Data.Int (Int64)
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (castPtr)
 import qualified Data.Map.Strict as Map
@@ -165,6 +166,18 @@ eval env ipm = go
     -- recurse over them normally instead of tripping over the transitional
     -- VStr representation.
     go (ELit (LStr s))   = stringLiteralToListVal s
+    -- @\"...\"#@ Addr# literal: allocate a leaked malloc-backed
+    -- buffer of the bytes and return as 'VPrimObj (PrimPtr p)'.
+    -- The literal lives for the program's lifetime — typical use
+    -- is in a top-level @bytes = unsafePackLenLiteral N "..."#@
+    -- whose result thunk caches the BS — so the leak is bounded
+    -- by the number of distinct literals, not by call count.
+    go (ELit (LAddrStr s)) = do
+        let len = BS.length s
+        ptr <- mallocBytes len
+        BS.useAsCStringLen s $ \(srcPtr, _) ->
+            copyBytes (castPtr ptr) (castPtr srcPtr) len
+        pure (VPrimObj (PrimPtr (castPtr ptr)))
     go (ELit (LChar c))  = pure (VChar c)
     go (ELabel name)     = pure (VLabel name)  -- Phase 3.5: OverloadedLabels
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
@@ -919,6 +932,10 @@ matchPat (PLit (LChar c)) (VChar d)
     | c == d    = pure (Just [])
     | otherwise = pure Nothing
 matchPat (PLit (LChar _)) _      = pure Nothing
+-- LAddrStr is only used to construct VPrimObj at eval time; it
+-- never appears as a pattern in source code (Addr# literals don't
+-- have pattern syntax), so a non-match catch-all is correct.
+matchPat (PLit (LAddrStr _)) _   = pure Nothing
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
 matchPat (PCon "()" []) VUnit = pure (Just [])
 -- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@

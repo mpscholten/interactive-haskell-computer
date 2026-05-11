@@ -56,6 +56,8 @@ evalCore env ipm = go
             LFloat d   -> pure (VFloat d)
             LChar c    -> pure (VChar c)
             LStr s     -> stringLitToList s
+            LAddrStr _ -> error
+                "IHC.EvalCore: LAddrStr not yet supported on Core path"
 
         CVar name _ -> case lookupEnv name env of
             Just t  -> force t
