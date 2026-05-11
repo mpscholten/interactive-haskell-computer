@@ -705,6 +705,12 @@ builtins reg =
     , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
     , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
     , ("bigNatSizeInBase#",        bigNatSizeInBaseHashB)     -- Word# -> BigNat# -> Word#
+    -- Phase 4: ghc-bignum 'integerMul (IS x) (IS y)' overflow path
+    -- constructs BigNats from a high/low Word# pair.  Without this
+    -- shim, in-Int64 × in-Int64 → out-of-Int64 multiplications
+    -- (e.g. @2 ^ 100 :: Integer@ which repeatedly squares through
+    -- the overflow boundary) silently truncated to 0.
+    , ("bigNatFromWord2#",         bigNatFromWord2HashB)      -- Word# -> Word# -> BigNat#
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -3875,6 +3881,18 @@ bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error
             ("bigNatSizeInBase#: not a Word#: " <> showValForDebug av)
 
+-- | Phase 4: @bigNatFromWord2# :: Word# -> Word# -> BigNat#@ —
+-- construct a BigNat from a high/low Word# pair.  Used by
+-- ghc-bignum's 'integerMul' overflow path to wrap the 128-bit
+-- product of two Int#-fitting Integers when the result exceeds
+-- Int range.  Implementation: @h * 2^64 + l@ as a Natural.
+bigNatFromWord2HashB :: IO Val
+bigNatFromWord2HashB = pure $ VFun $ \h -> pure $ VFun $ \l -> do
+    hv <- force legacyHooks h; lv <- force legacyHooks l
+    nh <- coerceWordArg "bigNatFromWord2#" hv
+    nl <- coerceWordArg "bigNatFromWord2#" lv
+    pure (VPrimObj (PrimBigNat ((nh `shiftL` 64) .|. nl)))
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
 --------------------------------------------------------------------------------
@@ -5484,26 +5502,54 @@ charPrimOrd (VChar c) = ord c
 charPrimOrd (VInt n)  = fromIntegral n
 charPrimOrd v         = error ("char primop: bad arg: " <> showValForDebug v)
 
+-- | @timesInt2# :: Int# -> Int# -> (# Int#, Int#, Int# #)@
+--
+-- ghc-prim spec (changelog 0.7+): returns @(# isHighNeeded, high, low #)@
+-- where @high@ and @low@ are the bits of the double-word product and
+-- @isHighNeeded@ is 1# when @high@ differs from the sign-extension of
+-- @low@ (i.e. the product doesn't fit in a single Int#).
+--
+-- Phase 4 fix: the previous implementation returned a 2-tuple with a
+-- single overflow flag and lost the high bits — breaking ghc-bignum's
+-- @integerMul (IS x) (IS y)@ overflow path, which produces silently-
+-- truncated 0 for @2 ^ 100 :: Integer@.
 timesInt2B :: IO Val
 timesInt2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
-            let r   = x * y
-                ovf = if x /= 0 && r `div` x /= y then 1 else 0 :: Int64
-            carryT  <- newWHNFThunk (VInt ovf)
-            resultT <- newWHNFThunk (VInt r)
-            pure (VCon "(#,#)" [carryT, resultT])
+            -- Compute full 128-bit product via Integer arithmetic, then
+            -- split into low / high 64-bit halves (reinterpreted as Int64).
+            let prod         = toInteger x * toInteger y
+                low          = fromInteger prod                  :: Int64
+                high         = fromInteger (prod `shiftR` 64)    :: Int64
+                signExtended = if low < 0 then -1 else 0         :: Int64
+                ovf          = if high /= signExtended then 1 else 0 :: Int64
+            ovfT  <- newWHNFThunk (VInt ovf)
+            highT <- newWHNFThunk (VInt high)
+            lowT  <- newWHNFThunk (VInt low)
+            pure (VCon "(#,,#)" [ovfT, highT, lowT])
         _ -> error ("timesInt2#: bad args: " <> showValForDebug av)
 
+-- | @timesWord2# :: Word# -> Word# -> (# Word#, Word# #)@ — returns
+-- the high and low 64-bit halves of the unsigned 128-bit product.
+--
+-- Phase 4 fix: previously returned @(# 0, low #)@, always dropping
+-- the high word — silently truncated all overflows.  Now computes
+-- via host 'Natural' to get the full 128-bit product.
 timesWord2B :: IO Val
 timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
-            let r = x * y
-            hiT <- newWHNFThunk (VInt 0)
-            loT <- newWHNFThunk (VInt r)
+            -- Reinterpret as unsigned, multiply over Natural, split.
+            let xNat = fromIntegral (fromIntegral x :: Word) :: Natural
+                yNat = fromIntegral (fromIntegral y :: Word) :: Natural
+                prod = xNat * yNat
+                low  = fromIntegral (fromIntegral prod :: Word)            :: Int64
+                high = fromIntegral (fromIntegral (prod `shiftR` 64) :: Word) :: Int64
+            hiT <- newWHNFThunk (VInt high)
+            loT <- newWHNFThunk (VInt low)
             pure (VCon "(#,#)" [hiT, loT])
         _ -> error ("timesWord2#: bad args: " <> showValForDebug av)
 
