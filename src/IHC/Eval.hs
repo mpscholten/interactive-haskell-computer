@@ -1503,6 +1503,32 @@ runIOVal hooks (VCon "STM" [ft]) = do
     case result of
         VCon _ [_stT, resT] -> force hooks resT
         other               -> pure other
+-- Unwrapped State#-passing function: an @IO a@ that has been
+-- pattern-matched via @IO f = ...@ to extract the underlying
+-- @State# RealWorld -> (# State# RealWorld, a #)@ closure.  This
+-- arrives as 'VFun' or 'VFunIP' depending on whether the closure
+-- carries an ImplicitParamMap context.  The shape is operationally
+-- identical to @VCon "IO" [ft]@ — apply with a state token and
+-- extract the result from the unboxed tuple.  Without this case,
+-- 'ioBind' (which threads its first action through 'runIOVal') would
+-- silently treat the wrapped IO action as a value and pass it as-is
+-- to the continuation, so e.g. warp's
+--    src <- mkSource (...)
+--    leftoverSource src bs0
+-- ends up binding 'src' to the State# function rather than the
+-- 'Source' value the do-bind was supposed to extract.
+runIOVal hooks (VFun fv) = do
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- fv rwT
+    case result of
+        VCon _ [_stT, resT] -> force hooks resT
+        other               -> pure other
+runIOVal hooks (VFunIP _ipm fv) = do
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- fv Map.empty rwT
+    case result of
+        VCon _ [_stT, resT] -> force hooks resT
+        other               -> pure other
 runIOVal _     v        = pure v
 
 isStateTokenNewtypeCtor :: Name -> Bool
