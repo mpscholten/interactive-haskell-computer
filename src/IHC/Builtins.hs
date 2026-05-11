@@ -140,7 +140,21 @@ foreignPtrValToForeignPtr (VPrimObj (PrimForeignPtr fp)) = pure fp
 foreignPtrValToForeignPtr (VCon "ForeignPtr" [addrT, gutsT]) = do
     gv <- force legacyHooks gutsT
     case gv of
-        VPrimObj (PrimForeignPtr fp) -> pure fp
+        VPrimObj (PrimForeignPtr fp) -> do
+            -- Source-loaded @plusForeignPtr (ForeignPtr addr c) (I# d)
+            -- = ForeignPtr (plusAddr# addr d) c@ stores the NEW
+            -- address in 'addrT' but keeps the ORIGINAL
+            -- 'PrimForeignPtr' as the finalizer-carrying 'gutsT'
+            -- stand-in.  If we returned the original fp directly,
+            -- the offset would be lost.  Apply the address
+            -- difference via the host's 'plusForeignPtr' so the
+            -- returned 'ForeignPtr' points at the right byte AND
+            -- shares the finalizer of the underlying allocation.
+            addrV <- force legacyHooks addrT
+            newP <- ptrValToPtr addrV
+            let origPtr = unsafeForeignPtrToPtr fp
+                offset  = newP `minusPtr` origPtr
+            pure (plusForeignPtr fp offset)
         -- Source-loaded code can construct ForeignPtr values whose guts are
         -- constructors like FinalPtr rather than our host PrimForeignPtr.
         -- Rebuild an equivalent host ForeignPtr from the raw address so the
