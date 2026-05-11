@@ -5673,15 +5673,41 @@ forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
 -- @ghc-prim@; we host it.  Wraps the host 'forkIO' and packages the
 -- result as a state-passing unboxed tuple so source-side
 -- @case fork# io s of (# s', tid #) -> ...@ matches our pattern bridge.
+--
+-- Critical: warp's 'defaultFork' inlines the primop call as
+--   @IO $ \\s0 -> case io unsafeUnmask of { IO io' -> case fork# io' s0 of ... }@
+-- so the first argument is @io'@ — the @State# RealWorld -> (# State# RealWorld, () #)@
+-- function EXTRACTED from the @IO io'@ pattern match, not a wrapped
+-- @IO ()@ Val.  In our value world that arrives as a 'VFun' (or
+-- 'VFunIP' for ImplicitParam-carrying closures), and 'runIOVal' on a
+-- 'VFun' falls through to @pure v@ — so the action body never runs
+-- and warp's connection handler never executes.  Apply the function
+-- with a state token here so the action runs in the new thread.
 forkHashB :: IO Val
 forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
     av <- force legacyHooks aT
     tid <- forkIO $ do
-        _ <- runIOVal legacyHooks av
+        _ <- runActionVal av
         pure ()
     rwT  <- newWHNFThunk (VPrimObj PrimRealWorld)
     tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
     pure (VCon "(#,#)" [rwT, tidT])
+  where
+    -- A forked action can arrive in any of these shapes:
+    --   * @VIO action@ — already-wrapped host IO
+    --   * @VCon \"IO\" [ft]@ — source-constructed @IO $ \\s -> ...@
+    --   * @VFun _ / VFunIP _ _@ — the State#-passing function extracted
+    --     from an @IO io'@ pattern match (warp's defaultFork shape)
+    -- Apply state token to the function variants so the body actually
+    -- runs in the new thread.
+    runActionVal v = case v of
+        VFun f -> do
+            stok <- newWHNFThunk (VPrimObj PrimRealWorld)
+            f stok
+        VFunIP _ f -> do
+            stok <- newWHNFThunk (VPrimObj PrimRealWorld)
+            f Map.empty stok
+        _ -> runIOVal legacyHooks v
 
 -- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
 killThreadB :: IO Val
