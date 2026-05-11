@@ -321,6 +321,26 @@ builtins reg =
     --
     -- Already graduated to pure source: empty, null, length, pack
     -- (Char8 siblings of all four also gone).
+    -- 'concat' source-loaded path needs additional interpreter
+    -- work to graduate. Two diagnosed blockers:
+    --
+    -- 1. 'Monoid.mconcat :: Monoid a => [a] -> a' is list-element-
+    --    polymorphic. Vanilla arg-directed dispatch picks up the
+    --    list tag ("[]") instead of the element type. A peek-the-
+    --    first-element heuristic handles this for non-empty input.
+    --
+    -- 2. The actual blocker after (1): @Monoid ByteString.mconcat =
+    --    concat@ where @concat@ refers to local
+    --    'Data.ByteString.Internal.Type.concat'. Its body shape
+    --    @concat = \\bss0 -> goLen0 bss0 bss0 where …@ — a top-level
+    --    binding whose RHS is a lambda over a large local @where@-
+    --    block — doesn't surface in our demand-discovery /
+    --    'lmBodies' population path. 'env-fallback' for the FQN
+    --    then raises @unbound variable Data.ByteString.Internal.Type.concat@,
+    --    'forceMethodVal' converts that to 'methodPlaceholder', and
+    --    the dispatcher falls through to the class default body
+    --    @foldr mappend mempty@ — which mishandles 'mempty' as a
+    --    'VClassMethod' wrapper and bombs in 'append'.
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
