@@ -313,7 +313,12 @@ builtins reg =
     -- Strings / lists (strings are [Char] from Phase 2.2 onward)
     , ("concatMap", concatMapB)
     , ("show",     showDispatch reg)
-    , ("length",   lengthB)
+    -- 'length' graduated to pure source: 'Foldable [a].length'
+    -- walks lists, and modules that explicitly @import M (length)@
+    -- (e.g. Data.ByteString.Char8 importing 'Data.ByteString.length')
+    -- get the right specialised function via 'buildImportRewrites'
+    -- — which used to filter 'length' as a builtin name but no
+    -- longer needs to, since it isn't one.
     -- Data.ByteString shims (see isBuiltinBackedModule comment).
     -- Each entry here is a CLAUDE.md rule-4 violation kept only
     -- while the source path is being verified. Remove one at a time
@@ -356,16 +361,15 @@ builtins reg =
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
-    -- Graduated to pure source: empty/null/length/pack/unpack/head/
-    -- index/singleton/replicate.  'Char8.putStrLn' calls source-
-    -- loaded 'hPutStrLn' which uses bare 'length' on a 'BS'; that
-    -- resolves to the builtin list-walking 'lengthB' (which only
-    -- handles cons-lists) and aborts.  The 'buildImportRewrites'
-    -- filter currently strips 'length' from import-rewrites because
-    -- it is a builtin name — relaxing that filter to honour explicit
-    -- 'ImportOnly' overrides broke 'text_io' (the source-loaded
-    -- @Data.Text.IO.putStrLn@ path), so the shim stays for now.
-    , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
+    -- Graduated to pure source: everything (empty/null/length/pack/
+    -- unpack/head/index/singleton/replicate/concat/append/putStrLn).
+    -- 'Char8.putStrLn' was the last hold-out — its source path uses
+    -- bare 'length ps' on a 'BS' value, which used to route to the
+    -- builtin list-walking 'lengthB'.  Dropping 'lengthB' from the
+    -- builtin registry above lets 'buildImportRewrites' honour
+    -- Char8's explicit @import Data.ByteString (length, …)@ and
+    -- route 'length' to 'Data.ByteString.length' (the BS-specific
+    -- function).
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
     -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
@@ -2217,21 +2221,6 @@ stringToListValIO (c:cs) = do
     tT   <- newWHNFThunk restV
     pure (VCon ":" [hT, tT])
 
--- | Generic @length@ — walks the spine of a list, forcing each cons
--- but not the elements.
-lengthB :: IO Val
-lengthB = pure $ VFun $ \a -> do
-    av <- force a
-    n  <- go av 0
-    pure (VInt n)
-  where
-    go (VStr s) !acc = pure (acc + fromIntegral (BC.length s))
-    go (VCon "[]" _) !acc = pure acc
-    go (VCon ":" [_, t]) !acc = do
-        tv <- force t
-        go tv (acc + 1)
-    go other _ = error ("length: not a list: " <> showValForDebug other)
-
 --------------------------------------------------------------------------------
 -- IO
 --------------------------------------------------------------------------------
@@ -3317,14 +3306,6 @@ bsFromBS bs = do
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
     mkBsVal fp len
-
-bs8PutStrLnB :: IO Val
-bs8PutStrLnB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force a
-    bs <- bsValToBS av
-    BC.putStrLn bs
-    hFlush stdout
-    pure VUnit
 
 withForeignPtrB :: IO Val
 withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
