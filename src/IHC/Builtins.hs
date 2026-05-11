@@ -3307,6 +3307,11 @@ bigNatFromWordB = pure $ VFun $ \w -> do
     case wv of
         VInt n ->
             pure (VPrimObj (PrimBigNat (fromIntegral (fromIntegral n :: Word))))
+        -- Word# literals like @0xFFFFFFFFFFFFFFFF##@ parse to VInteger
+        -- because their value exceeds maxBound :: Int64.  Accept that
+        -- shape too; the value is already an unsigned Natural in
+        -- spirit, so just clamp/truncate to the low 64 bits.
+        VInteger n -> pure (VPrimObj (PrimBigNat (fromInteger (n `mod` (1 `shiftL` 64)))))
         _ -> error ("bigNatFromWord#: not a Word#: " <> showValForDebug wv)
 
 -- | Extract a host 'Natural' from a 'VPrimObj (PrimBigNat _)'
@@ -3381,15 +3386,28 @@ makeBigNatBinOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- | Phase 2.B: @BigNat# -> Word# -> BigNat#@ primop.  The Word#
 -- arg is reinterpreted from VInt's Int64 bits (matching
 -- 'bigNatFromWord#') before applying the binary op over 'Natural'.
+-- VInteger args (for Word# literals exceeding @maxBound :: Int64@)
+-- are accepted and truncated to the low 64 bits, matching the
+-- Word# semantics.
 makeBigNatWordOp :: String -> (Natural -> Natural -> Natural) -> IO Val
 makeBigNatWordOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat name av
-    case bv of
-        VInt w ->
-            pure (VPrimObj (PrimBigNat
-                (op na (fromIntegral (fromIntegral w :: Word)))))
-        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+    nb <- coerceWordArg name bv
+    pure (VPrimObj (PrimBigNat (op na nb)))
+
+-- | Coerce a 'Val' representing a @Word#@ argument to a host 'Natural'
+-- magnitude (truncated to the low 64 bits).  Accepts:
+--   * 'VInt n'      — standard Word# storage (Int64 bit-reinterpret)
+--   * 'VInteger n'  — large hex/decimal Word# literals that exceed
+--                     @maxBound :: Int64@
+coerceWordArg :: String -> Val -> IO Natural
+coerceWordArg _   (VInt w)     =
+    pure (fromIntegral (fromIntegral w :: Word))
+coerceWordArg _   (VInteger n) =
+    pure (fromInteger (n `mod` (1 `shiftL` 64)))
+coerceWordArg ctx v =
+    error (ctx <> ": not a Word#: " <> showValForDebug v)
 
 -- | @bigNatSqr :: BigNat# -> BigNat#@ — square of a BigNat#.
 -- Equivalent to @bigNatMul a a@ but ghc-bignum keeps a dedicated
@@ -6062,6 +6080,13 @@ buildConEnv reg = do
     -- when at least one field is strict, force those thunks before
     -- returning the 'VCon'.  All-lazy ctors keep the original cheap
     -- path with no extra IO.
+    --
+    -- Phase 3: source-loaded @data Integer = IS !Int# | IP !BigNat# |
+    -- IN !BigNat#@ from @ghc-bignum@ — we intercept at construction
+    -- time and collapse to plain 'VInt' / 'VInteger' so the runtime
+    -- never carries @VCon "IS"/"IP"/"IN"@ shapes.  Mirrors how
+    -- @I#@ / @F#@ / @D#@ are already transparent; see
+    -- 'tryIntegerCollapse' below.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
@@ -6070,7 +6095,7 @@ buildConEnv reg = do
                 let thunks = reverse (t : acc)
                 strict <- lookupCtorStrictness name
                 forceStrictFields strict thunks
-                pure (VCon name thunks)
+                tryIntegerCollapse name thunks
             else pure (buildLam name (left - 1) (t : acc))
 
     -- | Walk the strict-field bitmap and force each marked thunk in
@@ -6081,6 +6106,54 @@ buildConEnv reg = do
     forceStrictFields (s : ss) (t : ts) = do
         when s (() <$ force legacyHooks t)
         forceStrictFields ss ts
+
+-- | Phase 3: construct-direction collapse for ghc-bignum's
+-- @data Integer = IS !Int# | IP !BigNat# | IN !BigNat#@.
+--
+-- The runtime never carries @VCon "IS"/"IP"/"IN"@ shapes after
+-- this — source-level @IS k@ / @IP bn@ / @IN bn@ produce plain
+-- 'VInt' (in-Int64 range) or 'VInteger' (out-of-range) directly.
+-- Mirrors how @I#@ / @F#@ / @D#@ are already handled transparently.
+--
+-- Sign-preservation: small IP and IN both fit in Int64 with
+-- opposite signs (@VInt n@ vs @VInt (-n)@); larger values become
+-- 'VInteger' with the appropriate sign.  Phase 1's matchPat
+-- bridges already discriminate via range guards.
+--
+-- Fall-through (default 'VCon name thunks') applies when the field
+-- isn't a recognised numeric shape (defensive — shouldn't happen
+-- for well-typed source); matchPat's generic VCon case will still
+-- handle it.
+tryIntegerCollapse :: Name -> [Thunk] -> IO Val
+tryIntegerCollapse "IS" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VInt _ -> pure v
+        VInteger n
+            | n >= toInteger (minBound :: Int64)
+            , n <= toInteger (maxBound :: Int64)
+            -> pure (VInt (fromInteger n))
+        _ -> pure (VCon "IS" [t])
+tryIntegerCollapse "IP" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n) ->
+            if n <= fromIntegral (maxBound :: Int64)
+                then pure (VInt (fromIntegral n))
+                else pure (VInteger (fromIntegral n))
+        _ -> pure (VCon "IP" [t])
+tryIntegerCollapse "IN" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n)
+            | n == 0    -> pure (VInt 0)
+            | otherwise ->
+                let absMinBoundInt64 = 1 + fromIntegral (maxBound :: Int64) :: Natural
+                in if n <= absMinBoundInt64
+                    then pure (VInt (fromInteger (negate (toInteger n))))
+                    else pure (VInteger (negate (toInteger n)))
+        _ -> pure (VCon "IN" [t])
+tryIntegerCollapse name thunks = pure (VCon name thunks)
 
 -- | Build an environment binding each record-field name to an accessor
 -- function.  For a field @f@ that lives at index @i@ in constructor @Con@,
