@@ -52,6 +52,7 @@ import Data.List (intercalate)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
+import Numeric.Natural (Natural)
 import Foreign.C.String (peekCAString, withCString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
@@ -581,11 +582,25 @@ builtins reg =
     -- per CLAUDE.md): the representation mismatch makes source-load
     -- semantically wrong, not just slow.
     --
-    -- First primop landed: @bigNatFromWord#@.  Phase 2.A adds the
-    -- comparison tranche (@bigNatEq#@, @bigNatLt#@, …); Phase 2.B–F
-    -- add arithmetic / bit-ops / remaining conversions / show /
-    -- long-tail.
+    -- Phase 1 landed: @bigNatFromWord#@.  Phase 2.A adds the 10
+    -- comparison primops (this block, below); Phase 2.B–F add
+    -- arithmetic / bit-ops / remaining conversions / show / long-tail.
     , ("bigNatFromWord#",          bigNatFromWordB)
+    -- Phase 2.A: comparison primops.  All thin wrappers over host
+    -- 'Natural' comparison; signatures from
+    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
+    -- 'Bool#' is encoded as VInt 1 / VInt 0 (per IHC's existing
+    -- 'isTrue#' / '==#' convention; see 'primBoolVal').
+    , ("bigNatCompare",            bigNatCompareB)        -- BigNat# -> BigNat# -> Ordering
+    , ("bigNatEq#",                makeBigNatCmpOp "bigNatEq#" (==))
+    , ("bigNatNe#",                makeBigNatCmpOp "bigNatNe#" (/=))
+    , ("bigNatLt#",                makeBigNatCmpOp "bigNatLt#" (<))
+    , ("bigNatLe#",                makeBigNatCmpOp "bigNatLe#" (<=))
+    , ("bigNatGt#",                makeBigNatCmpOp "bigNatGt#" (>))
+    , ("bigNatGe#",                makeBigNatCmpOp "bigNatGe#" (>=))
+    , ("bigNatIsZero#",            makeBigNatUnaryBool "bigNatIsZero#" (== 0))
+    , ("bigNatIsOne#",             makeBigNatUnaryBool "bigNatIsOne#" (== 1))
+    , ("bigNatSize#",              bigNatSizeHashB)       -- BigNat# -> Int# (limb count)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -3167,7 +3182,7 @@ fromIntegralB = pure $ VFun $ \a -> do
         ]
 
 --------------------------------------------------------------------------------
--- Phase 1: BigNat# runtime representation
+-- Phase 1+2.A: BigNat# runtime representation + comparison primops
 --------------------------------------------------------------------------------
 
 -- | @bigNatFromWord# :: Word# -> BigNat#@ — first of the
@@ -3189,6 +3204,66 @@ bigNatFromWordB = pure $ VFun $ \w -> do
         VInt n ->
             pure (VPrimObj (PrimBigNat (fromIntegral (fromIntegral n :: Word))))
         _ -> error ("bigNatFromWord#: not a Word#: " <> showValForDebug wv)
+
+-- | Extract a host 'Natural' from a 'VPrimObj (PrimBigNat _)'
+-- argument or fail with a context-tagged error.  Used by the
+-- Phase 2.A comparison primops and the rest of the
+-- @bigNat*#@ family that lands later.
+extractBigNat :: String -> Val -> IO Natural
+extractBigNat _   (VPrimObj (PrimBigNat n)) = pure n
+extractBigNat ctx v = error (ctx <> ": not a BigNat#: " <> showValForDebug v)
+
+-- | Phase 2.A: binary BigNat# comparison primop.  Both args must
+-- be @VPrimObj (PrimBigNat _)@; the result is @Bool#@ encoded as
+-- @VInt 1 / VInt 0@.  Mirrors 'makeIntCmpOp' / 'makeWordCmpOp'.
+makeBigNatCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
+makeBigNatCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    nb <- extractBigNat name bv
+    pure (primBoolVal (op na nb))
+
+-- | Phase 2.A: unary BigNat# predicate primop, returning @Bool#@.
+-- Used for @bigNatIsZero#@ and @bigNatIsOne#@.
+makeBigNatUnaryBool :: String -> (Natural -> Bool) -> IO Val
+makeBigNatUnaryBool name p = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat name av
+    pure (primBoolVal (p n))
+
+-- | @bigNatCompare :: BigNat# -> BigNat# -> Ordering@ — note no
+-- @#@ suffix; ghc-bignum's source returns the lifted 'Ordering'
+-- type.  The unboxed-tuple-returning @bigNatCompare#@ name listed
+-- in the Phase 2 plan was a typo (no such ghc-bignum primop).
+bigNatCompareB :: IO Val
+bigNatCompareB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatCompare" av
+    nb <- extractBigNat "bigNatCompare" bv
+    pure $ case compare na nb of
+        LT -> VCon "LT" []
+        EQ -> VCon "EQ" []
+        GT -> VCon "GT" []
+
+-- | @bigNatSize# :: BigNat# -> Int#@ — returns the number of
+-- 64-bit Word# limbs needed to represent the BigNat in
+-- ghc-bignum's canonical layout.  For our 'Natural'-backed
+-- representation we compute it via repeated 64-bit shifts,
+-- matching @wordArraySize#@'s O(limbs) cost.  By convention,
+-- @bigNatSize# 0## == 0#@ (ghc-bignum BigNat.hs:81 + 111-112).
+bigNatSizeHashB :: IO Val
+bigNatSizeHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatSize#" av
+    pure (VInt (fromIntegral (bigNatLimbCount n)))
+
+-- | Count 64-bit limbs in a 'Natural'.  Zero is canonically
+-- represented with size 0 in ghc-bignum.
+bigNatLimbCount :: Natural -> Int
+bigNatLimbCount = go 0
+  where
+    go !i 0 = i
+    go !i n = go (i + 1) (n `shiftR` 64)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
