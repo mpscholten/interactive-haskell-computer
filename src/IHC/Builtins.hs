@@ -41,6 +41,7 @@ import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
+    , bit, testBit
     )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -635,6 +636,24 @@ builtins reg =
     , ("bigNatSubWordUnsafe#",     makeBigNatWordOp "bigNatSubWordUnsafe#" (-))
     , ("bigNatRemWord#",           bigNatRemWordHashB)
     , ("bigNatQuotRemWord#",       bigNatQuotRemWordHashB)
+    -- Phase 2.C: bit-op primops.  Thin wrappers over host
+    -- 'Numeric.Natural''s 'Data.Bits' instance.  Signatures from
+    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
+    , ("bigNatAnd",                makeBigNatBinOp "bigNatAnd" (.&.))
+    , ("bigNatOr",                 makeBigNatBinOp "bigNatOr"  (.|.))
+    , ("bigNatXor",                makeBigNatBinOp "bigNatXor" xor)
+    , ("bigNatAndNot",             makeBigNatBinOp "bigNatAndNot" andNotNat)
+    , ("bigNatAndWord#",           makeBigNatWordOp "bigNatAndWord#" (.&.))
+    , ("bigNatOrWord#",            makeBigNatWordOp "bigNatOrWord#"  (.|.))
+    , ("bigNatXorWord#",           makeBigNatWordOp "bigNatXorWord#" xor)
+    , ("bigNatAndNotWord#",        makeBigNatWordOp "bigNatAndNotWord#" andNotNat)
+    , ("bigNatAndInt#",            bigNatAndIntHashB)
+    , ("bigNatShiftL#",            makeBigNatShiftOp "bigNatShiftL#" shiftL)
+    , ("bigNatShiftR#",            makeBigNatShiftOp "bigNatShiftR#" shiftR)
+    , ("bigNatShiftRNeg#",         bigNatShiftRNegHashB)
+    , ("bigNatPopCount#",          bigNatPopCountHashB)
+    , ("bigNatTestBit#",           bigNatTestBitHashB)
+    , ("bigNatBit#",               bigNatBitHashB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -3372,6 +3391,101 @@ bigNatQuotRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VCon "(#,#)" [qT, rT])
         _ -> error
             ("bigNatQuotRemWord#: not a Word#: " <> showValForDebug bv)
+
+-- | Phase 2.C: @a .&. ~b@ over 'Natural'.  Since 'Natural' has no
+-- 'complement' (unsigned, unbounded), implemented as
+-- @a `xor` (a .&. b)@ — which clears exactly the bits of @a@ that
+-- are also set in @b@, matching @a .&. ~b@ semantics.
+andNotNat :: Natural -> Natural -> Natural
+andNotNat a b = a `xor` (a .&. b)
+
+-- | Phase 2.C: shift primop builder.  @BigNat# -> Word# -> BigNat#@,
+-- shift amount from the Word# arg interpreted as 'Int' via the
+-- standard VInt-as-Word reinterpretation chain.  Used for
+-- 'bigNatShiftL#' and 'bigNatShiftR#'.
+makeBigNatShiftOp :: String -> (Natural -> Int -> Natural) -> IO Val
+makeBigNatShiftOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    case bv of
+        VInt w ->
+            pure (VPrimObj (PrimBigNat
+                (op na (fromIntegral (fromIntegral w :: Word)))))
+        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatShiftRNeg# :: BigNat# -> Word# -> BigNat#@ — arithmetic
+-- right-shift of a negative-magnitude BigNat, used by ghc-bignum's
+-- @integerShiftR#@ for the IN branch.  Semantically:
+-- @(-x) >> k = -(ceiling(x / 2^k))@ in two's complement, so this
+-- primop returns @ceiling(magnitude / 2^k)@.  Implementation:
+-- @(n + 2^k - 1) `shiftR` k@.
+bigNatShiftRNegHashB :: IO Val
+bigNatShiftRNegHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatShiftRNeg#" av
+    case bv of
+        VInt w -> do
+            let k = fromIntegral (fromIntegral w :: Word) :: Int
+            pure (VPrimObj (PrimBigNat
+                (if na == 0
+                    then 0
+                    else ((na + (1 `shiftL` k) - 1) `shiftR` k))))
+        _ -> error
+            ("bigNatShiftRNeg#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatPopCount# :: BigNat# -> Word#@ — population count of the
+-- magnitude.
+bigNatPopCountHashB :: IO Val
+bigNatPopCountHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatPopCount#" av
+    pure (VInt (fromIntegral (popCount n)))
+
+-- | @bigNatTestBit# :: BigNat# -> Word# -> Bool#@ — test if bit @i@
+-- is set.  @Bool#@ encoded as VInt 1/0 per IHC convention.
+bigNatTestBitHashB :: IO Val
+bigNatTestBitHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatTestBit#" av
+    case bv of
+        VInt w ->
+            pure (primBoolVal
+                (testBit na (fromIntegral (fromIntegral w :: Word))))
+        _ -> error
+            ("bigNatTestBit#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatBit# :: Word# -> BigNat#@ — returns @2^n@ as a BigNat.
+-- ghc-bignum convention: the n-th bit is set, all others zero.
+bigNatBitHashB :: IO Val
+bigNatBitHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt w ->
+            pure (VPrimObj (PrimBigNat
+                (bit (fromIntegral (fromIntegral w :: Word)))))
+        _ -> error
+            ("bigNatBit#: not a Word#: " <> showValForDebug av)
+
+-- | @bigNatAndInt# :: BigNat# -> Int# -> BigNat#@ — bitwise AND with
+-- a signed @Int#@.  Two's-complement semantics: for negative @i@,
+-- the upper bits of @i@ are all 1, so AND-ing clears only the
+-- lower @|i| - 1@ bits set in @i@'s complement.
+--
+-- For positive @i@: @na .&. fromIntegral i@.
+-- For negative @i@: @na `andNotNat` (|i| - 1)@ — clear the bits of
+--                   @na@ that correspond to set bits of @~i = |i| - 1@.
+bigNatAndIntHashB :: IO Val
+bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatAndInt#" av
+    case bv of
+        VInt i ->
+            pure (VPrimObj (PrimBigNat
+                (if i >= 0
+                    then na .&. fromIntegral i
+                    else na `andNotNat` fromIntegral (-i - 1))))
+        _ -> error
+            ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
