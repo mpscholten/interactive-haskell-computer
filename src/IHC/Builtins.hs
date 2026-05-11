@@ -61,7 +61,7 @@ import Foreign.ForeignPtr
     )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
-import Foreign.Marshal.Utils (copyBytes, fillBytes)
+import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
@@ -723,7 +723,10 @@ builtins reg =
     -- Phase 2.8: C memory ops
     , ("memcpy",     memcpyB)
     , ("memcpyFp",   memcpyFpB)
-    , ("copyBytes",  copyBytesB)  -- Foreign.Marshal.Utils.copyBytes: wraps memcpy (primop-backed, no Haskell source)
+    -- 'copyBytes' / 'moveBytes' / 'fillBytes' graduated to source.
+    -- Their source bodies are @coerce $ \... s -> (# primOp ... s, () #)@;
+    -- the underlying primops (@copyAddrToAddrNonOverlapping#@,
+    -- @copyAddrToAddr#@, @setAddrRange#@) are registered above.
     -- memset / memchr / memcmp / c_strlen retired: bytestring and the
     -- rest of Hackage declare these as
     --   foreign import ccall unsafe "string.h memset" c_memset
@@ -737,6 +740,8 @@ builtins reg =
     , ("word2Int#",         word2IntB)
     , ("word8ToWord#",      word8ToWordB)
     , ("setAddrRange#",     setAddrRangeB)
+    , ("copyAddrToAddrNonOverlapping#", copyAddrToAddrNonOverlappingB)
+    , ("copyAddrToAddr#",   copyAddrToAddrB)
     , ("or#",               orHashB)
     , ("and#",              andHashB)
     , ("xor#",              xorHashB)
@@ -3361,6 +3366,47 @@ setAddrRangeB = pure $ VFun $ \addrT -> pure $ VFun $ \sizeT -> pure $ VFun $ \b
                     <> " size=" <> showValForDebug sizeV
                     <> " byte=" <> showValForDebug byteV)
 
+-- | @copyAddrToAddrNonOverlapping# :: Addr# -> Addr# -> Int# -> State# RealWorld -> State# RealWorld@
+-- Memcpy primop used by source-loaded @copyBytes@ (and any other
+-- caller of @Foreign.Marshal.Utils.copyBytes@).  Same state-threading
+-- shape as 'setAddrRangeB': the side effect happens when the state
+-- thunk is forced.  Note the GHC primop argument order is
+-- @src dest size@, NOT the Haskell wrapper's @dest src size@.
+copyAddrToAddrNonOverlappingB :: IO Val
+copyAddrToAddrNonOverlappingB =
+    pure $ VFun $ \srcT -> pure $ VFun $ \destT -> pure $ VFun $ \sizeT -> pure $ VFun $ \stT -> do
+        srcV  <- force legacyHooks srcT
+        destV <- force legacyHooks destT
+        sizeV <- force legacyHooks sizeT
+        stV   <- force legacyHooks stT
+        case (srcV, destV, sizeV) of
+            (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
+                copyBytes (dest :: Ptr Word8) (src :: Ptr Word8) (fromIntegral size)
+                pure stV
+            _ -> error ("copyAddrToAddrNonOverlapping#: bad args: src=" <> showValForDebug srcV
+                        <> " dest=" <> showValForDebug destV
+                        <> " size=" <> showValForDebug sizeV)
+
+-- | @copyAddrToAddr# :: Addr# -> Addr# -> Int# -> State# RealWorld -> State# RealWorld@
+-- Same as 'copyAddrToAddrNonOverlappingB' but allows overlapping
+-- regions; used by source-loaded @moveBytes@.  We dispatch to the
+-- host 'moveBytes' (memmove) rather than 'copyBytes' (memcpy) because
+-- the GHC primop spec says regions MAY overlap.
+copyAddrToAddrB :: IO Val
+copyAddrToAddrB =
+    pure $ VFun $ \srcT -> pure $ VFun $ \destT -> pure $ VFun $ \sizeT -> pure $ VFun $ \stT -> do
+        srcV  <- force legacyHooks srcT
+        destV <- force legacyHooks destT
+        sizeV <- force legacyHooks sizeT
+        stV   <- force legacyHooks stT
+        case (srcV, destV, sizeV) of
+            (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
+                moveBytes (dest :: Ptr Word8) (src :: Ptr Word8) (fromIntegral size)
+                pure stV
+            _ -> error ("copyAddrToAddr#: bad args: src=" <> showValForDebug srcV
+                        <> " dest=" <> showValForDebug destV
+                        <> " size=" <> showValForDebug sizeV)
+
 -- | @word8ToWord# :: Word8# -> Word#@ — widening; no-op on our Val
 -- (we represent both Word8# and Word# as 'VInt').
 word8ToWordB :: IO Val
@@ -4628,16 +4674,6 @@ memcpyFpB = pure $ VFun $ \fpT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure
                 pure VUnit
         _ -> error "memcpyFp: bad args"
 
--- | copyBytes :: Ptr a -> Ptr a -> Int -> IO ()
--- Foreign.Marshal.Utils.copyBytes — wraps copyAddrToAddrNonOverlapping# primop.
-copyBytesB :: IO Val
-copyBytesB = pure $ VFun $ \destT -> pure $ VFun $ \srcT -> pure $ VFun $ \nT -> pure $ VIO $ do
-    dv <- force legacyHooks destT; sv <- force legacyHooks srcT; nv <- force legacyHooks nT
-    case (dv, sv, nv) of
-        (VPrimObj (PrimPtr dest), VPrimObj (PrimPtr src), VInt n) -> do
-            copyBytes dest src (fromIntegral n)
-            pure VUnit
-        _ -> error $ "copyBytes: bad args"
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: buffered I/O
