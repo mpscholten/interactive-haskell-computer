@@ -721,8 +721,10 @@ builtins reg =
     , ("sizeofArray#",              sizeofArrayHashB)
     , ("sizeofMutableArray#",       sizeofMutableArrayHashB)
     -- Phase 2.8: C memory ops
-    , ("memcpy",     memcpyB)
-    , ("memcpyFp",   memcpyFpB)
+    -- 'memcpy', 'memcpyFp' graduated to source — both are one-liners
+    -- in 'Data.ByteString.Internal.Type' that delegate to 'copyBytes'
+    -- (now source-loaded itself, see below).
+    --
     -- 'copyBytes' / 'moveBytes' / 'fillBytes' graduated to source.
     -- Their source bodies are @coerce $ \... s -> (# primOp ... s, () #)@;
     -- the underlying primops (@copyAddrToAddrNonOverlapping#@,
@@ -4650,30 +4652,6 @@ compareByteArraysB = pure
                     GT -> 1
             pure (VInt cmp)
         _ -> error "compareByteArrays#: bad args"
-
---------------------------------------------------------------------------------
--- Phase 2.8: C memory ops
---------------------------------------------------------------------------------
-
-memcpyB :: IO Val
-memcpyB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure $ VIO $ do
-    dstV <- force legacyHooks a; srcV <- force legacyHooks b; lenV <- force legacyHooks c
-    case (dstV, srcV, lenV) of
-        (VPrimObj (PrimPtr dst), VPrimObj (PrimPtr src), VInt n) -> do
-            copyBytes dst src (fromIntegral n)
-            pure VUnit
-        _ -> error "memcpy: bad args"
-
-memcpyFpB :: IO Val
-memcpyFpB = pure $ VFun $ \fpT -> pure $ VFun $ \pT -> pure $ VFun $ \nT -> pure $ VIO $ do
-    fpv <- force legacyHooks fpT; pv <- force legacyHooks pT; nv <- force legacyHooks nT
-    case (fpv, pv, nv) of
-        (VPrimObj (PrimForeignPtr fp), VPrimObj (PrimPtr src), VInt n) ->
-            withForeignPtr fp $ \dst -> do
-                copyBytes (castPtr dst) src (fromIntegral n)
-                pure VUnit
-        _ -> error "memcpyFp: bad args"
-
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: buffered I/O
