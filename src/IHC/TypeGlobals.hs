@@ -181,6 +181,15 @@ seedBuiltinClassMethodSigs = do
             -- Bounded
             , ("minBound",   "Bounded")
             , ("maxBound",   "Bounded")
+            -- Integral (mod / div / quotRem / divMod don't need seeding —
+            -- the registry handles them after Integral source-loads via
+            -- triggerCoreInstanceLoad / registerGlobalLoadedModule.  These
+            -- are seeded for first-call locality so bare references like
+            -- @17 \`quot\` 5@ in the REPL hit a 1-step lookup instead of
+            -- the 3-step probe→load→discover cascade.)
+            , ("quot",       "Integral")
+            , ("rem",        "Integral")
+            , ("toInteger",  "Integral")
             -- Fractional
             , ("/",          "Fractional")
             , ("recip",      "Fractional")

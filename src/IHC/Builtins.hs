@@ -295,7 +295,8 @@ builtins reg =
     --     gcd x y = gcd' (abs x) (abs y)
     --       where gcd' a 0 = a
     --             gcd' a b = gcd' b (a `rem` b)
-    -- abs already graduated in Phase E; rem is registered below.
+    -- abs already graduated in Phase E; rem source-loads from
+    -- 'Integral Int.rem' (Real.hs:452-455 → remInt → remInt#).
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
     [ ("sqrt",     unaryOpFloat sqrt)
@@ -304,7 +305,6 @@ builtins reg =
     , ("round",    floatToIntB round)
     , ("truncate", floatToIntB truncate)
     , ("fromIntegral", fromIntegralB)
-    , ("fromInteger",  fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
@@ -1000,11 +1000,19 @@ builtins reg =
     , ("getAddrInfo",     getAddrInfoB)
     , ("Network.Socket.getAddrInfo", getAddrInfoB)
     , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
-    -- Phase 2.8: additional numeric ops needed by containers
-    , ("fromInteger",  fromIntegralB)
-    , ("toInteger",    fromIntegralB)
-    , ("quot",         binOpInt quot)
-    , ("rem",          binOpInt rem)
+    -- Phase 2.8: additional numeric ops needed by containers (graduated)
+    --   * 'fromInteger' (Num class) → 'Num Int.fromInteger'
+    --     at GHC/Internal/Num.hs:115 — body @fromInteger i = I# (integerToInt# i)@.
+    --     The IS/IP/IN matchPat bridge in Eval.hs (PR #136) lets the
+    --     source-loaded @integerToInt# (IS i) = i@ unwrap a 'VInt'.
+    --   * 'toInteger' (Integral class) → 'Integral Int.toInteger'
+    --     at GHC/Internal/Real.hs:442 — body @toInteger (I# i) = IS i@.
+    --     Returns 'VCon "IS" [VInt n]'; downstream consumers either
+    --     pattern-match through the IS bridge or call 'fromIntegral'
+    --     (line 301), whose 'numericNewtypeCons' covers IS.
+    --   * 'quot' / 'rem' (Integral class) → 'Integral Int.{quot,rem}'
+    --     at Real.hs:445-455, routed through quotInt / remInt
+    --     (Base.hs:2376-2390) bottoming on quotInt# / remInt# primops.
     -- 'div' graduated with the rest of the TODO 2.6 block: it now
     -- routes through the Integral Int instance (a `divInt` b) and
     -- bottoms on divInt# registered below.
@@ -1477,15 +1485,6 @@ builtins reg =
 --------------------------------------------------------------------------------
 -- Builders
 --------------------------------------------------------------------------------
-
-binOpInt :: (Int64 -> Int64 -> Int64) -> IO Val
-binOpInt op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> pure (VInt (op x y))
-        _ -> error ("binOp: non-Int args: "
-                    <> showValForDebug av <> ", " <> showValForDebug bv)
 
 -- | Float-only unary op.
 unaryOpFloat :: (Double -> Double) -> IO Val

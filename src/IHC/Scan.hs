@@ -840,17 +840,32 @@ findBinding src ref target = do
     -- After one clause body ends (at a column-1 boundary), peek to see
     -- if the same binder-name repeats. If so, consume its params+rhs
     -- and loop. Otherwise, return.
+    --
+    -- Both 'TkIdent' (regular names) and 'TkPrimId' (MagicHash names
+    -- ending in @#@, e.g. @integerToInt#@ in ghc-bignum) are accepted
+    -- at column 1 — without the 'TkPrimId' arm, multi-clause hash-
+    -- suffixed bindings like
+    --     integerToInt# (IS i) = i
+    --     integerToInt# (IP b) = ...
+    --     integerToInt# (IN b) = ...
+    -- would have each clause registered as its own 'BindingLhs' and
+    -- the @Map.insert@ at the call site would silently overwrite,
+    -- leaving only the LAST clause (see 'handleTopIdent' / 'go').
     collectMoreClauses name acc cur = do
         -- Skip newlines only; do NOT skip other content.
         let (tok, curAfter) = peekSigTok cur
-        case tkKind tok of
-            TkIdent n | n == name && tkCol tok == 1 -> do
+            isContinuation = tkCol tok == 1 && case tkKind tok of
+                TkIdent  n -> n == name
+                TkPrimId n -> n == name && primIdIsValueLevel n
+                _          -> False
+        if isContinuation
+            then do
                 mClause <- scanOneClauseAfterName src curAfter
                 case mClause of
                     Nothing -> pure (acc, cur)
                     Just (cl, curNext) ->
                         collectMoreClauses name (cl : acc) curNext
-            _ -> pure (acc, cur)
+            else pure (acc, cur)
 
     -- Peek the next significant (non-newline) token without losing
     -- the ability to restart from `cur` on backtrack. Returns (token,
