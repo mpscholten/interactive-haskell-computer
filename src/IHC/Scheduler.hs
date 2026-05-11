@@ -3575,12 +3575,10 @@ ffiBuiltinNames = Set.fromList
     , "free"
     , "newUnique", "hashUnique", "fromThreadId"
     , "settingsHost", "settingsPort"
-    , "plusForeignPtr", "plusPtr", "minusPtr", "castPtr"
-    -- 'minusForeignPtr' is NOT in this list — it has graduated to a
-    -- source-loaded body via the @ForeignPtr@ data-ctor pattern
-    -- match.  'plusForeignPtr' stays here for now: see the inline
-    -- comment on the shim entry in 'IHC.Builtins.builtinTable' for
-    -- the (cross-rep IS / fromInteger arithmetic) blocker.
+    , "plusPtr", "minusPtr", "castPtr"
+    -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
+    -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
+    -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
     , "mkWeakIORef"  -- wraps mkWeak#, which has no Haskell implementation
     , "stdout", "stdin", "stderr"  -- RTS pre-built handles
     -- unix package: setFdOption uses c_fcntl_read internally, which we

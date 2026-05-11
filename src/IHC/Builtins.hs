@@ -652,25 +652,8 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("plusForeignPtr",             plusForeignPtrB)
-    -- 'minusForeignPtr' graduated to source.  'plusForeignPtr' would
-    -- also work source-loaded — its body
-    -- @plusForeignPtr (ForeignPtr addr c) (I# d) = ForeignPtr (plusAddr# addr d) c@
-    -- pattern-matches the 'ForeignPtr' data ctor and the
+    -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
     -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
-    -- The blocker is downstream: callers reach the source body with
-    -- @Int@-typed args that have been routed through 'fromInteger',
-    -- arriving as 'VCon "IS" [VInt n]' rather than bare 'VInt n'.
-    -- We have a 'matchPat' cross-rep case for @I# d@ vs 'VCon "IS"',
-    -- but the 'Integer' arithmetic chain feeding those args
-    -- independently produces wrong values (e.g. BSC.replicate writes
-    -- zeros) — a separate bug.  Until that's resolved, keeping the
-    -- shim avoids a fixture regression.  The actual reason historical
-    -- shim removal failed was the @parseSubNames@ operator-group bug
-    -- (now fixed): @import GHC.ForeignPtr (plusForeignPtr)@ in
-    -- @Data.ByteString.Internal.Type@ was being silently dropped
-    -- because the preceding @NonEmpty ((:|))@ sub-import corrupted
-    -- the import-parse cursor.
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -752,6 +735,8 @@ builtins reg =
     -- Phase 2.8: Int/Word coercions + bit ops
     , ("int2Word#",         int2WordB)
     , ("word2Int#",         word2IntB)
+    , ("word8ToWord#",      word8ToWordB)
+    , ("setAddrRange#",     setAddrRangeB)
     , ("or#",               orHashB)
     , ("and#",              andHashB)
     , ("xor#",              xorHashB)
@@ -3356,6 +3341,31 @@ addr2IntB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
 
+-- | @setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld@
+-- Memset primop used by source-loaded @fillBytes@.  The state value
+-- IS the side-effect carrier in our interpreter: the runIOVal IO
+-- unwrapper now forces the state thunk to trigger primop side
+-- effects (see IHC.Eval.runIOVal).  Returns the state value passed
+-- in (semantically the "new" State#) so threading continues.
+setAddrRangeB :: IO Val
+setAddrRangeB = pure $ VFun $ \addrT -> pure $ VFun $ \sizeT -> pure $ VFun $ \byteT -> pure $ VFun $ \stT -> do
+    addrV <- force legacyHooks addrT
+    sizeV <- force legacyHooks sizeT
+    byteV <- force legacyHooks byteT
+    stV   <- force legacyHooks stT
+    case (addrV, sizeV, byteV) of
+        (VPrimObj (PrimPtr p), VInt size, VInt byte) -> do
+            fillBytes (p :: Ptr Word8) (fromIntegral byte) (fromIntegral size)
+            pure stV
+        _ -> error ("setAddrRange#: bad args: addr=" <> showValForDebug addrV
+                    <> " size=" <> showValForDebug sizeV
+                    <> " byte=" <> showValForDebug byteV)
+
+-- | @word8ToWord# :: Word8# -> Word#@ — widening; no-op on our Val
+-- (we represent both Word8# and Word# as 'VInt').
+word8ToWordB :: IO Val
+word8ToWordB = pure $ VFun $ \t -> force legacyHooks t
+
 -- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
 -- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
 -- All six produce @Int#@ in source semantics (1 / 0); we map to the
@@ -3544,17 +3554,6 @@ withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
         pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
         rv <- apply legacyHooks fv pT
         runIOVal legacyHooks rv
-
-plusForeignPtrB :: IO Val
-plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
-    fpv <- force legacyHooks fpT; nv <- force legacyHooks nT
-    case (fpv, nv) of
-        -- ForeignPtr is RTS-backed and has no pure-Haskell storage model in IHC,
-        -- so this builtin must preserve the host pointer offset exactly.
-        (_, VInt n) -> do
-            fp <- foreignPtrValToForeignPtr fpv
-            mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
-        _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do

@@ -1523,7 +1523,19 @@ runIOVal hooks (VCon "IO" [ft]) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 -- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
 -- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
@@ -1536,7 +1548,19 @@ runIOVal hooks (VCon "STM" [ft]) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 -- Unwrapped State#-passing function: an @IO a@ that has been
 -- pattern-matched via @IO f = ...@ to extract the underlying
@@ -1556,13 +1580,37 @@ runIOVal hooks (VFun fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 runIOVal hooks (VFunIP _ipm fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv Map.empty rwT
     case result of
-        VCon _ [_stT, resT] -> force hooks resT
+        VCon _ [stT, resT] -> do
+            -- Side-effecting primops (e.g. @setAddrRange#@,
+            -- @writeAddr#@) are wired into the *state* slot of the IO
+            -- result tuple — @(# setAddrRange# dest# size# byte# s,
+            -- () #)@.  The runtime semantics is "evaluate the new
+            -- state to trigger the side effect, then return the
+            -- value".  Forcing only @resT@ (which is the unit value)
+            -- would leave the state thunk un-evaluated and the side
+            -- effect would never fire — explains why source-loaded
+            -- @fillBytes@ used to silently produce zero-filled
+            -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
         other               -> pure other
 runIOVal _     v        = pure v
 
