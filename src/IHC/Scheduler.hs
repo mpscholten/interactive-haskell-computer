@@ -615,8 +615,23 @@ loadProgramFromSource searchPath src0 = do
     -- in the registration pass.
     regAfterSplices <- readIORef registry
     let loadedModules' = [ lm | (_, Loaded lm) <- Map.toList regAfterSplices ]
+    -- Rebuild 'unionedTypeCtors' from the post-splice module list.  The
+    -- earlier 'unionedTypeCtors' at the top of this function was computed
+    -- from a stale snapshot taken before 'expandSplicesInModule' and the
+    -- per-FV demand-loading inside the instance-discovery pass had a
+    -- chance to pull in deeper transitive deps (e.g.
+    -- 'Data.ByteString.Internal.Type' which is where @data ByteString =
+    -- BS ...@ actually lives).  Without this refresh, the type-ctor
+    -- registry passed to 'registerInstancesFrom' is missing
+    -- @ByteString -> [BS]@; 'instanceRuntimeCtors "ByteString"' returns
+    -- [], the @Semigroup ByteString@ / @Monoid ByteString@ instances are
+    -- only registered under the type-name tag @"ByteString"@ and never
+    -- under the runtime-ctor tag @"BS"@, and class dispatch on a real
+    -- ByteString value falls through to 'methodPlaceholder' and aborts at
+    -- the next 'apply'.
+    let unionedTypeCtors' = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules')
     classTable <- buildClassMethodTable loadedModules'
-    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors classTable env) loadedModules'
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors' classTable env) loadedModules'
     -- Install the per-load instance-registration hook now that the env
     -- is fully tied.  Any subsequent 'loadModule' call (typically a lazy
     -- fallback load via 'resolveFallback') will fire this hook, which
@@ -629,7 +644,7 @@ loadProgramFromSource searchPath src0 = do
         case Map.lookup modName globalMods of
             Just lm ->
                 registerInstancesFrom registry fullSearchPath includeMap
-                                      classReg unionedTypeCtors classTable env lm
+                                      classReg unionedTypeCtors' classTable env lm
             Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
@@ -2098,7 +2113,19 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                         findRuntimeCtorsForType registry searchPath includeMap Set.empty targetLm bareTy
                     Nothing -> pure []
             Nothing ->
-                pure (Map.findWithDefault [] ty typeCtors)
+                -- Two modules can declare different @data ByteString@
+                -- (strict in @Data.ByteString.Internal.Type@, lazy in
+                -- @Data.ByteString.Lazy.Internal@); a global union over
+                -- both 'lmTypeCtorReg's collapses them to one constructor
+                -- set and the wrong instance methods end up dispatched on
+                -- the wrong runtime ctor.  For bare type names, prefer
+                -- the owning module's local view first — that's the
+                -- @ByteString@ the instance head actually refers to —
+                -- and fall back to the global union for types only
+                -- visible through re-exports.
+                case Map.findWithDefault [] ty (lmTypeCtorReg lm) of
+                    [] -> pure (Map.findWithDefault [] ty typeCtors)
+                    ctors -> pure ctors
 
 findRuntimeCtorsForType
     :: ModuleRegistry

@@ -321,7 +321,6 @@ builtins reg =
     --
     -- Already graduated to pure source: empty, null, length, pack
     -- (Char8 siblings of all four also gone).
-    , ("Data.ByteString.append",    bsAppendB)
     , ("Data.ByteString.concat",    bsConcatB)
     , ("Data.ByteString.singleton", bsSingletonB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
@@ -353,7 +352,6 @@ builtins reg =
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
     -- Graduated to pure source: empty/null/length/pack/unpack/head/index.
-    , ("Data.ByteString.Char8.append",    bsAppendB)
     , ("Data.ByteString.Char8.concat",    bsConcatB)
     , ("Data.ByteString.Char8.singleton", bs8SingletonB)
     , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
@@ -3309,12 +3307,6 @@ bsFromBS bs = do
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
     mkBsVal fp len
-
-bsAppendB :: IO Val
-bsAppendB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force a; bv <- force b
-    ba <- bsValToBS av; bb <- bsValToBS bv
-    bsFromBS (BS.append ba bb)
 
 bsConcatB :: IO Val
 bsConcatB = pure $ VFun $ \a -> do
