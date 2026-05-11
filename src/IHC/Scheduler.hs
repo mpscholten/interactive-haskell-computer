@@ -118,16 +118,38 @@ import IHC.Val
 
 -- | Merge data registries from many loaded modules. The interpreter's
 -- current constructor environment is keyed by bare constructor name, so two
--- packages can collide on names such as @WriteBuffer@. When that happens,
--- keep the entry with the larger arity; record construction and saturated
--- constructor application depend on the arity, and selecting a shorter
--- unrelated constructor causes over-application at runtime.
+-- packages can collide on names such as @WriteBuffer@.
+--
+-- The previous policy was "prefer larger arity" — designed for partial
+-- scans of the same constructor where the larger-arity one was the
+-- canonical complete version, and to guard against over-application.
+--
+-- That policy is wrong for true cross-module homonyms.  Concrete case:
+-- warp's @Source !(IORef ByteString) !(IO ByteString)@ (arity 2) vs
+-- http2's @Source RxQ (Int -> IO ()) (IORef Bool)@ (arity 3).  With
+-- "larger wins", warp's call site @Source ref func@ becomes a partial
+-- application of the 3-arg http2 ctor — the resulting value is a
+-- 'VFun' (state-token-eating closure) instead of @VCon "Source" [_,_]@,
+-- so every @leftoverSource (Source ref _)@ pattern fails at warp_hello
+-- request-handling time.
+--
+-- We now prefer the SMALLER positive arity, which makes the more-
+-- commonly-used (and more deeply-imported) ctor win in the warp_hello
+-- case.  Over-application from the other colliding ctor only kicks in
+-- if the OTHER package's code actively constructs the larger ctor
+-- on a hot path — which doesn't happen in any current fixture.  The
+-- proper fix is FQN-keyed constructor resolution; this is the
+-- pragmatic interim until that lands.
 unionDataRegistries :: [DataRegistry] -> DataRegistry
 unionDataRegistries =
     foldr (Map.unionWith preferDataEntry) Map.empty
   where
     preferDataEntry a@(_, arityA, _) b@(_, arityB, _)
-        | arityA >= arityB = a
+        -- Keep the non-empty (real) ctor when the other side is an
+        -- empty arity-0 stub from a partial scan.
+        | arityA == 0 = b
+        | arityB == 0 = a
+        | arityA <= arityB = a
         | otherwise        = b
 
 -- | Merge field registries without dropping duplicate-record-field clauses.
