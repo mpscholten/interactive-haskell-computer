@@ -356,19 +356,15 @@ builtins reg =
     -- Data.ByteString.Char8: same BS runtime value, but pack/unpack
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
-    -- Graduated to pure source: empty/null/length/pack/unpack/head/index.
-    -- 'Char8.singleton' / 'Char8.replicate' source-loaded paths
-    -- delegate to 'Data.ByteString.singleton' / '.replicate' which
-    -- both hit the same @Addr#@ literal blocker as the BS-side
-    -- 'singleton' shim above.  'Char8.putStrLn' calls 'hPutStrLn
-    -- stdout' which has its own gap (a Handle-shape pattern-match
-    -- non-exhaustive on @FileHandle@/@DuplexHandle@ in source-loaded
-    -- 'GHC.Internal.IO.Handle.Text.hPutStrLn').
-    -- 'Char8.putStrLn' = 'hPutStrLn stdout' calls into source-loaded
-    -- code that uses bare 'length' on a 'BS' value; that resolves to
-    -- 'Foldable.length' (no instance for 'BS') and aborts.  Needs
-    -- the same per-FQN preference applied to 'length' as we have
-    -- for module-local bindings — leaving shimmed for now.
+    -- Graduated to pure source: empty/null/length/pack/unpack/head/
+    -- index/singleton/replicate.  'Char8.putStrLn' calls source-
+    -- loaded 'hPutStrLn' which uses bare 'length' on a 'BS'; that
+    -- resolves to the builtin list-walking 'lengthB' (which only
+    -- handles cons-lists) and aborts.  The 'buildImportRewrites'
+    -- filter currently strips 'length' from import-rewrites because
+    -- it is a builtin name — relaxing that filter to honour explicit
+    -- 'ImportOnly' overrides broke 'text_io' (the source-loaded
+    -- @Data.Text.IO.putStrLn@ path), so the shim stays for now.
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
