@@ -758,7 +758,18 @@ parseBindingsIn src fx (start, end) = do
     --   a    = case $wh0 of { (a, _) -> a }
     --   b    = case $wh0 of { (_, b) -> b }
     parseWherePatBind ctx accLen cur = do
-        (pat, cur2) <- parseSubPat ctx cur
+        -- Use 'parseTopPat' so constructor-application LHS patterns
+        -- like @BS _ m = bs@ (i.e. PCon with arguments) and infix
+        -- @x : xs = ys@ are accepted.  'parseSubPat' only consumes
+        -- a single atomic pattern token — for @BS _ m = bs@ it
+        -- consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
+        -- with @expected `=`; saw TkUnderscore@.  This had been
+        -- silently failing inside 'discoverInModule' (the error was
+        -- caught and turned into 'unbound variable Data.ByteString.
+        -- Internal.Type.concat' downstream), which was the root
+        -- cause keeping the 'Data.ByteString.concat' shim alive
+        -- (rule 4).
+        (pat, cur2) <- parseTopPat ctx cur
         let (eqTok, cur3) = nextSig ctx cur2
         case tkKind eqTok of
             TkEq -> do

@@ -321,27 +321,6 @@ builtins reg =
     --
     -- Already graduated to pure source: empty, null, length, pack
     -- (Char8 siblings of all four also gone).
-    -- 'concat' source-loaded path needs additional interpreter
-    -- work to graduate. Two diagnosed blockers:
-    --
-    -- 1. 'Monoid.mconcat :: Monoid a => [a] -> a' is list-element-
-    --    polymorphic. Vanilla arg-directed dispatch picks up the
-    --    list tag ("[]") instead of the element type. A peek-the-
-    --    first-element heuristic handles this for non-empty input.
-    --
-    -- 2. The actual blocker after (1): @Monoid ByteString.mconcat =
-    --    concat@ where @concat@ refers to local
-    --    'Data.ByteString.Internal.Type.concat'. Its body shape
-    --    @concat = \\bss0 -> goLen0 bss0 bss0 where …@ — a top-level
-    --    binding whose RHS is a lambda over a large local @where@-
-    --    block — doesn't surface in our demand-discovery /
-    --    'lmBodies' population path. 'env-fallback' for the FQN
-    --    then raises @unbound variable Data.ByteString.Internal.Type.concat@,
-    --    'forceMethodVal' converts that to 'methodPlaceholder', and
-    --    the dispatcher falls through to the class default body
-    --    @foldr mappend mempty@ — which mishandles 'mempty' as a
-    --    'VClassMethod' wrapper and bombs in 'append'.
-    , ("Data.ByteString.concat",    bsConcatB)
     -- 'singleton' source-loaded path needs unboxed string literal
     -- support: 'singleton c = unsafeTake 1 $ unsafeDrop (fromIntegral c) allBytes'
     -- where 'allBytes = unsafePackLenLiteral 0x100 "\NUL\SOH...\xFF"#'.
@@ -379,7 +358,6 @@ builtins reg =
     -- treat each Char's low 8 bits as a byte. Nearly all other ops
     -- share Data.ByteString's implementations directly.
     -- Graduated to pure source: empty/null/length/pack/unpack/head/index.
-    , ("Data.ByteString.Char8.concat",    bsConcatB)
     -- 'Char8.singleton' / 'Char8.replicate' source-loaded paths
     -- delegate to 'Data.ByteString.singleton' / '.replicate' which
     -- both hit the same @Addr#@ literal blocker as the BS-side
@@ -3341,20 +3319,6 @@ bsFromBS bs = do
     withForeignPtr fp $ \dst -> BS.useAsCStringLen bs $ \(src, l) ->
         copyBytes (castPtr dst) (castPtr src) l
     mkBsVal fp len
-
-bsConcatB :: IO Val
-bsConcatB = pure $ VFun $ \a -> do
-    av <- force a
-    xs <- valToBsList av
-    bsFromBS (BS.concat xs)
-  where
-    valToBsList (VCon "[]" _)       = pure []
-    valToBsList (VCon ":" [hT, tT]) = do
-        hv <- force hT
-        h  <- bsValToBS hv
-        tv <- force tT
-        (h :) <$> valToBsList tv
-    valToBsList other = error ("BS.concat: expected list of ByteString, got " <> showValForDebug other)
 
 bsSingletonB :: IO Val
 bsSingletonB = pure $ VFun $ \wT -> do

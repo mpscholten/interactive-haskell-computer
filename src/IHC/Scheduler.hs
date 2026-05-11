@@ -2861,8 +2861,28 @@ classMethodDispatcher reg cls methodName = selfVal
             -- with @foldr f z xs@ where @z@ might happen to be @VIO@)
             -- keep the raw "<IO>" tag and walk past — IO isn't a
             -- Foldable instance.
-            let rawTag = typeTagOf av
-                tag | rawTag == BC.pack "<IO>" && isMonadicClass cls
+            let rawTag0 = typeTagOf av
+            -- 'Monoid.mconcat :: Monoid a => [a] -> a' is list-
+            -- ELEMENT-polymorphic: the type variable @a@ is the
+            -- list's element type, not the list type itself.  Vanilla
+            -- arg-directed dispatch picks up "[]" from the list arg
+            -- and routes to the @Monoid []@ instance, whose default
+            -- body 'concatMap'-walks the list — mis-typed when the
+            -- elements aren't lists themselves (e.g. @mconcat [bs1,
+            -- bs2] :: [ByteString] -> ByteString@).  Peek the
+            -- first element to recover the element's tag so the
+            -- right @Monoid <element>@ instance is reached.  Empty
+            -- list keeps the "[]" tag and the existing
+            -- result-polymorphic / default chain handles it
+            -- (@mconcat [] = mempty@).
+            rawTag <- if rawTag0 == BC.pack "[]"
+                        && cls == BC.pack "Monoid"
+                        && methodName == BC.pack "mconcat"
+                      then case av of
+                              VCon ":" (hT : _) -> typeTagOf <$> force hT
+                              _                 -> pure rawTag0
+                      else pure rawTag0
+            let tag | rawTag == BC.pack "<IO>" && isMonadicClass cls
                         = BC.pack "IO"
                     | otherwise
                         = rawTag
