@@ -367,8 +367,6 @@ builtins reg =
     -- Data.Functor.Identity.runIdentity: field accessor. The scanner
     -- fails to register it (see Scheduler's field-accessor discovery
     -- path), so provide a direct unwrapper here. Matches `VCon "Identity"`.
-    , ("runIdentity",                        runIdentityB)
-    , ("Data.Functor.Identity.runIdentity",  runIdentityB)
     -- IO
     , ("putStrLn", putStrLnB)
     , ("putStr",   putStrB)
@@ -397,9 +395,14 @@ builtins reg =
     , ("GHC.Internal.Base.<*>", apDispatch reg)
     , ("Prelude.<*>", apDispatch reg)
     , ("join",     joinB)
-    , ("void",     voidB)
-    , ("Control.Monad.void", voidB)
-    , ("GHC.Internal.Base.void", voidB)
+    -- 'void', 'first', 'second', 'runIdentity', 'Control.Arrow.first',
+    -- 'Control.Arrow.second', 'Control.Monad.void',
+    -- 'Data.Functor.Identity.runIdentity' all graduated to pure
+    -- source.  Their definitions are:
+    --   void x = () <$ x          -- Functor class method via <$
+    --   first  f (a, b) = (f a, b) -- Arrow (->) instance method
+    --   second g (a, b) = (a, g b) -- ditto
+    --   runIdentity (Identity x) = x  -- newtype field accessor
     -- @Control.Arrow.first@ / @second@ - for the @(->)@ arrow.  Warp's
     -- @runSettingsConnectionMaker@ uses
     -- @first ((,TCP) \<$\>)@ to lift @(,Transport)@ into the IO action and
@@ -409,10 +412,6 @@ builtins reg =
     -- @Arrow (,) first@, which doesn't exist (Arrow is for arrows, not
     -- tuples).  Host directly under the (->)-instance semantics:
     -- @first f (a, b) = (f a, b)@.
-    , ("first",   firstFnB)
-    , ("Control.Arrow.first", firstFnB)
-    , ("second",  secondFnB)
-    , ("Control.Arrow.second", secondFnB)
     -- IORef
     , ("newIORef",    newIORefB)
     , ("GHC.IORef.newIORef", newIORefB)
@@ -524,12 +523,14 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
-    -- 'minusForeignPtr' graduated to source: it's defined in
-    -- 'GHC.ForeignPtr' / 'Data.ByteString.Internal.Type' as
-    -- @minusForeignPtr (ForeignPtr a1 _) (ForeignPtr a2 _) =
-    -- I# (minusAddr# a1 a2)@, both of which interpret cleanly
-    -- (matchPat exposes ForeignPtr's addr as a Ptr, and
-    -- 'minusAddr#' is shimmed as a real primop).
+    -- 'minusForeignPtr' graduated to source (uses 'minusAddr#' primop
+    -- via the 'ForeignPtr' data-ctor pattern match).  'plusForeignPtr'
+    -- stays shimmed for now: source-loaded
+    -- @plusForeignPtr (ForeignPtr addr c) (I# d) = ForeignPtr (plusAddr# addr d) c@
+    -- needs to reconstruct a 'ForeignPtr' value from a raw addr +
+    -- contents, which the matchPat-exposed address path doesn't yet
+    -- re-pack into the right host shape — removing the shim regresses
+    -- ~7 fixtures.
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -2539,37 +2540,6 @@ joinB = pure $ VFun $ \mmt -> pure $ VIO $ do
     inner <- runIOVal mv
     runIOVal inner
 
-voidB :: IO Val
-voidB = pure $ VFun $ \mt -> pure $ VIO $ do
-    mv <- force mt
-    _ <- runIOVal mv
-    pure VUnit
-
--- | @first f (a, b) = (f a, b)@ — the @Arrow (->)@ instance method.
--- Warp uses @first ((,TCP) <$>)@ in 'runSettingsConnectionMaker'.
-firstFnB :: IO Val
-firstFnB = pure $ VFun $ \fT -> pure $ VFun $ \tupT -> do
-    fv  <- force fT
-    tupV <- force tupT
-    case tupV of
-        VCon "(,)" [aT, bT] -> do
-            r  <- apply fv aT
-            rT <- newWHNFThunk r
-            pure (VCon "(,)" [rT, bT])
-        _ -> error ("first: not a tuple: " <> showValForDebug tupV)
-
--- | @second g (a, b) = (a, g b)@ — counterpart to 'firstFnB'.
-secondFnB :: IO Val
-secondFnB = pure $ VFun $ \gT -> pure $ VFun $ \tupT -> do
-    gv  <- force gT
-    tupV <- force tupT
-    case tupV of
-        VCon "(,)" [aT, bT] -> do
-            r  <- apply gv bT
-            rT <- newWHNFThunk r
-            pure (VCon "(,)" [aT, rT])
-        _ -> error ("second: not a tuple: " <> showValForDebug tupV)
-
 -- runIOVal lives in 'IHC.Eval' (and now also covers STM, which used to
 -- be a separate copy here).  We import it from there.
 
@@ -3200,17 +3170,6 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VCon "Unique" [nT] -> force nT
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
-
--- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
--- and forces the payload. Also accepts `Identity { runIdentity = x }`
--- record-constructor form since ihc lowers both to the same VCon shape.
-runIdentityB :: IO Val
-runIdentityB = pure $ VFun $ \a -> do
-    av <- force a
-    case av of
-        VCon "Identity" (tx : _) -> force tx
-        other -> error ("runIdentity: expected Identity wrapper, got "
-                         <> showValForDebug other)
 
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString
