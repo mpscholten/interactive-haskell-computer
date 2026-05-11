@@ -333,22 +333,16 @@ builtins reg =
     -- memory; ihc currently parses it as an ordinary @[Char]@
     -- cons-list, which 'unsafePackLenLiteral' then mis-handles as a
     -- 'Ptr' arg and aborts with @expected Ptr: <:...>@ in 'pokeB'.
-    -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
-    -- allocation boundaries; the caller-supplied fill action is still
-    -- interpreted, but the mutable memory it writes into must be host-managed.
-    , ("create", bsCreateB)
-    , ("createAndTrim", bsCreateAndTrimB)
-    , ("createFp", bsCreateFpB)
-    , ("createFpAndTrim", bsCreateFpAndTrimB)
-    , ("Data.ByteString.Internal.create", bsCreateB)
-    , ("Data.ByteString.Internal.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.create", bsCreateB)
-    , ("Data.ByteString.Internal.Type.createAndTrim", bsCreateAndTrimB)
-    , ("Data.ByteString.Internal.Type.createFp", bsCreateFpB)
-    , ("Data.ByteString.Internal.Type.createFpAndTrim", bsCreateFpAndTrimB)
-    , ("PS", bsPSConB)
-    , ("Data.ByteString.Internal.PS", bsPSConB)
-    , ("Data.ByteString.Internal.Type.PS", bsPSConB)
+    -- create/createFp/createAndTrim/createFpAndTrim: graduated to
+    -- pure source.  These are Haskell-defined wrappers around the
+    -- RTS primitive 'mallocPlainForeignPtrBytes' (which is the real
+    -- allocation boundary) — see bytestring's
+    -- 'Data.ByteString.Internal.Type'.
+    -- 'PS' is a pattern synonym over the 'BS' data constructor; the
+    -- pattern-synonym desugaring is recognised by 'matchPat' in
+    -- 'IHC.Eval', so we don't need a host shim for the constructor
+    -- expression either — source-loaded callers reach the real BS
+    -- ctor through 'plusForeignPtr' offset arithmetic.
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
@@ -530,9 +524,12 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
-    , ("minusForeignPtr",            minusForeignPtrB)
-    , ("Data.ByteString.Internal.Type.minusForeignPtr", minusForeignPtrB)
-    , ("GHC.ForeignPtr.minusForeignPtr", minusForeignPtrB)
+    -- 'minusForeignPtr' graduated to source: it's defined in
+    -- 'GHC.ForeignPtr' / 'Data.ByteString.Internal.Type' as
+    -- @minusForeignPtr (ForeignPtr a1 _) (ForeignPtr a2 _) =
+    -- I# (minusAddr# a1 a2)@, both of which interpret cleanly
+    -- (matchPat exposes ForeignPtr's addr as a Ptr, and
+    -- 'minusAddr#' is shimmed as a real primop).
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -3185,16 +3182,6 @@ bsValPayload v = case v of
         markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (BS.length bs)
         pure (fp, BS.length bs)
 
-bsPSConB :: IO Val
-bsPSConB = pure $ VFun $ \fpT -> pure $ VFun $ \offT -> pure $ VFun $ \lenT -> do
-    fpv <- force fpT
-    offv <- force offT
-    lenv <- force lenT
-    fp <- foreignPtrValToForeignPtr fpv
-    case (offv, lenv) of
-        (VInt off, VInt len) -> mkBsVal (plusForeignPtr fp (fromIntegral off)) (fromIntegral len)
-        _ -> error ("PS: offset/length are not Ints: " <> showValForDebug offv <> ", " <> showValForDebug lenv)
-
 {-# NOINLINE uniqueCounterRef #-}
 uniqueCounterRef :: IORef Int64
 uniqueCounterRef = unsafePerformIO (newIORef 0)
@@ -3213,72 +3200,6 @@ hashUniqueB = pure $ VFun $ \uT -> do
         VCon "Unique" [nT] -> force nT
         VInt n             -> pure (VInt n)
         other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
-
-byteStringCreateLen :: String -> Val -> IO Int
-byteStringCreateLen label val =
-    case val of
-        VInt n -> pure (fromIntegral n)
-        other  -> error (label <> ": callback did not return Int: " <> showValForDebug other)
-
-bsCreateB :: IO Val
-bsCreateB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                _ <- runIOVal rv
-                mkBsVal fp (fromIntegral n)
-        _ -> error ("create: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateAndTrimB :: IO Val
-bsCreateAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            used <- withForeignPtr fp $ \ptr -> do
-                ptrT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-                rv <- apply actionV ptrT
-                byteStringCreateLen "createAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
-
-bsCreateFpB :: IO Val
-bsCreateFpB = pure $ VFun $ \lenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    lenV <- force lenT
-    actionV <- force actionT
-    case lenV of
-        VInt n | n >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral n)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral n)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            _ <- runIOVal rv
-            mkBsVal fp (fromIntegral n)
-        _ -> error ("createFp: not a non-negative Int: " <> showValForDebug lenV)
-
-bsCreateFpAndTrimB :: IO Val
-bsCreateFpAndTrimB = pure $ VFun $ \maxLenT -> pure $ VFun $ \actionT -> pure $ VIO $ do
-    maxLenV <- force maxLenT
-    actionV <- force actionT
-    case maxLenV of
-        VInt maxLen | maxLen >= 0 -> do
-            fp <- mallocForeignPtrBytes (fromIntegral maxLen)
-            markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (fromIntegral maxLen)
-            fpVal <- mkForeignPtrVal fp
-            fpT <- newWHNFThunk fpVal
-            rv <- apply actionV fpT
-            used <- byteStringCreateLen "createFpAndTrim" =<< runIOVal rv
-            mkBsVal fp (min (fromIntegral maxLen) (max 0 used))
-        _ -> error ("createFpAndTrim: not a non-negative Int: " <> showValForDebug maxLenV)
 
 -- | Data.Functor.Identity.runIdentity shim. Unwraps `VCon "Identity" [x]`
 -- and forces the payload. Also accepts `Identity { runIdentity = x }`
@@ -3328,22 +3249,6 @@ plusForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \nT -> do
             fp <- foreignPtrValToForeignPtr fpv
             mkForeignPtrVal (plusForeignPtr fp (fromIntegral n))
         _ -> error ("plusForeignPtr: bad args: " <> showValForDebug fpv)
-
--- | @minusForeignPtr :: ForeignPtr a -> ForeignPtr b -> Int@.  bytestring's
--- own definition pattern-matches on the @ForeignPtr@ data constructor to
--- pull out raw addresses, but in IHC @ForeignPtr@ is RTS-backed
--- ('VPrimObj (PrimForeignPtr _)') with no exposed constructor, so the
--- pattern match silently fails and the function returns @()@ instead of
--- the byte difference.  Register a host shim that does the host-side
--- subtraction directly.
-minusForeignPtrB :: IO Val
-minusForeignPtrB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> do
-    av <- force aT; bv <- force bT
-    fpA <- foreignPtrValToForeignPtr av
-    fpB <- foreignPtrValToForeignPtr bv
-    let pA = unsafeForeignPtrToPtr fpA
-        pB = unsafeForeignPtrToPtr fpB
-    pure (VInt (fromIntegral (pA `minusPtr` pB)))
 
 touchForeignPtrB :: IO Val
 touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
