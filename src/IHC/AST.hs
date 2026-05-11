@@ -1,15 +1,8 @@
 -- | The AST that the parser produces and the evaluator consumes.
 --
--- This is the central data structure of Phase 2 — it replaces the
--- Phase-1 'IHC.IR.Item' list. Where Items were a flat sequence of
--- aarch64-instruction-sized actions, Expr is a real abstract syntax
--- tree with the structure needed for laziness, pattern matching, and
--- (eventually) type classes.
---
--- For Phase 2.0 the surface stays the same as Phase-1's final state
--- (Int + String literals, arithmetic, comparisons, if, case-on-Int,
--- let, where, do, multi-arg functions). Subsequent phases extend
--- this module rather than replacing it.
+-- Expr is the central data structure of the parser → evaluator
+-- pipeline: a real abstract syntax tree with the structure needed
+-- for laziness, pattern matching, and type classes.
 module IHC.AST
     ( Name
     , Expr(..)

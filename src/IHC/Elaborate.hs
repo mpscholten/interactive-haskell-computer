@@ -31,7 +31,8 @@ import qualified Data.Set as Set
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, lookupInstance)
+import IHC.Classes (ClassRegistry)
+import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef)
 import IHC.TypeUnify
@@ -489,8 +490,7 @@ parseRawTypeExpr bs = do
         [] -> Just t
         _  -> Just t   -- ignore trailing junk — best effort
   where
-    trimSpaces = BC.dropWhile isSpc
-    isSpc c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
+    trimSpaces = BC.dropWhile isAsciiSpace
 
     -- One simple type = list of atoms folded into a TyApp chain.
     parseT toks = do
@@ -593,7 +593,3 @@ tokenize bs
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
 
--- | Minimal monadic foldM — pure; not used yet.
-foldM :: (Monad m) => (b -> a -> m b) -> b -> [a] -> m b
-foldM _ z [] = pure z
-foldM f z (x:xs) = do { z' <- f z x; foldM f z' xs }

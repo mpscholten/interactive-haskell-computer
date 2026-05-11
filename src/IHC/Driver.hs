@@ -24,6 +24,7 @@ import IHC.CabalProject
     , detectProjectRoot
     , resolve
     )
+import IHC.Classes (legacyHooks)
 import IHC.Diagnostics (warnStub)
 import IHC.Eval (force)
 import IHC.PackageStore (acquire, buildSearchEnv)
@@ -120,7 +121,7 @@ runWithSearchPath searchPath src =
   where
     runImpl = do
         (_env, mainT) <- loadProgramFromSource searchPath src
-        v             <- force mainT
+        v             <- force legacyHooks mainT
         final         <- runIO v
         case final of
             VInt n -> pure (fromIntegral n)

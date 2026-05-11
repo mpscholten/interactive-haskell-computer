@@ -13,10 +13,8 @@ module IHC.TypeUnify
     ) where
 
 import Control.Exception (Exception)
-import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)

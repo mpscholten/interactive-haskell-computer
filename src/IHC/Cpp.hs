@@ -49,7 +49,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
+import Data.Char (isDigit, isAlpha, isAlphaNum)
 import Data.IORef (IORef, newIORef, readIORef, atomicWriteIORef)
 import Data.List (isSuffixOf)
 import System.Environment (lookupEnv)
@@ -99,6 +99,23 @@ defaultCppContext = Map.fromList
     , ("HS_cstringLength_AND_FinalPtr_AVAILABLE", MObj "1")
     , ("HS_unsafeWithForeignPtr_AVAILABLE",       MObj "1")
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
+    -- ghc-bignum WordSize.h macros for 64-bit aarch64.
+    -- Pre-defined here as a fallback for sources that
+    -- @#include "WordSize.h"@ but where IHC's per-package
+    -- include-dirs resolution doesn't surface the header.
+    -- Required by 'GHC.Num.Integer.integerFromInt64#' which the
+    -- source-loaded float→Int chain (floor / ceiling / round /
+    -- truncate) routes through.  IHC's parser supports
+    -- NegativeLiterals (parseApp recognises 'TkMinus' followed
+    -- by a numeric literal as a single negative-literal arg),
+    -- so the bare @-0x...@ macro values parse cleanly inside
+    -- @intToInt64# INT_MINBOUND#@ shapes.
+    , ("WORD_SIZE_IN_BITS",  MObj "64")
+    , ("INT_MINBOUND",       MObj "-0x8000000000000000")
+    , ("INT_MAXBOUND",       MObj "0x7fffffffffffffff")
+    , ("ABS_INT_MINBOUND",   MObj "0x8000000000000000")
+    , ("WORD_MAXBOUND",      MObj "0xffffffffffffffff")
+    , ("SQRT_INT_MAXBOUND",  MObj "0xb504f333")
     ]
 
 -- | Hard cap on include nesting depth to prevent infinite recursion.
@@ -420,11 +437,15 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
             let isCHeader = ".h"   `isSuffixOf` filePath
                          || ".hpp" `isSuffixOf` filePath
                          || ".H"   `isSuffixOf` filePath
+                (regularLn, regularContCount, regularRest)
+                    | active && not isCHeader =
+                        joinFunctionMacroInvocation ctx ln rest'
+                    | otherwise = (ln, 0, rest')
             let emit | not active  = BS.empty
                      | isCHeader   = BS.empty   -- C comments / non-Haskell content
-                     | otherwise   = expandMacrosInLine ctx ln
-            (xs, c) <- processIO includeDirs ctx active rest' stack filePath depth
-            pure (emit : xs, c)
+                     | otherwise   = expandMacrosInLine ctx regularLn
+            (xs, c) <- processIO includeDirs ctx active regularRest stack filePath depth
+            pure (emit : replicate regularContCount BS.empty ++ xs, c)
 
 -- | Search a list of include directories for @incPath@, returning the bytes
 -- of the first match or 'Nothing' if none is found.
@@ -471,14 +492,6 @@ isSystemHeader p =
     || ".hpp"  `isSuffixOf` p
     || ".H"    `isSuffixOf` p
     || not (".hs"  `isSuffixOf` p || ".lhs" `isSuffixOf` p)
-
--- | Read a file, throwing 'IncludeMissing' if it doesn't exist.
-readFileOrThrow :: FilePath -> FilePath -> IO ByteString
-readFileOrThrow resolved original = do
-    result <- tryReadFile resolved
-    case result of
-        Just bs -> pure bs
-        Nothing -> throwIO (IncludeMissing original resolved)
 
 -- | Search ancestor directories for @include\/<incPath>@.
 -- Many Hackage packages place their @.h@ headers in a top-level
@@ -939,64 +952,167 @@ expandMacrosInLine ctx ln
                 Just (c, rest) ->
                     BC.singleton c : scanLine rest False
 
-        -- Scan past a string literal body (after the opening ").
-        -- Returns (body-including-closing-quote, rest-after-close) as ByteStrings.
-        scanStringLit :: ByteString -> (ByteString, ByteString)
-        scanStringLit s = go s []
-          where
-            go bs acc = case BC.uncons bs of
-                Nothing              -> (BC.pack (reverse acc), BS.empty)
-                Just ('\\', rest) ->
-                    case BC.uncons rest of
-                        Nothing   -> (BC.pack (reverse acc), BS.empty)
-                        Just (e, rest') -> go rest' (e : '\\' : acc)
-                Just ('"', rest)  -> (BC.pack (reverse ('"' : acc)), rest)
-                Just (c, rest)    -> go rest (c : acc)
+-- | Join physical lines for a function-like macro invocation whose argument
+-- list spans newlines, e.g. @STORABLE(Int,...,\n read,write)@.  CPP treats
+-- newlines inside macro-call parentheses as whitespace; keeping this at the
+-- process-line layer lets the later one-line expander stay simple while
+-- preserving the input line count by emitting blanks for consumed lines.
+joinFunctionMacroInvocation
+    :: CppContext -> ByteString -> [ByteString]
+    -> (ByteString, Int, [ByteString])
+joinFunctionMacroInvocation ctx ln rest =
+    case openFunctionMacroDepth ctx ln of
+        Nothing -> (ln, 0, rest)
+        Just d  -> gather d ln 0 rest
+  where
+    gather _ acc consumed [] = (acc, consumed, [])
+    gather d acc consumed (r:rs) =
+        let d'   = parenDepthContinue d r
+            acc' = acc <> BC.singleton ' ' <> r
+        in if d' <= 0
+            then (acc', consumed + 1, rs)
+            else gather d' acc' (consumed + 1) rs
 
-        -- Scan past a char literal body (after the opening ').
-        scanCharLit :: ByteString -> (ByteString, ByteString)
-        scanCharLit s = go s []
-          where
-            go bs acc = case BC.uncons bs of
-                Nothing              -> (BC.pack (reverse acc), BS.empty)
-                Just ('\\', rest) ->
-                    case BC.uncons rest of
-                        Nothing   -> (BC.pack (reverse acc), BS.empty)
-                        Just (e, rest') -> go rest' (e : '\\' : acc)
-                Just ('\'', rest) -> (BC.pack (reverse ('\'' : acc)), rest)
-                Just (c, rest)    -> go rest (c : acc)
+openFunctionMacroDepth :: CppContext -> ByteString -> Maybe Int
+openFunctionMacroDepth ctx = scan
+  where
+    scan s
+        | BS.null s = Nothing
+        | otherwise = case BC.uncons s of
+            Just ('-', rest) | not (BS.null rest) && BC.head rest == '-' ->
+                Nothing
+            Just ('"', rest) ->
+                let (_, after) = scanStringLit rest
+                in scan after
+            Just ('\'', rest) ->
+                let (_, after) = scanCharLit rest
+                in scan after
+            Just (c, _) | isIdentStart c ->
+                let (ident, afterIdent) = BC.span isIdentChar s
+                    afterWs = BC.dropWhile isHSpace afterIdent
+                in case Map.lookup ident ctx of
+                    Just (MFun _ _) ->
+                        case BC.uncons afterWs of
+                            Just ('(', afterOpen) ->
+                                case consumeBalancedParens 1 afterOpen of
+                                    Left d      -> Just d
+                                    Right after -> scan after
+                            _ -> scan afterIdent
+                    _ -> scan afterIdent
+            Just (_, rest) -> scan rest
+            Nothing -> Nothing
 
-    -- Consume a function-like macro argument list @(arg1, arg2, ...)@ and
-    -- return (args, rest-after-close-paren).  Returns Nothing if the next
-    -- non-whitespace character is not @(@.
-    consumeArgs :: ByteString -> Maybe ([ByteString], ByteString)
-    consumeArgs s0 =
-        let s = BC.dropWhile isHSpace s0
-        in case BC.uncons s of
+parenDepthContinue :: Int -> ByteString -> Int
+parenDepthContinue depth0 = go depth0
+  where
+    go d s
+        | d <= 0 || BS.null s = d
+        | otherwise = case BC.uncons s of
+            Just ('"', rest) ->
+                let (_, after) = scanStringLit rest
+                in go d after
+            Just ('\'', rest) ->
+                let (_, after) = scanCharLit rest
+                in go d after
+            Just ('(', rest) -> go (d + 1) rest
+            Just (')', rest) -> go (d - 1) rest
+            Just (_, rest)   -> go d rest
+            Nothing          -> d
+
+consumeBalancedParens :: Int -> ByteString -> Either Int ByteString
+consumeBalancedParens depth0 = go depth0
+  where
+    go d s
+        | d <= 0 = Right s
+        | BS.null s = Left d
+        | otherwise = case BC.uncons s of
+            Just ('"', rest) ->
+                let (_, after) = scanStringLit rest
+                in go d after
+            Just ('\'', rest) ->
+                let (_, after) = scanCharLit rest
+                in go d after
+            Just ('(', rest) -> go (d + 1) rest
+            Just (')', rest) ->
+                let d' = d - 1
+                in if d' == 0 then Right rest else go d' rest
+            Just (_, rest)   -> go d rest
+            Nothing          -> Left d
+
+scanStringLit :: ByteString -> (ByteString, ByteString)
+scanStringLit s = go s []
+  where
+    go bs acc = case BC.uncons bs of
+        Nothing              -> (BC.pack (reverse acc), BS.empty)
+        Just ('\\', rest) ->
+            case BC.uncons rest of
+                Nothing   -> (BC.pack (reverse acc), BS.empty)
+                Just (e, rest') -> go rest' (e : '\\' : acc)
+        Just ('"', rest)  -> (BC.pack (reverse ('"' : acc)), rest)
+        Just (c, rest)    -> go rest (c : acc)
+
+scanCharLit :: ByteString -> (ByteString, ByteString)
+scanCharLit s = go s []
+  where
+    go bs acc = case BC.uncons bs of
+        Nothing              -> (BC.pack (reverse acc), BS.empty)
+        Just ('\\', rest) ->
+            case BC.uncons rest of
+                Nothing   -> (BC.pack (reverse acc), BS.empty)
+                Just (e, rest') -> go rest' (e : '\\' : acc)
+        Just ('\'', rest) -> (BC.pack (reverse ('\'' : acc)), rest)
+        Just (c, rest)    -> go rest (c : acc)
+
+-- Consume a function-like macro argument list @(arg1, arg2, ...)@ and
+-- return (args, rest-after-close-paren).  Returns Nothing if the next
+-- non-whitespace character is not @(@.
+consumeArgs :: ByteString -> Maybe ([ByteString], ByteString)
+consumeArgs s0 =
+    let s = BC.dropWhile isHSpace s0
+    in case BC.uncons s of
+        Just ('(', rest) -> Just (collectArgs rest)
+        _                -> Nothing
+
+collectArgs :: ByteString -> ([ByteString], ByteString)
+collectArgs = go 0 [] []
+  where
+    go _ cur groups bs | BS.null bs =
+        (finish cur groups, BS.empty)
+    go depth cur groups bs =
+        case BC.uncons bs of
             Just ('(', rest) ->
-                let (argsStr, after) = BC.break (== ')') rest
-                    args = splitComma argsStr
-                in case BC.uncons after of
-                    Just (')', rest') -> Just (args, rest')
-                    _                 -> Just (args, after)
-            _ -> Nothing
+                go (depth + 1) ('(' : cur) groups rest
+            Just (')', rest)
+                | depth == 0 -> (finish cur groups, rest)
+                | otherwise  -> go (depth - 1) (')' : cur) groups rest
+            Just (',', rest)
+                | depth == 0 -> go depth [] (BC.pack (reverse cur) : groups) rest
+                | otherwise  -> go depth (',' : cur) groups rest
+            Just (c, rest) ->
+                go depth (c : cur) groups rest
+            Nothing -> (finish cur groups, BS.empty)
 
-    -- Substitute parameter names in a function-like macro body.
-    substituteParams :: Map ByteString ByteString -> ByteString -> ByteString
-    substituteParams paramMap body
-        | Map.null paramMap = body
-        | otherwise = BC.concat (go body)
-      where
-        go bs
-            | BS.null bs = []
-            | otherwise = case BC.uncons bs of
-                Just (c, rest) | isIdentStart c ->
-                    let (ident, rest') = BC.span isIdentChar bs
-                    in case Map.lookup ident paramMap of
-                        Just v  -> v : go rest'
-                        Nothing -> ident : go rest'
-                Just (c, rest) -> BC.singleton c : go rest
-                Nothing -> []
+    finish cur groups =
+        reverse (case (cur, groups) of
+            ([], []) -> []
+            _        -> BC.pack (reverse cur) : groups)
+
+-- Substitute parameter names in a function-like macro body.
+substituteParams :: Map ByteString ByteString -> ByteString -> ByteString
+substituteParams paramMap body
+    | Map.null paramMap = body
+    | otherwise = BC.concat (go body)
+  where
+    go bs
+        | BS.null bs = []
+        | otherwise = case BC.uncons bs of
+            Just (c, rest) | isIdentStart c ->
+                let (ident, rest') = BC.span isIdentChar bs
+                in case Map.lookup ident paramMap of
+                    Just v  -> v : go rest'
+                    Nothing -> ident : go rest'
+            Just (c, rest) -> BC.singleton c : go rest
+            Nothing -> []
 
 --------------------------------------------------------------------------------
 -- Utilities

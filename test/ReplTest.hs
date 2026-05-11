@@ -87,6 +87,28 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "[2,3,4]"
 
+    -- Regression: locks in the Show-Either improvement that the
+    -- per-class manifest-driven core-instance hook preserves.
+    -- Triggering the hook on 'Show' loads 'Show''s manifest providers
+    -- (incl. GHC.Internal.Show with @instance Show Either@).
+    it "import Prelude: show (Right 1 :: Either String Int) contains \"Right 1\"" do
+        (code, out, _err) <- runRepl
+            ( "import Prelude\n"
+           <> "show (Right 1 :: Either String Int)\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "Right 1"
+
+    -- Regression: 'length' resolves through the Foldable instance for
+    -- '[]' (loaded on the per-class first miss for 'Foldable').
+    it "import Prelude: length [1,2,3] = 3 (Foldable resolution)" do
+        (code, out, _err) <- runRepl
+            ( "import Prelude\n"
+           <> "length [1,2,3]\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "3"
+
     it "import qualified Data.ByteString as BS succeeds" do
         (code, out, _err) <- runRepl "import qualified Data.ByteString as BS\n:q\n"
         code `shouldBe` ExitSuccess

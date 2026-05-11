@@ -17,9 +17,11 @@ import IHC.ModuleHeader
     , ModuleHeader(..)
     , parseModuleHeader
     )
+import IHC.AST (Alt(..), Expr(..), Lit(..), Pat(..))
 import IHC.Parser
     ( ParseError
     , defaultFixityTable
+    , parseExprAtEof
     , parseExprOnly
     , scanFixityDecls
     )
@@ -186,3 +188,104 @@ spec = describe "Parser/lexer bug regressions (audit 2026-04-27)" $ do
                     items `shouldNotContain` [ExportName "bar"]
                 _ -> expectationFailure
                     ("unexpected header: " <> show mh)
+
+    -- Bug 8 — found by Properties.RoundTrip on a 'PLit' input
+    -- with an out-of-Int64 'LInteger' value.  parseSubPat's
+    -- 'TkInt n' arm at @src/IHC/Parser.hs:2558@ used
+    -- @fromInteger n@ unconditionally, silently truncating the
+    -- value into a wrapped 'Int64' instead of routing to
+    -- 'LInteger' for the out-of-range slice (which the
+    -- /expression/-side @parseAtom@ at line 3242 already did).
+    -- Soundness bug:
+    --   case x of 9223372036854775808 -> ...
+    -- would match against @-9223372036854775808@ instead.  Fix:
+    -- mirror the expression-side range check; same logic for the
+    -- @-N@ negative-pattern arm at line 2586.
+    describe "bug8: pattern Int literals route to LInteger when out of Int64 range" $ do
+        let parseAlts src = do
+                e <- parseExprAtEof (mkSrc src) defaultFixityTable
+                case e of
+                    ECase _ alts -> pure alts
+                    _ -> error
+                        ("expected ECase from <" <> show src <> ">, got " <> show e)
+        it "9223372036854775808 (maxBound :: Int64 + 1) parses as PLit (LInteger _)" $ do
+            alts <- parseAlts "case x of 9223372036854775808 -> 0"
+            case alts of
+                [Alt (PLit (LInteger n)) _] | n == 9223372036854775808 -> pure ()
+                _ -> expectationFailure
+                    ("expected single Alt PLit (LInteger 9223372036854775808), got " <> show alts)
+        it "-9223372036854775809 parses as PLit (LInteger _)" $ do
+            alts <- parseAlts "case x of -9223372036854775809 -> 0"
+            case alts of
+                [Alt (PLit (LInteger n)) _] | n == -9223372036854775809 -> pure ()
+                _ -> expectationFailure
+                    ("expected single Alt PLit (LInteger _), got " <> show alts)
+        it "in-range 9223372036854775807 (maxBound :: Int64) still uses LInt" $ do
+            alts <- parseAlts "case x of 9223372036854775807 -> 0"
+            case alts of
+                [Alt (PLit (LInt n)) _] | n == maxBound -> pure ()
+                _ -> expectationFailure
+                    ("expected Alt PLit (LInt maxBound), got " <> show alts)
+
+    -- Bug 7 — found by Properties.RoundTrip on a generated
+    -- 'PLit' 'LStr' shrunk to a string ending with byte 0x08
+    -- (which the pretty-printer emits as @\\8\\&@).  The lexer
+    -- decoded @\\&@ (the Haskell 2010 §2.6 empty separator) by
+    -- emitting a NUL character, so @"\\&"@ became @[0x00]@ and
+    -- @"\\8\\&"@ became @[0x08, 0x00]@ instead of @[0x08]@.
+    -- Fix: consult a new 'tryEmptySep' helper before 'readEscape'
+    -- in @lexString@; treat @\\&@ as a zero-width separator.
+    describe "bug7: \\& empty string-separator must produce no byte" $ do
+        it "lexes \"\\&\" to TkStr empty" $ do
+            r <- lexOne "\"\\&\""
+            case r of
+                Right (TkStr bs) -> bs `shouldBe` ""
+                Right other -> expectationFailure
+                    ("expected TkStr \"\", got " <> show other)
+                Left e -> expectationFailure
+                    ("lexer crashed on \"\\&\": " <> show e)
+        it "lexes \"\\8\\&\" to TkStr [0x08]" $ do
+            r <- lexOne "\"\\8\\&\""
+            case r of
+                Right (TkStr bs) -> bs `shouldBe` "\b"
+                Right other -> expectationFailure
+                    ("expected TkStr \"\\b\", got " <> show other)
+                Left e -> expectationFailure
+                    ("lexer crashed on \"\\8\\&\": " <> show e)
+        it "lexes \"\\65\\&5\" to TkStr \"A5\" (separator stops digit run)" $ do
+            r <- lexOne "\"\\65\\&5\""
+            case r of
+                Right (TkStr bs) -> bs `shouldBe` "A5"
+                Right other -> expectationFailure
+                    ("expected TkStr \"A5\", got " <> show other)
+                Left e -> expectationFailure
+                    ("lexer crashed: " <> show e)
+
+    -- Bug 6 — found by Properties.Totality fixture-mutation fuzz, seed
+    -- 1067065700 / shrunk input "Gg\SID@'".  An unexpected ASCII
+    -- control byte (0x00..0x1F minus whitespace) hit the fall-through
+    -- branch in 'IHC.Lexer.nextToken' and was raised via 'error',
+    -- which surfaces as 'ErrorCall' rather than 'ParseError' — a
+    -- totality violation: callers that 'try @ParseError' would let
+    -- the exception escape uncaught.  Fix: throw 'LexError' which
+    -- 'parseExprOnly' bridges to 'ParseError' via @liftLex@.
+    describe "bug6: control bytes must surface as ParseError, not ErrorCall" $ do
+        -- "\x0F\&D" — \& terminates the hex escape so the literal is
+        -- exactly bytes [G, g, 0x0F, D, @, '], the QuickCheck-shrunk
+        -- repro; without it GHC reads "\x0FD" as the single byte 0xFD.
+        it "rejects byte 0x0F mid-token without an uncaught ErrorCall" $ do
+            r <- parseExpr "Gg\x0F\&D@'"
+            case r of
+                Left e | isParseError e -> pure ()
+                Left e -> expectationFailure
+                    ("expected ParseError, got " <> show e)
+                Right _ -> expectationFailure
+                    "expected ParseError, parse succeeded"
+        it "rejects bare byte 0x01 without an uncaught ErrorCall" $ do
+            r <- parseExpr "\x01"
+            case r of
+                Left e | isParseError e -> pure ()
+                Left e -> expectationFailure
+                    ("expected ParseError, got " <> show e)
+                Right _ -> expectationFailure
+                    "expected ParseError, parse succeeded"

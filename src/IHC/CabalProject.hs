@@ -51,9 +51,8 @@ import Data.IORef
     , readIORef
     , writeIORef
     )
-import Data.List (isPrefixOf, isSuffixOf, maximumBy, sortBy)
+import Data.List (isPrefixOf, maximumBy, sortBy)
 import Data.Ord (Down(..))
-import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Time.Clock.POSIX (POSIXTime, utcTimeToPOSIXSeconds)
@@ -83,14 +82,12 @@ import Distribution.PackageDescription
     , CondTree(..)
     , Library(..)
     , BuildInfo(..)
-    , library
     )
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription, runParseResult)
 import qualified Distribution.Types.PackageId as CabalPkgId
 import qualified Distribution.Types.PackageName as CabalPkgName
 import Distribution.Types.Dependency (depPkgName)
 import qualified Distribution.Types.Version as CabalVer
-import qualified Distribution.ModuleName as ModuleName
 import qualified Distribution.Pretty as CabalPretty
 import qualified Distribution.Utils.Path as CabalPath
 import qualified Language.Haskell.Extension as CabalLang

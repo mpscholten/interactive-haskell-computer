@@ -56,6 +56,11 @@ Symptom of misuse: a Hackage library appears in `preludeScope` but only one fixt
 
 If you find such an entry, remove it and route the library through the manifest. Do not add new ones.
 
+### Tracked carve-outs (known violations, blocked on separate work)
+
+- **VIO ↔ State# bridges** in `src/IHC/Builtins.hs` (`unIO`, `ioToST`/`unsafeIOToST`, `stToIO`/`unsafeSTToIO`) — truly RTS-exclusive. The VIO runtime representation cannot be expressed as a source-level `State# RealWorld -> (# State# RealWorld, a #)` function; these bridges are compiler-intrinsic in the same way `unsafeCoerce` is (see the `Unsafe.Coerce` justification in `Scheduler.hs`'s `isBuiltinBackedModule`). Documented inline; not for removal.
+- **`plusForeignPtr`** still shimmed despite being a Haskell definition (`plusForeignPtr (ForeignPtr addr c) (I# d) = ForeignPtr (plusAddr# addr d) c`). Removing it regresses ~7 fixtures because source-loaded reconstruction of a 'ForeignPtr' value from a raw addr + contents pair doesn't yet round-trip cleanly through `matchPat`. Comment in `Builtins.hs` documents the gap.
+
 ## Fixing interpreter bugs: reproduce → fixture → fix → verify
 
 When real Hackage code (warp, IHP, blaze-html, …) fails with an interpreter error, **do not start by editing `src/IHC/`**. Follow this loop — it has a much higher hit rate and ships a regression test with every fix:

@@ -30,6 +30,7 @@ module IHC.Parser
     , parseBodyExprWithFixity
     , parseExprOnly
     , parseExprAtEof
+    , parsePatIn
     , ParseError(..)
     , FixityTable
     , Assoc(..)
@@ -50,6 +51,7 @@ import IHC.AST
 import IHC.Lexer
 import IHC.Scan (Clause(..))
 import IHC.Source
+import IHC.StringUtils (isAsciiSpace)
 
 -- | Run a parser action, converting any pure 'LexError' it forces into a
 -- 'ParseError' so callers see one error type. The lexer raises 'LexError'
@@ -307,10 +309,23 @@ parseClause src fx (Clause patsSpan rhsSpan) = do
 -- LHS pattern parsing
 --------------------------------------------------------------------------------
 
+-- | Parse a single pattern from a pre-located source span.  Used by the
+-- pattern-synonym registration path (see "IHC.Scan.scanPatternSynonyms")
+-- to materialise the body pattern of a @pattern Name p \<- body@ decl.
+parsePatIn :: Source -> FixityTable -> Span -> IO Pat
+parsePatIn src fx (start, end) = do
+    let ctx  = Ctx src end 0 fx
+        (startLine, startCol) = offsetToPos src start
+        cur0 = Cursor start startLine startCol
+    liftLex $ do
+        (p, _) <- parseTopPat ctx cur0
+        pure p
+
 parsePatsIn :: Source -> FixityTable -> Span -> IO [Pat]
 parsePatsIn src fx (start, end) = do
     let ctx  = Ctx src end 0 fx
-        cur0 = Cursor start 1 1
+        (startLine, startCol) = offsetToPos src start
+        cur0 = Cursor start startLine startCol
     -- Distinguish prefix vs infix LHS.  Prefix form `name pat1 pat2 = body`
     -- expects atomic patterns (constructors with args must be parenthesised:
     -- `f (Just x) y = …`).  Infix form `pat1 op pat2 = body` allows full
@@ -361,6 +376,14 @@ parsePatsIn src fx (start, end) = do
     -- Each side is a full constructor-application pattern (parseTopPat
     -- absorbs ctor args), and the operator/backtick name in the middle
     -- is consumed without being kept as a pattern.
+    --
+    -- The skipped operator can be either a generic 'TkSymOp' or one of
+    -- the dedicated-op tokens carved out by the lexer (==, /=, <, <=,
+    -- etc.; see 'isDedicatedInfixOpKind').  Without skipping the
+    -- dedicated forms, an instance method whose LHS uses '==' (e.g.
+    -- @Status \{ statusCode = a } == ... = ...@) would treat the '==' as
+    -- not-a-pattern, stop at the first side, and produce the wrong LHS
+    -- pattern list / arity.
     loopInfix ctx cur acc = do
         let (tok, cur1) = nextSig ctx cur
         case tkKind tok of
@@ -374,6 +397,7 @@ parsePatsIn src fx (start, end) = do
                             _          -> pure (reverse acc)
                     Nothing -> pure (reverse acc)
             TkSymOp _ -> loopInfix ctx cur1 acc
+            k | isDedicatedInfixOpKind k -> loopInfix ctx cur1 acc
             TkAt ->
                 let (peek2, cur2) = nextSig ctx cur1
                 in case tkKind peek2 of
@@ -384,26 +408,69 @@ parsePatsIn src fx (start, end) = do
                 (p, cur') <- parseTopPat ctx cur
                 loopInfix ctx cur' (p : acc)
 
+-- | True for the dedicated-operator tokens the lexer carves out — the
+-- ones that can appear as the infix operator in a function/method LHS
+-- (==, /=, <, <=, >, >=, &&, ||, +, ++, *, :, $).  Used by the LHS
+-- parser to (a) decide that an LHS uses infix form and (b) skip the
+-- operator token between the two pattern arguments.
+--
+-- Mirrors the dedicated-op cases in 'IHC.Scan.findTopLevelOpBeforeEq'
+-- (the scanner that registers the binding under its operator name) so
+-- the parser and the scanner agree on which forms count as infix.
+isDedicatedInfixOpKind :: TokenKind -> Bool
+isDedicatedInfixOpKind k = case k of
+    TkEqEq     -> True
+    TkNeq      -> True
+    TkLt       -> True
+    TkLe       -> True
+    TkGt       -> True
+    TkGe       -> True
+    TkAnd      -> True
+    TkOr       -> True
+    TkPlus     -> True
+    TkPlusPlus -> True
+    TkStar     -> True
+    -- TkMinus IS dedicated infix when scanning a method LHS at depth 0
+    -- with preceding patterns (e.g. @I# x - I# y = …@ in Num Int).
+    -- Unary-minus in expressions is handled separately by the expression
+    -- parser via ENeg.
+    TkMinus    -> True
+    TkColon    -> True
+    TkDollar   -> True
+    _          -> False
+
 -- | Look ahead in @cur0..end@ for a top-level (paren-depth 0) infix
 -- operator before @=@ or @|@.  Mirrors 'IHC.Scan.findTopLevelOpBeforeEq'
 -- but operates on parser tokens.  Returns True for any @TkSymOp@ /
--- @TkBacktick@ at depth 0 before the RHS separator.
+-- @TkBacktick@ / dedicated-op token at depth 0 before the RHS separator.
 hasTopLevelInfixOp :: Ctx -> Cursor -> IO Bool
-hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int)
+hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
   where
-    go cur depth =
+    -- @sawPat@: at least one pattern-starting token has been seen at
+    -- depth 0.  TkMinus alone (no preceding pat) is unary-minus on a
+    -- negative literal pattern @-1@, NOT an infix operator.  All other
+    -- dedicated infix tokens are unambiguous from token zero so they
+    -- don't need the gate.
+    go cur depth !sawPat =
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
-            TkSymOp _ | depth == 0      -> pure True
+            TkSymOp _  | depth == 0     -> pure True
             TkBacktick | depth == 0     -> pure True
-            TkLParen                    -> go cur' (depth + 1)
-            TkLBracket                  -> go cur' (depth + 1)
-            TkLBrace                    -> go cur' (depth + 1)
-            TkRParen                    -> go cur' (max 0 (depth - 1))
-            TkRBracket                  -> go cur' (max 0 (depth - 1))
-            TkRBrace                    -> go cur' (max 0 (depth - 1))
-            _                           -> go cur' depth
+            TkMinus    | depth == 0
+                       , sawPat         -> pure True
+            TkMinus    | depth == 0     -> go cur' depth sawPat
+            k | depth == 0
+              , isDedicatedInfixOpKind k -> pure True
+            TkLParen                    -> go cur' (depth + 1) sawPat
+            TkLBracket                  -> go cur' (depth + 1) sawPat
+            TkLBrace                    -> go cur' (depth + 1) sawPat
+            TkRParen                    -> go cur' (max 0 (depth - 1)) True
+            TkRBracket                  -> go cur' (max 0 (depth - 1)) True
+            TkRBrace                    -> go cur' (max 0 (depth - 1)) True
+            _ | depth == 0
+              , startsPat (tkKind tok)  -> go cur' depth True
+            _                           -> go cur' depth sawPat
 
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do
@@ -568,8 +635,11 @@ isTrivialPat _        = False
 --------------------------------------------------------------------------------
 
 splitOnWhere :: Source -> Span -> (Span, Maybe Span)
-splitOnWhere src (start, end) = go (Cursor start 1 1) (0 :: Int) [] []
+splitOnWhere src (start, end) = go cur0 (0 :: Int) [] []
   where
+    (startLine, startCol) = offsetToPos src start
+    cur0 = Cursor start startLine startCol
+
     -- @depth@: bracket nesting ((/[/{); a @where@ inside brackets can't
     -- be the binding's where.
     -- @caseStack@: stack of @of@-keyword columns currently open.  A
@@ -1006,12 +1076,11 @@ parseExpr ctx cur0 = do
         TkDColon -> do
             cur3 <- skipTypeToBinding ctx cur2
             let src     = ctxSrc ctx
-                tyBytes = BC.dropWhile isSpace
+                tyBytes = BC.dropWhile isAsciiSpace
                             (BC.reverse
-                                (BC.dropWhile isSpace
+                                (BC.dropWhile isAsciiSpace
                                     (BC.reverse
                                         (sliceBytes src (cPos cur2, cPos cur3)))))
-                isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
             if BS.null tyBytes
                 then pure (e, cur3)
                 else pure (ETyApp e tyBytes, cur3)
@@ -2058,7 +2127,20 @@ parseLet ctx cur0 = do
                 case tkKind eqTok of
                     TkEq -> do
                         (e, cur4) <- parseExpr rhsCtx cur3
-                        pure (Right (pat, e), cur4)
+                        -- @let !x = e@ is just a strict simple-name binding;
+                        -- since IHC currently ignores the strictness annotation
+                        -- (Parser.hs:20) we strip the bang and treat it as a
+                        -- normal @Left (x, e)@ binding.  This matters for
+                        -- mixed multi-binding lets like
+                        --   @let !d = ...; go_up x = ... d ... in ...@
+                        -- (e.g. @GHC.Enum.efdtIntUp@): pattern bindings are
+                        -- desugared via a @case@-projection that only binds the
+                        -- pattern's variables inside the alt's body, not in
+                        -- the surrounding @ELet@ siblings, so without this
+                        -- strip the inner @go_up@ would see @d@ as unbound.
+                        case pat of
+                            PBang (PVar n) -> pure (Left (n, e), cur4)
+                            _              -> pure (Right (pat, e), cur4)
                     _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
               | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
 
@@ -2473,6 +2555,14 @@ collectArgs ctx name acc cur =
             if isWild
                 then pure (PRecordWild name, curEnd)
                 else pure (PRecord name fieldPats, curEnd)
+        -- TkMinus would otherwise look like the start of a negative-
+        -- literal pattern (@-1@), but as an unparenthesised arg of a
+        -- constructor it's actually the binary infix operator that
+        -- separates this constructor's pattern from the next infix-LHS
+        -- pattern, e.g. @I# x - I# y = …@ in Num Int.  Negative literal
+        -- args are written @C (-1)@, so the parens path in parseSubPat
+        -- still handles them correctly.
+        TkMinus -> pure (PCon name (reverse acc), cur)
         _ | startsPat (tkKind tok) -> do
             (sp, cur'') <- parseSubPat ctx cur
             collectArgs ctx name (sp : acc) cur''
@@ -2512,7 +2602,17 @@ parseSubPat ctx cur = do
             | primIdStartsCon n -> pure (PCon n [], cur1)
             | otherwise         -> pure (PVar n, cur1)   -- e.g. state# param in primop binding
         TkUnderscore -> pure (PWild, cur1)
-        TkInt n      -> pure (PLit (LInt (fromInteger n)), cur1)
+        -- Mirror the expression-side routing at parseAtom (see
+        -- IHC.Parser § "TkInt n | n <= maxBound :: Int64") — keep
+        -- arbitrary-precision values as 'LInteger' instead of
+        -- silently truncating via 'fromInteger' into a wrapped Int64.
+        -- Otherwise @case x of 9223372036854775808 -> ...@ would
+        -- match against @-9223372036854775808@ — a soundness bug.
+        TkInt n
+            | n <= toInteger (maxBound :: Int64)
+                -> pure (PLit (LInt (fromInteger n)), cur1)
+            | otherwise
+                -> pure (PLit (LInteger n), cur1)
         TkFloat d    -> pure (PLit (LFloat d), cur1)
         TkStr s      -> pure (PLit (LStr s), cur1)
         TkChar c     -> pure (PLit (LChar c), cur1)
@@ -2540,7 +2640,16 @@ parseSubPat ctx cur = do
         TkMinus -> do
             let (n, cur2) = nextSig ctx cur1
             case tkKind n of
-                TkInt i   -> pure (PLit (LInt (fromInteger (negate i))), cur2)
+                -- Same routing as the unsigned arm above, applied to
+                -- the negated value: stay in 'LInt' when the Int64
+                -- range can hold it (note that @minBound :: Int64@ is
+                -- one slot below @-(maxBound :: Int64)@, so the
+                -- comparison must be against @minBound@ post-negate).
+                TkInt i ->
+                    let neg = negate i in
+                    if neg >= toInteger (minBound :: Int64)
+                        then pure (PLit (LInt (fromInteger neg)), cur2)
+                        else pure (PLit (LInteger neg), cur2)
                 TkFloat d -> pure (PLit (LFloat (negate d)), cur2)
                 _         -> parseErr ctx "expected number after `-` in pattern" n
         _ -> parseErr ctx "expected pattern (Int, String, _, ident, or constructor)" tok
@@ -2878,15 +2987,28 @@ peekOp ctx cur =
 
 -- | Parse an identifier-like name inside backticks, allowing qualified
 -- segments such as @B.snoc@ or @Data.List.elem@.
+--
+-- 'TkPrimId' is accepted alongside 'TkIdent' / 'TkConId' so that
+-- MagicHash primops can be used in backticked-operator position, e.g.
+-- @x \`eqChar#\` y@ in @ghc-prim-0.12.0/GHC/Classes.hs:301@:
+--
+-- > (C# x) \`eqChar\` (C# y) = isTrue# (x \`eqChar#\` y)
+--
+-- Without this, the parser bails on the inner backtick, the body parse
+-- of @eqChar@ throws 'ParseError', and 'discoverInModuleWith'' silently
+-- records @eqChar@ as a discovery miss — which then surfaces as
+-- @IHC.Eval: unbound variable \`eqChar\`@ when the source-loaded
+-- @instance Eq Char where (==) = eqChar@ method body is forced.
 readBacktickName :: Ctx -> Cursor -> Maybe (Name, Cursor)
 readBacktickName ctx = goFirst
   where
     goFirst cur =
         let (tok, cur1) = nextSig ctx cur
         in case tkKind tok of
-            TkIdent n -> goRest n cur1
-            TkConId n -> goRest n cur1
-            _         -> Nothing
+            TkIdent  n -> goRest n cur1
+            TkConId  n -> goRest n cur1
+            TkPrimId n -> goRest n cur1
+            _          -> Nothing
 
     goRest acc cur =
         let (dotTok, curDot) = nextSig ctx cur
@@ -2993,7 +3115,28 @@ parseApp ctx cur0 = do
             _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseAtomPostfix ctx cur
                     loop (EApp fn arg) curA
+            -- NegativeLiterals (always-on): @TkMinus@ /immediately/
+            -- followed by a numeric literal in argument position is a
+            -- single negative literal, not binary subtraction.  The
+            -- adjacency check (no whitespace between '-' and the
+            -- digit) preserves the standard Haskell behaviour for
+            -- @f - 1@ (subtraction) — only @f -1@ becomes @f (-1)@.
+            -- Required by ghc-bignum's source, which uses this form
+            -- pervasively (e.g. @intToInt64# INT_MINBOUND#@ where
+            -- @INT_MINBOUND@ expands to @-0x8000000000000000@).
+            TkMinus
+              | tkCol tok > ctxMinCol ctx
+              , let (litTok, _) = nextToken (ctxSrc ctx) cur'
+              , tkStart litTok == tkEnd tok
+              , case tkKind litTok of
+                  TkInt _   -> True
+                  TkFloat _ -> True
+                  _         -> False
+              -> do
+                    (arg, curA) <- parseAtomPostfix ctx cur'
+                    loop (EApp fn (ENeg arg)) curA
               | otherwise -> pure (fn, cur)
+            _ | otherwise -> pure (fn, cur)
 
     isBlockArgStart k = case k of
         TkDo        -> True
@@ -3095,15 +3238,12 @@ parseRecordUpdateFields ctx cur acc = do
         TkEof -> pure (reverse acc, cur')
         _ -> parseErr ctx "expected field name or `}` in record update" tok
 
--- | Skip one type-argument after @\@@ in a type application.
+-- | Skip one type-argument after @\@@ in a type application, returning
+-- the cursor advanced past the consumed argument and the raw source-byte
+-- slice that spans it (opening bracket/tick through closing token).
 -- Handles: plain ident/conid (@\@Int@, @\@a@), promoted (@\@\'Foo@),
 -- and balanced paren/bracket groups (@\@(Maybe Int)@, @\@[Int]@).
-skipTypeArg :: Ctx -> Cursor -> IO Cursor
-skipTypeArg ctx cur0 = snd <$> captureTypeArg ctx cur0
-
--- | Like 'skipTypeArg', but also returns the raw source-byte slice that
--- spans the consumed type argument (opening bracket/tick through closing
--- token). Used to produce 'ETyApp' nodes that retain the type for later
+-- Used to produce 'ETyApp' nodes that retain the type for later
 -- inspection. Returns an empty string if nothing was consumed.
 captureTypeArg :: Ctx -> Cursor -> IO (Name, Cursor)
 captureTypeArg ctx cur0 =
@@ -3660,6 +3800,8 @@ tryQualified ctx firstName firstTok cur0 =
     go acc lastTok cur =
         let (dotTok, curAfterDot) = nextToken src cur in
         case tkKind dotTok of
+            TkDotDot | tkStart dotTok == tkEnd lastTok ->
+                pure (EVar (acc <> BC.pack ".."), curAfterDot)
             TkDot | tkStart dotTok == tkEnd lastTok ->
                 let (segTok, curAfterSeg) = nextToken src curAfterDot in
                 case tkKind segTok of
@@ -3667,6 +3809,9 @@ tryQualified ctx firstName firstTok cur0 =
                         pure (EVar (acc <> BC.pack "." <> n), curAfterSeg)
                     TkConId n | tkStart segTok == tkEnd dotTok ->
                         go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    _ | Just opName <- tokenOpName (tkKind segTok)
+                      , tkStart segTok == tkEnd dotTok ->
+                        pure (EVar (acc <> BC.pack "." <> opName), curAfterSeg)
                     _ -> pure (EVar acc, cur)
             _ -> pure (EVar acc, cur)
 

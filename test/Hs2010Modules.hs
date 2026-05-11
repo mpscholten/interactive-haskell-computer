@@ -129,7 +129,7 @@ spec = describe "Hs2010 — Modules" $ do
         it "2.3.6 import M (T(..))" $
             "module M where\nimport N (T(..))\n" `shouldParseHeaderTo`
                 mh "M" ExportAll
-                    [ImportDecl "N" False Nothing (ImportOnly ["T"])]
+                    [ImportDecl "N" False Nothing (ImportOnly ["T","$dotdot:T"])]
 
         it "2.3.7 import M hiding (x)" $
             "module M where\nimport N hiding (x)\n" `shouldParseHeaderTo`

@@ -32,9 +32,8 @@ module IHC.Classes
     , InstanceScopeRef
     , ScanHook
     , instanceScopeRef
-    , scanHookRef
-    , sharedClassRegRef
     , setSharedClassReg
+    , getSharedClassReg
     , unionInstanceScope
     , currentInstanceScope
     , clearInstanceScope
@@ -45,25 +44,23 @@ module IHC.Classes
     , catalogueHasClass
       -- * Demand-driven env fallback
     , EnvFallbackHook
-    , envFallbackRef
     , setEnvFallback
     , lookupEnvFallback
       -- * Core-instance load hook
-    , coreInstanceLoadHookRef
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
+      -- * Ctor -> type-name lookup (for source-loaded ADTs)
+    , setCtorTypeHook
+    , lookupCtorType
       -- * Per-load instance-registration hook
     , RegisterInstancesHook
-    , registerInstancesHookRef
     , setRegisterInstancesHook
     , triggerRegisterInstances
       -- * Class-method dispatcher fallback
-    , classMethodFallbackRef
     , setClassMethodFallback
     , lookupClassMethodFallback
       -- * TH Exp -> Expr decoder hook
     , ThExpToExprHook
-    , thExpToExprRef
     , setThExpToExpr
     , runThExpToExpr
       -- * B.1: superclass tracking
@@ -72,6 +69,10 @@ module IHC.Classes
     , clearSuperclasses
     , allSuperclasses
     , checkSuperclassCoverage
+      -- * PR 1: per-session hook bundle
+    , IHCHooks(..)
+    , legacyHooks
+    , resetSessionHooks
     ) where
 
 import Control.Exception (SomeException, catch)
@@ -87,6 +88,7 @@ import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr)
+import IHC.StringUtils (trimAscii)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -278,8 +280,7 @@ lookupInstanceMulti reg className typeTags = do
 -- This means /every/ call site (the dispatcher, @show@/@==@/@compare@
 -- builtins, the elaborator's @resolveTypedMethod@, …) automatically
 -- gets lazy-registration support without needing to call drain
--- explicitly. Callers that need a strictly-non-mutating lookup can
--- still use 'lookupInstanceMethodRaw'.
+-- explicitly.
 lookupInstanceMethod :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
 lookupInstanceMethod reg className typeTag methodName =
     lookupInstanceMethodMulti reg className [typeTag] methodName
@@ -299,16 +300,6 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
                     pure (mMethods' >>= HashMap.lookup methodName)
                 else pure Nothing
 
--- | Strictly-non-mutating variant of 'lookupInstanceMethod' — does NOT
--- drain the lazy-instance catalogue. Used by call sites that need to
--- distinguish "no instance is registered" from "an instance is
--- catalogued but not yet materialised" without triggering
--- materialisation.
-lookupInstanceMethodRaw :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
-lookupInstanceMethodRaw reg className typeTag methodName = do
-    m <- readIORef reg
-    pure (HashMap.lookup (className, [typeTag]) m >>= HashMap.lookup methodName)
-
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a
 -- type-application argument verbatim — this means quotes, parens, and
@@ -324,16 +315,12 @@ lookupInstanceMethodRaw reg className typeTag methodName = do
 --   * @42@       (a @Nat@ literal)   → @42@
 --   * @\'x\'@    (a @Char@ literal)   → @x@
 normalizeTyTag :: ByteString -> ByteString
-normalizeTyTag bs0 = stripQuotes (trimSpace (stripParens bs0))
+normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
   where
-    trimSpace s =
-        BC.dropWhile isSpace (BC.reverse (BC.dropWhile isSpace (BC.reverse s)))
-    isSpace c = c == ' ' || c == '\t' || c == '\n' || c == '\r'
-
     stripParens s
         | BC.length s >= 2
         , BC.head s == '('
-        , BC.last s == ')'    = stripParens (trimSpace (BC.init (BC.tail s)))
+        , BC.last s == ')'    = stripParens (trimAscii (BC.init (BC.tail s)))
         | otherwise           = s
 
     stripQuotes s
@@ -360,7 +347,23 @@ typeTagOf (VCon "True"  _) = BC.pack "Bool"
 typeTagOf (VCon "False" _) = BC.pack "Bool"
 typeTagOf (VCon "(,)" _)   = BC.pack "(,)"
 typeTagOf (VCon "(,,)" _)  = BC.pack "(,,)"
-typeTagOf (VCon n _)    = n
+-- Common-case ctor -> type-name normalisation for built-in data types
+-- whose instances are registered under the type name, not the
+-- constructor name.  Without this, @<*>@/@>>=@/@<>@ on a 'Just'/'Nothing'
+-- looks for @Applicative Just@ etc. and finds nothing.
+typeTagOf (VCon "Just"    _) = BC.pack "Maybe"
+typeTagOf (VCon "Nothing" _) = BC.pack "Maybe"
+typeTagOf (VCon "Left"    _) = BC.pack "Either"
+typeTagOf (VCon "Right"   _) = BC.pack "Either"
+typeTagOf (VCon n _) =
+    -- For source-loaded ADTs (e.g. warp's @StdMethod = GET | POST | ...@),
+    -- consult the scheduler-installed ctor->type hook so dispatch keys
+    -- on the type name, not the ctor name.  Falls back to the ctor
+    -- name when the hook hasn't been installed (boot, REPL transient
+    -- lookups) or doesn't know about @n@.
+    case unsafePerformIO (lookupCtorType legacyHooks n) of
+        Just ty -> ty
+        Nothing -> n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
@@ -377,6 +380,7 @@ typeTagOf (VPrimObj PrimRealWorld)       = BC.pack "<RealWorld#>"
 typeTagOf (VPrimObj (PrimMVar _))        = BC.pack "<MVar>"
 typeTagOf (VPrimObj (PrimTVar _))        = BC.pack "<TVar>"
 typeTagOf (VPrimObj (PrimThreadId _))    = BC.pack "<ThreadId>"
+typeTagOf (VPrimObj (PrimBigNat _))      = BC.pack "<BigNat>"
 typeTagOf (VLabel _)                     = BC.pack "Label"
 
 --------------------------------------------------------------------------------
@@ -386,20 +390,23 @@ typeTagOf (VLabel _)                     = BC.pack "Label"
 type InstanceScopeRef = IORef (Set ByteString)
 type ScanHook = ByteString -> IO ()
 
-{-# NOINLINE instanceScopeRef #-}
+-- 'instanceScopeRef' is now a field-projection accessor over
+-- 'legacyClassRunState' (see below).  The four legacy module-level
+-- @IORef@s for per-run class state ('instanceScope',
+-- 'instanceCatalogue', 'superclasses') were collapsed into a single
+-- bundle CAF in PR 3; the names below stay public so existing
+-- callers don't have to update.
 instanceScopeRef :: InstanceScopeRef
-instanceScopeRef = unsafePerformIO (newIORef Set.empty)
+instanceScopeRef = lcrsInstanceScope legacyClassRunState
 
-{-# NOINLINE scanHookRef #-}
-scanHookRef :: IORef (Maybe ScanHook)
-scanHookRef = unsafePerformIO (newIORef Nothing)
+setSharedClassReg :: IHCHooks -> ClassRegistry -> IO ()
+setSharedClassReg hooks reg = writeIORef (hkSharedClassReg hooks) (Just reg)
 
-{-# NOINLINE sharedClassRegRef #-}
-sharedClassRegRef :: IORef (Maybe ClassRegistry)
-sharedClassRegRef = unsafePerformIO (newIORef Nothing)
-
-setSharedClassReg :: ClassRegistry -> IO ()
-setSharedClassReg reg = writeIORef sharedClassRegRef (Just reg)
+-- | Read the currently-installed shared 'ClassRegistry', if any.
+-- Replaces the @readIORef sharedClassRegRef@ idiom that the
+-- evaluator and scheduler used to do directly.
+getSharedClassReg :: IHCHooks -> IO (Maybe ClassRegistry)
+getSharedClassReg hooks = readIORef (hkSharedClassReg hooks)
 
 unionInstanceScope :: Set ByteString -> IO ()
 unionInstanceScope ms = modifyIORef' instanceScopeRef (Set.union ms)
@@ -445,9 +452,8 @@ clearInstanceScope = writeIORef instanceScopeRef Set.empty
 -- the eager 'registerOne' would have done up front.
 type InstanceCatalogue = Map ByteString [IO ()]
 
-{-# NOINLINE instanceCatalogueRef #-}
 instanceCatalogueRef :: IORef InstanceCatalogue
-instanceCatalogueRef = unsafePerformIO (newIORef Map.empty)
+instanceCatalogueRef = lcrsInstanceCatalogue legacyClassRunState
 
 -- | Stash a "register one instance of @cls@" closure into the catalogue.
 -- Cheap: just an 'IORef' update. The expensive work (parsing instance
@@ -522,16 +528,12 @@ catalogueHasClass cls = do
 -- 'currentOwner' in 'IHC.Eval').
 type EnvFallbackHook = Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 
-{-# NOINLINE envFallbackRef #-}
-envFallbackRef :: IORef EnvFallbackHook
-envFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+setEnvFallback :: IHCHooks -> EnvFallbackHook -> IO ()
+setEnvFallback hooks = writeIORef (hkEnvFallback hooks)
 
-setEnvFallback :: EnvFallbackHook -> IO ()
-setEnvFallback = writeIORef envFallbackRef
-
-lookupEnvFallback :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
-lookupEnvFallback owner name = do
-    hook <- readIORef envFallbackRef
+lookupEnvFallback :: IHCHooks -> Maybe ByteString -> ByteString -> IO (Maybe Thunk)
+lookupEnvFallback hooks owner name = do
+    hook <- readIORef (hkEnvFallback hooks)
     hook owner name
 
 --------------------------------------------------------------------------------
@@ -547,43 +549,67 @@ lookupEnvFallback owner name = do
 -- had before the elaborator existed.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE classMethodFallbackRef #-}
-classMethodFallbackRef :: IORef (ByteString -> ByteString -> IO (Maybe Val))
-classMethodFallbackRef = unsafePerformIO (newIORef (\_ _ -> pure Nothing))
+setClassMethodFallback :: IHCHooks -> (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
+setClassMethodFallback hooks = writeIORef (hkClassMethodFallback hooks)
 
-setClassMethodFallback :: (ByteString -> ByteString -> IO (Maybe Val)) -> IO ()
-setClassMethodFallback = writeIORef classMethodFallbackRef
-
-lookupClassMethodFallback :: ByteString -> ByteString -> IO (Maybe Val)
-lookupClassMethodFallback cls method = do
-    hook <- readIORef classMethodFallbackRef
+lookupClassMethodFallback :: IHCHooks -> ByteString -> ByteString -> IO (Maybe Val)
+lookupClassMethodFallback hooks cls method = do
+    hook <- readIORef (hkClassMethodFallback hooks)
     hook cls method
 
 --------------------------------------------------------------------------------
 -- Core-instance load hook
 --
--- One-shot trigger for force-loading GHC.Internal.Base and friends so
--- their Applicative/Monad/Functor instance dicts are in the registry.
--- Bare REPL startup skips this (keeps prompt latency low); the elaborator's
--- 'resolveTypedMethod' fires it only when a type-annotation-driven
--- lookup misses (e.g. @pure 42 :: Maybe Int@ before any explicit import).
+-- Per-class trigger for force-loading the modules that provide instances
+-- for a specific class so its dict is in the registry.  Bare REPL
+-- startup skips this (keeps prompt latency low); the elaborator's
+-- 'resolveTypedMethod' fires it with the class name only when a
+-- type-annotation-driven lookup misses (e.g. @pure 42 :: Maybe Int@ for
+-- 'Applicative', @show (Right 1)@ for 'Show', etc.).
 --
 -- Installed by 'buildBaseEnv'; invoked by 'IHC.Eval.resolveTypedMethod'.
--- The hook itself maintains its own "already-loaded" flag so subsequent
--- calls are free (no re-scan).
+-- The hook itself maintains a per-class "already-loaded" set so
+-- subsequent calls for the same class are free (no re-scan).  Different
+-- classes load on first miss for each, scoped to the modules the
+-- 'IHC.InstanceManifest' says provide instances for that class.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE coreInstanceLoadHookRef #-}
-coreInstanceLoadHookRef :: IORef (IO ())
-coreInstanceLoadHookRef = unsafePerformIO (newIORef (pure ()))
+setCoreInstanceLoadHook :: IHCHooks -> (ByteString -> IO ()) -> IO ()
+setCoreInstanceLoadHook hooks = writeIORef (hkCoreInstanceLoad hooks)
 
-setCoreInstanceLoadHook :: IO () -> IO ()
-setCoreInstanceLoadHook = writeIORef coreInstanceLoadHookRef
+-- | Trigger a core-instance load for the given class.  The hook tracks
+-- which classes it has already loaded and short-circuits subsequent
+-- calls for the same class.
+triggerCoreInstanceLoad :: IHCHooks -> ByteString -> IO ()
+triggerCoreInstanceLoad hooks cls = do
+    hook <- readIORef (hkCoreInstanceLoad hooks)
+    hook cls
 
-triggerCoreInstanceLoad :: IO ()
-triggerCoreInstanceLoad = do
-    hook <- readIORef coreInstanceLoadHookRef
-    hook
+--------------------------------------------------------------------------------
+-- Ctor -> type-name lookup hook (Section: source-loaded ADT dispatch)
+--
+-- 'typeTagOf' hardcodes a handful of stdlib ctor -> type-name mappings
+-- (Just/Nothing -> Maybe, etc.), but every source-loaded ADT - warp's
+-- 'StdMethod', any user-defined enum, etc. - falls into the @VCon n _ -> n@
+-- arm and surfaces with the ctor name as its type tag.  Class dispatch
+-- then looks for an instance keyed on @"GET"@ instead of @"StdMethod"@
+-- and silently fails, the host @Ix Int@ shim takes over because @Int@
+-- happens to be a dispatchable tag, and the call ends in
+-- @Ix Int.index: non-Int index@.
+--
+-- A scheduler-installed hook supplies the live ctor->type mapping built
+-- from 'lmDataReg' across all loaded modules.  Same pattern as
+-- 'coreInstanceLoadHookRef': default to @const Nothing@ until installed,
+-- @typeTagOf@ peeks via @unsafePerformIO@.
+--------------------------------------------------------------------------------
+
+setCtorTypeHook :: IHCHooks -> (ByteString -> Maybe ByteString) -> IO ()
+setCtorTypeHook hooks = writeIORef (hkCtorType hooks)
+
+lookupCtorType :: IHCHooks -> ByteString -> IO (Maybe ByteString)
+lookupCtorType hooks ctor = do
+    f <- readIORef (hkCtorType hooks)
+    pure (f ctor)
 
 --------------------------------------------------------------------------------
 -- Per-load instance-registration hook
@@ -605,16 +631,12 @@ triggerCoreInstanceLoad = do
 
 type RegisterInstancesHook = ByteString -> IO ()
 
-{-# NOINLINE registerInstancesHookRef #-}
-registerInstancesHookRef :: IORef RegisterInstancesHook
-registerInstancesHookRef = unsafePerformIO (newIORef (\_ -> pure ()))
+setRegisterInstancesHook :: IHCHooks -> RegisterInstancesHook -> IO ()
+setRegisterInstancesHook hooks = writeIORef (hkRegisterInstances hooks)
 
-setRegisterInstancesHook :: RegisterInstancesHook -> IO ()
-setRegisterInstancesHook = writeIORef registerInstancesHookRef
-
-triggerRegisterInstances :: ByteString -> IO ()
-triggerRegisterInstances modName = do
-    hook <- readIORef registerInstancesHookRef
+triggerRegisterInstances :: IHCHooks -> ByteString -> IO ()
+triggerRegisterInstances hooks modName = do
+    hook <- readIORef (hkRegisterInstances hooks)
     hook modName
 
 --------------------------------------------------------------------------------
@@ -629,18 +651,140 @@ triggerRegisterInstances modName = do
 
 type ThExpToExprHook = Val -> IO Expr
 
-{-# NOINLINE thExpToExprRef #-}
-thExpToExprRef :: IORef ThExpToExprHook
-thExpToExprRef = unsafePerformIO (newIORef (\_ ->
-    error "IHC.Classes: thExpToExpr hook not installed"))
+setThExpToExpr :: IHCHooks -> ThExpToExprHook -> IO ()
+setThExpToExpr hooks = writeIORef (hkThExpToExpr hooks)
 
-setThExpToExpr :: ThExpToExprHook -> IO ()
-setThExpToExpr = writeIORef thExpToExprRef
-
-runThExpToExpr :: Val -> IO Expr
-runThExpToExpr v = do
-    hook <- readIORef thExpToExprRef
+runThExpToExpr :: IHCHooks -> Val -> IO Expr
+runThExpToExpr hooks v = do
+    hook <- readIORef (hkThExpToExpr hooks)
     hook v
+
+--------------------------------------------------------------------------------
+-- IHCHooks bundle (PR 1 of the IHCContext refactor)
+--
+-- 'IHCHooks' is the per-session bundle of all eight write-once hooks
+-- declared above (env fallback, class-method fallback, core-instance
+-- load trigger, ctor-type lookup, per-load instance registration,
+-- legacy scan hook, shared 'ClassRegistry', and TH-Exp decoder).
+--
+-- The data type is intentionally defined HERE in 'IHC.Classes' rather
+-- than in 'IHC.Context' so that 'IHC.Eval' (which sits below
+-- 'IHC.Context' in the import DAG via 'IHC.FFI' → 'IHC.Loader.Types' →
+-- 'IHC.Context') can take an 'IHCHooks' parameter through 'eval' /
+-- 'force' / 'apply' without forcing the cycle:
+--
+--   IHC.Context → IHC.Loader.Types → IHC.FFI → IHC.Eval → IHC.Context
+--
+-- 'IHC.Context' re-exports 'IHCHooks' (see 'IHC.Context.IHCHooks') so
+-- the rest of the codebase can keep importing the bundle from there.
+--
+-- During PR 1 the legacy module-level @IORef@s above remain the
+-- source of truth and the bundle is unused; later steps in PR 1
+-- migrate the storage into 'IHCHooks' fields and delete the globals.
+--------------------------------------------------------------------------------
+
+data IHCHooks = IHCHooks
+    { hkEnvFallback         :: !(IORef EnvFallbackHook)
+    , hkClassMethodFallback :: !(IORef (ByteString -> ByteString -> IO (Maybe Val)))
+    , hkCoreInstanceLoad    :: !(IORef (ByteString -> IO ()))
+    , hkCtorType            :: !(IORef (ByteString -> Maybe ByteString))
+    , hkRegisterInstances   :: !(IORef RegisterInstancesHook)
+    , hkScan                :: !(IORef (Maybe ScanHook))
+    , hkSharedClassReg      :: !(IORef (Maybe ClassRegistry))
+    , hkThExpToExpr         :: !(IORef ThExpToExprHook)
+    }
+
+-- | Bundle of the three module-level per-run class-state IORefs:
+-- the in-scope module set for instance dispatch, the lazy instance
+-- catalogue, and the superclass map.
+--
+-- Allocated once via the 'legacyClassRunState' CAF below.  The three
+-- legacy @global*Ref@-style accessors ('instanceScopeRef',
+-- 'instanceCatalogueRef', 'superclassesRef') are now field
+-- projections on this single record, collapsing three separate
+-- 'unsafePerformIO + IORef + NOINLINE' globals into one allocation.
+data LegacyClassRunState = LegacyClassRunState
+    { lcrsInstanceScope     :: !(IORef (Set ByteString))
+    , lcrsInstanceCatalogue :: !(IORef InstanceCatalogue)
+    , lcrsSuperclasses      :: !(IORef (Map ByteString [ByteString]))
+    }
+
+-- | One-shot allocation of the three per-run class-state IORefs.
+-- Same defaults the legacy individual @{-# NOINLINE #-}@ refs used:
+-- empty 'Set', empty 'Map', empty 'Map'.
+{-# NOINLINE legacyClassRunState #-}
+legacyClassRunState :: LegacyClassRunState
+legacyClassRunState = unsafePerformIO $ do
+    scope     <- newIORef Set.empty
+    catalogue <- newIORef Map.empty
+    supers    <- newIORef Map.empty
+    pure LegacyClassRunState
+        { lcrsInstanceScope     = scope
+        , lcrsInstanceCatalogue = catalogue
+        , lcrsSuperclasses      = supers
+        }
+
+-- | A package of the legacy module-level hook 'IORef's into an
+-- 'IHCHooks' record.  Used while PR 1B threads 'IHCHooks' through
+-- 'eval' / 'force' / 'apply' and every caller without yet migrating
+-- the storage off the legacy globals.  Reading any field of
+-- 'legacyHooks' returns the SAME 'IORef' the legacy accessors
+-- ('lookupEnvFallback', 'triggerCoreInstanceLoad', …) read from, so
+-- semantics carry over verbatim during this slice.
+--
+-- PR 1C deletes 'legacyHooks' alongside the eight module-level
+-- @IORef@s, rewires the hook accessors to take 'IHCHooks' explicitly,
+-- and constructs a fresh 'IHCHooks' per session via 'freshHooks' in
+-- 'IHC.Context'.
+{-# NOINLINE legacyHooks #-}
+legacyHooks :: IHCHooks
+legacyHooks = unsafePerformIO $ do
+    envFb       <- newIORef (\_ _ -> pure Nothing)
+    classMethFb <- newIORef (\_ _ -> pure Nothing)
+    coreLoad    <- newIORef (\_ -> pure ())
+    ctorType    <- newIORef (const Nothing)
+    regInsts    <- newIORef (\_ -> pure ())
+    scan        <- newIORef Nothing
+    sharedReg   <- newIORef Nothing
+    thExp       <- newIORef
+        (\_ -> error "IHC.Classes: thExpToExpr hook not installed")
+    pure IHCHooks
+        { hkEnvFallback         = envFb
+        , hkClassMethodFallback = classMethFb
+        , hkCoreInstanceLoad    = coreLoad
+        , hkCtorType            = ctorType
+        , hkRegisterInstances   = regInsts
+        , hkScan                = scan
+        , hkSharedClassReg      = sharedReg
+        , hkThExpToExpr         = thExp
+        }
+
+-- | Reset every hook field of an 'IHCHooks' bundle to its no-op
+-- default.  Called by 'IHC.Scheduler.resetPerRunGlobals' at session
+-- boot so a per-run reset wipes the entire bundle in one place
+-- instead of scattering per-hook reset calls across the loader.
+--
+-- Defaults match 'legacyHooks''s initial values byte-for-byte (the
+-- same lambdas/Nothing values that 'unsafePerformIO' wrote in at
+-- module-init time).  After this returns, every hook field reads as
+-- if the session had just started: 'lookupEnvFallback' returns
+-- 'Nothing', 'triggerCoreInstanceLoad' is a no-op, etc.
+--
+-- Boot code (e.g. 'IHC.Scheduler.installEnvFallbackHook',
+-- 'setSharedClassReg', 'IHC.TH.installThExpToExprHook') is expected
+-- to overwrite the relevant fields with real implementations after
+-- 'resetSessionHooks' runs.
+resetSessionHooks :: IHCHooks -> IO ()
+resetSessionHooks hooks = do
+    writeIORef (hkEnvFallback         hooks) (\_ _ -> pure Nothing)
+    writeIORef (hkClassMethodFallback hooks) (\_ _ -> pure Nothing)
+    writeIORef (hkCoreInstanceLoad    hooks) (\_   -> pure ())
+    writeIORef (hkCtorType            hooks) (const Nothing)
+    writeIORef (hkRegisterInstances   hooks) (\_   -> pure ())
+    writeIORef (hkScan                hooks) Nothing
+    writeIORef (hkSharedClassReg      hooks) Nothing
+    writeIORef (hkThExpToExpr         hooks)
+        (\_ -> error "IHC.Classes: thExpToExpr hook not installed")
 
 --------------------------------------------------------------------------------
 -- B.1: superclass tracking (Haskell Report §4.3.1)
@@ -659,9 +803,8 @@ runThExpToExpr v = do
 -- to would require a real type AST and is deferred.
 --------------------------------------------------------------------------------
 
-{-# NOINLINE superclassesRef #-}
 superclassesRef :: IORef (Map ByteString [ByteString])
-superclassesRef = unsafePerformIO (newIORef Map.empty)
+superclassesRef = lcrsSuperclasses legacyClassRunState
 
 -- | Register a class's superclass list.  Idempotent: subsequent
 -- registrations for the same class name overwrite (later modules win,

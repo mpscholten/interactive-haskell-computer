@@ -14,6 +14,7 @@
 -- Phase 3.6: ImplicitParamMap is threaded alongside Env. Implicit params
 -- (?x) live in a separate namespace; closures capture the map at creation
 -- time (lexical scoping).
+{-# LANGUAGE ScopedTypeVariables #-}
 module IHC.Eval
     ( eval
     , force
@@ -29,8 +30,8 @@ import Control.Exception (throwIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.IORef
 import Data.Int (Int64)
+import Data.IORef
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc (mallocBytes)
@@ -41,8 +42,9 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, sharedClassRegRef, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import qualified IHC.Elaborate as Elab
+import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
@@ -58,31 +60,33 @@ import IHC.Val
 -- doesn't need every rewrite target resolved at registration time.
 -- Propagates exceptions from 'force' — callers decide whether to
 -- fall back to a placeholder.
-forceMethodVal :: Val -> IO Val
-forceMethodVal (VLazyMethod t) = force t
-forceMethodVal v               = pure v
+forceMethodVal :: IHCHooks -> Val -> IO Val
+forceMethodVal hooks (VLazyMethod t) = force hooks t
+forceMethodVal _     v               = pure v
 
 -- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
 -- method in the class registry; if the instance registered a
 -- 'methodPlaceholder' (class default with no per-instance override),
 -- falls back to a known-equivalent method (e.g. Monad.return →
 -- Applicative.pure).
-resolveTypedMethod :: ClassRegistry -> Name -> Name -> Name -> IO Val
-resolveTypedMethod reg cls method tag = do
+resolveTypedMethod :: IHCHooks -> ClassRegistry -> Name -> Name -> Name -> IO Val
+resolveTypedMethod hooks reg cls method tag = do
     resolved <- tryResolve
     case resolved of
-        Just v  -> forceMethodVal v
+        Just v  -> forceMethodVal hooks v
         Nothing -> do
             -- First-miss retry: the REPL doesn't pre-load core instance
             -- dicts (keeps startup latency low). The hook force-loads
-            -- GHC.Internal.Base / Maybe / … once per session; subsequent
-            -- calls are free. ('lookupInstanceMethod' inside @tryResolve@
+            -- the modules the manifest reports as providers for THIS
+            -- class (and the modules defining its instance head types)
+            -- once per session per class; subsequent calls for the same
+            -- class are free. ('lookupInstanceMethod' inside @tryResolve@
             -- already drains the Stage-2 lazy-instance catalogue on
             -- miss, so a separate drain is unnecessary here.)
-            triggerCoreInstanceLoad
+            triggerCoreInstanceLoad legacyHooks cls
             resolved2 <- tryResolve
             case resolved2 of
-                Just v  -> forceMethodVal v
+                Just v  -> forceMethodVal hooks v
                 Nothing -> do
                     -- Still no match: fall back to the existing value-
                     -- directed dispatcher.  This keeps behaviour
@@ -90,9 +94,9 @@ resolveTypedMethod reg cls method tag = do
                     -- resolved tag points at an instance we haven't
                     -- loaded (e.g. @Monad (ST s)@: we don't force-load
                     -- @GHC.Internal.ST@ on startup).
-                    mFallback <- lookupClassMethodFallback cls method
+                    mFallback <- lookupClassMethodFallback legacyHooks cls method
                     case mFallback of
-                        Just v  -> forceMethodVal v
+                        Just v  -> forceMethodVal hooks v
                         Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
                                         <> BC.unpack cls <> " " <> BC.unpack tag
                                         <> "` for method `" <> BC.unpack method <> "`")
@@ -130,15 +134,15 @@ typedMethodFallbacks c m
         [(BC.pack "Applicative", BC.pack "(*>)")]
   | otherwise = []
 
-force :: Thunk -> IO Val
-force t = do
+force :: IHCHooks -> Thunk -> IO Val
+force hooks t = do
     st <- readIORef t
     case st of
         Evaluated v -> pure v
         BlackHole msg -> throwIO (LoopException msg)
         Unevaluated (Closure env ipm expr) -> do
             writeIORef t (BlackHole (take 500 (show expr)))
-            v <- eval env ipm expr
+            v <- eval hooks env ipm expr
             writeIORef t (Evaluated v)
             pure v
         -- Lazy-init builtin: run the host @IO Val@ action exactly once,
@@ -155,8 +159,8 @@ force t = do
 -- eval
 --------------------------------------------------------------------------------
 
-eval :: Env -> ImplicitParamMap -> Expr -> IO Val
-eval env ipm = go
+eval :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
+eval hooks env ipm = go
   where
     go (ELit (LInt n))   = pure (VInt n)
     go (ELit (LInteger n)) = pure (VInteger n)
@@ -183,7 +187,7 @@ eval env ipm = go
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
 
     go (EVar name) = case lookupEnv name env of
-        Just t  -> force t
+        Just t  -> force hooks t
         Nothing -> do
             -- Demand-driven fallback (Haskell 2010 §4.3.2 scope + lazy
             -- body eval): a closure's frozen env may be missing a
@@ -199,10 +203,10 @@ eval env ipm = go
             -- search to that module's actual import declarations, per
             -- Haskell 2010 §5.5.  'Nothing' falls back to the unscoped
             -- search (entry boundary, builtins, transient lookups).
-            owner <- currentOwner env
-            mT    <- lookupEnvFallback owner name
+            owner <- currentOwner hooks env
+            mT    <- lookupEnvFallback legacyHooks owner name
             case mT of
-                Just t  -> force t
+                Just t  -> force hooks t
                 Nothing -> error ("IHC.Eval: unbound variable `"
                                   <> BC.unpack name <> "`")
 
@@ -211,10 +215,20 @@ eval env ipm = go
         xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
         case fv of
             VPrimObj _ -> do
-                a <- force xt
+                a <- force hooks xt
                 error ("IHC.Eval.go(EApp): VPrimObj in function position: "
                        <> showValForDebug fv <> " applied to " <> showValForDebug a)
-            _ -> applyIP ipm fv xt
+            VCon _ (_:_:_) -> do
+                a <- force hooks xt
+                error ("IHC.Eval.go(EApp): not a function while evaluating `"
+                       <> show f <> "` applied to `" <> show x <> "`: "
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
+            VCon n [] | not (isStateTokenNewtypeCtor n) -> do
+                a <- force hooks xt
+                error ("IHC.Eval.go(EApp): not a function while evaluating `"
+                       <> show f <> "` applied to `" <> show x <> "`: "
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
+            _ -> applyIP hooks ipm fv xt
 
     go (ELam name body) =
         -- Phase 3.6: User-defined lambdas use VFunIP so the caller can
@@ -222,7 +236,7 @@ eval env ipm = go
         -- (lexical binding) takes priority over the caller's map.
         pure $ VFunIP ipm $ \callerIPM argThunk ->
             let mergedIPM = Map.union ipm callerIPM
-            in eval (extendEnv name argThunk env) mergedIPM body
+            in eval hooks (extendEnv name argThunk env) mergedIPM body
 
     go (ELet binds body) = do
         -- Recursive group: pre-allocate a thunk per binding holding a
@@ -238,7 +252,7 @@ eval env ipm = go
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure env' ipm rhs)))
               (zip binds slots)
-        eval env' ipm body
+        eval hooks env' ipm body
 
     go (ECase scrut alts) = do
         v0 <- go scrut
@@ -247,7 +261,7 @@ eval env ipm = go
         -- wrapper before matching, but must not eagerly execute source-built
         -- `IO` / `ST` constructors, which use `VCon`.
         v <- case v0 of
-            VIO _ -> runIOVal v0
+            VIO _ -> runIOVal hooks v0
             _     -> pure v0
         tryAlts v alts
 
@@ -266,10 +280,11 @@ eval env ipm = go
     go (ENeg e) = do
         v <- go e
         case v of
-            VInt n   -> pure (VInt (negate n))
-            VFloat d -> pure (VFloat (negate d))
-            other    -> error ("IHC.Eval: negate of non-numeric: "
-                               <> showValForDebug other)
+            VInt n     -> pure (VInt (negate n))
+            VInteger n -> pure (VInteger (negate n))
+            VFloat d   -> pure (VFloat (negate d))
+            other      -> error ("IHC.Eval: negate of non-numeric: "
+                                 <> showValForDebug other)
 
     go (ETuple es) = do
         -- Build the right tuple constructor name for this arity.
@@ -278,12 +293,12 @@ eval env ipm = go
         thunks <- mapM (newThunkIP env ipm) es
         pure (VCon name thunks)
 
-    go (EDo stmts) = evalDo env ipm stmts
+    go (EDo stmts) = evalDo hooks env ipm stmts
 
     -- Phase 3.6: Implicit parameter reference.
     -- Look up ?name in the current ImplicitParamMap. Miss -> runtime error.
     go (EImplicitRef name) = case lookupIPMap name ipm of
-        Just t  -> force t
+        Just t  -> force hooks t
         Nothing -> error ("IHC.Eval: implicit parameter `?"
                           <> BC.unpack name <> "` is not in scope")
 
@@ -298,7 +313,7 @@ eval env ipm = go
         mapM_ (\((_, rhs), slot) ->
                    writeIORef slot (Unevaluated (Closure env ipm rhs)))
               (zip binds slots)
-        eval env ipm' body
+        eval hooks env ipm' body
 
     -- Record construction: Con { f1 = e1, f2 = e2, ... }
     -- We ignore field names and build a positional VCon.
@@ -336,11 +351,11 @@ eval env ipm = go
         qqVal      <- go (EVar qqName)
         projVal    <- go (EVar (BC.pack "$fldProj$quoteExp"))
         qqT        <- newWHNFThunk qqVal
-        quoteExpFn <- applyIP ipm projVal qqT
+        quoteExpFn <- applyIP hooks ipm projVal qqT
         bodyT      <- newWHNFThunk =<< stringLiteralToListVal body
-        qExp       <- applyIP ipm quoteExpFn bodyT
-        thExpVal   <- runIOVal qExp
-        eval env ipm =<< runThExpToExpr thExpVal
+        qExp       <- applyIP hooks ipm quoteExpFn bodyT
+        thExpVal   <- runIOVal hooks qExp
+        eval hooks env ipm =<< runThExpToExpr legacyHooks thExpVal
 
     -- Value-level TypeApplications (@T). ihc is optimistic about types:
     -- the type argument is retained by the parser as AST metadata, but
@@ -370,11 +385,11 @@ eval env ipm = go
     -- (class, tag, method) isn't in the shared class registry —
     -- that's a bug (elaborator shouldn't emit an unresolvable tag).
     go (ETypedMethod cls method tag) = do
-        mReg <- readIORef sharedClassRegRef
+        mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
                               <> "(elaborator fired before buildBaseEnv?)")
-            Just reg -> resolveTypedMethod reg cls method tag
+            Just reg -> resolveTypedMethod hooks reg cls method tag
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -410,7 +425,7 @@ eval env ipm = go
             EVar method
                 | method == BC.pack "maxBound"
                || method == BC.pack "minBound" -> do
-                    mReg <- readIORef sharedClassRegRef
+                    mReg <- getSharedClassReg legacyHooks
                     case mReg of
                         Nothing -> pure Nothing
                         Just classReg -> do
@@ -422,7 +437,7 @@ eval env ipm = go
                             case mv of
                                 Nothing -> pure Nothing
                                 Just v -> do
-                                    r <- try (forceMethodVal v)
+                                    r <- try (forceMethodVal hooks v)
                                             :: IO (Either SomeException Val)
                                     case r of
                                         Right v' -> pure (Just v')
@@ -433,7 +448,7 @@ eval env ipm = go
     -- Returns 'Just' if elaboration rewrote something; 'Nothing'
     -- otherwise.
     tryElaborateTyAnn e ty = do
-        mReg <- readIORef sharedClassRegRef
+        mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing -> pure Nothing
             Just classReg -> case Elab.parseRawTypeExpr ty of
@@ -578,11 +593,11 @@ eval env ipm = go
                     | otherwise              ->
                         case lookupEnv (BC.pack "fromLabel") env of
                             Just t -> do
-                                flv <- force t
+                                flv <- force hooks t
                                 case flv of
                                     VFun _ -> do
                                         lblT <- newWHNFThunk v
-                                        apply flv lblT
+                                        apply hooks flv lblT
                                     _ -> pure v
                             Nothing -> pure v
                 _               -> pure v
@@ -598,10 +613,10 @@ eval env ipm = go
              <> " in alternatives "
              <> show (map (\(Alt p _) -> p) alts0)))
         goAlts (Alt pat body : rest) = do
-            m <- matchPat pat v
+            m <- matchPat hooks pat v
             case m of
                 Just bindings -> do
-                    r <- try (eval (extendEnvMany bindings env) ipm body)
+                    r <- try (eval hooks (extendEnvMany bindings env) ipm body)
                            :: IO (Either PatternMatchFail Val)
                     case r of
                         Right result -> pure result
@@ -813,15 +828,15 @@ stringLitVal bs = go (BC.unpack bs)
 -- | Match a Haskell string literal against a runtime cons-list value
 -- (@VCon ":" [h, t]@ chain ending in @VCon "[]" []@).  Succeeds when the
 -- list's characters equal @s@ (byte-for-byte over the UTF-8 payload).
-matchStringPatList :: ByteString -> Val -> IO (Maybe [(Name, Thunk)])
-matchStringPatList s0 v0 = go (BC.unpack s0) v0
+matchStringPatList :: IHCHooks -> ByteString -> Val -> IO (Maybe [(Name, Thunk)])
+matchStringPatList hooks s0 v0 = go (BC.unpack s0) v0
   where
     go [] (VCon "[]" []) = pure (Just [])
     go (c:cs) (VCon ":" [hT, tT]) = do
-        hv <- force hT
+        hv <- force hooks hT
         case hv of
             VChar d | d == c -> do
-                tv <- force tT
+                tv <- force hooks tT
                 go cs tv
             _ -> pure Nothing
     -- The runtime sometimes keeps short strings as VStr even after
@@ -853,29 +868,46 @@ patternVars (PRecord _ fps)  = concatMap (patternVars . snd) fps
 patternVars (PRecordWild _)  = []
 patternVars (PView _ p)      = patternVars p
 
-matchPat :: Pat -> Val -> IO (Maybe [(Name, Thunk)])
-matchPat PWild        _          = pure (Just [])
-matchPat (PVar n)     v          = do
+-- | Attempt to match a constructor pattern against a value via the
+-- pattern synonym registry: if @name@ is registered as a pattern
+-- synonym with parameters @ps@ and body @b@, substitute @ps -> args@
+-- in @b@ and re-match against @v@.  Falls back to 'Nothing' when
+-- @name@ is not a registered synonym (i.e. genuinely an unknown
+-- constructor).
+tryPatSyn :: IHCHooks -> Name -> [Pat] -> Val -> IO (Maybe [(Name, Thunk)])
+tryPatSyn hooks name args v = do
+    mPs <- PatSyn.lookupPatSyn name
+    case mPs of
+        Just (PatSyn.PatSyn params body)
+            | length params == length args ->
+                let sub   = Map.fromList (zip params args)
+                    body' = PatSyn.substPat sub body
+                in matchPat hooks body' v
+        _ -> pure Nothing
+
+matchPat :: IHCHooks -> Pat -> Val -> IO (Maybe [(Name, Thunk)])
+matchPat hooks PWild        _          = pure (Just [])
+matchPat hooks (PVar n)     v          = do
     -- The value is already WHNF -- bind it directly to a WHNF thunk.
     -- (This is the cheapest way; we don't have the original thunk
     -- here since the caller forced it before calling matchPat.)
     t <- newWHNFThunk v
     pure (Just [(n, t)])
-matchPat (PBang p)    v          = matchPat p v
+matchPat hooks (PBang p)    v          = matchPat hooks p v
 -- Per Haskell Report §3.17.3: an irrefutable pattern @~p@ ALWAYS
 -- matches.  Each variable bound by @p@ becomes a thunk that, when
 -- forced, re-attempts the inner match against the original value;
 -- only then can the match-fail error fire.  This is the "lazy
 -- pattern" deferral.  Sharing of the inner match is preserved by the
 -- thunk's IORef-backed memoisation.
-matchPat (PIrref p)   v          = do
+matchPat hooks (PIrref p)   v          = do
     let vars = patternVars p
     binds <- traverse (\name -> do
         t <- newLazyBuiltinThunk $ do
-            m <- matchPat p v
+            m <- matchPat hooks p v
             case m of
                 Just bs -> case lookup name bs of
-                    Just t' -> force t'
+                    Just t' -> force hooks t'
                     Nothing ->
                         error ("IHC.Eval: irrefutable pattern: variable `"
                                <> BC.unpack name
@@ -886,135 +918,206 @@ matchPat (PIrref p)   v          = do
                            <> show p)
         pure (name, t)) vars
     pure (Just binds)
-matchPat (PAs n p)    v          = do
-    m <- matchPat p v
+matchPat hooks (PAs n p)    v          = do
+    m <- matchPat hooks p v
     case m of
         Nothing  -> pure Nothing
         Just bs  -> do
             t <- newWHNFThunk v
             pure (Just ((n, t) : bs))
-matchPat (PTuple ps) v = do
+matchPat hooks (PTuple ps) v = do
     let arity = length ps
         tupleName = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
     case v of
         VCon cn vthunks
             | cn == tupleName && length vthunks == arity ->
-                matchPat (PCon tupleName ps) v
+                matchPat hooks (PCon tupleName ps) v
         _ -> pure Nothing
-matchPat (PLit (LInt n)) (VInt m)
+matchPat hooks (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing
-matchPat (PLit (LInt _)) _       = pure Nothing
+matchPat hooks (PLit (LInt _)) _       = pure Nothing
 -- A.3: arbitrary-precision Integer literal pattern.  Equality against
 -- VInteger uses the underlying Integer; against VInt we widen to
 -- compare. No match against any other shape.
-matchPat (PLit (LInteger n)) (VInteger m)
+matchPat hooks (PLit (LInteger n)) (VInteger m)
     | n == m    = pure (Just [])
     | otherwise = pure Nothing
-matchPat (PLit (LInteger n)) (VInt m)
+matchPat hooks (PLit (LInteger n)) (VInt m)
     | n == toInteger m = pure (Just [])
     | otherwise        = pure Nothing
-matchPat (PLit (LInteger _)) _   = pure Nothing
-matchPat (PLit (LFloat x)) (VFloat y)
+matchPat hooks (PLit (LInteger _)) _   = pure Nothing
+matchPat hooks (PLit (LFloat x)) (VFloat y)
     | x == y    = pure (Just [])
     | otherwise = pure Nothing
-matchPat (PLit (LFloat _)) _     = pure Nothing
-matchPat (PLit (LStr s)) (VStr t)
+matchPat hooks (PLit (LFloat _)) _     = pure Nothing
+matchPat hooks (PLit (LStr s)) (VStr t)
     | s == t    = pure (Just [])
     | otherwise = pure Nothing
 -- Strings are compiled to Haskell lists of 'Char' (@VCon ":" [h, t]@ /
 -- @VCon "[]" []@), so a string-literal pattern must also match the
 -- list-form runtime value.  Without this case a pattern like @"" -> ...@
 -- fails against @VCon "[]" []@ even though they denote the same string.
-matchPat (PLit (LStr s)) v = matchStringPatList s v
-matchPat (PLit (LStr _)) _       = pure Nothing
-matchPat (PLit (LChar c)) (VChar d)
+matchPat hooks (PLit (LStr s)) v = matchStringPatList hooks s v
+matchPat hooks (PLit (LStr _)) _       = pure Nothing
+matchPat hooks (PLit (LChar c)) (VChar d)
     | c == d    = pure (Just [])
     | otherwise = pure Nothing
-matchPat (PLit (LChar _)) _      = pure Nothing
+matchPat _hooks (PLit (LChar _)) _      = pure Nothing
 -- LAddrStr is only used to construct VPrimObj at eval time; it
 -- never appears as a pattern in source code (Addr# literals don't
 -- have pattern syntax), so a non-match catch-all is correct.
-matchPat (PLit (LAddrStr _)) _   = pure Nothing
+matchPat _hooks (PLit (LAddrStr _)) _   = pure Nothing
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
-matchPat (PCon "()" []) VUnit = pure (Just [])
+matchPat hooks (PCon "()" []) VUnit = pure (Just [])
 -- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@
 -- but pattern @Proxy@ (nullary) should still match — the payload is
 -- type-level metadata that user code doesn't observe via the ctor.
-matchPat (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
+matchPat hooks (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
 -- Boxed prim constructors are host-backed wrappers over the interpreter's
 -- primitive runtime values. Pattern matching must therefore treat
 -- @I# x@ / @W# x@ / @W8# x@ as wrappers around 'VInt' and @C# x@ as a
 -- wrapper around 'VChar'; otherwise source bindings like
 -- @new (I# len#) = ...@ never match and libraries such as @text@ fail at
 -- first use after discovery succeeds.
-matchPat (PCon "I#" [p]) (VInt n) = do
+matchPat hooks (PCon "I#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
-    matchFields [(p, t)] []
-matchPat (PCon "W#" [p]) (VInt n) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
-    matchFields [(p, t)] []
-matchPat (PCon "W8#" [p]) (VInt n) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W8#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
-    matchFields [(p, t)] []
-matchPat (PCon "C#" [p]) (VChar c) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "C#" [p]) (VChar c) = do
     t <- newWHNFThunk (VChar c)
-    matchFields [(p, t)] []
+    matchFields hooks [(p, t)] []
+-- F# / D#: source-loaded Num Float / Num Double instance bodies
+-- pattern-match on these to access the underlying Float# / Double#.
+-- The runtime stores both Float and Double as VFloat (Double internally),
+-- so the unwrap just exposes that VFloat for the primops to operate on.
+matchPat hooks (PCon "F#" [p]) (VFloat n) = do
+    t <- newWHNFThunk (VFloat n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "D#" [p]) (VFloat n) = do
+    t <- newWHNFThunk (VFloat n)
+    matchFields hooks [(p, t)] []
+-- ghc-bignum's @Integer@ data constructors:
+--
+--     data Integer = IS !Int# | IP !BigNat# | IN !BigNat#
+--
+-- IHC's runtime represents Integer as 'VInt' (Int64 range) or
+-- 'VInteger' (arbitrary precision).  Source-loaded code that
+-- pattern-matches @case n of IS k -> ...@ needs to see the
+-- underlying primitive — the same transparent-constructor trick
+-- as I# / F# / D# above.
+--
+-- @IS k@ binds k to an @Int#@-shaped 'VInt'.  Matches:
+--   * 'VInt n'                          (already Int-range)
+--   * 'VInteger n' iff @n@ fits in Int64 (parser-routed overflow
+--                                         that fits after a sign flip)
+matchPat hooks (PCon "IS" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IS" [p]) (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInt (fromInteger n))
+        matchFields hooks [(p, t)] []
+-- @IP bn@ / @IN bn@ bind bn to a @BigNat#@.  IHC has no
+-- BigNat# runtime yet, so we expose the underlying 'VInteger'
+-- (positive value for IP, magnitude for IN) directly.  Source
+-- code that does arithmetic on the BigNat# will fail until the
+-- BigNat# primop suite lands; pattern matching alone works for
+-- the common @case n of IS k -> ... ; _ -> defaultBig@ shape.
+matchPat hooks (PCon "IP" [p]) (VInteger n)
+    | n > toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInteger n)
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IN" [p]) (VInteger n)
+    | n < toInteger (minBound :: Int64) = do
+        t <- newWHNFThunk (VInteger (negate n))
+        matchFields hooks [(p, t)] []
+-- Phase 1: BigNat# is now backed by 'VPrimObj (PrimBigNat n)'.
+-- Source-loaded code that pattern-matches @case n of IP bn -> ...@
+-- against an Integer whose runtime is the new BigNat# representation
+-- binds 'bn' to the underlying VPrimObj directly so Phase 2 BigNat#
+-- primops can dispatch on it.  Sign-direction (IP vs IN) is encoded
+-- in the source-level constructor used to build the Integer; the
+-- BigNat# itself is always an unsigned magnitude.
+matchPat hooks (PCon "IP" [p]) v@(VPrimObj (PrimBigNat _)) = do
+    t <- newWHNFThunk v
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "IN" [p]) v@(VPrimObj (PrimBigNat _)) = do
+    t <- newWHNFThunk v
+    matchFields hooks [(p, t)] []
 -- Lazy ST's lifted state token is `data State s = S# (State# s)`.
 -- The interpreter represents all erased State# tokens as PrimRealWorld, so
 -- expose that raw token through the source constructor when lazy ST code
 -- pattern-matches on `S# s`.
-matchPat (PCon "S#" [p]) prim@(VPrimObj PrimRealWorld) = do
+matchPat hooks (PCon "S#" [p]) prim@(VPrimObj PrimRealWorld) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
+    matchFields hooks [(p, t)] []
 -- IORef/STRef source wrappers around the same host-backed mutable reference.
 -- Some source functions (e.g. GHC.Exts.touch via network's withFdSocket)
 -- pattern-match through IORef (STRef ref#), while ihc's newIORef builtin
 -- stores the reference directly as PrimIORef.
-matchPat (PCon "IORef" [PCon "STRef" [p]]) prim@(VPrimObj (PrimIORef _)) = do
+matchPat hooks (PCon "IORef" [PCon "STRef" [p]]) prim@(VPrimObj (PrimIORef _)) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
-matchPat (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
-matchPat (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
+    matchFields hooks [(p, t)] []
+-- (PCon "Ptr" against VPrimObj PrimPtr is already handled by the
+-- existing clause further down in this file — the source-loaded
+-- @data Ptr a = Ptr Addr#@'s derived @Eq@ body
+-- @Ptr a == Ptr b = isTrue# (eqAddr# a b)@ relies on it once the
+-- synthesised @Eq Ptr@ instance from
+-- 'IHC.Scheduler.registerDerivedEqInstances' fires.  Adding a second
+-- clause here would shadow that existing handler.)
 -- Data.Array.Byte lifted wrappers. The interpreter keeps both mutable and
 -- frozen byte arrays as the same host-backed PrimByteArray object, so the
 -- source constructors just expose that underlying primitive value.
-matchPat (PCon "MutableByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+matchPat hooks (PCon "MutableByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
-matchPat (PCon "ByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "ByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
     t <- newWHNFThunk prim
-    matchFields [(p, t)] []
-matchPat (PCon "BS" pats) (VCon "BS" vthunks)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "BS" pats) (VCon "BS" vthunks)
     | length pats == length vthunks =
-        matchFields (zip pats vthunks) []
-matchPat pat@(PCon "BS" _) v = do
-    mBs <- charListToByteStringVal v
+        matchFields hooks (zip pats vthunks) []
+matchPat hooks pat@(PCon "BS" _) v = do
+    mBs <- charListToByteStringVal hooks v
     case mBs of
-        Just bsV -> matchPat pat bsV
+        Just bsV -> matchPat hooks pat bsV
         Nothing  -> pure Nothing
-matchPat (PCon "IO" [p]) v@(VCon name _)
-    | name /= "IO" = matchPat p (pureStateFn v)
-matchPat (PCon "ST" [p]) v@(VCon name _)
-    | name /= "ST" = matchPat p (pureStateFn v)
+matchPat hooks (PCon "IO" [p]) v@(VCon name _)
+    | name /= "IO" = matchPat hooks p (pureStateFn v)
+matchPat hooks (PCon "ST" [p]) v@(VCon name _)
+    | name /= "ST" = matchPat hooks p (pureStateFn v)
 -- bytestring-0.12 exposes PS as a pattern synonym over the real BS
 -- constructor. The parser represents the synonym as a constructor pattern, so
 -- model the synonym at match time.
-matchPat (PCon "PS" [pFp, pOff, pLen]) (VCon "BS" [fpT, lenT]) = do
+matchPat hooks (PCon "PS" [pFp, pOff, pLen]) (VCon "BS" [fpT, lenT]) = do
     offT <- newWHNFThunk (VInt 0)
-    matchFields [(pFp, fpT), (pOff, offT), (pLen, lenT)] []
+    matchFields hooks [(pFp, fpT), (pOff, offT), (pLen, lenT)] []
+matchPat hooks pat@(PCon "PS" _) v = do
+    mBs <- charListToByteStringVal hooks v
+    case mBs of
+        Just bsV -> matchPat hooks pat bsV
+        Nothing  -> pure Nothing
 -- Lazy ST represents state-thread results as boxed pairs `(a, State s)`,
 -- while strict ST code pattern-matches on unboxed state tuples
 -- `(# State# s, a #)`. When those representations meet at
 -- strictToLazyST/lazyToStrictST boundaries, expose the boxed pair in the
 -- strict state-passing order.
-matchPat (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
-    matchFields [(pState, stateT), (pVal, valT)] []
-matchPat (PCon name pats) (VCon vname vthunks)
+matchPat hooks (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
+    matchFields hooks [(pState, stateT), (pVal, valT)] []
+matchPat hooks (PCon name pats) v@(VCon vname vthunks)
     | name == vname && length pats == length vthunks =
         -- Zip sub-patterns with the constructor's field thunks. For
         -- each pair: if the sub-pattern is a 'PVar' we bind the name
@@ -1022,37 +1125,41 @@ matchPat (PCon name pats) (VCon vname vthunks)
         -- and laziness -- we never force the field). For any other
         -- sub-pattern we MUST force the thunk to pattern-match its
         -- structure, then recurse.
-        matchFields (zip pats vthunks) []
-    | otherwise = pure Nothing
+        matchFieldsLocal (zip pats vthunks) []
+    | otherwise =
+        -- Constructor name doesn't match the value's constructor.
+        -- May still succeed via a pattern synonym (e.g.
+        -- @pattern Head x \<- (x:_)@ matched against a non-empty list).
+        tryPatSyn hooks name pats v
   where
-    matchFields [] acc = pure (Just (reverse acc))
-    matchFields ((PVar n, t) : rest) acc =
-        matchFields rest ((n, t) : acc)
-    matchFields ((PWild, _) : rest) acc =
-        matchFields rest acc
+    matchFieldsLocal [] acc = pure (Just (reverse acc))
+    matchFieldsLocal ((PVar n, t) : rest) acc =
+        matchFieldsLocal rest ((n, t) : acc)
+    matchFieldsLocal ((PWild, _) : rest) acc =
+        matchFieldsLocal rest acc
     -- Per Haskell Report §3.17.2 + GHC BangPatterns: a bang sub-pattern
     -- forces the corresponding field thunk to WHNF before binding. The
     -- generic _ -> force arm below handles non-PVar inner patterns
     -- correctly (the force happens unconditionally), but PBang (PVar n)
     -- would otherwise route through matchPat's PBang->p collapse and
     -- bind n to an unforced thunk via the PVar arm above. Force here.
-    matchFields ((PBang inner, t) : rest) acc = do
-        _ <- force t  -- ! : force the field thunk; sharing preserved.
+    matchFieldsLocal ((PBang inner, t) : rest) acc = do
+        _ <- force hooks t  -- ! : force the field thunk; sharing preserved.
         case inner of
-            PVar n -> matchFields rest ((n, t) : acc)
-            PWild  -> matchFields rest acc
+            PVar n -> matchFieldsLocal rest ((n, t) : acc)
+            PWild  -> matchFieldsLocal rest acc
             _      -> do
-                fv <- force t
-                m  <- matchPat inner fv
+                fv <- force hooks t
+                m  <- matchPat hooks inner fv
                 case m of
                     Nothing   -> pure Nothing
-                    Just subs -> matchFields rest (reverse subs ++ acc)
-    matchFields ((p, t) : rest) acc = do
-        fv <- force t
-        m  <- matchPat p fv
+                    Just subs -> matchFieldsLocal rest (reverse subs ++ acc)
+    matchFieldsLocal ((p, t) : rest) acc = do
+        fv <- force hooks t
+        m  <- matchPat hooks p fv
         case m of
             Nothing   -> pure Nothing
-            Just subs -> matchFields rest (reverse subs ++ acc)
+            Just subs -> matchFieldsLocal rest (reverse subs ++ acc)
 -- IO constructor: VIO wraps a suspended (IO Val). When source code
 -- pattern-matches on IO (e.g. `IO act`), expose the underlying
 -- State# RealWorld -> (# State# RealWorld, a #) function so that
@@ -1062,42 +1169,42 @@ matchPat (PCon name pats) (VCon vname vthunks)
 -- `ForeignPtr addr# contents` on our opaque VPrimObj (PrimForeignPtr fp).
 -- Expose Addr# as VPrimObj PrimPtr (the raw pointer) and
 -- ForeignPtrContents as an opaque placeholder.
-matchPat (PCon "ForeignPtr" [pAddr, pContents]) (VPrimObj (PrimForeignPtr fp)) = do
+matchPat hooks (PCon "ForeignPtr" [pAddr, pContents]) (VPrimObj (PrimForeignPtr fp)) = do
     let rawPtr = unsafeForeignPtrToPtr fp
     addrThunk <- newWHNFThunk (VPrimObj (PrimPtr (castPtr rawPtr)))
     -- ForeignPtrContents is opaque; use the ForeignPtr itself as a stand-in
     -- so touchForeignPtr can still work if needed.
     contentsThunk <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
-    matchFields [(pAddr, addrThunk), (pContents, contentsThunk)] []
+    matchFieldsLocal [(pAddr, addrThunk), (pContents, contentsThunk)] []
   where
-    matchFields [] acc = pure (Just (reverse acc))
-    matchFields ((PVar n, t) : rest) acc =
-        matchFields rest ((n, t) : acc)
-    matchFields ((PWild, _) : rest) acc =
-        matchFields rest acc
-    matchFields ((p, t) : rest) acc = do
-        fv <- force t
-        m  <- matchPat p fv
+    matchFieldsLocal [] acc = pure (Just (reverse acc))
+    matchFieldsLocal ((PVar n, t) : rest) acc =
+        matchFieldsLocal rest ((n, t) : acc)
+    matchFieldsLocal ((PWild, _) : rest) acc =
+        matchFieldsLocal rest acc
+    matchFieldsLocal ((p, t) : rest) acc = do
+        fv <- force hooks t
+        m  <- matchPat hooks p fv
         case m of
             Nothing   -> pure Nothing
-            Just subs -> matchFields rest (reverse subs ++ acc)
+            Just subs -> matchFieldsLocal rest (reverse subs ++ acc)
 
 -- Ptr deconstruction: source code pattern-matches `Ptr addr#`.
-matchPat (PCon "Ptr" [pAddr]) (VPrimObj (PrimPtr ptr)) = do
+matchPat hooks (PCon "Ptr" [pAddr]) (VPrimObj (PrimPtr ptr)) = do
     addrThunk <- newWHNFThunk (VPrimObj (PrimPtr ptr))
-    matchFields [(pAddr, addrThunk)] []
+    matchFieldsLocal [(pAddr, addrThunk)] []
   where
-    matchFields [] acc = pure (Just (reverse acc))
-    matchFields ((PVar n, t) : rest) acc =
-        matchFields rest ((n, t) : acc)
-    matchFields ((PWild, _) : rest) acc =
-        matchFields rest acc
-    matchFields ((p, t) : rest) acc = do
-        fv <- force t
-        m  <- matchPat p fv
+    matchFieldsLocal [] acc = pure (Just (reverse acc))
+    matchFieldsLocal ((PVar n, t) : rest) acc =
+        matchFieldsLocal rest ((n, t) : acc)
+    matchFieldsLocal ((PWild, _) : rest) acc =
+        matchFieldsLocal rest acc
+    matchFieldsLocal ((p, t) : rest) acc = do
+        fv <- force hooks t
+        m  <- matchPat hooks p fv
         case m of
             Nothing   -> pure Nothing
-            Just subs -> matchFields rest (reverse subs ++ acc)
+            Just subs -> matchFieldsLocal rest (reverse subs ++ acc)
 
 -- Phase 3.5: OverloadedLabels IsLabel dispatch.
 -- IHP's default instance `(s ~ s') => IsLabel s (Proxy s')` converts #email
@@ -1106,21 +1213,21 @@ matchPat (PCon "Ptr" [pAddr]) (VPrimObj (PrimPtr ptr)) = do
 -- (0 sub-patterns since Proxy is nullary). This lets source code like
 -- `case lbl of Proxy -> ...` work whether the label was already forced
 -- through `fromLabel` or is still a raw VLabel.
-matchPat (PCon "Proxy" []) (VLabel _) = pure (Just [])
-matchPat (PCon "IO" [p]) stFn@(VFun _) =
-    matchPat p stFn
-matchPat (PCon "IO" [p]) stFn@(VFunIP _ _) =
-    matchPat p stFn
-matchPat (PCon "IO" [p]) (VIO action) = do
+matchPat hooks (PCon "Proxy" []) (VLabel _) = pure (Just [])
+matchPat hooks (PCon "IO" [p]) stFn@(VFun _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "IO" [p]) stFn@(VFunIP _ _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "IO" [p]) (VIO action) = do
     let stFn = VFun $ \_stateThunk -> do
             -- Run the IO action, return an unboxed tuple (# state, result #)
             result <- action
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
             resT <- newWHNFThunk result
             pure (VCon "(#,#)" [stT, resT])
-    matchPat p stFn
-matchPat (PCon "IO" [p]) v =
-    matchPat p (pureStateFn v)
+    matchPat hooks p stFn
+matchPat hooks (PCon "IO" [p]) v =
+    matchPat hooks p (pureStateFn v)
 -- ST bridge: VIO-valued ST computations (e.g. `return 42 :: ST s Int`
 -- produces `VIO (pure 42)` via the builtin `returnB`). When source code
 -- pattern-matches `ST f` on such a value -- e.g. `runST (ST m)` in
@@ -1129,32 +1236,32 @@ matchPat (PCon "IO" [p]) v =
 -- Rationale: `ST s a` is semantically identical to `IO a` in our
 -- single-threaded interpreter (see CLAUDE.md: runRW# is compiler-intrinsic,
 -- no userland Haskell can implement it).
-matchPat (PCon "ST" [p]) stFn@(VFun _) =
-    matchPat p stFn
-matchPat (PCon "ST" [p]) stFn@(VFunIP _ _) =
-    matchPat p stFn
-matchPat (PCon "ST" [p]) (VIO action) = do
+matchPat hooks (PCon "ST" [p]) stFn@(VFun _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "ST" [p]) stFn@(VFunIP _ _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "ST" [p]) (VIO action) = do
     let stFn = VFun $ \_stateThunk -> do
             result <- action
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
             resT <- newWHNFThunk result
             pure (VCon "(#,#)" [stT, resT])
-    matchPat p stFn
-matchPat (PCon "ST" [p]) v =
-    matchPat p (pureStateFn v)
-matchPat (PCon "STM" [p]) stFn@(VFun _) =
-    matchPat p stFn
-matchPat (PCon "STM" [p]) stFn@(VFunIP _ _) =
-    matchPat p stFn
-matchPat (PCon "STM" [p]) (VIO action) = do
+    matchPat hooks p stFn
+matchPat hooks (PCon "ST" [p]) v =
+    matchPat hooks p (pureStateFn v)
+matchPat hooks (PCon "STM" [p]) stFn@(VFun _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "STM" [p]) stFn@(VFunIP _ _) =
+    matchPat hooks p stFn
+matchPat hooks (PCon "STM" [p]) (VIO action) = do
     let stFn = VFun $ \_stateThunk -> do
             result <- action
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
             resT <- newWHNFThunk result
             pure (VCon "(#,#)" [stT, resT])
-    matchPat p stFn
-matchPat (PCon "STM" [p]) v =
-    matchPat p (pureStateFn v)
+    matchPat hooks p stFn
+matchPat hooks (PCon "STM" [p]) v =
+    matchPat hooks p (pureStateFn v)
 -- Pattern-match-driven type-class dispatch: when a class method
 -- dispatcher flows into a position where the pattern expects a
 -- specific constructor, the pattern tells us the type.  Feed the
@@ -1164,21 +1271,20 @@ matchPat (PCon "STM" [p]) v =
 -- then re-match.  This is the backbone of nullary class-method
 -- dispatch (mempty, maxBound, empty, …) in an otherwise
 -- arg-directed runtime.
-matchPat pat@(PCon pname _) (VClassMethod _ _ _ go) = do
+matchPat hooks pat@(PCon pname _) (VClassMethod _ _ _ go) = do
     dummyT <- newWHNFThunk VUnit
     resolved <- go [pname] dummyT
     case resolved of
         VClassMethod{} -> pure Nothing
-        _              -> matchPat pat resolved
-matchPat (PCon pname ppats) v = do
-    pure Nothing
+        _              -> matchPat hooks pat resolved
+matchPat hooks (PCon pname ppats) v = tryPatSyn hooks pname ppats v
 -- Record patterns: should have been desugared to PCon by the scheduler.
 -- If they reach here (e.g. in a standalone test), fall back to failure.
-matchPat (PRecord _ _) _ = pure Nothing
-matchPat (PRecordWild _) _ = pure Nothing
+matchPat hooks (PRecord _ _) _ = pure Nothing
+matchPat hooks (PRecordWild _) _ = pure Nothing
 -- ViewPatterns: (f -> p) matches v when f v matches p.
 -- We evaluate f v and then match the result against p.
-matchPat (PView fn p) v = do
+matchPat hooks (PView fn p) v = do
     -- f is an Expr; we need an Env to evaluate it. We don't have the
     -- env here, so ViewPatterns MUST be desugared before reaching Eval.
     -- This case is a safeguard — in practice desugarRecordPats converts
@@ -1202,11 +1308,11 @@ ownerSentinelKey = BC.pack "$$owner"
 -- Returns 'Nothing' for envs that haven't had the sentinel installed
 -- (REPL transient evals, certain entry-boundary paths) — those will
 -- fall through to the unscoped legacy fallback.
-currentOwner :: Env -> IO (Maybe ByteString)
-currentOwner env = case lookupEnv ownerSentinelKey env of
+currentOwner :: IHCHooks -> Env -> IO (Maybe ByteString)
+currentOwner hooks env = case lookupEnv ownerSentinelKey env of
     Nothing -> pure Nothing
     Just t  -> do
-        v <- force t
+        v <- force hooks t
         case v of
             VStr m -> pure (Just m)
             _      -> pure Nothing
@@ -1216,10 +1322,10 @@ currentOwner env = case lookupEnv ownerSentinelKey env of
 -- narrower representation.  Data.ByteString functions pattern-match on the
 -- real @BS ForeignPtr Int@ constructor, so materialize a Char list or
 -- transitional VStr into that constructor at the pattern boundary.
-charListToByteStringVal :: Val -> IO (Maybe Val)
-charListToByteStringVal (VCon "BS" _) = pure Nothing
-charListToByteStringVal (VStr bs) = Just <$> byteStringConFromBS bs
-charListToByteStringVal v = do
+charListToByteStringVal :: IHCHooks -> Val -> IO (Maybe Val)
+charListToByteStringVal hooks (VCon "BS" _) = pure Nothing
+charListToByteStringVal hooks (VStr bs) = Just <$> byteStringConFromBS bs
+charListToByteStringVal hooks v = do
     chars <- go [] v
     case chars of
         Nothing -> pure Nothing
@@ -1227,10 +1333,10 @@ charListToByteStringVal v = do
   where
     go acc (VCon "[]" []) = pure (Just acc)
     go acc (VCon ":" [hT, tT]) = do
-        hv <- force hT
+        hv <- force hooks hT
         case hv of
             VChar c -> do
-                tv <- force tT
+                tv <- force hooks tT
                 go (c : acc) tv
             _ -> pure Nothing
     go acc (VStr bs) = pure (Just (reverse (BC.unpack bs) ++ acc))
@@ -1247,51 +1353,59 @@ byteStringConFromBS bs = do
     lenT <- newWHNFThunk (VInt (fromIntegral len))
     pure (VCon "BS" [fpT, lenT])
 
-matchFields :: [(Pat, Thunk)] -> [(Name, Thunk)] -> IO (Maybe [(Name, Thunk)])
-matchFields [] acc = pure (Just (reverse acc))
-matchFields ((PVar nm, t) : rest) acc =
-    matchFields rest ((nm, t) : acc)
-matchFields ((PWild, _) : rest) acc =
-    matchFields rest acc
-matchFields ((pat, t) : rest) acc = do
-    fv <- force t
-    m  <- matchPat pat fv
+matchFields :: IHCHooks -> [(Pat, Thunk)] -> [(Name, Thunk)] -> IO (Maybe [(Name, Thunk)])
+matchFields _     [] acc = pure (Just (reverse acc))
+matchFields hooks ((PVar nm, t) : rest) acc =
+    matchFields hooks rest ((nm, t) : acc)
+matchFields hooks ((PWild, _) : rest) acc =
+    matchFields hooks rest acc
+matchFields hooks ((pat, t) : rest) acc = do
+    fv <- force hooks t
+    m  <- matchPat hooks pat fv
     case m of
         Nothing   -> pure Nothing
-        Just subs -> matchFields rest (reverse subs ++ acc)
+        Just subs -> matchFields hooks rest (reverse subs ++ acc)
 
 --------------------------------------------------------------------------------
 -- apply
 --------------------------------------------------------------------------------
 
-apply :: Val -> Thunk -> IO Val
-apply (VFun f)                    arg = f arg
-apply (VFunIP _ f)                arg = f Map.empty arg
-apply (VClassMethod _ _ tags go)  arg = go tags arg
+apply :: IHCHooks -> Val -> Thunk -> IO Val
+apply _     (VFun f)                    arg = f arg
+apply _     (VFunIP _ f)                arg = f Map.empty arg
+apply _     (VClassMethod _ _ tags go)  arg = go tags arg
+-- Source may see the compiler/runtime state-token newtype constructors
+-- as constructor-shaped values rather than the builtin constructor
+-- functions. Applying the nullary shell should build the one-field
+-- wrapper that matchPat/runIOVal already know how to deconstruct.
+apply _     (VCon n [])                 arg
+    | isStateTokenNewtypeCtor n = pure (VCon n [arg])
 -- Newtype-transparent application: a single-field 'VCon' built from a
 -- newtype constructor (e.g. @ParsecT body@) is operationally equivalent
 -- to its inner field at GHC runtime.  Some IHC code paths return the
 -- wrapped 'VCon' instead of unwrapping it; if a caller then tries to
 -- apply that 'VCon' as a function, project the field and retry.  Other
 -- 'VCon' shapes (multi-field, enum-like) still error.
-apply (VCon _ [innerT])           arg = do
-    inner <- force innerT
-    apply inner arg
-apply v                           _   = error ("IHC.Eval.apply: not a function: "
+apply hooks (VCon _ [innerT])           arg = do
+    inner <- force hooks innerT
+    apply hooks inner arg
+apply _     v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 
 -- | Apply with the caller's ImplicitParamMap — used by EApp so that
 -- implicit params flow from the call site into the callee.
-applyIP :: ImplicitParamMap -> Val -> Thunk -> IO Val
-applyIP _         (VFun f)                   arg = f arg
-applyIP callerIPM (VFunIP _ f)               arg = f callerIPM arg
-applyIP _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP :: IHCHooks -> ImplicitParamMap -> Val -> Thunk -> IO Val
+applyIP _     _         (VFun f)                   arg = f arg
+applyIP _     callerIPM (VFunIP _ f)               arg = f callerIPM arg
+applyIP _     _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP _     _         (VCon n [])                arg
+    | isStateTokenNewtypeCtor n = pure (VCon n [arg])
 -- Newtype-transparent application: see note on 'apply' above.
-applyIP ipm       (VCon _ [innerT])          arg = do
-    inner <- force innerT
-    applyIP ipm inner arg
-applyIP _         v                          arg  = do
-    a <- force arg
+applyIP hooks ipm       (VCon _ [innerT])          arg = do
+    inner <- force hooks innerT
+    applyIP hooks ipm inner arg
+applyIP hooks _         v                          arg  = do
+    a <- force hooks arg
     error ("IHC.Eval.applyIP: not a function: "
            <> showValForDebug v <> " applied to " <> showValForDebug a)
 
@@ -1316,46 +1430,46 @@ applyIP _         v                          arg  = do
 --                      recurse.
 --------------------------------------------------------------------------------
 
-evalDo :: Env -> ImplicitParamMap -> [Stmt] -> IO Val
-evalDo _   _   []              = pure (VIO (pure VUnit))
-evalDo env ipm [SExpr e]       = eval env ipm e
-evalDo env ipm [SBind _ e]     =
+evalDo :: IHCHooks -> Env -> ImplicitParamMap -> [Stmt] -> IO Val
+evalDo hooks _   _   []              = pure (VIO (pure VUnit))
+evalDo hooks env ipm [SExpr e]       = eval hooks env ipm e
+evalDo hooks env ipm [SBind _ e]     =
     -- Haskell forbids a do-block to end in a bind statement, but be
     -- defensive: evaluate the action and return its value directly.
-    eval env ipm e
-evalDo _   _   [SLet _]        = pure (VIO (pure VUnit))
-evalDo env ipm (SExpr e : rest) =
+    eval hooks env ipm e
+evalDo hooks _   _   [SLet _]        = pure (VIO (pure VUnit))
+evalDo hooks env ipm (SExpr e : rest) =
     pure $ VIO $ do
-        mv <- eval env ipm e
-        _  <- runIOVal mv                   -- run and discard
-        restV <- evalDo env ipm rest
-        runIOVal restV
-evalDo env ipm (SBind name e : rest) =
+        mv <- eval hooks env ipm e
+        _  <- runIOVal hooks mv                   -- run and discard
+        restV <- evalDo hooks env ipm rest
+        runIOVal hooks restV
+evalDo hooks env ipm (SBind name e : rest) =
     pure $ VIO $ do
-        mv <- eval env ipm e
-        v  <- runIOVal mv
+        mv <- eval hooks env ipm e
+        v  <- runIOVal hooks mv
         vT <- newWHNFThunk v
         let env' = extendEnv name vT env
-        restV <- evalDo env' ipm rest
-        runIOVal restV
-evalDo env ipm [SBangBind _ e] =
+        restV <- evalDo hooks env' ipm rest
+        runIOVal hooks restV
+evalDo hooks env ipm [SBangBind _ e] =
     -- Defensive: a do-block ending in a (bang-)bind is ill-formed; mirror SBind.
-    eval env ipm e
-evalDo env ipm (SBangBind name e : rest) =
+    eval hooks env ipm e
+evalDo hooks env ipm (SBangBind name e : rest) =
     -- Per Haskell Report §3.17.2 + GHC BangPatterns: !x <- m forces the
     -- bound result to WHNF before the rest of the do-block runs. The
     -- parser desugars do-blocks to (>>=)/(>>)/lambda chains, so this
     -- branch is only hit on the defensive EDo fallback path; we still
     -- preserve the strictness contract here for completeness.
     pure $ VIO $ do
-        mv <- eval env ipm e
-        v  <- runIOVal mv
+        mv <- eval hooks env ipm e
+        v  <- runIOVal hooks mv
         vT <- newWHNFThunk v
-        _  <- force vT  -- bang: force to WHNF before continuing
+        _  <- force hooks vT  -- bang: force to WHNF before continuing
         let env' = extendEnv name vT env
-        restV <- evalDo env' ipm rest
-        runIOVal restV
-evalDo env ipm (SLet bs : rest) = do
+        restV <- evalDo hooks env' ipm rest
+        runIOVal hooks restV
+evalDo hooks env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
     slots <- mapM (\_ -> newIORef (BlackHole "<do-let-placeholder>")) bs
@@ -1364,9 +1478,9 @@ evalDo env ipm (SLet bs : rest) = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure env' ipm rhs)))
           (zip bs slots)
-    evalDo env' ipm rest
-evalDo _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
-evalDo env ipm (SImplicitLet bs : rest) = do
+    evalDo hooks env' ipm rest
+evalDo hooks _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
+evalDo hooks env ipm (SImplicitLet bs : rest) = do
     slots <- mapM (\_ -> newIORef (BlackHole "<do-implicit-let-placeholder>")) bs
     let names = map fst bs
         ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
@@ -1374,7 +1488,7 @@ evalDo env ipm (SImplicitLet bs : rest) = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure env ipm rhs)))
           (zip bs slots)
-    evalDo env ipm' rest
+    evalDo hooks env ipm' rest
 
 -- | Force one 'IO' layer to execute its suspended action. Any other value
 -- is returned as-is (treated as a "pure" IO result -- shouldn't happen
@@ -1383,16 +1497,16 @@ evalDo env ipm (SImplicitLet bs : rest) = do
 -- Important: do not recursively run a VIO returned by the action.  In
 -- Haskell, @IO (IO a)@ is a valid action whose result is another action;
 -- the inner action only runs if the program explicitly binds/runs it.
-runIOVal :: Val -> IO Val
-runIOVal (VIO io) = io
+runIOVal :: IHCHooks -> Val -> IO Val
+runIOVal _     (VIO io) = io
 -- Source-constructed IO actions: `IO $ \s -> (# s', a #)`
 -- The thunk wraps a function from State# to unboxed tuple.
-runIOVal (VCon "IO" [ft]) = do
-    fv <- force ft
+runIOVal hooks (VCon "IO" [ft]) = do
+    fv <- force hooks ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
+    result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force resT
+        VCon _ [_stT, resT] -> force hooks resT
         other               -> pure other
 -- @STM a@ is a newtype wrapper around @State# RealWorld -> (# State# RealWorld, a #)@
 -- (see 'GHC.Conc.STM').  Source-loaded STM actions arrive as
@@ -1400,14 +1514,46 @@ runIOVal (VCon "IO" [ft]) = do
 -- expect a plain value (e.g. 'atomically' chains, or any 'do'-bind
 -- inside the warp Counter / time-manager paths) end up working on the
 -- wrapper instead of its result and dispatch breaks downstream.
-runIOVal (VCon "STM" [ft]) = do
-    fv <- force ft
+runIOVal hooks (VCon "STM" [ft]) = do
+    fv <- force hooks ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
-    result <- apply fv rwT
+    result <- apply hooks fv rwT
     case result of
-        VCon _ [_stT, resT] -> force resT
+        VCon _ [_stT, resT] -> force hooks resT
         other               -> pure other
-runIOVal v        = pure v
+-- Unwrapped State#-passing function: an @IO a@ that has been
+-- pattern-matched via @IO f = ...@ to extract the underlying
+-- @State# RealWorld -> (# State# RealWorld, a #)@ closure.  This
+-- arrives as 'VFun' or 'VFunIP' depending on whether the closure
+-- carries an ImplicitParamMap context.  The shape is operationally
+-- identical to @VCon "IO" [ft]@ — apply with a state token and
+-- extract the result from the unboxed tuple.  Without this case,
+-- 'ioBind' (which threads its first action through 'runIOVal') would
+-- silently treat the wrapped IO action as a value and pass it as-is
+-- to the continuation, so e.g. warp's
+--    src <- mkSource (...)
+--    leftoverSource src bs0
+-- ends up binding 'src' to the State# function rather than the
+-- 'Source' value the do-bind was supposed to extract.
+runIOVal hooks (VFun fv) = do
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- fv rwT
+    case result of
+        VCon _ [_stT, resT] -> force hooks resT
+        other               -> pure other
+runIOVal hooks (VFunIP _ipm fv) = do
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- fv Map.empty rwT
+    case result of
+        VCon _ [_stT, resT] -> force hooks resT
+        other               -> pure other
+runIOVal _     v        = pure v
+
+isStateTokenNewtypeCtor :: Name -> Bool
+isStateTokenNewtypeCtor n =
+       n == BC.pack "IO"
+    || n == BC.pack "ST"
+    || n == BC.pack "STM"
 
 --------------------------------------------------------------------------------
 -- Phase 2.12: TemplateHaskellQuotes — [| expr |] evaluation

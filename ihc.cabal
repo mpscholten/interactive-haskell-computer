@@ -10,7 +10,7 @@ build-type:         Simple
 tested-with:        GHC == 9.10.*
 
 common warnings
-    ghc-options:      -Wall -Wno-unused-imports -Wno-unused-matches -Wno-name-shadowing -Werror=incomplete-patterns
+    ghc-options:      -Wall -Wno-unused-matches -Wno-name-shadowing -Werror=incomplete-patterns -Werror=incomplete-uni-patterns -Werror=incomplete-record-updates -Werror=missing-fields -Werror=missing-methods -Werror=unused-binds -Werror=unused-imports
 
 common lang
     default-language: GHC2024
@@ -34,6 +34,7 @@ library
       , IHC.Builtins
       , IHC.CabalProject
       , IHC.Classes
+      , IHC.Context
       , IHC.Core
       , IHC.Cpp
       , IHC.Diagnostics
@@ -44,14 +45,18 @@ library
       , IHC.FFI
       , IHC.InstanceManifest
       , IHC.Lexer
+      , IHC.Loader.Types
       , IHC.Lower
       , IHC.ModuleHeader
       , IHC.PackageStore
       , IHC.Parser
+      , IHC.PatSyn
+      , IHC.Pretty
       , IHC.Repl
       , IHC.Scan
       , IHC.Scheduler
       , IHC.Source
+      , IHC.StringUtils
       , IHC.TH
       , IHC.TypeAST
       , IHC.TypeDescribe
@@ -59,15 +64,6 @@ library
       , IHC.TypeReduce
       , IHC.TypeUnify
       , IHC.Val
-      -- Dormant Phase-1 JIT machinery, kept in tree but no longer
-      -- on the runtime path. May be re-activated as a tier-2 opt JIT
-      -- once the interpreter supports the full language.
-      , IHC.CodeBuffer
-      , IHC.Emit
-      , IHC.Encode
-      , IHC.IR
-      , IHC.Jit
-      , IHC.Stdlib
     build-depends:
         base             >= 4.19 && < 5
       , bytestring       >= 0.11
@@ -84,21 +80,6 @@ library
       , time             >= 1.12
       , unix             >= 2.8
       , unordered-containers >= 0.2
-
-    c-sources:
-        rts/jit.c
-      , rts/bridge.c
-    -- rts/enter.S will be added once it has real content.
-    include-dirs:
-        rts
-    install-includes:
-        jit.h
-
-    cc-options:
-        -Wall
-        -Wextra
-        -fno-stack-protector
-        -mmacosx-version-min=14.0
 
     -- Interpreter inner loops (env lookup, thunk forcing, class dispatch)
     -- run millions of times during warp-style programs. -O2 unlocks
@@ -117,9 +98,6 @@ executable ihc
       , ihc
       , text
     ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2
-
-    -- Post-build codesigning must be handled outside cabal (see Makefile /
-    -- scripts/codesign-jit.sh). cabal does not have a portable post-build hook.
 
 executable ihc-parse-probe
     import:           warnings, lang
@@ -153,6 +131,13 @@ test-suite ihc-test
         CabalLoader
       , CoreLowerTest
       , Coverage
+      , Properties.DoDesugar
+      , Properties.Generators
+      , Properties.RoundTrip
+      , Properties.SectionDesugar
+      , Properties.StringDesugar
+      , Properties.Totality
+      , Properties.TupleSectionDesugar
       , HsExtTypeFams
       , HsExtMisc
       , HsExtRecords
@@ -180,13 +165,17 @@ test-suite ihc-test
       , Hs2010ExprData
       , Hs2010LexLayout
       , Hs2010DataDecl
-      , JitSmoke
       , LexerIhp
       , NorthStarTest
       , ParserBugs
       , ReplTest
       , RunFile
       , Unsupported
+      , NetworkSocketAddrInfoRecordUpdateTest
+      , TopLevelIOBindingTest
+      , TopLevelWarpAliasTest
+      , WarpHelloTest
+      , WarpRunStartupTest
     build-depends:
         base
       , ihc
@@ -196,8 +185,19 @@ test-suite ihc-test
       , filepath
       , hspec            >= 2.10
       , process          >= 1.6
+      -- Property-based parser totality fuzz suite (Phase 1 of the
+      -- "random Haskell programs" plan — see
+      -- plans/can-we-convert-the-temporal-castle.md).
+      , QuickCheck       >= 2.14
     -- Tests run sequentially under hspec.  Pin the RTS to a single
     -- capability so parallel GC doesn't spin on every core while the
     -- actual workload is single-threaded.  The user-facing interpreter
     -- binary (exe:ihc) still gets -N.
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M4G"
+    --
+    -- -M8G (was 4G): the suite ran cleanly at 4G on macOS, but the
+    -- linux-test job heap-exhausted during hspec finalisation on x86_64
+    -- (run 25599719381: 593 examples / 0 failures / 72 pending, then
+    -- ran out of heap shutting down).  8G is a safe ceiling on both
+    -- runners — it's a max, not a reservation, so macOS keeps its
+    -- usual sub-4G footprint.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M8G"
