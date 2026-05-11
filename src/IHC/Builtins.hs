@@ -342,6 +342,13 @@ builtins reg =
     --    @foldr mappend mempty@ — which mishandles 'mempty' as a
     --    'VClassMethod' wrapper and bombs in 'append'.
     , ("Data.ByteString.concat",    bsConcatB)
+    -- 'singleton' source-loaded path needs unboxed string literal
+    -- support: 'singleton c = unsafeTake 1 $ unsafeDrop (fromIntegral c) allBytes'
+    -- where 'allBytes = unsafePackLenLiteral 0x100 "\NUL\SOH...\xFF"#'.
+    -- The trailing @"…"#@ is an @Addr#@ literal pointing to static
+    -- memory; ihc currently parses it as an ordinary @[Char]@
+    -- cons-list, which 'unsafePackLenLiteral' then mis-handles as a
+    -- 'Ptr' arg and aborts with @expected Ptr: <:...>@ in 'pokeB'.
     , ("Data.ByteString.singleton", bsSingletonB)
     -- ByteString buffer allocation helpers. These are RTS/ForeignPtr-backed
     -- allocation boundaries; the caller-supplied fill action is still
@@ -373,6 +380,13 @@ builtins reg =
     -- share Data.ByteString's implementations directly.
     -- Graduated to pure source: empty/null/length/pack/unpack/head/index.
     , ("Data.ByteString.Char8.concat",    bsConcatB)
+    -- 'Char8.singleton' / 'Char8.replicate' source-loaded paths
+    -- delegate to 'Data.ByteString.singleton' / '.replicate' which
+    -- both hit the same @Addr#@ literal blocker as the BS-side
+    -- 'singleton' shim above.  'Char8.putStrLn' calls 'hPutStrLn
+    -- stdout' which has its own gap (a Handle-shape pattern-match
+    -- non-exhaustive on @FileHandle@/@DuplexHandle@ in source-loaded
+    -- 'GHC.Internal.IO.Handle.Text.hPutStrLn').
     , ("Data.ByteString.Char8.singleton", bs8SingletonB)
     , ("Data.ByteString.Char8.replicate", bs8ReplicateB)
     , ("Data.ByteString.Char8.putStrLn",  bs8PutStrLnB)
