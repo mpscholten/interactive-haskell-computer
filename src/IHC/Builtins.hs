@@ -41,7 +41,7 @@ import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
-    , bit, testBit
+    , bit, testBit, clearBit, setBit, complementBit
     )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -681,6 +681,30 @@ builtins reg =
     , ("bigNatLog2#",              bigNatLog2HashB)           -- BigNat# -> Word#
     , ("bigNatLogBase#",           bigNatLogBaseHashB)        -- BigNat# -> BigNat# -> Word#
     , ("bigNatLogBaseWord#",       bigNatLogBaseWordHashB)    -- Word# -> BigNat# -> Word#
+    -- Phase 2.E: completion tranche.  The Phase 2 plan listed
+    -- 'bigNatShow' / 'bigNatRead' / 'bigNatToHexString' as the show/read
+    -- tranche, but none of those primops exist in ghc-bignum source —
+    -- show/read for 'Integer' uses character-by-character building
+    -- through quotRem, which is composed at the source level over the
+    -- arithmetic primops already shipped in Phase 2.B.  Instead this
+    -- tranche fills out the remaining basic BigNat# primops: bit-modify,
+    -- BigNat#-vs-Word# comparison, count-trailing-zeros, indexing into
+    -- limbs, zero/one constants, and digit-count-in-base.
+    , ("bigNatClearBit#",          makeBigNatShiftOp "bigNatClearBit#" (\n i -> clearBit n i))
+    , ("bigNatSetBit#",            makeBigNatShiftOp "bigNatSetBit#"   (\n i -> setBit n i))
+    , ("bigNatComplementBit#",     makeBigNatShiftOp "bigNatComplementBit#" (\n i -> complementBit n i))
+    , ("bigNatGtWord#",            makeBigNatWordCmpOp "bigNatGtWord#" (>))
+    , ("bigNatLeWord#",            makeBigNatWordCmpOp "bigNatLeWord#" (<=))
+    , ("bigNatEqWord#",            makeBigNatWordCmpOp "bigNatEqWord#" (==))
+    , ("bigNatCompareWord#",       bigNatCompareWordHashB)    -- BigNat# -> Word# -> Ordering
+    , ("bigNatIsTwo#",             makeBigNatUnaryBool "bigNatIsTwo#" (== 2))
+    , ("bigNatCheck#",             bigNatCheckHashB)          -- BigNat# -> Bool# (always 1 for our backing)
+    , ("bigNatIndex#",             bigNatIndexHashB)          -- BigNat# -> Int# -> Word# (i-th 64-bit limb)
+    , ("bigNatZero#",              bigNatZeroHashB)           -- (# #) -> BigNat#
+    , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
+    , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
+    , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
+    , ("bigNatSizeInBase#",        bigNatSizeInBaseHashB)     -- Word# -> BigNat# -> Word#
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -3713,6 +3737,125 @@ naturalLogBase b n          = go 0 n
   where
     go !i k | k < b     = i
             | otherwise = go (i + 1) (k `div` b)
+
+-- | Phase 2.E: @BigNat# -> Word# -> Bool#@ comparison primop.
+-- Both args extracted via the standard Natural reinterpretation
+-- chain; result is VInt 1/0 per 'primBoolVal'.  Mirrors
+-- 'makeBigNatCmpOp' from Phase 2.A.
+makeBigNatWordCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
+makeBigNatWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    case bv of
+        VInt w ->
+            pure (primBoolVal
+                (op na (fromIntegral (fromIntegral w :: Word))))
+        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
+bigNatCompareWordHashB :: IO Val
+bigNatCompareWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatCompareWord#" av
+    case bv of
+        VInt w ->
+            pure $ case compare na (fromIntegral (fromIntegral w :: Word)) of
+                LT -> VCon "LT" []
+                EQ -> VCon "EQ" []
+                GT -> VCon "GT" []
+        _ -> error
+            ("bigNatCompareWord#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatCheck# :: BigNat# -> Bool#@ — ghc-bignum's canonical-form
+-- sanity check (high limb non-zero, etc.).  Our 'Natural'-backed
+-- representation is always canonical by construction, so this is
+-- a constant True.
+bigNatCheckHashB :: IO Val
+bigNatCheckHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (primBoolVal True)
+
+-- | @bigNatIndex# :: BigNat# -> Int# -> Word#@ — extract the i-th
+-- 64-bit limb (little-endian).  Bounds-checking is the caller's
+-- responsibility per ghc-bignum convention (out-of-range returns 0
+-- in our backing since shifted-out bits are 0).
+bigNatIndexHashB :: IO Val
+bigNatIndexHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatIndex#" av
+    case bv of
+        VInt i ->
+            -- Right-shift by 64*i, then mask off to the low 64 bits.
+            -- For i out of range (i >= limbCount na), the shift
+            -- produces 0; the .&. 0xFFFFFFFFFFFFFFFF is implicit in
+            -- the fromIntegral :: Natural -> Word truncation.
+            let shifted = na `shiftR` (64 * fromIntegral i)
+            in pure (VInt (fromIntegral (fromIntegral shifted :: Word)))
+        _ -> error
+            ("bigNatIndex#: not an Int#: " <> showValForDebug bv)
+
+-- | @bigNatZero# :: (# #) -> BigNat#@ — constant zero BigNat.  The
+-- @(# #)@ argument is the unit unboxed tuple ghc-bignum uses to
+-- force evaluation at use site (see "Note [Why (# #)?]" at
+-- BigNat.hs:53).  IHC doesn't track unboxed-tuple types so we
+-- just accept any single argument and discard it.
+bigNatZeroHashB :: IO Val
+bigNatZeroHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (VPrimObj (PrimBigNat 0))
+
+-- | @bigNatOne# :: (# #) -> BigNat#@ — constant one BigNat.
+bigNatOneHashB :: IO Val
+bigNatOneHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (VPrimObj (PrimBigNat 1))
+
+-- | @bigNatCtz# :: BigNat# -> Word#@ — count trailing zero bits.
+-- Returns 0 for n = 0 (ghc-bignum convention, BigNat.hs:1213).
+bigNatCtzHashB :: IO Val
+bigNatCtzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatCtz#" av
+    pure (VInt (fromIntegral (naturalCtz n)))
+
+-- | @bigNatCtzWord# :: BigNat# -> Word#@ — count trailing zero
+-- 64-bit limbs.  Returns 0 for n = 0.  Equivalent to
+-- @bigNatCtz# n `div` 64@.
+bigNatCtzWordHashB :: IO Val
+bigNatCtzWordHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatCtzWord#" av
+    pure (VInt (fromIntegral (naturalCtz n `div` 64)))
+
+-- | Pure helper: count trailing zero bits of a 'Natural'.  Returns 0
+-- for n = 0 (matches ghc-bignum's @bigNatCtz# 0 == 0##@).
+naturalCtz :: Natural -> Int
+naturalCtz 0 = 0
+naturalCtz n = go 0 n
+  where
+    go !i k
+      | k .&. 1 == 1 = i
+      | otherwise    = go (i + 1) (k `shiftR` 1)
+
+-- | @bigNatSizeInBase# :: Word# -> BigNat# -> Word#@ — number of
+-- digits to represent @n@ in @base@.  ghc-bignum errors for
+-- @base <= 1@; we match.  For n = 0 returns 0 (ghc-bignum
+-- convention).  Otherwise returns @floor(logBase base n) + 1@.
+bigNatSizeInBaseHashB :: IO Val
+bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case av of
+        VInt w -> do
+            let base = fromIntegral (fromIntegral w :: Word) :: Natural
+            n <- extractBigNat "bigNatSizeInBase#" bv
+            pure (VInt
+                (if base <= 1
+                    then error "bigNatSizeInBase#: base must be > 1"
+                    else if n == 0
+                        then 0
+                        else fromIntegral (naturalLogBase base n) + 1))
+        _ -> error
+            ("bigNatSizeInBase#: not a Word#: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
