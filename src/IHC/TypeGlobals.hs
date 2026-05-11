@@ -240,4 +240,18 @@ seedBuiltinClassMethodSigs = do
             -- starts using it.
             , ("==",         "Eq")
             , ("/=",         "Eq")
+            -- Show
+            --
+            -- Lets the env-fallback's 'tryClassMethodFromRegistry'
+            -- synthesise a 'classMethodDispatcher' for bare @show@
+            -- without first lazy-loading @GHC.Internal.Show@ via the
+            -- Prelude scope walk.  Crucial because @print x@ (the
+            -- most-typed name in the suite) source-expands to
+            -- @putStrLn (show x)@; resolving @show@ via demand-driven
+            -- Prelude load adds ~5s to a stub @main = print 1@
+            -- run.  With the seed, the dispatcher fires immediately
+            -- and 'IHC.Scheduler.hostShowFallback' short-circuits
+            -- to 'showValWith' for primitives, no Show class load
+            -- needed.
+            , ("show",       "Show")
             ]

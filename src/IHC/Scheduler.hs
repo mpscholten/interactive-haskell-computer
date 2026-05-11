@@ -2905,12 +2905,28 @@ classMethodDispatcher reg cls methodName = selfVal
                                          <> BC.unpack tag
                                          <> "` and no result-polymorphic / default instance" )
                     else do
-                        -- Non-dispatchable (function / primitive object):
-                        -- stash and wait for the next arg so the dispatcher
-                        -- can look at a dispatchable argument later in the
-                        -- application chain.
-                        let v = dispatch (remaining - 1) (argT : accArgs)
-                        pure v
+                        -- Non-dispatchable tag (function / primitive object
+                        -- / unit @()@).  For @Show.show@ specifically,
+                        -- try the host fallback first: 'show ()' /
+                        -- 'show <function>' / etc. used to flow through
+                        -- the bare-name @showDispatch@ shim before that
+                        -- shim was retired, and the source-loaded
+                        -- @class Show a@ has no dispatchable handle for
+                        -- these tags ('isDispatchableTag' excludes them
+                        -- precisely because they're singletons whose
+                        -- runtime shape can't drive a class lookup).
+                        -- 'hostShowFallback' returns 'Nothing' for any
+                        -- other class/method, so non-Show classes keep
+                        -- the original stash-and-wait behaviour.
+                        mHostNonDisp <- hostShowFallback reg cls tag methodName av
+                        case mHostNonDisp of
+                          Just hostVal -> pure hostVal
+                          Nothing -> do
+                            -- Stash and wait for the next arg so the
+                            -- dispatcher can look at a dispatchable
+                            -- argument later in the application chain.
+                            let v = dispatch (remaining - 1) (argT : accArgs)
+                            pure v
 
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
@@ -3174,21 +3190,32 @@ classMethodDispatcher reg cls methodName = selfVal
     functionValueTag = BC.pack "<function>"
     functionArrowTag = BC.pack "(->)"
 
--- | Host-backed fallback for @Show.show@ on primitive types.
+-- | Host-backed fallback for @Show.show@.
 --
--- Source-loaded @instance Show Int@ overrides @showsPrec@ with
--- @showSignedInt@, whose body uses primop patterns @(I# n)@ that the
--- parser doesn't yet handle.  The instance method ends up registered
--- as 'methodPlaceholder', so the dispatcher falls through to the
--- class default body @show x = showsPrec 0 x ""@, which itself
--- dispatches @showsPrec.Int@ → also placeholder → its default @showsPrec
--- _ x s = show x ++ s@ → calls @show x@ → infinite loop.
+-- After the bare-name @show@ builtin shim was retired (per CLAUDE.md
+-- "Builtin modules: minimum surface only"), resolution flows through
+-- 'tryClassMethodFromRegistry' → 'classMethodDispatcher', which looks
+-- up the user / source-loaded @Show T.show@ method first.  This
+-- fallback fires only when that lookup yields 'Nothing' or a
+-- 'methodPlaceholder' — i.e. either the type has no @Show@ instance
+-- yet, or the source-loaded instance body uses constructs the parser
+-- can't yet handle.  The canonical example is
+-- @instance Show Int.showsPrec = showSignedInt@, whose body uses
+-- primop unboxing patterns @(I# n)@; without this fallback the
+-- dispatcher would fall through to the class default body
+-- @show x = showsPrec 0 x ""@, which calls @showsPrec.Int@ → also
+-- placeholder → its default @showsPrec _ x s = show x ++ s@ → loops.
 --
--- For primitive types where 'IHC.Builtins.showValWith' already has a
--- correct implementation, short-circuit to that instead of letting the
--- placeholder/default chain run.  Only fires for @Show.show@ — other
--- methods (showsPrec, showList) keep their normal dispatch so user
--- overrides still work.
+-- The implementation delegates to 'IHC.Builtins.showValWith', which
+-- (a) does its own user-instance probe via 'lookupInstanceMethod', so
+-- recursive @show@ calls on element types still see user instances,
+-- and (b) falls through to a structural pretty-printer ('showVal')
+-- for any remaining 'VCon'.  This exactly mirrors the codepath the
+-- old @showDispatch@ shim took, just one indirection later via the
+-- class-method dispatcher.
+--
+-- Only fires for @Show.show@ — other methods (showsPrec, showList)
+-- keep their normal dispatch so user overrides still work.
 hostShowFallback
     :: ClassRegistry
     -> ByteString    -- ^ class
@@ -3196,23 +3223,12 @@ hostShowFallback
     -> ByteString    -- ^ method name
     -> Val           -- ^ already-forced argument value
     -> IO (Maybe Val)
-hostShowFallback reg cls tag methodName av
+hostShowFallback reg cls _tag methodName av
     | cls == BC.pack "Show"
-    , methodName == BC.pack "show"
-    , isHostShowable tag = do
+    , methodName == BC.pack "show" = do
         s <- showValWith reg av
         Just <$> stringToListValIO s
     | otherwise = pure Nothing
-  where
-    isHostShowable t =
-        t == BC.pack "Int" || t == BC.pack "Integer" ||
-        t == BC.pack "Float" || t == BC.pack "Double" ||
-        t == BC.pack "Char" || t == BC.pack "Bool" ||
-        t == BC.pack "Word" ||
-        t == BC.pack "Int8" || t == BC.pack "Int16" ||
-        t == BC.pack "Int32" || t == BC.pack "Int64" ||
-        t == BC.pack "Word8" || t == BC.pack "Word16" ||
-        t == BC.pack "Word32" || t == BC.pack "Word64"
 
 -- | Look up a class method in the shared (REPL-level) class registry
 -- set up by 'setSharedClassReg'. Returns 'Nothing' if no shared reg is
