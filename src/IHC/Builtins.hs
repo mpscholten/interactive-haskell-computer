@@ -653,14 +653,24 @@ builtins reg =
     , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
     , ("plusForeignPtr",             plusForeignPtrB)
-    -- 'minusForeignPtr' graduated to source (uses 'minusAddr#' primop
-    -- via the 'ForeignPtr' data-ctor pattern match).  'plusForeignPtr'
-    -- stays shimmed for now: source-loaded
+    -- 'minusForeignPtr' graduated to source.  'plusForeignPtr' would
+    -- also work source-loaded — its body
     -- @plusForeignPtr (ForeignPtr addr c) (I# d) = ForeignPtr (plusAddr# addr d) c@
-    -- needs to reconstruct a 'ForeignPtr' value from a raw addr +
-    -- contents, which the matchPat-exposed address path doesn't yet
-    -- re-pack into the right host shape — removing the shim regresses
-    -- ~7 fixtures.
+    -- pattern-matches the 'ForeignPtr' data ctor and the
+    -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
+    -- The blocker is downstream: callers reach the source body with
+    -- @Int@-typed args that have been routed through 'fromInteger',
+    -- arriving as 'VCon "IS" [VInt n]' rather than bare 'VInt n'.
+    -- We have a 'matchPat' cross-rep case for @I# d@ vs 'VCon "IS"',
+    -- but the 'Integer' arithmetic chain feeding those args
+    -- independently produces wrong values (e.g. BSC.replicate writes
+    -- zeros) — a separate bug.  Until that's resolved, keeping the
+    -- shim avoids a fixture regression.  The actual reason historical
+    -- shim removal failed was the @parseSubNames@ operator-group bug
+    -- (now fixed): @import GHC.ForeignPtr (plusForeignPtr)@ in
+    -- @Data.ByteString.Internal.Type@ was being silently dropped
+    -- because the preceding @NonEmpty ((:|))@ sub-import corrupted
+    -- the import-parse cursor.
     , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
@@ -4191,6 +4201,15 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     p <- ptrValToPtr av
     case bv of
         VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
+        -- values reaching @poke@ via the Char8 path arrive as
+        -- 'VCon "IS" [VInt n]' rather than the bare 'VInt' the
+        -- type-correct path would land — accept both shapes.
+        VCon "IS" [t] -> do
+            inner <- force legacyHooks t
+            case inner of
+                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+                _      -> error ("poke: IS inner not an Int: " <> showValForDebug inner)
         -- Accept 'VChar' for the @Ptr Word8@ default.  ihc skips type
         -- checking, so a 'VChar' can flow into a Word8-typed slot
         -- when a user writes e.g. @Data.ByteString.pack "test"@ — a

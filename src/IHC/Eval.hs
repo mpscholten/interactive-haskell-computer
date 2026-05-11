@@ -983,6 +983,23 @@ matchPat hooks (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
 matchPat hooks (PCon "I#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
+-- Cross-rep match: source-loaded code that destructures a boxed
+-- scalar via @I# d@ / @W# d@ / @W8# d@ can be handed a value
+-- originally constructed through the 'Integer' path — small Integers
+-- live in 'VCon "IS" [VInt n]' and carry the same underlying 'Int#'
+-- as 'VInt'.  This shows up after 'fromIntegral' or implicit
+-- 'fromInteger' chains reach e.g. source-loaded
+-- @plusForeignPtr (ForeignPtr addr c) (I# d) = …@ or
+-- @poke (W8# byte#)@-shaped lambdas in @Data.ByteString.Char8@.
+-- Without these cases the function falls through to "Non-exhaustive
+-- patterns" even though the runtime value semantically IS an
+-- Int#-shaped boxed scalar.
+matchPat hooks (PCon "I#" [p]) (VCon "IS" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =
+    matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
