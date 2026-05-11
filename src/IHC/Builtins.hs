@@ -601,6 +601,40 @@ builtins reg =
     , ("bigNatIsZero#",            makeBigNatUnaryBool "bigNatIsZero#" (== 0))
     , ("bigNatIsOne#",             makeBigNatUnaryBool "bigNatIsOne#" (== 1))
     , ("bigNatSize#",              bigNatSizeHashB)       -- BigNat# -> Int# (limb count)
+    -- Phase 2.B: arithmetic primops.  Thin wrappers over host
+    -- 'Numeric.Natural' arithmetic.  Signatures from
+    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
+    --
+    -- 'bigNatSub' (returning @(# (# #) | BigNat# #)@) is DEFERRED —
+    -- IHC has no unboxed-sum runtime yet; ghc-bignum's source-level
+    -- @case bigNatSub a b of (# (# #) | #) -> ... ; (# | bn #) -> ...@
+    -- can't be matched against any VCon we currently produce.  Tracked
+    -- as a follow-up.  Callers that don't need the underflow check
+    -- can use 'bigNatSubUnsafe' instead; both ghc-bignum 'integerSub'
+    -- callsites guard with 'bigNatCompare' first.
+    --
+    -- 'bigNatPow#' is listed in the Phase 2 plan but doesn't exist in
+    -- ghc-bignum source.  The closest primop is 'bigNatPowModWord#'
+    -- (modular exponentiation), which is niche and deferred.
+    --
+    -- For symmetry with 'bigNatSub', 'bigNatIsPowerOf2#' (also
+    -- @(# (# #) | Word# #)@-returning) is deferred to the same
+    -- unboxed-sum follow-up.
+    , ("bigNatAdd",                makeBigNatBinOp "bigNatAdd" (+))
+    , ("bigNatMul",                makeBigNatBinOp "bigNatMul" (*))
+    , ("bigNatSubUnsafe",          makeBigNatBinOp "bigNatSubUnsafe" (-))
+    , ("bigNatQuot",               makeBigNatBinOp "bigNatQuot" quot)
+    , ("bigNatRem",                makeBigNatBinOp "bigNatRem" rem)
+    , ("bigNatGcd",                makeBigNatBinOp "bigNatGcd" gcd)
+    , ("bigNatLcm",                makeBigNatBinOp "bigNatLcm" lcm)
+    , ("bigNatSqr",                bigNatSqrB)
+    , ("bigNatQuotRem#",           bigNatQuotRemHashB)
+    , ("bigNatAddWord#",           makeBigNatWordOp "bigNatAddWord#" (+))
+    , ("bigNatMulWord#",           makeBigNatWordOp "bigNatMulWord#" (*))
+    , ("bigNatQuotWord#",          makeBigNatWordOp "bigNatQuotWord#" quot)
+    , ("bigNatSubWordUnsafe#",     makeBigNatWordOp "bigNatSubWordUnsafe#" (-))
+    , ("bigNatRemWord#",           bigNatRemWordHashB)
+    , ("bigNatQuotRemWord#",       bigNatQuotRemWordHashB)
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -3264,6 +3298,80 @@ bigNatLimbCount = go 0
   where
     go !i 0 = i
     go !i n = go (i + 1) (n `shiftR` 64)
+
+-- | Phase 2.B: binary BigNat# arithmetic primop returning BigNat#.
+-- Both args are 'VPrimObj (PrimBigNat _)'.
+makeBigNatBinOp :: String -> (Natural -> Natural -> Natural) -> IO Val
+makeBigNatBinOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    nb <- extractBigNat name bv
+    pure (VPrimObj (PrimBigNat (op na nb)))
+
+-- | Phase 2.B: @BigNat# -> Word# -> BigNat#@ primop.  The Word#
+-- arg is reinterpreted from VInt's Int64 bits (matching
+-- 'bigNatFromWord#') before applying the binary op over 'Natural'.
+makeBigNatWordOp :: String -> (Natural -> Natural -> Natural) -> IO Val
+makeBigNatWordOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    case bv of
+        VInt w ->
+            pure (VPrimObj (PrimBigNat
+                (op na (fromIntegral (fromIntegral w :: Word)))))
+        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatSqr :: BigNat# -> BigNat#@ — square of a BigNat#.
+-- Equivalent to @bigNatMul a a@ but ghc-bignum keeps a dedicated
+-- primop because GMP has a specialised path; over host 'Natural'
+-- the speedup is negligible, so we just multiply.
+bigNatSqrB :: IO Val
+bigNatSqrB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatSqr" av
+    pure (VPrimObj (PrimBigNat (n * n)))
+
+-- | @bigNatQuotRem# :: BigNat# -> BigNat# -> (# BigNat#, BigNat# #)@.
+-- The unboxed tuple is encoded as @VCon "(#,#)" [qT, rT]@ (same
+-- shape as 'decodeDouble_Int64#').
+bigNatQuotRemHashB :: IO Val
+bigNatQuotRemHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatQuotRem#" av
+    nb <- extractBigNat "bigNatQuotRem#" bv
+    let (q, r) = na `quotRem` nb
+    qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
+    rT <- newWHNFThunk (VPrimObj (PrimBigNat r))
+    pure (VCon "(#,#)" [qT, rT])
+
+-- | @bigNatRemWord# :: BigNat# -> Word# -> Word#@.  The remainder
+-- fits in a Word# (since @r < divisor < 2^64@).
+bigNatRemWordHashB :: IO Val
+bigNatRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatRemWord#" av
+    case bv of
+        VInt w -> do
+            let wNat = fromIntegral (fromIntegral w :: Word) :: Natural
+                r    = na `rem` wNat
+            pure (VInt (fromIntegral r))
+        _ -> error
+            ("bigNatRemWord#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatQuotRemWord# :: BigNat# -> Word# -> (# BigNat#, Word# #)@.
+bigNatQuotRemWordHashB :: IO Val
+bigNatQuotRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatQuotRemWord#" av
+    case bv of
+        VInt w -> do
+            let wNat   = fromIntegral (fromIntegral w :: Word) :: Natural
+                (q, r) = na `quotRem` wNat
+            qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
+            rT <- newWHNFThunk (VInt (fromIntegral r))
+            pure (VCon "(#,#)" [qT, rT])
+        _ -> error
+            ("bigNatQuotRemWord#: not a Word#: " <> showValForDebug bv)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops

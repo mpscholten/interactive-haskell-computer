@@ -1,0 +1,17 @@
+add  5+10 == 15  : True
+mul  5*10 == 50  : True
+subU 10-5 == 5   : True
+quot 10/3 == 3   : True
+rem  10%3 == 1   : True
+quotRem# 10 3 q==3: True
+quotRem# 10 3 r==1: True
+gcd  12 8 == 4   : True
+lcm  4 6  == 12  : True
+sqr  5    == 25  : True
+addW#  5 +# 10 == 15  : True
+mulW#  5 *# 10 == 50  : True
+quotW# 10 /# 3 == 3   : True
+subWU# 10 -# 5 == 5   : True
+remW#  10 %# 3 == 1   : True
+quotRemW# 10 3 q==3 : True
+quotRemW# 10 3 r==1 : True
