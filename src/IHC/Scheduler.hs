@@ -52,6 +52,7 @@ import Control.Applicative ((<|>))
 import Foreign.Ptr (nullPtr)
 import qualified Foreign.Ptr as FP
 import Data.ByteString (ByteString, isSuffixOf)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
@@ -1714,15 +1715,23 @@ registerInstancesFrom registry searchPath includeMap classReg typeCtors classTab
             (registerOne registry searchPath includeMap classReg
                          typeCtors classTable env lm decl)
 
--- | Sentinel used as a placeholder when an instance method can't be
--- evaluated (parse error, unbound helper, etc.). The dispatcher detects
--- this sentinel and falls through to the class's default method body,
--- preserving partial-instance semantics.
-methodPlaceholder :: Val
-methodPlaceholder = VCon (BC.pack "<ihc-method-placeholder>") []
+-- | Identifying placeholder used when an instance method can't be
+-- evaluated (parse error, unbound helper, etc.).  The dispatcher
+-- detects this sentinel via 'isMethodPlaceholder' and falls through
+-- to the class's default method body, preserving partial-instance
+-- semantics.
+--
+-- The constructor name carries the @cls\/method@ tag so
+-- 'showValForDebug' surfaces which method couldn't be evaluated in
+-- @IHC.Eval.apply@'s "not a function" error.
+identifyingPlaceholder :: ByteString -> ByteString -> Val
+identifyingPlaceholder cls methodName =
+    VCon (BC.pack "<ihc-method-placeholder>" <> BC.pack ":"
+          <> cls <> BC.pack "/" <> methodName) []
 
 isMethodPlaceholder :: Val -> Bool
-isMethodPlaceholder (VCon n []) = n == BC.pack "<ihc-method-placeholder>"
+isMethodPlaceholder (VCon n [])
+    = BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
 isMethodPlaceholder _           = False
 
 registerOne
@@ -1843,12 +1852,12 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     ctors <- instanceRuntimeCtors typ
     mapM_ (\ctor -> registerInstance classReg cls ctor methodVals) ctors
   where
-    evalOneMethodWith _e _rw _mn Nothing = pure methodPlaceholder
+    evalOneMethodWith _e _rw _mn Nothing = pure (identifyingPlaceholder cls _mn)
     evalOneMethodWith e rw _mn (Just lhs) = do
         r <- try (evalMethodWithLazy e lm rw (_mn, lhs)) :: IO (Either SomeException Val)
         case r of
             Right v -> pure v
-            Left  _ -> pure methodPlaceholder
+            Left  _ -> pure (identifyingPlaceholder cls _mn)
 
     instanceRuntimeCtors ty =
         case splitQualified ty of
@@ -2704,7 +2713,7 @@ lookupInstanceMethodForced reg cls tag methodName = do
         r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
         case r of
             Right v' -> pure v'
-            Left  _  -> pure methodPlaceholder
+            Left  _  -> pure (identifyingPlaceholder cls methodName)
 
 -- | 'lookupInSharedReg' + 'forceMethodVal'.  Parallel to
 -- 'lookupInstanceMethodForced' for the REPL-level shared registry.
@@ -2718,7 +2727,7 @@ lookupInSharedRegForced cls tag methodName = do
         r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
         case r of
             Right v' -> pure v'
-            Left  _  -> pure methodPlaceholder
+            Left  _  -> pure (identifyingPlaceholder cls methodName)
 
 -- | Build a dispatcher Val for a single class method.
 --
@@ -3396,7 +3405,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
     -- giving e.g. 'MonadParsec.*>' a chance to find the ParsecT instance
     -- (which DOES define '*>' explicitly) instead of failing on the
     -- missing class default.
-    placeholder _cls _methodName = methodPlaceholder
+    placeholder cls' methodName = identifyingPlaceholder cls' methodName
 
 evalDefaultMethodWith :: Env -> LoadedModule -> Map ByteString ByteString -> BindingLhs -> IO Val
 evalDefaultMethodWith env lm rewrites lhs = do
