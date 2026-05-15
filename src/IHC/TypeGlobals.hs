@@ -190,6 +190,22 @@ seedBuiltinClassMethodSigs = do
             , ("quot",       "Integral")
             , ("rem",        "Integral")
             , ("toInteger",  "Integral")
+            -- Bits (bitwise core).  Seeded so the env-fallback's
+            -- 'tryClassMethodFromRegistry' can synthesise a
+            -- 'classMethodDispatcher' for bare @.&. .|. xor
+            -- complement shiftL shiftR@ on first call, without
+            -- first walking the Prelude scope to lazy-load
+            -- @GHC.Internal.Bits@.  These were builtin-shimmed
+            -- before the env-fallback infra existed; the shims
+            -- are now removed and the @instance Bits Int@ body
+            -- (Bits.hs:444) source-loads, bottoming on the
+            -- andI#/orI#/xorI#/notI#/iShiftL#/iShiftRA# primops.
+            , (".&.",        "Bits")
+            , (".|.",        "Bits")
+            , ("xor",        "Bits")
+            , ("complement", "Bits")
+            , ("shiftL",     "Bits")
+            , ("shiftR",     "Bits")
             -- Fractional
             , ("/",          "Fractional")
             , ("recip",      "Fractional")
