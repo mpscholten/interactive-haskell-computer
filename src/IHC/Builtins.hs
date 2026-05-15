@@ -1511,14 +1511,6 @@ builtins reg =
     , ("GHC.Internal.IO.catch", catchB)
     , ("Control.Exception.catch", catchB)
     , ("GHC.Internal.Control.Exception.catch", catchB)
-    , ("handle",          handleB)
-    , ("Control.Exception.handle", handleB)
-    , ("GHC.Internal.Control.Exception.handle", handleB)
-    , ("try",             tryB)
-    , ("Control.Exception.try", tryB)
-    , ("Control.Exception.Base.try", tryB)
-    , ("GHC.Internal.Control.Exception.try", tryB)
-    , ("GHC.Internal.Control.Exception.Base.try", tryB)
     , ("evaluate",        evaluateB)
     , ("Control.Exception.evaluate", evaluateB)
     , ("GHC.Internal.Control.Exception.evaluate", evaluateB)
@@ -7559,57 +7551,6 @@ catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
             excT   <- newWHNFThunk excVal
             rv     <- apply legacyHooks hv excT
             runIOVal legacyHooks rv)
-
-handleB :: IO Val
-handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    hv <- force legacyHooks hT
-    av <- force legacyHooks aT
-    catch
-        (catch
-            (runIOVal legacyHooks av)
-            (\(exc :: IhcException) -> do
-                excVal <- ihcExceptionToVal exc
-                excT   <- newWHNFThunk excVal
-                rv     <- apply legacyHooks hv excT
-                runIOVal legacyHooks rv))
-        (\(exc :: SomeException) -> do
-            let msg = BC.pack (show exc)
-            excT <- newWHNFThunk (VStr msg)
-            rv   <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv)
-
--- | @Control.Exception.try :: Exception e => IO a -> IO (Either e a)@.
---
--- The previous implementation only caught 'IhcException' (the
--- interpreter-thrown wrapper for source-level @throw@ / @throwIO@).
--- Anything thrown by a host-backed builtin — most notably the
--- 'IOException's that 'Network.Socket' operations raise — slipped
--- straight past, terminating the calling thread silently.  Warp's
--- @acceptNewConnection@ depends on @try@ catching the syscall errors
--- that @accept@/@setSocketOption@ throw, so this regression caused
--- @runSettings@ to bail after one iteration of the accept loop with
--- exit code 0 and no diagnostic output.
---
--- Now we catch @SomeException@ and convert it to a Val:
---   * 'IhcException' is unwrapped to its embedded 'Val' (preserves
---     source-level @throw v@ semantics).
---   * Anything else is materialised via 'hostExceptionToVal' as a
---     stub @IOError@ record so source code that pattern-matches on
---     fields like 'ioe_errno' doesn't blow up.
-tryB :: IO Val
-tryB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    r  <- CE.try @SomeException (runIOVal legacyHooks av)
-    case r of
-        Right v -> do
-            vT <- newWHNFThunk v
-            pure (VCon "Right" [vT])
-        Left e -> do
-            excVal <- case CE.fromException e of
-                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
-                Nothing                       -> hostExceptionToVal e
-            excT <- newWHNFThunk excVal
-            pure (VCon "Left" [excT])
 
 -- | Convert a host-thrown 'SomeException' into a Val that source-level
 -- pattern matching on 'IOError' can introspect.  Most Haskell code in
