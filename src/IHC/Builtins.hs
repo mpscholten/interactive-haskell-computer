@@ -575,9 +575,14 @@ builtins reg =
     , ("__ihc_class_supers", classSupersProbeB)
     , ("exitWith",    exitWithB)
     , ("exitSuccess", exitSuccessB)
-    -- Char / numeric conversions
-    , ("ord",         ordB)
-    , ("chr",         chrB)
+    -- Char / numeric conversions.
+    -- NOTE: only the GHC.Prim primops @ord#@ / @chr#@ are host-backed.
+    -- @Data.Char.ord@ / @Data.Char.chr@ have real source — @ord@ in
+    -- @GHC/Internal/Base.hs@ (@ord (C# c#) = I# (ord# c#)@) and @chr@ in
+    -- @GHC/Internal/Char.hs@ (@chr i\@(I# i#) | isTrue# (...) = C# (chr# i#)
+    -- | otherwise = ...@) — so they are interpreted from source via the
+    -- env-fallback path, bottoming out on these primops. Do NOT re-add
+    -- the bare ("ord"/"chr") shims.
     , ("ord#",        ordB)
     , ("chr#",        chrB)
     -- isTrue# :: Int# -> Bool.  Projects the 1#/0# unboxed-Int encoding
