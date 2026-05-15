@@ -564,7 +564,6 @@ builtins reg =
     , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
-    , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
     -- B.1: debug-only superclass-relation probe.  Source-loaded code
@@ -3209,10 +3208,6 @@ seqB :: IO Val
 seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     _ <- force legacyHooks a
     force legacyHooks b
-
--- | @assert cond x = x@.  Like GHC's default (assertions ignored) behaviour.
-assertB :: IO Val
-assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force legacyHooks x
 
 -- | @exitWith code@: throws 'ExitCode'. Wrapped in VIO so it's delayed.
 exitWithB :: IO Val
