@@ -1,0 +1,2 @@
+exitWith caught: SomeException ExitFailure 7
+exitSuccess caught: SomeException ExitSuccess
