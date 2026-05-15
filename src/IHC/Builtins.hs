@@ -976,6 +976,19 @@ builtins reg =
     , ("-##",          minusDoubleHashB)
     , ("*##",          timesDoubleHashB)
     , ("/##",          divideDoubleHashB)
+    -- Power primops (GHC.Prim, no .hs source — carve-out, same class
+    -- as the +##/-##/*##//## intrinsics above).  Backing the
+    -- source-loaded Floating instances graduated when the (^)/(^^)/(**)
+    -- builtins were removed:
+    --   instance Floating Double where (**) x y = powerDouble x y
+    --   powerDouble (D# x) (D# y) = D# (x **## y)        (Float.hs:1594)
+    --   instance Floating Float  where (**) x y = powerFloat x y
+    --   powerFloat (F# x) (F# y) = F# (powerFloat# x y)  (Float.hs:1542)
+    -- @powerFloat#@'s only "source" is the GHC.PrimopWrappers.hs
+    -- pass-through @powerFloat# a1 a2 = GHC.Prim.powerFloat# a1 a2@;
+    -- @**##@ has no wrapper at all.  Both are compiler intrinsics.
+    , ("**##",         powerDoubleHashB)
+    , ("powerFloat#",  powerFloatHashB)
     -- Phase 5: Double# comparison primops (==##, <##, etc.).
     -- These are needed by source-loaded Eq Double / Ord Double bodies
     -- and by 'floorDouble' / 'ceilingDouble' (which compare r < 0.0).
@@ -1176,10 +1189,19 @@ builtins reg =
     , ("testBit",      testBitB)
     , ("clearBit",     clearBitB)
     , ("setBit",       setBitB)
-    -- Power operator
-    , ("^",            powOpB)
-    , ("^^",           powFloatOpB)
-    , ("**",           powFloatOpB)
+    -- Power operators graduated to source-loaded:
+    --   (^)  / (^^) are top-level functions in GHC.Internal.Real
+    --     (^)  :: (Num a, Integral b)        => a -> b -> a   (Real.hs:744)
+    --     (^^) :: (Fractional a, Integral b) => a -> b -> a   (Real.hs:772)
+    --   They recurse via (*), `quot`, recip, negate — all already
+    --   graduated — so they resolve through the env-fallback EVar path
+    --   with no class-method seed.
+    --   (**) is a Floating class method, seeded @("**","Floating")@ in
+    --   TypeGlobals.seedBuiltinClassMethodSigs and routed via
+    --   tryClassMethodFromRegistry → classMethodDispatcher.  Its
+    --   Double#/Float# power primops (@**##@ / @powerFloat#@) are
+    --   GHC.Prim intrinsics — registered as carve-outs below near the
+    --   Double# arithmetic primops (full chain documented there).
     -- Phase 2.10a: concurrency primitives.  forkIO is backed by GHC's
     -- RTS thread primitive (`fork#` in GHC.Internal.Conc.Sync), so the
     -- module-qualified names forward to the same host operation as the bare
@@ -6096,39 +6118,29 @@ setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error "setBit: bad args"
 
 --------------------------------------------------------------------------------
--- Power operator
+-- Power primops (GHC.Prim intrinsics, no .hs source)
 --------------------------------------------------------------------------------
 
--- | @(^) :: Num a => a -> Int -> a@ — right-associative, precedence 8.
--- Int ^ Int → Int via repeated multiplication (handles 0^0 = 1).
--- Double ^ Int → Double via Haskell's (^^).
-powOpB :: IO Val
-powOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
+-- | @(**##) :: Double# -> Double# -> Double#@ — GHC.Prim floating
+-- exponentiation.  Bottom of the source-loaded @Floating Double@
+-- instance: @powerDouble (D# x) (D# y) = D# (x **## y)@.
+powerDoubleHashB :: IO Val
+powerDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
-        (VInt x, VInt n)
-            | n < 0    -> error ("(^): negative exponent: " <> show n)
-            | otherwise -> pure (VInt (intPow x n))
-        (VFloat x, VInt n) -> pure (VFloat (x ^^ n))
-        (VInt x, VFloat _) -> error "(^): exponent must be Int"
-        _ -> error ("(^): non-numeric args: "
-                    <> showValForDebug av <> " ^ " <> showValForDebug bv)
-  where
-    intPow :: Int64 -> Int64 -> Int64
-    intPow _ 0 = 1
-    intPow x n | odd n    = x * intPow x (n - 1)
-               | otherwise = let h = intPow x (n `div` 2) in h * h
+        (VFloat x, VFloat y) -> pure (VFloat (x ** y))
+        _ -> error ("**##: bad args: " <> showValForDebug av)
 
--- | @(^^) :: Fractional a => a -> Int -> a@  and  @(**) :: Floating a => a -> a -> a@.
-powFloatOpB :: IO Val
-powFloatOpB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    let toD (VFloat d) = d
-        toD (VInt n)   = fromIntegral n
-        toD v          = error ("(^^)/(** ): non-numeric: " <> showValForDebug v)
-    pure (VFloat (toD av ** toD bv))
+-- | @powerFloat# :: Float# -> Float# -> Float#@ — GHC.Prim floating
+-- exponentiation.  Bottom of the source-loaded @Floating Float@
+-- instance: @powerFloat (F# x) (F# y) = F# (powerFloat# x y)@.
+-- IHC stores both Float# and Double# as 'VFloat' (Double-backed).
+powerFloatHashB :: IO Val
+powerFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (VFloat (x ** y))
+        _ -> error ("powerFloat#: bad args: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
 -- Simple file IO: readFile, writeFile, appendFile
