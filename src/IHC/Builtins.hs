@@ -902,6 +902,15 @@ builtins reg =
     , ("andI#",             bitAndB)
     , ("orI#",              bitOrB)
     , ("xorI#",             bitXorB)
+    -- 'notI#' — bitwise complement on Int#.  A genuine GHC.Prim
+    -- primop with NO .hs source (ghc-prim's GHC/PrimopWrappers.hs
+    -- only re-exports @GHC.Prim.notI#@), so it qualifies as a
+    -- compiler-intrinsic carve-out under the builtins
+    -- minimum-surface rule.  Reached by the source-loaded
+    -- @divModInt#@ (GHC/Classes.hs:846) that the graduated
+    -- @divMod@ rides; aliased to the boxed complement since IHC
+    -- represents Int# as 'VInt' (Int64-backed).
+    , ("notI#",             bitComplementB)
     -- Int64# primops: IHC stores both Int# and Int64# as
     -- 'VInt' (Int64-backed Haskell), so conversions are
     -- identity functions and arithmetic dispatches to the
@@ -1163,8 +1172,20 @@ builtins reg =
     -- 'div' graduated with the rest of the TODO 2.6 block: it now
     -- routes through the Integral Int instance (a `divInt` b) and
     -- bottoms on divInt# registered below.
-    , ("divMod",       divModB)
-    , ("quotRem",      quotRemB)
+    --   * 'divMod' / 'quotRem' (Integral class) graduated (builtins
+    --     minimum-surface): the @divModB@ / @quotRemB@ shims were
+    --     dropped.  They now source-load through @Integral Int@ in
+    --     GHC/Internal/Real.hs:471-482, which routes
+    --     @a \`quotRem\` b@ → 'quotRemInt' / @a \`divMod\` b@ →
+    --     'divModInt' (Base.hs:2428,2444).  'quotRemInt' bottoms on
+    --     the 'quotRemInt#' primop (registered below); 'divModInt'
+    --     bottoms on 'divModInt#', which is *itself* source-loaded
+    --     from ghc-prim's GHC/Classes.hs:840 (it has real .hs source,
+    --     so per the doctrine it is interpreted, not shimmed) and in
+    --     turn rides 'quotRemInt#' plus the 'notI#' GHC.Prim primop
+    --     carve-out registered below.  The class-method dispatch is
+    --     seeded via @("divMod","Integral")@ / @("quotRem","Integral")@
+    --     in 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
     , ("shiftL",       shiftLB)
     , ("shiftR",       shiftRB)
     , (".&.",          bitAndB)
@@ -5740,21 +5761,6 @@ asInt64 (VInteger n)
 asInt64 _ = Nothing
 
 
--- | IO-aware coercion of a 'Val' to 'Int64'.  Like 'asInt64'
--- but additionally peeks through @VCon \"IS\" [thunk]@ — the
--- source-loaded ghc-bignum 'Integer' small-Int constructor —
--- by forcing the inner thunk.  See @IHC.Eval.matchPat@'s @IS@
--- pattern arm for the symmetric pattern-direction bridge.
-coerceInt64 :: Val -> IO (Maybe Int64)
-coerceInt64 v = case asInt64 v of
-    Just n -> pure (Just n)
-    Nothing -> case v of
-        VCon "IS" [t] -> do
-            v' <- force legacyHooks t
-            coerceInt64 v'
-        _ -> pure Nothing
-
-
 -- | @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@
 -- GHC primop: decompose a Double into mantissa (Int64) and
 -- base-2 exponent (Int).  For finite non-zero @d@,
@@ -5995,28 +6001,10 @@ alignmentB = pure $ VFun $ \a -> do
 -- Phase 2.8: additional numeric / bit ops
 --------------------------------------------------------------------------------
 
-divModB :: IO Val
-divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> do
-            let (d, m) = x `divMod` y
-            dT <- newWHNFThunk (VInt d); mT <- newWHNFThunk (VInt m)
-            pure (VCon "(,)" [dT, mT])
-        _ -> error "divMod: bad args"
-
-quotRemB :: IO Val
-quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    mx <- coerceInt64 av
-    my <- coerceInt64 bv
-    case (mx, my) of
-        (Just x, Just y) -> do
-            let (q, r) = x `quotRem` y
-            qT <- newWHNFThunk (VInt q); rT <- newWHNFThunk (VInt r)
-            pure (VCon "(,)" [qT, rT])
-        _ -> error ("quotRem: bad args: a=" <> showValForDebug av
-                   <> " b=" <> showValForDebug bv)
+-- Phase (builtins minimum-surface): the bare-name @divMod@ / @quotRem@
+-- shims were removed.  Resolution now flows through the source-loaded
+-- @Integral Int@ instance in GHC/Internal/Real.hs (see the registry
+-- comment near the old @("divMod", …)@ entry).  No host helper here.
 
 shiftLB :: IO Val
 shiftLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do

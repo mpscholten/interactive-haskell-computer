@@ -181,14 +181,20 @@ seedBuiltinClassMethodSigs = do
             -- Bounded
             , ("minBound",   "Bounded")
             , ("maxBound",   "Bounded")
-            -- Integral (mod / div / quotRem / divMod don't need seeding —
-            -- the registry handles them after Integral source-loads via
-            -- triggerCoreInstanceLoad / registerGlobalLoadedModule.  These
-            -- are seeded for first-call locality so bare references like
-            -- @17 \`quot\` 5@ in the REPL hit a 1-step lookup instead of
-            -- the 3-step probe→load→discover cascade.)
+            -- Integral.  These are seeded for first-call locality so
+            -- bare references like @17 \`quot\` 5@ in the REPL hit a
+            -- 1-step lookup instead of the 3-step probe→load→discover
+            -- cascade.  divMod / quotRem MUST be seeded since their
+            -- builtin shims were removed (builtins minimum-surface):
+            -- the env-fallback's tryClassMethodFromRegistry needs the
+            -- class binding present so it can synthesise the
+            -- classMethodDispatcher that triggers the Integral source
+            -- load.  (mod / div likewise graduated and ride the same
+            -- registry path; they are covered once Real source-loads.)
             , ("quot",       "Integral")
             , ("rem",        "Integral")
+            , ("divMod",     "Integral")
+            , ("quotRem",    "Integral")
             , ("toInteger",  "Integral")
             -- Fractional
             , ("/",          "Fractional")
