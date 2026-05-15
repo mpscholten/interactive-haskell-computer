@@ -32,7 +32,7 @@ import Control.Concurrent.STM
     )
 import qualified Control.Exception as CE
 import Control.Exception
-    ( throwIO, catch, try, evaluate, mask, mask_
+    ( throwIO, catch, try, evaluate
     , bracket, bracket_, bracketOnError, finally, onException, throwTo
     , SomeException
     )
@@ -1522,43 +1522,12 @@ builtins reg =
     , ("evaluate",        evaluateB)
     , ("Control.Exception.evaluate", evaluateB)
     , ("GHC.Internal.Control.Exception.evaluate", evaluateB)
-    , ("mask_",           mask_B)
-    , ("GHC.IO.mask_",    mask_B)
-    , ("GHC.Internal.IO.mask_", mask_B)
-    , ("Control.Exception.mask_", mask_B)
-    , ("GHC.Internal.Control.Exception.mask_", mask_B)
-    , ("mask",            maskB)
-    , ("GHC.IO.mask",     maskB)
-    , ("GHC.Internal.IO.mask", maskB)
-    , ("Control.Exception.mask", maskB)
-    , ("GHC.Internal.Control.Exception.mask", maskB)
-    , ("uninterruptibleMask_", mask_B)
-    , ("uninterruptibleMask", maskB)
-    , ("GHC.IO.uninterruptibleMask_", mask_B)
-    , ("GHC.IO.uninterruptibleMask", maskB)
-    , ("GHC.Internal.IO.uninterruptibleMask_", mask_B)
-    , ("GHC.Internal.IO.uninterruptibleMask", maskB)
-    , ("Control.Exception.uninterruptibleMask_", mask_B)
-    , ("Control.Exception.uninterruptibleMask", maskB)
-    , ("GHC.Internal.Control.Exception.uninterruptibleMask_", mask_B)
-    , ("GHC.Internal.Control.Exception.uninterruptibleMask", maskB)
-    , ("block",           mask_B)
-    , ("GHC.IO.block",    mask_B)
-    , ("GHC.Internal.IO.block", mask_B)
-    , ("unblock",         mask_B)
-    , ("GHC.IO.unblock",  mask_B)
-    , ("GHC.Internal.IO.unblock", mask_B)
-    , ("unsafeUnmask",    mask_B)
-    , ("GHC.IO.unsafeUnmask", mask_B)
-    , ("GHC.Internal.IO.unsafeUnmask", mask_B)
-    , ("allowInterrupt", allowInterruptB)
-    , ("Control.Exception.allowInterrupt", allowInterruptB)
-    , ("GHC.Internal.Control.Exception.allowInterrupt", allowInterruptB)
-    , ("interruptible", interruptibleB)
-    , ("Control.Exception.interruptible", interruptibleB)
-    , ("GHC.Internal.Control.Exception.interruptible", interruptibleB)
-    , ("GHC.IO.interruptible", interruptibleB)
-    , ("GHC.Internal.IO.interruptible", interruptibleB)
+    -- mask / mask_ / uninterruptibleMask{,_} / block / unblock /
+    -- unsafeUnmask / allowInterrupt / interruptible are source-loaded from
+    -- GHC.Internal.IO: the chain bottoms out on getMaskingState# /
+    -- maskAsyncExceptions# / maskUninterruptible# / unmaskAsyncExceptions#
+    -- (GHC.Prim primops, registered above) which the interpreter treats as
+    -- Unmasked / identity — the no-op masking semantics this code needs.
     , ("bracket",         bracketB)
     , ("Control.Exception.bracket", bracketB)
     , ("GHC.Internal.Control.Exception.bracket", bracketB)
@@ -7641,30 +7610,6 @@ evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
     av <- force legacyHooks aT
     _  <- evaluate av
     pure av
-
-mask_B :: IO Val
-mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    mask_ (runIOVal legacyHooks av)
-
-allowInterruptB :: IO Val
-allowInterruptB = pure $ VIO $ pure VUnit
-
-interruptibleB :: IO Val
-interruptibleB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    runIOVal legacyHooks av
-
-maskB :: IO Val
-maskB = pure $ VFun $ \fT -> pure $ VIO $ do
-    fv <- force legacyHooks fT
-    mask $ \restore -> do
-        let restoreVal = VFun $ \aT -> pure $ VIO $ do
-                av <- force legacyHooks aT
-                restore (runIOVal legacyHooks av)
-        restoreT <- newWHNFThunk restoreVal
-        rv <- apply legacyHooks fv restoreT
-        runIOVal legacyHooks rv
 
 bracketB :: IO Val
 bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
