@@ -1171,11 +1171,15 @@ builtins reg =
     , (".|.",          bitOrB)
     , ("xor",          bitXorB)
     , ("complement",   bitComplementB)
-    , ("popCount",     popCountB)
-    , ("bit",          bitB)
-    , ("testBit",      testBitB)
-    , ("clearBit",     clearBitB)
-    , ("setBit",       setBitB)
+    -- popCount / bit / testBit / clearBit / setBit removed per CLAUDE.md
+    -- "Builtin modules: minimum surface only".  These are @class Bits@
+    -- methods (GHC.Internal.Bits); the @Bits Int@ instance + class
+    -- defaults express them via shifts, @.&.@, @.|.@, @complement@, and
+    -- the @popCnt#@ primop (registered below).  Resolution now flows
+    -- through the source-loaded @class Bits@ via the env-fallback's
+    -- 'tryClassMethodFromRegistry' → 'classMethodDispatcher', seeded by
+    -- @("popCount"/"bit"/"testBit"/"clearBit"/"setBit","Bits")@ in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
     -- Power operator
     , ("^",            powOpB)
     , ("^^",           powFloatOpB)
@@ -6060,40 +6064,8 @@ bitComplementB = pure $ VFun $ \a -> do
         VInt x -> pure (VInt (complement x))
         _ -> error "complement: bad arg"
 
-popCountB :: IO Val
-popCountB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
-        _ -> error "popCount: bad arg"
-
-bitB :: IO Val
-bitB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n -> pure (VInt (1 `shiftL` fromIntegral n))
-        _ -> error "bit: bad arg"
-
-testBitB :: IO Val
-testBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (boolVal ((x `shiftR` fromIntegral n) .&. 1 /= 0))
-        _ -> error "testBit: bad args"
-
-clearBitB :: IO Val
-clearBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x .&. complement (1 `shiftL` fromIntegral n)))
-        _ -> error "clearBit: bad args"
-
-setBitB :: IO Val
-setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x .|. (1 `shiftL` fromIntegral n)))
-        _ -> error "setBit: bad args"
+-- popCountB / bitB / testBitB / clearBitB / setBitB removed — see the
+-- @class Bits@ removal note at their former registry entries above.
 
 --------------------------------------------------------------------------------
 -- Power operator
