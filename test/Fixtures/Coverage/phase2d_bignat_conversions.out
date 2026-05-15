@@ -1,0 +1,20 @@
+toWord#  12345    == 12345 : True
+toInt#   12345    == 12345 : True
+fromAbs#  42      == 42    : True
+fromAbs# -42      == 42    : True
+fromW64# 99       == 99    : True
+toW64#   99       == 99    : True
+encDbl#  5 4      == 80.0  : True
+encDbl#  3 -2     == 0.75  : True
+intFrom# 0        == 0     : True
+intFrom# 42       == 42    : True
+intFromN# 42      == -42   : True
+intFromS# 0 42    == 42    : True
+intFromS# 1 42    == -42   : True
+intToBNC# 42      == 42    : True
+intToBNC# -5      == 0     : True
+log2#  8          == 3     : True
+log2#  1          == 0     : True
+log2#  0          == 0     : True
+logBase#  3 81    == 4     : True
+logBaseW# 10 1000 == 3     : True

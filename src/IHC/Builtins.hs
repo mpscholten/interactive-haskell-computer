@@ -41,6 +41,7 @@ import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
+    , bit, testBit, clearBit, setBit, complementBit
     )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -315,13 +316,37 @@ builtins reg =
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
     [ ("sqrt",     unaryOpFloat sqrt)
-    , ("floor",    floatToIntB floor)
-    , ("ceiling",  floatToIntB ceiling)
-    , ("round",    floatToIntB round)
-    , ("truncate", floatToIntB truncate)
+    -- Phase 5: graduated 'floor' / 'ceiling' / 'round' / 'truncate'
+    -- to source-loaded.  The chain is:
+    --
+    --   floor :: RealFrac Double => Double -> Int
+    --   = RealFrac Double.floor  (source-loaded GHC.Internal.Float)
+    --   = floorDouble x
+    --   = case properFractionDouble x of (n,r) -> if r < 0 then n-1 else n
+    --   = ... uses 'decodeFloat' / 'encodeFloat' / Integer arithmetic
+    --
+    -- Needed primops added in this PR:
+    --   int2Double#, intEncodeDouble#, negateDouble#, double2Int#,
+    --   double2Float#, float2Double#  — Int#/Double# bridges
+    --   ==##, /=##, <##, <=##, >##, >=##  — Double# comparisons
+    --   fabsDouble#, negateFloat#  — Double# unary
+    --
+    -- Plus host shims for 'encodeFloat' / 'decodeFloat' that
+    -- short-circuit the class-method dispatcher (separate workstream:
+    -- @RealFloat Double.encodeFloat@ instance method registration
+    -- isn't surfacing through dispatch; the host shim bypasses).
     , ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
+    -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  The
+    -- source-loaded @RealFloat Double@ instance methods aren't being
+    -- picked up by the class dispatcher (separate workstream); by
+    -- registering them in the builtin env the env-fallback short-
+    -- circuits the dispatcher and returns these shims directly.
+    -- This unblocks the source-loaded floor/ceiling/round/truncate
+    -- chain through 'properFractionDouble'.
+    , ("encodeFloat",  encodeFloatB)
+    , ("decodeFloat",  decodeFloatB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
@@ -591,6 +616,115 @@ builtins reg =
     , ("bigNatIsZero#",            makeBigNatUnaryBool "bigNatIsZero#" (== 0))
     , ("bigNatIsOne#",             makeBigNatUnaryBool "bigNatIsOne#" (== 1))
     , ("bigNatSize#",              bigNatSizeHashB)       -- BigNat# -> Int# (limb count)
+    -- Phase 2.B: arithmetic primops.  Thin wrappers over host
+    -- 'Numeric.Natural' arithmetic.  Signatures from
+    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
+    --
+    -- 'bigNatSub' (returning @(# (# #) | BigNat# #)@) is DEFERRED —
+    -- IHC has no unboxed-sum runtime yet; ghc-bignum's source-level
+    -- @case bigNatSub a b of (# (# #) | #) -> ... ; (# | bn #) -> ...@
+    -- can't be matched against any VCon we currently produce.  Tracked
+    -- as a follow-up.  Callers that don't need the underflow check
+    -- can use 'bigNatSubUnsafe' instead; both ghc-bignum 'integerSub'
+    -- callsites guard with 'bigNatCompare' first.
+    --
+    -- 'bigNatPow#' is listed in the Phase 2 plan but doesn't exist in
+    -- ghc-bignum source.  The closest primop is 'bigNatPowModWord#'
+    -- (modular exponentiation), which is niche and deferred.
+    --
+    -- For symmetry with 'bigNatSub', 'bigNatIsPowerOf2#' (also
+    -- @(# (# #) | Word# #)@-returning) is deferred to the same
+    -- unboxed-sum follow-up.
+    , ("bigNatAdd",                makeBigNatBinOp "bigNatAdd" (+))
+    , ("bigNatMul",                makeBigNatBinOp "bigNatMul" (*))
+    , ("bigNatSubUnsafe",          makeBigNatBinOp "bigNatSubUnsafe" (-))
+    , ("bigNatQuot",               makeBigNatBinOp "bigNatQuot" quot)
+    , ("bigNatRem",                makeBigNatBinOp "bigNatRem" rem)
+    , ("bigNatGcd",                makeBigNatBinOp "bigNatGcd" gcd)
+    , ("bigNatLcm",                makeBigNatBinOp "bigNatLcm" lcm)
+    , ("bigNatSqr",                bigNatSqrB)
+    , ("bigNatQuotRem#",           bigNatQuotRemHashB)
+    , ("bigNatAddWord#",           makeBigNatWordOp "bigNatAddWord#" (+))
+    , ("bigNatMulWord#",           makeBigNatWordOp "bigNatMulWord#" (*))
+    , ("bigNatQuotWord#",          makeBigNatWordOp "bigNatQuotWord#" quot)
+    , ("bigNatSubWordUnsafe#",     makeBigNatWordOp "bigNatSubWordUnsafe#" (-))
+    , ("bigNatRemWord#",           bigNatRemWordHashB)
+    , ("bigNatQuotRemWord#",       bigNatQuotRemWordHashB)
+    -- Phase 2.C: bit-op primops.  Thin wrappers over host
+    -- 'Numeric.Natural''s 'Data.Bits' instance.  Signatures from
+    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
+    , ("bigNatAnd",                makeBigNatBinOp "bigNatAnd" (.&.))
+    , ("bigNatOr",                 makeBigNatBinOp "bigNatOr"  (.|.))
+    , ("bigNatXor",                makeBigNatBinOp "bigNatXor" xor)
+    , ("bigNatAndNot",             makeBigNatBinOp "bigNatAndNot" andNotNat)
+    , ("bigNatAndWord#",           makeBigNatWordOp "bigNatAndWord#" (.&.))
+    , ("bigNatOrWord#",            makeBigNatWordOp "bigNatOrWord#"  (.|.))
+    , ("bigNatXorWord#",           makeBigNatWordOp "bigNatXorWord#" xor)
+    , ("bigNatAndNotWord#",        makeBigNatWordOp "bigNatAndNotWord#" andNotNat)
+    , ("bigNatAndInt#",            bigNatAndIntHashB)
+    , ("bigNatShiftL#",            makeBigNatShiftOp "bigNatShiftL#" shiftL)
+    , ("bigNatShiftR#",            makeBigNatShiftOp "bigNatShiftR#" shiftR)
+    , ("bigNatShiftRNeg#",         bigNatShiftRNegHashB)
+    , ("bigNatPopCount#",          bigNatPopCountHashB)
+    , ("bigNatTestBit#",           bigNatTestBitHashB)
+    , ("bigNatBit#",               bigNatBitHashB)
+    -- Phase 2.D: conversion primops.  'bigNatFromWord#' landed in
+    -- Phase 1; this tranche covers the remaining basic conversions
+    -- plus the Integer<->BigNat# bridge primops from
+    -- GHC.Num.Integer (which the source-loaded ghc-bignum 'Integer'
+    -- arithmetic uses pervasively).
+    --
+    -- DEFERRED to a later tranche (state-token / Addr# threading,
+    -- unboxed sums, list-based):
+    --   bigNatFromWordList / bigNatToWordList         (list-based)
+    --   bigNatToWordMaybe# :: BigNat# -> (# (# #) | Word# #)
+    --   bigNatToAddr* / bigNatFromAddr* / bigNatTo|FromByteArray* /
+    --     bigNatFromWordArray*                         (IO + Addr#)
+    , ("bigNatToWord#",            bigNatToWordHashB)         -- BigNat# -> Word#
+    , ("bigNatToInt#",             bigNatToIntHashB)          -- BigNat# -> Int#
+    , ("bigNatFromAbsInt#",        bigNatFromAbsIntHashB)     -- Int# -> BigNat#
+    , ("bigNatFromWord64#",        bigNatFromWordB)           -- alias on 64-bit
+    , ("bigNatToWord64#",          bigNatToWordHashB)         -- alias on 64-bit
+    , ("bigNatEncodeDouble#",      bigNatEncodeDoubleHashB)   -- m * 2^e
+    -- Integer <-> BigNat# bridges (from GHC.Num.Integer)
+    , ("integerFromBigNat#",       integerFromBigNatHashB)
+    , ("integerFromBigNatNeg#",    integerFromBigNatNegHashB)
+    , ("integerFromBigNatSign#",   integerFromBigNatSignHashB)
+    , ("integerToBigNatClamp#",    integerToBigNatClampHashB)
+    -- Logarithms
+    , ("bigNatLog2#",              bigNatLog2HashB)           -- BigNat# -> Word#
+    , ("bigNatLogBase#",           bigNatLogBaseHashB)        -- BigNat# -> BigNat# -> Word#
+    , ("bigNatLogBaseWord#",       bigNatLogBaseWordHashB)    -- Word# -> BigNat# -> Word#
+    -- Phase 2.E: completion tranche.  The Phase 2 plan listed
+    -- 'bigNatShow' / 'bigNatRead' / 'bigNatToHexString' as the show/read
+    -- tranche, but none of those primops exist in ghc-bignum source —
+    -- show/read for 'Integer' uses character-by-character building
+    -- through quotRem, which is composed at the source level over the
+    -- arithmetic primops already shipped in Phase 2.B.  Instead this
+    -- tranche fills out the remaining basic BigNat# primops: bit-modify,
+    -- BigNat#-vs-Word# comparison, count-trailing-zeros, indexing into
+    -- limbs, zero/one constants, and digit-count-in-base.
+    , ("bigNatClearBit#",          makeBigNatShiftOp "bigNatClearBit#" (\n i -> clearBit n i))
+    , ("bigNatSetBit#",            makeBigNatShiftOp "bigNatSetBit#"   (\n i -> setBit n i))
+    , ("bigNatComplementBit#",     makeBigNatShiftOp "bigNatComplementBit#" (\n i -> complementBit n i))
+    , ("bigNatGtWord#",            makeBigNatWordCmpOp "bigNatGtWord#" (>))
+    , ("bigNatLeWord#",            makeBigNatWordCmpOp "bigNatLeWord#" (<=))
+    , ("bigNatEqWord#",            makeBigNatWordCmpOp "bigNatEqWord#" (==))
+    , ("bigNatCompareWord#",       bigNatCompareWordHashB)    -- BigNat# -> Word# -> Ordering
+    , ("bigNatIsTwo#",             makeBigNatUnaryBool "bigNatIsTwo#" (== 2))
+    , ("bigNatCheck#",             bigNatCheckHashB)          -- BigNat# -> Bool# (always 1 for our backing)
+    , ("bigNatIndex#",             bigNatIndexHashB)          -- BigNat# -> Int# -> Word# (i-th 64-bit limb)
+    , ("bigNatZero#",              bigNatZeroHashB)           -- (# #) -> BigNat#
+    , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
+    , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
+    , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
+    , ("bigNatSizeInBase#",        bigNatSizeInBaseHashB)     -- Word# -> BigNat# -> Word#
+    -- Phase 4: ghc-bignum 'integerMul (IS x) (IS y)' overflow path
+    -- constructs BigNats from a high/low Word# pair.  Without this
+    -- shim, in-Int64 × in-Int64 → out-of-Int64 multiplications
+    -- (e.g. @2 ^ 100 :: Integer@ which repeatedly squares through
+    -- the overflow boundary) silently truncated to 0.
+    , ("bigNatFromWord2#",         bigNatFromWord2HashB)      -- Word# -> Word# -> BigNat#
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
@@ -842,6 +976,19 @@ builtins reg =
     , ("-##",          minusDoubleHashB)
     , ("*##",          timesDoubleHashB)
     , ("/##",          divideDoubleHashB)
+    -- Phase 5: Double# comparison primops (==##, <##, etc.).
+    -- These are needed by source-loaded Eq Double / Ord Double bodies
+    -- and by 'floorDouble' / 'ceilingDouble' (which compare r < 0.0).
+    , ("==##",         makeDoubleCmpOp "==##" (==))
+    , ("/=##",         makeDoubleCmpOp "/=##" (/=))
+    , ("<##",          makeDoubleCmpOp "<##"  (<))
+    , ("<=##",         makeDoubleCmpOp "<=##" (<=))
+    , (">##",          makeDoubleCmpOp ">##"  (>))
+    , (">=##",         makeDoubleCmpOp ">=##" (>=))
+    -- Phase 5: Double# unary primops (needed by 'roundDouble' /
+    -- 'truncateDouble' which use 'abs' and 'compare' on Doubles).
+    , ("fabsDouble#",  unaryOpFloat abs)
+    , ("negateFloat#", unaryOpFloat negate)
     -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
     -- Bottom-of-stack primop for 'decodeFloat' on Double:
     -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
@@ -849,6 +996,15 @@ builtins reg =
     -- the source-loaded RealFrac Double / properFractionFloat
     -- chain, which 'floor'\/'ceiling'\/'round'\/'truncate' ride.
     , ("decodeDouble_Int64#", decodeDoubleInt64HashB)
+    -- Phase 5: Int#/Double# conversion primops needed by source-loaded
+    -- @RealFloat Double.encodeFloat@ (which calls
+    -- @integerEncodeDouble#@ → @intEncodeDouble#@ / @int2Double#@).
+    , ("int2Double#",         int2DoubleHashB)
+    , ("intEncodeDouble#",    intEncodeDoubleHashB)
+    , ("negateDouble#",       negateDoubleHashB)
+    , ("double2Int#",         double2IntHashB)
+    , ("double2Float#",       double2FloatHashB)
+    , ("float2Double#",       float2DoubleHashB)
     -- Phase 2.8: misc
     , ("cstringLength#",  cstringLengthB)
     , ("unpackCString#",  unpackCStringB)
@@ -3120,6 +3276,46 @@ maxBoundB = pure (VInt maxBound)
 minBoundB :: IO Val
 minBoundB = pure (VInt minBound)
 
+-- | @encodeFloat m e@ — @m * 2^e@ as a 'Double' (or 'Float', we
+-- represent both as 'VFloat').  Host shim because the source-loaded
+-- @RealFloat Double.encodeFloat@ instance method isn't being routed
+-- by the class dispatcher.  Accepts 'VInt' or 'VInteger' for the
+-- mantissa.
+encodeFloatB :: IO Val
+encodeFloatB = pure $ VFun $ \mT -> pure $ VFun $ \eT -> do
+    mv <- force legacyHooks mT
+    ev <- force legacyHooks eT
+    let mInt = case mv of
+            VInt n     -> toInteger n
+            VInteger n -> n
+            VPrimObj (PrimBigNat n) -> toInteger n
+            _ -> error ("encodeFloat: bad mantissa: " <> showValForDebug mv)
+        eInt = case ev of
+            VInt n -> fromIntegral n :: Int
+            _      -> error ("encodeFloat: bad exponent: " <> showValForDebug ev)
+    pure (VFloat (encodeFloat mInt eInt :: Double))
+
+-- | @decodeFloat x@ — @(m, e)@ such that @x == m * 2^e@.  Returns
+-- a tuple of '(Integer, Int)'.  Source-loaded path bottoms out at
+-- 'decodeDouble_Int64#' (already shipped) but the surrounding
+-- 'RealFloat Double.decodeFloat' instance method dispatch is
+-- blocked on the same dispatcher gap as 'encodeFloat'.
+decodeFloatB :: IO Val
+decodeFloatB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> do
+            let (m, e) = decodeFloat d :: (Integer, Int)
+            -- Mantissa is Integer; Phase 3 collapse handles the wrapping
+            mV <- pure $ if m >= toInteger (minBound :: Int64)
+                         && m <= toInteger (maxBound :: Int64)
+                            then VInt (fromInteger m)
+                            else VInteger m
+            mT <- newWHNFThunk mV
+            eT <- newWHNFThunk (VInt (fromIntegral e))
+            pure (VCon "(,)" [mT, eT])
+        _ -> error ("decodeFloat: not a Double: " <> showValForDebug av)
+
 fromIntegralB :: IO Val
 fromIntegralB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
@@ -3176,6 +3372,11 @@ bigNatFromWordB = pure $ VFun $ \w -> do
     case wv of
         VInt n ->
             pure (VPrimObj (PrimBigNat (fromIntegral (fromIntegral n :: Word))))
+        -- Word# literals like @0xFFFFFFFFFFFFFFFF##@ parse to VInteger
+        -- because their value exceeds maxBound :: Int64.  Accept that
+        -- shape too; the value is already an unsigned Natural in
+        -- spirit, so just clamp/truncate to the low 64 bits.
+        VInteger n -> pure (VPrimObj (PrimBigNat (fromInteger (n `mod` (1 `shiftL` 64)))))
         _ -> error ("bigNatFromWord#: not a Word#: " <> showValForDebug wv)
 
 -- | Extract a host 'Natural' from a 'VPrimObj (PrimBigNat _)'
@@ -3237,6 +3438,519 @@ bigNatLimbCount = go 0
   where
     go !i 0 = i
     go !i n = go (i + 1) (n `shiftR` 64)
+
+-- | Phase 2.B: binary BigNat# arithmetic primop returning BigNat#.
+-- Both args are 'VPrimObj (PrimBigNat _)'.
+makeBigNatBinOp :: String -> (Natural -> Natural -> Natural) -> IO Val
+makeBigNatBinOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    nb <- extractBigNat name bv
+    pure (VPrimObj (PrimBigNat (op na nb)))
+
+-- | Phase 2.B: @BigNat# -> Word# -> BigNat#@ primop.  The Word#
+-- arg is reinterpreted from VInt's Int64 bits (matching
+-- 'bigNatFromWord#') before applying the binary op over 'Natural'.
+-- VInteger args (for Word# literals exceeding @maxBound :: Int64@)
+-- are accepted and truncated to the low 64 bits, matching the
+-- Word# semantics.
+makeBigNatWordOp :: String -> (Natural -> Natural -> Natural) -> IO Val
+makeBigNatWordOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    nb <- coerceWordArg name bv
+    pure (VPrimObj (PrimBigNat (op na nb)))
+
+-- | Coerce a 'Val' representing a @Word#@ argument to a host 'Natural'
+-- magnitude (truncated to the low 64 bits).  Accepts:
+--   * 'VInt n'      — standard Word# storage (Int64 bit-reinterpret)
+--   * 'VInteger n'  — large hex/decimal Word# literals that exceed
+--                     @maxBound :: Int64@
+coerceWordArg :: String -> Val -> IO Natural
+coerceWordArg _   (VInt w)     =
+    pure (fromIntegral (fromIntegral w :: Word))
+coerceWordArg _   (VInteger n) =
+    pure (fromInteger (n `mod` (1 `shiftL` 64)))
+coerceWordArg ctx v =
+    error (ctx <> ": not a Word#: " <> showValForDebug v)
+
+-- | @bigNatSqr :: BigNat# -> BigNat#@ — square of a BigNat#.
+-- Equivalent to @bigNatMul a a@ but ghc-bignum keeps a dedicated
+-- primop because GMP has a specialised path; over host 'Natural'
+-- the speedup is negligible, so we just multiply.
+bigNatSqrB :: IO Val
+bigNatSqrB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatSqr" av
+    pure (VPrimObj (PrimBigNat (n * n)))
+
+-- | @bigNatQuotRem# :: BigNat# -> BigNat# -> (# BigNat#, BigNat# #)@.
+-- The unboxed tuple is encoded as @VCon "(#,#)" [qT, rT]@ (same
+-- shape as 'decodeDouble_Int64#').
+bigNatQuotRemHashB :: IO Val
+bigNatQuotRemHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatQuotRem#" av
+    nb <- extractBigNat "bigNatQuotRem#" bv
+    let (q, r) = na `quotRem` nb
+    qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
+    rT <- newWHNFThunk (VPrimObj (PrimBigNat r))
+    pure (VCon "(#,#)" [qT, rT])
+
+-- | @bigNatRemWord# :: BigNat# -> Word# -> Word#@.  The remainder
+-- fits in a Word# (since @r < divisor < 2^64@).
+bigNatRemWordHashB :: IO Val
+bigNatRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatRemWord#" av
+    case bv of
+        VInt w -> do
+            let wNat = fromIntegral (fromIntegral w :: Word) :: Natural
+                r    = na `rem` wNat
+            pure (VInt (fromIntegral r))
+        _ -> error
+            ("bigNatRemWord#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatQuotRemWord# :: BigNat# -> Word# -> (# BigNat#, Word# #)@.
+bigNatQuotRemWordHashB :: IO Val
+bigNatQuotRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatQuotRemWord#" av
+    case bv of
+        VInt w -> do
+            let wNat   = fromIntegral (fromIntegral w :: Word) :: Natural
+                (q, r) = na `quotRem` wNat
+            qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
+            rT <- newWHNFThunk (VInt (fromIntegral r))
+            pure (VCon "(#,#)" [qT, rT])
+        _ -> error
+            ("bigNatQuotRemWord#: not a Word#: " <> showValForDebug bv)
+
+-- | Phase 2.C: @a .&. ~b@ over 'Natural'.  Since 'Natural' has no
+-- 'complement' (unsigned, unbounded), implemented as
+-- @a `xor` (a .&. b)@ — which clears exactly the bits of @a@ that
+-- are also set in @b@, matching @a .&. ~b@ semantics.
+andNotNat :: Natural -> Natural -> Natural
+andNotNat a b = a `xor` (a .&. b)
+
+-- | Phase 2.C: shift primop builder.  @BigNat# -> Word# -> BigNat#@,
+-- shift amount from the Word# arg interpreted as 'Int' via the
+-- standard VInt-as-Word reinterpretation chain.  Used for
+-- 'bigNatShiftL#' and 'bigNatShiftR#'.
+makeBigNatShiftOp :: String -> (Natural -> Int -> Natural) -> IO Val
+makeBigNatShiftOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    case bv of
+        VInt w ->
+            pure (VPrimObj (PrimBigNat
+                (op na (fromIntegral (fromIntegral w :: Word)))))
+        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatShiftRNeg# :: BigNat# -> Word# -> BigNat#@ — arithmetic
+-- right-shift of a negative-magnitude BigNat, used by ghc-bignum's
+-- @integerShiftR#@ for the IN branch.  Semantically:
+-- @(-x) >> k = -(ceiling(x / 2^k))@ in two's complement, so this
+-- primop returns @ceiling(magnitude / 2^k)@.  Implementation:
+-- @(n + 2^k - 1) `shiftR` k@.
+bigNatShiftRNegHashB :: IO Val
+bigNatShiftRNegHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatShiftRNeg#" av
+    case bv of
+        VInt w -> do
+            let k = fromIntegral (fromIntegral w :: Word) :: Int
+            pure (VPrimObj (PrimBigNat
+                (if na == 0
+                    then 0
+                    else ((na + (1 `shiftL` k) - 1) `shiftR` k))))
+        _ -> error
+            ("bigNatShiftRNeg#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatPopCount# :: BigNat# -> Word#@ — population count of the
+-- magnitude.
+bigNatPopCountHashB :: IO Val
+bigNatPopCountHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatPopCount#" av
+    pure (VInt (fromIntegral (popCount n)))
+
+-- | @bigNatTestBit# :: BigNat# -> Word# -> Bool#@ — test if bit @i@
+-- is set.  @Bool#@ encoded as VInt 1/0 per IHC convention.
+bigNatTestBitHashB :: IO Val
+bigNatTestBitHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatTestBit#" av
+    case bv of
+        VInt w ->
+            pure (primBoolVal
+                (testBit na (fromIntegral (fromIntegral w :: Word))))
+        _ -> error
+            ("bigNatTestBit#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatBit# :: Word# -> BigNat#@ — returns @2^n@ as a BigNat.
+-- ghc-bignum convention: the n-th bit is set, all others zero.
+bigNatBitHashB :: IO Val
+bigNatBitHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt w ->
+            pure (VPrimObj (PrimBigNat
+                (bit (fromIntegral (fromIntegral w :: Word)))))
+        _ -> error
+            ("bigNatBit#: not a Word#: " <> showValForDebug av)
+
+-- | @bigNatAndInt# :: BigNat# -> Int# -> BigNat#@ — bitwise AND with
+-- a signed @Int#@.  Two's-complement semantics: for negative @i@,
+-- the upper bits of @i@ are all 1, so AND-ing clears only the
+-- lower @|i| - 1@ bits set in @i@'s complement.
+--
+-- For positive @i@: @na .&. fromIntegral i@.
+-- For negative @i@: @na `andNotNat` (|i| - 1)@ — clear the bits of
+--                   @na@ that correspond to set bits of @~i = |i| - 1@.
+bigNatAndIntHashB :: IO Val
+bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatAndInt#" av
+    case bv of
+        VInt i ->
+            pure (VPrimObj (PrimBigNat
+                (if i >= 0
+                    then na .&. fromIntegral i
+                    else na `andNotNat` fromIntegral (-i - 1))))
+        _ -> error
+            ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
+
+-- | Phase 2.D: @bigNatToWord# :: BigNat# -> Word#@ — returns the
+-- low 64 bits of the BigNat, reinterpreted as a Word#.  For a
+-- BigNat that fits in one limb, this is just the limb value.  For
+-- larger BigNats, the high limbs are dropped (matches
+-- @wordArrayLast@-on-low-limb behaviour in ghc-bignum).
+--
+-- Same body powers 'bigNatToWord64#' since Word# == Word64# on
+-- 64-bit (our target).
+bigNatToWordHashB :: IO Val
+bigNatToWordHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatToWord#" av
+    pure (VInt (fromIntegral (fromIntegral n :: Word)))
+
+-- | Phase 2.D: @bigNatToInt# :: BigNat# -> Int#@ — like
+-- 'bigNatToWord#' but reinterprets the low 64 bits as signed Int#.
+-- Equivalent to @word2Int# (bigNatToWord# n)@ in ghc-bignum.
+bigNatToIntHashB :: IO Val
+bigNatToIntHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatToInt#" av
+    pure (VInt (fromIntegral (fromIntegral n :: Word)))
+
+-- | Phase 2.D: @bigNatFromAbsInt# :: Int# -> BigNat#@ — absolute
+-- value of an Int# as a BigNat.  ghc-bignum uses this for the
+-- @IS k@ → BigNat# transition in 'integerNegate' etc.  For
+-- @minBound :: Int@, the magnitude exceeds maxBound, so we use
+-- 'abs' over 'Integer' to avoid overflow.
+bigNatFromAbsIntHashB :: IO Val
+bigNatFromAbsIntHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt i ->
+            pure (VPrimObj (PrimBigNat (fromInteger (abs (toInteger i)))))
+        _ -> error
+            ("bigNatFromAbsInt#: not an Int#: " <> showValForDebug av)
+
+-- | Phase 2.D: @bigNatEncodeDouble# :: BigNat# -> Int# -> Double#@
+-- — returns @m * 2^e@ as a Double#.  Uses host 'encodeFloat'
+-- which is the canonical Haskell primitive for this conversion.
+bigNatEncodeDoubleHashB :: IO Val
+bigNatEncodeDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    n  <- extractBigNat "bigNatEncodeDouble#" av
+    case bv of
+        VInt e ->
+            pure (VFloat
+                (encodeFloat (toInteger n) (fromIntegral e) :: Double))
+        _ -> error
+            ("bigNatEncodeDouble#: not an Int#: " <> showValForDebug bv)
+
+-- | Phase 2.D: @integerFromBigNat# :: BigNat# -> Integer@ — wraps
+-- a non-negative BigNat# in the canonical 'Integer' shape:
+--   bn == 0                    -> VInt 0   (matches IS via Phase 1 bridge)
+--   bn <= maxBound :: Int64    -> VInt n   (matches IS via Phase 1 bridge)
+--   otherwise                  -> VCon "IP" [VPrimObj (PrimBigNat bn)]
+-- Source-level pattern matches on @IS k@ / @IP bn@ fire through
+-- the existing matchPat bridges.
+integerFromBigNatHashB :: IO Val
+integerFromBigNatHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "integerFromBigNat#" av
+    if n <= fromIntegral (maxBound :: Int64)
+        then pure (VInt (fromIntegral n))
+        else do
+            t <- newWHNFThunk (VPrimObj (PrimBigNat n))
+            pure (VCon "IP" [t])
+
+-- | Phase 2.D: @integerFromBigNatNeg# :: BigNat# -> Integer@ —
+-- wraps a BigNat# as a negative Integer:
+--   bn == 0                       -> VInt 0
+--   bn <= -minBound :: Int64      -> VInt (-n)
+--   otherwise                     -> VCon "IN" [VPrimObj (PrimBigNat bn)]
+--
+-- Note: @-minBound :: Int64 == abs (toInteger (minBound :: Int64))
+-- == 2^63 == maxBound :: Word63@.  We compare against that ceiling.
+integerFromBigNatNegHashB :: IO Val
+integerFromBigNatNegHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "integerFromBigNatNeg#" av
+    let absMinBoundInt64 = 1 + fromIntegral (maxBound :: Int64) :: Natural -- 2^63
+    if n == 0
+        then pure (VInt 0)
+        else if n <= absMinBoundInt64
+            then pure (VInt (fromInteger (negate (toInteger n))))
+            else do
+                t <- newWHNFThunk (VPrimObj (PrimBigNat n))
+                pure (VCon "IN" [t])
+
+-- | Phase 2.D: @integerFromBigNatSign# :: Int# -> BigNat# -> Integer@.
+-- Dispatch on the sign Int#: 0 means positive, non-zero means negative.
+-- Mirrors the source body at GHC.Num.Integer:106.
+integerFromBigNatSignHashB :: IO Val
+integerFromBigNatSignHashB = pure $ VFun $ \s -> pure $ VFun $ \a -> do
+    sv <- force legacyHooks s
+    av <- force legacyHooks a
+    n  <- extractBigNat "integerFromBigNatSign#" av
+    case sv of
+        VInt 0 ->
+            -- positive path: same as integerFromBigNat#
+            if n <= fromIntegral (maxBound :: Int64)
+                then pure (VInt (fromIntegral n))
+                else do
+                    t <- newWHNFThunk (VPrimObj (PrimBigNat n))
+                    pure (VCon "IP" [t])
+        VInt _ -> do
+            -- negative path: same as integerFromBigNatNeg#
+            let absMinBoundInt64 = 1 + fromIntegral (maxBound :: Int64) :: Natural
+            if n == 0
+                then pure (VInt 0)
+                else if n <= absMinBoundInt64
+                    then pure (VInt (fromInteger (negate (toInteger n))))
+                    else do
+                        t <- newWHNFThunk (VPrimObj (PrimBigNat n))
+                        pure (VCon "IN" [t])
+        _ -> error
+            ("integerFromBigNatSign#: not an Int#: " <> showValForDebug sv)
+
+-- | Phase 2.D: @integerToBigNatClamp# :: Integer -> BigNat#@ —
+-- clamp an Integer down to a non-negative BigNat.  Negative
+-- Integers (IS k where k < 0, or IN _) become 0.
+integerToBigNatClampHashB :: IO Val
+integerToBigNatClampHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n
+            | n >= 0    -> pure (VPrimObj (PrimBigNat (fromIntegral n)))
+            | otherwise -> pure (VPrimObj (PrimBigNat 0))
+        VInteger n
+            | n >= 0    -> pure (VPrimObj (PrimBigNat (fromInteger n)))
+            | otherwise -> pure (VPrimObj (PrimBigNat 0))
+        VPrimObj (PrimBigNat n) -> pure (VPrimObj (PrimBigNat n))
+        VCon "IS" [t] -> do
+            v <- force legacyHooks t
+            case v of
+                VInt n | n >= 0    -> pure (VPrimObj (PrimBigNat (fromIntegral n)))
+                       | otherwise -> pure (VPrimObj (PrimBigNat 0))
+                _ -> error ("integerToBigNatClamp#: IS field not Int: " <> showValForDebug v)
+        VCon "IP" [t] -> do
+            v <- force legacyHooks t
+            case v of
+                VPrimObj (PrimBigNat n) -> pure (VPrimObj (PrimBigNat n))
+                VInteger n -> pure (VPrimObj (PrimBigNat (fromInteger n)))
+                _ -> error ("integerToBigNatClamp#: IP field not BigNat: " <> showValForDebug v)
+        VCon "IN" _ -> pure (VPrimObj (PrimBigNat 0))
+        _ -> error
+            ("integerToBigNatClamp#: not an Integer: " <> showValForDebug av)
+
+-- | Phase 2.D: @bigNatLog2# :: BigNat# -> Word#@ — floor(log2 n).
+-- ghc-bignum returns 0 for n = 0; we match that.
+bigNatLog2HashB :: IO Val
+bigNatLog2HashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatLog2#" av
+    pure (VInt (fromIntegral (naturalLog2 n)))
+
+-- | Pure helper for floor(log2 n).  Returns 0 for n = 0
+-- (matching ghc-bignum's @bigNatLog2# 0 == 0##@).
+naturalLog2 :: Natural -> Int
+naturalLog2 0 = 0
+naturalLog2 n = go 0 n
+  where
+    go !i 1 = i
+    go !i k = go (i + 1) (k `shiftR` 1)
+
+-- | Phase 2.D: @bigNatLogBase# :: BigNat# -> BigNat# -> Word#@.
+-- ghc-bignum raises 'unexpectedValue_Word#' for base ≤ 1; we
+-- 'error' (matches the host shim convention for source-loaded
+-- @raiseUnexpectedValue@).
+bigNatLogBaseHashB :: IO Val
+bigNatLogBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    base <- extractBigNat "bigNatLogBase#" av
+    n    <- extractBigNat "bigNatLogBase#" bv
+    pure (VInt (fromIntegral (naturalLogBase base n)))
+
+-- | Phase 2.D: @bigNatLogBaseWord# :: Word# -> BigNat# -> Word#@.
+bigNatLogBaseWordHashB :: IO Val
+bigNatLogBaseWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case av of
+        VInt w -> do
+            let base = fromIntegral (fromIntegral w :: Word) :: Natural
+            n <- extractBigNat "bigNatLogBaseWord#" bv
+            pure (VInt (fromIntegral (naturalLogBase base n)))
+        _ -> error
+            ("bigNatLogBaseWord#: not a Word#: " <> showValForDebug av)
+
+-- | Pure helper for floor(log_b n).  Errors if @b <= 1@ (matches
+-- ghc-bignum's @unexpectedValue_Word#@).  Returns 0 for n = 0 as a
+-- practical default; ghc-bignum's source is undefined here.
+naturalLogBase :: Natural -> Natural -> Int
+naturalLogBase b _ | b <= 1 = error "bigNatLogBase#: base must be > 1"
+naturalLogBase _ 0          = 0
+naturalLogBase 2 n          = naturalLog2 n
+naturalLogBase b n          = go 0 n
+  where
+    go !i k | k < b     = i
+            | otherwise = go (i + 1) (k `div` b)
+
+-- | Phase 2.E: @BigNat# -> Word# -> Bool#@ comparison primop.
+-- Both args extracted via the standard Natural reinterpretation
+-- chain; result is VInt 1/0 per 'primBoolVal'.  Mirrors
+-- 'makeBigNatCmpOp' from Phase 2.A.
+makeBigNatWordCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
+makeBigNatWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat name av
+    case bv of
+        VInt w ->
+            pure (primBoolVal
+                (op na (fromIntegral (fromIntegral w :: Word))))
+        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
+bigNatCompareWordHashB :: IO Val
+bigNatCompareWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatCompareWord#" av
+    case bv of
+        VInt w ->
+            pure $ case compare na (fromIntegral (fromIntegral w :: Word)) of
+                LT -> VCon "LT" []
+                EQ -> VCon "EQ" []
+                GT -> VCon "GT" []
+        _ -> error
+            ("bigNatCompareWord#: not a Word#: " <> showValForDebug bv)
+
+-- | @bigNatCheck# :: BigNat# -> Bool#@ — ghc-bignum's canonical-form
+-- sanity check (high limb non-zero, etc.).  Our 'Natural'-backed
+-- representation is always canonical by construction, so this is
+-- a constant True.
+bigNatCheckHashB :: IO Val
+bigNatCheckHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (primBoolVal True)
+
+-- | @bigNatIndex# :: BigNat# -> Int# -> Word#@ — extract the i-th
+-- 64-bit limb (little-endian).  Bounds-checking is the caller's
+-- responsibility per ghc-bignum convention (out-of-range returns 0
+-- in our backing since shifted-out bits are 0).
+bigNatIndexHashB :: IO Val
+bigNatIndexHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatIndex#" av
+    case bv of
+        VInt i ->
+            -- Right-shift by 64*i, then mask off to the low 64 bits.
+            -- For i out of range (i >= limbCount na), the shift
+            -- produces 0; the .&. 0xFFFFFFFFFFFFFFFF is implicit in
+            -- the fromIntegral :: Natural -> Word truncation.
+            let shifted = na `shiftR` (64 * fromIntegral i)
+            in pure (VInt (fromIntegral (fromIntegral shifted :: Word)))
+        _ -> error
+            ("bigNatIndex#: not an Int#: " <> showValForDebug bv)
+
+-- | @bigNatZero# :: (# #) -> BigNat#@ — constant zero BigNat.  The
+-- @(# #)@ argument is the unit unboxed tuple ghc-bignum uses to
+-- force evaluation at use site (see "Note [Why (# #)?]" at
+-- BigNat.hs:53).  IHC doesn't track unboxed-tuple types so we
+-- just accept any single argument and discard it.
+bigNatZeroHashB :: IO Val
+bigNatZeroHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (VPrimObj (PrimBigNat 0))
+
+-- | @bigNatOne# :: (# #) -> BigNat#@ — constant one BigNat.
+bigNatOneHashB :: IO Val
+bigNatOneHashB = pure $ VFun $ \a -> do
+    _ <- force legacyHooks a
+    pure (VPrimObj (PrimBigNat 1))
+
+-- | @bigNatCtz# :: BigNat# -> Word#@ — count trailing zero bits.
+-- Returns 0 for n = 0 (ghc-bignum convention, BigNat.hs:1213).
+bigNatCtzHashB :: IO Val
+bigNatCtzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatCtz#" av
+    pure (VInt (fromIntegral (naturalCtz n)))
+
+-- | @bigNatCtzWord# :: BigNat# -> Word#@ — count trailing zero
+-- 64-bit limbs.  Returns 0 for n = 0.  Equivalent to
+-- @bigNatCtz# n `div` 64@.
+bigNatCtzWordHashB :: IO Val
+bigNatCtzWordHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatCtzWord#" av
+    pure (VInt (fromIntegral (naturalCtz n `div` 64)))
+
+-- | Pure helper: count trailing zero bits of a 'Natural'.  Returns 0
+-- for n = 0 (matches ghc-bignum's @bigNatCtz# 0 == 0##@).
+naturalCtz :: Natural -> Int
+naturalCtz 0 = 0
+naturalCtz n = go 0 n
+  where
+    go !i k
+      | k .&. 1 == 1 = i
+      | otherwise    = go (i + 1) (k `shiftR` 1)
+
+-- | @bigNatSizeInBase# :: Word# -> BigNat# -> Word#@ — number of
+-- digits to represent @n@ in @base@.  ghc-bignum errors for
+-- @base <= 1@; we match.  For n = 0 returns 0 (ghc-bignum
+-- convention).  Otherwise returns @floor(logBase base n) + 1@.
+bigNatSizeInBaseHashB :: IO Val
+bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case av of
+        VInt w -> do
+            let base = fromIntegral (fromIntegral w :: Word) :: Natural
+            n <- extractBigNat "bigNatSizeInBase#" bv
+            pure (VInt
+                (if base <= 1
+                    then error "bigNatSizeInBase#: base must be > 1"
+                    else if n == 0
+                        then 0
+                        else fromIntegral (naturalLogBase base n) + 1))
+        _ -> error
+            ("bigNatSizeInBase#: not a Word#: " <> showValForDebug av)
+
+-- | Phase 4: @bigNatFromWord2# :: Word# -> Word# -> BigNat#@ —
+-- construct a BigNat from a high/low Word# pair.  Used by
+-- ghc-bignum's 'integerMul' overflow path to wrap the 128-bit
+-- product of two Int#-fitting Integers when the result exceeds
+-- Int range.  Implementation: @h * 2^64 + l@ as a Natural.
+bigNatFromWord2HashB :: IO Val
+bigNatFromWord2HashB = pure $ VFun $ \h -> pure $ VFun $ \l -> do
+    hv <- force legacyHooks h; lv <- force legacyHooks l
+    nh <- coerceWordArg "bigNatFromWord2#" hv
+    nl <- coerceWordArg "bigNatFromWord2#" lv
+    pure (VPrimObj (PrimBigNat ((nh `shiftL` 64) .|. nl)))
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: RealWorld / State primops
@@ -4778,26 +5492,54 @@ charPrimOrd (VChar c) = ord c
 charPrimOrd (VInt n)  = fromIntegral n
 charPrimOrd v         = error ("char primop: bad arg: " <> showValForDebug v)
 
+-- | @timesInt2# :: Int# -> Int# -> (# Int#, Int#, Int# #)@
+--
+-- ghc-prim spec (changelog 0.7+): returns @(# isHighNeeded, high, low #)@
+-- where @high@ and @low@ are the bits of the double-word product and
+-- @isHighNeeded@ is 1# when @high@ differs from the sign-extension of
+-- @low@ (i.e. the product doesn't fit in a single Int#).
+--
+-- Phase 4 fix: the previous implementation returned a 2-tuple with a
+-- single overflow flag and lost the high bits — breaking ghc-bignum's
+-- @integerMul (IS x) (IS y)@ overflow path, which produces silently-
+-- truncated 0 for @2 ^ 100 :: Integer@.
 timesInt2B :: IO Val
 timesInt2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
-            let r   = x * y
-                ovf = if x /= 0 && r `div` x /= y then 1 else 0 :: Int64
-            carryT  <- newWHNFThunk (VInt ovf)
-            resultT <- newWHNFThunk (VInt r)
-            pure (VCon "(#,#)" [carryT, resultT])
+            -- Compute full 128-bit product via Integer arithmetic, then
+            -- split into low / high 64-bit halves (reinterpreted as Int64).
+            let prod         = toInteger x * toInteger y
+                low          = fromInteger prod                  :: Int64
+                high         = fromInteger (prod `shiftR` 64)    :: Int64
+                signExtended = if low < 0 then -1 else 0         :: Int64
+                ovf          = if high /= signExtended then 1 else 0 :: Int64
+            ovfT  <- newWHNFThunk (VInt ovf)
+            highT <- newWHNFThunk (VInt high)
+            lowT  <- newWHNFThunk (VInt low)
+            pure (VCon "(#,,#)" [ovfT, highT, lowT])
         _ -> error ("timesInt2#: bad args: " <> showValForDebug av)
 
+-- | @timesWord2# :: Word# -> Word# -> (# Word#, Word# #)@ — returns
+-- the high and low 64-bit halves of the unsigned 128-bit product.
+--
+-- Phase 4 fix: previously returned @(# 0, low #)@, always dropping
+-- the high word — silently truncated all overflows.  Now computes
+-- via host 'Natural' to get the full 128-bit product.
 timesWord2B :: IO Val
 timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     case (av, bv) of
         (VInt x, VInt y) -> do
-            let r = x * y
-            hiT <- newWHNFThunk (VInt 0)
-            loT <- newWHNFThunk (VInt r)
+            -- Reinterpret as unsigned, multiply over Natural, split.
+            let xNat = fromIntegral (fromIntegral x :: Word) :: Natural
+                yNat = fromIntegral (fromIntegral y :: Word) :: Natural
+                prod = xNat * yNat
+                low  = fromIntegral (fromIntegral prod :: Word)            :: Int64
+                high = fromIntegral (fromIntegral (prod `shiftR` 64) :: Word) :: Int64
+            hiT <- newWHNFThunk (VInt high)
+            loT <- newWHNFThunk (VInt low)
             pure (VCon "(#,#)" [hiT, loT])
         _ -> error ("timesWord2#: bad args: " <> showValForDebug av)
 
@@ -4958,20 +5700,10 @@ identityIntPrimop = pure $ VFun $ \a -> do
 -- source-loaded code where literal overflow routed an
 -- in-range value through 'LInteger' (e.g. @-2^63@ via
 -- NegativeLiterals on @-0x8000000000000000@).
--- | floor/ceiling/round/truncate — Float -> Int.  Tracked
--- carve-out: the source-loaded RealFrac Double / properFractionFloat
--- chain reaches Num Integer class-method dispatch which still
--- bottoms out at @<<ihc-method-placeholder>>@ — even with the
--- IS\/IP\/IN matchPat bridge below in place.  Lifting the rest
--- requires class-dispatch work for Num Integer \/ Integral
--- Integer instances; a separate workstream.
-floatToIntB :: (Double -> Int64) -> IO Val
-floatToIntB op = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VFloat d -> pure (VInt (op d))
-        VInt n   -> pure (VInt n)
-        _ -> error ("floatToInt: non-numeric arg: " <> showValForDebug av)
+-- 'floatToIntB' removed in Phase 5 — host shims for
+-- floor / ceiling / round / truncate graduated out.  If the
+-- source-loaded RealFrac chain regresses, restore from git
+-- history.
 
 
 asInt64 :: Val -> Maybe Int64
@@ -5020,6 +5752,73 @@ decodeDoubleInt64HashB = pure $ VFun $ \a -> do
             pure (VCon "(#,#)" [mT, eT])
         _ -> error
             ("decodeDouble_Int64#: not a Double: " <> showValForDebug av)
+
+-- | @int2Double# :: Int# -> Double#@ — widen Int# to Double#.
+-- Needed by source-loaded 'integerEncodeDouble#' (ghc-bignum
+-- @GHC.Num.Integer:1052@): @integerEncodeDouble# (IS i) 0# =
+-- int2Double# i@.
+int2DoubleHashB :: IO Val
+int2DoubleHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n -> pure (VFloat (fromIntegral n))
+        _ -> error ("int2Double#: not an Int: " <> showValForDebug av)
+
+-- | @intEncodeDouble# :: Int# -> Int# -> Double#@ — @m * 2^e@ as
+-- a Double#.  Mirrors host 'encodeFloat' for Int mantissa.
+intEncodeDoubleHashB :: IO Val
+intEncodeDoubleHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt m, VInt e) ->
+            pure (VFloat (encodeFloat (toInteger m) (fromIntegral e) :: Double))
+        _ -> error
+            ("intEncodeDouble#: bad args: " <> showValForDebug av
+             <> ", " <> showValForDebug bv)
+
+-- | @negateDouble# :: Double# -> Double#@.
+negateDoubleHashB :: IO Val
+negateDoubleHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VFloat (negate d))
+        _ -> error ("negateDouble#: not a Double: " <> showValForDebug av)
+
+-- | @double2Int# :: Double# -> Int#@ — truncating conversion
+-- (matches GHC's Double->Int primop: round toward zero).
+double2IntHashB :: IO Val
+double2IntHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VInt (truncate d))
+        _ -> error ("double2Int#: not a Double: " <> showValForDebug av)
+
+-- | @double2Float# :: Double# -> Float#@ — IHC stores both as
+-- 'VFloat' so the primop is identity.
+double2FloatHashB :: IO Val
+double2FloatHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VFloat d)
+        _ -> error ("double2Float#: not a Double: " <> showValForDebug av)
+
+-- | @float2Double# :: Float# -> Double#@ — identity (see above).
+float2DoubleHashB :: IO Val
+float2DoubleHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VFloat d -> pure (VFloat d)
+        _ -> error ("float2Double#: not a Float: " <> showValForDebug av)
+
+-- | Binary Double# comparison primop builder.  Result is Bool#
+-- (VInt 1/0).  Both args must be 'VFloat'.
+makeDoubleCmpOp :: String -> (Double -> Double -> Bool) -> IO Val
+makeDoubleCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VFloat x, VFloat y) -> pure (primBoolVal (op x y))
+        _ -> error (name <> ": bad args: " <> showValForDebug av
+                    <> ", " <> showValForDebug bv)
 
 quotRemIntB :: IO Val
 quotRemIntB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
@@ -5374,6 +6173,13 @@ buildConEnv reg = do
     -- when at least one field is strict, force those thunks before
     -- returning the 'VCon'.  All-lazy ctors keep the original cheap
     -- path with no extra IO.
+    --
+    -- Phase 3: source-loaded @data Integer = IS !Int# | IP !BigNat# |
+    -- IN !BigNat#@ from @ghc-bignum@ — we intercept at construction
+    -- time and collapse to plain 'VInt' / 'VInteger' so the runtime
+    -- never carries @VCon "IS"/"IP"/"IN"@ shapes.  Mirrors how
+    -- @I#@ / @F#@ / @D#@ are already transparent; see
+    -- 'tryIntegerCollapse' below.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
     buildLam name left acc = VFun $ \t ->
@@ -5382,7 +6188,7 @@ buildConEnv reg = do
                 let thunks = reverse (t : acc)
                 strict <- lookupCtorStrictness name
                 forceStrictFields strict thunks
-                pure (VCon name thunks)
+                tryIntegerCollapse name thunks
             else pure (buildLam name (left - 1) (t : acc))
 
     -- | Walk the strict-field bitmap and force each marked thunk in
@@ -5393,6 +6199,54 @@ buildConEnv reg = do
     forceStrictFields (s : ss) (t : ts) = do
         when s (() <$ force legacyHooks t)
         forceStrictFields ss ts
+
+-- | Phase 3: construct-direction collapse for ghc-bignum's
+-- @data Integer = IS !Int# | IP !BigNat# | IN !BigNat#@.
+--
+-- The runtime never carries @VCon "IS"/"IP"/"IN"@ shapes after
+-- this — source-level @IS k@ / @IP bn@ / @IN bn@ produce plain
+-- 'VInt' (in-Int64 range) or 'VInteger' (out-of-range) directly.
+-- Mirrors how @I#@ / @F#@ / @D#@ are already handled transparently.
+--
+-- Sign-preservation: small IP and IN both fit in Int64 with
+-- opposite signs (@VInt n@ vs @VInt (-n)@); larger values become
+-- 'VInteger' with the appropriate sign.  Phase 1's matchPat
+-- bridges already discriminate via range guards.
+--
+-- Fall-through (default 'VCon name thunks') applies when the field
+-- isn't a recognised numeric shape (defensive — shouldn't happen
+-- for well-typed source); matchPat's generic VCon case will still
+-- handle it.
+tryIntegerCollapse :: Name -> [Thunk] -> IO Val
+tryIntegerCollapse "IS" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VInt _ -> pure v
+        VInteger n
+            | n >= toInteger (minBound :: Int64)
+            , n <= toInteger (maxBound :: Int64)
+            -> pure (VInt (fromInteger n))
+        _ -> pure (VCon "IS" [t])
+tryIntegerCollapse "IP" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n) ->
+            if n <= fromIntegral (maxBound :: Int64)
+                then pure (VInt (fromIntegral n))
+                else pure (VInteger (fromIntegral n))
+        _ -> pure (VCon "IP" [t])
+tryIntegerCollapse "IN" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n)
+            | n == 0    -> pure (VInt 0)
+            | otherwise ->
+                let absMinBoundInt64 = 1 + fromIntegral (maxBound :: Int64) :: Natural
+                in if n <= absMinBoundInt64
+                    then pure (VInt (fromInteger (negate (toInteger n))))
+                    else pure (VInteger (negate (toInteger n)))
+        _ -> pure (VCon "IN" [t])
+tryIntegerCollapse name thunks = pure (VCon name thunks)
 
 -- | Build an environment binding each record-field name to an accessor
 -- function.  For a field @f@ that lives at index @i@ in constructor @Con@,

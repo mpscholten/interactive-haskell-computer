@@ -1,0 +1,20 @@
+and    0xFF 0xF0 == 0xF0 : True
+or     0xF0 0x0F == 0xFF : True
+xor    0xFF 0x0F == 0xF0 : True
+andNot 0xFF 0x0F == 0xF0 : True
+andW#  0xFF 0xF0 == 0xF0 : True
+orW#   0xF0 0x0F == 0xFF : True
+xorW#  0xFF 0x0F == 0xF0 : True
+anW#   0xFF 0x0F == 0xF0 : True
+andI#  0xFF +0xF0 == 0xF0: True
+andI#  0xFF -1   == 0xFF : True
+shiftL# 1 4      == 16   : True
+shiftR# 256 4    == 16   : True
+shiftRNeg# 9 2   == 3    : True
+shiftRNeg# 8 2   == 2    : True
+popCount# 0xFF   == 8    : True
+popCount# 0x55   == 4    : True
+testBit#  0x55 0 == True : True
+testBit#  0x55 1 == False: False
+bit#      4      == 16   : True
+bit#      0      == 1    : True

@@ -1041,19 +1041,24 @@ matchPat hooks (PCon "IS" [p]) (VInteger n)
     , n <= toInteger (maxBound :: Int64) = do
         t <- newWHNFThunk (VInt (fromInteger n))
         matchFields hooks [(p, t)] []
--- @IP bn@ / @IN bn@ bind bn to a @BigNat#@.  IHC has no
--- BigNat# runtime yet, so we expose the underlying 'VInteger'
--- (positive value for IP, magnitude for IN) directly.  Source
--- code that does arithmetic on the BigNat# will fail until the
--- BigNat# primop suite lands; pattern matching alone works for
--- the common @case n of IS k -> ... ; _ -> defaultBig@ shape.
+-- @IP bn@ / @IN bn@ bind bn to a @BigNat#@.  Since Phase 1 we
+-- have a 'VPrimObj (PrimBigNat _)' runtime for BigNat#, so the
+-- bound field is wrapped in that — Phase 2 BigNat# primops
+-- ('bigNatAdd', 'bigNatEq#', …) can then dispatch on it directly
+-- without further unwrapping.  The 'VInteger' magnitude is
+-- converted to host 'Natural' for IP (positive) and IN (negated
+-- to get the unsigned magnitude).  Phase 3 ('tryIntegerCollapse')
+-- ensures the construct direction matches: source-level
+-- @IP someBigNat@ collapses to 'VInteger' (large) or 'VInt'
+-- (small), and this matchPat then materialises a 'VPrimObj' for
+-- the field.
 matchPat hooks (PCon "IP" [p]) (VInteger n)
     | n > toInteger (maxBound :: Int64) = do
-        t <- newWHNFThunk (VInteger n)
+        t <- newWHNFThunk (VPrimObj (PrimBigNat (fromInteger n)))
         matchFields hooks [(p, t)] []
 matchPat hooks (PCon "IN" [p]) (VInteger n)
     | n < toInteger (minBound :: Int64) = do
-        t <- newWHNFThunk (VInteger (negate n))
+        t <- newWHNFThunk (VPrimObj (PrimBigNat (fromInteger (negate n))))
         matchFields hooks [(p, t)] []
 -- Phase 1: BigNat# is now backed by 'VPrimObj (PrimBigNat n)'.
 -- Source-loaded code that pattern-matches @case n of IP bn -> ...@

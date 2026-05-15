@@ -883,8 +883,40 @@ parseBindingsIn src fx (start, end) = do
     -- (e.g. `f _ [] = ...; f x (y:_) = ...`) are properly desugared.
     -- Returns a list of Bind because a pattern binding expands to multiple binds.
     parseOne ctx bindCol accLen cur = do
-        let (peekTok, _) = nextSig ctx cur
+        let (peekTok, cur1Peek) = nextSig ctx cur
         case tkKind peekTok of
+            -- As-pattern binding: @name @ pat = rhs@ (e.g.
+            -- @qr@(q,r) = quotRem n d@ in Integral's @divMod@ default
+            -- at @GHC/Internal/Real.hs:282@).  Desugar to two binds:
+            --   @name = rhs@
+            --   @pat  = name@  (then 'parseWherePatBind' projects each
+            --                   bound variable of @pat@ out of @name@).
+            TkIdent n
+                | (atTok, _) <- nextSig ctx cur1Peek
+                , tkKind atTok == TkAt -> do
+                    let (_, cur2Peek)   = nextSig ctx cur1Peek    -- consume @
+                    (subPat, cur3Peek)  <- parseSubPat ctx cur2Peek
+                    let (eqTok, cur4Peek) = nextSig ctx cur3Peek
+                    case tkKind eqTok of
+                        TkEq -> do
+                            (rhsE, cur5Peek) <- parseExpr ctx cur4Peek
+                            -- Project the bound vars of subPat out of name.
+                            let nameBind = (n, rhsE)
+                                vars     = patVars subPat
+                                perVarBind v =
+                                    ( v
+                                    , ECase (EVar n)
+                                        [ Alt subPat (EVar v)
+                                        , Alt PWild (EApp (EVar "error")
+                                                      (stringToConsList
+                                                        "Non-exhaustive as-pattern in where"))
+                                        ]
+                                    )
+                                newBinds = nameBind : map perVarBind vars
+                            pure (newBinds, cur5Peek)
+                        _ -> parseErr ctx
+                                "expected `=` after as-pattern in where-binding"
+                                eqTok
             TkIdent _ -> do
                 -- Normal named binding (identifier starts the binding).
                 (name, params0, rhs0, cur1) <- parseClauseRaw ctx cur
