@@ -1,0 +1,8 @@
+IS 42#                 classifies as IS  : True
+IS 42# == 42                            : True
+IP small (42) classifies as IS          : True
+IP small (42) == 42                     : True
+IP large (2^64-1) classifies as IP      : True
+IN small (42) classifies as IS          : True
+IN small (42) == -42                    : True
+IN large (2^64-1) classifies as IN      : True

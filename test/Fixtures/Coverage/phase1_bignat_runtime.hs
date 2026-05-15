@@ -7,9 +7,11 @@
 -- Integer in IP-canonical shape, and pattern-matches it through
 -- IS / IP / IN.
 --
--- Pinned to bigNatFromWord# specifically so a regression in
--- Phase 1's matchPat plumbing or the conversion primop surfaces
--- here, before Phase 2's larger comparison/arithmetic suite lands.
+-- Uses 'maxBound :: Word' (= 2^64 - 1) so the magnitude is out of
+-- Int64 range — Phase 3's construct-direction collapse would
+-- otherwise turn small IP magnitudes into VInt and the IS arm
+-- would fire instead.  See phase3_construct_collapse for the
+-- small-value collapse path.
 --
 -- See plans/full-ghc-bignum-source-load.md for the full roadmap.
 module Main where
@@ -18,7 +20,7 @@ import GHC.Num.Integer (Integer(..))
 import GHC.Num.BigNat (bigNatFromWord#)
 
 main :: IO ()
-main = case bigNatFromWord# 12345## of
+main = case bigNatFromWord# 0xFFFFFFFFFFFFFFFF## of   -- 2^64 - 1, out of Int64 range
     bn -> case (IP bn :: Integer) of
         IS _ -> putStrLn "FAIL: matched IS"
         IP _ -> putStrLn "PASS: matched IP"
