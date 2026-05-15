@@ -452,12 +452,7 @@ peekInfixOp src cur =
         -- (ident, paren-wrapped pattern, literal, etc.) — otherwise this is
         -- not an infix-op binding LHS.
         _ | Just opName <- tokenOpNameBS (tkKind t1)
-          , opName /= "-"
           , opName /= "~"    -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
-                             -- leading minus in `f (- 1) = ...` patterns etc.
-                             -- already never matches here since col-1 ident
-                             -- already consumed; keeping the exception is a
-                             -- no-op safeguard.
           , opName /= "!"    -- bang-pattern/strict marker in `f !x = ...`,
                              -- and also `arr ! i` array-index at expression
                              -- position (the RHS of a do-stmt, let, etc.).
@@ -466,14 +461,23 @@ peekInfixOp src cur =
                              -- drops the real binding's clause.
           -> let (t2, _) = peekSigTokFrom src c1
              in case tkKind t2 of
+                 -- For `-` specifically: only treat as infix-op binding
+                 -- when the second arg is an identifier or paren-pattern.
+                 -- Literal RHS (TkInt) is more likely a NegativeLiterals
+                 -- pattern like `f -1 = ...`.  Mismatch in either
+                 -- direction is rare in practice; the conservative
+                 -- choice unblocks Num's @class@ default
+                 --   x - y = x + negate y
+                 -- (GHC.Internal.Num.hs:91) which previously got
+                 -- mis-scanned as a method named "x".
                  TkIdent _    -> Just opName
                  TkConId _    -> Just opName
                  TkLParen     -> Just opName
-                 TkLBracket   -> Just opName
-                 TkUnderscore -> Just opName
-                 TkInt   _    -> Just opName
-                 TkStr   _    -> Just opName
-                 TkChar  _    -> Just opName
+                 TkLBracket   | opName /= "-" -> Just opName
+                 TkUnderscore | opName /= "-" -> Just opName
+                 TkInt   _    | opName /= "-" -> Just opName
+                 TkStr   _    | opName /= "-" -> Just opName
+                 TkChar  _    | opName /= "-" -> Just opName
                  _            -> Nothing
         _ -> Nothing
 
