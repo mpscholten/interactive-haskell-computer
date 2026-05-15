@@ -32,8 +32,8 @@ import Control.Concurrent.STM
     )
 import qualified Control.Exception as CE
 import Control.Exception
-    ( throwIO, catch, try, evaluate, mask, mask_
-    , bracket, bracket_, bracketOnError, finally, onException, throwTo
+    ( throwIO, try, evaluate, mask, mask_
+    , throwTo
     , SomeException
     )
 import Foreign.C.Error (Errno(..), getErrno, eAGAIN, eWOULDBLOCK, eINTR)
@@ -1559,21 +1559,6 @@ builtins reg =
     , ("GHC.Internal.Control.Exception.interruptible", interruptibleB)
     , ("GHC.IO.interruptible", interruptibleB)
     , ("GHC.Internal.IO.interruptible", interruptibleB)
-    , ("bracket",         bracketB)
-    , ("Control.Exception.bracket", bracketB)
-    , ("GHC.Internal.Control.Exception.bracket", bracketB)
-    , ("bracketOnError",  bracketOnErrorB)
-    , ("Control.Exception.bracketOnError", bracketOnErrorB)
-    , ("GHC.Internal.Control.Exception.bracketOnError", bracketOnErrorB)
-    , ("bracket_",        bracket_B)
-    , ("Control.Exception.bracket_", bracket_B)
-    , ("GHC.Internal.Control.Exception.bracket_", bracket_B)
-    , ("finally",         finallyB)
-    , ("Control.Exception.finally", finallyB)
-    , ("GHC.Internal.Control.Exception.finally", finallyB)
-    , ("onException",     onExceptionB)
-    , ("Control.Exception.onException", onExceptionB)
-    , ("GHC.Internal.Control.Exception.onException", onExceptionB)
     , ("throwTo",         throwToB)
     , ("displayException", displayExceptionB)
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
@@ -7546,37 +7531,40 @@ catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
     av <- force legacyHooks aT
     hv <- force legacyHooks hT
-    catch
-        (catch
-            (runIOVal legacyHooks av)
-            (\(exc :: IhcException) -> do
-                excVal <- ihcExceptionToVal exc
-                excT   <- newWHNFThunk excVal
-                rv     <- apply legacyHooks hv excT
-                runIOVal legacyHooks rv))
-        (\(exc :: SomeException) -> do
-            excVal <- hostExceptionToVal exc
-            excT   <- newWHNFThunk excVal
-            rv     <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv)
+    -- A single `try @SomeException` so the user handler runs exactly once.
+    -- Nesting two host `catch`es (one for IhcException, one for the
+    -- SomeException fallthrough) double-invoked the handler whenever the
+    -- handler itself rethrew: the rethrown IhcException escaped the inner
+    -- catch and was re-caught by the outer one, running `hv` a second
+    -- time. (This was masked while bracket/finally/onException were
+    -- host-shimmed; source-loading them exercises this path.)
+    r <- CE.try @SomeException (runIOVal legacyHooks av)
+    case r of
+        Right v -> pure v
+        Left e  -> do
+            excVal <- case CE.fromException e of
+                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
+                Nothing                       -> hostExceptionToVal e
+            excT <- newWHNFThunk excVal
+            rv   <- apply legacyHooks hv excT
+            runIOVal legacyHooks rv
 
 handleB :: IO Val
 handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
     hv <- force legacyHooks hT
     av <- force legacyHooks aT
-    catch
-        (catch
-            (runIOVal legacyHooks av)
-            (\(exc :: IhcException) -> do
-                excVal <- ihcExceptionToVal exc
-                excT   <- newWHNFThunk excVal
-                rv     <- apply legacyHooks hv excT
-                runIOVal legacyHooks rv))
-        (\(exc :: SomeException) -> do
-            let msg = BC.pack (show exc)
-            excT <- newWHNFThunk (VStr msg)
+    -- Single `try @SomeException` for the same reason as catchB: nesting
+    -- two host catches double-invoked the handler when it rethrew.
+    r <- CE.try @SomeException (runIOVal legacyHooks av)
+    case r of
+        Right v -> pure v
+        Left e  -> do
+            excVal <- case CE.fromException e of
+                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
+                Nothing                       -> pure (VStr (BC.pack (show e)))
+            excT <- newWHNFThunk excVal
             rv   <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv)
+            runIOVal legacyHooks rv
 
 -- | @Control.Exception.try :: Exception e => IO a -> IO (Either e a)@.
 --
@@ -7665,66 +7653,6 @@ maskB = pure $ VFun $ \fT -> pure $ VIO $ do
         restoreT <- newWHNFThunk restoreVal
         rv <- apply legacyHooks fv restoreT
         runIOVal legacyHooks rv
-
-bracketB :: IO Val
-bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
-    acqV <- force legacyHooks acqT
-    relV <- force legacyHooks relT
-    useV <- force legacyHooks useT
-    bracket
-        (runIOVal legacyHooks acqV)
-        (\res -> do
-            resT <- newWHNFThunk res
-            rv   <- apply legacyHooks relV resT
-            _    <- runIOVal legacyHooks rv
-            pure ())
-        (\res -> do
-            resT <- newWHNFThunk res
-            rv   <- apply legacyHooks useV resT
-            runIOVal legacyHooks rv)
-
-bracketOnErrorB :: IO Val
-bracketOnErrorB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
-    acqV <- force legacyHooks acqT
-    relV <- force legacyHooks relT
-    useV <- force legacyHooks useT
-    bracketOnError
-        (runIOVal legacyHooks acqV)
-        (\res -> do
-            resT <- newWHNFThunk res
-            rv   <- apply legacyHooks relV resT
-            _    <- runIOVal legacyHooks rv
-            pure ())
-        (\res -> do
-            resT <- newWHNFThunk res
-            rv   <- apply legacyHooks useV resT
-            runIOVal legacyHooks rv)
-
-bracket_B :: IO Val
-bracket_B = pure $ VFun $ \befT -> pure $ VFun $ \aftT -> pure $ VFun $ \thingT -> pure $ VIO $ do
-    befV   <- force legacyHooks befT
-    aftV   <- force legacyHooks aftT
-    thingV <- force legacyHooks thingT
-    bracket_
-        (runIOVal legacyHooks befV >> pure ())
-        (runIOVal legacyHooks aftV >> pure ())
-        (runIOVal legacyHooks thingV)
-
-finallyB :: IO Val
-finallyB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
-    av     <- force legacyHooks aT
-    cleanV <- force legacyHooks cleanT
-    finally
-        (runIOVal legacyHooks av)
-        (runIOVal legacyHooks cleanV >> pure ())
-
-onExceptionB :: IO Val
-onExceptionB = pure $ VFun $ \aT -> pure $ VFun $ \cleanT -> pure $ VIO $ do
-    av     <- force legacyHooks aT
-    cleanV <- force legacyHooks cleanT
-    onException
-        (runIOVal legacyHooks av)
-        (runIOVal legacyHooks cleanV >> pure ())
 
 throwToB :: IO Val
 throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
