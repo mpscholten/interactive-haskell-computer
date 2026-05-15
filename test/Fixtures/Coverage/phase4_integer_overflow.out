@@ -1,0 +1,12 @@
+timesInt2# 2^32 2^32 carry == 1   : True
+timesInt2# 2^32 2^32 high  == 1   : True
+timesInt2# 2^32 2^32 low   == 0   : True
+timesInt2# 5 3 carry == 0         : True
+timesInt2# 5 3 low   == 15        : True
+timesWord2# 2^32 2^32 high == 1   : True
+timesWord2# 2^32 2^32 low  == 0   : True
+timesWord2# 100 200 high == 0     : True
+timesWord2# 100 200 low == 20000  : True
+bigNatFromWord2# 0 42 == 42      : True
+bigNatFromWord2# 1 0 self-eq     : True
+bigNatFromWord2# 1 0 != 0        : True

@@ -1,0 +1,28 @@
+clearBit# 0xFF 0 == 0xFE: True
+setBit#   0xF0 0 == 0xF1: True
+compBit#  0x0F 4 == 0x1F: True
+compBit#  0x1F 4 == 0x0F: True
+gtW#  10 5      == True : True
+gtW#  5 10      == False: False
+leW#  5 5       == True : True
+eqW#  42 42     == True : True
+eqW#  42 43     == False: False
+cmpW# 10 5      == GT   : GT
+cmpW# 5 5       == EQ   : EQ
+cmpW# 5 10      == LT   : LT
+isTwo# 2        == True : True
+isTwo# 3        == False: False
+check# 42       == True : True
+index# 42 0     == 42   : True
+index# 42 1     == 0    : True
+zero#  ()       == 0    : True
+one#   ()       == 1    : True
+ctz#   8        == 3    : True
+ctz#   10       == 1    : True
+ctz#   1        == 0    : True
+ctz#   0        == 0    : True
+ctzW#  0        == 0    : True
+ctzW#  42       == 0    : True
+sizeInBase# 10 1000 == 4: True
+sizeInBase# 2 8     == 4: True
+sizeInBase# 10 0    == 0: True
