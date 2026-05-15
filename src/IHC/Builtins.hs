@@ -32,7 +32,7 @@ import Control.Concurrent.STM
     )
 import qualified Control.Exception as CE
 import Control.Exception
-    ( throwIO, catch, try, evaluate, mask, mask_
+    ( throwIO, catch, try, mask, mask_
     , bracket, bracket_, bracketOnError, finally, onException, throwTo
     , SomeException
     )
@@ -727,6 +727,11 @@ builtins reg =
     , ("bigNatFromWord2#",         bigNatFromWord2HashB)      -- Word# -> Word# -> BigNat#
     -- Phase 2.8: RealWorld / State primops
     , ("realWorld#",               realWorldB)
+    -- seq# :: a -> State# s -> (# State# s, a #) -- GHC.Prim primop.
+    -- No .hs source (GHC/PrimopWrappers.hs only re-exports GHC.Prim.seq#);
+    -- compiler-intrinsic, qualifies under the carve-out rule. Backs
+    -- source-loaded `evaluate a = IO $ \s -> seq# a s` in GHC.Internal.IO.
+    , ("seq#",                     seqHashB)
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
@@ -1519,9 +1524,10 @@ builtins reg =
     , ("Control.Exception.Base.try", tryB)
     , ("GHC.Internal.Control.Exception.try", tryB)
     , ("GHC.Internal.Control.Exception.Base.try", tryB)
-    , ("evaluate",        evaluateB)
-    , ("Control.Exception.evaluate", evaluateB)
-    , ("GHC.Internal.Control.Exception.evaluate", evaluateB)
+    -- evaluate: removed shim. Source-loaded from GHC.Internal.IO:
+    --   `evaluate a = IO $ \s -> seq# a s`
+    -- bottoms out into the `seq#` GHC.Prim primop (registered below),
+    -- which forces @a@ to WHNF and returns the IO unboxed tuple.
     , ("mask_",           mask_B)
     , ("GHC.IO.mask_",    mask_B)
     , ("GHC.Internal.IO.mask_", mask_B)
@@ -3963,6 +3969,23 @@ realWorldB = pure (VPrimObj PrimRealWorld)
 -- No-op in the interpreter; in GHC RTS this prevents thunk duplication.
 noDuplicateB :: IO Val
 noDuplicateB = pure $ VFun $ \_ -> pure (VPrimObj PrimRealWorld)
+
+-- | seq# :: a -> State# s -> (# State# s, a #)
+--
+-- GHC.Prim primop with no Haskell implementation (GHC/PrimopWrappers.hs
+-- only re-exports @GHC.Prim.seq#@). It forces @a@ to WHNF *in the IO
+-- monad* (sequenced w.r.t. the state token) and returns it paired with
+-- the threaded state. Backs source-loaded
+-- @evaluate a = IO $ \s -> seq# a s@ in GHC.Internal.IO: the @IO@ data
+-- constructor (registered above) applies this state-passing function to
+-- a RealWorld token and unwraps the @(# s, a #)@ tuple. If forcing @a@
+-- throws, the host exception propagates through the surrounding VIO,
+-- giving @evaluate@ its exception-uncovering semantics.
+seqHashB :: IO Val
+seqHashB = pure $ VFun $ \aT -> pure $ VFun $ \sT -> do
+    av <- force legacyHooks aT
+    avT <- newWHNFThunk av
+    pure (VCon "(#,#)" [sT, avT])
 
 -- | touch# :: a -> State# s -> State# s
 --
@@ -7635,12 +7658,6 @@ hostExceptionToVal e = do
     let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
     ioErrT <- newWHNFThunk ioErrVal
     pure (VCon "SomeException" [ioErrT])
-
-evaluateB :: IO Val
-evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    _  <- evaluate av
-    pure av
 
 mask_B :: IO Val
 mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
