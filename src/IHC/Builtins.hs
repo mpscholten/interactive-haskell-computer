@@ -347,13 +347,16 @@ builtins reg =
     , ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
-    -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  The
-    -- source-loaded @RealFloat Double@ instance methods aren't being
-    -- picked up by the class dispatcher (separate workstream); by
-    -- registering them in the builtin env the env-fallback short-
-    -- circuits the dispatcher and returns these shims directly.
-    -- This unblocks the source-loaded floor/ceiling/round/truncate
-    -- chain through 'properFractionDouble'.
+    -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  Kept:
+    -- graduation is blocked on the @RealFloat Double@ *instance-method
+    -- registration* gap (a distinct root cause from the integerMul
+    -- parse/qualified-resolution gap fixed in this PR — verified:
+    -- @integerEncodeDouble#@ source-loads and runs fine, but the
+    -- @RealFloat Double.encodeFloat@ instance method still dispatches
+    -- to a @<<ihc-method-placeholder>:RealFloat/encodeFloat>@).
+    -- Registering the shims in the builtin env makes the env-fallback
+    -- short-circuit the dispatcher.  Tracked for the instance-
+    -- registration workstream.
     , ("encodeFloat",  encodeFloatB)
     , ("decodeFloat",  decodeFloatB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
@@ -908,6 +911,12 @@ builtins reg =
     , ("uncheckedShiftL#",  uncheckedShiftLB)
     , ("uncheckedIShiftL#", uncheckedShiftLB)
     , ("uncheckedShiftRL#", uncheckedShiftRLB)
+    -- @uncheckedIShiftRL# :: Int# -> Int# -> Int#@ — logical
+    -- (zero-fill) right shift of an Int#.  Same bit operation as
+    -- 'uncheckedShiftRL#' (reinterpret the Int64 bits as unsigned,
+    -- shift right with zero fill); ghc-bignum's @bigNat*@ /
+    -- @integer*@ paths use it for limb extraction.
+    , ("uncheckedIShiftRL#", uncheckedShiftRLB)
     , ("uncheckedIShiftRA#", uncheckedIShiftRAB)
     -- Bitwise Int# primops: aliased to the boxed bit ops since
     -- IHC represents Int# as VInt (Int64-backed).  Required by
@@ -3293,8 +3302,9 @@ minBoundB = pure (VInt minBound)
 -- | @encodeFloat m e@ — @m * 2^e@ as a 'Double' (or 'Float', we
 -- represent both as 'VFloat').  Host shim because the source-loaded
 -- @RealFloat Double.encodeFloat@ instance method isn't being routed
--- by the class dispatcher.  Accepts 'VInt' or 'VInteger' for the
--- mantissa.
+-- by the class dispatcher (instance-method-registration gap; the
+-- underlying 'integerEncodeDouble#' source-loads fine).  Accepts
+-- 'VInt' or 'VInteger' for the mantissa.
 encodeFloatB :: IO Val
 encodeFloatB = pure $ VFun $ \mT -> pure $ VFun $ \eT -> do
     mv <- force legacyHooks mT
@@ -3313,7 +3323,7 @@ encodeFloatB = pure $ VFun $ \mT -> pure $ VFun $ \eT -> do
 -- a tuple of '(Integer, Int)'.  Source-loaded path bottoms out at
 -- 'decodeDouble_Int64#' (already shipped) but the surrounding
 -- 'RealFloat Double.decodeFloat' instance method dispatch is
--- blocked on the same dispatcher gap as 'encodeFloat'.
+-- blocked on the same instance-registration gap as 'encodeFloat'.
 decodeFloatB :: IO Val
 decodeFloatB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
@@ -3557,28 +3567,19 @@ bigNatRemWordHashB :: IO Val
 bigNatRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat "bigNatRemWord#" av
-    case bv of
-        VInt w -> do
-            let wNat = fromIntegral (fromIntegral w :: Word) :: Natural
-                r    = na `rem` wNat
-            pure (VInt (fromIntegral r))
-        _ -> error
-            ("bigNatRemWord#: not a Word#: " <> showValForDebug bv)
+    wNat <- coerceWordArg "bigNatRemWord#" bv
+    pure (VInt (fromIntegral (na `rem` wNat)))
 
 -- | @bigNatQuotRemWord# :: BigNat# -> Word# -> (# BigNat#, Word# #)@.
 bigNatQuotRemWordHashB :: IO Val
 bigNatQuotRemWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat "bigNatQuotRemWord#" av
-    case bv of
-        VInt w -> do
-            let wNat   = fromIntegral (fromIntegral w :: Word) :: Natural
-                (q, r) = na `quotRem` wNat
-            qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
-            rT <- newWHNFThunk (VInt (fromIntegral r))
-            pure (VCon "(#,#)" [qT, rT])
-        _ -> error
-            ("bigNatQuotRemWord#: not a Word#: " <> showValForDebug bv)
+    wNat <- coerceWordArg "bigNatQuotRemWord#" bv
+    let (q, r) = na `quotRem` wNat
+    qT <- newWHNFThunk (VPrimObj (PrimBigNat q))
+    rT <- newWHNFThunk (VInt (fromIntegral r))
+    pure (VCon "(#,#)" [qT, rT])
 
 -- | Phase 2.C: @a .&. ~b@ over 'Natural'.  Since 'Natural' has no
 -- 'complement' (unsigned, unbounded), implemented as
@@ -3595,11 +3596,8 @@ makeBigNatShiftOp :: String -> (Natural -> Int -> Natural) -> IO Val
 makeBigNatShiftOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat name av
-    case bv of
-        VInt w ->
-            pure (VPrimObj (PrimBigNat
-                (op na (fromIntegral (fromIntegral w :: Word)))))
-        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+    nb <- coerceWordArg name bv
+    pure (VPrimObj (PrimBigNat (op na (fromIntegral nb))))
 
 -- | @bigNatShiftRNeg# :: BigNat# -> Word# -> BigNat#@ — arithmetic
 -- right-shift of a negative-magnitude BigNat, used by ghc-bignum's
@@ -3611,15 +3609,12 @@ bigNatShiftRNegHashB :: IO Val
 bigNatShiftRNegHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat "bigNatShiftRNeg#" av
-    case bv of
-        VInt w -> do
-            let k = fromIntegral (fromIntegral w :: Word) :: Int
-            pure (VPrimObj (PrimBigNat
-                (if na == 0
-                    then 0
-                    else ((na + (1 `shiftL` k) - 1) `shiftR` k))))
-        _ -> error
-            ("bigNatShiftRNeg#: not a Word#: " <> showValForDebug bv)
+    nb <- coerceWordArg "bigNatShiftRNeg#" bv
+    let k = fromIntegral nb :: Int
+    pure (VPrimObj (PrimBigNat
+        (if na == 0
+            then 0
+            else ((na + (1 `shiftL` k) - 1) `shiftR` k))))
 
 -- | @bigNatPopCount# :: BigNat# -> Word#@ — population count of the
 -- magnitude.
@@ -3635,24 +3630,16 @@ bigNatTestBitHashB :: IO Val
 bigNatTestBitHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat "bigNatTestBit#" av
-    case bv of
-        VInt w ->
-            pure (primBoolVal
-                (testBit na (fromIntegral (fromIntegral w :: Word))))
-        _ -> error
-            ("bigNatTestBit#: not a Word#: " <> showValForDebug bv)
+    nb <- coerceWordArg "bigNatTestBit#" bv
+    pure (primBoolVal (testBit na (fromIntegral nb)))
 
 -- | @bigNatBit# :: Word# -> BigNat#@ — returns @2^n@ as a BigNat.
 -- ghc-bignum convention: the n-th bit is set, all others zero.
 bigNatBitHashB :: IO Val
 bigNatBitHashB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
-    case av of
-        VInt w ->
-            pure (VPrimObj (PrimBigNat
-                (bit (fromIntegral (fromIntegral w :: Word)))))
-        _ -> error
-            ("bigNatBit#: not a Word#: " <> showValForDebug av)
+    nb <- coerceWordArg "bigNatBit#" av
+    pure (VPrimObj (PrimBigNat (bit (fromIntegral nb))))
 
 -- | @bigNatAndInt# :: BigNat# -> Int# -> BigNat#@ — bitwise AND with
 -- a signed @Int#@.  Two's-complement semantics: for negative @i@,
@@ -3855,13 +3842,9 @@ bigNatLogBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 bigNatLogBaseWordHashB :: IO Val
 bigNatLogBaseWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case av of
-        VInt w -> do
-            let base = fromIntegral (fromIntegral w :: Word) :: Natural
-            n <- extractBigNat "bigNatLogBaseWord#" bv
-            pure (VInt (fromIntegral (naturalLogBase base n)))
-        _ -> error
-            ("bigNatLogBaseWord#: not a Word#: " <> showValForDebug av)
+    base <- coerceWordArg "bigNatLogBaseWord#" av
+    n    <- extractBigNat "bigNatLogBaseWord#" bv
+    pure (VInt (fromIntegral (naturalLogBase base n)))
 
 -- | Pure helper for floor(log_b n).  Errors if @b <= 1@ (matches
 -- ghc-bignum's @unexpectedValue_Word#@).  Returns 0 for n = 0 as a
@@ -3883,25 +3866,26 @@ makeBigNatWordCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
 makeBigNatWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat name av
-    case bv of
-        VInt w ->
-            pure (primBoolVal
-                (op na (fromIntegral (fromIntegral w :: Word))))
-        _ -> error (name <> ": not a Word#: " <> showValForDebug bv)
+    -- 'coerceWordArg' (not a bare @VInt@ match): Word# literals such
+    -- as @ABS_INT_MINBOUND## = 0x8000000000000000@ exceed
+    -- @maxBound :: Int64@ so the parser stores them as 'VInteger',
+    -- not 'VInt'.  ghc-bignum's 'integerNegate' (@IP b@ arm) calls
+    -- @bigNatEqWord# b ABS_INT_MINBOUND##@, which would otherwise
+    -- fail "not a Word#".  Mirrors the Phase 3 'makeBigNatWordOp'
+    -- fix.
+    nb <- coerceWordArg name bv
+    pure (primBoolVal (op na nb))
 
 -- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
 bigNatCompareWordHashB :: IO Val
 bigNatCompareWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
     na <- extractBigNat "bigNatCompareWord#" av
-    case bv of
-        VInt w ->
-            pure $ case compare na (fromIntegral (fromIntegral w :: Word)) of
-                LT -> VCon "LT" []
-                EQ -> VCon "EQ" []
-                GT -> VCon "GT" []
-        _ -> error
-            ("bigNatCompareWord#: not a Word#: " <> showValForDebug bv)
+    nb <- coerceWordArg "bigNatCompareWord#" bv
+    pure $ case compare na nb of
+        LT -> VCon "LT" []
+        EQ -> VCon "EQ" []
+        GT -> VCon "GT" []
 
 -- | @bigNatCheck# :: BigNat# -> Bool#@ — ghc-bignum's canonical-form
 -- sanity check (high limb non-zero, etc.).  Our 'Natural'-backed
@@ -3981,18 +3965,14 @@ naturalCtz n = go 0 n
 bigNatSizeInBaseHashB :: IO Val
 bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case av of
-        VInt w -> do
-            let base = fromIntegral (fromIntegral w :: Word) :: Natural
-            n <- extractBigNat "bigNatSizeInBase#" bv
-            pure (VInt
-                (if base <= 1
-                    then error "bigNatSizeInBase#: base must be > 1"
-                    else if n == 0
-                        then 0
-                        else fromIntegral (naturalLogBase base n) + 1))
-        _ -> error
-            ("bigNatSizeInBase#: not a Word#: " <> showValForDebug av)
+    base <- coerceWordArg "bigNatSizeInBase#" av
+    n    <- extractBigNat "bigNatSizeInBase#" bv
+    pure (VInt
+        (if base <= 1
+            then error "bigNatSizeInBase#: base must be > 1"
+            else if n == 0
+                then 0
+                else fromIntegral (naturalLogBase base n) + 1))
 
 -- | Phase 4: @bigNatFromWord2# :: Word# -> Word# -> BigNat#@ —
 -- construct a BigNat from a high/low Word# pair.  Used by

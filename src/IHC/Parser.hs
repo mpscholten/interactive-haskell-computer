@@ -2587,14 +2587,30 @@ collectArgs ctx name acc cur =
             if isWild
                 then pure (PRecordWild name, curEnd)
                 else pure (PRecord name fieldPats, curEnd)
-        -- TkMinus would otherwise look like the start of a negative-
-        -- literal pattern (@-1@), but as an unparenthesised arg of a
-        -- constructor it's actually the binary infix operator that
-        -- separates this constructor's pattern from the next infix-LHS
-        -- pattern, e.g. @I# x - I# y = …@ in Num Int.  Negative literal
-        -- args are written @C (-1)@, so the parens path in parseSubPat
-        -- still handles them correctly.
-        TkMinus -> pure (PCon name (reverse acc), cur)
+        -- @TkMinus@ is ambiguous as an unparenthesised constructor arg:
+        --
+        --   * @I# x - I# y = …@  (Num Int)         — binary infix @-@
+        --     separating this ctor pattern from the next infix-LHS
+        --     pattern.  Stop collecting; @-@ is the operator.
+        --
+        --   * @integerMul x (IS -1#) = …@  (ghc-bignum)  — @-1#@ is a
+        --     NegativeLiterals sub-pattern argument of @IS@.  Parse it.
+        --
+        -- Disambiguate by the token after @-@: a numeric literal
+        -- (@TkInt@ / @TkFloat@) means a negative-literal arg (delegate
+        -- to 'parseSubPat', which already handles @-1#@ / @-1@ /
+        -- @-1.0@); anything else (ident, ConId, paren, …) is the infix
+        -- @-@ operator, so we stop as before.
+        TkMinus ->
+            let (afterMinus, _) = nextSig ctx cur' in
+            case tkKind afterMinus of
+                TkInt _   -> do
+                    (sp, cur'') <- parseSubPat ctx cur
+                    collectArgs ctx name (sp : acc) cur''
+                TkFloat _ -> do
+                    (sp, cur'') <- parseSubPat ctx cur
+                    collectArgs ctx name (sp : acc) cur''
+                _ -> pure (PCon name (reverse acc), cur)
         _ | startsPat (tkKind tok) -> do
             (sp, cur'') <- parseSubPat ctx cur
             collectArgs ctx name (sp : acc) cur''
