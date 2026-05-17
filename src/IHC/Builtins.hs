@@ -7539,7 +7539,6 @@ runStateTransformer stateFnT = do
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
-    av <- force legacyHooks aT
     hv <- force legacyHooks hT
     -- A single `try @SomeException` so the user handler runs exactly once.
     -- Nesting two host `catch`es (one for IhcException, one for the
@@ -7548,7 +7547,22 @@ catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
     -- catch and was re-caught by the outer one, running `hv` a second
     -- time. (This was masked while bracket/finally/onException were
     -- host-shimmed; source-loading them exercises this path.)
-    r <- CE.try @SomeException (runIOVal legacyHooks av)
+    --
+    -- Force the action thunk *inside* the `try`.  In the Val model an IO
+    -- action is a thunk whose WHNF can already run side effects (the
+    -- evaluator eagerly runs a `VIO` when it is the scrutinee of the
+    -- `case (IO io) -> …` newtype-deconstruction that `unblock`/`block`/
+    -- `unsafeUnmask` — the `restore` wrapper `mask` hands to
+    -- `bracket`/`finally`/`onException` — perform on their argument).
+    -- If we force `aT` before the `try`, an exception raised while
+    -- forcing escapes the handler entirely: the source-loaded
+    -- `onException` never gets to run its cleanup/rethrow handler, so
+    -- `finally`/`bracket`/`bracket_`/`bracketOnError` silently skip the
+    -- release action on the exception path.  `catch` must evaluate its
+    -- action within the protected region.
+    r <- CE.try @SomeException (do
+            av <- force legacyHooks aT
+            runIOVal legacyHooks av)
     case r of
         Right v -> pure v
         Left e  -> do
