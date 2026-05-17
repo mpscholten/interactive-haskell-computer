@@ -219,6 +219,22 @@ seedBuiltinClassMethodSigs = do
             , ("round",      "RealFrac")
             , ("ceiling",    "RealFrac")
             , ("floor",      "RealFrac")
+            -- Bits
+            --
+            -- Builtins-removal companion: the @popCount@ / @bit@ /
+            -- @testBit@ / @clearBit@ / @setBit@ shims were dropped from
+            -- 'IHC.Builtins.builtins' per CLAUDE.md's "minimum surface"
+            -- rule.  Seeding method→class here lets the env-fallback's
+            -- 'tryClassMethodFromRegistry' synthesise a
+            -- 'classMethodDispatcher' on the first bare reference,
+            -- routing through the source-loaded @class Bits@ /
+            -- @Bits Int@ instance in @GHC.Internal.Bits@ (defaults
+            -- bottom on shifts, @.&.@, @.|.@, @complement@, @popCnt#@).
+            , ("popCount",   "Bits")
+            , ("bit",        "Bits")
+            , ("testBit",    "Bits")
+            , ("clearBit",   "Bits")
+            , ("setBit",     "Bits")
             -- Foldable
             , ("length",     "Foldable")
             -- Applicative / Monad seeds (already in env via builtins, but
