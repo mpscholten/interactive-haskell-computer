@@ -181,14 +181,20 @@ seedBuiltinClassMethodSigs = do
             -- Bounded
             , ("minBound",   "Bounded")
             , ("maxBound",   "Bounded")
-            -- Integral (mod / div / quotRem / divMod don't need seeding —
-            -- the registry handles them after Integral source-loads via
-            -- triggerCoreInstanceLoad / registerGlobalLoadedModule.  These
-            -- are seeded for first-call locality so bare references like
-            -- @17 \`quot\` 5@ in the REPL hit a 1-step lookup instead of
-            -- the 3-step probe→load→discover cascade.)
+            -- Integral.  These are seeded for first-call locality so
+            -- bare references like @17 \`quot\` 5@ in the REPL hit a
+            -- 1-step lookup instead of the 3-step probe→load→discover
+            -- cascade.  divMod / quotRem MUST be seeded since their
+            -- builtin shims were removed (builtins minimum-surface):
+            -- the env-fallback's tryClassMethodFromRegistry needs the
+            -- class binding present so it can synthesise the
+            -- classMethodDispatcher that triggers the Integral source
+            -- load.  (mod / div likewise graduated and ride the same
+            -- registry path; they are covered once Real source-loads.)
             , ("quot",       "Integral")
             , ("rem",        "Integral")
+            , ("divMod",     "Integral")
+            , ("quotRem",    "Integral")
             , ("toInteger",  "Integral")
             -- Bits (bitwise core).  Seeded so the env-fallback's
             -- 'tryClassMethodFromRegistry' can synthesise a
@@ -235,6 +241,22 @@ seedBuiltinClassMethodSigs = do
             , ("round",      "RealFrac")
             , ("ceiling",    "RealFrac")
             , ("floor",      "RealFrac")
+            -- Bits
+            --
+            -- Builtins-removal companion: the @popCount@ / @bit@ /
+            -- @testBit@ / @clearBit@ / @setBit@ shims were dropped from
+            -- 'IHC.Builtins.builtins' per CLAUDE.md's "minimum surface"
+            -- rule.  Seeding method→class here lets the env-fallback's
+            -- 'tryClassMethodFromRegistry' synthesise a
+            -- 'classMethodDispatcher' on the first bare reference,
+            -- routing through the source-loaded @class Bits@ /
+            -- @Bits Int@ instance in @GHC.Internal.Bits@ (defaults
+            -- bottom on shifts, @.&.@, @.|.@, @complement@, @popCnt#@).
+            , ("popCount",   "Bits")
+            , ("bit",        "Bits")
+            , ("testBit",    "Bits")
+            , ("clearBit",   "Bits")
+            , ("setBit",     "Bits")
             -- Foldable
             , ("length",     "Foldable")
             -- Applicative / Monad seeds (already in env via builtins, but

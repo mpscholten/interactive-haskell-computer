@@ -431,23 +431,28 @@ peekInfixOp :: Source -> Cursor -> Maybe ByteString
 peekInfixOp src cur =
     let (t1, c1) = peekSigTokFrom src cur
     in case tkKind t1 of
-        -- Immediately followed by backtick: `arg \`op\` ...`.
-        -- The backticked operator can be a MagicHash primop (lexed as
-        -- 'TkPrimId', e.g. @a \`iShiftL#\` b = ...@ at
-        -- GHC.Internal.Base.hs:2495) just as easily as a plain
-        -- identifier.  Without the 'TkPrimId' arm the scanner mis-reads
-        -- the whole line as a binding of the col-1 first-argument name,
-        -- so @iShiftL#@ / @iShiftRA#@ never get registered as top-level
-        -- bindings — which breaks the source-loaded @instance Bits Int@
-        -- (its @shiftL@/@shiftR@ bodies call these).  Mirrors the col-1
-        -- 'TkPrimId' value-binding handling elsewhere in this module.
-        TkBacktick
-            | (t2, c2) <- peekSigTokFrom src c1
-            , Just op  <- backtickOpName (tkKind t2)
-            , (t3, _)  <- peekSigTokFrom src c2
-            , TkBacktick <- tkKind t3
-            -> Just op
-            | otherwise -> Nothing
+        -- Immediately followed by backtick: `arg \`op\` ...`
+        TkBacktick ->
+            let (t2, c2) = peekSigTokFrom src c1
+                closedByBacktick op =
+                    let (t3, _) = peekSigTokFrom src c2
+                    in case tkKind t3 of
+                        TkBacktick -> Just op
+                        _          -> Nothing
+            in case tkKind t2 of
+                TkIdent op -> closedByBacktick op
+                -- MagicHash value-level op between backticks, e.g.
+                --   x# \`divModInt#\` y# = ...
+                -- in ghc-prim's GHC.Classes, or
+                --   a \`iShiftL#\` b = ...
+                -- at GHC.Internal.Base.hs:2495 (the leaf the
+                -- source-loaded @instance Bits Int@ shiftL/shiftR
+                -- bodies bottom on).  Such names lex as 'TkPrimId'
+                -- (trailing @#@); without this arm the whole binding
+                -- LHS goes unrecognised and the symbol (e.g.
+                -- @divModInt#@, @iShiftL#@) reports as unbound.
+                TkPrimId op | primIdIsValueLevel op -> closedByBacktick op
+                _ -> Nothing
         -- Immediately followed by '@'-prefixed op: `arg @?= ...`
         TkAt ->
             let (t2, _) = peekSigTokFrom src c1
@@ -487,15 +492,6 @@ peekInfixOp src cur =
                  TkChar  _    | opName /= "-" -> Just opName
                  _            -> Nothing
         _ -> Nothing
-
--- | Name of an identifier usable as a backticked infix operator.
--- Both plain identifiers ('TkIdent') and MagicHash primops
--- ('TkPrimId', e.g. @iShiftL#@) are valid in @\`op\`@ position.
-backtickOpName :: TokenKind -> Maybe ByteString
-backtickOpName = \case
-    TkIdent  op -> Just op
-    TkPrimId op -> Just op
-    _           -> Nothing
 
 -- | Map an operator-like token kind to its printable operator name.
 -- Mirrors 'IHC.Parser.tokenOpName' but returns a 'ByteString' for use

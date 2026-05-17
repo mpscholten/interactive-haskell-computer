@@ -32,7 +32,7 @@ import Control.Concurrent.STM
     )
 import qualified Control.Exception as CE
 import Control.Exception
-    ( throwIO, catch, try, evaluate, mask, mask_
+    ( throwIO, catch, try, evaluate
     , bracket, bracket_, bracketOnError, finally, onException, throwTo
     , SomeException
     )
@@ -324,7 +324,19 @@ builtins reg =
     -- 'Integral Int.rem' (Real.hs:452-455 → remInt → remInt#).
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
-    [ ("sqrt",     unaryOpFloat sqrt)
+    --
+    -- 'sqrt' graduated to source-loaded (Builtins-removal batch).
+    -- The 'Floating Double' instance method body lives at
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Float.hs:746
+    --     sqrt x = sqrtDouble x
+    -- and 'sqrtDouble' (Float.hs:1578) bottoms on the 'sqrtDouble#'
+    -- GHC.Prim primop: @sqrtDouble (D# x) = D# (sqrtDouble# x)@.
+    -- The ("sqrt","Floating") class-method seed is registered in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs', and the carved-out
+    -- 'sqrtDouble#' GHC.Prim builtin (no .hs source — PrimopWrappers.hs
+    -- just re-exports GHC.Prim.sqrtDouble#) is registered below next to
+    -- the other Double# unary primops.
+    --
     -- Phase 5: graduated 'floor' / 'ceiling' / 'round' / 'truncate'
     -- to source-loaded.  The chain is:
     --
@@ -344,7 +356,7 @@ builtins reg =
     -- short-circuit the class-method dispatcher (separate workstream:
     -- @RealFloat Double.encodeFloat@ instance method registration
     -- isn't surfacing through dispatch; the host shim bypasses).
-    , ("fromIntegral", fromIntegralB)
+    [ ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
     -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  The
@@ -572,7 +584,6 @@ builtins reg =
     , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
-    , ("assert",      assertB)
     , ("error",       errorB)
     , ("undefined",   undefinedB)
     -- B.1: debug-only superclass-relation probe.  Source-loaded code
@@ -583,9 +594,14 @@ builtins reg =
     , ("__ihc_class_supers", classSupersProbeB)
     , ("exitWith",    exitWithB)
     , ("exitSuccess", exitSuccessB)
-    -- Char / numeric conversions
-    , ("ord",         ordB)
-    , ("chr",         chrB)
+    -- Char / numeric conversions.
+    -- NOTE: only the GHC.Prim primops @ord#@ / @chr#@ are host-backed.
+    -- @Data.Char.ord@ / @Data.Char.chr@ have real source — @ord@ in
+    -- @GHC/Internal/Base.hs@ (@ord (C# c#) = I# (ord# c#)@) and @chr@ in
+    -- @GHC/Internal/Char.hs@ (@chr i\@(I# i#) | isTrue# (...) = C# (chr# i#)
+    -- | otherwise = ...@) — so they are interpreted from source via the
+    -- env-fallback path, bottoming out on these primops. Do NOT re-add
+    -- the bare ("ord"/"chr") shims.
     , ("ord#",        ordB)
     , ("chr#",        chrB)
     -- isTrue# :: Int# -> Bool.  Projects the 1#/0# unboxed-Int encoding
@@ -781,11 +797,9 @@ builtins reg =
     -- these primops; there is no .hs implementation to interpret below them.
     , ("readIntOffAddr#",  readIntOffAddrHashB)
     , ("writeIntOffAddr#", writeIntOffAddrHashB)
-    -- Phase 2.8: Ptr arithmetic
-    , ("plusPtr",   plusPtrB)
-    , ("minusPtr",  minusPtrB)
-    , ("nullPtr",   nullPtrB)
-    , ("castPtr",   castPtrB)
+    -- Ptr arithmetic (plusPtr/minusPtr/nullPtr/castPtr) is now
+    -- source-loaded from GHC.Internal.Ptr — its bodies bottom on
+    -- plusAddr#/minusAddr#/nullAddr#/coerce, all already available.
     -- Phase 2.8: ForeignPtr
     , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB)
     , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
@@ -915,12 +929,16 @@ builtins reg =
     , ("andI#",             bitAndB)
     , ("orI#",              bitOrB)
     , ("xorI#",             bitXorB)
-    -- notI# :: Int# -> Int# — GHC.Prim primop with NO Haskell
-    -- source (only the trivial PrimopWrappers.hs alias).  Carve-out
-    -- per CLAUDE.md "Compiler-intrinsic OR RTS-exclusive": required
-    -- by @complement (I# x#) = I# (notI# x#)@ in @instance Bits Int@
-    -- (GHC.Internal.Bits, Bits.hs:461) now that the @complement@
-    -- shim is removed.
+    -- notI# :: Int# -> Int# — a genuine GHC.Prim primop with NO
+    -- .hs source (ghc-prim's GHC/PrimopWrappers.hs only re-exports
+    -- @GHC.Prim.notI#@), so it qualifies as a compiler-intrinsic
+    -- carve-out under the builtins minimum-surface rule.  Two
+    -- source-loaded leaves bottom on it: @divModInt#@
+    -- (GHC/Classes.hs:846, ridden by the graduated @divMod@) and
+    -- @complement (I# x#) = I# (notI# x#)@ in @instance Bits Int@
+    -- (GHC.Internal.Bits, Bits.hs:461, ridden by the graduated
+    -- @complement@).  Aliased to the boxed complement since IHC
+    -- represents Int# as 'VInt' (Int64-backed).
     , ("notI#",             notIB)
     -- Int64# primops: IHC stores both Int# and Int64# as
     -- 'VInt' (Int64-backed Haskell), so conversions are
@@ -1009,6 +1027,16 @@ builtins reg =
     -- 'truncateDouble' which use 'abs' and 'compare' on Doubles).
     , ("fabsDouble#",  unaryOpFloat abs)
     , ("negateFloat#", unaryOpFloat negate)
+    -- Builtins-removal carve-out: @sqrtDouble# :: Double# -> Double#@
+    -- is a genuine GHC.Prim primop with NO .hs source (ghc-prim
+    -- PrimopWrappers.hs:841 just re-exports @GHC.Prim.sqrtDouble#@), so
+    -- it qualifies as a compiler-intrinsic builtin under the
+    -- "Builtin modules: minimum surface only" carve-out rule. It is the
+    -- bottom of the source-loaded @Floating Double.sqrt@ chain
+    -- (Float.hs:746 @sqrt x = sqrtDouble x@; Float.hs:1578
+    -- @sqrtDouble (D# x) = D# (sqrtDouble# x)@) now that the bare-name
+    -- @sqrt@ shim is gone.  Reuses the shared 'unaryOpFloat' helper.
+    , ("sqrtDouble#",  unaryOpFloat sqrt)
     -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
     -- Bottom-of-stack primop for 'decodeFloat' on Double:
     -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
@@ -1183,8 +1211,20 @@ builtins reg =
     -- 'div' graduated with the rest of the TODO 2.6 block: it now
     -- routes through the Integral Int instance (a `divInt` b) and
     -- bottoms on divInt# registered below.
-    , ("divMod",       divModB)
-    , ("quotRem",      quotRemB)
+    --   * 'divMod' / 'quotRem' (Integral class) graduated (builtins
+    --     minimum-surface): the @divModB@ / @quotRemB@ shims were
+    --     dropped.  They now source-load through @Integral Int@ in
+    --     GHC/Internal/Real.hs:471-482, which routes
+    --     @a \`quotRem\` b@ → 'quotRemInt' / @a \`divMod\` b@ →
+    --     'divModInt' (Base.hs:2428,2444).  'quotRemInt' bottoms on
+    --     the 'quotRemInt#' primop (registered below); 'divModInt'
+    --     bottoms on 'divModInt#', which is *itself* source-loaded
+    --     from ghc-prim's GHC/Classes.hs:840 (it has real .hs source,
+    --     so per the doctrine it is interpreted, not shimmed) and in
+    --     turn rides 'quotRemInt#' plus the 'notI#' GHC.Prim primop
+    --     carve-out registered below.  The class-method dispatch is
+    --     seeded via @("divMod","Integral")@ / @("quotRem","Integral")@
+    --     in 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
     -- NOTE (Bits bitwise core): the @class Bits@ methods
     --   shiftL / shiftR / .&. / .|. / xor / complement
     -- are no longer shimmed.  They source-load from the
@@ -1195,11 +1235,15 @@ builtins reg =
     -- ride @uncheckedIShiftL#@/@uncheckedIShiftRA#@; @notI#@ is
     -- the GHC.Prim carve-out registered below).  Method→class
     -- seeds live in 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
-    , ("popCount",     popCountB)
-    , ("bit",          bitB)
-    , ("testBit",      testBitB)
-    , ("clearBit",     clearBitB)
-    , ("setBit",       setBitB)
+    -- popCount / bit / testBit / clearBit / setBit removed per CLAUDE.md
+    -- "Builtin modules: minimum surface only".  These are @class Bits@
+    -- methods (GHC.Internal.Bits); the @Bits Int@ instance + class
+    -- defaults express them via shifts, @.&.@, @.|.@, @complement@, and
+    -- the @popCnt#@ primop (registered below).  Resolution now flows
+    -- through the source-loaded @class Bits@ via the env-fallback's
+    -- 'tryClassMethodFromRegistry' → 'classMethodDispatcher', seeded by
+    -- @("popCount"/"bit"/"testBit"/"clearBit"/"setBit","Bits")@ in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
     -- Power operator
     , ("^",            powOpB)
     , ("^^",           powFloatOpB)
@@ -1530,59 +1574,42 @@ builtins reg =
     -- =================================================================
     -- end VIO <-> State# bridge
     -- =================================================================
+    -- Phase 2.10a exception shim. `catch` HAS real source in
+    -- ghc-internal/src/GHC/Internal/IO.hs and bottoms out into
+    -- primops we already implement (`catch#`/`unIO`/`raiseIO#`), so
+    -- per "minimum surface only" it is a graduation candidate.
+    -- Graduation is BLOCKED on TWO interpreter gaps (both reproduced;
+    -- see test/Fixtures/Unsupported/io_catch_graduated.hs):
+    --   1. ECase eagerly runs a `VIO` scrutinee even when the case
+    --      destructures the `IO` newtype (`catch (IO io) h = …`), so
+    --      the action throws OUTSIDE `catch#`'s protection. Fixable in
+    --      IHC.Eval `go (ECase …)` — a core-evaluator change kept
+    --      separate from the shim removal to bound the blast radius.
+    --   2. Even past (1): source `catch`'s
+    --        handler' e = case fromException e of
+    --                       Just e' -> unIO (handler e') ; Nothing -> raiseIO# e
+    --      needs `fromException` to return `Just` for the @SomeException@
+    --      handler case (GHC: @instance Exception SomeException where
+    --      fromException = Just@). `fromExceptionB` deliberately returns
+    --      `Nothing` for downcast-safety (warp/wai `Just (Con _) <-
+    --      fromException e` guards — see its inline note); flipping it
+    --      regresses those, and matchPat has no `SomeException`
+    --      newtype-transparency for concrete-ctor patterns to compensate.
+    --      Needs runtime-type-directed `fromException`/`cast`.
     , ("catch",           catchB)
     , ("GHC.IO.catch",    catchB)
     , ("GHC.Internal.IO.catch", catchB)
     , ("Control.Exception.catch", catchB)
     , ("GHC.Internal.Control.Exception.catch", catchB)
-    , ("handle",          handleB)
-    , ("Control.Exception.handle", handleB)
-    , ("GHC.Internal.Control.Exception.handle", handleB)
-    , ("try",             tryB)
-    , ("Control.Exception.try", tryB)
-    , ("Control.Exception.Base.try", tryB)
-    , ("GHC.Internal.Control.Exception.try", tryB)
-    , ("GHC.Internal.Control.Exception.Base.try", tryB)
     , ("evaluate",        evaluateB)
     , ("Control.Exception.evaluate", evaluateB)
     , ("GHC.Internal.Control.Exception.evaluate", evaluateB)
-    , ("mask_",           mask_B)
-    , ("GHC.IO.mask_",    mask_B)
-    , ("GHC.Internal.IO.mask_", mask_B)
-    , ("Control.Exception.mask_", mask_B)
-    , ("GHC.Internal.Control.Exception.mask_", mask_B)
-    , ("mask",            maskB)
-    , ("GHC.IO.mask",     maskB)
-    , ("GHC.Internal.IO.mask", maskB)
-    , ("Control.Exception.mask", maskB)
-    , ("GHC.Internal.Control.Exception.mask", maskB)
-    , ("uninterruptibleMask_", mask_B)
-    , ("uninterruptibleMask", maskB)
-    , ("GHC.IO.uninterruptibleMask_", mask_B)
-    , ("GHC.IO.uninterruptibleMask", maskB)
-    , ("GHC.Internal.IO.uninterruptibleMask_", mask_B)
-    , ("GHC.Internal.IO.uninterruptibleMask", maskB)
-    , ("Control.Exception.uninterruptibleMask_", mask_B)
-    , ("Control.Exception.uninterruptibleMask", maskB)
-    , ("GHC.Internal.Control.Exception.uninterruptibleMask_", mask_B)
-    , ("GHC.Internal.Control.Exception.uninterruptibleMask", maskB)
-    , ("block",           mask_B)
-    , ("GHC.IO.block",    mask_B)
-    , ("GHC.Internal.IO.block", mask_B)
-    , ("unblock",         mask_B)
-    , ("GHC.IO.unblock",  mask_B)
-    , ("GHC.Internal.IO.unblock", mask_B)
-    , ("unsafeUnmask",    mask_B)
-    , ("GHC.IO.unsafeUnmask", mask_B)
-    , ("GHC.Internal.IO.unsafeUnmask", mask_B)
-    , ("allowInterrupt", allowInterruptB)
-    , ("Control.Exception.allowInterrupt", allowInterruptB)
-    , ("GHC.Internal.Control.Exception.allowInterrupt", allowInterruptB)
-    , ("interruptible", interruptibleB)
-    , ("Control.Exception.interruptible", interruptibleB)
-    , ("GHC.Internal.Control.Exception.interruptible", interruptibleB)
-    , ("GHC.IO.interruptible", interruptibleB)
-    , ("GHC.Internal.IO.interruptible", interruptibleB)
+    -- mask / mask_ / uninterruptibleMask{,_} / block / unblock /
+    -- unsafeUnmask / allowInterrupt / interruptible are source-loaded from
+    -- GHC.Internal.IO: the chain bottoms out on getMaskingState# /
+    -- maskAsyncExceptions# / maskUninterruptible# / unmaskAsyncExceptions#
+    -- (GHC.Prim primops, registered above) which the interpreter treats as
+    -- Unmasked / identity — the no-op masking semantics this code needs.
     , ("bracket",         bracketB)
     , ("Control.Exception.bracket", bracketB)
     , ("GHC.Internal.Control.Exception.bracket", bracketB)
@@ -3234,10 +3261,6 @@ seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     _ <- force legacyHooks a
     force legacyHooks b
 
--- | @assert cond x = x@.  Like GHC's default (assertions ignored) behaviour.
-assertB :: IO Val
-assertB = pure $ VFun $ \_cond -> pure $ VFun $ \x -> force legacyHooks x
-
 -- | @exitWith code@: throws 'ExitCode'. Wrapped in VIO so it's delayed.
 exitWithB :: IO Val
 exitWithB = pure $ VFun $ \a -> pure $ VIO $ do
@@ -4102,21 +4125,60 @@ dHashB = pure $ VFun $ \a -> force legacyHooks a
 nullAddrB :: IO Val
 nullAddrB = pure (VPrimObj (PrimPtr nullPtr))
 
+-- | Resolve any of the runtime shapes an @Addr#@ / @Ptr@-ish value
+-- can take under interpretation down to a host 'Ptr'.
+--
+-- @plusAddr#@ / @minusAddr#@ are genuine 'GHC.Prim' primops with no
+-- @.hs@ source — they are legitimately host-backed.  Source-loaded
+-- 'Foreign.Ptr.plusPtr' / 'minusPtr' (no longer host-shimmed) bottom
+-- out on these, and 'Data.ByteString.foldr' reaches them via
+-- @unsafeForeignPtrToPtr (ForeignPtr fo _) = Ptr fo@ — so the
+-- @Addr#@ argument can arrive as a 'PrimForeignPtr' (the extracted
+-- finalizer-carrying allocation), a 'VCon \"Ptr\" [_]' wrapper
+-- (source-loaded @Ptr@ ctor), or an integer/'VUnit' null alias, not
+-- just a bare 'PrimPtr'.  This resolver subsumes the cross-rep
+-- handling the removed @plusPtrCore@/@minusPtrCore@ shims carried
+-- (see commit @f902b59@ for the parallel 'eqVals' fix), keeping
+-- @plusPtr@/@minusPtr@ source-loaded per the CLAUDE.md
+-- minimum-surface rule while letting the primop they bottom on cope
+-- with the interpreter's actual value shapes.
+valToHostPtr :: Val -> IO (Ptr Word8)
+valToHostPtr v = case v of
+    VPrimObj (PrimPtr p)        -> pure (castPtr p)
+    VPrimObj (PrimForeignPtr f) -> pure (castPtr (unsafeForeignPtrToPtr f))
+    VCon "Ptr" [t]              -> force legacyHooks t >>= valToHostPtr
+    VInt n                      -> pure (intPtrToPtr (fromIntegral n))
+    VInteger n                  -> pure (intPtrToPtr (fromIntegral n))
+    VUnit                       -> pure nullPtr
+    _ -> error ("Addr#: not an address: " <> showValForDebug v)
+
 plusAddrB :: IO Val
 plusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VInt n) ->
-            pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-        _ -> error ("plusAddr#: bad args: " <> showValForDebug av)
+    case bv of
+        VInt n  -> go av n
+        _ -> error ("plusAddr#: offset not an Int: " <> showValForDebug bv)
+  where
+    -- A 'PrimForeignPtr' flowing through must advance by @n@ bytes
+    -- while KEEPING its finalizer: 'Data.ByteString.foldr' walks
+    -- @go (p `plusPtr` 1)@ off a ForeignPtr-derived pointer and
+    -- compares against @end@; if the offset is dropped, @p == end@
+    -- never holds and the fold diverges -> heap exhaustion.  Unwrap
+    -- nested source-loaded @VCon "Ptr" [_]@ wrappers first; for any
+    -- other shape resolve to a host Ptr and advance that.
+    go (VPrimObj (PrimForeignPtr f)) n =
+        pure (VPrimObj (PrimForeignPtr (plusForeignPtr f (fromIntegral n))))
+    go (VCon "Ptr" [t]) n = force legacyHooks t >>= \t' -> go t' n
+    go other n = do
+        p <- valToHostPtr other
+        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
 
 minusAddrB :: IO Val
 minusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
-            pure (VInt (fromIntegral (p `minusPtr` q)))
-        _ -> error ("minusAddr#: bad args: " <> showValForDebug av)
+    p <- valToHostPtr av
+    q <- valToHostPtr bv
+    pure (VInt (fromIntegral (p `minusPtr` q)))
 
 addr2IntB :: IO Val
 addr2IntB = pure $ VFun $ \a -> do
@@ -4253,64 +4315,6 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                         (fromIntegral n :: Int)
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
-
---------------------------------------------------------------------------------
--- Phase 2.8: Ptr arithmetic
---------------------------------------------------------------------------------
-
-plusPtrB :: IO Val
-plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    plusPtrCore av bv
-
--- | Cross-representation 'plusPtr': unwraps source-loaded
--- @VCon \"Ptr\" [t]@ wrappers around a host-primitive 'PrimPtr'
--- before recursing.  Same gap addressed for 'Eq Ptr' by commit
--- @f902b59@ ('eqVals' cross-rep cases) — repeated here for
--- 'plusPtr' so 'Data.ByteString.foldr' (and thus 'unpack') can run
--- under interpretation: the source body @unsafeForeignPtrToPtr
--- (ForeignPtr fo _) = Ptr fo@ wraps the extracted primitive Ptr in
--- a 'VCon \"Ptr\" [_]', because source-loaded 'Ptr' resolves to the
--- ordinary data constructor, not the special-cased 'ptrCtorV' in
--- the global env.
-plusPtrCore :: Val -> Val -> IO Val
-plusPtrCore av bv = case (av, bv) of
-    (VPrimObj (PrimPtr p), VInt n) ->
-        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-    -- A ForeignPtr flowing through plusPtr must advance by @n@
-    -- bytes just like a raw Ptr would; dropping @n@ silently
-    -- breaks callers that derive subsequent reads off the
-    -- offset pointer (memchr/memcmp/peek).
-    (VPrimObj (PrimForeignPtr fp), VInt n) ->
-        pure (VPrimObj (PrimForeignPtr (plusForeignPtr fp (fromIntegral n))))
-    (VCon "Ptr" [t], _) -> do
-        t' <- force legacyHooks t
-        plusPtrCore t' bv
-    _ -> error ("plusPtr: bad args: " <> showValForDebug av)
-
-minusPtrB :: IO Val
-minusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    minusPtrCore av bv
-
--- | Cross-representation 'minusPtr'; see 'plusPtrCore'.
-minusPtrCore :: Val -> Val -> IO Val
-minusPtrCore av bv = case (av, bv) of
-    (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
-        pure (VInt (fromIntegral (p `minusPtr` q)))
-    (VCon "Ptr" [t], _) -> do
-        t' <- force legacyHooks t
-        minusPtrCore t' bv
-    (_, VCon "Ptr" [t]) -> do
-        t' <- force legacyHooks t
-        minusPtrCore av t'
-    _ -> error ("minusPtr: bad args: " <> showValForDebug av)
-
-nullPtrB :: IO Val
-nullPtrB = pure (VPrimObj (PrimPtr nullPtr))
-
-castPtrB :: IO Val
-castPtrB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: ForeignPtr
@@ -5804,21 +5808,6 @@ asInt64 (VInteger n)
 asInt64 _ = Nothing
 
 
--- | IO-aware coercion of a 'Val' to 'Int64'.  Like 'asInt64'
--- but additionally peeks through @VCon \"IS\" [thunk]@ — the
--- source-loaded ghc-bignum 'Integer' small-Int constructor —
--- by forcing the inner thunk.  See @IHC.Eval.matchPat@'s @IS@
--- pattern arm for the symmetric pattern-direction bridge.
-coerceInt64 :: Val -> IO (Maybe Int64)
-coerceInt64 v = case asInt64 v of
-    Just n -> pure (Just n)
-    Nothing -> case v of
-        VCon "IS" [t] -> do
-            v' <- force legacyHooks t
-            coerceInt64 v'
-        _ -> pure Nothing
-
-
 -- | @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@
 -- GHC primop: decompose a Double into mantissa (Int64) and
 -- base-2 exponent (Int).  For finite non-zero @d@,
@@ -6059,28 +6048,10 @@ alignmentB = pure $ VFun $ \a -> do
 -- Phase 2.8: additional numeric / bit ops
 --------------------------------------------------------------------------------
 
-divModB :: IO Val
-divModB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) -> do
-            let (d, m) = x `divMod` y
-            dT <- newWHNFThunk (VInt d); mT <- newWHNFThunk (VInt m)
-            pure (VCon "(,)" [dT, mT])
-        _ -> error "divMod: bad args"
-
-quotRemB :: IO Val
-quotRemB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    mx <- coerceInt64 av
-    my <- coerceInt64 bv
-    case (mx, my) of
-        (Just x, Just y) -> do
-            let (q, r) = x `quotRem` y
-            qT <- newWHNFThunk (VInt q); rT <- newWHNFThunk (VInt r)
-            pure (VCon "(,)" [qT, rT])
-        _ -> error ("quotRem: bad args: a=" <> showValForDebug av
-                   <> " b=" <> showValForDebug bv)
+-- Phase (builtins minimum-surface): the bare-name @divMod@ / @quotRem@
+-- shims were removed.  Resolution now flows through the source-loaded
+-- @Integral Int@ instance in GHC/Internal/Real.hs (see the registry
+-- comment near the old @("divMod", …)@ entry).  No host helper here.
 
 bitAndB :: IO Val
 bitAndB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
@@ -6115,40 +6086,8 @@ notIB = pure $ VFun $ \a -> do
         VInt x -> pure (VInt (complement x))
         _ -> error ("notI#: bad arg: " <> showValForDebug av)
 
-popCountB :: IO Val
-popCountB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
-        _ -> error "popCount: bad arg"
-
-bitB :: IO Val
-bitB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n -> pure (VInt (1 `shiftL` fromIntegral n))
-        _ -> error "bit: bad arg"
-
-testBitB :: IO Val
-testBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (boolVal ((x `shiftR` fromIntegral n) .&. 1 /= 0))
-        _ -> error "testBit: bad args"
-
-clearBitB :: IO Val
-clearBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x .&. complement (1 `shiftL` fromIntegral n)))
-        _ -> error "clearBit: bad args"
-
-setBitB :: IO Val
-setBitB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x .|. (1 `shiftL` fromIntegral n)))
-        _ -> error "setBit: bad args"
+-- popCountB / bitB / testBitB / clearBitB / setBitB removed — see the
+-- @class Bits@ removal note at their former registry entries above.
 
 --------------------------------------------------------------------------------
 -- Power operator
@@ -7615,57 +7554,6 @@ catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
             rv     <- apply legacyHooks hv excT
             runIOVal legacyHooks rv)
 
-handleB :: IO Val
-handleB = pure $ VFun $ \hT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    hv <- force legacyHooks hT
-    av <- force legacyHooks aT
-    catch
-        (catch
-            (runIOVal legacyHooks av)
-            (\(exc :: IhcException) -> do
-                excVal <- ihcExceptionToVal exc
-                excT   <- newWHNFThunk excVal
-                rv     <- apply legacyHooks hv excT
-                runIOVal legacyHooks rv))
-        (\(exc :: SomeException) -> do
-            let msg = BC.pack (show exc)
-            excT <- newWHNFThunk (VStr msg)
-            rv   <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv)
-
--- | @Control.Exception.try :: Exception e => IO a -> IO (Either e a)@.
---
--- The previous implementation only caught 'IhcException' (the
--- interpreter-thrown wrapper for source-level @throw@ / @throwIO@).
--- Anything thrown by a host-backed builtin — most notably the
--- 'IOException's that 'Network.Socket' operations raise — slipped
--- straight past, terminating the calling thread silently.  Warp's
--- @acceptNewConnection@ depends on @try@ catching the syscall errors
--- that @accept@/@setSocketOption@ throw, so this regression caused
--- @runSettings@ to bail after one iteration of the accept loop with
--- exit code 0 and no diagnostic output.
---
--- Now we catch @SomeException@ and convert it to a Val:
---   * 'IhcException' is unwrapped to its embedded 'Val' (preserves
---     source-level @throw v@ semantics).
---   * Anything else is materialised via 'hostExceptionToVal' as a
---     stub @IOError@ record so source code that pattern-matches on
---     fields like 'ioe_errno' doesn't blow up.
-tryB :: IO Val
-tryB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    r  <- CE.try @SomeException (runIOVal legacyHooks av)
-    case r of
-        Right v -> do
-            vT <- newWHNFThunk v
-            pure (VCon "Right" [vT])
-        Left e -> do
-            excVal <- case CE.fromException e of
-                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
-                Nothing                       -> hostExceptionToVal e
-            excT <- newWHNFThunk excVal
-            pure (VCon "Left" [excT])
-
 -- | Convert a host-thrown 'SomeException' into a Val that source-level
 -- pattern matching on 'IOError' can introspect.  Most Haskell code in
 -- the ecosystem reaches for 'ioe_errno', 'ioeGetErrorType', and
@@ -7696,30 +7584,6 @@ evaluateB = pure $ VFun $ \aT -> pure $ VIO $ do
     av <- force legacyHooks aT
     _  <- evaluate av
     pure av
-
-mask_B :: IO Val
-mask_B = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    mask_ (runIOVal legacyHooks av)
-
-allowInterruptB :: IO Val
-allowInterruptB = pure $ VIO $ pure VUnit
-
-interruptibleB :: IO Val
-interruptibleB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    runIOVal legacyHooks av
-
-maskB :: IO Val
-maskB = pure $ VFun $ \fT -> pure $ VIO $ do
-    fv <- force legacyHooks fT
-    mask $ \restore -> do
-        let restoreVal = VFun $ \aT -> pure $ VIO $ do
-                av <- force legacyHooks aT
-                restore (runIOVal legacyHooks av)
-        restoreT <- newWHNFThunk restoreVal
-        rv <- apply legacyHooks fv restoreT
-        runIOVal legacyHooks rv
 
 bracketB :: IO Val
 bracketB = pure $ VFun $ \acqT -> pure $ VFun $ \relT -> pure $ VFun $ \useT -> pure $ VIO $ do
