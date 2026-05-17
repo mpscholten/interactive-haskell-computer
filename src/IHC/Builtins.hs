@@ -360,19 +360,18 @@ builtins reg =
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
     --
-    -- TODO (slice-2 follow-up): drop @==@ / @/=@ once the per-FV
-    -- discovery cascade triggered by their absence is fully mapped.
-    -- The infrastructure to support source-loaded @Eq@ is in place
-    -- (registerDerivedEqInstances + scanStandaloneDerivings + the
-    -- @PCon "Ptr" [_]@ matchPat bridge + eqAddr# / etc. primops),
-    -- but a per-FV @discoverInModule@ chase from
-    -- @registerInstancesFrom@ / @registerClassDefaults@ still
-    -- transitively walks @base@ + @ghc-internal@ until the heap
-    -- exhausts.  Reproducer: @main = print (compare 1 2 == LT)@.
-    -- Master baseline: discovery total ~1000, runs in seconds; with
-    -- @==@ dropped: discovery total >2400, OOM at 4GB.  See
-    -- 'globalEarlyBuiltinsRef' for the partial fix that wasn't
-    -- enough.
+    -- TODO (slice-2 follow-up): drop @==@ / @/=@ — they have real
+    -- source in @GHC.Classes@ and the doctrine says interpret it.
+    -- The discovery-cascade blocker is FIXED: the per-FV chase from
+    -- @registerInstancesFrom@ / @registerClassDefaults@ now goes
+    -- through @IHC.Scheduler.discoverInModuleForChase@ (curated
+    -- 'perFVChaseShortCircuit'), so a source-loaded @GHC.Classes@ no
+    -- longer fans the chase out across @base@ + @ghc-internal@ until
+    -- the 4 GB heap exhausts.  Reproducer: @main = print (compare 1 2
+    -- == LT)@ (was: discovery >2400 → OOM; now ~master's ~1000).
+    -- Remaining before removal: route the @eqVals@ representation
+    -- bridges (cross-numeric, VStr, ByteString/ForeignPtr, null-ptr)
+    -- through source — there is no host Eq fallback in the dispatcher.
     , ("==",       eqDispatch reg)
     , ("/=",       neqDispatch reg)
     , ("<",        ordDispatch reg 0)

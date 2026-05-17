@@ -367,10 +367,6 @@ loadProgramFromSource searchPath src0 = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
 
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
@@ -1043,10 +1039,6 @@ loadFileIntoEnv searchPath path existingEnv = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
     -- Load the entry module.
     entry <- loadEntryModule registry src
     -- Determine which names to bring into scope.
@@ -1361,10 +1353,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
     -- Preload direct imports of targetLm so class declarations in
     -- re-export chains become visible to 'buildClassMethodEnv'.
@@ -1812,7 +1800,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- (e.g. @Foldable []@ uses @List.foldl@ but no user call triggers
     -- @foldl@ discovery) can't be rewritten to the owner's FQN.
     mapM_ (\fv -> do
-              r <- try (discoverInModule registry searchPath includeMap lm fv)
+              r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                         :: IO (Either SomeException ())
               case r of
                   Right () -> pure ()
@@ -1829,7 +1817,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
         then pure rewrites0
         else do
             mapM_ (\fv -> do
-                      r <- try (discoverInModule registry searchPath includeMap lm fv)
+                      r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                                 :: IO (Either SomeException ())
                       case r of
                           Right () -> pure ()
@@ -3471,7 +3459,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                              Left  _ -> pure [])
                      (Map.toList defaults)
             mapM_ (\fv -> do
-                       r <- try (discoverInModule registry searchPath includeMap lm fv)
+                       r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                                 :: IO (Either SomeException ())
                        case r of
                            Right () -> pure ()
@@ -5188,27 +5176,6 @@ setGlobalSearchPath sp im = do
     writeIORef globalSearchPathRef sp
     writeIORef globalIncludeMapRef im
 
--- | Snapshot of the @earlyBuiltinNames@ set computed by
--- 'loadProgramFromSource' / 'loadProgramFromSourceREPL' / etc.  Stored
--- here so the per-FV chase callers ('discoverInModule' inside
--- 'registerInstancesFrom' and friends) can short-circuit on the FULL
--- builtin set, not just on @extraDiscoverShortCircuit@'s 15 entries.
---
--- Without this, dropping a heavily-used builtin shim (@==@, @show@,
--- @print@) makes every per-FV chase walk through Prelude →
--- ghc-internal looking for the dropped name, transitively dragging in
--- @base@ + @ghc-internal@ until the heap exhausts.  The main entry-
--- point discovery already had access to this set; the per-FV chase
--- callers (instance registration, class-default registration) ran with
--- @Set.empty@ on master because @==@ was a builtin so the chase
--- terminated naturally.  After @==@ is dropped, they need the same
--- short-circuit set as the entry-point discovery.
-{-# NOINLINE globalEarlyBuiltinsRef #-}
-globalEarlyBuiltinsRef :: IORef (Set ByteString)
-globalEarlyBuiltinsRef = unsafePerformIO (newIORef Set.empty)
-
-setGlobalEarlyBuiltins :: Set ByteString -> IO ()
-setGlobalEarlyBuiltins = writeIORef globalEarlyBuiltinsRef
 
 -- | Memoised slots produced by the env fallback hook.  Keeps one
 -- 'Thunk' per FQN so successive demand-lookups share evaluation +
@@ -6739,19 +6706,40 @@ discoverInModule
     -> LoadedModule
     -> ByteString
     -> IO ()
--- Stays @Set.empty@ to match master's per-FV chase semantics.  An
--- earlier attempt threaded the full @earlyBuiltinNames@ set in via
--- 'globalEarlyBuiltinsRef' to fix a discovery cascade after the
--- eventual @==@ removal — but it short-circuited too much:
--- class-method names like @pure@ / @return@ that need a per-FV walk
--- through Prelude (so 'registerInstancesFrom' can register their
--- 'Applicative' / 'Monad' instances) got skipped, and
--- @pure 99 :: [Int]@ regressed to @<IO>@ via the result-polymorphic
--- fallback.  Restore @Set.empty@ until a finer-grained shortcut is
--- worked out alongside the actual @==@ removal.
--- 'globalEarlyBuiltinsRef' itself stays — it's harmless on its own
--- and gives the follow-up the data it needs.
+-- @Set.empty@: no short-circuit.  Used by the splice / runtime-
+-- fallback / rewrite-pair callers — they are NOT the discovery-cascade
+-- origin, so they keep the full walk.
+--
+-- The per-FV chase callers ('registerInstancesFrom' / 'registerOne' /
+-- 'registerClassDefaults') must NOT use this variant: once @==@/@/=@
+-- are source-loaded, an empty short-circuit makes the chase recurse
+-- through @GHC.Classes@'s Eq/Ord surface and the transitively-allowed
+-- @GHC.Internal.*@ web until the heap exhausts (the @==@-removal OOM).
+-- They use 'discoverInModuleForChase' instead.  An earlier attempt
+-- threaded the full @earlyBuiltinNames@ set in here and short-
+-- circuited too much — @pure@ / @return@ need a per-FV walk through
+-- Prelude so 'registerInstancesFrom' can register their 'Applicative'
+-- / 'Monad' instances; skipping them regressed @pure 99 :: [Int]@ to
+-- @<IO>@.  'perFVChaseShortCircuit' is the finer-grained set (Eq/Ord
+-- comparison cluster only) that avoids both the cascade and that
+-- regression.
 discoverInModule = discoverInModuleWith Set.empty
+
+-- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
+-- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
+-- cluster ('perFVChaseShortCircuit') so a source-loaded @GHC.Classes@
+-- does not make the chase fan out across @base@ + @ghc-internal@ (the
+-- @==@/@/=@-removal OOM at 4 GB).  Every other name still gets the
+-- full @Set.empty@-equivalent walk so Applicative/Monad/Semigroup
+-- instance bodies' rewrite targets still load.
+discoverInModuleForChase
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO ()
+discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
 
 -- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
 -- pairs that have already been walked once — regardless of whether the
@@ -8097,6 +8085,39 @@ extraDiscoverShortCircuit = Set.fromList $ map BC.pack
     , "<>", "mappend", "mconcat", "mempty"
     , "fmap", "<*>", ">>=", ">>", "pure", "return"
     ]
+
+-- | Curated subset threaded into the *per-FV chase* of
+-- 'registerInstancesFrom' / 'registerClassDefaults' via
+-- 'discoverInModuleForChase' (NOT just entry-point discovery).
+--
+-- Membership criterion: the name's instances reach the
+-- 'ClassRegistry' WITHOUT a per-FV source walk — Eq via
+-- 'registerDerivedEqInstances' / 'synthStructuralEq' + explicit-
+-- instance catalogue draining ('drainCataloguedInstancesForClass');
+-- Eq/Ord comparison via the eval-time 'classMethodDispatcher', plus
+-- the @class Ord@ default
+-- @compare x y = if x == y then EQ else if x <= y then LT else GT@
+-- whose own FVs are exactly these names and resolve at eval time, not
+-- load time.  So short-circuiting them in the chase cannot break
+-- Eq/Ord instance registration.
+--
+-- Deliberately EXCLUDES @pure@ / @return@ / @>>=@ / @>>@ / @<*>@ /
+-- @fmap@ / @<>@ / @mappend@ / @mconcat@ / @mempty@: their
+-- Applicative/Monad/Functor/Semigroup/Monoid instance *bodies* are
+-- real source bodies whose rewrite targets the chase must demand-load
+-- (the prior regression — threading the full @earlyBuiltinNames@ here
+-- short-circuited @pure@ and made @pure 99 :: [Int]@ fall to @<IO>@;
+-- see the 'discoverInModule' note).  @show@ / @showsPrec@ are
+-- likely-safe future additions, left out as out-of-scope for the
+-- @==@/@/=@ removal.
+--
+-- @min@ / @max@ are the one pair beyond what 'extraDiscoverShortCircuit'
+-- proved safe at entry-point; they sit on the same @class Ord@ surface
+-- and are served by 'ordDispatch'.  If a fixture's discovery total
+-- *rises* after this lands, drop them first.
+perFVChaseShortCircuit :: Set ByteString
+perFVChaseShortCircuit = Set.fromList $ map BC.pack
+    [ "==", "/=", "compare", "<", "<=", ">", ">=", "min", "max" ]
 
 -- | Small demand hints for library entry points whose operationally strict
 -- calls sit behind top-level lambdas. The main discovery walk intentionally
