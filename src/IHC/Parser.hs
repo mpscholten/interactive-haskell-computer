@@ -2818,12 +2818,23 @@ gatherListPat ctx acc cur = do
 -- Desugars to @PCon "(#,#)" [p1, p2]@ etc., matching the runtime
 -- representation used by the MutVar# primops (VCon "(#,#)" [...]).
 parseUnboxedTuplePat :: Ctx -> Cursor -> IO (Pat, Cursor)
-parseUnboxedTuplePat ctx cur0 =
-    if isUnboxClose ctx cur0
-        then pure (PCon "(##)" [], skipUnboxClose ctx cur0)
-        else do
-            (first, cur1) <- parseTopPat ctx cur0
-            gatherUnboxedTuplePat ctx [first] cur1
+parseUnboxedTuplePat ctx cur0
+    -- @(# #)@ — nullary unboxed tuple.
+    | isUnboxClose ctx cur0 =
+        pure (PCon "(##)" [], skipUnboxClose ctx cur0)
+    -- @(# | ... #)@ — unboxed sum with an empty first slot
+    -- (the value lives in alternative ≥ 2).
+    | (t0, _) <- nextSig ctx cur0
+    , tkKind t0 == TkBar =
+        parseUnboxedSumPat ctx 1 Nothing cur0
+    | otherwise = do
+        (first, cur1) <- parseTopPat ctx cur0
+        -- A @|@ here means this is an unboxed sum, not a tuple:
+        -- @first@ is alternative 1's payload.
+        let (sep, _) = nextSig ctx cur1
+        case tkKind sep of
+            TkBar -> parseUnboxedSumPat ctx 1 (Just (1, first)) cur1
+            _     -> gatherUnboxedTuplePat ctx [first] cur1
 
 gatherUnboxedTuplePat :: Ctx -> [Pat] -> Cursor -> IO (Pat, Cursor)
 gatherUnboxedTuplePat ctx acc cur =
@@ -2840,6 +2851,46 @@ gatherUnboxedTuplePat ctx acc cur =
                     (p, cur2) <- parseTopPat ctx cur1
                     gatherUnboxedTuplePat ctx (p : acc) cur2
                 _ -> parseErr ctx "expected `,` or `#)` in unboxed tuple pattern" tok
+
+-- | Parse the tail of an unboxed-sum pattern, starting at the
+-- separator/close after slot @curIdx@.  @mFound@ carries the
+-- payload pattern + its 1-based slot index once seen (exactly one
+-- slot is non-empty in a well-formed sum pattern).  Desugars to
+-- @PCon "(#|#)" [PLit (LInt tag), payloadPat]@ so matchPat's
+-- generic VCon zip checks the tag and binds the payload.
+--
+-- Grammar handled (2-alt is all ghc-bignum uses, but N-alt works):
+--   @(# p  |    #)@   slot 1 = p,   slot 2 empty   → tag 1
+--   @(#    | p  #)@   slot 1 empty, slot 2 = p     → tag 2
+--   @(# (# #) | #)@   slot 1 = @(##)@, slot 2 empty → tag 1
+parseUnboxedSumPat
+    :: Ctx -> Int -> Maybe (Int, Pat) -> Cursor -> IO (Pat, Cursor)
+parseUnboxedSumPat ctx curIdx mFound cur
+    | isUnboxClose ctx cur =
+        case mFound of
+            Just (idx, p) ->
+                pure ( PCon (BC.pack "(#|#)")
+                            [PLit (LInt (fromIntegral idx)), p]
+                     , skipUnboxClose ctx cur )
+            Nothing ->
+                parseErr ctx
+                    "unboxed sum pattern has no payload slot"
+                    (fst (nextSig ctx cur))
+    | otherwise = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            -- Separator: advance to the next alternative slot.
+            TkBar -> parseUnboxedSumPat ctx (curIdx + 1) mFound cur1
+            -- A pattern at the current slot.  Record it (its slot
+            -- index is curIdx) and continue scanning for the close.
+            _ -> do
+                (p, cur2) <- parseTopPat ctx cur
+                case mFound of
+                    Just _  -> parseErr ctx
+                                 "unboxed sum pattern has more than one payload"
+                                 tok
+                    Nothing -> parseUnboxedSumPat ctx curIdx
+                                 (Just (curIdx, p)) cur2
 
 -- | Parse record-pattern field list @{ f1 = p1, f2, .. }@. The opening
 -- @{@ has already been consumed. Returns @(fields, cursorAfterClose, isWild)@.
@@ -3729,9 +3780,14 @@ parseUnboxedTuple ctx cur0 = do
     -- EApp chain using a named unboxed-tuple constructor "(#,#)" / "(#,,#)" etc.
     if isUnboxClose ctx cur0
         then pure (EVar "()", skipUnboxClose ctx cur0)
-        else do
-            (e, cur1) <- parseExpr ctx cur0
-            if isUnboxClose ctx cur1
+        else
+          -- @(# | ... #)@ — unboxed sum, empty first slot.
+          let (t0, _) = nextSig ctx cur0 in
+          if tkKind t0 == TkBar
+            then parseUnboxedSumExpr ctx 1 Nothing cur0
+            else do
+              (e, cur1) <- parseExpr ctx cur0
+              if isUnboxClose ctx cur1
                 then pure (e, skipUnboxClose ctx cur1)
                 else do
                     let (sep, cur2) = nextSig ctx cur1
@@ -3745,7 +3801,10 @@ parseUnboxedTuple ctx cur0 = do
                                 con  = EVar conName
                                 expr = foldl EApp con elems
                             pure (expr, curEnd)
-                        _ -> parseErr ctx "expected `,` or `#)` in unboxed tuple" sep
+                        -- @(# e | ... #)@ — unboxed sum, @e@ is
+                        -- alternative 1's payload.
+                        TkBar -> parseUnboxedSumExpr ctx 1 (Just (1, e)) cur1
+                        _ -> parseErr ctx "expected `,`, `|` or `#)` in unboxed tuple/sum" sep
   where
     gatherUnboxed c cur acc = do
         (e, cur1) <- parseExpr c cur
@@ -3756,6 +3815,34 @@ parseUnboxedTuple ctx cur0 = do
                 case tkKind sep of
                     TkComma -> gatherUnboxed c cur2 (e : acc)
                     _       -> parseErr ctx "expected `,` or `#)` in unboxed tuple" sep
+
+    -- Mirror 'parseUnboxedSumPat' for expression position.  Builds
+    -- @(#|#) <tag> <payload>@ where tag is the 1-based index of the
+    -- non-empty alternative slot.
+    parseUnboxedSumExpr
+        :: Ctx -> Int -> Maybe (Int, Expr) -> Cursor -> IO (Expr, Cursor)
+    parseUnboxedSumExpr curCtx curIdx mFound cur
+        | isUnboxClose curCtx cur =
+            case mFound of
+                Just (idx, e) ->
+                    let con = EVar (BC.pack "(#|#)")
+                    in pure ( EApp (EApp con (ELit (LInt (fromIntegral idx)))) e
+                            , skipUnboxClose curCtx cur )
+                Nothing ->
+                    parseErr curCtx
+                        "unboxed sum has no payload slot"
+                        (fst (nextSig curCtx cur))
+        | otherwise =
+            let (tok, cur1) = nextSig curCtx cur in
+            case tkKind tok of
+                TkBar -> parseUnboxedSumExpr curCtx (curIdx + 1) mFound cur1
+                _ -> do
+                    (e, cur2) <- parseExpr curCtx cur
+                    case mFound of
+                        Just _  -> parseErr curCtx
+                                     "unboxed sum has more than one payload" tok
+                        Nothing -> parseUnboxedSumExpr curCtx curIdx
+                                     (Just (curIdx, e)) cur2
 
 -- | Is the next token sequence an unboxed-tuple close: @#)@?
 isUnboxClose :: Ctx -> Cursor -> Bool
