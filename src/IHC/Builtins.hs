@@ -324,7 +324,19 @@ builtins reg =
     -- 'Integral Int.rem' (Real.hs:452-455 → remInt → remInt#).
     -- The Phase F buildOwnerLocalEnv guard handles class-method
     -- resolution inside the source-loaded body.
-    [ ("sqrt",     unaryOpFloat sqrt)
+    --
+    -- 'sqrt' graduated to source-loaded (Builtins-removal batch).
+    -- The 'Floating Double' instance method body lives at
+    --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Float.hs:746
+    --     sqrt x = sqrtDouble x
+    -- and 'sqrtDouble' (Float.hs:1578) bottoms on the 'sqrtDouble#'
+    -- GHC.Prim primop: @sqrtDouble (D# x) = D# (sqrtDouble# x)@.
+    -- The ("sqrt","Floating") class-method seed is registered in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs', and the carved-out
+    -- 'sqrtDouble#' GHC.Prim builtin (no .hs source — PrimopWrappers.hs
+    -- just re-exports GHC.Prim.sqrtDouble#) is registered below next to
+    -- the other Double# unary primops.
+    --
     -- Phase 5: graduated 'floor' / 'ceiling' / 'round' / 'truncate'
     -- to source-loaded.  The chain is:
     --
@@ -344,7 +356,7 @@ builtins reg =
     -- short-circuit the class-method dispatcher (separate workstream:
     -- @RealFloat Double.encodeFloat@ instance method registration
     -- isn't surfacing through dispatch; the host shim bypasses).
-    , ("fromIntegral", fromIntegralB)
+    [ ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
     -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  The
@@ -1002,6 +1014,16 @@ builtins reg =
     -- 'truncateDouble' which use 'abs' and 'compare' on Doubles).
     , ("fabsDouble#",  unaryOpFloat abs)
     , ("negateFloat#", unaryOpFloat negate)
+    -- Builtins-removal carve-out: @sqrtDouble# :: Double# -> Double#@
+    -- is a genuine GHC.Prim primop with NO .hs source (ghc-prim
+    -- PrimopWrappers.hs:841 just re-exports @GHC.Prim.sqrtDouble#@), so
+    -- it qualifies as a compiler-intrinsic builtin under the
+    -- "Builtin modules: minimum surface only" carve-out rule. It is the
+    -- bottom of the source-loaded @Floating Double.sqrt@ chain
+    -- (Float.hs:746 @sqrt x = sqrtDouble x@; Float.hs:1578
+    -- @sqrtDouble (D# x) = D# (sqrtDouble# x)@) now that the bare-name
+    -- @sqrt@ shim is gone.  Reuses the shared 'unaryOpFloat' helper.
+    , ("sqrtDouble#",  unaryOpFloat sqrt)
     -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
     -- Bottom-of-stack primop for 'decodeFloat' on Double:
     -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
