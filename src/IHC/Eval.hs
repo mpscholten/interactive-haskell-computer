@@ -275,7 +275,8 @@ eval hooks env ipm = go
         -- @PCon "IO"@/@"ST"@/@"STM"@ arms wrap the `VIO` lazily as a
         -- State#-passing function without forcing it, which is exactly the
         -- newtype-coercion semantics this code needs.
-        let destructuresMonadCarrier = any altDestructuresMonadCarrier alts
+        let destructuresMonadCarrier =
+                any (\(Alt p _) -> patHeadIsMonadCarrier p) alts
         v <- case v0 of
             VIO _ | not destructuresMonadCarrier -> runIOVal hooks v0
             _                                    -> pure v0
@@ -671,18 +672,15 @@ eval hooks env ipm = go
 -- decide how to surface them at the Val level.
 --------------------------------------------------------------------------------
 
--- | Does this case alternative destructure the @IO@ / @ST@ / @STM@
--- newtype carrier?  Such a match (e.g. @catch (IO io) h = …@,
+-- | Does this pattern destructure the @IO@ / @ST@ / @STM@ newtype
+-- carrier?  Such a match (e.g. @catch (IO io) h = …@,
 -- @unsafeUnmask (IO io) = …@) must NOT trigger the @ECase@ eager-run
--- heuristic: running the wrapped @VIO@ here would execute the protected
+-- heuristic: running the wrapped @VIO@ there would execute the protected
 -- action outside the surrounding @catch#@ / @mask@ frame and lose the
 -- exception-path cleanup.  See the long note at @go (ECase …)@.
 --
 -- We look through @!p@ / @~p@ / @\@as@ wrappers (GHC accepts
 -- @catch !(IO io)@ — see @catchAny@) so the head ctor is still found.
-altDestructuresMonadCarrier :: Alt -> Bool
-altDestructuresMonadCarrier (Alt p _) = patHeadIsMonadCarrier p
-
 patHeadIsMonadCarrier :: Pat -> Bool
 patHeadIsMonadCarrier (PCon n [_]) = n `elem` monadCarrierCtors
 patHeadIsMonadCarrier (PBang inner)  = patHeadIsMonadCarrier inner
