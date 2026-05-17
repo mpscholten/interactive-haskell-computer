@@ -22,6 +22,7 @@ module IHC.Source
     , ScanCacheBox
     , readScanCache
     , writeScanCache
+    , clearScanCacheRegistry
     ) where
 
 import Data.ByteString (ByteString)
@@ -29,7 +30,7 @@ import qualified Data.ByteString as BS
 import Data.Dynamic (Dynamic)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef, writeIORef)
 import Data.Word (Word8)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -118,6 +119,32 @@ mkFreshScanCache _name bs = unsafePerformIO $ do
 {-# NOINLINE globalScanCacheRegistry #-}
 globalScanCacheRegistry :: IORef (Map ByteString (IORef (Map String Dynamic)))
 globalScanCacheRegistry = unsafePerformIO (newIORef Map.empty)
+
+-- | Drop every entry in the content-addressable scan-cache registry.
+--
+-- This registry is the single largest source of cross-run heap growth
+-- in the test harness.  Its key is the FULL source 'ByteString' of
+-- every module ever scanned (each fixture's entry module, every
+-- CPP-rewritten / @\<splice:\>@ slice with unique bytes, and — when the
+-- module cache is off, which is the default and what CI uses — every
+-- re-scanned base/library module).  The value retains 'Dynamic'-boxed
+-- parsed-decl ASTs for ~16 scan tags per source.  Nothing ever removed
+-- entries, so over the ~600-example single-process @ihc-test@ run the
+-- union of all distinct source bytes plus their boxed ASTs grew
+-- monotonically until the @-M8G@ cap was exhausted (deterministically
+-- around the 465 K-discovery mark on the macOS @build@ job).
+--
+-- Wiping the whole registry is safe: the cache only ever amortises
+-- WITHIN a single 'IHC.Scheduler.loadProgramFromSource' run (the
+-- entry-module probe, header parse, and discovery pass each rebuild a
+-- 'Source' over the same files).  'IHC.Scheduler.resetPerRunGlobals'
+-- calls this at the very start of every run — before any scanning —
+-- so 100% of the within-run sharing is preserved while the unbounded
+-- cross-run accumulation is reclaimed.  Cross-run reuse would only
+-- matter if 'IHC.Scheduler.globalLoadedModulesRef' persisted
+-- (@IHC_KEEP_MODULE_CACHE@), which is off by default and unset in CI.
+clearScanCacheRegistry :: IO ()
+clearScanCacheRegistry = writeIORef globalScanCacheRegistry Map.empty
 
 -- | Scan @bs@ once and return the byte offset of the first byte on each
 -- line.  Line 1 always starts at offset 0.
