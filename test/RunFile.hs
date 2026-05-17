@@ -1,16 +1,18 @@
 module RunFile (spec) where
 
 import Control.Exception (bracket_, displayException, try, SomeException)
-import Data.List (isInfixOf)
+import Control.Monad (forM_)
+import Data.List (isInfixOf, sort, isSuffixOf)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
-import System.FilePath (takeDirectory)
+import System.FilePath (takeDirectory, (</>))
 import System.IO
-import System.Directory (removeFile, getTemporaryDirectory, doesDirectoryExist, getHomeDirectory)
+import System.Directory (removeFile, getTemporaryDirectory, doesDirectoryExist, getHomeDirectory, listDirectory)
 import System.Environment (lookupEnv)
 
 import Test.Hspec
 
 import IHC.Classes (legacyHooks)
+import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
 import IHC.Eval (force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
@@ -79,6 +81,26 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n1 `shouldBe` 42
         n2 `shouldBe` 81985529216486895
         n3 `shouldBe` 7
+
+    -- Flag-gated cross-fixture memory probe.  Inert in CI (pending
+    -- unless IHC_MEM_DEBUG=1) so it does NOT shift the baseline
+    -- pass/fail count, but runnable on demand to read the [ihc:mem]
+    -- growth curve over a bounded 120-fixture in-process run without
+    -- the ~45-min full suite:
+    --   IHC_MEM_DEBUG=1 IHC_MEM_DEBUG_EVERY=10 \
+    --     cabal run ihc-test -- --match "MEM: cross-fixture"
+    -- Each runFile is wrapped in 'try' so a throwing fixture doesn't
+    -- truncate the 120-sample curve.
+    it "MEM: cross-fixture live-bytes probe over first 120 Coverage fixtures" $
+        if not memDebugEnabled
+            then pendingWith "set IHC_MEM_DEBUG=1 to run the memory probe"
+            else do
+                fs <- (take 120 . sort . filter (".hs" `isSuffixOf`))
+                          <$> listDirectory "test/Fixtures/Coverage"
+                forM_ fs $ \f -> do
+                    _ <- try (runFile ("test/Fixtures/Coverage" </> f))
+                            :: IO (Either SomeException Int)
+                    pure ()
 
     it "runs `main = 42`" do
         n <- runFile "test/Fixtures/lit42.hs"

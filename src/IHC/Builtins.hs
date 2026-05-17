@@ -15,10 +15,11 @@ module IHC.Builtins
     , stringToListValIO
     , clearCtorIndex
     , clearForeignPtrWord8Ranges
+    , reapSpawnedThreads
     ) where
 
 import Control.Concurrent
-    ( forkIO, killThread, myThreadId, threadDelay
+    ( ThreadId, forkIO, killThread, myThreadId, threadDelay
     , threadWaitRead, threadWaitWrite
     )
 import Control.Concurrent.MVar
@@ -111,6 +112,25 @@ mkForeignPtrVal fp = do
 {-# NOINLINE foreignPtrWord8RangesRef #-}
 foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
 foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
+
+-- | Every interpreter-spawned thread ('forkIOB' / 'fork#').  An
+-- interpreted program's @main@ can fork background threads (warp's
+-- accept loop, System.TimeManager, async workers, bare @forkIO@) that
+-- are still alive — running or blocked on an MVar\/STM\/threadDelay —
+-- when 'IHC.Driver.runFile' has already forced @main@'s result and
+-- returned.  Nothing reaps them, so under the ~600-example in-process
+-- hspec suite their TSO stacks accumulate without bound: a heap
+-- profile of the full run is ~4 GB of @STACK@ (everything else ≤56 MB),
+-- which is the master-CI OOM.  'reapSpawnedThreads' (wired into
+-- 'IHC.Scheduler.resetPerRunGlobals') kills the prior run's threads at
+-- the next run boundary so their stacks become collectable.
+{-# NOINLINE spawnedThreadsRef #-}
+spawnedThreadsRef :: IORef [ThreadId]
+spawnedThreadsRef = unsafePerformIO (newIORef [])
+
+-- | Record an interpreter-spawned thread for end-of-run reaping.
+registerSpawnedThread :: ThreadId -> IO ()
+registerSpawnedThread tid = modifyIORef' spawnedThreadsRef (tid :)
 
 markWord8Ptr :: Ptr Word8 -> IO ()
 markWord8Ptr p = markWord8PtrRange p 1
@@ -2030,6 +2050,27 @@ clearCtorIndex = writeIORef ctorIndexRegistry Map.empty
 -- 'isMarkedWord8Ptr' check.
 clearForeignPtrWord8Ranges :: IO ()
 clearForeignPtrWord8Ranges = writeIORef foreignPtrWord8RangesRef []
+
+-- | Kill every interpreter-spawned thread from the prior
+-- 'loadProgramFromSource' run and clear the registry.  Called by
+-- 'IHC.Scheduler.resetPerRunGlobals' at the next run boundary — by
+-- which point the prior program's @main@ result has already been
+-- forced and returned, so any thread it forked (warp accept loop,
+-- TimeManager, async workers, bare @forkIO@) is leaked background
+-- work whose TSO stack is pure garbage.  Without this the ~600-example
+-- in-process hspec suite accumulates ~4 GB of @STACK@ and the
+-- master-CI run heap-exhausts (the GC death-spiral repeatedly walking
+-- thousands of retained thread stacks).  @killThread@ exceptions are
+-- swallowed: an already-finished thread, or one wedged in an
+-- uninterruptible FFI call, must not abort the reset.
+reapSpawnedThreads :: IO ()
+reapSpawnedThreads = do
+    tids <- readIORef spawnedThreadsRef
+    writeIORef spawnedThreadsRef []
+    mapM_ (\t -> do
+              _ <- CE.try (killThread t) :: IO (Either SomeException ())
+              pure ())
+          tids
 
 -- | Structural Ord fallback for VCon values.
 --
@@ -6485,6 +6526,7 @@ forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
     tid <- forkIO $ do
         _ <- runIOVal legacyHooks av
         pure ()
+    registerSpawnedThread tid
     pure (VPrimObj (PrimThreadId tid))
 
 -- | @fork# :: IO () -> State# RealWorld -> (# State# RealWorld, ThreadId# #)@
@@ -6509,6 +6551,7 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
     tid <- forkIO $ do
         _ <- runActionVal av
         pure ()
+    registerSpawnedThread tid
     rwT  <- newWHNFThunk (VPrimObj PrimRealWorld)
     tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
     pure (VCon "(#,#)" [rwT, tidT])

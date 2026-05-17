@@ -22,6 +22,12 @@ module IHC.Source
     , ScanCacheBox
     , readScanCache
     , writeScanCache
+      -- Exposed only so 'IHC.MemDebug' can size it for the
+      -- @IHC_MEM_DEBUG@ probe.  NOT a per-run reset target: this
+      -- registry is the content-addressed cross-run scan-cache
+      -- amortization (see 'mkFreshScanCache') and must survive
+      -- 'IHC.Scheduler.resetPerRunGlobals'.
+    , globalScanCacheRegistry
     ) where
 
 import Data.ByteString (ByteString)

@@ -73,13 +73,14 @@ import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
-    , clearCtorIndex, clearForeignPtrWord8Ranges
+    , clearCtorIndex, clearForeignPtrWord8Ranges, reapSpawnedThreads
     )
 import IHC.CabalProject
     ( cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
     )
-import IHC.Diagnostics (warnStub)
+import IHC.Diagnostics (warnStub, memDebugEnabled, memDebugEvery)
+import IHC.MemDebug (dumpMemStats)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
     , lookupInstance
@@ -5033,6 +5034,22 @@ globalLoadedModulesRef = lsrsLoadedModules legacySchedulerRunState
 -- instance-scope registries, all of which feed elaborator decisions.
 resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
+    -- Flag-gated cross-fixture memory probe (@IHC_MEM_DEBUG@).  Runs
+    -- BEFORE the wipes below so the dump reflects the PEAK live set the
+    -- just-finished fixture left behind (pre-clear).  Zero-cost when
+    -- the flag is unset: a single CAF boolean test, same disposition as
+    -- 'IHC.Diagnostics.traceLine'.  This is the single guaranteed
+    -- per-fixture boundary (every 'loadProgramFromSource' calls it
+    -- first), so it also covers 'RunFile' multi-run without test
+    -- wiring.  See 'IHC.MemDebug.dumpMemStats'.
+    when memDebugEnabled $ do
+        modifyIORef' _memDebugFixtureCounter (+1)
+        n <- readIORef _memDebugFixtureCounter
+        when (n `mod` memDebugEvery == 0) $ do
+            lm  <- Map.size <$> readIORef globalLoadedModulesRef
+            fbc <- Map.size <$> readIORef envFallbackCache
+            eb  <- Set.size <$> readIORef globalEarlyBuiltinsRef
+            dumpMemStats ("pre-reset fixture #" <> show n) lm fbc eb
     -- 'globalLoadedModulesRef' (the parsed-module skeleton cache) is
     -- the cross-fixture amortization win: wiping it forces every
     -- 'loadProgramFromSource' run to re-scan ~155 base modules from
@@ -5062,6 +5079,27 @@ resetPerRunGlobals = do
     clearCtorStrictness
     clearCtorIndex
     clearForeignPtrWord8Ranges
+    -- THE master-CI OOM fix.  A heap profile of the full ~600-example
+    -- in-process hspec suite is dominated by ~4 GB of @STACK@ (every
+    -- other band ≤56 MB): interpreted programs fork background threads
+    -- (warp accept loop, System.TimeManager, async, bare @forkIO@) that
+    -- are still alive when 'runFile' has already returned @main@'s
+    -- value.  Nothing reaped them, so their TSO stacks accumulated
+    -- across fixtures until the heap cap (the 24-min GC death-spiral
+    -- then 'Heap exhausted' in CI).  Kill the prior run's leaked
+    -- threads here, at the next run boundary — by now that program is
+    -- finished and its threads are pure garbage.  Light / pure
+    -- fixtures fork nothing, so this is a no-op for them.
+    reapSpawnedThreads
+    -- Extend the clear* precedent to the remaining append-only globals
+    -- so no per-run state leaks across the ~354-fixture in-process
+    -- suite.  Each is reconstructed on demand next run
+    -- ('registerCbitsDylibs' re-opens libs, 'resolveSymbol' re-resolves
+    -- symbols, 'registerPatSyns' re-runs at module load); see the
+    -- justification comments on each helper.
+    FFI.clearOpenLibs
+    FFI.clearSymbolCache
+    PatSyn.clearPatSyns
     resetNewNameCounter
     resetLocateModuleNegCache
     TR.setGlobalRegistry Map.empty
@@ -6861,6 +6899,14 @@ discoveryCallCap = 2_000_000
 {-# NOINLINE _discoverTotalRef #-}
 _discoverTotalRef :: IORef Int
 _discoverTotalRef = unsafePerformIO (newIORef 0)
+
+-- | Per-process fixture counter for the @IHC_MEM_DEBUG@ probe (drives
+-- the every-Nth-fixture dump in 'resetPerRunGlobals').  Deliberately
+-- NOT reset per run — it must count across the whole in-process suite.
+-- Inert unless 'memDebugEnabled'.
+{-# NOINLINE _memDebugFixtureCounter #-}
+_memDebugFixtureCounter :: IORef Int
+_memDebugFixtureCounter = unsafePerformIO (newIORef 0)
 
 {-# NOINLINE _exportedFieldRegistryMemoRef #-}
 _exportedFieldRegistryMemoRef :: IORef (Map ByteString FieldRegistry)

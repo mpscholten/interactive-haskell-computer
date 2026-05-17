@@ -1,5 +1,18 @@
 module Main (main) where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Monad (when)
+import Data.Char (isDigit)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import System.Environment
+    (getArgs, getEnvironment, getExecutablePath, lookupEnv)
+import System.Exit (ExitCode(..), exitWith)
+import System.IO (BufferMode(..), hFlush, hGetLine, hIsEOF, hSetBuffering, stdout)
+import System.Posix.Signals (sigKILL, signalProcess)
+import System.Process
+    ( CreateProcess(..), StdStream(..), createProcess, getPid
+    , getProcessExitCode, proc, waitForProcess
+    )
 import Test.Hspec
 
 import qualified CabalLoader
@@ -50,8 +63,94 @@ import qualified TopLevelWarpAliasTest
 import qualified WarpHelloTest
 import qualified WarpRunStartupTest
 
+-- The ~600-example suite runs in ONE process.
+-- 'IHC.Builtins.reapSpawnedThreads' (wired into 'resetPerRunGlobals'
+-- and the end of 'runWithSearchPath') is the master-CI OOM fix: it
+-- bounds the cross-fixture interpreter-thread STACK growth that
+-- heap-exhausted the run.  Independently, a fixture leaves one
+-- interpreter thread that never terminates and runs with async
+-- exceptions masked, so 'killThread' cannot reap it; at shutdown it
+-- busy-spins holding the stdout Handle lock and wedges GHC's RTS
+-- shutdown.  The suite prints "603 examples, 0 failures" and then the
+-- process hangs forever — a CI *timeout*.  Every in-process escape is
+-- itself RTS-scheduled behind the wedge (verified the hard way: -N2,
+-- exitImmediately, and a C SIGALRM watchdog were all defeated or
+-- unreachable).
+--
+-- So the binary re-execs itself.  A tiny PARENT process (runs no
+-- interpreter code, so nothing can wedge it) runs the suite as a
+-- CHILD, forwards the child's output so CI still sees the full report,
+-- and reads hspec's own summary line — always printed before the
+-- wedge — to learn pass/fail.  It gives the child a short grace to
+-- exit on its own (the normal, non-wedged path) then SIGKILLs it, and
+-- exits with the correct code.
+childEnvVar :: String
+childEnvVar = "IHC_TEST_CHILD"
+
 main :: IO ()
-main = hspec do
+main = do
+    child <- lookupEnv childEnvVar
+    case child of
+        Just _  -> hspec allSpecs   -- CHILD: ordinary runner; exits itself unless wedged
+        Nothing -> parentMain
+
+parentMain :: IO ()
+parentMain = do
+    self <- getExecutablePath
+    args <- getArgs
+    env0 <- getEnvironment
+    (_, Just hOut, _, ph) <- createProcess (proc self args)
+        { std_out = CreatePipe       -- captured: we tee it + scan the summary
+        , std_err = Inherit          -- child stderr -> ours (visible in CI)
+        , env     = Just ((childEnvVar, "1") : env0)
+        }
+    hSetBuffering stdout LineBuffering
+    fref  <- newIORef Nothing        -- parsed failure count, once the summary is seen
+    armed <- newIORef False          -- grace-then-SIGKILL armed?
+    let killChild = getPid ph >>= maybe (pure ()) (signalProcess sigKILL)
+        pump = do
+            eof <- hIsEOF hOut       -- blocks until a line or the pipe closes
+            if eof then pure () else do
+                line <- hGetLine hOut
+                putStrLn line
+                hFlush stdout
+                case parseFailures line of
+                    Nothing -> pure ()
+                    Just n  -> do
+                        writeIORef fref (Just n)
+                        a <- readIORef armed
+                        when (not a) $ do
+                            writeIORef armed True
+                            _ <- forkIO $ do
+                                threadDelay (15 * 1000 * 1000)
+                                alive <- getProcessExitCode ph
+                                when (alive == Nothing) killChild
+                            pure ()
+                pump
+    pump                             -- until the child's stdout closes (clean exit or SIGKILL)
+    ec <- waitForProcess ph
+    mf <- readIORef fref
+    exitWith $ case mf of
+        Just 0  -> ExitSuccess       -- hspec summary is authoritative
+        Just _  -> ExitFailure 1
+        Nothing -> case ec of        -- no summary => child crashed; trust its code
+            ExitSuccess -> ExitSuccess
+            _           -> ExitFailure 1
+
+-- hspec prints e.g. @603 examples, 0 failures, 72 pending@; pull the
+-- integer immediately preceding the @failure(s)@ token.
+parseFailures :: String -> Maybe Int
+parseFailures line =
+    case [ ds | (a, b) <- zip ws (drop 1 ws), isFailWord b
+              , let ds = takeWhile isDigit a, not (null ds) ] of
+        (ds : _) -> Just (read ds)
+        _        -> Nothing
+  where
+    ws = words line
+    isFailWord w = w `elem` ["failure", "failures", "failure,", "failures,"]
+
+allSpecs :: Spec
+allSpecs = do
     ParserBugs.spec
     Properties.Totality.spec
     Properties.RoundTrip.spec
