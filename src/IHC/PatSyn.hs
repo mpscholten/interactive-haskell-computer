@@ -17,6 +17,7 @@ module IHC.PatSyn
     ( PatSyn (..)
     , globalPatSynRef
     , registerPatSyns
+    , clearPatSyns
     , lookupPatSyn
     , substPat
     ) where
@@ -46,6 +47,18 @@ registerPatSyns :: [(ByteString, PatSyn)] -> IO ()
 registerPatSyns ps =
     modifyIORef' globalPatSynRef $ \m ->
         foldr (\(k, v) -> Map.insert k v) m ps
+
+-- | Drop every registered pattern synonym.  Like the scan-cache
+-- registry, this CAF accumulated across the single-process test run:
+-- 'registerPatSyns' is called per loaded module with no per-run reset,
+-- so every fixture that declares a @pattern@ permanently added its
+-- synonyms.  Far smaller than the scan-cache leak (keyed by name, so
+-- bounded by the distinct pattern-syn names across all fixtures), but
+-- it is still unbounded cross-run state captured against prior runs'
+-- module skeletons.  'IHC.Scheduler.resetPerRunGlobals' clears it
+-- alongside the other per-run registries so a fresh run starts clean.
+clearPatSyns :: IO ()
+clearPatSyns = writeIORef globalPatSynRef Map.empty
 
 lookupPatSyn :: ByteString -> IO (Maybe PatSyn)
 lookupPatSyn n = do

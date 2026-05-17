@@ -225,7 +225,16 @@ builtinEnv reg = do
     -- Lazy-init — most programs never construct unboxed tuples.
     unbox2T <- newLazyBuiltinThunk (pure (VFun $ \a -> pure $ VFun $ \b -> pure (VCon "(#,#)" [a, b])))
     unbox3T <- newLazyBuiltinThunk (pure (VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure (VCon "(#,,#)" [a, b, c])))
-    let unboxCtors = [("(#,#)", unbox2T), ("(#,,#)", unbox3T)]
+    -- Unboxed-sum constructor: @(# a | b | ... #)@.  IHC encodes
+    -- every unboxed sum, regardless of alternative count, as a
+    -- 2-field @VCon "(#|#)" [tagThunk, payloadThunk]@ where
+    -- @tagThunk@ evaluates to @VInt n@ (1-based alternative index)
+    -- and @payloadThunk@ holds that alternative's value.  The parser
+    -- desugars @(# x | #)@ → @(#|#) 1 x@ and @(# | x #)@ →
+    -- @(#|#) 2 x@; matchPat's generic @PCon/VCon@ zip handles the
+    -- tag check (a 'PLit (LInt n)' sub-pattern) + payload bind.
+    unboxSumT <- newLazyBuiltinThunk (pure (VFun $ \tag -> pure $ VFun $ \v -> pure (VCon "(#|#)" [tag, v])))
+    let unboxCtors = [("(#,#)", unbox2T), ("(#,,#)", unbox3T), ("(#|#)", unboxSumT)]
     -- IO constructor: IO wraps a (State# RealWorld -> (# State# RealWorld, a #))
     -- function into a VIO action.  GHC.Types defines `newtype IO a = IO (State# ...)`
     -- but since GHC.Types is builtin-backed (no .hs source), we register it here.
@@ -351,19 +360,18 @@ builtins reg =
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
     --
-    -- TODO (slice-2 follow-up): drop @==@ / @/=@ once the per-FV
-    -- discovery cascade triggered by their absence is fully mapped.
-    -- The infrastructure to support source-loaded @Eq@ is in place
-    -- (registerDerivedEqInstances + scanStandaloneDerivings + the
-    -- @PCon "Ptr" [_]@ matchPat bridge + eqAddr# / etc. primops),
-    -- but a per-FV @discoverInModule@ chase from
-    -- @registerInstancesFrom@ / @registerClassDefaults@ still
-    -- transitively walks @base@ + @ghc-internal@ until the heap
-    -- exhausts.  Reproducer: @main = print (compare 1 2 == LT)@.
-    -- Master baseline: discovery total ~1000, runs in seconds; with
-    -- @==@ dropped: discovery total >2400, OOM at 4GB.  See
-    -- 'globalEarlyBuiltinsRef' for the partial fix that wasn't
-    -- enough.
+    -- TODO (slice-2 follow-up): drop @==@ / @/=@ — they have real
+    -- source in @GHC.Classes@ and the doctrine says interpret it.
+    -- The discovery-cascade blocker is FIXED: the per-FV chase from
+    -- @registerInstancesFrom@ / @registerClassDefaults@ now goes
+    -- through @IHC.Scheduler.discoverInModuleForChase@ (curated
+    -- 'perFVChaseShortCircuit'), so a source-loaded @GHC.Classes@ no
+    -- longer fans the chase out across @base@ + @ghc-internal@ until
+    -- the 4 GB heap exhausts.  Reproducer: @main = print (compare 1 2
+    -- == LT)@ (was: discovery >2400 → OOM; now ~master's ~1000).
+    -- Remaining before removal: route the @eqVals@ representation
+    -- bridges (cross-numeric, VStr, ByteString/ForeignPtr, null-ptr)
+    -- through source — there is no host Eq fallback in the dispatcher.
     , ("==",       eqDispatch reg)
     , ("/=",       neqDispatch reg)
     , ("<",        ordDispatch reg 0)
@@ -637,6 +645,11 @@ builtins reg =
     , ("bigNatAdd",                makeBigNatBinOp "bigNatAdd" (+))
     , ("bigNatMul",                makeBigNatBinOp "bigNatMul" (*))
     , ("bigNatSubUnsafe",          makeBigNatBinOp "bigNatSubUnsafe" (-))
+    -- Unboxed-sum-returning primops (now that the runtime exists):
+    --   bigNatSub        :: BigNat# -> BigNat# -> (# (# #) | BigNat# #)
+    --   bigNatIsPowerOf2# :: BigNat# -> (# (# #) | Word# #)
+    , ("bigNatSub",                bigNatSubB)
+    , ("bigNatIsPowerOf2#",        bigNatIsPowerOf2HashB)
     , ("bigNatQuot",               makeBigNatBinOp "bigNatQuot" quot)
     , ("bigNatRem",                makeBigNatBinOp "bigNatRem" rem)
     , ("bigNatGcd",                makeBigNatBinOp "bigNatGcd" gcd)
@@ -3478,6 +3491,46 @@ bigNatSqrB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
     n  <- extractBigNat "bigNatSqr" av
     pure (VPrimObj (PrimBigNat (n * n)))
+
+-- | Build an unboxed-sum value @(# … | … #)@ — see the @(#|#)@
+-- constructor registration in 'builtinEnv'.  @tag@ is the 1-based
+-- alternative index; @payload@ is that alternative's value.
+mkUnboxedSum :: Int -> Val -> IO Val
+mkUnboxedSum tag payload = do
+    tagT <- newWHNFThunk (VInt (fromIntegral tag))
+    pT   <- newWHNFThunk payload
+    pure (VCon "(#|#)" [tagT, pT])
+
+-- | The empty/left injection @(# (# #) | #)@ — alternative 1,
+-- payload is the nullary unboxed tuple.
+unboxedSumLeftUnit :: IO Val
+unboxedSumLeftUnit = mkUnboxedSum 1 (VCon "(##)" [])
+
+-- | @bigNatSub :: BigNat# -> BigNat# -> (# (# #) | BigNat# #)@.
+-- ghc-bignum (BigNat.hs:546): @(# | a-b #)@ when @a >= b@,
+-- else @(# (# #) | #)@ (would-underflow).  The @b == 0@ fast path
+-- in the source is subsumed by @a >= b@ → @a - 0 == a@.
+bigNatSubB :: IO Val
+bigNatSubB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    na <- extractBigNat "bigNatSub" av
+    nb <- extractBigNat "bigNatSub" bv
+    if na >= nb
+        then mkUnboxedSum 2 (VPrimObj (PrimBigNat (na - nb)))
+        else unboxedSumLeftUnit
+
+-- | @bigNatIsPowerOf2# :: BigNat# -> (# (# #) | Word# #)@.
+-- ghc-bignum (BigNat.hs:135): @(# | k #)@ (k = exponent) when the
+-- BigNat is exactly @2^k@ (k ≥ 0), else @(# (# #) | #)@ (incl. 0).
+-- A 'Natural' is a power of two iff exactly one bit is set
+-- (@popCount == 1@); the exponent is then the trailing-zero count.
+bigNatIsPowerOf2HashB :: IO Val
+bigNatIsPowerOf2HashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    n  <- extractBigNat "bigNatIsPowerOf2#" av
+    if n > 0 && popCount n == 1
+        then mkUnboxedSum 2 (VInt (fromIntegral (naturalCtz n)))
+        else unboxedSumLeftUnit
 
 -- | @bigNatQuotRem# :: BigNat# -> BigNat# -> (# BigNat#, BigNat# #)@.
 -- The unboxed tuple is encoded as @VCon "(#,#)" [qT, rT]@ (same
