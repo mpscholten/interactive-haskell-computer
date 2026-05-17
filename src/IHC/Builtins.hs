@@ -1568,6 +1568,28 @@ builtins reg =
     -- =================================================================
     -- end VIO <-> State# bridge
     -- =================================================================
+    -- Phase 2.10a exception shim. `catch` HAS real source in
+    -- ghc-internal/src/GHC/Internal/IO.hs and bottoms out into
+    -- primops we already implement (`catch#`/`unIO`/`raiseIO#`), so
+    -- per "minimum surface only" it is a graduation candidate.
+    -- Graduation is BLOCKED on TWO interpreter gaps (both reproduced;
+    -- see test/Fixtures/Unsupported/io_catch_graduated.hs):
+    --   1. ECase eagerly runs a `VIO` scrutinee even when the case
+    --      destructures the `IO` newtype (`catch (IO io) h = …`), so
+    --      the action throws OUTSIDE `catch#`'s protection. Fixable in
+    --      IHC.Eval `go (ECase …)` — a core-evaluator change kept
+    --      separate from the shim removal to bound the blast radius.
+    --   2. Even past (1): source `catch`'s
+    --        handler' e = case fromException e of
+    --                       Just e' -> unIO (handler e') ; Nothing -> raiseIO# e
+    --      needs `fromException` to return `Just` for the @SomeException@
+    --      handler case (GHC: @instance Exception SomeException where
+    --      fromException = Just@). `fromExceptionB` deliberately returns
+    --      `Nothing` for downcast-safety (warp/wai `Just (Con _) <-
+    --      fromException e` guards — see its inline note); flipping it
+    --      regresses those, and matchPat has no `SomeException`
+    --      newtype-transparency for concrete-ctor patterns to compensate.
+    --      Needs runtime-type-directed `fromException`/`cast`.
     , ("catch",           catchB)
     , ("GHC.IO.catch",    catchB)
     , ("GHC.Internal.IO.catch", catchB)
