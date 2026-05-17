@@ -1,0 +1,22 @@
+acquire
+use res
+release
+finally-body
+finally-cleanup
+finally-rethrew
+onexc-ok-body
+onexc-bad-body
+onexc-bad-cleanup
+onexc-rethrew
+b_-before
+b_-thing
+b_-after
+b_e-before
+b_e-thing
+b_e-after
+b_e-rethrew
+boe-ok-thing
+boe-bad-thing
+boe-bad-release
+boe-rethrew
+done
