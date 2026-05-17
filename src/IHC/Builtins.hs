@@ -792,11 +792,9 @@ builtins reg =
     -- these primops; there is no .hs implementation to interpret below them.
     , ("readIntOffAddr#",  readIntOffAddrHashB)
     , ("writeIntOffAddr#", writeIntOffAddrHashB)
-    -- Phase 2.8: Ptr arithmetic
-    , ("plusPtr",   plusPtrB)
-    , ("minusPtr",  minusPtrB)
-    , ("nullPtr",   nullPtrB)
-    , ("castPtr",   castPtrB)
+    -- Ptr arithmetic (plusPtr/minusPtr/nullPtr/castPtr) is now
+    -- source-loaded from GHC.Internal.Ptr — its bodies bottom on
+    -- plusAddr#/minusAddr#/nullAddr#/coerce, all already available.
     -- Phase 2.8: ForeignPtr
     , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB)
     , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
@@ -4133,21 +4131,60 @@ dHashB = pure $ VFun $ \a -> force legacyHooks a
 nullAddrB :: IO Val
 nullAddrB = pure (VPrimObj (PrimPtr nullPtr))
 
+-- | Resolve any of the runtime shapes an @Addr#@ / @Ptr@-ish value
+-- can take under interpretation down to a host 'Ptr'.
+--
+-- @plusAddr#@ / @minusAddr#@ are genuine 'GHC.Prim' primops with no
+-- @.hs@ source — they are legitimately host-backed.  Source-loaded
+-- 'Foreign.Ptr.plusPtr' / 'minusPtr' (no longer host-shimmed) bottom
+-- out on these, and 'Data.ByteString.foldr' reaches them via
+-- @unsafeForeignPtrToPtr (ForeignPtr fo _) = Ptr fo@ — so the
+-- @Addr#@ argument can arrive as a 'PrimForeignPtr' (the extracted
+-- finalizer-carrying allocation), a 'VCon \"Ptr\" [_]' wrapper
+-- (source-loaded @Ptr@ ctor), or an integer/'VUnit' null alias, not
+-- just a bare 'PrimPtr'.  This resolver subsumes the cross-rep
+-- handling the removed @plusPtrCore@/@minusPtrCore@ shims carried
+-- (see commit @f902b59@ for the parallel 'eqVals' fix), keeping
+-- @plusPtr@/@minusPtr@ source-loaded per the CLAUDE.md
+-- minimum-surface rule while letting the primop they bottom on cope
+-- with the interpreter's actual value shapes.
+valToHostPtr :: Val -> IO (Ptr Word8)
+valToHostPtr v = case v of
+    VPrimObj (PrimPtr p)        -> pure (castPtr p)
+    VPrimObj (PrimForeignPtr f) -> pure (castPtr (unsafeForeignPtrToPtr f))
+    VCon "Ptr" [t]              -> force legacyHooks t >>= valToHostPtr
+    VInt n                      -> pure (intPtrToPtr (fromIntegral n))
+    VInteger n                  -> pure (intPtrToPtr (fromIntegral n))
+    VUnit                       -> pure nullPtr
+    _ -> error ("Addr#: not an address: " <> showValForDebug v)
+
 plusAddrB :: IO Val
 plusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VInt n) ->
-            pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-        _ -> error ("plusAddr#: bad args: " <> showValForDebug av)
+    case bv of
+        VInt n  -> go av n
+        _ -> error ("plusAddr#: offset not an Int: " <> showValForDebug bv)
+  where
+    -- A 'PrimForeignPtr' flowing through must advance by @n@ bytes
+    -- while KEEPING its finalizer: 'Data.ByteString.foldr' walks
+    -- @go (p `plusPtr` 1)@ off a ForeignPtr-derived pointer and
+    -- compares against @end@; if the offset is dropped, @p == end@
+    -- never holds and the fold diverges -> heap exhaustion.  Unwrap
+    -- nested source-loaded @VCon "Ptr" [_]@ wrappers first; for any
+    -- other shape resolve to a host Ptr and advance that.
+    go (VPrimObj (PrimForeignPtr f)) n =
+        pure (VPrimObj (PrimForeignPtr (plusForeignPtr f (fromIntegral n))))
+    go (VCon "Ptr" [t]) n = force legacyHooks t >>= \t' -> go t' n
+    go other n = do
+        p <- valToHostPtr other
+        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
 
 minusAddrB :: IO Val
 minusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
-            pure (VInt (fromIntegral (p `minusPtr` q)))
-        _ -> error ("minusAddr#: bad args: " <> showValForDebug av)
+    p <- valToHostPtr av
+    q <- valToHostPtr bv
+    pure (VInt (fromIntegral (p `minusPtr` q)))
 
 addr2IntB :: IO Val
 addr2IntB = pure $ VFun $ \a -> do
@@ -4284,64 +4321,6 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                         (fromIntegral n :: Int)
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
-
---------------------------------------------------------------------------------
--- Phase 2.8: Ptr arithmetic
---------------------------------------------------------------------------------
-
-plusPtrB :: IO Val
-plusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    plusPtrCore av bv
-
--- | Cross-representation 'plusPtr': unwraps source-loaded
--- @VCon \"Ptr\" [t]@ wrappers around a host-primitive 'PrimPtr'
--- before recursing.  Same gap addressed for 'Eq Ptr' by commit
--- @f902b59@ ('eqVals' cross-rep cases) — repeated here for
--- 'plusPtr' so 'Data.ByteString.foldr' (and thus 'unpack') can run
--- under interpretation: the source body @unsafeForeignPtrToPtr
--- (ForeignPtr fo _) = Ptr fo@ wraps the extracted primitive Ptr in
--- a 'VCon \"Ptr\" [_]', because source-loaded 'Ptr' resolves to the
--- ordinary data constructor, not the special-cased 'ptrCtorV' in
--- the global env.
-plusPtrCore :: Val -> Val -> IO Val
-plusPtrCore av bv = case (av, bv) of
-    (VPrimObj (PrimPtr p), VInt n) ->
-        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
-    -- A ForeignPtr flowing through plusPtr must advance by @n@
-    -- bytes just like a raw Ptr would; dropping @n@ silently
-    -- breaks callers that derive subsequent reads off the
-    -- offset pointer (memchr/memcmp/peek).
-    (VPrimObj (PrimForeignPtr fp), VInt n) ->
-        pure (VPrimObj (PrimForeignPtr (plusForeignPtr fp (fromIntegral n))))
-    (VCon "Ptr" [t], _) -> do
-        t' <- force legacyHooks t
-        plusPtrCore t' bv
-    _ -> error ("plusPtr: bad args: " <> showValForDebug av)
-
-minusPtrB :: IO Val
-minusPtrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    minusPtrCore av bv
-
--- | Cross-representation 'minusPtr'; see 'plusPtrCore'.
-minusPtrCore :: Val -> Val -> IO Val
-minusPtrCore av bv = case (av, bv) of
-    (VPrimObj (PrimPtr p), VPrimObj (PrimPtr q)) ->
-        pure (VInt (fromIntegral (p `minusPtr` q)))
-    (VCon "Ptr" [t], _) -> do
-        t' <- force legacyHooks t
-        minusPtrCore t' bv
-    (_, VCon "Ptr" [t]) -> do
-        t' <- force legacyHooks t
-        minusPtrCore av t'
-    _ -> error ("minusPtr: bad args: " <> showValForDebug av)
-
-nullPtrB :: IO Val
-nullPtrB = pure (VPrimObj (PrimPtr nullPtr))
-
-castPtrB :: IO Val
-castPtrB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: ForeignPtr
