@@ -66,7 +66,6 @@ import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
-import System.Exit (ExitCode(..))
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
     ( BufferMode(..)
@@ -592,8 +591,6 @@ builtins reg =
     -- the @class C a => D a@ relation. Single argument is a [Char]
     -- list (a String); result is a [[Char]] list (a [String]).
     , ("__ihc_class_supers", classSupersProbeB)
-    , ("exitWith",    exitWithB)
-    , ("exitSuccess", exitSuccessB)
     -- Char / numeric conversions.
     -- NOTE: only the GHC.Prim primops @ord#@ / @chr#@ are host-backed.
     -- @Data.Char.ord@ / @Data.Char.chr@ have real source — @ord@ in
@@ -3282,25 +3279,6 @@ seqB :: IO Val
 seqB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     _ <- force legacyHooks a
     force legacyHooks b
-
--- | @exitWith code@: throws 'ExitCode'. Wrapped in VIO so it's delayed.
-exitWithB :: IO Val
-exitWithB = pure $ VFun $ \a -> pure $ VIO $ do
-    av <- force legacyHooks a
-    case av of
-        VCon "ExitSuccess" _ -> throwIO ExitSuccess
-        VCon "ExitFailure" [nT] -> do
-            nv <- force legacyHooks nT
-            case nv of
-                VInt n -> throwIO (ExitFailure (fromIntegral n))
-                _ -> error ("exitWith ExitFailure: not an Int: "
-                            <> showValForDebug nv)
-        VInt n -> throwIO (if n == 0 then ExitSuccess
-                                     else ExitFailure (fromIntegral n))
-        _ -> error ("exitWith: not an ExitCode: " <> showValForDebug av)
-
-exitSuccessB :: IO Val
-exitSuccessB = pure $ VIO (throwIO ExitSuccess)
 
 --------------------------------------------------------------------------------
 -- Char / numeric conversions.
