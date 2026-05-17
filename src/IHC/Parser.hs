@@ -2394,6 +2394,20 @@ layoutAlts ctx altCol cur acc = do
         -- IHP's inline @\b -> case …readInt b of Just (n, "") -> …;
         -- _ -> Nothing@ form relies on this.
         TkSemi -> layoutAlts ctx altCol curAfterSep (alt : acc)
+        -- A @where@ at the alt column does NOT start a new alternative
+        -- (`where` is a reserved keyword, never a pattern).  It is the
+        -- trailing where-clause of the *enclosing* equation/let/lambda,
+        -- e.g. ghc-prim's
+        --   x# `divModInt#` y# = case … of
+        --     (# q#, r# #) -> (# … #)
+        --     where !yn# = …
+        -- where the single alt and the @where@ share column 3.  Stop
+        -- the alts loop so the equation-level 'attachWhere' (or the
+        -- lambda/let equivalent) consumes the binds.  Without this the
+        -- loop calls 'parseAlt' on @where@ and dies with
+        -- "expected pattern … saw TkWhere".
+        TkWhere | tkCol nextTok == altCol ->
+              pure (reverse (alt : acc), cur')
         _ | tkCol nextTok == altCol ->
               layoutAlts ctx altCol cur' (alt : acc)
           | otherwise ->
