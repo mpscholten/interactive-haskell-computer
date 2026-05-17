@@ -443,11 +443,14 @@ peekInfixOp src cur =
                 TkIdent op -> closedByBacktick op
                 -- MagicHash value-level op between backticks, e.g.
                 --   x# \`divModInt#\` y# = ...
-                -- in ghc-prim's GHC.Classes.  Such names lex as
-                -- 'TkPrimId' (trailing @#@), so without this arm the
-                -- whole binding LHS goes unrecognised and the symbol
-                -- (e.g. @divModInt#@, reached by the source-loaded
-                -- @divMod@) reports as an unbound variable.
+                -- in ghc-prim's GHC.Classes, or
+                --   a \`iShiftL#\` b = ...
+                -- at GHC.Internal.Base.hs:2495 (the leaf the
+                -- source-loaded @instance Bits Int@ shiftL/shiftR
+                -- bodies bottom on).  Such names lex as 'TkPrimId'
+                -- (trailing @#@); without this arm the whole binding
+                -- LHS goes unrecognised and the symbol (e.g.
+                -- @divModInt#@, @iShiftL#@) reports as unbound.
                 TkPrimId op | primIdIsValueLevel op -> closedByBacktick op
                 _ -> Nothing
         -- Immediately followed by '@'-prefixed op: `arg @?= ...`

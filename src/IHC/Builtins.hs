@@ -929,15 +929,17 @@ builtins reg =
     , ("andI#",             bitAndB)
     , ("orI#",              bitOrB)
     , ("xorI#",             bitXorB)
-    -- 'notI#' — bitwise complement on Int#.  A genuine GHC.Prim
-    -- primop with NO .hs source (ghc-prim's GHC/PrimopWrappers.hs
-    -- only re-exports @GHC.Prim.notI#@), so it qualifies as a
-    -- compiler-intrinsic carve-out under the builtins
-    -- minimum-surface rule.  Reached by the source-loaded
-    -- @divModInt#@ (GHC/Classes.hs:846) that the graduated
-    -- @divMod@ rides; aliased to the boxed complement since IHC
+    -- notI# :: Int# -> Int# — a genuine GHC.Prim primop with NO
+    -- .hs source (ghc-prim's GHC/PrimopWrappers.hs only re-exports
+    -- @GHC.Prim.notI#@), so it qualifies as a compiler-intrinsic
+    -- carve-out under the builtins minimum-surface rule.  Two
+    -- source-loaded leaves bottom on it: @divModInt#@
+    -- (GHC/Classes.hs:846, ridden by the graduated @divMod@) and
+    -- @complement (I# x#) = I# (notI# x#)@ in @instance Bits Int@
+    -- (GHC.Internal.Bits, Bits.hs:461, ridden by the graduated
+    -- @complement@).  Aliased to the boxed complement since IHC
     -- represents Int# as 'VInt' (Int64-backed).
-    , ("notI#",             bitComplementB)
+    , ("notI#",             notIB)
     -- Int64# primops: IHC stores both Int# and Int64# as
     -- 'VInt' (Int64-backed Haskell), so conversions are
     -- identity functions and arithmetic dispatches to the
@@ -1223,12 +1225,16 @@ builtins reg =
     --     carve-out registered below.  The class-method dispatch is
     --     seeded via @("divMod","Integral")@ / @("quotRem","Integral")@
     --     in 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
-    , ("shiftL",       shiftLB)
-    , ("shiftR",       shiftRB)
-    , (".&.",          bitAndB)
-    , (".|.",          bitOrB)
-    , ("xor",          bitXorB)
-    , ("complement",   bitComplementB)
+    -- NOTE (Bits bitwise core): the @class Bits@ methods
+    --   shiftL / shiftR / .&. / .|. / xor / complement
+    -- are no longer shimmed.  They source-load from the
+    -- @instance Bits Int@ in @GHC.Internal.Bits@ (Bits.hs:444),
+    -- which bottoms on the @andI# / orI# / xorI# / notI# /
+    -- iShiftL# / iShiftRA#@ primops (the first three registered
+    -- below; @iShiftL#@/@iShiftRA#@ source-load from Base.hs and
+    -- ride @uncheckedIShiftL#@/@uncheckedIShiftRA#@; @notI#@ is
+    -- the GHC.Prim carve-out registered below).  Method→class
+    -- seeds live in 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.
     -- popCount / bit / testBit / clearBit / setBit removed per CLAUDE.md
     -- "Builtin modules: minimum surface only".  These are @class Bits@
     -- methods (GHC.Internal.Bits); the @Bits Int@ instance + class
@@ -6047,20 +6053,6 @@ alignmentB = pure $ VFun $ \a -> do
 -- @Integral Int@ instance in GHC/Internal/Real.hs (see the registry
 -- comment near the old @("divMod", …)@ entry).  No host helper here.
 
-shiftLB :: IO Val
-shiftLB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x `shiftL` fromIntegral n))
-        _ -> error "shiftL: bad args"
-
-shiftRB :: IO Val
-shiftRB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt n) -> pure (VInt (x `shiftR` fromIntegral n))
-        _ -> error "shiftR: bad args"
-
 bitAndB :: IO Val
 bitAndB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     av <- force legacyHooks a; bv <- force legacyHooks b
@@ -6082,12 +6074,17 @@ bitXorB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VInt x, VInt y) -> pure (VInt (x `xor` y))
         _ -> error "xor: bad args"
 
-bitComplementB :: IO Val
-bitComplementB = pure $ VFun $ \a -> do
+-- | @notI# :: Int# -> Int#@ — GHC.Prim bitwise-complement primop.
+-- No Haskell source exists (carve-out, see registry comment); this
+-- is the leaf the source-loaded @complement (I# x#) = I# (notI# x#)@
+-- from @instance Bits Int@ bottoms on.  IHC stores @Int#@ as a
+-- Haskell 'Int' inside 'VInt', so this is just 'complement'.
+notIB :: IO Val
+notIB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
     case av of
         VInt x -> pure (VInt (complement x))
-        _ -> error "complement: bad arg"
+        _ -> error ("notI#: bad arg: " <> showValForDebug av)
 
 -- popCountB / bitB / testBitB / clearBitB / setBitB removed — see the
 -- @class Bits@ removal note at their former registry entries above.
