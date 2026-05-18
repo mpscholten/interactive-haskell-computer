@@ -5031,20 +5031,25 @@ globalLoadedModulesRef = lsrsLoadedModules legacySchedulerRunState
 -- instance-scope registries, all of which feed elaborator decisions.
 resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
-    -- Reclaim cross-fixture garbage deterministically.  The ~600-example
-    -- in-process suite accumulates RECLAIMABLE memory (prior runs'
-    -- module graphs / Thunks / scan ASTs) faster than GHC's default
-    -- generational GC collects it under @-M8G@, hitting a ~24-min GC
-    -- death-spiral then @Heap exhausted@ around discovery ~471 K.  A
-    -- forced major GC every 25 run boundaries reclaims it before the
-    -- spiral.  Found via CI: enabling @IHC_MEM_DEBUG@ — whose dump does
-    -- 'System.Mem.performMajorGC' every 25 fixtures — turned a
-    -- previously-OOMing @nix flake check@ green; this makes that the
-    -- principled, always-on fix (independent of the debug flag).
-    -- Complements 'reapSpawnedThreads' below, which frees the ~4 GB of
-    -- leaked-thread @STACK@ so the live set the GC must retain stays
-    -- small.  25 is empirically sufficient and not timeout-inducing
-    -- (CI completed the full suite with it).
+    -- Periodic forced major GC (every 25 run boundaries): cheap
+    -- cross-fixture heap hygiene for the ~600-example in-process suite.
+    -- NOTE — this is NOT proven to fix the master-CI @Heap exhausted@
+    -- at discovery ~471 K, and the commit that introduced it
+    -- (@9a87a9b@) overclaimed: CI run @26027458628@ still OOMs at the
+    -- identical @total=471000@ signature with this in place.  That OOM
+    -- is a PRE-EXISTING @master@ regression (present on pristine
+    -- @master@ @156da98@ and base @ad6b9c1@; prior merged attempts
+    -- PR #167 / #178 also failed it) and must be bisected on
+    -- @master@'s own history — see PR #179's pinned correction.
+    -- Empirical lead for whoever root-causes it: @IHC_MEM_DEBUG=1@ in
+    -- the flake @checkPhase@ made the suite complete @603/0/72@ with
+    -- ~10× lower discovery — and that is NOT this 'performMajorGC'
+    -- (the falsifier above proves the GC is not the operative factor;
+    -- the real mechanism is unknown).  Kept only as harmless GC
+    -- hygiene that complements 'reapSpawnedThreads' below (which is
+    -- the genuine, locally-verified fix for the ~4 GB leaked-thread
+    -- @STACK@); it does not by itself make CI green and is not claimed
+    -- to.
     rc <- atomicModifyIORef' _resetRunCounter (\k -> let k' = k + 1 in (k', k'))
     when (rc `mod` 25 == 0) performMajorGC
     -- Flag-gated cross-fixture memory probe (@IHC_MEM_DEBUG@).  Runs
@@ -6943,9 +6948,10 @@ _memDebugFixtureCounter = unsafePerformIO (newIORef 0)
 -- | Unconditional per-run counter driving the periodic
 -- 'System.Mem.performMajorGC' in 'resetPerRunGlobals' (every 25
 -- runs).  Separate from '_memDebugFixtureCounter' (which only ticks
--- under @IHC_MEM_DEBUG@) so the OOM fix is always on, debug flag or
--- not.  Not reset per run — it counts across the whole in-process
--- suite.
+-- under @IHC_MEM_DEBUG@).  This GC is harmless heap hygiene only — it
+-- is NOT the master-CI OOM fix (falsified by CI run @26027458628@;
+-- see the call-site comment).  Not reset per run — it counts across
+-- the whole in-process suite.
 {-# NOINLINE _resetRunCounter #-}
 _resetRunCounter :: IORef Int
 _resetRunCounter = unsafePerformIO (newIORef 0)
