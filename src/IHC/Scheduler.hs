@@ -70,6 +70,7 @@ import qualified System.Environment as SysEnv
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
+import System.Mem (performMajorGC)
 import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
@@ -5030,6 +5031,22 @@ globalLoadedModulesRef = lsrsLoadedModules legacySchedulerRunState
 -- instance-scope registries, all of which feed elaborator decisions.
 resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
+    -- Reclaim cross-fixture garbage deterministically.  The ~600-example
+    -- in-process suite accumulates RECLAIMABLE memory (prior runs'
+    -- module graphs / Thunks / scan ASTs) faster than GHC's default
+    -- generational GC collects it under @-M8G@, hitting a ~24-min GC
+    -- death-spiral then @Heap exhausted@ around discovery ~471 K.  A
+    -- forced major GC every 25 run boundaries reclaims it before the
+    -- spiral.  Found via CI: enabling @IHC_MEM_DEBUG@ — whose dump does
+    -- 'System.Mem.performMajorGC' every 25 fixtures — turned a
+    -- previously-OOMing @nix flake check@ green; this makes that the
+    -- principled, always-on fix (independent of the debug flag).
+    -- Complements 'reapSpawnedThreads' below, which frees the ~4 GB of
+    -- leaked-thread @STACK@ so the live set the GC must retain stays
+    -- small.  25 is empirically sufficient and not timeout-inducing
+    -- (CI completed the full suite with it).
+    rc <- atomicModifyIORef' _resetRunCounter (\k -> let k' = k + 1 in (k', k'))
+    when (rc `mod` 25 == 0) performMajorGC
     -- Flag-gated cross-fixture memory probe (@IHC_MEM_DEBUG@).  Runs
     -- BEFORE the wipes below so the dump reflects the PEAK live set the
     -- just-finished fixture left behind (pre-clear).  Zero-cost when
@@ -6922,6 +6939,16 @@ _discoverTotalRef = unsafePerformIO (newIORef 0)
 {-# NOINLINE _memDebugFixtureCounter #-}
 _memDebugFixtureCounter :: IORef Int
 _memDebugFixtureCounter = unsafePerformIO (newIORef 0)
+
+-- | Unconditional per-run counter driving the periodic
+-- 'System.Mem.performMajorGC' in 'resetPerRunGlobals' (every 25
+-- runs).  Separate from '_memDebugFixtureCounter' (which only ticks
+-- under @IHC_MEM_DEBUG@) so the OOM fix is always on, debug flag or
+-- not.  Not reset per run — it counts across the whole in-process
+-- suite.
+{-# NOINLINE _resetRunCounter #-}
+_resetRunCounter :: IORef Int
+_resetRunCounter = unsafePerformIO (newIORef 0)
 
 -- | The just-finished run's entry-module scan-cache keys (pre- and
 -- post-CPP source bytes), stashed by 'loadProgramFromSource' so the

@@ -439,21 +439,6 @@
               '' else ''
               export LD_LIBRARY_PATH=${ihcCbitsRoot}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
               ''}
-              # DIAGNOSTIC (temporary, revert once root-caused): the
-              # full suite still Heap-exhausts at ~471 K discoveries on
-              # both jobs, and the local env can't reproduce it (a
-              # local-only cold-scan stall blocks reaching that point).
-              # IHC_MEM_DEBUG is the zero-cost flag-gated probe
-              # (IHC.MemDebug.dumpMemStats): it prints a one-line
-              # [ihc:mem] table every N fixtures with post-major-GC
-              # live_bytes + the sizes of every suspected cross-fixture
-              # retainer (scan-cache outer/inner, loadedMods,
-              # envFbCache, ...).  Emitting it here surfaces, in the CI
-              # log right up to the OOM, exactly which structure
-              # dominates the ~471 K accumulation — the evidence the
-              # local profile cannot get.
-              export IHC_MEM_DEBUG=1
-              export IHC_MEM_DEBUG_EVERY=25
               ./dist/build/ihc-test/ihc-test \
                 --skip "REPL smoke tests" \
                 --skip "qualified class methods" \
