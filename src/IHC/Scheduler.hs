@@ -47,7 +47,7 @@ module IHC.Scheduler
     , desugarRecordPats
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try, finally)
+import Control.Exception (throwIO, Exception, catch, SomeException, try)
 import Control.Applicative ((<|>))
 import Foreign.Ptr (nullPtr)
 import qualified Foreign.Ptr as FP
@@ -336,6 +336,14 @@ loadProgramFromSource searchPath src0 = do
     -- returned unchanged.
     src <- cppSource src0
 
+    -- Record this fixture's entry-source scan-cache keys (pre- and
+    -- post-CPP bytes) so the NEXT run's 'resetPerRunGlobals' evicts
+    -- exactly them — bounding per-run scan-cache growth without the
+    -- cold-re-scan blowup a blanket wipe causes.  These bytes are
+    -- unique per fixture; shared base/library entries are never listed
+    -- here so they stay warm across runs.
+    writeIORef _prevEntryScanKeysRef [srcBytes src0, srcBytes src]
+
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
     -- Install as the shared reg so the ETypedMethod evaluator path +
@@ -368,10 +376,6 @@ loadProgramFromSource searchPath src0 = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
 
     -- Load the entry module. Its name is what the `module X where`
     -- header declares (or "Main" as a default). We always register it
@@ -1044,10 +1048,6 @@ loadFileIntoEnv searchPath path existingEnv = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
     -- Load the entry module.
     entry <- loadEntryModule registry src
     -- Determine which names to bring into scope.
@@ -1362,10 +1362,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             -- much of base+ghc-internal (PR #133, PR #141 same trick).
             Set.union extraDiscoverShortCircuit
                      (Set.fromList (HashMap.keys earlyBuiltins))
-    -- Make the FULL set visible to per-FV chase callers (instance
-    -- registration, class-default registration) that don't have
-    -- @earlyBuiltinNames@ in scope; see 'globalEarlyBuiltinsRef'.
-    setGlobalEarlyBuiltins earlyBuiltinNames
     mapM_ (discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap targetLm) requested
     -- Preload direct imports of targetLm so class declarations in
     -- re-export chains become visible to 'buildClassMethodEnv'.
@@ -1813,7 +1809,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- (e.g. @Foldable []@ uses @List.foldl@ but no user call triggers
     -- @foldl@ discovery) can't be rewritten to the owner's FQN.
     mapM_ (\fv -> do
-              r <- try (discoverInModule registry searchPath includeMap lm fv)
+              r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                         :: IO (Either SomeException ())
               case r of
                   Right () -> pure ()
@@ -1830,7 +1826,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
         then pure rewrites0
         else do
             mapM_ (\fv -> do
-                      r <- try (discoverInModule registry searchPath includeMap lm fv)
+                      r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                                 :: IO (Either SomeException ())
                       case r of
                           Right () -> pure ()
@@ -3472,7 +3468,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                              Left  _ -> pure [])
                      (Map.toList defaults)
             mapM_ (\fv -> do
-                       r <- try (discoverInModule registry searchPath includeMap lm fv)
+                       r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
                                 :: IO (Either SomeException ())
                        case r of
                            Right () -> pure ()
@@ -5048,8 +5044,10 @@ resetPerRunGlobals = do
         when (n `mod` memDebugEvery == 0) $ do
             lm  <- Map.size <$> readIORef globalLoadedModulesRef
             fbc <- Map.size <$> readIORef envFallbackCache
-            eb  <- Set.size <$> readIORef globalEarlyBuiltinsRef
-            dumpMemStats ("pre-reset fixture #" <> show n) lm fbc eb
+            -- (3rd arg was globalEarlyBuiltinsRef's size — a constant
+            -- ~1168, no diagnostic value — and master removed that
+            -- global; pass 0 to keep dumpMemStats's signature stable.)
+            dumpMemStats ("pre-reset fixture #" <> show n) lm fbc 0
     -- 'globalLoadedModulesRef' (the parsed-module skeleton cache) is
     -- the cross-fixture amortization win: wiping it forces every
     -- 'loadProgramFromSource' run to re-scan ~155 base modules from
@@ -5079,24 +5077,33 @@ resetPerRunGlobals = do
     clearCtorStrictness
     clearCtorIndex
     clearForeignPtrWord8Ranges
-    -- THE master-CI OOM fix.  A heap profile of the full ~600-example
-    -- in-process hspec suite is dominated by ~4 GB of @STACK@ (every
-    -- other band ≤56 MB): interpreted programs fork background threads
-    -- (warp accept loop, System.TimeManager, async, bare @forkIO@) that
-    -- are still alive when 'runFile' has already returned @main@'s
+    -- THE dominant master-CI OOM fix.  A `+RTS -hT` heap profile of the
+    -- full ~600-example in-process hspec suite is dominated by ~4 GB of
+    -- @STACK@ (every other band ≤56 MB): interpreted programs fork
+    -- background threads (warp accept loop, System.TimeManager, async,
+    -- bare @forkIO@) still alive when 'runFile' has returned @main@'s
     -- value.  Nothing reaped them, so their TSO stacks accumulated
     -- across fixtures until the heap cap (the 24-min GC death-spiral
     -- then 'Heap exhausted' in CI).  Kill the prior run's leaked
-    -- threads here, at the next run boundary — by now that program is
-    -- finished and its threads are pure garbage.  Light / pure
-    -- fixtures fork nothing, so this is a no-op for them.
+    -- threads at the next run boundary — that program is finished and
+    -- its threads are pure garbage.  Pure fixtures fork nothing → no-op.
     reapSpawnedThreads
+    -- Scan-cache: master's PR #167 wiped the WHOLE registry here, which
+    -- cold-re-scans base/ByteString every fixture (a measured
+    -- CI-timeout slowdown — see 'clearScanCacheRegistry's Haddock; the
+    -- cache is only ~56 MB anyway, the real ~4 GB was thread STACK,
+    -- reaped just above).  Instead drop only the PRIOR run's
+    -- entry-module source keys (stashed at the end of the prior
+    -- 'loadProgramFromSource' — pre- and post-CPP bytes): unique per
+    -- fixture and never reused, so this bounds per-run scan growth
+    -- while keeping shared library entries warm (no cold re-scan).
+    prevScanKeys <- readIORef _prevEntryScanKeysRef
+    mapM_ evictScanCacheKey prevScanKeys
+    writeIORef _prevEntryScanKeysRef []
     -- Extend the clear* precedent to the remaining append-only globals
-    -- so no per-run state leaks across the ~354-fixture in-process
-    -- suite.  Each is reconstructed on demand next run
-    -- ('registerCbitsDylibs' re-opens libs, 'resolveSymbol' re-resolves
-    -- symbols, 'registerPatSyns' re-runs at module load); see the
-    -- justification comments on each helper.
+    -- (reconstructed on demand next run: 'registerCbitsDylibs' re-opens
+    -- libs, 'resolveSymbol' re-resolves symbols, 'registerPatSyns'
+    -- re-runs at module load).
     FFI.clearOpenLibs
     FFI.clearSymbolCache
     PatSyn.clearPatSyns
@@ -5226,27 +5233,6 @@ setGlobalSearchPath sp im = do
     writeIORef globalSearchPathRef sp
     writeIORef globalIncludeMapRef im
 
--- | Snapshot of the @earlyBuiltinNames@ set computed by
--- 'loadProgramFromSource' / 'loadProgramFromSourceREPL' / etc.  Stored
--- here so the per-FV chase callers ('discoverInModule' inside
--- 'registerInstancesFrom' and friends) can short-circuit on the FULL
--- builtin set, not just on @extraDiscoverShortCircuit@'s 15 entries.
---
--- Without this, dropping a heavily-used builtin shim (@==@, @show@,
--- @print@) makes every per-FV chase walk through Prelude →
--- ghc-internal looking for the dropped name, transitively dragging in
--- @base@ + @ghc-internal@ until the heap exhausts.  The main entry-
--- point discovery already had access to this set; the per-FV chase
--- callers (instance registration, class-default registration) ran with
--- @Set.empty@ on master because @==@ was a builtin so the chase
--- terminated naturally.  After @==@ is dropped, they need the same
--- short-circuit set as the entry-point discovery.
-{-# NOINLINE globalEarlyBuiltinsRef #-}
-globalEarlyBuiltinsRef :: IORef (Set ByteString)
-globalEarlyBuiltinsRef = unsafePerformIO (newIORef Set.empty)
-
-setGlobalEarlyBuiltins :: Set ByteString -> IO ()
-setGlobalEarlyBuiltins = writeIORef globalEarlyBuiltinsRef
 
 -- | Memoised slots produced by the env fallback hook.  Keeps one
 -- 'Thunk' per FQN so successive demand-lookups share evaluation +
@@ -6777,61 +6763,88 @@ discoverInModule
     -> LoadedModule
     -> ByteString
     -> IO ()
--- Stays @Set.empty@ to match master's per-FV chase semantics.  An
--- earlier attempt threaded the full @earlyBuiltinNames@ set in via
--- 'globalEarlyBuiltinsRef' to fix a discovery cascade after the
--- eventual @==@ removal — but it short-circuited too much:
--- class-method names like @pure@ / @return@ that need a per-FV walk
--- through Prelude (so 'registerInstancesFrom' can register their
--- 'Applicative' / 'Monad' instances) got skipped, and
--- @pure 99 :: [Int]@ regressed to @<IO>@ via the result-polymorphic
--- fallback.  Restore @Set.empty@ until a finer-grained shortcut is
--- worked out alongside the actual @==@ removal.
--- 'globalEarlyBuiltinsRef' itself stays — it's harmless on its own
--- and gives the follow-up the data it needs.
+-- @Set.empty@: no short-circuit.  Used by the splice / runtime-
+-- fallback / rewrite-pair callers — they are NOT the discovery-cascade
+-- origin, so they keep the full walk.
+--
+-- The per-FV chase callers ('registerInstancesFrom' / 'registerOne' /
+-- 'registerClassDefaults') must NOT use this variant: once @==@/@/=@
+-- are source-loaded, an empty short-circuit makes the chase recurse
+-- through @GHC.Classes@'s Eq/Ord surface and the transitively-allowed
+-- @GHC.Internal.*@ web until the heap exhausts (the @==@-removal OOM).
+-- They use 'discoverInModuleForChase' instead.  An earlier attempt
+-- threaded the full @earlyBuiltinNames@ set in here and short-
+-- circuited too much — @pure@ / @return@ need a per-FV walk through
+-- Prelude so 'registerInstancesFrom' can register their 'Applicative'
+-- / 'Monad' instances; skipping them regressed @pure 99 :: [Int]@ to
+-- @<IO>@.  'perFVChaseShortCircuit' is the finer-grained set (Eq/Ord
+-- comparison cluster only) that avoids both the cascade and that
+-- regression.
 discoverInModule = discoverInModuleWith Set.empty
 
--- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
--- pairs that have already been walked once — regardless of whether the
--- walk yielded a body, a foreign-alias sentinel, or a "no resolution"
--- result.  The entry-time check turns retry calls (common from runtime
--- env-fallback paths) into O(1) Set lookups instead of repeating the
--- findOrResolveLhs+resolveImport chain.  Cleared per run by
--- 'resetDiscoveryNegCache' (wired into 'resetPerRunGlobals').
+-- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
+-- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
+-- cluster ('perFVChaseShortCircuit') so a source-loaded @GHC.Classes@
+-- does not make the chase fan out across @base@ + @ghc-internal@ (the
+-- @==@/@/=@-removal OOM at 4 GB).  Every other name still gets the
+-- full @Set.empty@-equivalent walk so Applicative/Monad/Semigroup
+-- instance bodies' rewrite targets still load.
+discoverInModuleForChase
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO ()
+discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
+
+-- | Visited set for 'discoverInModuleWith'.  Holds @(lmName, name)@
+-- pairs whose discovery has been STARTED — grey-set / entry-time
+-- semantics, not "completed once".  The pair is inserted before
+-- 'discoverInModuleWith'' recurses (see the guard in
+-- 'discoverInModuleWith'), so the @Set.member@ check both (a) turns
+-- retry calls from runtime env-fallback paths into O(1) lookups and
+-- (b) makes the recursive free-var chase a cycle-safe depth-first
+-- walk.  Cleared per run by 'resetDiscoveryNegCache' (wired into
+-- 'resetPerRunGlobals').
 --
--- == Why \"any walk\", not just \"miss\"
+-- == Why entry-time, and why this covers \"any walk\"
 --
--- The qualified path of 'discoverInModuleWith'' (split-by-dot) does not
--- check 'Map.member name (lmBodies lm)' for an early return — it always
--- runs 'qualifiedBuiltinAlias' / 'resolveQualifiedName' and recurses
--- into the target module before calling 'insertLmBody'.  When the
--- env-fallback hook keeps demanding the same FQN (every reference to
--- @GHC.Internal.Base.a@ from a 'main = a + b' program after
--- 'GHC.Internal.Base' is loaded re-fires this path), the body is
--- already there but the work runs again.  The recursive
--- @discoverInModuleWith targetLm bareName@ inside that path then keeps
--- re-entering 'discoverInModuleWith'' for @(GHC.Internal.Base, "a")@:
--- @"a"@ is a parser-reported but-not-real binding produced by the
--- @a `shiftL#` b = ...@ infix-binding lines in
--- @ghc-internal/.../GHC/Internal/Base.hs@ — the body insertion fires
--- with no recursion (lambda body), the negCache stays empty for that
--- pair, and every future env-fallback for the same name walks it
--- again.  Linux CI's @nix flake check@ trips on this and OOMs at
--- 4 GB / >7 M discover calls (see the 'Heap exhausted' tail in the
--- failing run).  Marking the pair done after every successful walk
--- collapses the cascade to one walk per @(lm, name)@ per run.
+-- 'discoverInModuleWith'' chases every free var of a freshly
+-- discovered binding back through 'discoverInModuleWith', so one
+-- top-level discovery fans out into a DFS over the whole import
+-- closure.  Two failure modes both reduce to "the same @(lm, name)@
+-- is walked again before its first walk is recorded":
+--
+--   * /Env-fallback replay/ — the qualified path of
+--     'discoverInModuleWith'' doesn't early-return on
+--     @Map.member name (lmBodies lm)@; it re-runs
+--     'qualifiedBuiltinAlias' / 'resolveQualifiedName' every time the
+--     fallback hook re-demands an FQN (e.g. repeated
+--     @GHC.Internal.Base.a@ from a @main = a + b@ program).  Linux
+--     @nix flake check@ OOMed at 4 GB / >7 M calls on this.
+--   * /Cyclic / diamond import graphs/ — real base graphs loop
+--     (@Data.ByteString@ → @Foreign.Marshal.Utils@ → @Foreign.Ptr@ →
+--     @GHC.Internal.*@ → back); an exit-time memo lets every
+--     diamond/back-edge re-enter a pair still on the stack.
+--
+-- Recording the pair on entry collapses both: the first call marks
+-- the pair, every re-entry (replay or diamond/cycle) short-circuits
+-- in O(1).  Strictly stronger than the old exit-time "mark after a
+-- successful walk" rule, which it subsumes.
 discoverNegCacheRef :: IORef (Set (ByteString, ByteString))
 discoverNegCacheRef = lsrsDiscoverNegCache legacySchedulerRunState
 
 resetDiscoveryNegCache :: IO ()
 resetDiscoveryNegCache = writeIORef discoverNegCacheRef Set.empty
 
--- | Mark @(lmName lm, name)@ as walked.  Called both on negative
--- results (no local binding, no resolution) and on successful walks
--- (body inserted, foreign-alias sentinel, qualified-path body) so the
--- outer cache check at 'discoverInModuleWith' covers every code path
--- through 'discoverInModuleWith'' uniformly.  Set.insert is idempotent
--- so multiple calls on the same pair are safe.
+-- | Mark @(lmName lm, name)@ as started/visited.  Called once on entry
+-- by the guard in 'discoverInModuleWith' before recursing, and also
+-- from the qualified path on negative results — 'Set.insert' is
+-- idempotent so the overlapping calls are harmless.  The grey-set
+-- invariant (a pair is recorded the moment its walk begins) is what
+-- makes the recursive free-var chase cycle-safe; see the
+-- 'discoverNegCacheRef' Haddock.
 recordDiscoveryMiss :: LoadedModule -> ByteString -> IO ()
 recordDiscoveryMiss lm name =
     modifyIORef' discoverNegCacheRef (Set.insert (lmName lm, name))
@@ -6878,15 +6891,17 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
             System.IO.hFlush System.IO.stderr
         throwIO (DiscoveryCallCapExceeded cntT (lmName lm) name)
 
-    -- Memo: skip pairs we've already walked.  See the
-    -- 'discoverNegCacheRef' Haddock for why this covers ALL outcomes
-    -- (success, miss, foreign alias, qualified body insertion), not
-    -- just the no-resolution case its name suggests.
+    -- Grey-set memo: record the pair on ENTRY (before recursing), not
+    -- in a @finally@ after the walk.  This makes the recursive free-var
+    -- chase a cycle-safe DFS and short-circuits env-fallback replay;
+    -- sound because 'discoverInModuleWith'' is idempotent.  Full
+    -- rationale: 'discoverNegCacheRef' Haddock.
     cache <- readIORef discoverNegCacheRef
     if Set.member (lmName lm, name) cache
         then pure ()
-        else discoverInModuleWith' builtins registry searchPath includeMap lm name
-                `finally` recordDiscoveryMiss lm name
+        else do
+            recordDiscoveryMiss lm name
+            discoverInModuleWith' builtins registry searchPath includeMap lm name
 
 -- | Cap on total 'discoverInModuleWith' calls per process.  Trips a
 -- 'DiscoveryCallCapExceeded' rather than letting a runaway loop OOM
@@ -6907,6 +6922,16 @@ _discoverTotalRef = unsafePerformIO (newIORef 0)
 {-# NOINLINE _memDebugFixtureCounter #-}
 _memDebugFixtureCounter :: IORef Int
 _memDebugFixtureCounter = unsafePerformIO (newIORef 0)
+
+-- | The just-finished run's entry-module scan-cache keys (pre- and
+-- post-CPP source bytes), stashed by 'loadProgramFromSource' so the
+-- NEXT run's 'resetPerRunGlobals' can selectively 'evictScanCacheKey'
+-- them — bounding per-run scan-cache growth without the cold-re-scan
+-- blowup a blanket 'clearScanCacheRegistry' causes (these keys are
+-- unique per fixture; shared library entries are never in this list).
+{-# NOINLINE _prevEntryScanKeysRef #-}
+_prevEntryScanKeysRef :: IORef [ByteString]
+_prevEntryScanKeysRef = unsafePerformIO (newIORef [])
 
 {-# NOINLINE _exportedFieldRegistryMemoRef #-}
 _exportedFieldRegistryMemoRef :: IORef (Map ByteString FieldRegistry)
@@ -8143,6 +8168,39 @@ extraDiscoverShortCircuit = Set.fromList $ map BC.pack
     , "<>", "mappend", "mconcat", "mempty"
     , "fmap", "<*>", ">>=", ">>", "pure", "return"
     ]
+
+-- | Curated subset threaded into the *per-FV chase* of
+-- 'registerInstancesFrom' / 'registerClassDefaults' via
+-- 'discoverInModuleForChase' (NOT just entry-point discovery).
+--
+-- Membership criterion: the name's instances reach the
+-- 'ClassRegistry' WITHOUT a per-FV source walk — Eq via
+-- 'registerDerivedEqInstances' / 'synthStructuralEq' + explicit-
+-- instance catalogue draining ('drainCataloguedInstancesForClass');
+-- Eq/Ord comparison via the eval-time 'classMethodDispatcher', plus
+-- the @class Ord@ default
+-- @compare x y = if x == y then EQ else if x <= y then LT else GT@
+-- whose own FVs are exactly these names and resolve at eval time, not
+-- load time.  So short-circuiting them in the chase cannot break
+-- Eq/Ord instance registration.
+--
+-- Deliberately EXCLUDES @pure@ / @return@ / @>>=@ / @>>@ / @<*>@ /
+-- @fmap@ / @<>@ / @mappend@ / @mconcat@ / @mempty@: their
+-- Applicative/Monad/Functor/Semigroup/Monoid instance *bodies* are
+-- real source bodies whose rewrite targets the chase must demand-load
+-- (the prior regression — threading the full @earlyBuiltinNames@ here
+-- short-circuited @pure@ and made @pure 99 :: [Int]@ fall to @<IO>@;
+-- see the 'discoverInModule' note).  @show@ / @showsPrec@ are
+-- likely-safe future additions, left out as out-of-scope for the
+-- @==@/@/=@ removal.
+--
+-- @min@ / @max@ are the one pair beyond what 'extraDiscoverShortCircuit'
+-- proved safe at entry-point; they sit on the same @class Ord@ surface
+-- and are served by 'ordDispatch'.  If a fixture's discovery total
+-- *rises* after this lands, drop them first.
+perFVChaseShortCircuit :: Set ByteString
+perFVChaseShortCircuit = Set.fromList $ map BC.pack
+    [ "==", "/=", "compare", "<", "<=", ">", ">=", "min", "max" ]
 
 -- | Small demand hints for library entry points whose operationally strict
 -- calls sit behind top-level lambdas. The main discovery walk intentionally

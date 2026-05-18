@@ -260,9 +260,26 @@ eval hooks env ipm = go
         -- their unboxed-tuple result. A case expression must force that
         -- wrapper before matching, but must not eagerly execute source-built
         -- `IO` / `ST` constructors, which use `VCon`.
+        --
+        -- The exception combinators (`catch`, `mask`/`block`/`unblock`,
+        -- `bracket`, `finally`, `onException`, …) are source-loaded and
+        -- destructure the `IO` newtype carrier directly, e.g.
+        --   catch (IO io) handler   = IO $ catch# io handler'
+        --   unsafeUnmask (IO io)    = IO $ unmaskAsyncExceptions# io
+        -- When the scrutinee of such a match is a `VIO` action, running it
+        -- here (via `runIOVal`) would execute the protected computation
+        -- OUTSIDE the `catch#` frame, so an exception it raises escapes the
+        -- intended handler — and the exception-path cleanup (which lives in
+        -- that handler) never runs.  Suppress the eager run whenever an alt
+        -- destructures the `IO`/`ST`/`STM` newtype carrier: `matchPat`'s
+        -- @PCon "IO"@/@"ST"@/@"STM"@ arms wrap the `VIO` lazily as a
+        -- State#-passing function without forcing it, which is exactly the
+        -- newtype-coercion semantics this code needs.
+        let destructuresMonadCarrier =
+                any (\(Alt p _) -> patHeadIsMonadCarrier p) alts
         v <- case v0 of
-            VIO _ -> runIOVal hooks v0
-            _     -> pure v0
+            VIO _ | not destructuresMonadCarrier -> runIOVal hooks v0
+            _                                    -> pure v0
         tryAlts v alts
 
     go (EIf c t e) = do
@@ -654,6 +671,27 @@ eval hooks env ipm = go
 -- inspect the raw bytes captured by the parser's 'captureTypeArg' and
 -- decide how to surface them at the Val level.
 --------------------------------------------------------------------------------
+
+-- | Does this pattern destructure the @IO@ / @ST@ / @STM@ newtype
+-- carrier?  Such a match (e.g. @catch (IO io) h = …@,
+-- @unsafeUnmask (IO io) = …@) must NOT trigger the @ECase@ eager-run
+-- heuristic: running the wrapped @VIO@ there would execute the protected
+-- action outside the surrounding @catch#@ / @mask@ frame and lose the
+-- exception-path cleanup.  See the long note at @go (ECase …)@.
+--
+-- We look through @!p@ / @~p@ / @\@as@ wrappers (GHC accepts
+-- @catch !(IO io)@ — see @catchAny@) so the head ctor is still found.
+patHeadIsMonadCarrier :: Pat -> Bool
+patHeadIsMonadCarrier (PCon n [_]) = n `elem` monadCarrierCtors
+patHeadIsMonadCarrier (PBang inner)  = patHeadIsMonadCarrier inner
+patHeadIsMonadCarrier (PIrref inner) = patHeadIsMonadCarrier inner
+patHeadIsMonadCarrier (PAs _ inner)  = patHeadIsMonadCarrier inner
+patHeadIsMonadCarrier _              = False
+
+-- | The single-field newtype constructors whose runtime carrier is a
+-- @VIO@ thunk the interpreter must hand to 'matchPat' unrun.
+monadCarrierCtors :: [Name]
+monadCarrierCtors = [BC.pack "IO", BC.pack "ST", BC.pack "STM"]
 
 -- | Names we short-circuit when seen as the @f@ in @f \@T@ (value-level
 -- TypeApplications).  Used so @symbolVal \@\"email\" undefined@,

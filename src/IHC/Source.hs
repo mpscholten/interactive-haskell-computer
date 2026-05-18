@@ -22,11 +22,14 @@ module IHC.Source
     , ScanCacheBox
     , readScanCache
     , writeScanCache
-      -- Exposed only so 'IHC.MemDebug' can size it for the
-      -- @IHC_MEM_DEBUG@ probe.  NOT a per-run reset target: this
-      -- registry is the content-addressed cross-run scan-cache
-      -- amortization (see 'mkFreshScanCache') and must survive
-      -- 'IHC.Scheduler.resetPerRunGlobals'.
+      -- 'evictScanCacheKey' is the per-run path
+      -- ('IHC.Scheduler.resetPerRunGlobals' drops each prior fixture's
+      -- entry-source keys); 'clearScanCacheRegistry' is the full wipe
+      -- (NOT used per-run — see its Haddock).
+      -- 'globalScanCacheRegistry' is exported so 'IHC.MemDebug' can
+      -- size it for the @IHC_MEM_DEBUG@ probe.
+    , clearScanCacheRegistry
+    , evictScanCacheKey
     , globalScanCacheRegistry
     ) where
 
@@ -35,7 +38,7 @@ import qualified Data.ByteString as BS
 import Data.Dynamic (Dynamic)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef)
+import Data.IORef (IORef, newIORef, atomicModifyIORef', readIORef, writeIORef)
 import Data.Word (Word8)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -124,6 +127,39 @@ mkFreshScanCache _name bs = unsafePerformIO $ do
 {-# NOINLINE globalScanCacheRegistry #-}
 globalScanCacheRegistry :: IORef (Map ByteString (IORef (Map String Dynamic)))
 globalScanCacheRegistry = unsafePerformIO (newIORef Map.empty)
+
+-- | Drop EVERY entry in the content-addressable scan-cache registry.
+--
+-- ⚠️ NOT wired into 'IHC.Scheduler.resetPerRunGlobals' (anymore).
+-- Master's PR #167 called this per run on the theory that cross-run
+-- scan reuse "only matters if 'globalLoadedModulesRef' persists".  That
+-- is empirically false: the scan cache is content-addressed by source
+-- BYTES, and base\/library\/ByteString module bytes are identical every
+-- run, so a persisted entry lets each fixture skip re-lexing the (very
+-- expensive) @Data.ByteString.*@ et al.  Wiping it per run forces every
+-- heavy fixture to cold-re-scan those — one such fixture measured 8+
+-- min at 100% CPU; across ~14+ such fixtures × ~600 runs the suite goes
+-- from ~13 min to a CI timeout (and the @-hT@ heap profile shows the
+-- scan cache is only ~56 MB anyway — the real ~4 GB OOM was leaked
+-- thread @STACK@, fixed by 'IHC.Builtins.reapSpawnedThreads').
+--
+-- Kept for @IHC_KEEP_MODULE_CACHE@ / manual use.  The per-run path now
+-- uses 'evictScanCacheKey' to drop only each fixture's own entry-source
+-- keys (never the shared library entries) — see 'resetPerRunGlobals'.
+clearScanCacheRegistry :: IO ()
+clearScanCacheRegistry = writeIORef globalScanCacheRegistry Map.empty
+
+-- | Selectively drop ONE source's scan-cache entry, by its exact source
+-- 'ByteString'.  'IHC.Scheduler.resetPerRunGlobals' calls this on the
+-- prior run's entry-module (pre- and post-CPP) bytes: those keys are
+-- unique per fixture and never reused, so dropping them bounds the
+-- per-run scan accumulation WITHOUT touching the content-addressed
+-- base\/library entries that every fixture re-uses (keeping them warm
+-- avoids the catastrophic cold-re-scan that a blanket wipe causes).
+-- O(log n); a miss is a harmless no-op.
+evictScanCacheKey :: ByteString -> IO ()
+evictScanCacheKey bs =
+    atomicModifyIORef' globalScanCacheRegistry (\m -> (Map.delete bs m, ()))
 
 -- | Scan @bs@ once and return the byte offset of the first byte on each
 -- line.  Line 1 always starts at offset 0.
