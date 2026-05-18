@@ -47,7 +47,7 @@ module IHC.Scheduler
     , desugarRecordPats
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try)
+import Control.Exception (throwIO, Exception, catch, SomeException, try, finally)
 import Control.Applicative ((<|>))
 import Foreign.Ptr (nullPtr)
 import qualified Foreign.Ptr as FP
@@ -5050,14 +5050,6 @@ resetPerRunGlobals = do
     clearCtorStrictness
     clearCtorIndex
     clearForeignPtrWord8Ranges
-    -- Scan cache + pat-syn registry: process-global CAFs that
-    -- accumulated unboundedly across the single-process 'ihc-test'
-    -- run and exhausted the macOS 'build' job's -M8G heap.  Clearing
-    -- at run start (before any scanning) reclaims the cross-run
-    -- accumulation while preserving within-run sharing — see the
-    -- 'clearScanCacheRegistry' / 'IHC.PatSyn.clearPatSyns' Haddocks.
-    clearScanCacheRegistry
-    PatSyn.clearPatSyns
     resetNewNameCounter
     resetLocateModuleNegCache
     TR.setGlobalRegistry Map.empty
@@ -6749,53 +6741,47 @@ discoverInModuleForChase
     -> IO ()
 discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
 
--- | Visited set for 'discoverInModuleWith'.  Holds @(lmName, name)@
--- pairs whose discovery has been STARTED — grey-set / entry-time
--- semantics, not "completed once".  The pair is inserted before
--- 'discoverInModuleWith'' recurses (see the guard in
--- 'discoverInModuleWith'), so the @Set.member@ check both (a) turns
--- retry calls from runtime env-fallback paths into O(1) lookups and
--- (b) makes the recursive free-var chase a cycle-safe depth-first
--- walk.  Cleared per run by 'resetDiscoveryNegCache' (wired into
--- 'resetPerRunGlobals').
+-- | Work-done memo for 'discoverInModuleWith'.  Holds @(lmName, name)@
+-- pairs that have already been walked once — regardless of whether the
+-- walk yielded a body, a foreign-alias sentinel, or a "no resolution"
+-- result.  The entry-time check turns retry calls (common from runtime
+-- env-fallback paths) into O(1) Set lookups instead of repeating the
+-- findOrResolveLhs+resolveImport chain.  Cleared per run by
+-- 'resetDiscoveryNegCache' (wired into 'resetPerRunGlobals').
 --
--- == Why entry-time, and why this covers \"any walk\"
+-- == Why \"any walk\", not just \"miss\"
 --
--- 'discoverInModuleWith'' chases every free var of a freshly
--- discovered binding back through 'discoverInModuleWith', so one
--- top-level discovery fans out into a DFS over the whole import
--- closure.  Two failure modes both reduce to "the same @(lm, name)@
--- is walked again before its first walk is recorded":
---
---   * /Env-fallback replay/ — the qualified path of
---     'discoverInModuleWith'' doesn't early-return on
---     @Map.member name (lmBodies lm)@; it re-runs
---     'qualifiedBuiltinAlias' / 'resolveQualifiedName' every time the
---     fallback hook re-demands an FQN (e.g. repeated
---     @GHC.Internal.Base.a@ from a @main = a + b@ program).  Linux
---     @nix flake check@ OOMed at 4 GB / >7 M calls on this.
---   * /Cyclic / diamond import graphs/ — real base graphs loop
---     (@Data.ByteString@ → @Foreign.Marshal.Utils@ → @Foreign.Ptr@ →
---     @GHC.Internal.*@ → back); an exit-time memo lets every
---     diamond/back-edge re-enter a pair still on the stack.
---
--- Recording the pair on entry collapses both: the first call marks
--- the pair, every re-entry (replay or diamond/cycle) short-circuits
--- in O(1).  Strictly stronger than the old exit-time "mark after a
--- successful walk" rule, which it subsumes.
+-- The qualified path of 'discoverInModuleWith'' (split-by-dot) does not
+-- check 'Map.member name (lmBodies lm)' for an early return — it always
+-- runs 'qualifiedBuiltinAlias' / 'resolveQualifiedName' and recurses
+-- into the target module before calling 'insertLmBody'.  When the
+-- env-fallback hook keeps demanding the same FQN (every reference to
+-- @GHC.Internal.Base.a@ from a 'main = a + b' program after
+-- 'GHC.Internal.Base' is loaded re-fires this path), the body is
+-- already there but the work runs again.  The recursive
+-- @discoverInModuleWith targetLm bareName@ inside that path then keeps
+-- re-entering 'discoverInModuleWith'' for @(GHC.Internal.Base, "a")@:
+-- @"a"@ is a parser-reported but-not-real binding produced by the
+-- @a `shiftL#` b = ...@ infix-binding lines in
+-- @ghc-internal/.../GHC/Internal/Base.hs@ — the body insertion fires
+-- with no recursion (lambda body), the negCache stays empty for that
+-- pair, and every future env-fallback for the same name walks it
+-- again.  Linux CI's @nix flake check@ trips on this and OOMs at
+-- 4 GB / >7 M discover calls (see the 'Heap exhausted' tail in the
+-- failing run).  Marking the pair done after every successful walk
+-- collapses the cascade to one walk per @(lm, name)@ per run.
 discoverNegCacheRef :: IORef (Set (ByteString, ByteString))
 discoverNegCacheRef = lsrsDiscoverNegCache legacySchedulerRunState
 
 resetDiscoveryNegCache :: IO ()
 resetDiscoveryNegCache = writeIORef discoverNegCacheRef Set.empty
 
--- | Mark @(lmName lm, name)@ as started/visited.  Called once on entry
--- by the guard in 'discoverInModuleWith' before recursing, and also
--- from the qualified path on negative results — 'Set.insert' is
--- idempotent so the overlapping calls are harmless.  The grey-set
--- invariant (a pair is recorded the moment its walk begins) is what
--- makes the recursive free-var chase cycle-safe; see the
--- 'discoverNegCacheRef' Haddock.
+-- | Mark @(lmName lm, name)@ as walked.  Called both on negative
+-- results (no local binding, no resolution) and on successful walks
+-- (body inserted, foreign-alias sentinel, qualified-path body) so the
+-- outer cache check at 'discoverInModuleWith' covers every code path
+-- through 'discoverInModuleWith'' uniformly.  Set.insert is idempotent
+-- so multiple calls on the same pair are safe.
 recordDiscoveryMiss :: LoadedModule -> ByteString -> IO ()
 recordDiscoveryMiss lm name =
     modifyIORef' discoverNegCacheRef (Set.insert (lmName lm, name))
@@ -6842,17 +6828,15 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
             System.IO.hFlush System.IO.stderr
         throwIO (DiscoveryCallCapExceeded cntT (lmName lm) name)
 
-    -- Grey-set memo: record the pair on ENTRY (before recursing), not
-    -- in a @finally@ after the walk.  This makes the recursive free-var
-    -- chase a cycle-safe DFS and short-circuits env-fallback replay;
-    -- sound because 'discoverInModuleWith'' is idempotent.  Full
-    -- rationale: 'discoverNegCacheRef' Haddock.
+    -- Memo: skip pairs we've already walked.  See the
+    -- 'discoverNegCacheRef' Haddock for why this covers ALL outcomes
+    -- (success, miss, foreign alias, qualified body insertion), not
+    -- just the no-resolution case its name suggests.
     cache <- readIORef discoverNegCacheRef
     if Set.member (lmName lm, name) cache
         then pure ()
-        else do
-            recordDiscoveryMiss lm name
-            discoverInModuleWith' builtins registry searchPath includeMap lm name
+        else discoverInModuleWith' builtins registry searchPath includeMap lm name
+                `finally` recordDiscoveryMiss lm name
 
 -- | Cap on total 'discoverInModuleWith' calls per process.  Trips a
 -- 'DiscoveryCallCapExceeded' rather than letting a runaway loop OOM
