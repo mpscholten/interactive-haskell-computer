@@ -17,6 +17,7 @@ module IHC.PatSyn
     ( PatSyn (..)
     , globalPatSynRef
     , registerPatSyns
+    , clearPatSyns
     , lookupPatSyn
     , substPat
     ) where
@@ -46,6 +47,14 @@ registerPatSyns :: [(ByteString, PatSyn)] -> IO ()
 registerPatSyns ps =
     modifyIORef' globalPatSynRef $ \m ->
         foldr (\(k, v) -> Map.insert k v) m ps
+
+-- | Reset the pattern-synonym registry between
+-- 'loadProgramFromSource' runs so a fresh module graph doesn't see
+-- synonyms scanned from a prior run's modules.  Mirrors the
+-- 'IHC.Builtins.clearCtorIndex' precedent; 'registerPatSyns' re-runs
+-- at module load so any synonym still in scope is re-registered.
+clearPatSyns :: IO ()
+clearPatSyns = writeIORef globalPatSynRef Map.empty
 
 lookupPatSyn :: ByteString -> IO (Maybe PatSyn)
 lookupPatSyn n = do

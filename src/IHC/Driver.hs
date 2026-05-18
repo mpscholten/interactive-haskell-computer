@@ -12,12 +12,13 @@ module IHC.Driver
     , resolveSearchPathFor
     ) where
 
-import Control.Exception (SomeException, catch, try)
+import Control.Exception (SomeException, catch, finally, try)
 import Data.ByteString (ByteString)
 import System.Exit (ExitCode(..))
 import System.FilePath (takeDirectory)
 import System.IO (hPutStrLn, stderr)
 
+import IHC.Builtins (reapSpawnedThreads)
 import IHC.CabalProject
     ( CabalProjectError(..)
     , SearchEnv(..)
@@ -113,11 +114,24 @@ runSource = runWithSearchPath []
 -- * an explicit @exitWith ExitFailure n@ in user code      -> n
 -- * 'ExitSuccess' / a successful run of any 'IO ()'         -> 0
 -- * a residual 'VInt' (pure-value @main@ for old fixtures) -> that int
+-- End-of-run thread reaping ('finally', so it covers the normal
+-- return, the caught 'ExitCode', and any other exception): an
+-- interpreted @main@ can leave background threads alive (warp accept
+-- loop, System.TimeManager, async, bare forkIO).  'resetPerRunGlobals'
+-- reaps the *prior* run's threads at the *next*
+-- 'loadProgramFromSource', which bounds cross-fixture accumulation —
+-- but the LAST run in a process has no next run, so its leaked threads
+-- keep a capability busy-spinning and GHC's threaded RTS never
+-- quiesces on @main@ return: the ~600-example test binary completed
+-- the suite then HUNG at shutdown.  Reaping here makes every run
+-- self-cleaning so the process can exit (and is the correct contract
+-- for any embedder/REPL too).
 runWithSearchPath :: [FilePath] -> Source -> IO Int
 runWithSearchPath searchPath src =
-    runImpl `catch` \e -> case e of
+    (runImpl `catch` \e -> case e of
         ExitSuccess   -> pure 0
-        ExitFailure n -> pure n
+        ExitFailure n -> pure n)
+      `finally` reapSpawnedThreads
   where
     runImpl = do
         (_env, mainT) <- loadProgramFromSource searchPath src
