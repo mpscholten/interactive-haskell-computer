@@ -5041,15 +5041,21 @@ resetPerRunGlobals = do
     -- @master@ @156da98@ and base @ad6b9c1@; prior merged attempts
     -- PR #167 / #178 also failed it) and must be bisected on
     -- @master@'s own history — see PR #179's pinned correction.
-    -- Empirical lead for whoever root-causes it: @IHC_MEM_DEBUG=1@ in
-    -- the flake @checkPhase@ made the suite complete @603/0/72@ with
-    -- ~10× lower discovery — and that is NOT this 'performMajorGC'
-    -- (the falsifier above proves the GC is not the operative factor;
-    -- the real mechanism is unknown).  Kept only as harmless GC
-    -- hygiene that complements 'reapSpawnedThreads' below (which is
-    -- the genuine, locally-verified fix for the ~4 GB leaked-thread
-    -- @STACK@); it does not by itself make CI green and is not claimed
-    -- to.
+    -- One run (@7b3499b@, run @26023998273@) with @IHC_MEM_DEBUG=1@ in
+    -- the flake @checkPhase@ completed @603/0/72@ at ~10× lower
+    -- discovery — but this is NOT a usable lead: @memDebugEnabled@ is
+    -- grep-proven to gate ONLY the read-only @[ihc:mem]@ dump block
+    -- (Scheduler @when memDebugEnabled@ + 'IHC.MemDebug.dumpMemStats',
+    -- nothing in the scan\/discover path), and its only side-effect
+    -- ('performMajorGC') is falsified above.  With no causal code
+    -- path, that clean run is best explained as CI-environment
+    -- nondeterminism (the suite sits right at the @-M8G@ edge; the
+    -- source-prep derivations vary run-to-run — e.g. @ihc-hackage-
+    -- sources-hsc@ logged @11 failed@ conversions that run).  Do NOT
+    -- chase @IHC_MEM_DEBUG@ as a fix.  This 'performMajorGC' is kept
+    -- only as harmless GC hygiene that complements 'reapSpawnedThreads'
+    -- below (the genuine, locally-verified fix for the ~4 GB leaked-
+    -- thread @STACK@); it does not make CI green and is not claimed to.
     rc <- atomicModifyIORef' _resetRunCounter (\k -> let k' = k + 1 in (k', k'))
     when (rc `mod` 25 == 0) performMajorGC
     -- Flag-gated cross-fixture memory probe (@IHC_MEM_DEBUG@).  Runs
