@@ -5444,6 +5444,23 @@ resolveFallback mOwner name = do
         Just t  -> pure (Just t)
         Nothing -> resolveFallbackSource mOwner name
 
+-- | The ghc-bignum modules whose @bigNat*@ / @wordArray*@ helpers
+-- IHC host-shims (Natural-backed runtime, per
+-- @plans/full-ghc-bignum-source-load.md@).  A source-loaded sibling
+-- (e.g. @GHC.Num.Integer.integerMul@) that calls into these has its
+-- FV import-rewritten to a module-qualified FQN; 'resolveFallbackSource'
+-- prefers the registered bare-name builtin shim for these modules
+-- instead of source-loading the incompatible ByteArray# limb-array
+-- body.  @integerMul@ etc. are NOT registered builtins so they still
+-- source-load; only the host-shimmed primops short-circuit.
+hostShimmedBignumModules :: [ByteString]
+hostShimmedBignumModules =
+    [ BC.pack "GHC.Num.BigNat"
+    , BC.pack "GHC.Num.WordArray"
+    , BC.pack "GHC.Num.Primitives"
+    , BC.pack "GHC.Num.Backend"
+    ]
+
 resolveFallbackSource :: Maybe ByteString -> ByteString -> IO (Maybe Thunk)
 resolveFallbackSource mOwner name = do
     mods <- readIORef globalLoadedModulesRef
@@ -5452,7 +5469,36 @@ resolveFallbackSource mOwner name = do
             <|> splitQualifiedDottedOperator name of
         Nothing -> resolveBarePrelude mOwner name mods
         Just (modName, bareName) -> do
-            case Map.lookup modName mods of
+          -- Phase 2 BigNat# carve-out, qualified-resolution path.
+          -- The @bigNat*@ / @wordArray*@ family is intentionally
+          -- host-shimmed (Natural-backed runtime, not source-loaded
+          -- ByteArray# limb arrays — see
+          -- @plans/full-ghc-bignum-source-load.md@).  Direct
+          -- @import GHC.Num.BigNat (bigNatMulWord#)@ already resolves
+          -- to the shim via the bare-name baseEnv, but a source-loaded
+          -- sibling (e.g. @integerMul@'s @IP@ arm calling
+          -- @bigNatMulWord#@) gets its FV import-rewritten to the FQN
+          -- @GHC.Num.BigNat.bigNatMulWord#@, which is NOT a baseEnv key
+          -- — so without this it would source-load the ByteArray#-based
+          -- body and crash with
+          -- @sizeofByteArray#: not a ByteArray: <BigNat# …>@.
+          --
+          -- When the qualified module is one of the host-shimmed
+          -- ghc-bignum modules AND the bare name is a registered
+          -- builtin shim, serve the shim.  @integerMul@ itself is NOT
+          -- a builtin (no @("integerMul", …)@ entry) so it still
+          -- source-loads correctly; only the host-shimmed primops
+          -- short-circuit here.
+          mShim <-
+            if modName `elem` hostShimmedBignumModules
+                then do
+                    baseEnv <- readIORef envBaseForFallbackRef
+                    pure (HashMap.lookup bareName baseEnv)
+                else pure Nothing
+          case mShim of
+            Just t  -> pure (Just t)
+            Nothing ->
+              case Map.lookup modName mods of
                 Nothing    -> do
                     -- A qualified rewrite can point directly at a source
                     -- module that has not been loaded yet, e.g.
