@@ -6335,6 +6335,15 @@ buildFieldEnv reg = do
                              <> " fields, index " <> show idx
                              <> " out of range"))
                     Nothing -> tryIsStringFallback fieldName clauses v conName
+            -- Nullary class methods like @mempty@ need result-type
+            -- evidence before a newtype field accessor can project them.
+            -- A single-constructor field registry gives us that evidence.
+            VClassMethod _ _ _ go
+              | [(conName, _)] <- clauses -> do
+                  dummyT <- newWHNFThunk VUnit
+                  resolved <- go [conName] dummyT
+                  resolvedT <- newWHNFThunk resolved
+                  access fieldName clauses resolvedT
             _
               -- Newtype-transparent fallback: if the field-registry
               -- entry for this name has a SINGLE constructor with a

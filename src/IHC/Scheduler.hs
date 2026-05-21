@@ -1914,7 +1914,8 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
   where
     evalOneMethodWith _e _rw _mn Nothing = pure (identifyingPlaceholder cls _mn)
     evalOneMethodWith e rw _mn (Just lhs) = do
-        r <- try (evalMethodWithLazy e lm rw (_mn, lhs)) :: IO (Either SomeException Val)
+        r <- try (evalMethodWithLazy e lm rw (Just (cls, typ, _mn)) (_mn, lhs))
+                :: IO (Either SomeException Val)
         case r of
             Right v -> pure v
             Left  _ -> pure (identifyingPlaceholder cls _mn)
@@ -2026,12 +2027,20 @@ findRuntimeCtorsForType registry searchPath includeMap seen lm ty
 -- 'discoverInModule' work has run (either via the per-FV pre-pass in
 -- 'registerOne' itself, or via later REPL-level discovery), so the
 -- thunk's captured env resolves successfully.
-evalMethodWithLazy :: Env -> LoadedModule -> Map ByteString ByteString -> (ByteString, BindingLhs) -> IO Val
-evalMethodWithLazy env lm rewrites (_, lhs) = do
+evalMethodWithLazy
+    :: Env
+    -> LoadedModule
+    -> Map ByteString ByteString
+    -> Maybe (ByteString, ByteString, ByteString)
+    -> (ByteString, BindingLhs)
+    -> IO Val
+evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
     expr0 <- Parser.parseBodyExprWithFixity
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
-    let expr1 = desugarRecordPats (lmFieldReg lm)
-                 (desugarRecordCons (lmFieldReg lm) expr0)
+    let expr0' = lowerInstanceCoerceMethod methodCtx
+               $ lowerHashDotCoerce methodName expr0
+        expr1 = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0')
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
@@ -3529,6 +3538,80 @@ evalDefaultMethodWith env lm rewrites lhs = do
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
     t <- newThunk envWithOwner expr
     force legacyHooks t
+
+-- | Runtime lowering for the standard library's coerce-composition helper:
+--
+-- > (#.) :: Coercible b c => (b -> c) -> (a -> b) -> (a -> c)
+-- > (#.) _f = coerce
+--
+-- GHC erases the left operand after the type checker proves the coercion.
+-- IHC does not yet carry enough type evidence at runtime for 'coerce' to
+-- reconstruct newtype wrappers like 'Any'/'All', so evaluating the source
+-- body literally turns @Any #. p@ into just @p@ and Semigroup dispatch sees
+-- @Bool@ instead of @Any@.  Lower only this exact source shape to ordinary
+-- composition, preserving the wrapper/accessor value that the interpreter
+-- needs while still loading the binding from source.
+lowerHashDotCoerce :: ByteString -> Expr -> Expr
+lowerHashDotCoerce name expr
+    | name == BC.pack "#."
+    , isHashDotCoerceBody expr = hashDotCompositionExpr
+    | otherwise = expr
+  where
+    isHashDotCoerceBody (ELam _ (EVar v)) = isCoerceName v
+    isHashDotCoerceBody _                 = False
+
+    hashDotCompositionExpr =
+        let f = BC.pack "$ihc_hashdot_f"
+            g = BC.pack "$ihc_hashdot_g"
+            x = BC.pack "$ihc_hashdot_x"
+        in ELam f
+            (ELam g
+                (ELam x
+                    (EApp (EVar f)
+                        (EApp (EVar g) (EVar x)))))
+
+-- | Source-loaded @All@/@Any@ define Semigroup methods through
+-- @coerce (&&)@ / @coerce (||)@. A plain identity 'coerce' would feed
+-- wrapped @All@/@Any@ values to the Bool operators. Lower those exact
+-- instance methods to the wrapper/accessor form the tagged runtime needs.
+lowerInstanceCoerceMethod :: Maybe (ByteString, ByteString, ByteString) -> Expr -> Expr
+lowerInstanceCoerceMethod (Just (cls, typ, methodName)) expr
+    | cls == BC.pack "Semigroup"
+    , methodName == BC.pack "<>"
+    , baseName typ == BC.pack "All"
+    , isCoerceOf (BC.pack "&&") expr =
+        newtypeBoolSemigroupExpr (BC.pack "All") (BC.pack "getAll") (BC.pack "&&")
+    | cls == BC.pack "Semigroup"
+    , methodName == BC.pack "<>"
+    , baseName typ == BC.pack "Any"
+    , isCoerceOf (BC.pack "||") expr =
+        newtypeBoolSemigroupExpr (BC.pack "Any") (BC.pack "getAny") (BC.pack "||")
+lowerInstanceCoerceMethod _ expr = expr
+
+isCoerceOf :: ByteString -> Expr -> Bool
+isCoerceOf op (EApp (EVar coerceName) (EVar opName)) =
+    isCoerceName coerceName && baseName opName == op
+isCoerceOf _ _ = False
+
+isCoerceName :: ByteString -> Bool
+isCoerceName v =
+    v == BC.pack "coerce"
+    || BC.isSuffixOf (BC.pack ".coerce") v
+
+baseName :: ByteString -> ByteString
+baseName v =
+    case BC.elemIndexEnd (toEnum (fromEnum '.')) v of
+        Just idx -> BC.drop (idx + 1) v
+        Nothing  -> v
+
+newtypeBoolSemigroupExpr :: ByteString -> ByteString -> ByteString -> Expr
+newtypeBoolSemigroupExpr ctor accessor boolOp =
+    let x = BC.pack "$ihc_sg_x"
+        y = BC.pack "$ihc_sg_y"
+        xBool = EApp (EVar accessor) (EVar x)
+        yBool = EApp (EVar accessor) (EVar y)
+        combined = EApp (EApp (EVar boolOp) xBool) yBool
+    in ELam x (ELam y (EApp (EVar ctor) combined))
 
 -- | For each loaded module, read its collected bodies out of the
 -- IORef and key them by either the unqualified local name (entry
@@ -6109,16 +6192,17 @@ resolveFallbackSource mOwner name = do
                 case mExpr of
                     Nothing -> pure Nothing
                     Just expr0 -> do
+                        let expr0' = lowerHashDotCoerce bareName expr0
                         searchPath <- readIORef globalSearchPathRef
                         includeMap <- readIORef globalIncludeMapRef
                         transientReg <- newIORef (Map.map Loaded mods)
                         visibleFields <-
-                            if needsRecordFields expr0
+                            if needsRecordFields expr0'
                                 then visibleFieldRegistryFor transientReg searchPath includeMap owner
-                                        (recordSyntaxFieldNames (lmFieldReg owner) expr0)
+                                        (recordSyntaxFieldNames (lmFieldReg owner) expr0')
                                 else pure (lmFieldReg owner)
                         let expr = desugarRecordPats visibleFields
-                                     (desugarRecordCons visibleFields expr0)
+                                     (desugarRecordCons visibleFields expr0')
                         modifyIORef' (lmBodies owner) (Map.insert bareName expr)
                         buildSlotFromOwner mods owner bareName
 
@@ -7088,13 +7172,14 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                             -- main".
                                             throwIO parseErr
                             Right expr0 -> do
+                                let expr0' = lowerHashDotCoerce name expr0
                                 visibleFields <-
-                                    if needsRecordFields expr0
+                                    if needsRecordFields expr0'
                                         then visibleFieldRegistryFor registry searchPath includeMap lm
-                                                (recordSyntaxFieldNames (lmFieldReg lm) expr0)
+                                                (recordSyntaxFieldNames (lmFieldReg lm) expr0')
                                         else pure (lmFieldReg lm)
                                 let expr = desugarRecordPats visibleFields
-                                             (desugarRecordCons visibleFields expr0)
+                                             (desugarRecordCons visibleFields expr0')
                                 insertLmBody lm name expr
                                 -- Recurse into every free var. Qualified ones
                                 -- will be routed on the next call.

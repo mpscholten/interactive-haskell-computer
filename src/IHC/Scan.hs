@@ -275,6 +275,14 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                                 let acc' = if opName `elem` acc then acc else opName : acc
                                 go acc' curSkipped
                             Nothing -> go acc cur'
+            TkLUnbox | tkCol tok == 1 -> do
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                case peekPrefixOpBinding src startCur of
+                    Just (opName, curAfterClose) -> do
+                        curSkipped <- skipThroughPrefixOpBinding src opName curAfterClose
+                        let acc' = if opName `elem` acc then acc else opName : acc
+                        go acc' curSkipped
+                    Nothing -> go acc cur'
             -- Phase 3.2 + 3.4: explicitly skip top-level type / type family /
             -- type instance declarations (DataKinds + TypeFamilies). These are
             -- not value bindings and must not be reported as names.
@@ -383,6 +391,15 @@ skipThroughPrefixOpBinding src opName curAfterClose = do
                                     Nothing -> pure cur
                                     Just (_, curAfter') -> loopClauses curAfter'
                             _ -> pure cur
+            TkLUnbox | tkCol peek == 1 ->
+                let startCur = Cursor (tkStart peek) (tkLine peek) (tkCol peek)
+                in case peekPrefixOpBinding src startCur of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterClose'
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
             -- Next clause in infix form: `x op y = ...`
             TkIdent _ | tkCol peek == 1 ->
                 case peekInfixOp src curAfterPeek of
@@ -544,6 +561,19 @@ peekPrefixOpBinding src cur0 =
                         TkRParen -> Just (opName, c3)
                         _        -> Nothing
                 Nothing -> Nothing
+        -- @(#.)@ lexes as @TkLUnbox@ followed by @.@ and @)@,
+        -- because the lexer must also support unboxed tuples. Treat
+        -- the immediately-closed form as an operator group.
+        TkLUnbox ->
+            let (t2, c2) = peekSigTokFrom src c1
+            in case tkKind t2 of
+                TkRParen -> Just (BC.pack "#", c2)
+                _ | Just suffix <- tokenOpNameBS (tkKind t2) ->
+                    let (t3, c3) = peekSigTokFrom src c2
+                    in case tkKind t3 of
+                        TkRParen -> Just (BC.pack "#" <> suffix, c3)
+                        _        -> Nothing
+                _ -> Nothing
         _ -> Nothing
 
 -- | Skip a balanced parenthesised expression. Cursor must be positioned
@@ -655,6 +685,12 @@ findBinding src ref target = do
                             Just (opName, curAfterBackticks) ->
                                 handleParenPatInfix acc opName tok curAfterBackticks
                             Nothing -> go acc cur'
+            TkLUnbox | tkCol tok == 1 ->
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                in case peekPrefixOpBinding src startCur of
+                    Just (opName, curAfterClose) ->
+                        handlePrefixOp acc opName tok curAfterClose
+                    Nothing -> go acc cur'
             -- Phase 3.2 + 3.4: explicitly skip type family / type instance /
             -- type synonym declarations so they are never mistaken for bindings.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
@@ -765,6 +801,16 @@ findBinding src ref target = do
                                                 (tkStart tok, snd (clausePats cl)) }
                                         in collectMoreOpClauses opName (cl' : acc) curNext
                             _ -> pure (acc, cur)
+            TkLUnbox | tkCol tok == 1 ->
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                in case peekPrefixOpBinding src startCur of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterClose'
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                collectMoreOpClauses opName (cl : acc) curNext
+                    _ -> pure (acc, cur)
             -- Infix clause `arg op arg = ...`
             TkIdent _ | tkCol tok == 1 ->
                 case peekInfixOp src curAfterTok of

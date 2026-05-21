@@ -1034,6 +1034,15 @@ matchPat hooks (PCon "()" []) VUnit = pure (Just [])
 -- but pattern @Proxy@ (nullary) should still match — the payload is
 -- type-level metadata that user code doesn't observe via the ctor.
 matchPat hooks (PCon "Proxy" []) (VCon "Proxy" _) = pure (Just [])
+-- Coercible Bool newtypes from base, notably @Any@ and @All@, can reach
+-- source-loaded Bool functions through @coerce@-based definitions before
+-- IHC has full type-directed coercion.  Expose their single Bool field
+-- when the demanded pattern is exactly @True@ or @False@.
+matchPat hooks pat@(PCon boolCtor []) (VCon wrapper [innerT])
+    | boolCtor == BC.pack "True" || boolCtor == BC.pack "False"
+    , wrapper == BC.pack "Any" || wrapper == BC.pack "All" = do
+        inner <- force hooks innerT
+        matchPat hooks pat inner
 -- Boxed prim constructors are host-backed wrappers over the interpreter's
 -- primitive runtime values. Pattern matching must therefore treat
 -- @I# x@ / @W# x@ / @W8# x@ as wrappers around 'VInt' and @C# x@ as a
