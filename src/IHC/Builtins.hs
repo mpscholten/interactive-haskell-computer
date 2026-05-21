@@ -75,6 +75,7 @@ import System.IO
     , hFlush
     , hGetLine
     , hPutBuf
+    , hPutChar
     , hPutStr
     , hPutStrLn
     , hSetBuffering
@@ -577,6 +578,7 @@ builtins reg =
     , ("openFile",    openFileB)
     , ("hClose",      hCloseB)
     , ("hPutStr",     hPutStrB)
+    , ("hPutChar",    hPutCharB)
     , ("hPutStrLn",   hPutStrLnB)
     , ("hGetLine",    hGetLineB)
     , ("hFlush",      hFlushB)
@@ -1830,7 +1832,7 @@ forceInstanceMethod (Just v) = do
           | otherwise        -> pure (Just v')
         Left  _              -> pure Nothing
   where
-    isPlaceholder (VCon n []) = n == BC.pack "<ihc-method-placeholder>"
+    isPlaceholder (VCon n []) = BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
     isPlaceholder _           = False
 
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
@@ -3249,6 +3251,16 @@ hPutStrB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     sv <- force legacyHooks b
     s  <- valToString sv
     hPutStr h s
+    pure VUnit
+
+hPutCharB :: IO Val
+hPutCharB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
+    h <- force legacyHooks a >>= requireHandle "hPutChar"
+    cv <- force legacyHooks b
+    c <- case cv of
+        VChar ch -> pure ch
+        _        -> error ("hPutChar: not a Char: " <> showValForDebug cv)
+    hPutChar h c
     pure VUnit
 
 hPutStrLnB :: IO Val

@@ -4253,6 +4253,8 @@ parseTypeAtoms toks = do
 
 parseAtom :: [TTok] -> Maybe (Type, [TTok])
 parseAtom toks = case toks of
+    (TTCon q : TTDot : TTCon n : rest) -> Just (TyCon (q <> BC.pack "." <> n), rest)
+    (TTVar q : TTDot : TTCon n : rest) -> Just (TyCon (q <> BC.pack "." <> n), rest)
     (TTCon n : rest)      -> Just (TyCon n, rest)
     (TTVar n : rest)      -> Just (TyVar n, rest)
     (TTUnderscore : rest) -> Just (TyVar (BC.pack "_"), rest)

@@ -116,6 +116,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -3079,7 +3080,7 @@ classMethodDispatcher reg cls methodName = selfVal
         -- to ParsecT — that instance defines '*>' / '<*' / '<*>' /
         -- 'fmap' / '>>=' explicitly.
         --
-        -- IO / STM are tried BEFORE ParsecT for @pure@ / @return@
+        -- IO / ST / STM are tried BEFORE ParsecT for @pure@ / @return@
         -- specifically: warp's @waitForZero@ does
         -- @atomically $ do { x <- readTVar v; when (x > 0) retry }@,
         -- whose @when False retry@ tail evaluates to @pure ()@ in STM
@@ -3093,7 +3094,7 @@ classMethodDispatcher reg cls methodName = selfVal
         -- exists — at which point IO is the safer default.
         | clsName == BC.pack "Applicative"
         , method `elem` map BC.pack ["pure"]
-        = [BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
+        = [BC.pack "IO", BC.pack "ST", BC.pack "STM", BC.pack "ParsecT"]
         | clsName == BC.pack "Applicative"
         , method `elem` map BC.pack ["*>", "<*", "<*>", "liftA2"]
         = [BC.pack "ParsecT"]
@@ -3102,7 +3103,7 @@ classMethodDispatcher reg cls methodName = selfVal
         = [BC.pack "ParsecT"]
         | clsName == BC.pack "Monad"
         , method `elem` map BC.pack ["return"]
-        = [BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
+        = [BC.pack "IO", BC.pack "ST", BC.pack "STM", BC.pack "ParsecT"]
         | clsName == BC.pack "Monad"
         , method `elem` map BC.pack [">>=", ">>"]
         = [BC.pack "ParsecT"]
@@ -3537,10 +3538,54 @@ exportBodies registry searchPath includeMap builtinNames lm = do
         -- For NON-ENTRY modules, sentinels are useful: the rewrite pass
         -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
         -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
-        [ (keyPrefix <> n, maybe (transform e) EVar (specialSelfAliasTarget lm n e))
+        [ ( keyPrefix <> n
+          , preserveNullaryClassResultType n
+                (maybe (transform e) EVar (specialSelfAliasTarget lm n e))
+          )
         | (n, e) <- Map.toList bs
         , not (isSelfAliasIn lm n e) || isJust (specialSelfAliasTarget lm n e)
         ]
+  where
+    preserveNullaryClassResultType n e =
+        case e of
+            EVar v
+                | isNullaryClassMethodName (lastNameComponent v)
+                , Just sig <- Map.lookup n (lmTypeSigs lm)
+                , Just tag <- schemeResultTag sig
+                -> ETyApp e tag
+            _ -> e
+
+    isNullaryClassMethodName n =
+        n == BC.pack "maxBound"
+     || n == BC.pack "minBound"
+     || n == BC.pack "mempty"
+
+    schemeResultTag (Scheme _ _ body) =
+        let (_, resultTy) = tyArrowArgs body
+        in typeResultTag resultTy
+
+    typeResultTag ty = case ty of
+        TyCon n -> Just (lastNameComponent n)
+        -- The type scanner can represent an alias-qualified constructor
+        -- like @P.Int@ as @TyApp (TyCon "P") (TyCon "Int")@.  That is a
+        -- qualifier, not a real type application, so the dispatch tag is
+        -- the RHS constructor.
+        TyApp (TyCon q) (TyCon n)
+            | q `Set.member` importedTypeQualifiers -> Just (lastNameComponent n)
+        TyApp h _ -> typeResultTag h
+        _ -> Nothing
+
+    importedTypeQualifiers =
+        Set.fromList
+            [ q
+            | imp <- mhImports (lmHeader lm)
+            , q <- maybe [impModule imp] (:[]) (impAlias imp)
+            ]
+
+    lastNameComponent n =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
 
 -- | Names of builtins that are FFI/primop-backed and should ALWAYS resolve
 -- to the host builtin, never to source definitions. These are excluded from
@@ -6971,13 +7016,13 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                         -- are not yet supported.  Skip them and fall through to
                         -- import resolution so the evaluator can still find the
                         -- name via a re-export.
-                        mExpr <- (Just <$> Parser.parseBodyExprWithFixity
+                        eExpr <- try (Parser.parseBodyExprWithFixity
                                             (lmSource lm)
                                             (lmFixity lm)
                                             (lhsClauses lhs))
-                                    `catch` (\(_ :: ParseError) -> pure Nothing)
-                        case mExpr of
-                            Nothing
+                                    :: IO (Either ParseError Expr)
+                        case eExpr of
+                            Left parseErr
                                 | Set.member name builtins ->
                                     recordDiscoveryMiss lm name
                                 | otherwise -> do
@@ -6991,8 +7036,16 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                             insertLmBody lm name
                                                 (EVar (srcMod <> BC.pack "." <> name))
                                         Nothing ->
-                                            recordDiscoveryMiss lm name
-                            Just expr0 -> do
+                                            -- Unsupported boot-library
+                                            -- definitions still get swallowed
+                                            -- by the caller-side free-var
+                                            -- discovery guards. For the entry
+                                            -- binding itself, keep the real
+                                            -- file:line:col parse diagnostic
+                                            -- instead of degrading to "no
+                                            -- main".
+                                            throwIO parseErr
+                            Right expr0 -> do
                                 visibleFields <-
                                     if needsRecordFields expr0
                                         then visibleFieldRegistryFor registry searchPath includeMap lm

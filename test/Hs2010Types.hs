@@ -9,7 +9,9 @@ import Test.Hspec
 
 import IHC.AST
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
+import IHC.Scan (scanTypeSigs)
 import IHC.Source (Source, mkSource)
+import IHC.TypeAST (Scheme(..), Type(..))
 
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
@@ -40,6 +42,9 @@ spec = describe "Hs2010 — Types" $ do
             "x :: Int" `shouldParseTo` ETyApp (EVar "x") "Int"
         it "7.1.3 qualified type constructor — `M.T`" $
             "x :: M.T" `shouldParseTo` ETyApp (EVar "x") "M.T"
+        it "7.1.3 qualified type constructor — top-level signature scanner preserves `M.T`" $ do
+            sigs <- scanTypeSigs (mkSrc "x :: M.T\nx = undefined\n")
+            sigs `shouldBe` [("x", Scheme [] [] (TyCon "M.T"))]
         it "7.1.4 unit type constructor — `()`" $
             "x :: ()" `shouldParseTo` ETyApp (EVar "x") "()"
         it "7.1.5 list type constructor (prefix) — `[]`" $

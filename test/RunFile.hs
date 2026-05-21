@@ -1168,6 +1168,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "42\n"
 
+    it "runST STRef counter: source-loaded ST actions sequence correctly" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/sem_runst_basic.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "10\n"
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------
@@ -1338,15 +1343,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left _e -> pure ()
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
-        -- The 'getString' record-accessor failure has been bridged
-        -- via an OverloadedStrings-style fallback in 'buildFieldEnv':
-        -- when the accessor sees a [Char] cons-list where it expected
-        -- a 'StaticString', it synthesises the appending closure
-        -- @(s ++)@ that the IsString instance would have produced.
-        -- That advances rendering past the StaticString boundary; the
-        -- next blocker is in the chunk-concatenation path
-        -- ('concatMap: not a list: ...').  Retarget when that one
-        -- falls.
+        -- With the HSX/blaze source cache populated, this reaches the
+        -- renderer and currently fails in the chunk-concatenation path
+        -- ('concatMap: not a list: ...').  On a fresh dev machine where
+        -- scripts/cache-hsx-deps.sh has not been run, the legitimate
+        -- earlier blocker is the missing source-loaded renderer binding.
         r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
         case (r :: Either SomeException Int) of
             Right code -> expectationFailure
@@ -1355,4 +1356,5 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             Left e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
-                    (\m -> "concatMap: not a list" `isInfixOf` m)
+                    (\m -> "concatMap: not a list" `isInfixOf` m
+                        || "unbound variable `Text.Blaze.Html.Renderer.String.renderHtml`" `isInfixOf` m)

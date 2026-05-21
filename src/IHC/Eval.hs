@@ -96,7 +96,11 @@ resolveTypedMethod hooks reg cls method tag = do
                     -- @GHC.Internal.ST@ on startup).
                     mFallback <- lookupClassMethodFallback legacyHooks cls method
                     case mFallback of
-                        Just v  -> forceMethodVal hooks v
+                        Just v  -> do
+                            forced <- forceMethodVal hooks v
+                            if not (isPlaceholder forced)
+                                then pure forced
+                                else noInstance
                         Nothing -> error ("IHC.Eval.ETypedMethod: no instance `"
                                         <> BC.unpack cls <> " " <> BC.unpack tag
                                         <> "` for method `" <> BC.unpack method <> "`")
@@ -104,21 +108,33 @@ resolveTypedMethod hooks reg cls method tag = do
     tryResolve = do
         mMethod <- lookupInstanceMethod reg cls tag method
         case mMethod of
-            Just v | not (isPlaceholder v) -> pure (Just v)
+            Just v -> do
+                forced <- forceMethodVal hooks v
+                if not (isPlaceholder forced)
+                    then pure (Just forced)
+                    else tryFallbacks (fallbackList cls method)
             _ -> tryFallbacks (fallbackList cls method)
 
     isPlaceholder (VCon n []) =
-        n == BC.pack "<ihc-method-placeholder>"
+        BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
     isPlaceholder _ = False
 
     tryFallbacks [] = pure Nothing
     tryFallbacks ((c, m) : rest) = do
         v <- lookupInstanceMethod reg c tag m
         case v of
-            Just vv | not (isPlaceholder vv) -> pure (Just vv)
+            Just vv -> do
+                forced <- forceMethodVal hooks vv
+                if not (isPlaceholder forced)
+                    then pure (Just forced)
+                    else tryFallbacks rest
             _ -> tryFallbacks rest
 
     fallbackList = typedMethodFallbacks
+
+    noInstance = error ("IHC.Eval.ETypedMethod: no instance `"
+                      <> BC.unpack cls <> " " <> BC.unpack tag
+                      <> "` for method `" <> BC.unpack method <> "`")
 
 -- | Known equalities between class methods — used when an instance
 -- relies on the class's default body instead of providing a
@@ -440,8 +456,9 @@ eval hooks env ipm = go
     tryTypedNullaryClassMethod e ty =
         case e of
             EVar method
-                | method == BC.pack "maxBound"
-               || method == BC.pack "minBound" -> do
+                | let bareMethod = lastNameComponent method
+                , bareMethod == BC.pack "maxBound"
+               || bareMethod == BC.pack "minBound" -> do
                     mReg <- getSharedClassReg legacyHooks
                     case mReg of
                         Nothing -> pure Nothing
@@ -450,7 +467,7 @@ eval hooks env ipm = go
                             -- 'lookupInstanceMethod' drains the Stage-2
                             -- lazy-instance catalogue on miss.
                             mv <- lookupInstanceMethod classReg
-                                    (BC.pack "Bounded") tag method
+                                    (BC.pack "Bounded") tag bareMethod
                             case mv of
                                 Nothing -> pure Nothing
                                 Just v -> do
@@ -460,6 +477,11 @@ eval hooks env ipm = go
                                         Right v' -> pure (Just v')
                                         Left _   -> pure Nothing
             _ -> pure Nothing
+      where
+        lastNameComponent n =
+            case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+                Just idx -> BC.drop (idx + 1) n
+                Nothing  -> n
 
     -- | Helper: try to elaborate @e@ under the annotation @ty@.
     -- Returns 'Just' if elaboration rewrote something; 'Nothing'
@@ -549,7 +571,7 @@ eval hooks env ipm = go
                 Nothing -> tryFb rest tag
 
         nonPlaceholder mv = case mv of
-            Just (VCon n []) | n == BC.pack "<ihc-method-placeholder>" -> Nothing
+            Just (VCon n []) | BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n -> Nothing
             _ -> mv
 
         go (ETypedMethod cls method tag) = checkOne cls method tag
