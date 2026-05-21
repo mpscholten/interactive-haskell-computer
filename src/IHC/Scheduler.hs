@@ -4327,7 +4327,18 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
         case mhExports (lmHeader tm) of
             ExportAll    -> pure []
             ExportList xs -> do
-                let exportedNames = [ n | ExportName n <- xs ]
+                -- Only aliases to already-materialised thunks can be
+                -- useful here.  Chasing every named re-export in large
+                -- gateway modules like Prelude turns a small ByteString
+                -- program into a broad import-graph search even though
+                -- almost none of those names have slots in this run.
+                let materializedBareNames = Set.fromList
+                        [ bareNameOfKey key | key <- Map.keys thunkByKey ]
+                    exportedNames =
+                        [ n
+                        | ExportName n <- xs
+                        , Set.member n materializedBareNames
+                        ]
                     missingNames  = filter (\n ->
                         case Map.lookup n bodiesMap of
                             Just expr -> isSelfAliasIn tm n expr && not (isJust (specialSelfAliasTarget tm n expr))
@@ -4335,6 +4346,11 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                         ) exportedNames
                 pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm [lmName tm]) missingNames
                 pure pairs
+
+    bareNameOfKey key =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) key of
+            Just idx -> BC.drop (idx + 1) key
+            Nothing  -> key
 
     -- | Find the Thunk for @n@ by walking @tm@'s unqualified imports.
     findThunkInImports reg thunkByKey tm visited n = do
