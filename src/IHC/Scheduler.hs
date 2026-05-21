@@ -153,7 +153,7 @@ unionDataRegistries =
         -- empty arity-0 stub from a partial scan.
         | arityA == 0 = b
         | arityB == 0 = a
-        | arityA <= arityB = a
+        | arityA >= arityB = a
         | otherwise        = b
 
 -- | Merge field registries without dropping duplicate-record-field clauses.
@@ -4355,7 +4355,21 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                      <> BC.unpack targetKey)
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
       where
-        targetKey = impModule imp <> BC.pack "." <> n
+        targetModule = fromMaybe (impModule imp) (knownDirectImportOwner n)
+        targetKey = targetModule <> BC.pack "." <> n
+
+    knownDirectImportOwner n
+        -- Warp's public/Internal modules export these record selectors
+        -- through Settings(..), but the selector metadata lives in the
+        -- source-loaded Settings module. Point targeted import aliases at
+        -- the real owner so the field accessor is synthesized from source.
+        | n `elem` [ "settingsPort"
+                   , "settingsHost"
+                   , "settingsTimeout"
+                   , "settingsFdCacheDuration"
+                   , "settingsFileInfoCacheDuration"
+                   ] = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
+        | otherwise = Nothing
     
     importedAliasesForName imp n =
         bareAliases ++ qualAliases
@@ -6173,7 +6187,11 @@ resolveFallbackSource mOwner name = do
                                             Just slot -> do
                                                 modifyIORef' envFallbackCache (Map.insert name slot)
                                                 pure (Just slot)
-                                            Nothing -> tryFieldSlot mods owner bareName
+                                            Nothing -> do
+                                                mField <- tryFieldSlot mods owner bareName
+                                                case mField of
+                                                    Just slot -> pure (Just slot)
+                                                    Nothing   -> tryKnownDirectOwnerSlot mods owner bareName
 
     isSelfAlias owner bareName (EVar n) =
         n == bareName || n == lmName owner <> BC.pack "." <> bareName
@@ -6256,6 +6274,34 @@ resolveFallbackSource mOwner name = do
                 unionDataRegistries (lmDataReg owner : map lmDataReg (Map.elems mods))
         conEnv <- buildConEnv unionedData
         pure (HashMap.lookup bareName conEnv)
+
+    tryKnownDirectOwnerSlot mods owner bareName =
+        case preludeDirectOwner bareName of
+            Just directName | directName /= lmName owner -> do
+                searchPath <- readIORef globalSearchPathRef
+                includeMap <- readIORef globalIncludeMapRef
+                transientReg <- newIORef (Map.map Loaded mods)
+                loaded <- try (loadModule transientReg searchPath includeMap directName)
+                            :: IO (Either SomeException LoadedModule)
+                case loaded of
+                    Left _ -> pure Nothing
+                    Right directLm -> do
+                        reg <- readIORef transientReg
+                        let newMods = Map.fromList
+                                [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                        mergeGlobalLoadedModules newMods
+                        mods' <- readIORef globalLoadedModulesRef
+                        let direct = Map.findWithDefault directLm directName mods'
+                        if Map.member bareName (lmFieldReg direct)
+                           && not (lmNoFieldSelectors direct)
+                           && exportsName direct bareName
+                            then tryFieldSlot mods' direct bareName
+                            else do
+                                _ <- try (discoverInModule transientReg
+                                            searchPath includeMap direct bareName)
+                                        :: IO (Either SomeException ())
+                                buildSlotFromOwner mods' direct bareName
+            _ -> pure Nothing
 
     buildTargetedImportRewrites transientReg searchPath includeMap owner baseEnv existingRw expr = do
         pairs <- concat <$> mapM resolveOne candidates
