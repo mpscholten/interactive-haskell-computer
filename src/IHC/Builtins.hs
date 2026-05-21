@@ -4231,7 +4231,10 @@ copyAddrToAddrNonOverlappingB =
         stV   <- force legacyHooks stT
         case (srcV, destV, sizeV) of
             (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
-                copyBytes (dest :: Ptr Word8) (src :: Ptr Word8) (fromIntegral size)
+                let n = fromIntegral size
+                    destWord8 = dest :: Ptr Word8
+                copyBytes destWord8 (src :: Ptr Word8) n
+                markWord8PtrRange destWord8 n
                 pure stV
             _ -> error ("copyAddrToAddrNonOverlapping#: bad args: src=" <> showValForDebug srcV
                         <> " dest=" <> showValForDebug destV
@@ -4251,7 +4254,10 @@ copyAddrToAddrB =
         stV   <- force legacyHooks stT
         case (srcV, destV, sizeV) of
             (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
-                moveBytes (dest :: Ptr Word8) (src :: Ptr Word8) (fromIntegral size)
+                let n = fromIntegral size
+                    destWord8 = dest :: Ptr Word8
+                moveBytes destWord8 (src :: Ptr Word8) n
+                markWord8PtrRange destWord8 n
                 pure stV
             _ -> error ("copyAddrToAddr#: bad args: src=" <> showValForDebug srcV
                         <> " dest=" <> showValForDebug destV

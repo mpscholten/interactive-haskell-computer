@@ -606,6 +606,16 @@ loadProgramFromSource searchPath src0 = do
         aliasesNormalized = HashMap.union aliasBuiltinOverrides aliasesWithoutBase
         envWithAliases = HashMap.union builtinOverrides (HashMap.union aliasesNormalized qualEnv)
     let env = envWithAliases
+        localAliasEnvByOwner =
+            HashMap.fromListWith HashMap.union
+                [ (ownerName, HashMap.singleton bareName localSlot)
+                | (qualKey, localSlot) <- zip (map fst qualPairs) slots
+                , Just idx <- [BC.elemIndexEnd (toEnum (fromEnum '.')) qualKey]
+                , let ownerName = BC.take idx qualKey
+                      bareName  = BC.drop (idx + 1) qualKey
+                ]
+        localBareAliases ownerName =
+            HashMap.lookupDefault HashMap.empty ownerName localAliasEnvByOwner
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
     -- the module that owns the binding (extracted from the FQN's
@@ -618,7 +628,8 @@ loadProgramFromSource searchPath src0 = do
                        Just idx -> BC.take idx fqn
                        Nothing  -> lmName entry
                ownerThunk <- newWHNFThunk (VStr ownerName)
-               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
+               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
+                                $ HashMap.union (localBareAliases ownerName) env
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
 
@@ -1078,6 +1089,16 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let innerEnv = HashMap.union aliases qualEnv
+        localAliasEnvByOwner =
+            HashMap.fromListWith HashMap.union
+                [ (ownerName, HashMap.singleton bareName localSlot)
+                | (qualKey, localSlot) <- zip (map fst qualPairs) slots
+                , Just idx <- [BC.elemIndexEnd (toEnum (fromEnum '.')) qualKey]
+                , let ownerName = BC.take idx qualKey
+                      bareName  = BC.drop (idx + 1) qualKey
+                ]
+        localBareAliases ownerName =
+            HashMap.lookupDefault HashMap.empty ownerName localAliasEnvByOwner
     -- Per-body owner sentinel — see 'loadProgramFromSource' for the
     -- analogous block in the run-from-source path.  The owner is
     -- extracted from the FQN's module prefix; entries that aren't
@@ -1087,7 +1108,8 @@ loadFileIntoEnv searchPath path existingEnv = do
                        Just idx -> BC.take idx fqn
                        Nothing  -> lmName entry
                ownerThunk <- newWHNFThunk (VStr ownerName)
-               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk innerEnv
+               let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
+                                $ HashMap.union (localBareAliases ownerName) innerEnv
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
     -- Register type-class instances.
@@ -1560,8 +1582,8 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         -- REPL-level pre-discoveries (e.g. the GHC.Exception helpers
         -- primed by 'buildBaseEnv') remain reachable from inside the
         -- imported bindings.
-        innerEnv = HashMap.union builtinOverrides
-                 $ HashMap.union (HashMap.fromList selfAliases)
+        innerEnv = HashMap.union (HashMap.fromList selfAliases)
+                 $ HashMap.union builtinOverrides
                  $ HashMap.union (HashMap.fromList requestedPairs)
                  $ HashMap.union (HashMap.fromList rewriteAliasPairs)
                  $ HashMap.union aliases
@@ -2011,7 +2033,9 @@ evalMethodWithLazy env lm rewrites (_, lhs) = do
     let expr1 = desugarRecordPats (lmFieldReg lm)
                  (desugarRecordCons (lmFieldReg lm) expr0)
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
-    t <- newThunk env expr
+    ownerThunk <- newWHNFThunk (VStr (lmName lm))
+    let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
+    t <- newThunk envWithOwner expr
     pure (VLazyMethod t)
 
 -- | Collect the union of free variables across all method bodies of an
@@ -3501,7 +3525,9 @@ evalDefaultMethodWith env lm rewrites lhs = do
     let expr1 = desugarRecordPats (lmFieldReg lm)
                  (desugarRecordCons (lmFieldReg lm) expr0)
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
-    t <- newThunk env expr
+    ownerThunk <- newWHNFThunk (VStr (lmName lm))
+    let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
+    t <- newThunk envWithOwner expr
     force legacyHooks t
 
 -- | For each loaded module, read its collected bodies out of the
