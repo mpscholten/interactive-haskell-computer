@@ -379,6 +379,7 @@ loadProgramFromSource searchPath src0 = do
 
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
+    debugRecord "[ihc:phase] after discover main"
 
     -- Discover transitively-referenced ENTRY-MODULE bindings.
     -- 'discoveryFreeVars' deliberately doesn't descend into function
@@ -414,6 +415,7 @@ loadProgramFromSource searchPath src0 = do
                     mapM_ discoverEntryLocal newLocals
                     chaseLocals (Set.union seen (Set.fromList newLocals))
     chaseLocals Set.empty
+    debugRecord "[ihc:phase] after chaseLocals"
 
     -- Force-load every module the entry source imports.  Without this,
     -- @import M (T(..))@ where the user only uses some constructor of T
@@ -433,6 +435,7 @@ loadProgramFromSource searchPath src0 = do
         _ <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         pure ()
+    debugRecord "[ihc:phase] after entryImports"
 
     -- Manifest-driven core load.
     --
@@ -472,6 +475,7 @@ loadProgramFromSource searchPath src0 = do
             _ <- try (loadModule registry fullSearchPath includeMap m)
                     :: IO (Either SomeException LoadedModule)
             pure ()
+    debugRecord "[ihc:phase] after manifest providers"
 
     -- Discover free variables of class default-method bodies and
     -- instance method bodies across every loaded module so those names
@@ -479,6 +483,7 @@ loadProgramFromSource searchPath src0 = do
     -- `class Foo a where m x = helper x` with `helper` at top-level
     -- would fail with 'unbound variable `helper`' at dispatch time.
     discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
+    debugRecord "[ihc:phase] after discoverClassAndInstanceFreeVars"
 
     -- Collect every loaded module.
     reg <- readIORef registry
@@ -521,12 +526,21 @@ loadProgramFromSource searchPath src0 = do
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
     -- contains all builtins including the 'lift' function.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
+    debugRecord "[ihc:phase] after expandSplices"
 
     -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
+    let qualPairOwners = Map.toList $ Map.fromListWith (+)
+            [ (case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
+                    Just idx -> BC.take idx k
+                    Nothing  -> BC.pack "<bare>", 1 :: Int)
+            | (k, _) <- qualPairs ]
+    debugRecord ("[ihc:phase] after exportBodies count=" <> show (length qualPairs)
+        <> " owners=" <> show qualPairOwners)
 
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
+    debugRecord "[ihc:phase] after create import-placeholder slots"
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
 
     -- For FQN keys whose bare name (last dot-component) matches a builtin,
@@ -561,6 +575,7 @@ loadProgramFromSource searchPath src0 = do
     -- Entry-module bindings are inserted LAST so they always shadow
     -- imported aliases.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
+    debugRecord "[ihc:phase] after buildAliases"
     let builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
                 Just idx -> BC.drop (idx + 1) k
@@ -623,10 +638,12 @@ loadProgramFromSource searchPath src0 = do
                let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
+    debugRecord "[ihc:phase] after write import closures"
 
     -- Seed the env-fallback's base env so any 'resolveFallback'-built
     -- Closure can reach builtins + class dispatchers + constructors.
     writeIORef envBaseForFallbackRef env
+    debugRecord "[ihc:phase] after seed envBaseForFallbackRef"
     -- Phase 2.3: scan instance declarations from all loaded modules
     -- and register their method vals into the ClassRegistry. This must
     -- happen AFTER the env is fully tied so instance bodies can see all
@@ -653,6 +670,7 @@ loadProgramFromSource searchPath src0 = do
     let unionedTypeCtors' = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules')
     classTable <- buildClassMethodTable loadedModules'
     mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors' classTable env) loadedModules'
+    debugRecord "[ihc:phase] after registerInstancesFrom pass"
     -- Install the per-load instance-registration hook now that the env
     -- is fully tied.  Any subsequent 'loadModule' call (typically a lazy
     -- fallback load via 'resolveFallback') will fire this hook, which
@@ -683,6 +701,7 @@ loadProgramFromSource searchPath src0 = do
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
     registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules'
+    debugRecord "[ihc:phase] after registerClassDefaults"
     -- Synthesize user-derived Functor instances for every @deriving
     -- Functor@ annotated data/newtype decl. Runs after the explicit
     -- instance-registration pass so we can honour any hand-written
@@ -691,9 +710,12 @@ loadProgramFromSource searchPath src0 = do
     registerDerivedFunctorInstances classReg loadedModules'
     registerDerivedEnumBoundedInstances classReg loadedModules'
     registerDerivedEqInstances        classReg loadedModules'
+    debugRecord "[ihc:phase] after derived instances"
 
     case lookupEnv "main" env of
-        Just t  -> pure (env, t)
+        Just t  -> do
+            debugRecord "[ihc:phase] before return main thunk"
+            pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
                            <> BC.unpack entryName)
 
@@ -1203,6 +1225,15 @@ visibleExportName n =
     case splitQualified n of
         Just (_, bare) -> bare
         Nothing        -> n
+
+debugRecord :: String -> IO ()
+debugRecord msg = do
+    m <- SysEnv.lookupEnv "IHC_DEBUG_RECORDS"
+    case m of
+        Just s | not (null s) -> do
+            System.IO.hPutStrLn System.IO.stderr msg
+            System.IO.hFlush System.IO.stderr
+        _ -> pure ()
 
 typeLikeRuntimeNames :: LoadedModule -> ByteString -> [ByteString] -> IO [ByteString]
 typeLikeRuntimeNames lm ty subs = do
@@ -3694,48 +3725,57 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                     Nothing
                         | impQualified imp -> Just (impModule imp <> BC.pack ".")
                         | otherwise        -> Nothing
-            mTm0 <- lookupOrLoadImport imp
-            case mTm0 of
-                Nothing -> pure (lazyRewritePairs needed imp unloadedQualRef)
-                Just tm -> do
-                    let qualRef = case impAlias imp of
-                            Just a  -> Just (a <> BC.pack ".")
-                            Nothing
-                                | impQualified imp -> Just (lmName tm <> BC.pack ".")
-                                | otherwise        -> Nothing
-                    requestedNames <- requestedNamesForImport tm needed imp qualRef
-                    if null requestedNames
-                        then pure []
-                        else do
-                            mapM_ (\n ->
-                                (discoverInModule registry searchPath includeMap tm n)
-                                    `catch` (\(_ :: SomeException) -> pure ()))
-                                requestedNames
-                            regAfterDiscover <- readIORef registry
-                            -- Gather only the names this module body actually mentions.
-                            directPairs <- directRewritePairs regAfterDiscover tm requestedNames
-                            reexportPairs <- concat <$>
-                                mapM (\m -> rewritePairsFromReexport regAfterDiscover m requestedNames)
-                                     (moduleReexports (lmHeader tm))
-                            let allPairs = directPairs ++ reexportPairs
-                                visible  = filter (specAllows (impSpec imp) . fst) allPairs
-                                bare | impQualified imp = []
-                                     | otherwise = filter (needsBare needed) visible
-                                qual = case qualRef of
-                                    Just p  -> [ (p <> n, q)
-                                               | (n, q) <- visible
-                                               , Set.member (p <> n) needed
-                                               ]
-                                    Nothing -> []
-                                concrete = bare ++ qual
-                                concreteKeys = Set.fromList (map fst concrete)
-                                lazyMissing =
-                                    [ p
-                                    | p@(localName, _) <- lazyRewritePairs needed imp qualRef
-                                    , not (Set.member localName concreteKeys)
-                                    , lazyTargetVisible tm p
-                                    ]
-                            pure (concrete ++ lazyMissing)
+            -- Qualified imports already give us a precise lazy rewrite target
+            -- (@Alias.name -> Real.Module.name@). Forcing the imported module
+            -- here to chase concrete re-exports can wedge pre-main startup on
+            -- re-export-heavy modules like Network.Socket, even when the body
+            -- only mentions the qualified name in an otherwise-unused let.
+            -- Let the env fallback resolve the FQN on demand instead.
+            if impQualified imp && not (ambiguousQualifiedImport imp)
+                then pure (lazyRewritePairs needed imp unloadedQualRef)
+                else do
+                    mTm0 <- lookupOrLoadImport imp
+                    case mTm0 of
+                        Nothing -> pure (lazyRewritePairs needed imp unloadedQualRef)
+                        Just tm -> do
+                            let qualRef = case impAlias imp of
+                                    Just a  -> Just (a <> BC.pack ".")
+                                    Nothing
+                                        | impQualified imp -> Just (lmName tm <> BC.pack ".")
+                                        | otherwise        -> Nothing
+                            requestedNames <- requestedNamesForImport tm needed imp qualRef
+                            if null requestedNames
+                                then pure []
+                                else do
+                                    mapM_ (\n ->
+                                        (discoverInModule registry searchPath includeMap tm n)
+                                            `catch` (\(_ :: SomeException) -> pure ()))
+                                        requestedNames
+                                    regAfterDiscover <- readIORef registry
+                                    -- Gather only the names this module body actually mentions.
+                                    directPairs <- directRewritePairs regAfterDiscover tm requestedNames
+                                    reexportPairs <- concat <$>
+                                        mapM (\m -> rewritePairsFromReexport regAfterDiscover m requestedNames)
+                                             (moduleReexports (lmHeader tm))
+                                    let allPairs = directPairs ++ reexportPairs
+                                        visible  = filter (specAllows (impSpec imp) . fst) allPairs
+                                        bare | impQualified imp = []
+                                             | otherwise = filter (needsBare needed) visible
+                                        qual = case qualRef of
+                                            Just p  -> [ (p <> n, q)
+                                                       | (n, q) <- visible
+                                                       , Set.member (p <> n) needed
+                                                       ]
+                                            Nothing -> []
+                                        concrete = bare ++ qual
+                                        concreteKeys = Set.fromList (map fst concrete)
+                                        lazyMissing =
+                                            [ p
+                                            | p@(localName, _) <- lazyRewritePairs needed imp qualRef
+                                            , not (Set.member localName concreteKeys)
+                                            , lazyTargetVisible tm p
+                                            ]
+                                    pure (concrete ++ lazyMissing)
 
     lazyRewritePairs needed imp qualRef =
         if shouldLazyRewriteImport imp
@@ -4088,12 +4128,16 @@ buildAliases
     -> [Thunk]
     -> [(ByteString, Expr)]
     -> IO Env
-buildAliases registry _searchPath _includeMap entry slots qualPairs = do
+buildAliases registry searchPath includeMap entry slots qualPairs = do
+    debugRecord ("[ihc:alias] buildAliases start entry=" <> BC.unpack (lmName entry)
+        <> " qualPairs=" <> show (length qualPairs))
     -- Index qualPairs so we can look up "Module.name" -> Thunk fast.
     let thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
     -- Build aliases for the entry module's imports.
     let entryImports = mhImports (lmHeader entry)
+    debugRecord ("[ihc:alias] buildAliases entryImports=" <> show (map impModule entryImports))
     entryPairs <- concat <$> mapM (aliasesForImport thunkByKey) entryImports
+    debugRecord ("[ihc:alias] buildAliases after entryPairs count=" <> show (length entryPairs))
     -- Also build aliases for ALL loaded modules' qualified imports.
     -- Without this, qualified references like `List.length` inside
     -- Data.ByteString.Internal.Type (which does `import qualified Data.List as List`)
@@ -4101,17 +4145,30 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     -- references `List.length`.
     reg <- readIORef registry
     let allModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
+    debugRecord ("[ihc:alias] buildAliases loadedModules=" <> show (map lmName allModules))
     internalPairs <- concat <$> mapM (internalAliases thunkByKey) allModules
+    debugRecord ("[ihc:alias] buildAliases after internalPairs count=" <> show (length internalPairs))
     pure (HashMap.fromList (internalPairs ++ entryPairs))
   where
     aliasesForImport thunkByKey imp = do
+            debugRecord ("[ihc:alias] aliasesForImport module=" <> BC.unpack (impModule imp)
+                <> " qualified=" <> show (impQualified imp)
+                <> " alias=" <> show (impAlias imp)
+                <> " spec=" <> show (impSpec imp))
             -- We need to know which names the target module actually
             -- exports. We only have the loaded registry, so look it up.
             reg <- readIORef registry
             case Map.lookup (impModule imp) reg of
                 Just (Loaded tm) -> do
-                    lazyPairs0 <- lazyAliasesForLoadedImport tm imp
-                    let fieldAliases = Set.fromList
+                    debugRecord ("[ihc:alias] aliasesForImport loaded target=" <> BC.unpack (lmName tm))
+                    exportNames0 <- effectiveExportNames registry searchPath includeMap tm [lmName tm]
+                    let exportNames = [ n | n <- exportNames0, specAllows (impSpec imp) n ]
+                    debugRecord ("[ihc:alias] aliasesForImport exportNames module=" <> BC.unpack (impModule imp)
+                        <> " count=" <> show (length exportNames)
+                        <> " names=" <> show exportNames)
+                    lazyPairsNested <- mapM (lazyAliasPairs imp) exportNames
+                    let lazyPairs0 = concat lazyPairsNested
+                        fieldAliases = Set.fromList
                             [ a
                             | n <- Map.keys (lmFieldReg tm)
                             , not (lmNoFieldSelectors tm)
@@ -4121,36 +4178,25 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                         lazyPairs = filter
                             (\(a, _) -> not (Set.member a fieldAliases))
                             lazyPairs0
-                    -- Collect (owning-module-prefix, name) pairs from both
-                    -- the target module's own bodies and any `module Foo`
-                    -- re-exports in its export list.
-                    directPairs <- namesFromModule thunkByKey tm
-                    reexportPairs <- concat <$>
-                        mapM (namesFromReexport reg thunkByKey)
-                             (moduleReexports (lmHeader tm))
-                    let allPairs = directPairs ++ reexportPairs
-                        qualPrefix = case impAlias imp of
-                            Just a  -> a <> BC.pack "."
-                            Nothing
-                                | impQualified imp -> lmName tm <> BC.pack "."
-                                | otherwise        -> BC.empty
-                        bareAliases
-                            | impQualified imp = []
-                            | otherwise =
-                                [ (n, t) | (n, t) <- allPairs ]
-                        qualAliases
-                            | BC.null qualPrefix = []
-                            | otherwise =
-                                [ (qualPrefix <> n, t) | (n, t) <- allPairs ]
-                    pure (lazyPairs ++ bareAliases ++ qualAliases)
+                    debugRecord ("[ihc:alias] aliasesForImport lazyPairs module=" <> BC.unpack (impModule imp)
+                        <> " count=" <> show (length lazyPairs))
+                    pure lazyPairs
                 _ -> lazyAliasesForImport imp
 
-    lazyAliasesForLoadedImport tm imp =
-        case impSpec imp of
-            ImportOnly names -> do
-                expanded <- expandImportOnlyNames tm names
-                concat <$> mapM (lazyAliasesForName imp) expanded
-            _                -> pure []
+    lazyAliasPairs imp n =
+        mapM mkAlias aliasCandidates
+      where
+        targetKey = impModule imp <> BC.pack "." <> n
+        aliasCandidates = filter (/= targetKey) (importedAliasesForName imp n)
+        mkAlias alias = do
+            slot <- newLazyBuiltinThunk $ do
+                mSlot <- resolveFallback Nothing targetKey
+                case mSlot of
+                    Just targetSlot -> force legacyHooks targetSlot
+                    Nothing -> error
+                        ("import alias: unresolved target "
+                         <> BC.unpack targetKey)
+            pure (alias, slot)
 
     lazyAliasesForImport imp =
         case impSpec imp of
@@ -4161,38 +4207,6 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                     , not (BC.pack "$dotdot:" `BC.isPrefixOf` n)
                     ]
             _                -> pure []
-
-    expandImportOnlyNames tm names = nubBS <$> go names
-      where
-        go [] = pure []
-        go (n:rest)
-            | BC.pack "$dotdot:" `BC.isPrefixOf` n = go rest
-            | otherwise =
-                case rest of
-                    dot:rest'
-                        | dot == BC.pack "$dotdot:" <> n -> do
-                            subs <- dotdotMembers tm n
-                            more <- go rest'
-                            pure (n : subs ++ more)
-                    _ -> (n :) <$> go rest
-
-    dotdotMembers tm ty =
-        case mhExports (lmHeader tm) of
-            ExportAll ->
-                typeLikeRuntimeNames tm ty []
-            ExportList items -> do
-                fromExports <- concat <$> mapM membersFromItem items
-                if null fromExports
-                    then typeLikeRuntimeNames tm ty []
-                    else pure fromExports
-      where
-        membersFromItem (ExportType ty' Nothing)
-            | ty' == ty = pure []
-        membersFromItem (ExportType ty' (Just []))
-            | ty' == ty = typeLikeRuntimeNames tm ty []
-        membersFromItem (ExportType ty' (Just subs))
-            | ty' == ty = pure subs
-        membersFromItem _ = pure []
 
     lazyAliasesForName imp n = do
         slot <- newLazyBuiltinThunk $ do
@@ -4205,7 +4219,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
       where
         targetKey = impModule imp <> BC.pack "." <> n
-    
+
     importedAliasesForName imp n =
         bareAliases ++ qualAliases
       where
@@ -4229,85 +4243,6 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     internalAliases thunkByKey lm = do
         let imports = filter impQualified (mhImports (lmHeader lm))
         concat <$> mapM (aliasesForImport thunkByKey) imports
-
-    -- | Return @(bare-name, Thunk)@ pairs for names exported by a loaded
-    -- module — including names re-exported via ExportName from its imports.
-    namesFromModule thunkByKey tm = do
-        reg <- readIORef registry
-        bodiesMap <- readIORef (lmBodies tm)
-        let prefix   = lmName tm <> BC.pack "."
-            allN     = Map.keys bodiesMap
-            -- Names defined directly in tm and exported.
-            localExported =
-                [ n
-                | n <- allN
-                , Just expr <- [Map.lookup n bodiesMap]
-                , not (isSelfAliasIn tm n expr) || isJust (specialSelfAliasTarget tm n expr)
-                , exportsNameDirect tm n
-                ]
-            localPairs = [ (n, t)
-                         | n <- localExported
-                         , Just t <- [Map.lookup (prefix <> n) thunkByKey]
-                         ]
-        -- Also follow ExportName re-exports via tm's imports.
-        namedPairs <- namesFromNamedReexports reg thunkByKey tm bodiesMap
-        pure (localPairs ++ namedPairs)
-
-    -- | Collect (name, Thunk) pairs for ExportName entries that are not
-    -- locally defined in @tm@ but are re-exported from @tm@'s imports.
-    namesFromNamedReexports reg thunkByKey tm bodiesMap =
-        case mhExports (lmHeader tm) of
-            ExportAll    -> pure []
-            ExportList xs -> do
-                let exportedNames = [ n | ExportName n <- xs ]
-                    missingNames  = filter (\n ->
-                        case Map.lookup n bodiesMap of
-                            Just expr -> isSelfAliasIn tm n expr && not (isJust (specialSelfAliasTarget tm n expr))
-                            Nothing   -> True
-                        ) exportedNames
-                pairs <- concat <$> mapM (findThunkInImports reg thunkByKey tm [lmName tm]) missingNames
-                pure pairs
-
-    -- | Find the Thunk for @n@ by walking @tm@'s unqualified imports.
-    findThunkInImports reg thunkByKey tm visited n = do
-        -- Walk all imports (qualified + unqualified) for the same reason
-        -- as 'findNameInImports': a module may re-export a qualified
-        -- name (@List.words@ in Prelude) whose definition lives behind
-        -- a qualified import; the qualifier is already stripped by the
-        -- ExportList parser so we treat qualified imports as potential
-        -- providers too.
-        let viaImports = mhImports (lmHeader tm)
-            viable = filter (\i ->
-                impModule i /= BC.pack "Prelude" &&
-                impModule i `notElem` visited &&
-                specAllows (impSpec i) n) viaImports
-        go viable
-      where
-        go [] = pure []
-        go (imp:rest) =
-            case Map.lookup (impModule imp) reg of
-                Just (Loaded srcLm) -> do
-                    srcBodies <- readIORef (lmBodies srcLm)
-                    case Map.lookup n srcBodies of
-                        Just expr | not (isSelfAliasIn srcLm n expr) -> do
-                            let srcPrefix = lmName srcLm <> BC.pack "."
-                            case Map.lookup (srcPrefix <> n) thunkByKey of
-                                Just t  -> pure [(n, t)]
-                                Nothing -> go rest
-                        _ -> do
-                            deeper <- findThunkInImports reg thunkByKey srcLm
-                                (impModule imp : visited) n
-                            case deeper of
-                                [] -> go rest
-                                ps -> pure ps
-                _ -> go rest
-
-    -- | Collect exported name-thunk pairs from a re-exported module
-    -- (a @module Foo@ entry in an export list).
-    namesFromReexport reg thunkByKey modName =
-        case Map.lookup modName reg of
-            Just (Loaded reLm) -> namesFromModule thunkByKey reLm
-            _                  -> pure []
 
 --------------------------------------------------------------------------------
 -- Loading modules
@@ -4454,14 +4389,110 @@ visibleFieldRegistryFor
     -> Maybe [ByteString]
     -> IO FieldRegistry
 visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
-    imported <- mapM importFields (mhImports (lmHeader lm))
-    reg <- readIORef registry
-    let loadedFields =
-            [ lmFieldReg loadedLm
-            | (_, Loaded loadedLm) <- Map.toList reg
-            ]
-    pure (unionFieldRegistries (lmFieldReg lm : imported ++ loadedFields))
+    debugRecord ("[ihc:record] visibleFieldRegistryFor module=" <> BC.unpack (lmName lm)
+           <> " wanted=" <> show mWanted)
+    case mWanted of
+        Just wanted
+            | localFieldsCover wanted ->
+                pure (relevantFieldRegistry wanted (lmFieldReg lm))
+            | otherwise -> do
+                let imports = prioritizedImports (mhImports (lmHeader lm))
+                localImported <- gatherWantedLocalImports wanted imports Map.empty
+                let immediateLocal = unionFieldRegistries [lmFieldReg lm, localImported]
+                if registryCovers wanted immediateLocal
+                    then do
+                        let result = relevantFieldRegistry wanted immediateLocal
+                        debugRecord ("[ihc:record] visibleFieldRegistryFor immediateLocal keys=" <> show (Map.keys result))
+                        pure result
+                    else do
+                        imported <- gatherWantedImports wanted imports localImported
+                        let immediate = unionFieldRegistries [lmFieldReg lm, imported]
+                        if registryCovers wanted immediate
+                            then do
+                                let result = relevantFieldRegistry wanted immediate
+                                debugRecord ("[ihc:record] visibleFieldRegistryFor immediate keys=" <> show (Map.keys result))
+                                pure result
+                            else do
+                                reg <- readIORef registry
+                                let loadedFields =
+                                        [ lmFieldReg loadedLm
+                                        | (_, Loaded loadedLm) <- Map.toList reg
+                                        ]
+                                    result = relevantFieldRegistry wanted (unionFieldRegistries (immediate : loadedFields))
+                                debugRecord ("[ihc:record] visibleFieldRegistryFor loaded keys=" <> show (Map.keys result))
+                                pure result
+        Nothing -> do
+            imported <- mapM importFields (mhImports (lmHeader lm))
+            let immediate = unionFieldRegistries (lmFieldReg lm : imported)
+            reg <- readIORef registry
+            let loadedFields =
+                    [ lmFieldReg loadedLm
+                    | (_, Loaded loadedLm) <- Map.toList reg
+                    ]
+            pure (unionFieldRegistries (immediate : loadedFields))
   where
+    localFieldsCover wanted =
+        localFieldsCoverIn lm wanted
+
+    localFieldsCoverIn targetLm wanted =
+        all (\fname -> Map.member fname (lmFieldReg targetLm)) wanted
+
+    registryCovers wanted reg =
+        all (\fname -> Map.member fname reg) wanted
+
+    prioritizedImports [] = []
+    prioritizedImports imps = localProviders ++ otherImports
+      where
+        localProviders =
+            [ imp
+            | imp <- imps
+            , moduleNamePrefix (impModule imp) (lmName lm)
+            ]
+        otherImports =
+            [ imp
+            | imp <- imps
+            , not (moduleNamePrefix (impModule imp) (lmName lm))
+            ]
+
+    gatherWantedLocalImports [] _ acc = pure acc
+    gatherWantedLocalImports wanted [] acc = pure acc
+    gatherWantedLocalImports wanted (imp:rest) acc
+        | registryCovers wanted acc = pure acc
+        | not (moduleNamePrefix (impModule imp) (lmName lm)) = pure acc
+        | otherwise = do
+            found <- importFieldsForWanted wanted imp
+            let acc' = unionFieldRegistries [acc, found]
+            gatherWantedLocalImports wanted rest acc'
+
+    gatherWantedImports [] _ acc = pure acc
+    gatherWantedImports wanted [] acc = pure acc
+    gatherWantedImports wanted (imp:rest) acc
+        | registryCovers wanted acc = pure acc
+        | otherwise = do
+            found <- importFieldsForWanted wanted imp
+            let acc' = unionFieldRegistries [acc, found]
+            gatherWantedImports wanted rest acc'
+
+    importFieldsForWanted wanted imp = do
+            r <- try (loadModule registry searchPath includeMap (impModule imp))
+                    :: IO (Either SomeException LoadedModule)
+            case r of
+                Left _ -> pure Map.empty
+                Right importedLm -> do
+                    visibleWanted <- filterM
+                        (specAllowsLoaded importedLm (impSpec imp))
+                        wanted
+                    debugRecord ("[ihc:record] importFieldsForWanted importer=" <> BC.unpack (lmName lm)
+                           <> " import=" <> BC.unpack (impModule imp)
+                           <> " qualified=" <> show (impQualified imp)
+                           <> " visibleWanted=" <> show visibleWanted)
+                    if null visibleWanted
+                        then pure Map.empty
+                        else if localFieldsCoverIn importedLm visibleWanted
+                            then pure (relevantFieldRegistry visibleWanted (lmFieldReg importedLm))
+                            else exportedFieldRegistryForNames registry searchPath includeMap
+                                    importedLm [lmName lm] visibleWanted
+
     importFields imp
         | impQualified imp = pure Map.empty
         | otherwise = do
@@ -4475,8 +4506,10 @@ visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
                             visibleWanted <- filterM
                                 (specAllowsLoaded importedLm (impSpec imp))
                                 wanted
-                            exportedFieldRegistryForNames registry searchPath includeMap
-                                importedLm [lmName lm] visibleWanted
+                            if localFieldsCoverIn importedLm visibleWanted
+                                then pure (relevantFieldRegistry visibleWanted (lmFieldReg importedLm))
+                                else exportedFieldRegistryForNames registry searchPath includeMap
+                                        importedLm [lmName lm] visibleWanted
                         Nothing -> do
                             exported <- exportedFieldRegistry registry searchPath includeMap
                                             importedLm [lmName lm]
@@ -4493,10 +4526,21 @@ exportedFieldRegistryForNames
 exportedFieldRegistryForNames _ _ _ _ _ [] = pure Map.empty
 exportedFieldRegistryForNames registry searchPath includeMap lm visited wanted0
     | lmName lm `elem` visited = pure Map.empty
-    | otherwise = case mhExports (lmHeader lm) of
-        ExportAll -> pure (relevantFieldRegistry wanted (lmFieldReg lm))
-        ExportList items ->
-            unionFieldRegistries <$> mapM exportItem items
+    | otherwise = do
+        let wanted = nubBS (map visibleExportName wanted0)
+        m <- SysEnv.lookupEnv "IHC_DEBUG_RECORDS"
+        case m of
+            Just s | not (null s) -> do
+                System.IO.hPutStrLn System.IO.stderr
+                    ("[ihc:record] exportedFieldRegistryForNames module=" <> BC.unpack (lmName lm)
+                     <> " wanted=" <> show wanted
+                     <> " exports=" <> show (mhExports (lmHeader lm)))
+                System.IO.hFlush System.IO.stderr
+            _ -> pure ()
+        case mhExports (lmHeader lm) of
+            ExportAll -> pure (relevantFieldRegistry wanted (lmFieldReg lm))
+            ExportList items ->
+                unionFieldRegistries <$> mapM exportItem items
   where
     wanted = nubBS (map visibleExportName wanted0)
     visited' = lmName lm : visited
@@ -4509,7 +4553,8 @@ exportedFieldRegistryForNames registry searchPath includeMap lm visited wanted0
                 ]
         | otherwise = pure Map.empty
     exportItem (ExportType ty mbSubs) =
-        pure (relevantFieldRegistry wanted (typeFieldRegistry lm ty mbSubs))
+        relevantFieldRegistry wanted
+            <$> exportTypeFieldRegistry registry searchPath includeMap lm ty mbSubs
     exportItem (ExportModule m)
         | m `elem` visited' = pure Map.empty
         | otherwise = do
@@ -4542,6 +4587,7 @@ exportedFieldRegistryForNames registry searchPath includeMap lm visited wanted0
                                 if Map.null found
                                     then go rest
                                     else pure found
+
 
 -- | Field selectors exported by a module, including selectors named in an
 -- explicit export list but defined by one of the module's imports. Record
@@ -4588,7 +4634,7 @@ exportedFieldRegistry registry searchPath includeMap lm visited
             , importedNamedField (visibleExportName n)
             ]
     exportItem (ExportType ty mbSubs) =
-        exportTypeFields ty mbSubs
+        exportTypeFieldRegistry registry searchPath includeMap lm ty mbSubs
     exportItem (ExportModule m)
         | m `elem` visited' = pure Map.empty
         | otherwise = do
@@ -4617,18 +4663,37 @@ exportedFieldRegistry registry searchPath includeMap lm visited
                                 exported <- exportedFieldRegistry registry searchPath includeMap
                                                 targetLm visited'
                                 case fieldByName exported n of
-                                    empty | Map.null empty -> go rest
-                                    found                  -> pure found
+                                    empty | Map.null empty ->
+                                        parentTypeFallback targetLm imp rest
+                                    found -> pure found
 
-    exportTypeFields ty mbSubs =
-        case splitQualified ty of
-            Just (qual, bareTy) -> do
-                mTarget <- resolveQualified registry searchPath includeMap lm qual
-                case mTarget of
-                    Just targetLm -> pure (typeFieldRegistry targetLm bareTy mbSubs)
-                    Nothing       -> pure Map.empty
-            Nothing ->
-                pure (typeFieldRegistry lm ty mbSubs)
+        parentTypeFallback targetLm imp rest = do
+            parentRegs <- mapM
+                (\ty -> exportTypeFieldRegistry registry searchPath includeMap targetLm ty (Just []))
+                (parentTypesForField targetLm n)
+            filtered <- filterImportedFieldRegistry targetLm (impSpec imp)
+                            (unionFieldRegistries parentRegs)
+            case fieldByName filtered n of
+                empty | Map.null empty -> go rest
+                found                  -> pure found
+
+exportTypeFieldRegistry
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> Maybe [ByteString]
+    -> IO FieldRegistry
+exportTypeFieldRegistry registry searchPath includeMap lm ty mbSubs =
+    case splitQualified ty of
+        Just (qual, bareTy) -> do
+            mTarget <- resolveQualified registry searchPath includeMap lm qual
+            case mTarget of
+                Just targetLm -> typeFieldRegistryWithProviders registry searchPath includeMap targetLm bareTy mbSubs
+                Nothing       -> pure Map.empty
+        Nothing ->
+            typeFieldRegistryWithProviders registry searchPath includeMap lm ty mbSubs
 
 fieldByName :: FieldRegistry -> ByteString -> FieldRegistry
 fieldByName reg n =
@@ -4656,6 +4721,109 @@ relevantFieldRegistry wanted reg
                 xs -> Just xs)
             reg
 
+typeFieldRegistryWithProviders
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> Maybe [ByteString]
+    -> IO FieldRegistry
+typeFieldRegistryWithProviders registry searchPath includeMap lm ty mbSubs = do
+    providers <- findTypeFieldProviders registry searchPath includeMap lm ty
+    let regs = [ typeFieldRegistry provider ty mbSubs | provider <- providers ]
+    pure (unionFieldRegistries regs)
+
+findTypeFieldProviders
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO [LoadedModule]
+findTypeFieldProviders registry searchPath includeMap lm ty = do
+    downstream <- findRuntimeTypeProviders registry searchPath includeMap Set.empty lm ty
+    let ordered = lm : [ provider | provider <- downstream, lmName provider /= lmName lm ]
+    pure (nubLoadedModules ordered)
+
+findRuntimeTypeProviders
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> Set ModuleName
+    -> LoadedModule
+    -> ByteString
+    -> IO [LoadedModule]
+findRuntimeTypeProviders registry searchPath includeMap seen lm ty
+    | lmName lm `Set.member` seen = pure []
+    | otherwise = do
+        let seen' = Set.insert (lmName lm) seen
+        case Map.lookup ty (lmTypeCtorReg lm) of
+            Just ctors | not (null ctors) -> pure [lm]
+            _ -> searchImports seen' (mhImports (lmHeader lm))
+  where
+    searchImports _ [] = pure []
+    searchImports seen' imps = do
+        candidates <- loadCandidates seen' imps
+        let localProviders =
+                [ targetLm
+                | targetLm <- candidates
+                , directlyProvidesTypeLike targetLm
+                ]
+            preferredLocalProviders =
+                [ targetLm
+                | targetLm <- localProviders
+                , moduleNamePrefix (lmName lm) (lmName targetLm)
+                ]
+            orderedCandidates = preferredLocalProviders ++ localProviders
+        if null orderedCandidates
+            then pure []
+            else concat <$> mapM
+                (\targetLm -> findRuntimeTypeProviders registry searchPath includeMap seen' targetLm ty)
+                orderedCandidates
+
+    loadCandidates _ [] = pure []
+    loadCandidates seen' (imp:rest)
+        | not (specAllows (impSpec imp) ty) = loadCandidates seen' rest
+        | otherwise = do
+            loaded <- try (loadModule registry searchPath includeMap (impModule imp))
+                        :: IO (Either SomeException LoadedModule)
+            more <- loadCandidates seen' rest
+            case loaded of
+                Left _ -> pure more
+                Right targetLm
+                    | lmName targetLm `Set.member` seen' -> pure more
+                    | otherwise -> pure (targetLm : more)
+
+    directlyProvidesTypeLike targetLm =
+        hasLocalTypeCtors targetLm || exportsTypeHeadDirect targetLm ty
+
+    hasLocalTypeCtors targetLm =
+        case Map.lookup ty (lmTypeCtorReg targetLm) of
+            Just ctors -> not (null ctors)
+            Nothing    -> False
+
+nubLoadedModules :: [LoadedModule] -> [LoadedModule]
+nubLoadedModules = go Set.empty
+  where
+    go _ [] = []
+    go seen (lm:rest)
+        | lmName lm `Set.member` seen = go seen rest
+        | otherwise = lm : go (Set.insert (lmName lm) seen) rest
+
+exportsTypeHeadDirect :: LoadedModule -> ByteString -> Bool
+exportsTypeHeadDirect lm ty = case mhExports (lmHeader lm) of
+    ExportAll     -> True
+    ExportList xs -> any matchDirect xs
+  where
+    matchDirect (ExportType m _) = m == ty
+    matchDirect _                = False
+
+moduleNamePrefix :: ByteString -> ByteString -> Bool
+moduleNamePrefix prefix name =
+    prefix == name
+    || (prefix <> BC.pack ".") `BC.isPrefixOf` name
+
 typeFieldRegistry :: LoadedModule -> ByteString -> Maybe [ByteString] -> FieldRegistry
 typeFieldRegistry lm ty mbSubs =
     case mbSubs of
@@ -4671,6 +4839,16 @@ typeFieldRegistry lm ty mbSubs =
         Map.filter
             (any (\(ctor, _) -> ctor `elem` ctorsOfTy))
             (lmFieldReg lm)
+
+parentTypesForField :: LoadedModule -> ByteString -> [ByteString]
+parentTypesForField lm fieldName =
+    nubBS
+        [ ty
+        | (ty, ctors) <- Map.toList (lmTypeCtorReg lm)
+        , any (\ctor -> any ((== ctor) . fst) fieldEntries) ctors
+        ]
+  where
+    fieldEntries = Map.findWithDefault [] fieldName (lmFieldReg lm)
 
 filterImportedFieldRegistry
     :: LoadedModule
@@ -6939,8 +7117,14 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                         then visibleFieldRegistryFor registry searchPath includeMap lm
                                                 (recordSyntaxFieldNames (lmFieldReg lm) expr0)
                                         else pure (lmFieldReg lm)
+                                when (needsRecordFields expr0) $
+                                    debugRecord ("[ihc:record] discover body=" <> BC.unpack name
+                                                 <> " fieldKeys=" <> show (Map.keys visibleFields))
                                 let expr = desugarRecordPats visibleFields
                                              (desugarRecordCons visibleFields expr0)
+                                when (needsRecordFields expr0) $ do
+                                    debugRecord ("[ihc:record] desugared body=" <> BC.unpack name)
+                                    debugRecord ("[ihc:record] desugared expr=" <> take 800 (show expr))
                                 insertLmBody lm name expr
                                 -- Recurse into every free var. Qualified ones
                                 -- will be routed on the next call.
@@ -6954,9 +7138,11 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                       discoverInModuleWith builtins registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
-                                mapM_ discoverFreeVar
-                                    (nubBS (discoveryFreeVars expr
-                                            ++ extraDiscoveryFreeVars lm name))
+                                let neededFvs = nubBS (discoveryFreeVars expr
+                                                ++ extraDiscoveryFreeVars lm name)
+                                when (needsRecordFields expr0) $
+                                    debugRecord ("[ihc:record] discover fvs=" <> show neededFvs)
+                                mapM_ discoverFreeVar neededFvs
                     Nothing
                         -- Names provided by IHC.Builtins resolve to the host
                         -- builtin env — no need to walk the source re-export
@@ -8020,9 +8206,12 @@ discoveryFreeVars = go []
         EDo stmts   -> goStmts bound stmts
         ENeg e      -> go bound e
         ETuple es   -> concatMap (go bound) es
-        ERecordCon _ _ -> []
-        ERecordWild _  -> []
-        ERecordUpdate e _ -> go bound e
+        ERecordCon con fs ->
+            concatMap (go bound . snd) fs ++ [con]
+        ERecordWild con ->
+            [con]
+        ERecordUpdate e fs ->
+            go bound e ++ concatMap (go bound . snd) fs
         EImplicitRef _ -> []
         EImplicitLet bs e ->
             let names = map fst bs
