@@ -78,17 +78,20 @@ jobs:
   # (sharedExt/undefinedSymbolsFlag in flake.nix), and FFI.registerCbitsDylibs
   # globs both extensions.
   #
-  # `continue-on-error: true` — KNOWN ISSUE: the long-running hspec
-  # session (~600 examples in one process) accumulates IHC scheduler
-  # state (7M+ discoveries by the end) and eventually OOMs on Linux
-  # even at -M8G.  macOS is fine because its GC reclaims the same
-  # state.  Tracked for follow-up; until then the job runs informationally
-  # — every example that *does* run is real validation, but a red
-  # final result doesn't gate PRs.  See run 25600175969 for the
-  # 605-examples-then-OOM trace.
+  # Re-armed as a gating job: the OOM that motivated
+  # `continue-on-error: true` is fixed.  Root cause (found by heap
+  # profiling the full run) was leaked interpreter-forked threads —
+  # warp accept loop / System.TimeManager / async / forkIO threads that
+  # were never reaped, so their TSO stacks accumulated to ~4 GB of
+  # STACK across the ~600-example in-process hspec session and the run
+  # heap-exhausted (worse on Linux; macOS GC merely kept up longer).
+  # 'IHC.Builtins.reapSpawnedThreads' (wired into
+  # 'IHC.Scheduler.resetPerRunGlobals') kills the prior run's threads
+  # at each fixture boundary; a full-suite heap profile now shows
+  # steady ~1.5 MB STACK instead of monotonic 4 GB growth, so Linux
+  # completes within the cap and a red result gates PRs again.
   linux-test:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

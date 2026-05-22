@@ -33,6 +33,13 @@ module IHC.FFI
     , registerLibrary
     , registerCbitsDylibs
     , resolveSymbol
+      -- * Cross-run reset (wired into 'IHC.Scheduler.resetPerRunGlobals')
+    , clearOpenLibs
+    , clearSymbolCache
+      -- Exposed only so 'IHC.MemDebug' can size them for the
+      -- @IHC_MEM_DEBUG@ probe.
+    , openLibs
+    , symbolCache
       -- * Dispatch
     , callForeign
     , makeForeignVal
@@ -144,6 +151,23 @@ openLibs = unsafePerformIO (newIORef [])
 symbolCache :: IORef (Map ByteString (FunPtr ()))
 symbolCache = unsafePerformIO (newIORef Map.empty)
 {-# NOINLINE symbolCache #-}
+
+-- | Reset the opened-shared-library list between 'loadProgramFromSource'
+-- runs.  Mirrors the 'IHC.Builtins.clearCtorIndex' precedent.  Safe:
+-- 'registerCbitsDylibs' re-opens every @IHC_CBITS_DIR@ library at the
+-- start of the next run, and @dlopen@ on an already-resident library is
+-- a cheap refcount bump.  In practice this list is bounded (registration
+-- is idempotent per path), so this is reset-surface hygiene rather than
+-- the OOM driver — see the @IHC_MEM_DEBUG@ findings.
+clearOpenLibs :: IO ()
+clearOpenLibs = writeIORef openLibs []
+
+-- | Reset the @symbol → FunPtr@ cache between runs.  Mirrors
+-- 'IHC.Builtins.clearCtorIndex'.  Bounded by the symbol universe so
+-- this is precautionary (kept uniform with 'clearOpenLibs'); symbols
+-- are re-resolved lazily via 'resolveSymbol' on next use.
+clearSymbolCache :: IO ()
+clearSymbolCache = writeIORef symbolCache Map.empty
 
 -- | Open a shared library by name (or absolute path) and remember it for
 -- later symbol lookups.  Idempotent: opening the same library twice is

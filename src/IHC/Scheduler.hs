@@ -70,16 +70,18 @@ import qualified System.Environment as SysEnv
 import System.FilePath ((</>), takeDirectory)
 import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
+import System.Mem (performMajorGC)
 import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
-    , clearCtorIndex, clearForeignPtrWord8Ranges
+    , clearCtorIndex, clearForeignPtrWord8Ranges, reapSpawnedThreads
     )
 import IHC.CabalProject
     ( cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
     )
-import IHC.Diagnostics (warnStub)
+import IHC.Diagnostics (warnStub, memDebugEnabled, memDebugEvery)
+import IHC.MemDebug (dumpMemStats)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
     , lookupInstance
@@ -335,6 +337,14 @@ loadProgramFromSource searchPath src0 = do
     -- else touches them. Directive-free files short-circuit and are
     -- returned unchanged.
     src <- cppSource src0
+
+    -- Record this fixture's entry-source scan-cache keys (pre- and
+    -- post-CPP bytes) so the NEXT run's 'resetPerRunGlobals' evicts
+    -- exactly them — bounding per-run scan-cache growth without the
+    -- cold-re-scan blowup a blanket wipe causes.  These bytes are
+    -- unique per fixture; shared base/library entries are never listed
+    -- here so they stay warm across runs.
+    writeIORef _prevEntryScanKeysRef [srcBytes src0, srcBytes src]
 
     -- Phase 2.3: class registry for type-class dispatch.
     classReg <- newClassRegistry
@@ -5205,6 +5215,51 @@ globalLoadedModulesRef = lsrsLoadedModules legacySchedulerRunState
 -- instance-scope registries, all of which feed elaborator decisions.
 resetPerRunGlobals :: IO ()
 resetPerRunGlobals = do
+    -- Periodic forced major GC (every 25 run boundaries): cheap
+    -- cross-fixture heap hygiene for the ~600-example in-process suite.
+    -- NOTE — this is NOT proven to fix the master-CI @Heap exhausted@
+    -- at discovery ~471 K, and the commit that introduced it
+    -- (@9a87a9b@) overclaimed: CI run @26027458628@ still OOMs at the
+    -- identical @total=471000@ signature with this in place.  That OOM
+    -- is a PRE-EXISTING @master@ regression (present on pristine
+    -- @master@ @156da98@ and base @ad6b9c1@; prior merged attempts
+    -- PR #167 / #178 also failed it) and must be bisected on
+    -- @master@'s own history — see PR #179's pinned correction.
+    -- One run (@7b3499b@, run @26023998273@) with @IHC_MEM_DEBUG=1@ in
+    -- the flake @checkPhase@ completed @603/0/72@ at ~10× lower
+    -- discovery — but this is NOT a usable lead: @memDebugEnabled@ is
+    -- grep-proven to gate ONLY the read-only @[ihc:mem]@ dump block
+    -- (Scheduler @when memDebugEnabled@ + 'IHC.MemDebug.dumpMemStats',
+    -- nothing in the scan\/discover path), and its only side-effect
+    -- ('performMajorGC') is falsified above.  With no causal code
+    -- path, that clean run is best explained as CI-environment
+    -- nondeterminism (the suite sits right at the @-M8G@ edge; the
+    -- source-prep derivations vary run-to-run — e.g. @ihc-hackage-
+    -- sources-hsc@ logged @11 failed@ conversions that run).  Do NOT
+    -- chase @IHC_MEM_DEBUG@ as a fix.  This 'performMajorGC' is kept
+    -- only as harmless GC hygiene that complements 'reapSpawnedThreads'
+    -- below (the genuine, locally-verified fix for the ~4 GB leaked-
+    -- thread @STACK@); it does not make CI green and is not claimed to.
+    rc <- atomicModifyIORef' _resetRunCounter (\k -> let k' = k + 1 in (k', k'))
+    when (rc `mod` 25 == 0) performMajorGC
+    -- Flag-gated cross-fixture memory probe (@IHC_MEM_DEBUG@).  Runs
+    -- BEFORE the wipes below so the dump reflects the PEAK live set the
+    -- just-finished fixture left behind (pre-clear).  Zero-cost when
+    -- the flag is unset: a single CAF boolean test, same disposition as
+    -- 'IHC.Diagnostics.traceLine'.  This is the single guaranteed
+    -- per-fixture boundary (every 'loadProgramFromSource' calls it
+    -- first), so it also covers 'RunFile' multi-run without test
+    -- wiring.  See 'IHC.MemDebug.dumpMemStats'.
+    when memDebugEnabled $ do
+        modifyIORef' _memDebugFixtureCounter (+1)
+        n <- readIORef _memDebugFixtureCounter
+        when (n `mod` memDebugEvery == 0) $ do
+            lm  <- Map.size <$> readIORef globalLoadedModulesRef
+            fbc <- Map.size <$> readIORef envFallbackCache
+            -- (3rd arg was globalEarlyBuiltinsRef's size — a constant
+            -- ~1168, no diagnostic value — and master removed that
+            -- global; pass 0 to keep dumpMemStats's signature stable.)
+            dumpMemStats ("pre-reset fixture #" <> show n) lm fbc 0
     -- 'globalLoadedModulesRef' (the parsed-module skeleton cache) is
     -- the cross-fixture amortization win: wiping it forces every
     -- 'loadProgramFromSource' run to re-scan ~155 base modules from
@@ -5234,13 +5289,35 @@ resetPerRunGlobals = do
     clearCtorStrictness
     clearCtorIndex
     clearForeignPtrWord8Ranges
-    -- Scan cache + pat-syn registry: process-global CAFs that
-    -- accumulated unboundedly across the single-process 'ihc-test'
-    -- run and exhausted the macOS 'build' job's -M8G heap.  Clearing
-    -- at run start (before any scanning) reclaims the cross-run
-    -- accumulation while preserving within-run sharing — see the
-    -- 'clearScanCacheRegistry' / 'IHC.PatSyn.clearPatSyns' Haddocks.
-    clearScanCacheRegistry
+    -- THE dominant master-CI OOM fix.  A `+RTS -hT` heap profile of the
+    -- full ~600-example in-process hspec suite is dominated by ~4 GB of
+    -- @STACK@ (every other band ≤56 MB): interpreted programs fork
+    -- background threads (warp accept loop, System.TimeManager, async,
+    -- bare @forkIO@) still alive when 'runFile' has returned @main@'s
+    -- value.  Nothing reaped them, so their TSO stacks accumulated
+    -- across fixtures until the heap cap (the 24-min GC death-spiral
+    -- then 'Heap exhausted' in CI).  Kill the prior run's leaked
+    -- threads at the next run boundary — that program is finished and
+    -- its threads are pure garbage.  Pure fixtures fork nothing → no-op.
+    reapSpawnedThreads
+    -- Scan-cache: master's PR #167 wiped the WHOLE registry here, which
+    -- cold-re-scans base/ByteString every fixture (a measured
+    -- CI-timeout slowdown — see 'clearScanCacheRegistry's Haddock; the
+    -- cache is only ~56 MB anyway, the real ~4 GB was thread STACK,
+    -- reaped just above).  Instead drop only the PRIOR run's
+    -- entry-module source keys (stashed at the end of the prior
+    -- 'loadProgramFromSource' — pre- and post-CPP bytes): unique per
+    -- fixture and never reused, so this bounds per-run scan growth
+    -- while keeping shared library entries warm (no cold re-scan).
+    prevScanKeys <- readIORef _prevEntryScanKeysRef
+    mapM_ evictScanCacheKey prevScanKeys
+    writeIORef _prevEntryScanKeysRef []
+    -- Extend the clear* precedent to the remaining append-only globals
+    -- (reconstructed on demand next run: 'registerCbitsDylibs' re-opens
+    -- libs, 'resolveSymbol' re-resolves symbols, 'registerPatSyns'
+    -- re-runs at module load).
+    FFI.clearOpenLibs
+    FFI.clearSymbolCache
     PatSyn.clearPatSyns
     resetNewNameCounter
     resetLocateModuleNegCache
@@ -7128,6 +7205,35 @@ discoveryCallCap = 2_000_000
 {-# NOINLINE _discoverTotalRef #-}
 _discoverTotalRef :: IORef Int
 _discoverTotalRef = unsafePerformIO (newIORef 0)
+
+-- | Per-process fixture counter for the @IHC_MEM_DEBUG@ probe (drives
+-- the every-Nth-fixture dump in 'resetPerRunGlobals').  Deliberately
+-- NOT reset per run — it must count across the whole in-process suite.
+-- Inert unless 'memDebugEnabled'.
+{-# NOINLINE _memDebugFixtureCounter #-}
+_memDebugFixtureCounter :: IORef Int
+_memDebugFixtureCounter = unsafePerformIO (newIORef 0)
+
+-- | Unconditional per-run counter driving the periodic
+-- 'System.Mem.performMajorGC' in 'resetPerRunGlobals' (every 25
+-- runs).  Separate from '_memDebugFixtureCounter' (which only ticks
+-- under @IHC_MEM_DEBUG@).  This GC is harmless heap hygiene only — it
+-- is NOT the master-CI OOM fix (falsified by CI run @26027458628@;
+-- see the call-site comment).  Not reset per run — it counts across
+-- the whole in-process suite.
+{-# NOINLINE _resetRunCounter #-}
+_resetRunCounter :: IORef Int
+_resetRunCounter = unsafePerformIO (newIORef 0)
+
+-- | The just-finished run's entry-module scan-cache keys (pre- and
+-- post-CPP source bytes), stashed by 'loadProgramFromSource' so the
+-- NEXT run's 'resetPerRunGlobals' can selectively 'evictScanCacheKey'
+-- them — bounding per-run scan-cache growth without the cold-re-scan
+-- blowup a blanket 'clearScanCacheRegistry' causes (these keys are
+-- unique per fixture; shared library entries are never in this list).
+{-# NOINLINE _prevEntryScanKeysRef #-}
+_prevEntryScanKeysRef :: IORef [ByteString]
+_prevEntryScanKeysRef = unsafePerformIO (newIORef [])
 
 {-# NOINLINE _exportedFieldRegistryMemoRef #-}
 _exportedFieldRegistryMemoRef :: IORef (Map ByteString FieldRegistry)

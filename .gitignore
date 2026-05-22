@@ -7,6 +7,12 @@ dist/
 result
 result-*
 
+# RTS heap-profile artifacts (ihc-mem-probe / ihc-test +RTS -hT, IHC_MEM_DEBUG)
+*.hp
+*.prof
+*.ps
+*.aux
+
 # Stray cabal-get extractions (from agents that ran `cabal get` here)
 /bytestring-*/
 /tasty-*/

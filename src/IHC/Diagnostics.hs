@@ -20,12 +20,15 @@ module IHC.Diagnostics
     , warnStubsEnabled
     , traceLine
     , traceEnabled
+    , memDebugEnabled
+    , memDebugEvery
     ) where
 
 import Data.Char (toLower)
 import System.Environment (lookupEnv)
 import System.IO (hFlush, hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
+import Text.Read (readMaybe)
 
 -- | 'True' iff the @IHC_WARN_STUBS@ env var is not set to a disabling
 -- value. Default (unset) is warnings-on. The gate is re-read on every
@@ -91,3 +94,34 @@ traceLine msg =
             hPutStrLn stderr ("[ihc:trace] " <> msg)
             hFlush stderr
         else pure ()
+
+-- | 'True' iff the @IHC_MEM_DEBUG@ env var is set to an enabling value
+-- (@1@ / @true@ / @yes@ / @on@, case-insensitive). Default (unset) is
+-- OFF. Cached in a top-level CAF — identical disposition to
+-- 'traceEnabled' — so the per-fixture guard in
+-- 'IHC.Scheduler.resetPerRunGlobals' is a single boolean test and the
+-- whole 'IHC.MemDebug' machinery is zero-cost in normal/CI runs.
+memDebugEnabled :: Bool
+memDebugEnabled = unsafePerformIO $ do
+    mv <- lookupEnv "IHC_MEM_DEBUG"
+    pure $ case mv of
+        Nothing -> False
+        Just v  -> case map toLower v of
+            "1"     -> True
+            "true"  -> True
+            "yes"   -> True
+            "on"    -> True
+            _       -> False
+{-# NOINLINE memDebugEnabled #-}
+
+-- | How many fixtures between @[ihc:mem]@ dumps.  Read from
+-- @IHC_MEM_DEBUG_EVERY@ (default 25); a non-positive or unparseable
+-- value falls back to 25.  Cached CAF, only consulted when
+-- 'memDebugEnabled'.
+memDebugEvery :: Int
+memDebugEvery = unsafePerformIO $ do
+    mv <- lookupEnv "IHC_MEM_DEBUG_EVERY"
+    pure $ case mv >>= readMaybe of
+        Just n | n > 0 -> n
+        _              -> 25
+{-# NOINLINE memDebugEvery #-}
