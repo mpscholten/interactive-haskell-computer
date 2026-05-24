@@ -67,6 +67,7 @@ import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
 import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
+import qualified System.Info
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
     ( BufferMode(..)
@@ -4524,7 +4525,7 @@ peekB = pure $ VFun $ \a -> pure $ VIO $ do
 looksLikeAddrInfo :: Word32 -> Word32 -> Word32 -> Word32 -> Bool
 looksLikeAddrInfo flags family socktype protocol =
     flags <= 0x1fff
-    && family `elem` [0, 1, 2, 30]
+    && family `elem` [0, 1, 2, 10, 30]  -- AF_INET6 is 10 on Linux, 30 on macOS
     && socktype <= 10
     && protocol <= 255
 
@@ -4709,6 +4710,38 @@ maybeCStringVal ptrWord = do
     strT <- newWHNFThunk strV
     pure (VCon "Just" [strT])
 
+-- | Read @sa_family@ from a @struct sockaddr@, handling both macOS
+-- (1-byte @sa_family@ at offset 1, after @sa_len@) and Linux
+-- (2-byte @sa_family_t@ at offset 0, no @sa_len@).  On
+-- little-endian, reading a Word16 at offset 0 on macOS gives
+-- @sa_family << 8 | sa_len@ (≥ 256 for any family > 0 with
+-- sa_len > 0); on Linux it gives the plain family value (≤ 255).
+peekSaFamily :: Ptr Word8 -> IO Word8
+peekSaFamily p = do
+    raw16 <- peekByteOff p 0 :: IO Word16
+    if raw16 <= 255
+        then pure (fromIntegral raw16)         -- Linux: plain sa_family
+        else peekByteOff p 1 :: IO Word8       -- macOS: sa_family after sa_len
+
+-- | Write @sa_family@ to a @struct sockaddr@.  On macOS writes
+-- sa_len + sa_family (offsets 0 + 1); on Linux writes sa_family
+-- as a Word16 at offset 0.
+pokeSaFamily :: Ptr Word8 -> Word8 -> IO ()
+pokeSaFamily p fam
+    | isDarwin  = do
+        pokeByteOff p 0 (0 :: Word8)   -- sa_len (set by bind/connect)
+        pokeByteOff p 1 fam
+    | otherwise =
+        pokeByteOff p 0 (fromIntegral fam :: Word16)
+
+-- | AF_INET6 value for the current platform.
+afInet6 :: Word8
+afInet6 = if isDarwin then 30 else 10
+
+-- | Detect macOS at runtime via System.Info.
+isDarwin :: Bool
+isDarwin = System.Info.os == "darwin"
+
 peekSockAddrVal :: Ptr Word8 -> IO Val
 peekSockAddrVal p
     | p == nullPtr = do
@@ -4716,7 +4749,7 @@ peekSockAddrVal p
         addrT <- newWHNFThunk (VInt 0)
         pure (VCon "SockAddrInet" [portT, addrT])
     | otherwise = do
-        family <- peekByteOff p 1 :: IO Word8
+        family <- peekSaFamily p
         case family of
             1 -> do
                 s <- peekCAString (castPtr (p `plusPtr` 2))
@@ -4730,7 +4763,8 @@ peekSockAddrVal p
                 portT <- newWHNFThunk (VInt (fromIntegral port))
                 addrT <- newWHNFThunk (VInt (fromIntegral addr))
                 pure (VCon "SockAddrInet" [portT, addrT])
-            30 -> do
+            -- AF_INET6: 30 on macOS, 10 on Linux
+            f | f == 30 || f == 10 -> do
                 portRaw <- peekByteOff (castPtr p :: Ptr Word16) 2 :: IO Word16
                 flowRaw <- peekByteOff (castPtr p :: Ptr Word32) 4 :: IO Word32
                 a0Raw <- peekByteOff (castPtr p :: Ptr Word32) 8 :: IO Word32
@@ -5004,8 +5038,7 @@ sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
     -- bytes ARE the network bytes).  PortNumber is host order, so htons
     -- is required for sin_port; sin_addr is poked raw.
     pure (16, \p -> do
-        pokeByteOff p 0 (16 :: Word8)
-        pokeByteOff p 1 (2 :: Word8)
+        pokeSaFamily p 2
         pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
         pokeByteOff p 4 (fromIntegral addr :: Word32))
 sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
@@ -5016,8 +5049,7 @@ sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
     -- HostAddress6 = (Word32, Word32, Word32, Word32) in HOST byte order,
     -- so each chunk needs htonl on poke.  ScopeID is raw (host concept).
     pure (28, \p -> do
-        pokeByteOff p 0 (28 :: Word8)
-        pokeByteOff p 1 (30 :: Word8)
+        pokeSaFamily p afInet6
         pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
         pokeByteOff p 4 (htonl32 (fromIntegral flow) :: Word32)
         pokeByteOff p 8 (htonl32 (fromIntegral a0) :: Word32)
