@@ -4654,7 +4654,18 @@ visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
     pure (unionFieldRegistries (lmFieldReg lm : imported ++ loadedFields))
   where
     importFields imp
-        | impQualified imp = pure Map.empty
+        -- Qualified imports: we don't walk their full export chain,
+        -- but we do ensure the target is loaded so its lmFieldReg
+        -- enters the loadedFields union (read from the registry
+        -- after all importFields calls complete).  This makes
+        -- record updates on types from qualified imports work
+        -- (e.g. NS.defaultHints { NS.addrFlags = ... }).
+        | impQualified imp = case mWanted of
+            Just _ -> do
+                _ <- try (loadModule registry searchPath includeMap (impModule imp))
+                        :: IO (Either SomeException LoadedModule)
+                pure Map.empty
+            Nothing -> pure Map.empty
         | otherwise = do
             r <- try (loadModule registry searchPath includeMap (impModule imp))
                     :: IO (Either SomeException LoadedModule)
@@ -4666,8 +4677,17 @@ visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
                             visibleWanted <- filterM
                                 (specAllowsLoaded importedLm (impSpec imp))
                                 wanted
+                            -- If specAllowsLoaded rejected all wanted names,
+                            -- they might be sub-names of a re-exported type
+                            -- (e.g. field names from T(..) where T is defined
+                            -- in a transitive import).  Try the original list
+                            -- so exportedFieldRegistryForNames can walk the
+                            -- re-export chain.
+                            let effective = if null visibleWanted
+                                              then wanted
+                                              else visibleWanted
                             exportedFieldRegistryForNames registry searchPath includeMap
-                                importedLm [lmName lm] visibleWanted
+                                importedLm [lmName lm] effective
                         Nothing -> do
                             exported <- exportedFieldRegistry registry searchPath includeMap
                                             importedLm [lmName lm]
@@ -4699,8 +4719,14 @@ exportedFieldRegistryForNames registry searchPath includeMap lm visited wanted0
                 , importedNamedFields [visibleExportName n]
                 ]
         | otherwise = pure Map.empty
-    exportItem (ExportType ty mbSubs) =
-        pure (relevantFieldRegistry wanted (typeFieldRegistry lm ty mbSubs))
+    exportItem (ExportType ty mbSubs) = do
+        let local = relevantFieldRegistry wanted (typeFieldRegistry lm ty mbSubs)
+        if not (Map.null local)
+            then pure local
+            -- Type is re-exported from an import (e.g. Network.Socket
+            -- re-exports AddrInfo(..) from Network.Socket.Info).
+            -- Walk unqualified imports to find the defining module.
+            else importedTypeFields ty mbSubs
     exportItem (ExportModule m)
         | m `elem` visited' = pure Map.empty
         | otherwise = do
@@ -4733,6 +4759,30 @@ exportedFieldRegistryForNames registry searchPath includeMap lm visited wanted0
                                 if Map.null found
                                     then go rest
                                     else pure found
+
+    -- | Walk imports to find field registries for a re-exported type.
+    -- E.g. Network.Socket re-exports AddrInfo(..) from
+    -- Network.Socket.Info — this function finds Info's field registry
+    -- for AddrInfo's fields.
+    -- Uses loadModule to ensure targets are available, but only checks
+    -- the target's local typeFieldRegistry (no recursive
+    -- exportedFieldRegistryForNames) to avoid infinite loops.
+    importedTypeFields ty mbSubs = go (mhImports (lmHeader lm))
+      where
+        go [] = pure Map.empty
+        go (imp:rest)
+            | impModule imp `elem` visited' = go rest
+            | otherwise = do
+                r <- try (loadModule registry searchPath includeMap (impModule imp))
+                        :: IO (Either SomeException LoadedModule)
+                case r of
+                    Left _ -> go rest
+                    Right targetLm -> do
+                        let found = relevantFieldRegistry wanted
+                                      (typeFieldRegistry targetLm ty mbSubs)
+                        if not (Map.null found)
+                            then pure found
+                            else go rest
 
 -- | Field selectors exported by a module, including selectors named in an
 -- explicit export list but defined by one of the module's imports. Record

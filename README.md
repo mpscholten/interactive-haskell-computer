@@ -14,23 +14,41 @@ A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goa
 
 The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns out to align cleanly with what agents do well: small steps, narrow blast radius, fixture-driven feedback. The project is as much a study of that alignment as it is a Haskell interpreter.
 
-## Status (Phase 2.3 — 2026-04-15)
+## Status (Phase 2.3 — 2026-05-24)
 
-- **102/102 tests pass** (94 fixtures + 8 type-class tests) through a tree-walking lazy evaluator.
-- **`Data/ByteString/Lazy.hs` + the rest of bytestring (55/55 files = 100%) parse cleanly.**
+- **332 coverage fixtures pass** through a tree-walking lazy evaluator.
+- **ByteString fully source-loaded** — all 55 files of `Data.ByteString.*` parse and interpret from real source.
+- **Exception handling graduated** — `try`, `handle`, `bracket`, `finally`, `onException`, `mask` all source-loaded from ghc-internal (host shims removed).
+- **ghc-bignum arithmetic pipeline** — `BigNat` primops, `Integer` dispatch via source-loaded `Num`/`Integral`, `IS`/`IP`/`IN` transparent construct collapse, `floor`/`ceiling`/`round`/`truncate` source-loaded.
+- **Thread lifecycle** — leaked interpreter threads reaped at fixture boundaries; `forkIO`/`killThread`/`MVar`/`STM` working.
 - **Cabal-aware source loader**: detects project root, reads `cabal.project.freeze`, parallel `cabal get` into `~/.cache/ihc/sources/`, per-package extensions/cpp-options.
-- **Type classes via dictionary passing**: `ClassRegistry` maps `(ClassName, TypeTag)` to method lists; builtin instances for Int/Char/Bool/List/Maybe; user-defined `instance C T where` parsed and registered at load time.
-- `True`/`False` are now `VCon "True"/"False"` — all comparisons return proper Bool.
+- **Type classes via dictionary passing**: `ClassRegistry` maps `(ClassName, TypeTag)` to method lists; builtin + user-defined instances.
 - Lazy evaluation with `IORef`-backed thunks (black-hole protocol).
 - ADTs + pattern matching + lists + `[Char]` strings + tuples + as/bang patterns.
-- Multi-clause functions + guards.
 - Pratt operator parser with module-level fixity tables.
 - Hand-rolled CPP (no `cpphs` dep) handling `#if`/`#ifdef`/`MIN_VERSION_*`/etc.
 - IO monad with `do`/`<-`/`>>=`/`return`/IORef/file IO/exit.
 - Multi-module loading with qualified imports + per-module `KnownSymbols`.
 - Lambdas (multi-arg + `\case`), sections, backtick infix, `$`, `.`, `MultiWayIf`.
+- **Cold-start 140x–280x faster than ghci/runghc** (0.018s vs 2.5s for small programs).
 
 Everything via interpretation — **no JIT path on the runtime today**.
+
+## What's next
+
+The four original warp blockers (re-export resolution, record patterns in instances, `Strict` extension, `GHC.Conc.Sync`) are all resolved. Warp imports resolve correctly and `runSettings` can be thunked. The remaining blocker for serving the first HTTP request:
+
+| Blocker | Where | Impact |
+|---------|-------|--------|
+| **Network.Socket FFI chain** — forcing `runSettings` pulls in `bindPortTCP` → `Network.Socket` with 64+ `foreign import` declarations and massive ADTs (`Family`, `SocketOption`, etc.) | `Builtins.hs` / `FFI.hs` | Blocks all socket I/O; discovery explodes to 5000+ bindings and hangs |
+
+High-ROI parser/evaluator fixes (1–2 days each, fix 6–12 files each):
+- Type signatures in where/let blocks (24 errors, 12 files)
+- `?x.field` dot-chain postfix (11 errors, 6 files)
+- Case-alternative guards (8 errors, 6 files)
+- Multi-binding layout `let` (20 errors)
+
+Longer-term IHP readiness requires `TypeFamilies`, `DataKinds`, `OverloadedLabels`, `ImplicitParams`, and full Template Haskell — see the roadmap below.
 
 ## Roadmap
 
