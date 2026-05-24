@@ -2991,6 +2991,22 @@ classMethodDispatcher reg cls methodName = selfVal
                                                   case mDef of
                                                       Just defVal ->
                                                           applyAll defVal (reverse (argT : accArgs))
+                                                      -- Category (->): (.) and id are GHC.Internal.Base
+                                                      -- primitives whose source body self-references
+                                                      -- through the class re-export.  Provide the
+                                                      -- canonical implementation directly.
+                                                      _ | cls == BC.pack "Category"
+                                                        , tag == functionArrowTag
+                                                        , methodName == BC.pack "." || methodName == BC.pack "id" -> do
+                                                          let baseDot = VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
+                                                                  gV <- force legacyHooks gT
+                                                                  gxV <- apply legacyHooks gV xT
+                                                                  gxT <- newWHNFThunk gxV
+                                                                  fV <- force legacyHooks fT
+                                                                  apply legacyHooks fV gxT
+                                                              baseId = VFun $ \a -> force legacyHooks a
+                                                              impl = if methodName == BC.pack "." then baseDot else baseId
+                                                          applyAll impl (reverse (argT : accArgs))
                                                       _ -> error
                                                           ( "class-method dispatch: no instance of `"
                                                            <> BC.unpack cls
