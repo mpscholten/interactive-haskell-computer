@@ -6003,11 +6003,26 @@ resolveFallbackSource mOwner name = do
                         | hasNoImplicitPrelude (lmSource owner) = []
                         | otherwise = preludeScope
                     candidateNames = visibleViaImport ++ implicit
-                    importCandidates =
-                        [ (n, lm)
-                        | n  <- candidateNames
-                        , Just lm <- [Map.lookup n mods]
-                        ]
+                -- Load unresolved import targets on demand.
+                -- Without this, names imported from not-yet-loaded
+                -- modules (e.g. #. from Data.Functor.Utils) fail as
+                -- "unbound variable" because the owner's import
+                -- wasn't loaded during discovery (non-entry skip).
+                loadedImports <- forM candidateNames $ \n ->
+                    case Map.lookup n mods of
+                        Just lm -> pure (Just (n, lm))
+                        Nothing -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            r <- try (loadModule transientReg searchPath includeMap n)
+                                    :: IO (Either SomeException LoadedModule)
+                            case r of
+                                Right lm -> do
+                                    mergeGlobalLoadedModules (Map.singleton n lm)
+                                    pure (Just (n, lm))
+                                Left _ -> pure Nothing
+                let importCandidates = catMaybes loadedImports
                     -- Local bindings shadow imports (H2010 §5.5.1):
                     -- search the owner module's own source first.
                     candidates = (ownerName, owner) : importCandidates
