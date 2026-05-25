@@ -37,7 +37,7 @@ import Control.Exception
     , throwTo
     , SomeException
     )
-import Foreign.C.Error (Errno(..), getErrno, eAGAIN, eWOULDBLOCK, eINTR)
+import Foreign.C.Error (Errno(..), getErrno)
 import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
@@ -1139,6 +1139,8 @@ builtins reg =
     , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
+    , ("Network.Socket.listen", socketListenB)
+    , ("Network.Socket.Syscall.listen", socketListenB)
     , ("Network.Socket.listen", socketListenB)
     , ("Network.Socket.Syscall.listen", socketListenB)
     -- accept(2) blocks for the next connection and returns a network Socket
@@ -4534,8 +4536,13 @@ looksLikeAddrInfo flags family socktype protocol =
 
 peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
 peekAddrInfoVal p flags family socktype protocol = do
-    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
-    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    -- Linux struct addrinfo layout (64-bit):
+    -- offset 16: ai_addrlen (socklen_t, 4 bytes + padding)
+    -- offset 24: ai_addr (struct sockaddr*)
+    -- offset 32: ai_canonname (char*)
+    -- offset 40: ai_next (struct addrinfo*)
+    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
+    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
     flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
     familyT <- newWHNFThunk =<< oneFieldCon "Family" family
     socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype
@@ -4866,6 +4873,7 @@ socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ 
     fd <- socketFdFromVal sockV
     backlog <- intField "listen.backlog" backlogT
     rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
+    System.IO.hFlush System.IO.stderr
     if rc == -1
         then ioError (userError "Network.Socket.listen")
         else pure VUnit
@@ -4874,36 +4882,21 @@ socketAcceptB :: IO Val
 socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
     sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
+    -- Set socket to blocking mode for accept.  The network library
+    -- creates sockets in non-blocking mode for GHC's IO manager,
+    -- but IHC's single-threaded accept loop needs a blocking accept.
+    c_setBlocking (fromIntegral fd)
     allocaBytes 128 $ \addrP ->
       allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        let acceptLoop = do
-                fillBytes addrP 0 128
-                poke (castPtr lenP :: Ptr CInt) 128
-                newFd <- c_accept_host (fromIntegral fd)
-                                       (castPtr addrP)
-                                       (castPtr lenP)
-                if newFd /= -1
-                    then pure newFd
-                    else do
-                        -- @Network.Socket@ puts listening sockets in
-                        -- non-blocking mode (see @Syscall.hs@ in
-                        -- @network@), so a real accept must retry on
-                        -- EAGAIN / EWOULDBLOCK via the IO manager and
-                        -- restart on EINTR — otherwise warp's accept
-                        -- loop bails on the first poll-with-no-pending.
-                        Errno e <- getErrno
-                        if Errno e == eAGAIN
-                                || Errno e == eWOULDBLOCK
-                            then do
-                                threadWaitRead (fromIntegral fd)
-                                acceptLoop
-                            else if Errno e == eINTR
-                                then acceptLoop
-                                else ioError
-                                    (userError
-                                       ("Network.Socket.accept: errno="
-                                        <> show e))
-        newFd <- acceptLoop
+        fillBytes addrP 0 128
+        poke (castPtr lenP :: Ptr CInt) 128
+        -- safe FFI: blocks OS thread, releases GHC capability
+        newFd <- c_accept_host (fromIntegral fd)
+                               (castPtr addrP)
+                               (castPtr lenP)
+        when (newFd == -1) $ do
+            Errno e <- getErrno
+            ioError (userError ("Network.Socket.accept: errno=" <> show e))
         fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
         ref <- newIORef fdValT
         refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
@@ -5116,8 +5109,18 @@ foreign import ccall unsafe "setsockopt"
 foreign import ccall unsafe "listen"
     c_listen_host :: CInt -> CInt -> IO CInt
 
-foreign import ccall unsafe "accept"
+foreign import ccall safe "accept"
     c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
+
+-- | Set a socket fd to blocking mode (clear O_NONBLOCK).
+c_setBlocking :: CInt -> IO ()
+c_setBlocking fd = do
+    flags <- c_fcntl fd 3 0  -- F_GETFL = 3
+    let newFlags = flags .&. complement 0x800  -- O_NONBLOCK = 0x800 on Linux
+    _ <- c_fcntl fd 4 newFlags  -- F_SETFL = 4
+    pure ()
+
+foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
 
 foreign import ccall unsafe "getsockname"
     c_getsockname_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
