@@ -1480,6 +1480,15 @@ apply _     (VCon n [])                 arg
 apply hooks (VCon _ [innerT])           arg = do
     inner <- force hooks innerT
     apply hooks inner arg
+-- VIO applied to a state token: the source-loaded IO bind extracts
+-- the state function from IO via pattern matching, but sometimes the
+-- unwrapped value is still VIO (not a VFun state function).  Run the
+-- IO action and return (# state, result #) as the state function would.
+apply hooks (VIO io) arg = do
+    result <- io
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    resT <- newWHNFThunk result
+    pure (VCon "(#,#)" [stT, resT])
 apply _     v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 
