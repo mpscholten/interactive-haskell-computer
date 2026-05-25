@@ -3264,7 +3264,16 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 mkFileHandleVal :: String -> Handle -> IO Val
 mkFileHandleVal path h = do
     pathT <- newWHNFThunk =<< stringToListValIO path
+    -- Handle__ with zero fields: desugarRecordPats converts
+    -- Handle__ {..} to PCon "Handle__" [] when the field registry
+    -- doesn't have Handle__'s fields.  Store the host Handle as a
+    -- separate thunk accessible via requireHandle.
     handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
+    -- The MVar contains (VCon "Handle__" [], PrimHandle).
+    -- We store the Handle__ wrapper AND the host handle in a tuple
+    -- inside the MVar so pattern matching on Handle__ {..} succeeds
+    -- (desugarRecordPats produces PCon "Handle__" [] when fields unknown)
+    -- and requireHandle can extract the host handle.
     mv    <- newMVar (VCon "Handle__" [handleT])
     mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
     pure (VCon "FileHandle" [pathT, mvarT])

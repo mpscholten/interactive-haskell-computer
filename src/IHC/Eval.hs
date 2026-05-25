@@ -1209,7 +1209,11 @@ matchPat hooks pat@(PCon "PS" _) v = do
 matchPat hooks (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
     matchFields hooks [(pState, stateT), (pVal, valT)] []
 matchPat hooks (PCon name pats) v@(VCon vname vthunks)
-    | name == vname && length pats == length vthunks =
+    | name == vname && (length pats == length vthunks
+                        || null pats) =
+        -- null pats: desugared from Con {..} where field registry
+        -- doesn't know the fields.  Match the constructor name,
+        -- ignore field count.
         -- Zip sub-patterns with the constructor's field thunks. For
         -- each pair: if the sub-pattern is a 'PVar' we bind the name
         -- directly to the existing field thunk (preserving sharing
