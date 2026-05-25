@@ -7552,15 +7552,7 @@ resolveImport
     -> ByteString
     -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
-    -- Cache: every call walks @lm@'s unqualified imports and may
-    -- @loadModule@ each.  For warp-shaped programs the same
-    -- @(module, name)@ pair gets re-resolved hundreds of times during
-    -- demand-driven discovery, with each retry costing
-    -- O(unqualified-imports-of-lm) loadModule calls — observed at
-    -- ~3,300 loadModule calls/sec hammering the registry.  A simple
-    -- per-(lm-name, query-name) memo cuts that to one resolve per
-    -- pair.  Cache hits return both the @Just M@ and the @Nothing@
-    -- (no-resolution) outcomes so failed lookups don't replay either.
+    -- Cache: see comment block below.
     cache <- readIORef resolveImportCacheRef
     case Map.lookup (lmName lm, name) cache of
         Just cached -> pure cached
@@ -7569,6 +7561,57 @@ resolveImport registry searchPath includeMap lm name = do
             modifyIORef' resolveImportCacheRef
                 (Map.insert (lmName lm, name) r0)
             pure r0
+
+-- | Shallow import resolution for discovery free vars.  Only checks
+-- whether the name is locally defined in a direct (non-qualified)
+-- import — no re-export chain walking.  If not found, returns
+-- Nothing and the evaluator's env-fallback resolves it at runtime.
+-- This bounds discovery to O(direct-imports) per name.
+_resolveImportShallow
+    :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath]
+    -> LoadedModule -> ByteString -> IO (Maybe ByteString)
+_resolveImportShallow registry searchPath includeMap lm name = do
+    let unqual = filter (not . impQualified) (mhImports (lmHeader lm))
+    go unqual
+  where
+    go [] = pure Nothing
+    go (imp:rest)
+        | not (specAllows (impSpec imp) name) = go rest
+        | otherwise = do
+            reg <- readIORef registry
+            case Map.lookup (impModule imp) reg of
+                Just (Loaded targetLm) -> do
+                    mLhs <- findOrResolveLhs (lmSource targetLm) (lmKnown targetLm) name
+                    case mLhs of
+                        Just _ | exportsName targetLm name ->
+                            pure (Just (lmName targetLm))
+                        _ -> do
+                            isMethod <- exportsClassMethod targetLm name
+                            if isMethod
+                                then pure (Just (lmName targetLm))
+                                else if Map.member name (lmFieldReg targetLm)
+                                        && exportsName targetLm name
+                                    then pure (Just (lmName targetLm))
+                                    else go rest
+                -- Module not yet loaded — skip (don't trigger loadModule).
+                -- If the name is needed at eval time, env-fallback will
+                -- load the module then.
+                _ -> go rest
+
+    exportsClassMethod targetLm methodName = do
+        decls <- scanClassDecls (lmSource targetLm)
+        let matches = [ ()
+                      | ClassDecl cn ms _ _ <- decls
+                      , methodName `elem` ms
+                      , case mhExports (lmHeader targetLm) of
+                          ExportAll -> True
+                          ExportList items -> any (exportsClass cn ms) items
+                      ]
+        pure (not (null matches))
+    exportsClass cn _ms (ExportType n Nothing) = n == cn
+    exportsClass cn _ms (ExportType n (Just [])) = n == cn
+    exportsClass cn _ms (ExportType n (Just subs)) = n == cn && name `elem` subs
+    exportsClass _ _ _ = False
 
 -- | Reset the resolve-import cache between runFile calls so a stale
 -- 'lmName' from a prior run doesn't shadow a fresh resolution.  Wired
