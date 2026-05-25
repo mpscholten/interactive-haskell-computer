@@ -5869,42 +5869,39 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
-                                     -- Class-method dispatcher fallback: when
-                                     -- @bareName@ is a method of a class that
-                                     -- has been scanned (e.g. @Num@'s @abs@),
-                                     -- synthesise a 'classMethodDispatcher' on
-                                     -- the spot. This is the same slot that
-                                     -- 'buildClassMethodEnv' would have built
-                                     -- at startup, but we need it on demand
-                                     -- when the user's reference precedes the
-                                     -- buildClassMethodEnv pass that would
-                                     -- have placed it in the env.
-                                     mMethod <- tryClassMethodFromRegistry bareName
-                                     case mMethod of
+                                     -- Try ALL loaded modules' imports — the owner
+                                     -- might be wrong (e.g. class default method
+                                     -- evaluated in a different module's context).
+                                     mGlobal <- tryGlobalImportScan mods bareName
+                                     case mGlobal of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
-                                        searchPath <- readIORef globalSearchPathRef
-                                        includeMap <- readIORef globalIncludeMapRef
-                                        transientReg <- newIORef (Map.map Loaded mods)
-                                        let ownerName = fromMaybe (BC.pack "Prelude")
-                                                (preludeDirectOwner bareName)
-                                        loaded <- try (loadModule transientReg searchPath includeMap ownerName)
-                                                    :: IO (Either SomeException LoadedModule)
-                                        case loaded of
-                                            Left _ -> pure Nothing
-                                            Right preludeLm -> do
-                                                _ <- try (discoverInModule transientReg
-                                                            searchPath includeMap preludeLm bareName)
-                                                        :: IO (Either SomeException ())
-                                                reg <- readIORef transientReg
-                                                let newMods = Map.fromList
-                                                        [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                                mergeGlobalLoadedModules newMods
-                                                mods' <- readIORef globalLoadedModulesRef
-                                                mSlot <- buildSlotFromOwner mods'
-                                                    (Map.findWithDefault preludeLm ownerName mods')
-                                                    bareName
-                                                case mSlot of
+                                       mMethod <- tryClassMethodFromRegistry bareName
+                                       case mMethod of
+                                        Just slot -> pure (Just slot)
+                                        Nothing -> do
+                                         searchPath <- readIORef globalSearchPathRef
+                                         includeMap <- readIORef globalIncludeMapRef
+                                         transientReg <- newIORef (Map.map Loaded mods)
+                                         let ownerName = fromMaybe (BC.pack "Prelude")
+                                                 (preludeDirectOwner bareName)
+                                         loaded <- try (loadModule transientReg searchPath includeMap ownerName)
+                                                     :: IO (Either SomeException LoadedModule)
+                                         case loaded of
+                                          Left _ -> pure Nothing
+                                          Right preludeLm -> do
+                                           _ <- try (discoverInModule transientReg
+                                                       searchPath includeMap preludeLm bareName)
+                                                   :: IO (Either SomeException ())
+                                           reg <- readIORef transientReg
+                                           let newMods = Map.fromList
+                                                   [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                                           mergeGlobalLoadedModules newMods
+                                           mods' <- readIORef globalLoadedModulesRef
+                                           mSlot <- buildSlotFromOwner mods'
+                                               (Map.findWithDefault preludeLm ownerName mods')
+                                               bareName
+                                           case mSlot of
                                                     Just _ -> pure mSlot
                                                     -- Class-method retry: the
                                                     -- 'discoverInModule' walk above
@@ -6008,7 +6005,7 @@ resolveFallbackSource mOwner name = do
                 -- modules (e.g. #. from Data.Functor.Utils) fail as
                 -- "unbound variable" because the owner's import
                 -- wasn't loaded during discovery (non-entry skip).
-                loadedImports <- forM candidateNames $ \n ->
+                loadedImports <- forM candidateNames $ \n -> do
                     case Map.lookup n mods of
                         Just lm -> pure (Just (n, lm))
                         Nothing -> do
@@ -6071,14 +6068,69 @@ resolveFallbackSource mOwner name = do
                             searchPath <- readIORef globalSearchPathRef
                             includeMap <- readIORef globalIncludeMapRef
                             transientReg <- newIORef (Map.map Loaded mods)
-                            _ <- try (discoverInModule transientReg
+                            r <- try (discoverInModule transientReg
                                         searchPath includeMap owner bareName)
                                     :: IO (Either SomeException ())
-                            bodies' <- readIORef (lmBodies owner)
-                            if Map.member bareName bodies'
-                                then buildSlotFromOwner mods owner bareName
-                                else go rest
+                            case r of
+                                Left e -> do
+                                    go rest
+                                Right () -> do
+                                    bodies' <- readIORef (lmBodies owner)
+                                    if Map.member bareName bodies'
+                                        then buildSlotFromOwner mods owner bareName
+                                        else do
+                                            go rest
                         Nothing -> go rest
+
+    -- | Search ALL loaded modules for one whose unqualified imports
+    -- provide @bareName@. Loads import targets on demand. Covers
+    -- the case where the owner sentinel is wrong (e.g. a class default
+    -- method body's $$owner is the call-site module, not the class's
+    -- declaring module).
+    tryGlobalImportScan mods bareName = go (Map.toList mods)
+      where
+        go [] = pure Nothing
+        go ((_, lm) : rest) = do
+            let imports = mhImports (lmHeader lm)
+                visible = [ impModule imp
+                          | imp <- imports
+                          , not (impQualified imp)
+                          , specAllows (impSpec imp) bareName
+                          ]
+            found <- firstJustM visible
+            case found of
+                Just slot -> pure (Just slot)
+                Nothing -> go rest
+
+        firstJustM [] = pure Nothing
+        firstJustM (modName : ms) = do
+            targetLm <- case Map.lookup modName mods of
+                Just lm -> pure (Just lm)
+                Nothing -> do
+                    searchPath <- readIORef globalSearchPathRef
+                    includeMap <- readIORef globalIncludeMapRef
+                    transientReg <- newIORef (Map.map Loaded mods)
+                    r <- try (loadModule transientReg searchPath includeMap modName)
+                            :: IO (Either SomeException LoadedModule)
+                    case r of
+                        Right lm -> do
+                            mergeGlobalLoadedModules (Map.singleton modName lm)
+                            pure (Just lm)
+                        Left _ -> pure Nothing
+            case targetLm of
+                Nothing -> firstJustM ms
+                Just tlm -> do
+                    mLhs <- findOrResolveLhs (lmSource tlm) (lmKnown tlm) bareName
+                    case mLhs of
+                        Just _ -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            _ <- try (discoverInModule transientReg searchPath includeMap tlm bareName)
+                                    :: IO (Either SomeException ())
+                            mods' <- readIORef globalLoadedModulesRef
+                            buildSlotFromOwner mods' tlm bareName
+                        Nothing -> firstJustM ms
 
     -- | Scan every loaded module's 'lmDataReg' for a constructor named
     -- @bareName@.  When @import M (T(..))@ brings constructors into
@@ -7192,7 +7244,6 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
     when (cntT `mod` 1000 == 0) $ do
         System.IO.hPutStrLn System.IO.stderr
             ("[ihc:discover] total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
-        System.IO.hFlush System.IO.stderr
 
     -- Safety net: if the counter blows past a generous cap, abort
     -- fast with a useful trace.  The expected workload across the full
@@ -7210,7 +7261,6 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
                   <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name
                   <> " — capping (suspected env-fallback loop; see "
                   <> "discoverNegCacheRef comment in Scheduler.hs)" )
-            System.IO.hFlush System.IO.stderr
         throwIO (DiscoveryCallCapExceeded cntT (lmName lm) name)
 
     -- Grey-set memo: record the pair on ENTRY (before recursing), not
