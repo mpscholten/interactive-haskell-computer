@@ -1427,44 +1427,49 @@ parseDo ctx cur0 = do
 
     -- | Desugar a list of do-statements.  First try the applicative form;
     -- if that doesn't apply, fall back to the classical monadic chain.
+    -- Return EDo directly — evalDo handles all statement types.
+    -- The monadicDo desugaring (>>= / >> chains) is only needed for
+    -- non-IO monads that don't go through evalDo.  For now, keep
+    -- EDo and let the evaluator's direct do-handler run, avoiding
+    -- synthetic >>= / >> free vars that trigger class dispatch
+    -- cascades during discovery.
     desugarDo :: [Stmt] -> Expr
-    desugarDo ss
-      | Just appl <- tryApplicativeDo ss = appl
-      | otherwise                        = monadicDo ss
+    desugarDo = EDo
 
     -- | Standard Haskell do-notation desugaring using >>=/>>/let.
-    monadicDo :: [Stmt] -> Expr
-    monadicDo []               = EDo []  -- shouldn't happen; fallback
-    monadicDo [SExpr e]        = e
-    monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
-    monadicDo [SBangBind _ e]  = e  -- ditto for !x <- m as final stmt
-    monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
-    monadicDo [SImplicitLet bs] = EImplicitLet bs (EDo [])
-    monadicDo (SExpr e : rest) =
+    -- Kept for future use when non-IO monads need desugaring.
+    _monadicDo :: [Stmt] -> Expr
+    _monadicDo []               = EDo []  -- shouldn't happen; fallback
+    _monadicDo [SExpr e]        = e
+    _monadicDo [SBind _ e]      = e  -- last stmt can't be bind, but be defensive
+    _monadicDo [SBangBind _ e]  = e  -- ditto for !x <- m as final stmt
+    _monadicDo [SLet bs]        = ELet bs (EDo [])  -- shouldn't happen
+    _monadicDo [SImplicitLet bs] = EImplicitLet bs (EDo [])
+    _monadicDo (SExpr e : rest) =
         -- e >> do { rest }
-        EApp (EApp (EVar ">>") e) (monadicDo rest)
-    monadicDo (SBind name e : rest) =
+        EApp (EApp (EVar ">>") e) (_monadicDo rest)
+    _monadicDo (SBind name e : rest) =
         -- e >>= \name -> do { rest }
-        EApp (EApp (EVar ">>=") e) (ELam name (monadicDo rest))
-    monadicDo (SBangBind name e : rest) =
+        EApp (EApp (EVar ">>=") e) (ELam name (_monadicDo rest))
+    _monadicDo (SBangBind name e : rest) =
         -- !name <- e ;  rest   ==>   e >>= \name -> seq name (do { rest })
         -- Per Haskell Report §3.17.2 + GHC BangPatterns: the bound result
         -- is forced to WHNF before the rest of the do-block runs.
         EApp (EApp (EVar ">>=") e)
              (ELam name
-                 (EApp (EApp (EVar "seq") (EVar name)) (monadicDo rest)))
-    monadicDo (SLet bs : rest) =
+                 (EApp (EApp (EVar "seq") (EVar name)) (_monadicDo rest)))
+    _monadicDo (SLet bs : rest) =
         -- let bs in do { rest }
-        ELet bs (monadicDo rest)
-    monadicDo (SImplicitLet bs : rest) =
+        ELet bs (_monadicDo rest)
+    _monadicDo (SImplicitLet bs : rest) =
         -- let ?x = e in do { rest }
-        EImplicitLet bs (monadicDo rest)
+        EImplicitLet bs (_monadicDo rest)
 
     -- | If the do-block matches the applicative pattern, return its
     -- applicative desugaring.  See the header comment on 'parseDo' for the
     -- full set of conditions.
-    tryApplicativeDo :: [Stmt] -> Maybe Expr
-    tryApplicativeDo stmts = do
+    _tryApplicativeDo :: [Stmt] -> Maybe Expr
+    _tryApplicativeDo stmts = do
         -- Need at least one SBind plus a final SExpr (pure e).  A single
         -- bind still benefits: @do { x <- a; pure e }@ becomes
         -- @fmap (\\x -> e) a@, which is a cheap win over @a >>= \\x -> pure e@.
@@ -1517,7 +1522,7 @@ parseDo ctx cur0 = do
             -- subsequent binds.
             independent _    []             = True
             independent seen ((n, rhs) : rs) =
-                all (`notElem` seen) (exprFreeVars rhs)
+                all (`notElem` seen) (_exprFreeVars rhs)
                 && independent (n : seen) rs
 
     -- | Free variables of an 'Expr' (names referenced via 'EVar' that
@@ -1525,8 +1530,8 @@ parseDo ctx cur0 = do
     -- local so the parser doesn't depend on the scheduler; the version in
     -- 'IHC.Scheduler' covers more constructors but this subset is enough
     -- for ApplicativeDo's independence check.
-    exprFreeVars :: Expr -> [Name]
-    exprFreeVars = fv []
+    _exprFreeVars :: Expr -> [Name]
+    _exprFreeVars = fv []
       where
         fv bound = \case
             EVar n
