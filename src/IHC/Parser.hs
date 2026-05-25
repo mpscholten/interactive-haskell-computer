@@ -1428,11 +1428,7 @@ parseDo ctx cur0 = do
     -- | Desugar a list of do-statements.  First try the applicative form;
     -- if that doesn't apply, fall back to the classical monadic chain.
     desugarDo :: [Stmt] -> Expr
-    desugarDo = monadicDo
-    -- ApplicativeDo disabled: the <$>/<*> dispatch for IO doesn't
-    -- correctly propagate values when the bind names are unused.
-    -- TODO: re-enable once Applicative IO dispatch is fixed.
-    _desugarDoAppl ss
+    desugarDo ss
       | Just appl <- tryApplicativeDo ss = appl
       | otherwise                        = monadicDo ss
 

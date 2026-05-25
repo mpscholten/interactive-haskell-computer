@@ -42,6 +42,30 @@ Before adding anything to `isBuiltinBackedModule` or the primop catalog in `IHC.
 
 If interpreting a module from source reveals a missing language extension, primop, or class-dispatch case, the correct response is to **implement the missing feature**, not to add another shim. This keeps the interpreter honest and exercises the full parser/evaluator path.
 
+## No host-backed class method dispatchers
+
+Standard type class methods (`>>=`, `>>`, `return`, `pure`, `fmap`, `<*>`, `<$>`, `.`, `id`, `mempty`, `<>`, `show`, `==`, `/=`, `compare`, etc.) are **normal Haskell functions** defined in source (`GHC.Internal.Base`, `GHC.Internal.Control.Category`, `GHC.Internal.Show`, etc.). They MUST be interpreted from that source, not short-circuited via host-backed dispatchers.
+
+### What is banned
+
+- **Host-backed method body shims**: functions like `bindDispatch`, `fmapDispatch`, `apDispatch`, `seqDispatch`, `returnB` that duplicate what the source-loaded class instance already provides. These embed host Haskell implementations of class methods that should come from interpreted source.
+- **The pattern `XyzDispatch :: ClassRegistry -> IO Val`** that takes a class registry, forces an argument, inspects its type tag, and manually dispatches to instance methods. The class method dispatcher infrastructure (`classMethodDispatcher` in `Scheduler.hs`) already does this generically for all classes — individual per-method host shims are redundant.
+- **IO fast-path shortcuts** inside dispatchers (e.g. `VIO _ -> ioBind mv kt`) that bypass the source-loaded `instance Monad IO`. The source instance works; the shortcut is unnecessary hardcoding.
+
+### What is allowed
+
+- **The class dispatch infrastructure** itself (`classMethodDispatcher`, `lookupInstanceMethod`, `resolveTypedMethod`) — this is the generic lookup mechanism, not a per-method shim.
+- **VIO ↔ State# bridges** (`unIO`, `ioToST`/`stToIO`) — these are documented RTS-exclusive carve-outs (see "Tracked carve-outs" above).
+- **Primops** (`catch#`, `raiseIO#`, `newMutVar#`, etc.) — these have no Haskell source; they live in `GHC.Prim`.
+
+### Migration path
+
+Existing dispatchers (`bindDispatch`, `fmapDispatch`, `apDispatch`, `seqDispatch`, `returnB`) are legacy shims awaiting removal. When removing one:
+1. Delete the builtin map entries (e.g. `("fmap", fmapDispatch reg)`)
+2. Verify the source-loaded instance is registered (check `instance Functor IO` in `GHC.Internal.Base`)
+3. Verify the class method dispatcher finds it (the `classMethodFallback` hook routes unresolved names to the dispatcher)
+4. Add/update a fixture exercising the method through class dispatch
+
 ## `preludeScope`: minimum surface, same discipline as builtins
 
 `preludeScope` in `src/IHC/Scheduler.hs` is the implicit "what every program sees before its own imports" list — the modules whose contents must be in scope regardless of what the user imports. It is NOT a place to hardcode Hackage library modules. Hackage instances are discovered via the per-package instance manifest (introduced in commit `8aac0cc`); user-imported modules contribute via `instanceScope`, computed from the user's import closure.
