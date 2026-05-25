@@ -3466,47 +3466,37 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
 
     -- The pre-Stage-3 eager body, now invoked from the catalogue
     -- closure on first dispatch into this class.
+    -- Lazy per-method: each default is a VLazyMethod thunk that
+    -- defers free-var discovery + evaluation to first dispatch.
+    -- Previously, ALL defaults were eagerly discovered + forced at
+    -- registration time, creating the same cascade that the Stage-2
+    -- lazification of registerOne addressed for instance methods.
+    -- The specific cascade: Monad.return = pure → forces pure →
+    -- triggers Applicative dispatch → drains Applicative catalogue
+    -- → discovers ALL Applicative default FVs eagerly → etc.
     registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers) = do
-            -- Pre-demand-load each free var referenced in the class's
-            -- default bodies so 'buildImportRewritesForNames' can
-            -- rewrite them to their fully-qualified form before we try
-            -- to evaluate.  Class defaults like @foldr f z t = appEndo
-            -- (foldMap (Endo #. f) t) z@ rely on qualified imports
-            -- (e.g. @Endo@ from @Data.Semigroup.Internal@, @#.@ from
-            -- @Data.Functor.Utils@) that may not yet be demanded via
-            -- the usual flow.
-            fvs <- fmap (Set.fromList . concat) $
-                mapM (\(_, lhs) -> do
-                         r <- try (Parser.parseBodyExprWithFixity
-                                     (lmSource lm) (lmFixity lm) (lhsClauses lhs))
-                                 :: IO (Either SomeException Expr)
-                         case r of
-                             Right e -> pure (freeVars e)
-                             Left  _ -> pure [])
-                     (Map.toList defaults)
-            mapM_ (\fv -> do
-                       r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                :: IO (Either SomeException ())
-                       case r of
-                           Right () -> pure ()
-                           Left  _  -> pure ())
-                  (Set.toList fvs)
-            rewrites <- buildImportRewritesForNames registry lm fvs
-            vals <- HashMap.fromList <$> mapM (\methodName -> do
-                        v <- slotVal lm cls defaults rewrites methodName
-                        pure (methodName, v))
+            vals <- HashMap.fromList <$> mapM (\methodName ->
+                        case Map.lookup methodName defaults of
+                            Just lhs -> do
+                                t <- newLazyBuiltinThunk $ do
+                                    fvs <- do
+                                        r <- try (Parser.parseBodyExprWithFixity
+                                                     (lmSource lm) (lmFixity lm) (lhsClauses lhs))
+                                                 :: IO (Either SomeException Expr)
+                                        case r of
+                                            Right e -> pure (Set.fromList (freeVars e))
+                                            Left  _ -> pure Set.empty
+                                    mapM_ (\fv -> do
+                                        r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
+                                                  :: IO (Either SomeException ())
+                                        case r of { Right () -> pure (); Left _ -> pure () })
+                                      (Set.toList fvs)
+                                    rw <- buildImportRewritesForNames registry lm fvs
+                                    evalDefaultMethodWith env lm rw lhs
+                                pure (methodName, VLazyMethod t)
+                            Nothing -> pure (methodName, placeholder cls methodName))
                     methodNames
             registerInstance classReg cls defaultTypeTag vals
-
-    slotVal lm cls defaults rewrites methodName =
-        case Map.lookup methodName defaults of
-            Just lhs -> do
-                r <- try (evalDefaultMethodWith env lm rewrites lhs)
-                        :: IO (Either SomeException Val)
-                case r of
-                    Right v -> pure v
-                    Left  _ -> pure (placeholder cls methodName)
-            Nothing -> pure (placeholder cls methodName)
 
     -- When the class default for 'methodName' couldn't be captured or
     -- evaluated (e.g. because the body uses operators that scanClassDecls
