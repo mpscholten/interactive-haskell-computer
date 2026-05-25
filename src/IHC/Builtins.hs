@@ -4682,14 +4682,31 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
             _ -> pure acc
 
     conIntField :: String -> Val -> IO Word32
-    conIntField name v = case v of
+    conIntField _name v = case v of
         VCon _ [innerT] -> do
             inner <- force legacyHooks innerT
             case inner of
                 VInt n -> pure (fromIntegral n)
-                _      -> error (name <> ": inner not VInt: " <> showValForDebug inner)
+                _      -> conByName v
         VInt n          -> pure (fromIntegral n)
-        _ -> error (name <> ": not a single-field VCon or VInt: " <> showValForDebug v)
+        _               -> conByName v
+
+    -- Source-loaded constructors: map name → C value
+    conByName :: Val -> IO Word32
+    conByName (VCon n _) = case Map.lookup n socketConMap of
+        Just v  -> pure v
+        Nothing -> error ("socket con: unknown constructor " <> BC.unpack n)
+    conByName v = error ("socket con: not a constructor: " <> showValForDebug v)
+
+    socketConMap :: Map.Map ByteString Word32
+    socketConMap = Map.fromList
+        -- SocketType
+        [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
+        , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
+        -- Family (common ones)
+        , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
+        , ("AF_INET6", if isDarwin then 30 else 10)
+        ]
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -5079,16 +5096,28 @@ familyField t = do
     v <- force legacyHooks t
     case v of
         VCon "Family" [nT] -> intField "socket.family" nT
-        VInt n             -> pure n
-        other              -> error ("socket.family: not a Family: " <> showValForDebug other)
+        -- Source-loaded Family constructors
+        VCon "AF_UNSPEC" [] -> pure 0
+        VCon "AF_UNIX"   [] -> pure 1
+        VCon "AF_INET"   [] -> pure 2
+        VCon "AF_INET6"  [] -> pure (if isDarwin then 30 else 10)
+        VInt n              -> pure n
+        other               -> error ("socket.family: not a Family: " <> showValForDebug other)
 
 socketTypeField :: Thunk -> IO Int64
 socketTypeField t = do
     v <- force legacyHooks t
     case v of
         VCon "SocketType" [nT] -> intField "socket.type" nT
-        VInt n                 -> pure n
-        other                  -> error ("socket.type: not a SocketType: " <> showValForDebug other)
+        -- Source-loaded SocketType constructors from Network.Socket.Types
+        VCon "NoSocketType"  [] -> pure 0
+        VCon "Stream"        [] -> pure 1
+        VCon "Datagram"      [] -> pure 2
+        VCon "Raw"           [] -> pure 3
+        VCon "RDM"           [] -> pure 4
+        VCon "SeqPacket"     [] -> pure 5
+        VInt n                  -> pure n
+        other                   -> error ("socket.type: not a SocketType: " <> showValForDebug other)
 
 socketOptionField :: Thunk -> IO (Int64, Int64)
 socketOptionField t = do
