@@ -7103,9 +7103,14 @@ discoverInModule
 -- handles them via instance lookup — discovering their source bodies
 -- cascades through every GHC.Internal.* module.
 discoverInModule = discoverInModuleWith classMethodShortCircuit
-  where
-    classMethodShortCircuit = Set.fromList $ map BC.pack
-        [">>=", ">>", "return", "pure", "fmap", "<*>", "<$>", "fail"]
+
+-- | Class method names that the class dispatcher handles via instance
+-- lookup.  Discovering their source bodies cascades through every
+-- GHC.Internal.* module — short-circuit them in both discoverInModule
+-- and the recursive free-var walk inside discoverInModuleWith'.
+classMethodShortCircuit :: Set ByteString
+classMethodShortCircuit = Set.fromList $ map BC.pack
+    [">>=", ">>", "return", "pure", "fmap", "<*>", "<$>", "fail"]
 
 -- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
 -- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
@@ -7375,8 +7380,9 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                 -- package like `array`) is silently swallowed: the
                                 -- missing name is treated as a builtin and the
                                 -- evaluator will complain if it is actually used.
-                                let discoverFreeVar fv =
-                                      discoverInModuleWith builtins registry searchPath includeMap lm fv
+                                let allShortCircuit = builtins `Set.union` classMethodShortCircuit
+                                    discoverFreeVar fv =
+                                      discoverInModuleWith allShortCircuit registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
                                 let fvs = nubBS (discoveryFreeVars expr
@@ -7389,6 +7395,8 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                         -- makes implicit Prelude tractable for programs that
                         -- only use builtin names (the common case).
                         | Set.member name builtins ->
+                            recordDiscoveryMiss lm name
+                        | Set.member name classMethodShortCircuit ->
                             recordDiscoveryMiss lm name
                         | otherwise -> do
                             -- Not local. Try imports.
@@ -7669,6 +7677,8 @@ resolveImport' registry searchPath includeMap lm name = do
                                             _             -> False
                             if isFfi && exportsName targetLm name
                               then do
+                                -- FFI: discover eagerly so the FFI
+                                -- sentinel is in lmBodies for eval.
                                 discoverInModule registry searchPath includeMap targetLm name
                                 pure (Just (lmName targetLm))
                               else do
@@ -7678,7 +7688,12 @@ resolveImport' registry searchPath includeMap lm name = do
                                     Just _ ->
                                         if exportsName targetLm name
                                             then do
-                                                discoverInModule registry searchPath includeMap targetLm name
+                                                -- Don't discover the target's body
+                                                -- eagerly — just return the module
+                                                -- name.  The caller stores an alias
+                                                -- (EVar "Mod.name") and the evaluator
+                                                -- discovers the body on demand via
+                                                -- the env-fallback / thunkByKey path.
                                                 pure (Just (lmName targetLm))
                                             else tryImports rest
                                     Nothing -> do
