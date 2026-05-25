@@ -407,6 +407,13 @@ parseImportList src cur0 = go [] cur0
                                 TkRParen -> cur3
                                 _        -> cur2
                         go (BC.pack "#" <> op : acc) cur'
+                    -- (#.) — dot is TkDot, not TkSymOp
+                    TkDot -> do
+                        let (close, cur3) = nextSigTok src cur2
+                        let cur' = case tkKind close of
+                                TkRParen -> cur3
+                                _        -> cur2
+                        go (BC.pack "#." : acc) cur'
                     _ -> do
                         -- Unknown — skip until we see TkRParen at depth 0.
                         curSkip <- skipToCloseParen src cur1 1

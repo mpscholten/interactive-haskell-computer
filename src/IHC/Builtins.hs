@@ -37,7 +37,7 @@ import Control.Exception
     , throwTo
     , SomeException
     )
-import Foreign.C.Error (Errno(..), getErrno, eAGAIN, eWOULDBLOCK, eINTR)
+import Foreign.C.Error (Errno(..), getErrno)
 import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
@@ -226,10 +226,10 @@ builtinEnv reg = do
         [ "ReadMode", "WriteMode", "AppendMode", "ReadWriteMode"
         , "NoBuffering", "LineBuffering", "BlockBuffering"
         ]
-    -- Standard handles.
-    stdinT  <- newWHNFThunk (VPrimObj (PrimHandle stdin))
-    stdoutT <- newWHNFThunk (VPrimObj (PrimHandle stdout))
-    stderrT <- newWHNFThunk (VPrimObj (PrimHandle stderr))
+    -- Standard handles — source-loaded FileHandle constructors.
+    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin
+    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout
+    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
@@ -1139,6 +1139,8 @@ builtins reg =
     , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
+    , ("Network.Socket.listen", socketListenB)
+    , ("Network.Socket.Syscall.listen", socketListenB)
     , ("Network.Socket.listen", socketListenB)
     , ("Network.Socket.Syscall.listen", socketListenB)
     -- accept(2) blocks for the next connection and returns a network Socket
@@ -3256,10 +3258,50 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 -- File IO primops.
 --------------------------------------------------------------------------------
 
+-- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
+-- The MVar holds @VCon "Handle__" [VPrimObj PrimHandle h]@ so source
+-- code can pattern-match on @Handle__ {..}@ (record wildcard).
+mkFileHandleVal :: String -> Handle -> IO Val
+mkFileHandleVal path h = do
+    pathT <- newWHNFThunk =<< stringToListValIO path
+    -- Handle__ with zero fields: desugarRecordPats converts
+    -- Handle__ {..} to PCon "Handle__" [] when the field registry
+    -- doesn't have Handle__'s fields.  Store the host Handle as a
+    -- separate thunk accessible via requireHandle.
+    handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
+    -- The MVar contains (VCon "Handle__" [], PrimHandle).
+    -- We store the Handle__ wrapper AND the host handle in a tuple
+    -- inside the MVar so pattern matching on Handle__ {..} succeeds
+    -- (desugarRecordPats produces PCon "Handle__" [] when fields unknown)
+    -- and requireHandle can extract the host handle.
+    mv    <- newMVar (VCon "Handle__" [handleT])
+    mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
+    pure (VCon "FileHandle" [pathT, mvarT])
+
+-- | Extract the host Handle from a source-loaded FileHandle/DuplexHandle
+-- or a legacy VPrimObj PrimHandle.
 requireHandle :: String -> Val -> IO Handle
 requireHandle fnName v = case v of
-    VPrimObj (PrimHandle h) -> pure h
+    VCon "FileHandle" [_pathT, mvarT]    -> extractFromMVar mvarT
+    VCon "DuplexHandle" [_pathT, mvarT, _] -> extractFromMVar mvarT
+    VPrimObj (PrimHandle h)              -> pure h  -- legacy
     _ -> error (fnName <> ": not a Handle: " <> showValForDebug v)
+  where
+    extractFromMVar mvarT = do
+        mvarV <- force legacyHooks mvarT
+        case mvarV of
+            VPrimObj (PrimMVar mv) -> do
+                inner <- readMVar mv
+                extractHandle inner
+            VPrimObj (PrimHandle h) -> pure h
+            _ -> error "requireHandle: not an MVar"
+    extractHandle (VCon "Handle__" (hT:_)) = do
+        hV <- force legacyHooks hT
+        case hV of
+            VPrimObj (PrimHandle h) -> pure h
+            _ -> error "requireHandle: Handle__ field not a PrimHandle"
+    extractHandle (VPrimObj (PrimHandle h)) = pure h
+    extractHandle v' = error ("requireHandle: unexpected MVar contents: " <> showValForDebug v')
 
 ioModeFromVal :: Val -> IOMode
 ioModeFromVal (VCon "ReadMode"      _) = ReadMode
@@ -3282,7 +3324,7 @@ openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
-    pure (VPrimObj (PrimHandle h))
+    mkFileHandleVal path h
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do
@@ -4534,8 +4576,13 @@ looksLikeAddrInfo flags family socktype protocol =
 
 peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
 peekAddrInfoVal p flags family socktype protocol = do
-    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
-    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    -- Linux struct addrinfo layout (64-bit):
+    -- offset 16: ai_addrlen (socklen_t, 4 bytes + padding)
+    -- offset 24: ai_addr (struct sockaddr*)
+    -- offset 32: ai_canonname (char*)
+    -- offset 40: ai_next (struct addrinfo*)
+    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
+    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
     flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
     familyT <- newWHNFThunk =<< oneFieldCon "Family" family
     socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype
@@ -4675,14 +4722,31 @@ getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \s
             _ -> pure acc
 
     conIntField :: String -> Val -> IO Word32
-    conIntField name v = case v of
+    conIntField _name v = case v of
         VCon _ [innerT] -> do
             inner <- force legacyHooks innerT
             case inner of
                 VInt n -> pure (fromIntegral n)
-                _      -> error (name <> ": inner not VInt: " <> showValForDebug inner)
+                _      -> conByName v
         VInt n          -> pure (fromIntegral n)
-        _ -> error (name <> ": not a single-field VCon or VInt: " <> showValForDebug v)
+        _               -> conByName v
+
+    -- Source-loaded constructors: map name → C value
+    conByName :: Val -> IO Word32
+    conByName (VCon n _) = case Map.lookup n socketConMap of
+        Just v  -> pure v
+        Nothing -> error ("socket con: unknown constructor " <> BC.unpack n)
+    conByName v = error ("socket con: not a constructor: " <> showValForDebug v)
+
+    socketConMap :: Map.Map ByteString Word32
+    socketConMap = Map.fromList
+        -- SocketType
+        [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
+        , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
+        -- Family (common ones)
+        , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
+        , ("AF_INET6", if isDarwin then 30 else 10)
+        ]
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -4866,6 +4930,7 @@ socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ 
     fd <- socketFdFromVal sockV
     backlog <- intField "listen.backlog" backlogT
     rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
+    System.IO.hFlush System.IO.stderr
     if rc == -1
         then ioError (userError "Network.Socket.listen")
         else pure VUnit
@@ -4874,36 +4939,21 @@ socketAcceptB :: IO Val
 socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
     sockV <- force legacyHooks sockT
     fd <- socketFdFromVal sockV
+    -- Set socket to blocking mode for accept.  The network library
+    -- creates sockets in non-blocking mode for GHC's IO manager,
+    -- but IHC's single-threaded accept loop needs a blocking accept.
+    c_setBlocking (fromIntegral fd)
     allocaBytes 128 $ \addrP ->
       allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        let acceptLoop = do
-                fillBytes addrP 0 128
-                poke (castPtr lenP :: Ptr CInt) 128
-                newFd <- c_accept_host (fromIntegral fd)
-                                       (castPtr addrP)
-                                       (castPtr lenP)
-                if newFd /= -1
-                    then pure newFd
-                    else do
-                        -- @Network.Socket@ puts listening sockets in
-                        -- non-blocking mode (see @Syscall.hs@ in
-                        -- @network@), so a real accept must retry on
-                        -- EAGAIN / EWOULDBLOCK via the IO manager and
-                        -- restart on EINTR — otherwise warp's accept
-                        -- loop bails on the first poll-with-no-pending.
-                        Errno e <- getErrno
-                        if Errno e == eAGAIN
-                                || Errno e == eWOULDBLOCK
-                            then do
-                                threadWaitRead (fromIntegral fd)
-                                acceptLoop
-                            else if Errno e == eINTR
-                                then acceptLoop
-                                else ioError
-                                    (userError
-                                       ("Network.Socket.accept: errno="
-                                        <> show e))
-        newFd <- acceptLoop
+        fillBytes addrP 0 128
+        poke (castPtr lenP :: Ptr CInt) 128
+        -- safe FFI: blocks OS thread, releases GHC capability
+        newFd <- c_accept_host (fromIntegral fd)
+                               (castPtr addrP)
+                               (castPtr lenP)
+        when (newFd == -1) $ do
+            Errno e <- getErrno
+            ioError (userError ("Network.Socket.accept: errno=" <> show e))
         fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
         ref <- newIORef fdValT
         refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
@@ -5086,16 +5136,28 @@ familyField t = do
     v <- force legacyHooks t
     case v of
         VCon "Family" [nT] -> intField "socket.family" nT
-        VInt n             -> pure n
-        other              -> error ("socket.family: not a Family: " <> showValForDebug other)
+        -- Source-loaded Family constructors
+        VCon "AF_UNSPEC" [] -> pure 0
+        VCon "AF_UNIX"   [] -> pure 1
+        VCon "AF_INET"   [] -> pure 2
+        VCon "AF_INET6"  [] -> pure (if isDarwin then 30 else 10)
+        VInt n              -> pure n
+        other               -> error ("socket.family: not a Family: " <> showValForDebug other)
 
 socketTypeField :: Thunk -> IO Int64
 socketTypeField t = do
     v <- force legacyHooks t
     case v of
         VCon "SocketType" [nT] -> intField "socket.type" nT
-        VInt n                 -> pure n
-        other                  -> error ("socket.type: not a SocketType: " <> showValForDebug other)
+        -- Source-loaded SocketType constructors from Network.Socket.Types
+        VCon "NoSocketType"  [] -> pure 0
+        VCon "Stream"        [] -> pure 1
+        VCon "Datagram"      [] -> pure 2
+        VCon "Raw"           [] -> pure 3
+        VCon "RDM"           [] -> pure 4
+        VCon "SeqPacket"     [] -> pure 5
+        VInt n                  -> pure n
+        other                   -> error ("socket.type: not a SocketType: " <> showValForDebug other)
 
 socketOptionField :: Thunk -> IO (Int64, Int64)
 socketOptionField t = do
@@ -5116,8 +5178,18 @@ foreign import ccall unsafe "setsockopt"
 foreign import ccall unsafe "listen"
     c_listen_host :: CInt -> CInt -> IO CInt
 
-foreign import ccall unsafe "accept"
+foreign import ccall safe "accept"
     c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
+
+-- | Set a socket fd to blocking mode (clear O_NONBLOCK).
+c_setBlocking :: CInt -> IO ()
+c_setBlocking fd = do
+    flags <- c_fcntl fd 3 0  -- F_GETFL = 3
+    let newFlags = flags .&. complement 0x800  -- O_NONBLOCK = 0x800 on Linux
+    _ <- c_fcntl fd 4 newFlags  -- F_SETFL = 4
+    pure ()
+
+foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
 
 foreign import ccall unsafe "getsockname"
     c_getsockname_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt

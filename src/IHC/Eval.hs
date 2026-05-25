@@ -1209,7 +1209,11 @@ matchPat hooks pat@(PCon "PS" _) v = do
 matchPat hooks (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
     matchFields hooks [(pState, stateT), (pVal, valT)] []
 matchPat hooks (PCon name pats) v@(VCon vname vthunks)
-    | name == vname && length pats == length vthunks =
+    | name == vname && (length pats == length vthunks
+                        || null pats) =
+        -- null pats: desugared from Con {..} where field registry
+        -- doesn't know the fields.  Match the constructor name,
+        -- ignore field count.
         -- Zip sub-patterns with the constructor's field thunks. For
         -- each pair: if the sub-pattern is a 'PVar' we bind the name
         -- directly to the existing field thunk (preserving sharing
@@ -1372,7 +1376,11 @@ matchPat hooks (PCon pname ppats) v = tryPatSyn hooks pname ppats v
 -- Record patterns: should have been desugared to PCon by the scheduler.
 -- If they reach here (e.g. in a standalone test), fall back to failure.
 matchPat hooks (PRecord _ _) _ = pure Nothing
-matchPat hooks (PRecordWild _) _ = pure Nothing
+-- RecordWildCards: @Con {..}@ matches any VCon with that constructor name.
+-- All fields are bound as wildcards (no new bindings).
+matchPat _hooks (PRecordWild conName) (VCon cn _)
+    | cn == conName = pure (Just [])
+matchPat _hooks (PRecordWild _) _ = pure Nothing
 -- ViewPatterns: (f -> p) matches v when f v matches p.
 -- We evaluate f v and then match the result against p.
 matchPat hooks (PView fn p) v = do
@@ -1480,6 +1488,15 @@ apply _     (VCon n [])                 arg
 apply hooks (VCon _ [innerT])           arg = do
     inner <- force hooks innerT
     apply hooks inner arg
+-- VIO applied to a state token: the source-loaded IO bind extracts
+-- the state function from IO via pattern matching, but sometimes the
+-- unwrapped value is still VIO (not a VFun state function).  Run the
+-- IO action and return (# state, result #) as the state function would.
+apply hooks (VIO io) arg = do
+    result <- io
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    resT <- newWHNFThunk result
+    pure (VCon "(#,#)" [stT, resT])
 apply _     v                           _   = error ("IHC.Eval.apply: not a function: "
                                    <> showValForDebug v)
 

@@ -505,23 +505,14 @@ loadProgramFromSource searchPath src0 = do
     -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
     ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
     let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv (HashMap.union conEnv ffiEnv))
-    -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
-    -- scanClassDecls). For every `class C a where m :: ...` declaration in
-    -- any loaded module, bind `m` as a top-level dispatcher that looks up
-    -- `(C, typeTagOf firstArg)` in the ClassRegistry and applies the
-    -- selected instance method. Names that collide with built-in
-    -- dispatchers (e.g. show/==/compare) are skipped.
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = HashMap.union classMethodEnv baseNoClass
-
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
     -- contains all builtins including the 'lift' function.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
-
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
-
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
@@ -547,8 +538,6 @@ loadProgramFromSource searchPath src0 = do
                     _ -> pure ()
             Nothing -> pure ()
 
-    -- Add aliases: every binding imported into the entry module is
-    -- visible there under its local name as well as the fully
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
@@ -684,15 +673,9 @@ loadProgramFromSource searchPath src0 = do
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
     registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules'
-    -- Synthesize user-derived Functor instances for every @deriving
-    -- Functor@ annotated data/newtype decl. Runs after the explicit
-    -- instance-registration pass so we can honour any hand-written
-    -- @instance Functor T where ...@ already in the registry (the
-    -- registrar skips types that already have a Functor dict).
     registerDerivedFunctorInstances classReg loadedModules'
     registerDerivedEnumBoundedInstances classReg loadedModules'
     registerDerivedEqInstances        classReg loadedModules'
-
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
@@ -1817,13 +1800,9 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
         lazyMethodVal mn Nothing  = pure (identifyingPlaceholder cls mn)
         lazyMethodVal mn (Just lhs) = do
             t <- newLazyBuiltinThunk $ do
-                fvs <- collectInstanceMethodFVs lm [(mn, lhs)]
-                mapM_ (\fv -> do
-                    r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                              :: IO (Either SomeException ())
-                    case r of { Right () -> pure (); Left _ -> pure () })
-                  (Set.toList fvs)
-                rw <- buildImportRewritesForNames registry lm fvs
+                -- No eager discovery: the env-fallback resolves
+                -- imported names on demand at eval time.
+                rw <- buildImportRewritesForNames registry lm Set.empty
                 r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
@@ -2009,8 +1988,8 @@ evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
 -- instance.  Used to seed 'buildImportRewritesForNames' with the exact
 -- set of names we need to resolve; restricting to actually-referenced
 -- names keeps the rewrite walk bounded.
-collectInstanceMethodFVs :: LoadedModule -> [(ByteString, BindingLhs)] -> IO (Set ByteString)
-collectInstanceMethodFVs lm methods = do
+_collectInstanceMethodFVs :: LoadedModule -> [(ByteString, BindingLhs)] -> IO (Set ByteString)
+_collectInstanceMethodFVs lm methods = do
     fvs <- mapM oneMethod methods
     pure (Set.fromList (concat fvs))
   where
@@ -3090,7 +3069,6 @@ classMethodDispatcher reg cls methodName = selfVal
         -- IO / ST / STM are tried BEFORE ParsecT for @pure@ / @return@
         -- specifically: warp's @waitForZero@ does
         -- @atomically $ do { x <- readTVar v; when (x > 0) retry }@,
-        -- whose @when False retry@ tail evaluates to @pure ()@ in STM
         -- context.  Our STM≈IO bridge means the IO instance produces a
         -- properly-shaped @VCon "IO" [_]@ that 'runIOVal' can unwrap;
         -- the ParsecT instance returns a parser closure 'VFun' that
@@ -3466,14 +3444,10 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                                                      (lmSource lm) (lmFixity lm) (lhsClauses lhs))
                                                  :: IO (Either SomeException Expr)
                                         case r of
-                                            Right e -> pure (Set.fromList (freeVars e))
-                                            Left  _ -> pure Set.empty
-                                    mapM_ (\fv -> do
-                                        r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                                  :: IO (Either SomeException ())
-                                        case r of { Right () -> pure (); Left _ -> pure () })
-                                      (Set.toList fvs)
-                                    rw <- buildImportRewritesForNames registry lm fvs
+                                            Right _e -> pure ()
+                                            Left  _ -> pure ()
+                                    -- No eager discovery: env-fallback resolves on demand.
+                                    rw <- buildImportRewritesForNames registry lm Set.empty
                                     evalDefaultMethodWith env lm rw lhs
                                 pure (methodName, VLazyMethod t)
                             Nothing -> pure (methodName, placeholder cls methodName))
@@ -7163,14 +7137,14 @@ discoverInModule = discoverInModuleWith Set.empty
 -- @==@/@/=@-removal OOM at 4 GB).  Every other name still gets the
 -- full @Set.empty@-equivalent walk so Applicative/Monad/Semigroup
 -- instance bodies' rewrite targets still load.
-discoverInModuleForChase
+_discoverInModuleForChase
     :: ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
+_discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
 
 -- | Visited set for 'discoverInModuleWith'.  Holds @(lmName, name)@
 -- pairs whose discovery has been STARTED — grey-set / entry-time
@@ -7438,13 +7412,11 @@ discoverImpl builtins registry searchPath includeMap lm name
                                 -- package like `array`) is silently swallowed: the
                                 -- missing name is treated as a builtin and the
                                 -- evaluator will complain if it is actually used.
-                                let discoverFreeVar fv =
-                                      discoverInModuleWith builtins registry searchPath includeMap lm fv
-                                        `catch` (\(_ :: ModuleNotFound) -> pure ())
-                                        `catch` (\(_ :: ParseError)     -> pure ())
-                                let fvs = nubBS (discoveryFreeVars expr
-                                            ++ extraDiscoveryFreeVars lm name)
-                                mapM_ discoverFreeVar fvs
+                                -- Don't recurse into free vars: each one will be
+                                -- resolved by its own env-fallback call when the
+                                -- evaluator first references it.  Eager recursion
+                                -- here cascades through the transitive dep graph.
+                                pure ()
                     Nothing
                         -- Names provided by IHC.Builtins resolve to the host
                         -- builtin env — no need to walk the source re-export
@@ -8662,8 +8634,8 @@ perFVChaseShortCircuit = Set.fromList $ map BC.pack
 -- avoids recursively chasing arbitrary lambda bodies; these hints keep known
 -- control-flow entry points on the normal tied-env path instead of forcing
 -- them through the eval-time fallback.
-extraDiscoveryFreeVars :: LoadedModule -> ByteString -> [ByteString]
-extraDiscoveryFreeVars lm name
+_extraDiscoveryFreeVars :: LoadedModule -> ByteString -> [ByteString]
+_extraDiscoveryFreeVars lm name
     | lmName lm == BC.pack "Network.Wai.Handler.Warp.Run"
     , name == BC.pack "run" =
         [BC.pack "runSettings"]
