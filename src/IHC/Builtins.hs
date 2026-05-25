@@ -226,10 +226,10 @@ builtinEnv reg = do
         [ "ReadMode", "WriteMode", "AppendMode", "ReadWriteMode"
         , "NoBuffering", "LineBuffering", "BlockBuffering"
         ]
-    -- Standard handles.
-    stdinT  <- newWHNFThunk (VPrimObj (PrimHandle stdin))
-    stdoutT <- newWHNFThunk (VPrimObj (PrimHandle stdout))
-    stderrT <- newWHNFThunk (VPrimObj (PrimHandle stderr))
+    -- Standard handles — source-loaded FileHandle constructors.
+    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin
+    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout
+    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
@@ -3258,10 +3258,41 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 -- File IO primops.
 --------------------------------------------------------------------------------
 
+-- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
+-- The MVar holds @VCon "Handle__" [VPrimObj PrimHandle h]@ so source
+-- code can pattern-match on @Handle__ {..}@ (record wildcard).
+mkFileHandleVal :: String -> Handle -> IO Val
+mkFileHandleVal path h = do
+    pathT <- newWHNFThunk =<< stringToListValIO path
+    handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
+    mv    <- newMVar (VCon "Handle__" [handleT])
+    mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
+    pure (VCon "FileHandle" [pathT, mvarT])
+
+-- | Extract the host Handle from a source-loaded FileHandle/DuplexHandle
+-- or a legacy VPrimObj PrimHandle.
 requireHandle :: String -> Val -> IO Handle
 requireHandle fnName v = case v of
-    VPrimObj (PrimHandle h) -> pure h
+    VCon "FileHandle" [_pathT, mvarT]    -> extractFromMVar mvarT
+    VCon "DuplexHandle" [_pathT, mvarT, _] -> extractFromMVar mvarT
+    VPrimObj (PrimHandle h)              -> pure h  -- legacy
     _ -> error (fnName <> ": not a Handle: " <> showValForDebug v)
+  where
+    extractFromMVar mvarT = do
+        mvarV <- force legacyHooks mvarT
+        case mvarV of
+            VPrimObj (PrimMVar mv) -> do
+                inner <- readMVar mv
+                extractHandle inner
+            VPrimObj (PrimHandle h) -> pure h
+            _ -> error "requireHandle: not an MVar"
+    extractHandle (VCon "Handle__" (hT:_)) = do
+        hV <- force legacyHooks hT
+        case hV of
+            VPrimObj (PrimHandle h) -> pure h
+            _ -> error "requireHandle: Handle__ field not a PrimHandle"
+    extractHandle (VPrimObj (PrimHandle h)) = pure h
+    extractHandle v' = error ("requireHandle: unexpected MVar contents: " <> showValForDebug v')
 
 ioModeFromVal :: Val -> IOMode
 ioModeFromVal (VCon "ReadMode"      _) = ReadMode
@@ -3284,7 +3315,7 @@ openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
-    pure (VPrimObj (PrimHandle h))
+    mkFileHandleVal path h
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do

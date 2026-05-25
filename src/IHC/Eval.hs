@@ -1372,7 +1372,11 @@ matchPat hooks (PCon pname ppats) v = tryPatSyn hooks pname ppats v
 -- Record patterns: should have been desugared to PCon by the scheduler.
 -- If they reach here (e.g. in a standalone test), fall back to failure.
 matchPat hooks (PRecord _ _) _ = pure Nothing
-matchPat hooks (PRecordWild _) _ = pure Nothing
+-- RecordWildCards: @Con {..}@ matches any VCon with that constructor name.
+-- All fields are bound as wildcards (no new bindings).
+matchPat _hooks (PRecordWild conName) (VCon cn _)
+    | cn == conName = pure (Just [])
+matchPat _hooks (PRecordWild _) _ = pure Nothing
 -- ViewPatterns: (f -> p) matches v when f v matches p.
 -- We evaluate f v and then match the result against p.
 matchPat hooks (PView fn p) v = do
