@@ -7454,17 +7454,12 @@ discoverImpl builtins registry searchPath includeMap lm name
                         | Set.member name builtins ->
                             recordDiscoveryMiss lm name
                         | not (lmIsEntry lm) ->
-                            -- Not local in a non-entry module: skip
-                            -- resolveImport during discovery.  The
-                            -- evaluator's env-fallback resolves imported
-                            -- names on demand at eval time.  Eagerly
-                            -- resolveImport here cascades through the
-                            -- transitive import graph.
+                            -- Non-entry: skip resolveImport.  The eval-time
+                            -- env-fallback resolves imported names on demand.
                             recordDiscoveryMiss lm name
                         | otherwise -> do
-                            -- Entry module: resolve imports eagerly so
-                            -- main's free vars (putStrLn, accept, etc.)
-                            -- are available for evaluation.
+                            -- Runtime / class-default discovery: resolve
+                            -- through imports so #. etc. can be found.
                             mForeign <- resolveImport registry searchPath includeMap lm name
                             case mForeign of
                                 Just srcMod ->
