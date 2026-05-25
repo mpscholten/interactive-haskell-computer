@@ -505,23 +505,14 @@ loadProgramFromSource searchPath src0 = do
     -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
     ffiEnv   <- buildForeignEnv loadedModules fullSearchPath
     let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv (HashMap.union conEnv ffiEnv))
-    -- User-defined class method dispatchers (Phase: Scan+Scheduler+Repl
-    -- scanClassDecls). For every `class C a where m :: ...` declaration in
-    -- any loaded module, bind `m` as a top-level dispatcher that looks up
-    -- `(C, typeTagOf firstArg)` in the ClassRegistry and applies the
-    -- selected instance method. Names that collide with built-in
-    -- dispatchers (e.g. show/==/compare) are skipped.
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = HashMap.union classMethodEnv baseNoClass
-
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
     -- contains all builtins including the 'lift' function.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
-
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
-
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
@@ -547,8 +538,6 @@ loadProgramFromSource searchPath src0 = do
                     _ -> pure ()
             Nothing -> pure ()
 
-    -- Add aliases: every binding imported into the entry module is
-    -- visible there under its local name as well as the fully
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
@@ -684,15 +673,9 @@ loadProgramFromSource searchPath src0 = do
     -- "<default>" so that the dispatcher can fall back to them when no
     -- instance-specific override exists.
     registerClassDefaults registry fullSearchPath includeMap classReg env loadedModules'
-    -- Synthesize user-derived Functor instances for every @deriving
-    -- Functor@ annotated data/newtype decl. Runs after the explicit
-    -- instance-registration pass so we can honour any hand-written
-    -- @instance Functor T where ...@ already in the registry (the
-    -- registrar skips types that already have a Functor dict).
     registerDerivedFunctorInstances classReg loadedModules'
     registerDerivedEnumBoundedInstances classReg loadedModules'
     registerDerivedEqInstances        classReg loadedModules'
-
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
@@ -3090,7 +3073,6 @@ classMethodDispatcher reg cls methodName = selfVal
         -- IO / ST / STM are tried BEFORE ParsecT for @pure@ / @return@
         -- specifically: warp's @waitForZero@ does
         -- @atomically $ do { x <- readTVar v; when (x > 0) retry }@,
-        -- whose @when False retry@ tail evaluates to @pure ()@ in STM
         -- context.  Our STM≈IO bridge means the IO instance produces a
         -- properly-shaped @VCon "IO" [_]@ that 'runIOVal' can unwrap;
         -- the ParsecT instance returns a parser closure 'VFun' that
