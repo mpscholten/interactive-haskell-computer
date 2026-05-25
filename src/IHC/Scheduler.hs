@@ -8151,9 +8151,10 @@ syntheticClassMethodNames :: Expr -> [ByteString]
 syntheticClassMethodNames = goExpr
   where
     goExpr = \case
-        EDo stmts ->
-            (BC.pack ">>=" : BC.pack ">>" : BC.pack "return" : BC.pack "fail" : [])
-              ++ concatMap goStmt stmts
+        -- EDo is handled directly by evalDo — no synthetic >>=/>>/
+        -- return/fail needed.  Adding them triggers class dispatch
+        -- cascades during discovery.
+        EDo stmts -> concatMap goStmt stmts
         ELit _      -> []
         EVar _      -> []
         EApp f x    -> goExpr f ++ goExpr x
