@@ -468,10 +468,16 @@ loadProgramFromSource searchPath src0 = do
     -- on every fixture and exhaust the heap.
     do
         bodies <- readIORef (lmBodies entry)
+        -- Use discoveryFreeVars (narrow, lazy-aware) not freeVars (deep).
+        -- freeVars descends into lambdas, let RHS, case alts — collecting
+        -- names that won't be needed until much later.  This over-broad
+        -- seed set causes the manifest to load dozens of GHC.Internal.*
+        -- provider modules eagerly, each of which triggers further
+        -- discovery and instance registration.
         let entryFvs = Set.fromList
                 [ fv
                 | expr <- Map.elems bodies
-                , fv   <- freeVars expr ++ syntheticClassMethodNames expr
+                , fv   <- discoveryFreeVars expr ++ syntheticClassMethodNames expr
                 ]
             allProviders = Manifest.providerModulesForMethods Manifest.manifestIndex entryFvs
             ghcInternalPrefix = BC.pack "GHC.Internal."
@@ -7090,10 +7096,16 @@ discoverInModule
 -- circuited too much — @pure@ / @return@ need a per-FV walk through
 -- Prelude so 'registerInstancesFrom' can register their 'Applicative'
 -- / 'Monad' instances; skipping them regressed @pure 99 :: [Int]@ to
--- @<IO>@.  'perFVChaseShortCircuit' is the finer-grained set (Eq/Ord
--- comparison cluster only) that avoids both the cascade and that
--- regression.
-discoverInModule = discoverInModuleWith Set.empty
+-- @<IO>@.  Now that instance registration is lazy (VLazyMethod thunks),
+-- the Applicative/Monad registration no longer needs eager per-FV
+-- walks from resolveImport.  Class method names (>>=, >>, return,
+-- pure, fmap, <*>) are short-circuited because the class dispatcher
+-- handles them via instance lookup — discovering their source bodies
+-- cascades through every GHC.Internal.* module.
+discoverInModule = discoverInModuleWith classMethodShortCircuit
+  where
+    classMethodShortCircuit = Set.fromList $ map BC.pack
+        [">>=", ">>", "return", "pure", "fmap", "<*>", "<$>", "fail"]
 
 -- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
 -- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
@@ -7367,9 +7379,9 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                       discoverInModuleWith builtins registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
-                                mapM_ discoverFreeVar
-                                    (nubBS (discoveryFreeVars expr
-                                            ++ extraDiscoveryFreeVars lm name))
+                                let fvs = nubBS (discoveryFreeVars expr
+                                            ++ extraDiscoveryFreeVars lm name)
+                                mapM_ discoverFreeVar fvs
                     Nothing
                         -- Names provided by IHC.Builtins resolve to the host
                         -- builtin env — no need to walk the source re-export
