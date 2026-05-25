@@ -1800,13 +1800,9 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
         lazyMethodVal mn Nothing  = pure (identifyingPlaceholder cls mn)
         lazyMethodVal mn (Just lhs) = do
             t <- newLazyBuiltinThunk $ do
-                fvs <- collectInstanceMethodFVs lm [(mn, lhs)]
-                mapM_ (\fv -> do
-                    r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                              :: IO (Either SomeException ())
-                    case r of { Right () -> pure (); Left _ -> pure () })
-                  (Set.toList fvs)
-                rw <- buildImportRewritesForNames registry lm fvs
+                -- No eager discovery: the env-fallback resolves
+                -- imported names on demand at eval time.
+                rw <- buildImportRewritesForNames registry lm Set.empty
                 r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
@@ -1992,8 +1988,8 @@ evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
 -- instance.  Used to seed 'buildImportRewritesForNames' with the exact
 -- set of names we need to resolve; restricting to actually-referenced
 -- names keeps the rewrite walk bounded.
-collectInstanceMethodFVs :: LoadedModule -> [(ByteString, BindingLhs)] -> IO (Set ByteString)
-collectInstanceMethodFVs lm methods = do
+_collectInstanceMethodFVs :: LoadedModule -> [(ByteString, BindingLhs)] -> IO (Set ByteString)
+_collectInstanceMethodFVs lm methods = do
     fvs <- mapM oneMethod methods
     pure (Set.fromList (concat fvs))
   where
@@ -3448,14 +3444,10 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                                                      (lmSource lm) (lmFixity lm) (lhsClauses lhs))
                                                  :: IO (Either SomeException Expr)
                                         case r of
-                                            Right e -> pure (Set.fromList (freeVars e))
-                                            Left  _ -> pure Set.empty
-                                    mapM_ (\fv -> do
-                                        r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                                  :: IO (Either SomeException ())
-                                        case r of { Right () -> pure (); Left _ -> pure () })
-                                      (Set.toList fvs)
-                                    rw <- buildImportRewritesForNames registry lm fvs
+                                            Right _e -> pure ()
+                                            Left  _ -> pure ()
+                                    -- No eager discovery: env-fallback resolves on demand.
+                                    rw <- buildImportRewritesForNames registry lm Set.empty
                                     evalDefaultMethodWith env lm rw lhs
                                 pure (methodName, VLazyMethod t)
                             Nothing -> pure (methodName, placeholder cls methodName))
@@ -7145,14 +7137,14 @@ discoverInModule = discoverInModuleWith Set.empty
 -- @==@/@/=@-removal OOM at 4 GB).  Every other name still gets the
 -- full @Set.empty@-equivalent walk so Applicative/Monad/Semigroup
 -- instance bodies' rewrite targets still load.
-discoverInModuleForChase
+_discoverInModuleForChase
     :: ModuleRegistry
     -> [FilePath]
     -> Map FilePath [FilePath]
     -> LoadedModule
     -> ByteString
     -> IO ()
-discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
+_discoverInModuleForChase = discoverInModuleWith perFVChaseShortCircuit
 
 -- | Visited set for 'discoverInModuleWith'.  Holds @(lmName, name)@
 -- pairs whose discovery has been STARTED — grey-set / entry-time
