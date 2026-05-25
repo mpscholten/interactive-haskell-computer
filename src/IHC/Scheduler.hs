@@ -1816,66 +1816,39 @@ registerOne
     -> InstanceDecl
     -> IO ()
 registerOne registry searchPath includeMap classReg typeCtors classTable env lm (InstanceDecl cls typ typeNames methods) = do
-    -- Pre-build the import-rewrite map so we can rewrite references
-    -- inside the instance method bodies before evaluation.  We use
-    -- 'buildImportRewritesForNames' which resolves each imported name
-    -- (qualified or unqualified) to the fully-qualified key stored in
-    -- the flat env, including walking named-reexport chains (so
-    -- @List.foldr@ → @GHC.Internal.Base.foldr@ when Base defines it
-    -- and List re-exports).  Without this, an instance body that uses
-    -- a qualified alias defined in its own module would fail with
-    -- "unbound variable" even though the target binding exists.
-    instMethodFVs <- collectInstanceMethodFVs lm methods
-    -- Demand-load each free var in the owning module so the flat env
-    -- (and 'buildImportRewritesForNames' that reads 'lmBodies') sees
-    -- the rewrite targets.  Without this, instance methods that use
-    -- qualified aliases whose bare names haven't been demanded yet
-    -- (e.g. @Foldable []@ uses @List.foldl@ but no user call triggers
-    -- @foldl@ discovery) can't be rewritten to the owner's FQN.
-    mapM_ (\fv -> do
-              r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                        :: IO (Either SomeException ())
-              case r of
-                  Right () -> pure ()
-                  Left  _  -> pure ())
-          (Set.toList instMethodFVs)
-    rewrites0 <- buildImportRewritesForNames registry lm instMethodFVs
-    -- Single-shot retry: some FVs may now resolve thanks to transitive
-    -- loads triggered by the per-FV discoverInModule pass just above.
-    -- For each FV still missing from the rewrite map, try discover
-    -- once more and rebuild.  Bounded: one extra pass, no fixpoint.
-    let unresolvedFVs =
-            [ fv | fv <- Set.toList instMethodFVs, not (Map.member fv rewrites0) ]
-    rewrites <- if null unresolvedFVs
-        then pure rewrites0
-        else do
-            mapM_ (\fv -> do
-                      r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                :: IO (Either SomeException ())
-                      case r of
-                          Right () -> pure ()
-                          Left  _  -> pure ())
-                  unresolvedFVs
-            buildImportRewritesForNames registry lm instMethodFVs
-    -- After the per-FV discovery passes above have mutated 'lmBodies' for
-    -- every rewrite target, the target FQNs exist in their owning
-    -- modules' bodies, but the env we'll pass to 'evalMethodWithLazy'
-    -- ('env') was snapshotted earlier (line 1246 in 'loadImportOnlyIntoEnv')
-    -- and has no slot for those FQNs.  Add one slot per rewrite target
-    -- that (a) is an FQN, (b) names a body we've already discovered, and
-    -- (c) isn't already in 'env'.  This is NOT pre-discovery beyond what
-    -- the retry just did — it's materialising env slots for bodies the
-    -- retry already produced.  Knot-tie so an augmented-slot body can
-    -- reference other augmented slots.
-    -- Build a name-keyed method table. When the class declaration is
-    -- known, the class's declared method names are canonical for
-    -- dispatch. Extra instance bindings are preserved under their own
-    -- names so non-standard extensions don't crash registration, but
-    -- dispatch only consults the class-declared names. If the class
-    -- declaration isn't available, keep every method the instance
-    -- provided so the legacy fallback still works.
+    -- Method bodies are registered LAZILY: each method is a VLazyMethod
+    -- thunk that defers free-var discovery, import-rewrite building,
+    -- and body parsing to first dispatch.  This avoids the O(N*M)
+    -- cascade where registering N instances eagerly discovers M free
+    -- vars each, pulling in the entire transitive dependency graph
+    -- at module load time.
+    --
+    -- Previously, all free vars were discovered eagerly here via
+    -- discoverInModuleForChase, which triggered loading of transitive
+    -- dependencies for every instance method body — even methods that
+    -- would never be dispatched.  For warp's dependency graph this
+    -- caused 10000+ binding discoveries at startup.
+    -- Each method is a VLazyMethod that captures the module, class,
+    -- and LHS.  Discovery + rewrite + parsing happen on first force
+    -- (at dispatch time), not at registration time.
     let methodMap = Map.fromList methods
-        evalMethodIn = evalOneMethodWith env
+        lazyMethodVal mn Nothing  = pure (identifyingPlaceholder cls mn)
+        lazyMethodVal mn (Just lhs) = do
+            t <- newLazyBuiltinThunk $ do
+                fvs <- collectInstanceMethodFVs lm [(mn, lhs)]
+                mapM_ (\fv -> do
+                    r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
+                              :: IO (Either SomeException ())
+                    case r of { Right () -> pure (); Left _ -> pure () })
+                  (Set.toList fvs)
+                rw <- buildImportRewritesForNames registry lm fvs
+                r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
+                        :: IO (Either SomeException Val)
+                case r of
+                    Right (VLazyMethod innerT) -> force legacyHooks innerT
+                    Right v                    -> pure v
+                    Left  _                    -> pure (identifyingPlaceholder cls mn)
+            pure (VLazyMethod t)
     methodVals <- case Map.lookup cls classTable of
         Just classMethods -> do
             let classMethodSet = Set.fromList classMethods
@@ -1885,18 +1858,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     , not (Set.member mn classMethodSet)
                     ]
             classEntries <- mapM (\mn -> do
-                    v <- evalMethodIn rewrites mn (Map.lookup mn methodMap)
+                    v <- lazyMethodVal mn (Map.lookup mn methodMap)
                     pure (mn, v))
                 classMethods
             extraEntries <- mapM (\(mn, lhs) -> do
-                    v <- evalMethodIn rewrites mn (Just lhs)
+                    v <- lazyMethodVal mn (Just lhs)
                     pure (mn, v))
                 extraMethods
             pure (HashMap.fromList (classEntries ++ extraEntries))
         Nothing ->
             HashMap.fromList <$>
                 mapM (\(mn, lhs) -> do
-                    v <- evalMethodIn rewrites mn (Just lhs)
+                    v <- lazyMethodVal mn (Just lhs)
                     pure (mn, v))
                 methods
     -- Register under the head type name (used by Bool/Int/Char/String
@@ -1922,13 +1895,6 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     ctors <- instanceRuntimeCtors typ
     mapM_ (\ctor -> registerInstance classReg cls ctor methodVals) ctors
   where
-    evalOneMethodWith _e _rw _mn Nothing = pure (identifyingPlaceholder cls _mn)
-    evalOneMethodWith e rw _mn (Just lhs) = do
-        r <- try (evalMethodWithLazy e lm rw (Just (cls, typ, _mn)) (_mn, lhs))
-                :: IO (Either SomeException Val)
-        case r of
-            Right v -> pure v
-            Left  _ -> pure (identifyingPlaceholder cls _mn)
 
     instanceRuntimeCtors ty =
         case splitQualified ty of
