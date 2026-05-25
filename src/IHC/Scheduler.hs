@@ -689,6 +689,7 @@ loadProgramFromSource searchPath src0 = do
         globalMods <- readIORef globalLoadedModulesRef
         case Map.lookup modName globalMods of
             Just lm -> do
+                pure ()
                 registerInstancesFrom registry fullSearchPath includeMap
                                       classReg unionedTypeCtors' classTable env lm
                 -- Also catalogue this module's @class C where m = ...@
@@ -7102,15 +7103,16 @@ discoverInModule
 -- pure, fmap, <*>) are short-circuited because the class dispatcher
 -- handles them via instance lookup — discovering their source bodies
 -- cascades through every GHC.Internal.* module.
-discoverInModule = discoverInModuleWith classMethodShortCircuit
+discoverInModule = discoverInModuleWith Set.empty
 
 -- | Class method names that the class dispatcher handles via instance
 -- lookup.  Discovering their source bodies cascades through every
 -- GHC.Internal.* module — short-circuit them in both discoverInModule
 -- and the recursive free-var walk inside discoverInModuleWith'.
-classMethodShortCircuit :: Set ByteString
-classMethodShortCircuit = Set.fromList $ map BC.pack
-    [">>=", ">>", "return", "pure", "fmap", "<*>", "<$>", "fail"]
+-- Removed: classMethodShortCircuit was a hardcoded list of names to
+-- skip during discovery.  The structural fix is to not resolve
+-- imported names during discovery at all — they're resolved lazily
+-- at eval time via the env-fallback.
 
 -- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
 -- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
@@ -7380,9 +7382,8 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                 -- package like `array`) is silently swallowed: the
                                 -- missing name is treated as a builtin and the
                                 -- evaluator will complain if it is actually used.
-                                let allShortCircuit = builtins `Set.union` classMethodShortCircuit
-                                    discoverFreeVar fv =
-                                      discoverInModuleWith allShortCircuit registry searchPath includeMap lm fv
+                                let discoverFreeVar fv =
+                                      discoverInModuleWith builtins registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
                                 let fvs = nubBS (discoveryFreeVars expr
@@ -7396,25 +7397,24 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                         -- only use builtin names (the common case).
                         | Set.member name builtins ->
                             recordDiscoveryMiss lm name
-                        | Set.member name classMethodShortCircuit ->
+                        | not (lmIsEntry lm) ->
+                            -- Not local in a non-entry module: skip
+                            -- resolveImport during discovery.  The
+                            -- evaluator's env-fallback resolves imported
+                            -- names on demand at eval time.  Eagerly
+                            -- resolveImport here cascades through the
+                            -- transitive import graph.
                             recordDiscoveryMiss lm name
                         | otherwise -> do
-                            -- Not local. Try imports.
+                            -- Entry module: resolve imports eagerly so
+                            -- main's free vars (putStrLn, accept, etc.)
+                            -- are available for evaluation.
                             mForeign <- resolveImport registry searchPath includeMap lm name
                             case mForeign of
                                 Just srcMod ->
-                                    -- Memoize: point at the actual providing
-                                    -- module's FQN so eval-time lookup goes
-                                    -- through thunkByKey to the real binding
-                                    -- (foreign-import sentinel or source body).
                                     insertLmBody lm name
                                         (EVar (srcMod <> BC.pack "." <> name))
                                 Nothing ->
-                                    -- Assume a builtin; let the evaluator
-                                    -- complain if truly missing.  Memoize
-                                    -- the miss so retries from the runtime
-                                    -- env-fallback don't replay the
-                                    -- findOrResolveLhs+resolveImport walk.
                                     recordDiscoveryMiss lm name
 
 qualifiedBuiltinAlias
