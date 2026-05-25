@@ -317,18 +317,11 @@ loadProgramFromSource searchPath src0 = do
     -- type name, not the ctor name -- required for class instance
     -- dispatch keyed on the type.
     installCtorTypeHook
-    -- Enumerate cached packages once; hs-source-dirs are respected via
-    -- parseCabalFile inside cachedPackageSearchPath.
-    -- Also collect include-dirs so CPP can find package headers.
     cacheWithIncludes <- cachedPackageSearchPathWithIncludes
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = searchPath ++ cacheDirs
     setGlobalSearchPath fullSearchPath includeMap
-    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
-    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
-    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
-    -- the nix-built libhs<pkg>-cbits.dylib.
     FFI.registerCbitsDylibs
 
     registry <- newIORef Map.empty
@@ -363,11 +356,7 @@ loadProgramFromSource searchPath src0 = do
 
     -- Pre-build the builtin name set so the discovery loop can short-
     -- circuit names that are provided by IHC.Builtins and never need to
-    -- be walked through Prelude's re-export chain.  Without this, every
-    -- use of a builtin (@putStrLn@, @print@, @+@, …) would trigger a
-    -- Prelude walk that eagerly loads much of base/ghc-internal — slow
-    -- and semantically pointless, because the evaluator resolves to the
-    -- builtin anyway.
+    -- be walked through Prelude's re-export chain.
     earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames =
             -- Class methods that no longer have a bare-name builtin
@@ -384,7 +373,6 @@ loadProgramFromSource searchPath src0 = do
     -- as the entry module so its bindings stay unqualified.
     entry <- loadEntryModule registry src
     let entryName = lmName entry
-
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
@@ -422,7 +410,6 @@ loadProgramFromSource searchPath src0 = do
                     mapM_ discoverEntryLocal newLocals
                     chaseLocals (Set.union seen (Set.fromList newLocals))
     chaseLocals Set.empty
-
     -- Force-load every module the entry source imports.  Without this,
     -- @import M (T(..))@ where the user only uses some constructor of T
     -- never triggers a 'loadModule' call for M (the qualified-FQN
@@ -488,10 +475,7 @@ loadProgramFromSource searchPath src0 = do
             pure ()
 
     -- Discover free variables of class default-method bodies and
-    -- instance method bodies across every loaded module so those names
-    -- are in the tied env before methods are evaluated. Without this,
-    -- `class Foo a where m x = helper x` with `helper` at top-level
-    -- would fail with 'unbound variable `helper`' at dispatch time.
+    -- instance method bodies across every loaded module.
     discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
 
     -- Collect every loaded module.
@@ -536,7 +520,6 @@ loadProgramFromSource searchPath src0 = do
     -- contains all builtins including the 'lift' function.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
-    -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
 
     -- Tie the knot for all bodies at once.
@@ -566,14 +549,6 @@ loadProgramFromSource searchPath src0 = do
 
     -- Add aliases: every binding imported into the entry module is
     -- visible there under its local name as well as the fully
-    -- qualified one. Qualified imports (@import qualified Foo as B@)
-    -- produce @B.name@ aliases via a different path (handled at
-    -- parse / EVar-rewrite time — see splitQualified). For the
-    -- simple-import case we expose the bare name.
-    --
-    -- Name collisions: last-writer-wins via Map.union right-bias.
-    -- Entry-module bindings are inserted LAST so they always shadow
-    -- imported aliases.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
@@ -7291,6 +7266,22 @@ discoverInModuleWith'
     :: Set ByteString -> ModuleRegistry -> [FilePath]
     -> Map FilePath [FilePath] -> LoadedModule -> ByteString -> IO ()
 discoverInModuleWith' builtins registry searchPath includeMap lm name
+    -- Skip constructors (uppercase), tuple/list/unit ctors, and primops.
+    -- These are handled by the type registry and primop catalog — the
+    -- discovery walk doesn't need to resolve their source bodies.
+    | isConstructorOrPrimop name = pure ()
+    | otherwise = discoverImpl builtins registry searchPath includeMap lm name
+  where
+    isConstructorOrPrimop n = case BC.uncons n of
+        Just (c, _) | c >= 'A' && c <= 'Z' -> True  -- Constructor
+        Just ('(', _) -> True  -- (), (,), (#,#), etc.
+        Just ('[', _) -> True  -- []
+        _ -> BC.pack "#" `BC.isSuffixOf` n  -- Primop
+
+discoverImpl
+    :: Set ByteString -> ModuleRegistry -> [FilePath]
+    -> Map FilePath [FilePath] -> LoadedModule -> ByteString -> IO ()
+discoverImpl builtins registry searchPath includeMap lm name
     | Just (qual, bareName) <- splitQualified name = do
         case qualifiedBuiltinAlias lm qual bareName builtins of
             Just rhs ->
