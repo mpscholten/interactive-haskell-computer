@@ -7412,13 +7412,11 @@ discoverImpl builtins registry searchPath includeMap lm name
                                 -- package like `array`) is silently swallowed: the
                                 -- missing name is treated as a builtin and the
                                 -- evaluator will complain if it is actually used.
-                                let discoverFreeVar fv =
-                                      discoverInModuleWith builtins registry searchPath includeMap lm fv
-                                        `catch` (\(_ :: ModuleNotFound) -> pure ())
-                                        `catch` (\(_ :: ParseError)     -> pure ())
-                                let fvs = nubBS (discoveryFreeVars expr
-                                            ++ extraDiscoveryFreeVars lm name)
-                                mapM_ discoverFreeVar fvs
+                                -- Don't recurse into free vars: each one will be
+                                -- resolved by its own env-fallback call when the
+                                -- evaluator first references it.  Eager recursion
+                                -- here cascades through the transitive dep graph.
+                                pure ()
                     Nothing
                         -- Names provided by IHC.Builtins resolve to the host
                         -- builtin env — no need to walk the source re-export
@@ -8636,8 +8634,8 @@ perFVChaseShortCircuit = Set.fromList $ map BC.pack
 -- avoids recursively chasing arbitrary lambda bodies; these hints keep known
 -- control-flow entry points on the normal tied-env path instead of forcing
 -- them through the eval-time fallback.
-extraDiscoveryFreeVars :: LoadedModule -> ByteString -> [ByteString]
-extraDiscoveryFreeVars lm name
+_extraDiscoveryFreeVars :: LoadedModule -> ByteString -> [ByteString]
+_extraDiscoveryFreeVars lm name
     | lmName lm == BC.pack "Network.Wai.Handler.Warp.Run"
     , name == BC.pack "run" =
         [BC.pack "runSettings"]
