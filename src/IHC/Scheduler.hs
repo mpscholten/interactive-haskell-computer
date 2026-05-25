@@ -317,18 +317,11 @@ loadProgramFromSource searchPath src0 = do
     -- type name, not the ctor name -- required for class instance
     -- dispatch keyed on the type.
     installCtorTypeHook
-    -- Enumerate cached packages once; hs-source-dirs are respected via
-    -- parseCabalFile inside cachedPackageSearchPath.
-    -- Also collect include-dirs so CPP can find package headers.
     cacheWithIncludes <- cachedPackageSearchPathWithIncludes
     let cacheDirs      = map fst cacheWithIncludes
         includeMap     = Map.fromList cacheWithIncludes
         fullSearchPath = searchPath ++ cacheDirs
     setGlobalSearchPath fullSearchPath includeMap
-    -- Auto-dlopen per-package cbits dylibs (IHC_CBITS_DIR).  See
-    -- buildBaseEnv for the REPL-path counterpart.  Needed so that
-    -- `foreign import ccall "_hs_text_measure_off"` etc. resolve via
-    -- the nix-built libhs<pkg>-cbits.dylib.
     FFI.registerCbitsDylibs
 
     registry <- newIORef Map.empty
@@ -363,11 +356,7 @@ loadProgramFromSource searchPath src0 = do
 
     -- Pre-build the builtin name set so the discovery loop can short-
     -- circuit names that are provided by IHC.Builtins and never need to
-    -- be walked through Prelude's re-export chain.  Without this, every
-    -- use of a builtin (@putStrLn@, @print@, @+@, …) would trigger a
-    -- Prelude walk that eagerly loads much of base/ghc-internal — slow
-    -- and semantically pointless, because the evaluator resolves to the
-    -- builtin anyway.
+    -- be walked through Prelude's re-export chain.
     earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames =
             -- Class methods that no longer have a bare-name builtin
@@ -384,7 +373,6 @@ loadProgramFromSource searchPath src0 = do
     -- as the entry module so its bindings stay unqualified.
     entry <- loadEntryModule registry src
     let entryName = lmName entry
-
     -- Drive discovery from `main`.
     discoverInModuleWith earlyBuiltinNames registry fullSearchPath includeMap entry "main"
 
@@ -422,7 +410,6 @@ loadProgramFromSource searchPath src0 = do
                     mapM_ discoverEntryLocal newLocals
                     chaseLocals (Set.union seen (Set.fromList newLocals))
     chaseLocals Set.empty
-
     -- Force-load every module the entry source imports.  Without this,
     -- @import M (T(..))@ where the user only uses some constructor of T
     -- never triggers a 'loadModule' call for M (the qualified-FQN
@@ -468,10 +455,16 @@ loadProgramFromSource searchPath src0 = do
     -- on every fixture and exhaust the heap.
     do
         bodies <- readIORef (lmBodies entry)
+        -- Use discoveryFreeVars (narrow, lazy-aware) not freeVars (deep).
+        -- freeVars descends into lambdas, let RHS, case alts — collecting
+        -- names that won't be needed until much later.  This over-broad
+        -- seed set causes the manifest to load dozens of GHC.Internal.*
+        -- provider modules eagerly, each of which triggers further
+        -- discovery and instance registration.
         let entryFvs = Set.fromList
                 [ fv
                 | expr <- Map.elems bodies
-                , fv   <- freeVars expr ++ syntheticClassMethodNames expr
+                , fv   <- discoveryFreeVars expr ++ syntheticClassMethodNames expr
                 ]
             allProviders = Manifest.providerModulesForMethods Manifest.manifestIndex entryFvs
             ghcInternalPrefix = BC.pack "GHC.Internal."
@@ -482,10 +475,7 @@ loadProgramFromSource searchPath src0 = do
             pure ()
 
     -- Discover free variables of class default-method bodies and
-    -- instance method bodies across every loaded module so those names
-    -- are in the tied env before methods are evaluated. Without this,
-    -- `class Foo a where m x = helper x` with `helper` at top-level
-    -- would fail with 'unbound variable `helper`' at dispatch time.
+    -- instance method bodies across every loaded module.
     discoverClassAndInstanceFreeVars registry fullSearchPath includeMap
 
     -- Collect every loaded module.
@@ -530,7 +520,6 @@ loadProgramFromSource searchPath src0 = do
     -- contains all builtins including the 'lift' function.
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
 
-    -- Build (fully-qualified-name, Expr) pairs for every loaded body.
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
 
     -- Tie the knot for all bodies at once.
@@ -560,14 +549,6 @@ loadProgramFromSource searchPath src0 = do
 
     -- Add aliases: every binding imported into the entry module is
     -- visible there under its local name as well as the fully
-    -- qualified one. Qualified imports (@import qualified Foo as B@)
-    -- produce @B.name@ aliases via a different path (handled at
-    -- parse / EVar-rewrite time — see splitQualified). For the
-    -- simple-import case we expose the bare name.
-    --
-    -- Name collisions: last-writer-wins via Map.union right-bias.
-    -- Entry-module bindings are inserted LAST so they always shadow
-    -- imported aliases.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let builtinBareName k =
             case BC.elemIndexEnd (toEnum (fromEnum '.')) k of
@@ -683,6 +664,7 @@ loadProgramFromSource searchPath src0 = do
         globalMods <- readIORef globalLoadedModulesRef
         case Map.lookup modName globalMods of
             Just lm -> do
+                pure ()
                 registerInstancesFrom registry fullSearchPath includeMap
                                       classReg unionedTypeCtors' classTable env lm
                 -- Also catalogue this module's @class C where m = ...@
@@ -1816,66 +1798,39 @@ registerOne
     -> InstanceDecl
     -> IO ()
 registerOne registry searchPath includeMap classReg typeCtors classTable env lm (InstanceDecl cls typ typeNames methods) = do
-    -- Pre-build the import-rewrite map so we can rewrite references
-    -- inside the instance method bodies before evaluation.  We use
-    -- 'buildImportRewritesForNames' which resolves each imported name
-    -- (qualified or unqualified) to the fully-qualified key stored in
-    -- the flat env, including walking named-reexport chains (so
-    -- @List.foldr@ → @GHC.Internal.Base.foldr@ when Base defines it
-    -- and List re-exports).  Without this, an instance body that uses
-    -- a qualified alias defined in its own module would fail with
-    -- "unbound variable" even though the target binding exists.
-    instMethodFVs <- collectInstanceMethodFVs lm methods
-    -- Demand-load each free var in the owning module so the flat env
-    -- (and 'buildImportRewritesForNames' that reads 'lmBodies') sees
-    -- the rewrite targets.  Without this, instance methods that use
-    -- qualified aliases whose bare names haven't been demanded yet
-    -- (e.g. @Foldable []@ uses @List.foldl@ but no user call triggers
-    -- @foldl@ discovery) can't be rewritten to the owner's FQN.
-    mapM_ (\fv -> do
-              r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                        :: IO (Either SomeException ())
-              case r of
-                  Right () -> pure ()
-                  Left  _  -> pure ())
-          (Set.toList instMethodFVs)
-    rewrites0 <- buildImportRewritesForNames registry lm instMethodFVs
-    -- Single-shot retry: some FVs may now resolve thanks to transitive
-    -- loads triggered by the per-FV discoverInModule pass just above.
-    -- For each FV still missing from the rewrite map, try discover
-    -- once more and rebuild.  Bounded: one extra pass, no fixpoint.
-    let unresolvedFVs =
-            [ fv | fv <- Set.toList instMethodFVs, not (Map.member fv rewrites0) ]
-    rewrites <- if null unresolvedFVs
-        then pure rewrites0
-        else do
-            mapM_ (\fv -> do
-                      r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                :: IO (Either SomeException ())
-                      case r of
-                          Right () -> pure ()
-                          Left  _  -> pure ())
-                  unresolvedFVs
-            buildImportRewritesForNames registry lm instMethodFVs
-    -- After the per-FV discovery passes above have mutated 'lmBodies' for
-    -- every rewrite target, the target FQNs exist in their owning
-    -- modules' bodies, but the env we'll pass to 'evalMethodWithLazy'
-    -- ('env') was snapshotted earlier (line 1246 in 'loadImportOnlyIntoEnv')
-    -- and has no slot for those FQNs.  Add one slot per rewrite target
-    -- that (a) is an FQN, (b) names a body we've already discovered, and
-    -- (c) isn't already in 'env'.  This is NOT pre-discovery beyond what
-    -- the retry just did — it's materialising env slots for bodies the
-    -- retry already produced.  Knot-tie so an augmented-slot body can
-    -- reference other augmented slots.
-    -- Build a name-keyed method table. When the class declaration is
-    -- known, the class's declared method names are canonical for
-    -- dispatch. Extra instance bindings are preserved under their own
-    -- names so non-standard extensions don't crash registration, but
-    -- dispatch only consults the class-declared names. If the class
-    -- declaration isn't available, keep every method the instance
-    -- provided so the legacy fallback still works.
+    -- Method bodies are registered LAZILY: each method is a VLazyMethod
+    -- thunk that defers free-var discovery, import-rewrite building,
+    -- and body parsing to first dispatch.  This avoids the O(N*M)
+    -- cascade where registering N instances eagerly discovers M free
+    -- vars each, pulling in the entire transitive dependency graph
+    -- at module load time.
+    --
+    -- Previously, all free vars were discovered eagerly here via
+    -- discoverInModuleForChase, which triggered loading of transitive
+    -- dependencies for every instance method body — even methods that
+    -- would never be dispatched.  For warp's dependency graph this
+    -- caused 10000+ binding discoveries at startup.
+    -- Each method is a VLazyMethod that captures the module, class,
+    -- and LHS.  Discovery + rewrite + parsing happen on first force
+    -- (at dispatch time), not at registration time.
     let methodMap = Map.fromList methods
-        evalMethodIn = evalOneMethodWith env
+        lazyMethodVal mn Nothing  = pure (identifyingPlaceholder cls mn)
+        lazyMethodVal mn (Just lhs) = do
+            t <- newLazyBuiltinThunk $ do
+                fvs <- collectInstanceMethodFVs lm [(mn, lhs)]
+                mapM_ (\fv -> do
+                    r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
+                              :: IO (Either SomeException ())
+                    case r of { Right () -> pure (); Left _ -> pure () })
+                  (Set.toList fvs)
+                rw <- buildImportRewritesForNames registry lm fvs
+                r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
+                        :: IO (Either SomeException Val)
+                case r of
+                    Right (VLazyMethod innerT) -> force legacyHooks innerT
+                    Right v                    -> pure v
+                    Left  _                    -> pure (identifyingPlaceholder cls mn)
+            pure (VLazyMethod t)
     methodVals <- case Map.lookup cls classTable of
         Just classMethods -> do
             let classMethodSet = Set.fromList classMethods
@@ -1885,18 +1840,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     , not (Set.member mn classMethodSet)
                     ]
             classEntries <- mapM (\mn -> do
-                    v <- evalMethodIn rewrites mn (Map.lookup mn methodMap)
+                    v <- lazyMethodVal mn (Map.lookup mn methodMap)
                     pure (mn, v))
                 classMethods
             extraEntries <- mapM (\(mn, lhs) -> do
-                    v <- evalMethodIn rewrites mn (Just lhs)
+                    v <- lazyMethodVal mn (Just lhs)
                     pure (mn, v))
                 extraMethods
             pure (HashMap.fromList (classEntries ++ extraEntries))
         Nothing ->
             HashMap.fromList <$>
                 mapM (\(mn, lhs) -> do
-                    v <- evalMethodIn rewrites mn (Just lhs)
+                    v <- lazyMethodVal mn (Just lhs)
                     pure (mn, v))
                 methods
     -- Register under the head type name (used by Bool/Int/Char/String
@@ -1922,13 +1877,6 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     ctors <- instanceRuntimeCtors typ
     mapM_ (\ctor -> registerInstance classReg cls ctor methodVals) ctors
   where
-    evalOneMethodWith _e _rw _mn Nothing = pure (identifyingPlaceholder cls _mn)
-    evalOneMethodWith e rw _mn (Just lhs) = do
-        r <- try (evalMethodWithLazy e lm rw (Just (cls, typ, _mn)) (_mn, lhs))
-                :: IO (Either SomeException Val)
-        case r of
-            Right v -> pure v
-            Left  _ -> pure (identifyingPlaceholder cls _mn)
 
     instanceRuntimeCtors ty =
         case splitQualified ty of
@@ -3500,47 +3448,37 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
 
     -- The pre-Stage-3 eager body, now invoked from the catalogue
     -- closure on first dispatch into this class.
+    -- Lazy per-method: each default is a VLazyMethod thunk that
+    -- defers free-var discovery + evaluation to first dispatch.
+    -- Previously, ALL defaults were eagerly discovered + forced at
+    -- registration time, creating the same cascade that the Stage-2
+    -- lazification of registerOne addressed for instance methods.
+    -- The specific cascade: Monad.return = pure → forces pure →
+    -- triggers Applicative dispatch → drains Applicative catalogue
+    -- → discovers ALL Applicative default FVs eagerly → etc.
     registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers) = do
-            -- Pre-demand-load each free var referenced in the class's
-            -- default bodies so 'buildImportRewritesForNames' can
-            -- rewrite them to their fully-qualified form before we try
-            -- to evaluate.  Class defaults like @foldr f z t = appEndo
-            -- (foldMap (Endo #. f) t) z@ rely on qualified imports
-            -- (e.g. @Endo@ from @Data.Semigroup.Internal@, @#.@ from
-            -- @Data.Functor.Utils@) that may not yet be demanded via
-            -- the usual flow.
-            fvs <- fmap (Set.fromList . concat) $
-                mapM (\(_, lhs) -> do
-                         r <- try (Parser.parseBodyExprWithFixity
-                                     (lmSource lm) (lmFixity lm) (lhsClauses lhs))
-                                 :: IO (Either SomeException Expr)
-                         case r of
-                             Right e -> pure (freeVars e)
-                             Left  _ -> pure [])
-                     (Map.toList defaults)
-            mapM_ (\fv -> do
-                       r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
-                                :: IO (Either SomeException ())
-                       case r of
-                           Right () -> pure ()
-                           Left  _  -> pure ())
-                  (Set.toList fvs)
-            rewrites <- buildImportRewritesForNames registry lm fvs
-            vals <- HashMap.fromList <$> mapM (\methodName -> do
-                        v <- slotVal lm cls defaults rewrites methodName
-                        pure (methodName, v))
+            vals <- HashMap.fromList <$> mapM (\methodName ->
+                        case Map.lookup methodName defaults of
+                            Just lhs -> do
+                                t <- newLazyBuiltinThunk $ do
+                                    fvs <- do
+                                        r <- try (Parser.parseBodyExprWithFixity
+                                                     (lmSource lm) (lmFixity lm) (lhsClauses lhs))
+                                                 :: IO (Either SomeException Expr)
+                                        case r of
+                                            Right e -> pure (Set.fromList (freeVars e))
+                                            Left  _ -> pure Set.empty
+                                    mapM_ (\fv -> do
+                                        r <- try (discoverInModuleForChase registry searchPath includeMap lm fv)
+                                                  :: IO (Either SomeException ())
+                                        case r of { Right () -> pure (); Left _ -> pure () })
+                                      (Set.toList fvs)
+                                    rw <- buildImportRewritesForNames registry lm fvs
+                                    evalDefaultMethodWith env lm rw lhs
+                                pure (methodName, VLazyMethod t)
+                            Nothing -> pure (methodName, placeholder cls methodName))
                     methodNames
             registerInstance classReg cls defaultTypeTag vals
-
-    slotVal lm cls defaults rewrites methodName =
-        case Map.lookup methodName defaults of
-            Just lhs -> do
-                r <- try (evalDefaultMethodWith env lm rewrites lhs)
-                        :: IO (Either SomeException Val)
-                case r of
-                    Right v -> pure v
-                    Left  _ -> pure (placeholder cls methodName)
-            Nothing -> pure (placeholder cls methodName)
 
     -- When the class default for 'methodName' couldn't be captured or
     -- evaluated (e.g. because the body uses operators that scanClassDecls
@@ -5931,42 +5869,39 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
-                                     -- Class-method dispatcher fallback: when
-                                     -- @bareName@ is a method of a class that
-                                     -- has been scanned (e.g. @Num@'s @abs@),
-                                     -- synthesise a 'classMethodDispatcher' on
-                                     -- the spot. This is the same slot that
-                                     -- 'buildClassMethodEnv' would have built
-                                     -- at startup, but we need it on demand
-                                     -- when the user's reference precedes the
-                                     -- buildClassMethodEnv pass that would
-                                     -- have placed it in the env.
-                                     mMethod <- tryClassMethodFromRegistry bareName
-                                     case mMethod of
+                                     -- Try ALL loaded modules' imports — the owner
+                                     -- might be wrong (e.g. class default method
+                                     -- evaluated in a different module's context).
+                                     mGlobal <- tryGlobalImportScan mods bareName
+                                     case mGlobal of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
-                                        searchPath <- readIORef globalSearchPathRef
-                                        includeMap <- readIORef globalIncludeMapRef
-                                        transientReg <- newIORef (Map.map Loaded mods)
-                                        let ownerName = fromMaybe (BC.pack "Prelude")
-                                                (preludeDirectOwner bareName)
-                                        loaded <- try (loadModule transientReg searchPath includeMap ownerName)
-                                                    :: IO (Either SomeException LoadedModule)
-                                        case loaded of
-                                            Left _ -> pure Nothing
-                                            Right preludeLm -> do
-                                                _ <- try (discoverInModule transientReg
-                                                            searchPath includeMap preludeLm bareName)
-                                                        :: IO (Either SomeException ())
-                                                reg <- readIORef transientReg
-                                                let newMods = Map.fromList
-                                                        [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
-                                                mergeGlobalLoadedModules newMods
-                                                mods' <- readIORef globalLoadedModulesRef
-                                                mSlot <- buildSlotFromOwner mods'
-                                                    (Map.findWithDefault preludeLm ownerName mods')
-                                                    bareName
-                                                case mSlot of
+                                       mMethod <- tryClassMethodFromRegistry bareName
+                                       case mMethod of
+                                        Just slot -> pure (Just slot)
+                                        Nothing -> do
+                                         searchPath <- readIORef globalSearchPathRef
+                                         includeMap <- readIORef globalIncludeMapRef
+                                         transientReg <- newIORef (Map.map Loaded mods)
+                                         let ownerName = fromMaybe (BC.pack "Prelude")
+                                                 (preludeDirectOwner bareName)
+                                         loaded <- try (loadModule transientReg searchPath includeMap ownerName)
+                                                     :: IO (Either SomeException LoadedModule)
+                                         case loaded of
+                                          Left _ -> pure Nothing
+                                          Right preludeLm -> do
+                                           _ <- try (discoverInModule transientReg
+                                                       searchPath includeMap preludeLm bareName)
+                                                   :: IO (Either SomeException ())
+                                           reg <- readIORef transientReg
+                                           let newMods = Map.fromList
+                                                   [ (n, lm) | (n, Loaded lm) <- Map.toList reg ]
+                                           mergeGlobalLoadedModules newMods
+                                           mods' <- readIORef globalLoadedModulesRef
+                                           mSlot <- buildSlotFromOwner mods'
+                                               (Map.findWithDefault preludeLm ownerName mods')
+                                               bareName
+                                           case mSlot of
                                                     Just _ -> pure mSlot
                                                     -- Class-method retry: the
                                                     -- 'discoverInModule' walk above
@@ -6065,11 +6000,26 @@ resolveFallbackSource mOwner name = do
                         | hasNoImplicitPrelude (lmSource owner) = []
                         | otherwise = preludeScope
                     candidateNames = visibleViaImport ++ implicit
-                    importCandidates =
-                        [ (n, lm)
-                        | n  <- candidateNames
-                        , Just lm <- [Map.lookup n mods]
-                        ]
+                -- Load unresolved import targets on demand.
+                -- Without this, names imported from not-yet-loaded
+                -- modules (e.g. #. from Data.Functor.Utils) fail as
+                -- "unbound variable" because the owner's import
+                -- wasn't loaded during discovery (non-entry skip).
+                loadedImports <- forM candidateNames $ \n -> do
+                    case Map.lookup n mods of
+                        Just lm -> pure (Just (n, lm))
+                        Nothing -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            r <- try (loadModule transientReg searchPath includeMap n)
+                                    :: IO (Either SomeException LoadedModule)
+                            case r of
+                                Right lm -> do
+                                    mergeGlobalLoadedModules (Map.singleton n lm)
+                                    pure (Just (n, lm))
+                                Left _ -> pure Nothing
+                let importCandidates = catMaybes loadedImports
                     -- Local bindings shadow imports (H2010 §5.5.1):
                     -- search the owner module's own source first.
                     candidates = (ownerName, owner) : importCandidates
@@ -6118,14 +6068,69 @@ resolveFallbackSource mOwner name = do
                             searchPath <- readIORef globalSearchPathRef
                             includeMap <- readIORef globalIncludeMapRef
                             transientReg <- newIORef (Map.map Loaded mods)
-                            _ <- try (discoverInModule transientReg
+                            r <- try (discoverInModule transientReg
                                         searchPath includeMap owner bareName)
                                     :: IO (Either SomeException ())
-                            bodies' <- readIORef (lmBodies owner)
-                            if Map.member bareName bodies'
-                                then buildSlotFromOwner mods owner bareName
-                                else go rest
+                            case r of
+                                Left e -> do
+                                    go rest
+                                Right () -> do
+                                    bodies' <- readIORef (lmBodies owner)
+                                    if Map.member bareName bodies'
+                                        then buildSlotFromOwner mods owner bareName
+                                        else do
+                                            go rest
                         Nothing -> go rest
+
+    -- | Search ALL loaded modules for one whose unqualified imports
+    -- provide @bareName@. Loads import targets on demand. Covers
+    -- the case where the owner sentinel is wrong (e.g. a class default
+    -- method body's $$owner is the call-site module, not the class's
+    -- declaring module).
+    tryGlobalImportScan mods bareName = go (Map.toList mods)
+      where
+        go [] = pure Nothing
+        go ((_, lm) : rest) = do
+            let imports = mhImports (lmHeader lm)
+                visible = [ impModule imp
+                          | imp <- imports
+                          , not (impQualified imp)
+                          , specAllows (impSpec imp) bareName
+                          ]
+            found <- firstJustM visible
+            case found of
+                Just slot -> pure (Just slot)
+                Nothing -> go rest
+
+        firstJustM [] = pure Nothing
+        firstJustM (modName : ms) = do
+            targetLm <- case Map.lookup modName mods of
+                Just lm -> pure (Just lm)
+                Nothing -> do
+                    searchPath <- readIORef globalSearchPathRef
+                    includeMap <- readIORef globalIncludeMapRef
+                    transientReg <- newIORef (Map.map Loaded mods)
+                    r <- try (loadModule transientReg searchPath includeMap modName)
+                            :: IO (Either SomeException LoadedModule)
+                    case r of
+                        Right lm -> do
+                            mergeGlobalLoadedModules (Map.singleton modName lm)
+                            pure (Just lm)
+                        Left _ -> pure Nothing
+            case targetLm of
+                Nothing -> firstJustM ms
+                Just tlm -> do
+                    mLhs <- findOrResolveLhs (lmSource tlm) (lmKnown tlm) bareName
+                    case mLhs of
+                        Just _ -> do
+                            searchPath <- readIORef globalSearchPathRef
+                            includeMap <- readIORef globalIncludeMapRef
+                            transientReg <- newIORef (Map.map Loaded mods)
+                            _ <- try (discoverInModule transientReg searchPath includeMap tlm bareName)
+                                    :: IO (Either SomeException ())
+                            mods' <- readIORef globalLoadedModulesRef
+                            buildSlotFromOwner mods' tlm bareName
+                        Nothing -> firstJustM ms
 
     -- | Scan every loaded module's 'lmDataReg' for a constructor named
     -- @bareName@.  When @import M (T(..))@ brings constructors into
@@ -7134,10 +7139,22 @@ discoverInModule
 -- circuited too much — @pure@ / @return@ need a per-FV walk through
 -- Prelude so 'registerInstancesFrom' can register their 'Applicative'
 -- / 'Monad' instances; skipping them regressed @pure 99 :: [Int]@ to
--- @<IO>@.  'perFVChaseShortCircuit' is the finer-grained set (Eq/Ord
--- comparison cluster only) that avoids both the cascade and that
--- regression.
+-- @<IO>@.  Now that instance registration is lazy (VLazyMethod thunks),
+-- the Applicative/Monad registration no longer needs eager per-FV
+-- walks from resolveImport.  Class method names (>>=, >>, return,
+-- pure, fmap, <*>) are short-circuited because the class dispatcher
+-- handles them via instance lookup — discovering their source bodies
+-- cascades through every GHC.Internal.* module.
 discoverInModule = discoverInModuleWith Set.empty
+
+-- | Class method names that the class dispatcher handles via instance
+-- lookup.  Discovering their source bodies cascades through every
+-- GHC.Internal.* module — short-circuit them in both discoverInModule
+-- and the recursive free-var walk inside discoverInModuleWith'.
+-- Removed: classMethodShortCircuit was a hardcoded list of names to
+-- skip during discovery.  The structural fix is to not resolve
+-- imported names during discovery at all — they're resolved lazily
+-- at eval time via the env-fallback.
 
 -- | 'discoverInModule' for the per-FV chase in 'registerInstancesFrom'
 -- / 'registerClassDefaults'.  Short-circuits the Eq/Ord comparison
@@ -7227,7 +7244,6 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
     when (cntT `mod` 1000 == 0) $ do
         System.IO.hPutStrLn System.IO.stderr
             ("[ihc:discover] total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
-        System.IO.hFlush System.IO.stderr
 
     -- Safety net: if the counter blows past a generous cap, abort
     -- fast with a useful trace.  The expected workload across the full
@@ -7245,7 +7261,6 @@ discoverInModuleWith builtins registry searchPath includeMap lm name = do
                   <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name
                   <> " — capping (suspected env-fallback loop; see "
                   <> "discoverNegCacheRef comment in Scheduler.hs)" )
-            System.IO.hFlush System.IO.stderr
         throwIO (DiscoveryCallCapExceeded cntT (lmName lm) name)
 
     -- Grey-set memo: record the pair on ENTRY (before recursing), not
@@ -7316,6 +7331,22 @@ discoverInModuleWith'
     :: Set ByteString -> ModuleRegistry -> [FilePath]
     -> Map FilePath [FilePath] -> LoadedModule -> ByteString -> IO ()
 discoverInModuleWith' builtins registry searchPath includeMap lm name
+    -- Skip constructors (uppercase), tuple/list/unit ctors, and primops.
+    -- These are handled by the type registry and primop catalog — the
+    -- discovery walk doesn't need to resolve their source bodies.
+    | isConstructorOrPrimop name = pure ()
+    | otherwise = discoverImpl builtins registry searchPath includeMap lm name
+  where
+    isConstructorOrPrimop n = case BC.uncons n of
+        Just (c, _) | c >= 'A' && c <= 'Z' -> True  -- Constructor
+        Just ('(', _) -> True  -- (), (,), (#,#), etc.
+        Just ('[', _) -> True  -- []
+        _ -> BC.pack "#" `BC.isSuffixOf` n  -- Primop
+
+discoverImpl
+    :: Set ByteString -> ModuleRegistry -> [FilePath]
+    -> Map FilePath [FilePath] -> LoadedModule -> ByteString -> IO ()
+discoverImpl builtins registry searchPath includeMap lm name
     | Just (qual, bareName) <- splitQualified name = do
         case qualifiedBuiltinAlias lm qual bareName builtins of
             Just rhs ->
@@ -7411,9 +7442,9 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                                       discoverInModuleWith builtins registry searchPath includeMap lm fv
                                         `catch` (\(_ :: ModuleNotFound) -> pure ())
                                         `catch` (\(_ :: ParseError)     -> pure ())
-                                mapM_ discoverFreeVar
-                                    (nubBS (discoveryFreeVars expr
-                                            ++ extraDiscoveryFreeVars lm name))
+                                let fvs = nubBS (discoveryFreeVars expr
+                                            ++ extraDiscoveryFreeVars lm name)
+                                mapM_ discoverFreeVar fvs
                     Nothing
                         -- Names provided by IHC.Builtins resolve to the host
                         -- builtin env — no need to walk the source re-export
@@ -7422,23 +7453,19 @@ discoverInModuleWith' builtins registry searchPath includeMap lm name
                         -- only use builtin names (the common case).
                         | Set.member name builtins ->
                             recordDiscoveryMiss lm name
+                        | not (lmIsEntry lm) ->
+                            -- Non-entry: skip resolveImport.  The eval-time
+                            -- env-fallback resolves imported names on demand.
+                            recordDiscoveryMiss lm name
                         | otherwise -> do
-                            -- Not local. Try imports.
+                            -- Runtime / class-default discovery: resolve
+                            -- through imports so #. etc. can be found.
                             mForeign <- resolveImport registry searchPath includeMap lm name
                             case mForeign of
                                 Just srcMod ->
-                                    -- Memoize: point at the actual providing
-                                    -- module's FQN so eval-time lookup goes
-                                    -- through thunkByKey to the real binding
-                                    -- (foreign-import sentinel or source body).
                                     insertLmBody lm name
                                         (EVar (srcMod <> BC.pack "." <> name))
                                 Nothing ->
-                                    -- Assume a builtin; let the evaluator
-                                    -- complain if truly missing.  Memoize
-                                    -- the miss so retries from the runtime
-                                    -- env-fallback don't replay the
-                                    -- findOrResolveLhs+resolveImport walk.
                                     recordDiscoveryMiss lm name
 
 qualifiedBuiltinAlias
@@ -7576,15 +7603,7 @@ resolveImport
     -> ByteString
     -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
-    -- Cache: every call walks @lm@'s unqualified imports and may
-    -- @loadModule@ each.  For warp-shaped programs the same
-    -- @(module, name)@ pair gets re-resolved hundreds of times during
-    -- demand-driven discovery, with each retry costing
-    -- O(unqualified-imports-of-lm) loadModule calls — observed at
-    -- ~3,300 loadModule calls/sec hammering the registry.  A simple
-    -- per-(lm-name, query-name) memo cuts that to one resolve per
-    -- pair.  Cache hits return both the @Just M@ and the @Nothing@
-    -- (no-resolution) outcomes so failed lookups don't replay either.
+    -- Cache: see comment block below.
     cache <- readIORef resolveImportCacheRef
     case Map.lookup (lmName lm, name) cache of
         Just cached -> pure cached
@@ -7593,6 +7612,57 @@ resolveImport registry searchPath includeMap lm name = do
             modifyIORef' resolveImportCacheRef
                 (Map.insert (lmName lm, name) r0)
             pure r0
+
+-- | Shallow import resolution for discovery free vars.  Only checks
+-- whether the name is locally defined in a direct (non-qualified)
+-- import — no re-export chain walking.  If not found, returns
+-- Nothing and the evaluator's env-fallback resolves it at runtime.
+-- This bounds discovery to O(direct-imports) per name.
+_resolveImportShallow
+    :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath]
+    -> LoadedModule -> ByteString -> IO (Maybe ByteString)
+_resolveImportShallow registry searchPath includeMap lm name = do
+    let unqual = filter (not . impQualified) (mhImports (lmHeader lm))
+    go unqual
+  where
+    go [] = pure Nothing
+    go (imp:rest)
+        | not (specAllows (impSpec imp) name) = go rest
+        | otherwise = do
+            reg <- readIORef registry
+            case Map.lookup (impModule imp) reg of
+                Just (Loaded targetLm) -> do
+                    mLhs <- findOrResolveLhs (lmSource targetLm) (lmKnown targetLm) name
+                    case mLhs of
+                        Just _ | exportsName targetLm name ->
+                            pure (Just (lmName targetLm))
+                        _ -> do
+                            isMethod <- exportsClassMethod targetLm name
+                            if isMethod
+                                then pure (Just (lmName targetLm))
+                                else if Map.member name (lmFieldReg targetLm)
+                                        && exportsName targetLm name
+                                    then pure (Just (lmName targetLm))
+                                    else go rest
+                -- Module not yet loaded — skip (don't trigger loadModule).
+                -- If the name is needed at eval time, env-fallback will
+                -- load the module then.
+                _ -> go rest
+
+    exportsClassMethod targetLm methodName = do
+        decls <- scanClassDecls (lmSource targetLm)
+        let matches = [ ()
+                      | ClassDecl cn ms _ _ <- decls
+                      , methodName `elem` ms
+                      , case mhExports (lmHeader targetLm) of
+                          ExportAll -> True
+                          ExportList items -> any (exportsClass cn ms) items
+                      ]
+        pure (not (null matches))
+    exportsClass cn _ms (ExportType n Nothing) = n == cn
+    exportsClass cn _ms (ExportType n (Just [])) = n == cn
+    exportsClass cn _ms (ExportType n (Just subs)) = n == cn && name `elem` subs
+    exportsClass _ _ _ = False
 
 -- | Reset the resolve-import cache between runFile calls so a stale
 -- 'lmName' from a prior run doesn't shadow a fresh resolution.  Wired
@@ -7701,6 +7771,8 @@ resolveImport' registry searchPath includeMap lm name = do
                                             _             -> False
                             if isFfi && exportsName targetLm name
                               then do
+                                -- FFI: discover eagerly so the FFI
+                                -- sentinel is in lmBodies for eval.
                                 discoverInModule registry searchPath includeMap targetLm name
                                 pure (Just (lmName targetLm))
                               else do
@@ -7710,7 +7782,12 @@ resolveImport' registry searchPath includeMap lm name = do
                                     Just _ ->
                                         if exportsName targetLm name
                                             then do
-                                                discoverInModule registry searchPath includeMap targetLm name
+                                                -- Don't discover the target's body
+                                                -- eagerly — just return the module
+                                                -- name.  The caller stores an alias
+                                                -- (EVar "Mod.name") and the evaluator
+                                                -- discovers the body on demand via
+                                                -- the env-fallback / thunkByKey path.
                                                 pure (Just (lmName targetLm))
                                             else tryImports rest
                                     Nothing -> do
@@ -8195,9 +8272,10 @@ syntheticClassMethodNames :: Expr -> [ByteString]
 syntheticClassMethodNames = goExpr
   where
     goExpr = \case
-        EDo stmts ->
-            (BC.pack ">>=" : BC.pack ">>" : BC.pack "return" : BC.pack "fail" : [])
-              ++ concatMap goStmt stmts
+        -- EDo is handled directly by evalDo — no synthetic >>=/>>/
+        -- return/fail needed.  Adding them triggers class dispatch
+        -- cascades during discovery.
+        EDo stmts -> concatMap goStmt stmts
         ELit _      -> []
         EVar _      -> []
         EApp f x    -> goExpr f ++ goExpr x

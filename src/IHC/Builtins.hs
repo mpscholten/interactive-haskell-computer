@@ -525,9 +525,9 @@ builtins reg =
     , ("pure",     returnB)
     , ("GHC.Internal.Base.pure", returnB)
     , ("Prelude.pure", returnB)
-    , ("fmap",     fmapDispatch reg)
-    , ("GHC.Internal.Base.fmap", fmapDispatch reg)
-    , ("Prelude.fmap", fmapDispatch reg)
+    -- fmap: source-loaded from `instance Functor IO` in GHC.Internal.Base.
+    -- No host-backed dispatcher — per CLAUDE.md "No host-backed class
+    -- method dispatchers".  Resolved via classMethodDispatcher.
     , ("<*>",      apDispatch reg)
     , ("GHC.Internal.Base.<*>", apDispatch reg)
     , ("Prelude.<*>", apDispatch reg)
@@ -2918,8 +2918,11 @@ stResultComponents _                               = Nothing
 -- uses keep working, and a @fmap@ on a container type that truly has
 -- no registered instance still produces a runtime error from the IO
 -- path rather than silently misbehaving.
-fmapDispatch :: ClassRegistry -> IO Val
-fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
+-- Legacy host-backed fmap dispatcher — awaiting full removal.
+-- Kept as dead code to preserve the pattern for reference during
+-- migration of other dispatchers (bindDispatch, apDispatch, etc.).
+_fmapDispatch :: ClassRegistry -> IO Val
+_fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     mv <- force legacyHooks mt
     let tag = typeTagOf mv
     mFmapMethod <- lookupInstanceMethod reg (BC.pack "Functor") tag (BC.pack "fmap") >>= forceInstanceMethod
