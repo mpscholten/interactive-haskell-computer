@@ -1800,9 +1800,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
         lazyMethodVal mn Nothing  = pure (identifyingPlaceholder cls mn)
         lazyMethodVal mn (Just lhs) = do
             t <- newLazyBuiltinThunk $ do
-                -- No eager discovery: the env-fallback resolves
-                -- imported names on demand at eval time.
-                rw <- buildImportRewritesForNames registry lm Set.empty
+                -- Build import rewrites (but don't chase free vars
+                -- through discoverInModuleForChase).  The rewrites
+                -- ensure bare names like WriteBuffer resolve to their
+                -- owning module's FQN at eval time.
+                fvs <- do
+                    r <- try (Parser.parseBodyExprWithFixity
+                                (lmSource lm) (lmFixity lm) (lhsClauses lhs))
+                            :: IO (Either SomeException Expr)
+                    case r of
+                        Right e -> pure (Set.fromList (freeVars e))
+                        Left  _ -> pure Set.empty
+                rw <- buildImportRewritesForNames registry lm fvs
                 r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
@@ -3446,8 +3455,14 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                                         case r of
                                             Right _e -> pure ()
                                             Left  _ -> pure ()
-                                    -- No eager discovery: env-fallback resolves on demand.
-                                    rw <- buildImportRewritesForNames registry lm Set.empty
+                                    fvs <- do
+                                        r <- try (Parser.parseBodyExprWithFixity
+                                                    (lmSource lm) (lmFixity lm) (lhsClauses lhs))
+                                                :: IO (Either SomeException Expr)
+                                        case r of
+                                            Right e -> pure (Set.fromList (freeVars e))
+                                            Left  _ -> pure Set.empty
+                                    rw <- buildImportRewritesForNames registry lm fvs
                                     evalDefaultMethodWith env lm rw lhs
                                 pure (methodName, VLazyMethod t)
                             Nothing -> pure (methodName, placeholder cls methodName))
