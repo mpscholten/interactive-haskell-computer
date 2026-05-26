@@ -3220,7 +3220,18 @@ parseApp ctx cur0 = do
             -- we see '{' immediately followed by 'ident =' or '}'.
             TkLBrace | isRecordUpdateBrace ctx cur' -> do
                     (fields, curEnd) <- parseRecordUpdateFields ctx cur' []
-                    loop (ERecordUpdate fn fields) curEnd
+                    -- Distinguish record construction (ConName { ... })
+                    -- from record update (expr { ... }).  Check the LAST
+                    -- dot-segment: qualified names like Network.Socket.defaultHints
+                    -- start with uppercase but are NOT constructors.
+                    let isConHead n = case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+                            Just i  -> let bare = BC.drop (i+1) n
+                                       in not (BC.null bare) && BC.head bare >= 'A' && BC.head bare <= 'Z'
+                            Nothing -> not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z'
+                        expr = case fn of
+                            EVar n | isConHead n -> ERecordCon n fields
+                            _ -> ERecordUpdate fn fields
+                    loop expr curEnd
             -- BlockArguments (IHP default-extension): @do@, @case@,
             -- @let … in …@, @if … then … else …@, and lambdas can
             -- serve as function arguments without parens.  We consume
@@ -3287,7 +3298,14 @@ parseAtomPostfix ctx cur0 = do
         case tkKind tok of
             TkLBrace | isRecordUpdateBrace ctx cur' -> do
                 (fields, curEnd) <- parseRecordUpdateFields ctx cur' []
-                loop (ERecordUpdate expr fields) curEnd
+                let isConHead n = case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+                        Just i  -> let bare = BC.drop (i+1) n
+                                   in not (BC.null bare) && BC.head bare >= 'A' && BC.head bare <= 'Z'
+                        Nothing -> not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z'
+                    result = case expr of
+                        EVar n | isConHead n -> ERecordCon n fields
+                        _ -> ERecordUpdate expr fields
+                loop result curEnd
             _ -> pure (expr, cur)
 
 -- | Peek ahead after @{@ to decide whether this is a record-update
