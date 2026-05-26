@@ -1976,15 +1976,8 @@ evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
     let expr0' = lowerInstanceCoerceMethod methodCtx
                $ lowerHashDotCoerce methodName expr0
-    -- Use global field registry (all loaded modules) for record
-    -- patterns/updates.  lmFieldReg lm only has fields defined in lm;
-    -- imported types like Handle__ need their defining module's fields.
-    globalMods <- readIORef globalLoadedModulesRef
-    let globalFields = unionFieldRegistries
-            [ lmFieldReg m | m <- Map.elems globalMods ]
-        allFields = unionFieldRegistries [lmFieldReg lm, globalFields]
-        expr1 = desugarRecordPats allFields
-                 (desugarRecordCons allFields expr0')
+        expr1 = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0')
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
@@ -3476,12 +3469,8 @@ evalDefaultMethodWith :: Env -> LoadedModule -> Map ByteString ByteString -> Bin
 evalDefaultMethodWith env lm rewrites lhs = do
     expr0 <- Parser.parseBodyExprWithFixity
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
-    globalMods <- readIORef globalLoadedModulesRef
-    let globalFields = unionFieldRegistries
-            [ lmFieldReg m | m <- Map.elems globalMods ]
-        allFields = unionFieldRegistries [lmFieldReg lm, globalFields]
-        expr1 = desugarRecordPats allFields
-                 (desugarRecordCons allFields expr0)
+    let expr1 = desugarRecordPats (lmFieldReg lm)
+                 (desugarRecordCons (lmFieldReg lm) expr0)
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
@@ -8886,10 +8875,7 @@ desugarRecordPats fldReg = goExpr
         let allFields = conFields fldReg conName
             subPats   = [PVar fname | (fname, _) <- allFields]
         in if null allFields
-            -- Field registry doesn't know this constructor's fields.
-            -- Keep PRecordWild so matchPat can handle it at runtime
-            -- (matches any VCon with the same constructor name).
-            then PRecordWild conName
+            then PRecordWild conName  -- field registry empty; matchPat handles
             else PCon conName subPats
     goPat (PView fn p)     = PView (goExpr fn) (goPat p)  -- nested view (unusual)
     goPat (PCon n ps)      = PCon n (map goPat ps)

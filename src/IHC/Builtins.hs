@@ -3264,17 +3264,47 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 mkFileHandleVal :: String -> Handle -> IO Val
 mkFileHandleVal path h = do
     pathT <- newWHNFThunk =<< stringToListValIO path
-    -- Handle__ with zero fields: desugarRecordPats converts
-    -- Handle__ {..} to PCon "Handle__" [] when the field registry
-    -- doesn't have Handle__'s fields.  Store the host Handle as a
-    -- separate thunk accessible via requireHandle.
+    -- Build a VCon "Handle__" with 13 positional fields matching the
+    -- source Handle__ record from GHC.Internal.IO.Handle.Types.
+    -- Most fields are stubs (VUnit); haType is the one that matters
+    -- (the source-loaded withHandle code inspects it).
+    let handleMode = case h of
+            _ | h == stdin  -> "ReadHandle"
+              | h == stdout -> "WriteHandle"
+              | h == stderr -> "WriteHandle"
+              | otherwise   -> "ReadWriteHandle"
     handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
-    -- The MVar contains (VCon "Handle__" [], PrimHandle).
-    -- We store the Handle__ wrapper AND the host handle in a tuple
-    -- inside the MVar so pattern matching on Handle__ {..} succeeds
-    -- (desugarRecordPats produces PCon "Handle__" [] when fields unknown)
-    -- and requireHandle can extract the host handle.
-    mv    <- newMVar (VCon "Handle__" [handleT])
+    haTypeT <- newWHNFThunk (VCon handleMode [])
+    -- haByteBuffer, haCharBuffer etc. — IORef stubs.  The builtins
+    -- handle actual I/O via the PrimHandle; source code that reads
+    -- these IORefs gets empty buffer stubs.
+    emptyBufRef <- newIORef =<< newWHNFThunk VUnit
+    stubT   <- newWHNFThunk (VPrimObj (PrimIORef emptyBufRef))
+    nothingT <- newWHNFThunk (VCon "Nothing" [])
+    lnT     <- newWHNFThunk (VCon "LF" [])  -- Newline = LF
+    nobufT  <- newWHNFThunk (VCon "LineBuffering" [])
+    -- haBuffers needs BufferListNil, not VUnit
+    bufListRef <- newIORef =<< newWHNFThunk (VCon "BufferListNil" [])
+    bufListT <- newWHNFThunk (VPrimObj (PrimIORef bufListRef))
+    -- 13 fields in order: haDevice haType haByteBuffer haBufferMode
+    -- haLastDecode haCharBuffer haBuffers haEncoder haDecoder
+    -- haCodec haInputNL haOutputNL haOtherSide
+    let handle__ = VCon "Handle__"
+            [ handleT   -- haDevice (PrimHandle — used by requireHandle)
+            , haTypeT   -- haType (HandleType)
+            , stubT     -- haByteBuffer (IORef stub)
+            , nobufT    -- haBufferMode
+            , stubT     -- haLastDecode (IORef stub)
+            , stubT     -- haCharBuffer (IORef stub)
+            , bufListT  -- haBuffers (IORef BufferListNil)
+            , nothingT  -- haEncoder
+            , nothingT  -- haDecoder
+            , nothingT  -- haCodec
+            , lnT       -- haInputNL
+            , lnT       -- haOutputNL
+            , nothingT  -- haOtherSide
+            ]
+    mv    <- newMVar handle__
     mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
     pure (VCon "FileHandle" [pathT, mvarT])
 
