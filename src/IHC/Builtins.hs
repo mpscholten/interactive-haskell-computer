@@ -6534,7 +6534,8 @@ buildFieldEnv reg = do
               | otherwise ->
                   throwIO (userError
                       ("record accessor `" <> BC.unpack fieldName
-                       <> "` applied to non-constructor value"))
+                       <> "` applied to non-constructor value: "
+                       <> showValForDebug v))
 
     -- Optimistic OverloadedStrings bridge for record accessors.
     --
