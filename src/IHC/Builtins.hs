@@ -7732,16 +7732,13 @@ runStateTransformer stateFnT = do
 
 catchB :: IO Val
 catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
-    av <- force legacyHooks aT
     hv <- force legacyHooks hT
-    -- A single `try @SomeException` so the user handler runs exactly once.
-    -- Nesting two host `catch`es (one for IhcException, one for the
-    -- SomeException fallthrough) double-invoked the handler whenever the
-    -- handler itself rethrew: the rethrown IhcException escaped the inner
-    -- catch and was re-caught by the outer one, running `hv` a second
-    -- time. (This was masked while bracket/finally/onException were
-    -- host-shimmed; source-loading them exercises this path.)
-    r <- CE.try @SomeException (runIOVal legacyHooks av)
+    -- Wrap BOTH force and runIOVal inside try: the >> operator's
+    -- ioSeq returns VIO, and applying it (inside force) runs the IO
+    -- which may throw BEFORE runIOVal is reached.
+    r <- CE.try @SomeException $ do
+            av <- force legacyHooks aT
+            runIOVal legacyHooks av
     case r of
         Right v -> pure v
         Left e  -> do
