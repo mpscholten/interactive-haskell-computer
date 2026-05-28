@@ -3871,6 +3871,11 @@ scanForeignImportsRaw src
                         tok = if null ws then s else last ws
                     in if BC.take 1 tok == BC.pack "&"
                            then (True,  Just (BC.drop 1 tok))
+                       -- A single word containing '.' is a header hint
+                       -- (e.g. "string.h"), not a C symbol.  Fall back
+                       -- to the Haskell identifier name.
+                       else if BC.elem '.' tok && length ws == 1
+                           then (False, Nothing)
                            else (False, Just tok)
                 Nothing -> (False, Nothing)
         let (t2, cur2) = peekSigTokFrom src curAfterSym
