@@ -2934,11 +2934,15 @@ classMethodDispatcher reg cls methodName = selfVal
                                                               baseId = VFun $ \a -> force legacyHooks a
                                                               impl = if methodName == BC.pack "." then baseDot else baseId
                                                           applyAll impl (reverse (argT : accArgs))
-                                                      _ -> error
-                                                          ( "class-method dispatch: no instance of `"
-                                                           <> BC.unpack cls
-                                                           <> "` for type `" <> BC.unpack tag
-                                                           <> "` (method `" <> BC.unpack methodName <> "`)" )
+                                                      _ ->
+                                                          -- No instance and no default — try the
+                                                          -- next argument position (the class
+                                                          -- variable may not be in the first
+                                                          -- dispatchable slot, e.g. SocketAddress).
+                                                          -- Exhausting all positions terminates at
+                                                          -- 'fallback', which raises the no-instance
+                                                          -- error.
+                                                          pure (dispatch (remaining - 1) (argT : accArgs))
                 else if isUnaryResultPolymorphicMethod cls methodName
                     then do
                         -- Arity-1 methods like @Applicative.pure@ /
