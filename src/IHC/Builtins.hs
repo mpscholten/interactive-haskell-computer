@@ -37,7 +37,7 @@ import Control.Exception
     , throwTo
     , SomeException
     )
-import Foreign.C.Error (Errno(..), getErrno)
+import Foreign.C.Error (Errno(..), getErrno, eINTR, eINPROGRESS)
 import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
@@ -1150,6 +1150,12 @@ builtins reg =
     , ("Network.Socket.accept", socketAcceptB)
     , ("Network.Socket.SockAddr.accept", socketAcceptB)
     , ("Network.Socket.Syscall.accept", socketAcceptB)
+    -- connect(2) — host-backed because the interpreted connectLoop
+    -- triggers excessive lazy discovery (~5000 bindings) that hangs.
+    , ("connect", socketConnectB)
+    , ("Network.Socket.connect", socketConnectB)
+    , ("Network.Socket.SockAddr.connect", socketConnectB)
+    , ("Network.Socket.Syscall.connect", socketConnectB)
     -- getsockname(2), used by Warp to populate connMySockAddr.
     , ("getSocketName", socketGetNameB)
     , ("Network.Socket.getSocketName", socketGetNameB)
@@ -4924,6 +4930,42 @@ socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ 
             then ioError (userError "Network.Socket.setSocketOption")
             else pure VUnit
 
+-- | Host-backed @connect :: Socket -> SockAddr -> IO ()@.
+-- Handles non-blocking sockets: retries on EINTR, waits via
+-- threadWaitWrite on EINPROGRESS, then checks SO_ERROR.
+socketConnectB :: IO Val
+socketConnectB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
+    sockV <- force legacyHooks sockT
+    addrV <- force legacyHooks addrT
+    fd <- socketFdFromVal sockV
+    (sz, pokeAddr) <- sockAddrPoke addrV
+    allocaBytes sz $ \p -> do
+        fillBytes p 0 sz
+        pokeAddr (castPtr p)
+        let connectLoop = do
+                rc <- c_connect_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
+                if rc == 0
+                    then pure ()
+                    else do
+                        Errno e <- getErrno
+                        if Errno e == eINTR
+                            then connectLoop
+                            else if Errno e == eINPROGRESS
+                                then do
+                                    threadWaitWrite (fromIntegral fd)
+                                    -- Check SO_ERROR after connect completes
+                                    allocaBytes (sizeOf (undefined :: CInt)) $ \optP -> do
+                                        allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
+                                            poke (castPtr lenP :: Ptr CInt) (fromIntegral (sizeOf (undefined :: CInt)))
+                                            _ <- c_getsockopt_host (fromIntegral fd) 1 4 (castPtr optP) (castPtr lenP)
+                                            soErr <- peek (castPtr optP :: Ptr CInt)
+                                            if soErr /= 0
+                                                then ioError (userError ("Network.Socket.connect: SO_ERROR=" <> show soErr))
+                                                else pure ()
+                                else ioError (userError ("Network.Socket.connect: errno=" <> show e))
+        connectLoop
+        pure VUnit
+
 socketListenB :: IO Val
 socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ do
     sockV <- force legacyHooks sockT
@@ -5196,6 +5238,12 @@ foreign import ccall unsafe "getsockname"
 
 foreign import ccall unsafe "bind"
     c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
+
+foreign import ccall unsafe "connect"
+    c_connect_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
+
+foreign import ccall unsafe "getsockopt"
+    c_getsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
 
 foreign import ccall unsafe "close"
     c_close_host :: CInt -> IO CInt
