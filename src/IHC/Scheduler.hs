@@ -155,7 +155,7 @@ unionDataRegistries =
         -- empty arity-0 stub from a partial scan.
         | arityA == 0 = b
         | arityB == 0 = a
-        | arityA >= arityB = a
+        | arityA <= arityB = a
         | otherwise        = b
 
 -- | Merge field registries without dropping duplicate-record-field clauses.
