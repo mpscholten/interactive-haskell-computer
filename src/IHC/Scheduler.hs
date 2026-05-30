@@ -6249,7 +6249,21 @@ resolveFallbackSource mOwner name = do
                 -- module that weren't in the original base env
                 -- (which predates the user's imports).
                 let unionedData =
-                        unionDataRegistries (map lmDataReg (Map.elems mods))
+                        -- Owner-scoped constructor resolution: the owning
+                        -- module's OWN data declarations take priority over
+                        -- the global bare-name union (Map.union is
+                        -- left-biased).  A single global arity tiebreak
+                        -- cannot satisfy every collision — warp's
+                        -- @Settings@ is the LARGEST-arity homonym (30 fields
+                        -- vs http2's 10) while warp's @Counter@ is the
+                        -- SMALLEST (arity 1 vs network-control's 2).  Letting
+                        -- the owner win means a construction/record-update in
+                        -- @Warp.Settings@ resolves @Settings@ to warp's ctor
+                        -- and one in @Warp.Counter@ resolves @Counter@ to
+                        -- warp's, regardless of arity.  The union only
+                        -- decides names the owner neither defines nor scans.
+                        Map.union (lmDataReg owner)
+                                  (unionDataRegistries (map lmDataReg (Map.elems mods)))
                     (publicFields, unionedFields) =
                         partitionFieldRegistries (Map.elems mods)
                 conEnvAll   <- buildConEnv unionedData
@@ -6270,8 +6284,10 @@ resolveFallbackSource mOwner name = do
                 -- global module set must shadow the fallback base env:
                 -- bare constructor names can collide across packages
                 -- (e.g. Warp.Settings.Settings vs HTTP2.Settings).
-                -- The refreshed union uses the larger constructor arity
-                -- and the owner-scoped record update must see that one.
+                -- 'unionedData' above is owner-prioritised, so the
+                -- owner-scoped record update / construction sees the
+                -- owning module's own ctor regardless of cross-package
+                -- arity differences.
                 let richEnv = HashMap.insert ownerSentinelKey ownerThunk
                             $ HashMap.unions
                                 [ ownerLocalEnv
