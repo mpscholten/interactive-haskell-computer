@@ -93,7 +93,7 @@ evalCore env ipm = go
             -- build the env, then back-patch each slot with its
             -- proper closure (mirrors 'IHC.Eval.eval' on 'ELet').
             slots <- traverse (\_ -> newIORef
-                                       (BlackHole "<core-let-placeholder>"))
+                                       (BlackHole Nothing "<core-let-placeholder>"))
                               binds
             let names  = [n | (n, _, _) <- binds]
                 envExt = extendEnvMany (zip names slots) env

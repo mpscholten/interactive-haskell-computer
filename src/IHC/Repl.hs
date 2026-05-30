@@ -639,7 +639,7 @@ tryEvalLetDecl loadedRef importsRef fldReg env name input = do
             -- include the binding, then fill the slot with a closure
             -- that captures the extended env.  This makes the binding
             -- visible to itself (recursion) and to later REPL lines.
-            slot <- newIORef (BlackHole "<repl-placeholder>")
+            slot <- newIORef (BlackHole Nothing "<repl-placeholder>")
             let env' = HashMap.insert key slot env0
             writeIORef slot (Unevaluated (Closure env' emptyIPMap expr))
             pure (Right env')

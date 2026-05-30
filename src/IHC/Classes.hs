@@ -212,7 +212,7 @@ typeRepListEq _ _ = pure False
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
-forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (BlackHole _ _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 -- | A class instance's method table. HashMap keyed by method name, so

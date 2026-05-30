@@ -27,6 +27,7 @@ module IHC.Eval
     ) where
 
 import Control.Exception (throwIO)
+import Control.Concurrent (myThreadId, yield)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -155,18 +156,33 @@ force hooks t = do
     st <- readIORef t
     case st of
         Evaluated v -> pure v
-        BlackHole msg -> throwIO (LoopException msg)
+        BlackHole owner msg -> do
+            self <- myThreadId
+            case owner of
+                -- The black-hole was entered by a DIFFERENT thread that is
+                -- still evaluating this shared thunk (warp forks a thread per
+                -- connection plus timeout/date threads, all forcing shared
+                -- 'Settings'/etc. thunks). This is NOT a loop — GHC's RTS
+                -- blocks on a foreign black-hole. Yield and retry until the
+                -- owner publishes the 'Evaluated' result.
+                Just o | o /= self -> yield >> force hooks t
+                -- Same thread re-entered (a genuine `<<loop>>`), or an
+                -- owner-less knot-tying placeholder was demanded before it
+                -- was filled: that IS a real loop.
+                _ -> throwIO (LoopException msg)
         Unevaluated (Closure env ipm expr) -> do
-            writeIORef t (BlackHole (take 500 (show expr)))
+            self <- myThreadId
+            writeIORef t (BlackHole (Just self) (take 500 (show expr)))
             v <- eval hooks env ipm expr
             writeIORef t (Evaluated v)
             pure v
         -- Lazy-init builtin: run the host @IO Val@ action exactly once,
         -- then memoise. Mirrors the 'Unevaluated' path (same black-hole
-        -- protocol) so concurrent forces see 'LoopException' instead of
-        -- double-running the initialiser. See 'IHC.Val.newLazyBuiltinThunk'.
+        -- protocol) so a concurrent forcer waits (foreign owner) or sees a
+        -- loop (same thread). See 'IHC.Val.newLazyBuiltinThunk'.
         LazyBuiltin mkV -> do
-            writeIORef t (BlackHole "<lazy-builtin>")
+            self <- myThreadId
+            writeIORef t (BlackHole (Just self) "<lazy-builtin>")
             v <- mkV
             writeIORef t (Evaluated v)
             pure v
@@ -262,7 +278,7 @@ eval hooks env ipm = go
         -- tying-the-knot pattern with mutable refs — avoids the
         -- strict-cycle hazard that 'mfix' / 'rec' would hit on the
         -- 'IO' monad given that 'Closure' has a strict env field.
-        slots <- mapM (\_ -> newIORef (BlackHole "<let-placeholder>")) binds
+        slots <- mapM (\_ -> newIORef (BlackHole Nothing "<let-placeholder>")) binds
         let names  = map fst binds
             env'   = extendEnvMany (zip names slots) env
         mapM_ (\((_, rhs), slot) ->
@@ -339,7 +355,7 @@ eval hooks env ipm = go
     -- Extend the implicit-param map for the duration of @body@.
     -- Each binding thunk captures the CURRENT env+ipm (not the extended ipm').
     go (EImplicitLet binds body) = do
-        slots <- mapM (\_ -> newIORef (BlackHole "<implicit-let-placeholder>")) binds
+        slots <- mapM (\_ -> newIORef (BlackHole Nothing "<implicit-let-placeholder>")) binds
         let names = map fst binds
             ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
                           (zip names slots)
@@ -1580,7 +1596,7 @@ evalDo hooks env ipm (SBangBind name e : rest) =
 evalDo hooks env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
-    slots <- mapM (\_ -> newIORef (BlackHole "<do-let-placeholder>")) bs
+    slots <- mapM (\_ -> newIORef (BlackHole Nothing "<do-let-placeholder>")) bs
     let names = map fst bs
         env'  = extendEnvMany (zip names slots) env
     mapM_ (\((_, rhs), slot) ->
@@ -1589,7 +1605,7 @@ evalDo hooks env ipm (SLet bs : rest) = do
     evalDo hooks env' ipm rest
 evalDo hooks _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
 evalDo hooks env ipm (SImplicitLet bs : rest) = do
-    slots <- mapM (\_ -> newIORef (BlackHole "<do-implicit-let-placeholder>")) bs
+    slots <- mapM (\_ -> newIORef (BlackHole Nothing "<do-implicit-let-placeholder>")) bs
     let names = map fst bs
         ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
                       (zip names slots)

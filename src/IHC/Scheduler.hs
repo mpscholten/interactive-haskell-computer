@@ -514,7 +514,7 @@ loadProgramFromSource searchPath src0 = do
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot for all bodies at once.
-    slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
+    slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
 
     -- For FQN keys whose bare name (last dot-component) matches a builtin,
@@ -1059,7 +1059,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- Build (key, Expr) pairs.  Entry module bindings are keyed bare.
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot.
-    slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
+    slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
@@ -1419,7 +1419,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     let baseForImport = HashMap.union classMethodEnv baseNoClass
     mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules0
-    slots <- mapM (\_ -> newIORef (BlackHole "<import-placeholder>")) qualPairs
+    slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     -- For builtin-backed stubs with no qualPairs, synthesize alias
     -- slots for any requested name whose FQN has a builtin binding.
     -- This makes e.g. `BS.length` resolve to the host `Data.ByteString.length`
@@ -6270,7 +6270,7 @@ resolveFallbackSource mOwner name = do
                 fieldEnvAll <- buildFieldAccessorEnv
                                     (Map.elems mods) publicFields unionedFields
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
-                slot <- newIORef (BlackHole "<fallback-placeholder>")
+                slot <- newIORef (BlackHole Nothing "<fallback-placeholder>")
                 let selfKey = lmName owner <> BC.pack "." <> bareName
                 ownerLocalEnv <- buildOwnerLocalEnv owner bodies bareName slot baseEnv
                 -- Stamp the closure's env with the owning module via
@@ -6482,7 +6482,7 @@ resolveFallbackSource mOwner name = do
                 -- GHC.Internal.Arr.Array repro in the unit #5 fix.
                 st <- readIORef slot
                 case st of
-                    BlackHole _ -> pure Nothing
+                    BlackHole _ _ -> pure Nothing
                     Unevaluated (Closure _ _ (EVar target))
                         | target == name -> pure Nothing
                     _ -> pure (Just slot)

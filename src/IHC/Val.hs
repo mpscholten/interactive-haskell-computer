@@ -188,7 +188,13 @@ type Thunk = IORef ThunkState
 data ThunkState
     = Unevaluated !Closure
     | Evaluated   !Val
-    | BlackHole  !String                -- entered, not yet returned
+    -- entered, not yet returned. The 'Maybe ThreadId' is the thread that
+    -- entered (set the black-hole) during evaluation; 'Nothing' for
+    -- knot-tying placeholder slots that have no evaluating owner. A thread
+    -- that hits a black-hole owned by ANOTHER thread must wait for that
+    -- thread to finish (concurrent evaluation of a shared thunk), not raise
+    -- a spurious loop — see 'IHC.Eval.force'.
+    | BlackHole  !(Maybe ThreadId) !String
     -- | Lazy-init for builtins: a host @IO Val@ action that produces the
     -- builtin's value on first force. Used by 'IHC.Builtins.builtinEnv'
     -- so startup doesn't pay the cost of materialising every primop,
