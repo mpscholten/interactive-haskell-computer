@@ -487,7 +487,7 @@ loadProgramFromSource searchPath src0 = do
     -- 'loadedModules'' below; the earlier-snapshot version is intentionally
     -- not bound here so we don't accidentally use a stale type-ctor map.
     let unionedData  = unionDataRegistries (map lmDataReg loadedModules)
-        (publicFields, unionedFields) = partitionFieldRegistries loadedModules
+        (_unexportedPublicFields, unionedFields) = partitionFieldRegistries loadedModules
         -- Union type-family registries across all loaded modules and
         -- publish the merged result into the global 'TR.globalRegistry'
         -- so the ETyApp path in 'IHC.Eval' can look up reductions for
@@ -497,6 +497,10 @@ loadProgramFromSource searchPath src0 = do
         unionedTFReg = foldr (Map.unionWith (++)) Map.empty
                          (map lmTypeFamilies loadedModules)
     TR.setGlobalRegistry unionedTFReg
+    -- Bare field-selector accessors are gated on EXPORT visibility so an
+    -- un-exported field (e.g. GHC.Event.KQueue's internal 'filter') can't
+    -- shadow a Prelude function of the same name. See 'exportedPublicFields'.
+    publicFields <- exportedPublicFields registry fullSearchPath includeMap loadedModules
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
     builtins <- builtinEnv classReg
@@ -4858,6 +4862,37 @@ partitionFieldRegistries lms =
                          [ lmFieldReg lm | lm <- lms, not (lmNoFieldSelectors lm) ]
     in (publicFields, allFields)
 
+-- | The field selectors that may become globally-nameable BARE accessors.
+--
+-- 'partitionFieldRegistries' returns @publicFields@ as the union of every
+-- loaded module's *entire* field registry. That over-approximates scope: a
+-- record field is a top-level selector only if its owning module actually
+-- EXPORTS it. An un-exported field selector is module-private (GHC §5.2) and
+-- must not be nameable elsewhere — otherwise e.g. @GHC.Event.KQueue@'s internal
+-- @filter@ field (@data Event = KEvent { ..., filter :: !Filter }@; KQueue
+-- exports only @new@/@available@) registers a bare @filter@ accessor that
+-- shadows @Prelude.filter@ at every unrelated use site, crashing the warp
+-- hello-world startup with "record accessor `filter` applied to
+-- non-constructor value".
+--
+-- We therefore restrict the bare-accessor registry to each module's EXPORTED
+-- fields via 'exportedFieldRegistry' (which also follows @T(..)@ and
+-- @module M@ re-exports). The full union is still used elsewhere for
+-- record-dot desugaring and qualified accessors — only the bare names are
+-- export-gated. @NoFieldSelectors@ modules contribute nothing, as before.
+exportedPublicFields
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> [LoadedModule]
+    -> IO FieldRegistry
+exportedPublicFields registry searchPath includeMap lms =
+    unionFieldRegistries <$> mapM perModule lms
+  where
+    perModule lm
+        | lmNoFieldSelectors lm = pure Map.empty
+        | otherwise = exportedFieldRegistry registry searchPath includeMap lm []
+
 -- | Build the combined field-accessor env: every field is bound under
 -- its 'fieldProjName' prefix (for record-dot), and fields from modules
 -- that do NOT have 'NoFieldSelectors' are also bound under their bare
@@ -6684,9 +6719,21 @@ resolveFallbackSource mOwner name = do
                         -- decides names the owner neither defines nor scans.
                         Map.union (lmDataReg owner)
                                   (unionDataRegistries (map lmDataReg (Map.elems mods)))
-                    (publicFields, unionedFields) =
+                    (_unexportedPublicFields, unionedFields) =
                         partitionFieldRegistries (Map.elems mods)
                 conEnvAll   <- buildConEnv unionedData
+                -- Bare field-selector accessors from OTHER modules are gated on
+                -- EXPORT visibility (see 'exportedPublicFields'). Without this,
+                -- an un-exported field (e.g. GHC.Event.KQueue's internal
+                -- 'filter') leaks a bare accessor into this lazily-resolved
+                -- body's closure and shadows a Prelude function of the same
+                -- name. The OWNER's own field selectors, however, are always in
+                -- scope unqualified within the owner module (GHC §5.2), so we
+                -- union the owner's full field registry back in — that keeps
+                -- same-module field access (eventFilter = filter e) working
+                -- while still gating cross-module leakage.
+                exportedPF <- exportedPublicFields transientReg searchPath includeMap (Map.elems mods)
+                let publicFields = unionFieldRegistries [exportedPF, lmFieldReg owner]
                 fieldEnvAll <- buildFieldAccessorEnv
                                     (Map.elems mods) publicFields unionedFields
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
@@ -7003,8 +7050,19 @@ resolveFallbackSource mOwner name = do
                     _ -> pure (Just slot)
 
     tryGlobalFieldSlot mods bareName = do
+        searchPath <- readIORef globalSearchPathRef
+        includeMap <- readIORef globalIncludeMapRef
+        transientReg <- newIORef (Map.map Loaded mods)
         let loaded = Map.elems mods
-            (publicFields, unionedFields) = partitionFieldRegistries loaded
+            (_unexportedPublicFields, unionedFields) = partitionFieldRegistries loaded
+        -- Gate bare accessors on EXPORT visibility (see 'exportedPublicFields').
+        -- An un-exported field selector (e.g. GHC.Event.KQueue's internal
+        -- 'filter') must not resolve here and shadow a Prelude function of the
+        -- same name. A module's OWN field selectors are served by its
+        -- owner-scoped closure ('buildSlotFromOwner' unions the owner's field
+        -- registry back in), so this cross-module gate leaves same-module field
+        -- access intact.
+        publicFields <- exportedPublicFields transientReg searchPath includeMap loaded
         fieldEnvAll <- buildFieldAccessorEnv loaded publicFields unionedFields
         pure (HashMap.lookup bareName fieldEnvAll)
 
