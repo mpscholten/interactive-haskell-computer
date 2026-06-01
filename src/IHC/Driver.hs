@@ -26,7 +26,7 @@ import IHC.CabalProject
     , resolve
     )
 import IHC.Classes (legacyHooks)
-import IHC.Diagnostics (warnStub)
+import IHC.Diagnostics (warnStubOnce)
 import IHC.Eval (force)
 import IHC.PackageStore (acquire, buildSearchEnv)
 import IHC.Scheduler (loadProgramFromSource)
@@ -72,13 +72,13 @@ resolveSearchPathFor path = do
                     -- out of nowhere. Silenceable via IHC_WARN_STUBS=0.
                     case err of
                         NoFreezeFile freezePath ->
-                            warnStub
+                            warnStubOnce
                                 ("cabal.project.freeze not found at "
                                  <> freezePath
                                  <> "; single-file mode (entry dir: "
                                  <> entryDir <> ")")
                         CabalParseFailed cabalPath msg ->
-                            warnStub
+                            warnStubOnce
                                 ("failed to parse " <> cabalPath
                                  <> " (" <> msg
                                  <> "); single-file mode (entry dir: "
