@@ -639,7 +639,36 @@ eval hooks env ipm = go
                                         apply hooks flv lblT
                                     _ -> pure v
                             Nothing -> pure v
-                _               -> pure v
+                _               -> pure (applyNumericTyAnnotation ty v)
+
+    -- Explicit numeric ascriptions stand in for the typechecker when an
+    -- overloaded expression has already evaluated to IHC's default integral
+    -- representation.  This lets code such as
+    -- @sqrt (fromIntegral n :: Double)@ dispatch on the annotated result type
+    -- instead of the intermediate @Int@ runtime tag.
+    applyNumericTyAnnotation :: ByteString -> Val -> Val
+    applyNumericTyAnnotation ty v =
+        case tyAnnotationHead ty of
+            "Double" -> toFloat v
+            "Float"  -> toFloat v
+            _        -> v
+      where
+        toFloat (VInt n)     = VFloat (fromIntegral n)
+        toFloat (VInteger n) = VFloat (fromInteger n)
+        toFloat other        = other
+
+    tyAnnotationHead :: ByteString -> ByteString
+    tyAnnotationHead ty =
+        let rawHead = case Elab.parseRawTypeExpr ty >>= TA.tyHead of
+                Just h  -> h
+                Nothing -> ty
+        in lastNameComponent (normalizeTyTag rawHead)
+
+    lastNameComponent :: ByteString -> ByteString
+    lastNameComponent n =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
@@ -1028,6 +1057,16 @@ matchPat _hooks (PLit (LChar _)) _      = pure Nothing
 -- never appears as a pattern in source code (Addr# literals don't
 -- have pattern syntax), so a non-match catch-all is correct.
 matchPat _hooks (PLit (LAddrStr _)) _   = pure Nothing
+matchPat _hooks (PCon "[]" []) (VStr s)
+    | BC.null s = pure (Just [])
+    | otherwise = pure Nothing
+matchPat hooks (PCon ":" [pHead, pTail]) (VStr s) =
+    case BC.uncons s of
+        Nothing -> pure Nothing
+        Just (c, rest) -> do
+            hT <- newWHNFThunk (VChar c)
+            tT <- newWHNFThunk (VStr rest)
+            matchFields hooks [(pHead, hT), (pTail, tT)] []
 -- Unit constructor pattern matches VUnit (the canonical runtime unit).
 matchPat hooks (PCon "()" []) VUnit = pure (Just [])
 -- DataKinds: @Proxy \@"foo"@ is represented as @VCon "Proxy" [payload]@
@@ -1547,19 +1586,31 @@ evalDo hooks env ipm [SBind _ e]     =
     eval hooks env ipm e
 evalDo hooks _   _   [SLet _]        = pure (VIO (pure VUnit))
 evalDo hooks env ipm (SExpr e : rest) =
-    pure $ VIO $ do
+    do
         mv <- eval hooks env ipm e
-        _  <- runIOVal hooks mv                   -- run and discard
-        restV <- evalDo hooks env ipm rest
-        runIOVal hooks restV
+        case mv of
+            VCon "Just" _ ->
+                evalDoMaybe hooks env ipm rest
+            VCon "Nothing" [] ->
+                pure mv
+            _ -> pure $ VIO $ do
+                _  <- runIOVal hooks mv                   -- run and discard
+                restV <- evalDo hooks env ipm rest
+                runIOVal hooks restV
 evalDo hooks env ipm (SBind name e : rest) =
-    pure $ VIO $ do
+    do
         mv <- eval hooks env ipm e
-        v  <- runIOVal hooks mv
-        vT <- newWHNFThunk v
-        let env' = extendEnv name vT env
-        restV <- evalDo hooks env' ipm rest
-        runIOVal hooks restV
+        case mv of
+            VCon "Just" [vT] ->
+                evalDoMaybe hooks (extendEnv name vT env) ipm rest
+            VCon "Nothing" [] ->
+                pure mv
+            _ -> pure $ VIO $ do
+                v  <- runIOVal hooks mv
+                vT <- newWHNFThunk v
+                let env' = extendEnv name vT env
+                restV <- evalDo hooks env' ipm rest
+                runIOVal hooks restV
 evalDo hooks env ipm [SBangBind _ e] =
     -- Defensive: a do-block ending in a (bang-)bind is ill-formed; mirror SBind.
     eval hooks env ipm e
@@ -1598,6 +1649,87 @@ evalDo hooks env ipm (SImplicitLet bs : rest) = do
           (zip bs slots)
     evalDo hooks env ipm' rest
 
+evalDoMaybe :: IHCHooks -> Env -> ImplicitParamMap -> [Stmt] -> IO Val
+evalDoMaybe _     _   _   []              = do
+    unitT <- newWHNFThunk VUnit
+    pure (VCon "Just" [unitT])
+evalDoMaybe hooks env ipm [SExpr e]       = evalMaybeFinal hooks env ipm e
+evalDoMaybe hooks env ipm [SBind _ e]     = evalMaybeAction hooks env ipm e
+evalDoMaybe hooks _   _   [SLet _]        = do
+    unitT <- newWHNFThunk VUnit
+    pure (VCon "Just" [unitT])
+evalDoMaybe hooks env ipm (SExpr e : rest) = do
+    mv <- evalMaybeAction hooks env ipm e
+    case mv of
+        VCon "Just" _  -> evalDoMaybe hooks env ipm rest
+        VCon "Nothing" [] -> pure mv
+        _ -> pure mv
+evalDoMaybe hooks env ipm (SBind name e : rest) = do
+    mv <- evalMaybeAction hooks env ipm e
+    case mv of
+        VCon "Just" [vT] -> evalDoMaybe hooks (extendEnv name vT env) ipm rest
+        VCon "Nothing" [] -> pure mv
+        _ -> pure mv
+evalDoMaybe hooks env ipm [SBangBind _ e] = evalMaybeAction hooks env ipm e
+evalDoMaybe hooks env ipm (SBangBind name e : rest) = do
+    mv <- evalMaybeAction hooks env ipm e
+    case mv of
+        VCon "Just" [vT] -> do
+            _ <- force hooks vT
+            evalDoMaybe hooks (extendEnv name vT env) ipm rest
+        VCon "Nothing" [] -> pure mv
+        _ -> pure mv
+evalDoMaybe hooks env ipm (SLet bs : rest) = do
+    slots <- mapM (\_ -> newIORef (BlackHole "<maybe-do-let-placeholder>")) bs
+    let names = map fst bs
+        env'  = extendEnvMany (zip names slots) env
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure env' ipm rhs)))
+          (zip bs slots)
+    evalDoMaybe hooks env' ipm rest
+evalDoMaybe hooks env ipm [SImplicitLet _] = do
+    unitT <- newWHNFThunk VUnit
+    pure (VCon "Just" [unitT])
+evalDoMaybe hooks env ipm (SImplicitLet bs : rest) = do
+    slots <- mapM (\_ -> newIORef (BlackHole "<maybe-do-implicit-let-placeholder>")) bs
+    let names = map fst bs
+        ipm'  = foldr (\(n, sl) m -> extendIPMap n sl m) ipm
+                      (zip names slots)
+    mapM_ (\((_, rhs), slot) ->
+               writeIORef slot (Unevaluated (Closure env ipm rhs)))
+          (zip bs slots)
+    evalDoMaybe hooks env ipm' rest
+
+evalMaybeAction :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
+evalMaybeAction hooks env ipm e = eval hooks env ipm e
+
+evalMaybeFinal :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
+evalMaybeFinal hooks env ipm e =
+    case stripTyApps e of
+        EApp f arg
+            | isMaybePureHead f -> do
+                v <- eval hooks env ipm arg
+                mkJust v
+        _ -> evalMaybeAction hooks env ipm e
+  where
+    stripTyApps (ETyApp inner _) = stripTyApps inner
+    stripTyApps other           = other
+
+    isMaybePureHead (EVar n) =
+        let bare = lastNameComponent n
+        in bare == BC.pack "pure" || bare == BC.pack "return"
+    isMaybePureHead (ETyApp inner _) = isMaybePureHead inner
+    isMaybePureHead _                = False
+
+    lastNameComponent n =
+        case BC.elemIndexEnd '.' n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
+
+    mkJust v = do
+        t <- newWHNFThunk v
+        pure (VCon "Just" [t])
+
 -- | Force one 'IO' layer to execute its suspended action. Any other value
 -- is returned as-is (treated as a "pure" IO result -- shouldn't happen
 -- in well-typed code, but we're optimistic and permissive).
@@ -1625,6 +1757,27 @@ runIOVal hooks (VCon "IO" [ft]) = do
             -- effect would never fire — explains why source-loaded
             -- @fillBytes@ used to silently produce zero-filled
             -- buffers in e.g. @BSC.replicate 4 'a'@.
+            _ <- force hooks stT
+            force hooks resT
+        other               -> pure other
+-- @ST s a@ has the same State#-passing runtime shape as source-built IO.
+-- The direct EDo evaluator runs bind statements through 'runIOVal'; without
+-- this case, an ST do-bind like @ref <- newSTRef 0@ binds @ref@ to the ST
+-- action wrapper rather than to the STRef result.
+runIOVal hooks (VCon "ST" [ft]) = do
+    fv <- force hooks ft
+    rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    result <- apply hooks fv rwT
+    case result of
+        -- Strict ST returns an unboxed state tuple shaped as
+        -- (# State# s, a #), but lazy ST's state function returns a
+        -- boxed pair `(a, State s)`.  Direct EDo uses runIOVal for both;
+        -- preserve the lazy-ST field order or binds receive `S#`
+        -- instead of the computation result.
+        VCon "(,)" [resT, stT] -> do
+            _ <- force hooks stT
+            force hooks resT
+        VCon _ [stT, resT] -> do
             _ <- force hooks stT
             force hooks resT
         other               -> pure other

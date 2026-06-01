@@ -6,6 +6,7 @@
 -- have the binary on PATH.
 module ReplTest (spec) where
 
+import IhcTestBinary (ihcBin)
 import System.IO (hPutStr, hFlush, hClose, openTempFile)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
@@ -13,13 +14,10 @@ import System.Exit (ExitCode(..))
 import System.Timeout (timeout)
 import Test.Hspec
 
--- | Locate the ihc binary built by cabal.
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
-
 runRepl :: String -> IO (ExitCode, String, String)
 runRepl input = do
-    result <- timeout (20 * 1000000) (readProcessWithExitCode ihcBin ["repl"] input)
+    bin <- ihcBin
+    result <- timeout (20 * 1000000) (readProcessWithExitCode bin ["repl"] input)
     case result of
         Just triple -> pure triple
         Nothing -> do

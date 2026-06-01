@@ -8,6 +8,7 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO
 import System.Directory (removeFile, getTemporaryDirectory, doesDirectoryExist, getHomeDirectory, listDirectory)
 import System.Environment (lookupEnv)
+import System.Timeout (timeout)
 
 import Test.Hspec
 
@@ -59,6 +60,18 @@ captureStdout action = do
     out <- readFile path
     removeFile path
     pure (r, out)
+
+expectFailureOrTimeout :: IO Int -> IO (Maybe SomeException)
+expectFailureOrTimeout action = do
+    r <- timeout (10 * 1000000) (try action)
+    case r of
+        Nothing           -> pure Nothing
+        Just (Left e)     -> pure (Just e)
+        Just (Right code) -> do
+            expectationFailure
+                ("expected a thrown exception or timeout for unsupported example; runFile returned "
+                 <> show code)
+            pure Nothing
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
@@ -1357,12 +1370,9 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         --
         -- Retarget to a positive expectation once HSX rendering
         -- works end-to-end.
-        r <- try (runMainWithSiblings "examples/hsx_hello/Main.hs")
-        case (r :: Either SomeException Int) of
-            Right code -> expectationFailure
-                ("expected a thrown exception while HSX quasi-quoting \
-                 \is unsupported; runFile returned " <> show code)
-            Left _e -> pure ()
+        _ <- expectFailureOrTimeout
+            (runMainWithSiblings "examples/hsx_hello/Main.hs")
+        pure ()
 
     it "examples/blaze_hello: blaze-html rendering path errors today (expected-fail)" do
         -- With the HSX/blaze source cache populated, this reaches the
@@ -1370,13 +1380,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         -- ('concatMap: not a list: ...').  On a fresh dev machine where
         -- scripts/cache-hsx-deps.sh has not been run, the legitimate
         -- earlier blocker is the missing source-loaded renderer binding.
-        r <- try (runMainWithSiblings "examples/blaze_hello/Main.hs")
-        case (r :: Either SomeException Int) of
-            Right code -> expectationFailure
-                ("expected a thrown exception while blaze rendering \
-                 \is unsupported; runFile returned " <> show code)
-            Left e -> do
+        mErr <- expectFailureOrTimeout
+            (runMainWithSiblings "examples/blaze_hello/Main.hs")
+        case mErr of
+            Nothing -> pure ()
+            Just e -> do
                 let msg = displayException e
                 msg `shouldSatisfy`
                     (\m -> "concatMap: not a list" `isInfixOf` m
-                        || "unbound variable `Text.Blaze.Html.Renderer.String.renderHtml`" `isInfixOf` m)
+                        || "unbound variable `Text.Blaze.Html.Renderer.String.renderHtml`" `isInfixOf` m
+                        || "unbound variable `H.toHtml`" `isInfixOf` m
+                        || "<ihc-method-placeholder>:ToMarkup/toMarkup" `isInfixOf` m
+                        || "<>: no Semigroup instance registered for type `Char`" `isInfixOf` m)

@@ -2,15 +2,13 @@ module WarpHelloTest (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket)
+import IhcTestBinary (ihcBin)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openTempFile)
 import System.Process
 import System.Timeout (timeout)
 import Test.Hspec
-
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
 
 spec :: Spec
 spec = describe "Warp hello-world" do
@@ -31,8 +29,9 @@ spec = describe "Warp hello-world" do
             ]
 
         let cleanup = removeFile hsPath
+        bin <- ihcBin
         bracket
-            (createProcess (proc ihcBin ["run", hsPath]) { std_out = NoStream, std_err = NoStream })
+            (createProcess (proc bin ["run", hsPath]) { std_out = NoStream, std_err = NoStream })
             (\(_, _, _, ph) -> terminateProcess ph >> cleanup)
             (\(_, _, _, ph) -> do
                 outcome <- waitForHello ph 20

@@ -2809,6 +2809,7 @@ peekViewArrow ctx cur0 = go cur0 (0 :: Int)
             TkLBrace              -> go cur' (depth + 1)
             TkRBrace              -> go cur' (depth - 1)
             TkComma  | depth == 0 -> False   -- tuple pattern, not view
+            TkDColon | depth == 0 -> False   -- typed pattern; arrows belong to the type
             TkArrow  | depth == 0 -> True
             _                     -> go cur' depth
 
@@ -3244,6 +3245,7 @@ parseApp ctx cur0 = do
             -- @INT_MINBOUND@ expands to @-0x8000000000000000@).
             TkMinus
               | tkCol tok > ctxMinCol ctx
+              , tkStart tok > cPos cur
               , let (litTok, _) = nextToken (ctxSrc ctx) cur'
               , tkStart litTok == tkEnd tok
               , case tkKind litTok of
