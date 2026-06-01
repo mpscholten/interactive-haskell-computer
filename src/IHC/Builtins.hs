@@ -227,9 +227,9 @@ builtinEnv reg = do
         , "NoBuffering", "LineBuffering", "BlockBuffering"
         ]
     -- Standard handles — source-loaded FileHandle constructors.
-    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin
-    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout
-    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr
+    stdinT  <- newWHNFThunk =<< mkFileHandleVal "ReadHandle"  "<stdin>"  stdin
+    stdoutT <- newWHNFThunk =<< mkFileHandleVal "WriteHandle" "<stdout>" stdout
+    stderrT <- newWHNFThunk =<< mkFileHandleVal "WriteHandle" "<stderr>" stderr
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
@@ -1355,10 +1355,30 @@ builtins reg =
     , ("GHC.Conc.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Conc.IO.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Internal.Conc.IO.threadWaitWrite", threadWaitWriteB)
-    -- IHC does not run GHC's RTS event manager.  Source modules such as
-    -- auto-update branch on this probe; returning Nothing selects their
-    -- ordinary threadDelay/forkIO implementation instead of the event-manager
-    -- backend.
+    -- GHC.Internal.Event.Thread.threadWait evt fd — the single choke point the
+    -- threaded socket-wait path (threadWaitRead/Write -> Event.threadWaitRead
+    -- -> threadWait) reduces to.  The source body registers on the RTS event
+    -- manager IHC never runs; host-back it to the host RTS IO manager directly.
+    , ("threadWait", threadWaitB)
+    , ("GHC.Event.Thread.threadWait", threadWaitB)
+    , ("GHC.Internal.Event.Thread.threadWait", threadWaitB)
+    -- GHC.Internal.Event.Manager.registerFd / unregisterFd_ — the event-manager
+    -- registration both threadWait (IO) and threadWaitSTM (the cancellable STM
+    -- wait network/warp use for recv) funnel through after getSystemEventManager_.
+    -- IHC does not run the RTS event manager; emulate a OneShot registration on
+    -- the host RTS IO manager (see 'registerFdB').
+    , ("registerFd", registerFdB)
+    , ("GHC.Event.Manager.registerFd", registerFdB)
+    , ("GHC.Internal.Event.Manager.registerFd", registerFdB)
+    , ("unregisterFd_", unregisterFd_B)
+    , ("GHC.Event.Manager.unregisterFd_", unregisterFd_B)
+    , ("GHC.Internal.Event.Manager.unregisterFd_", unregisterFd_B)
+    -- IHC does not run GHC's RTS event manager.  We return a stub 'Just mgr'
+    -- (see 'getSystemEventManagerB') so the threaded socket-wait path
+    -- (threadWait / threadWaitSTM) proceeds via our host-backed registerFd.
+    -- Code that branches on this probe (e.g. auto-update's mkAutoUpdate) then
+    -- takes the event-manager backend, which routes through the equally
+    -- host-backed timer manager (getSystemTimerManager / registerTimeout).
     , ("getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Event.Thread.getSystemEventManager", getSystemEventManagerB)
@@ -3265,24 +3285,64 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 --------------------------------------------------------------------------------
 
 -- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
--- The MVar holds @VCon "Handle__" [VPrimObj PrimHandle h]@ so source
--- code can pattern-match on @Handle__ {..}@ (record wildcard).
-mkFileHandleVal :: String -> Handle -> IO Val
-mkFileHandleVal path h = do
+--
+-- The MVar holds a @VCon "Handle__"@ carrying ALL 13 source fields, in the
+-- declaration order of @GHC.Internal.IO.Handle.Types.Handle__@:
+--
+--   0 haDevice   1 haType       2 haByteBuffer  3 haBufferMode
+--   4 haLastDecode  5 haCharBuffer  6 haBuffers   7 haEncoder
+--   8 haDecoder   9 haCodec     10 haInputNL    11 haOutputNL
+--   12 haOtherSide
+--
+-- This matters because the scanner now registers @Handle__@'s fields, so
+-- @desugarRecordPats@ expands @Handle__{..}@ into a 13-field positional
+-- pattern (e.g. @checkWritableHandle act h_\@Handle__{..}@) and accessors
+-- like @haType@/@haBufferMode@ index into the constructor by position. A
+-- 1-field stub failed both ("only 1 fields, index 1 out of range" /
+-- non-exhaustive @Handle__{..}@).
+--
+-- @haDevice@ (idx 0) carries the host 'Handle' — RTS-exclusive; requireHandle
+-- extracts it, and 'checkWritableHandle' for a 'WriteHandle' short-circuits to
+-- @act h_@ without touching the buffers. The buffer/decode IORef fields are
+-- therefore lazy "not populated" stubs: real IO is host-backed (hPutStr etc.),
+-- so the source-level buffered path (only reached for @ReadWriteHandle@) is
+-- never exercised; if it ever is, the stub names the exact field it needed.
+mkFileHandleVal :: String -> String -> Handle -> IO Val
+mkFileHandleVal htypeCon path h = do
     pathT <- newWHNFThunk =<< stringToListValIO path
-    -- Handle__ with zero fields: desugarRecordPats converts
-    -- Handle__ {..} to PCon "Handle__" [] when the field registry
-    -- doesn't have Handle__'s fields.  Store the host Handle as a
-    -- separate thunk accessible via requireHandle.
-    handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
-    -- The MVar contains (VCon "Handle__" [], PrimHandle).
-    -- We store the Handle__ wrapper AND the host handle in a tuple
-    -- inside the MVar so pattern matching on Handle__ {..} succeeds
-    -- (desugarRecordPats produces PCon "Handle__" [] when fields unknown)
-    -- and requireHandle can extract the host handle.
-    mv    <- newMVar (VCon "Handle__" [handleT])
+    -- idx 0: the host Handle (requireHandle reads the first field).
+    haDeviceT     <- newWHNFThunk (VPrimObj (PrimHandle h))
+    haTypeT       <- newWHNFThunk (VCon (BC.pack htypeCon) [])
+    haBufferModeT <- newWHNFThunk (VCon "LineBuffering" [])
+    haEncoderT    <- newWHNFThunk (VCon "Nothing" [])
+    haDecoderT    <- newWHNFThunk (VCon "Nothing" [])
+    haCodecT      <- newWHNFThunk (VCon "Nothing" [])
+    haInputNLT    <- newWHNFThunk (VCon "LF" [])
+    haOutputNLT   <- newWHNFThunk (VCon "LF" [])
+    haOtherSideT  <- newWHNFThunk (VCon "Nothing" [])
+    -- Buffer/decode IORefs: never forced on the host-backed write path.
+    haByteBufferT <- stubField "haByteBuffer"
+    haLastDecodeT <- stubField "haLastDecode"
+    haCharBufferT <- stubField "haCharBuffer"
+    haBuffersT    <- stubField "haBuffers"
+    let fields = [ haDeviceT, haTypeT, haByteBufferT, haBufferModeT
+                 , haLastDecodeT, haCharBufferT, haBuffersT, haEncoderT
+                 , haDecoderT, haCodecT, haInputNLT, haOutputNLT, haOtherSideT ]
+    mv    <- newMVar (VCon "Handle__" fields)
     mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
     pure (VCon "FileHandle" [pathT, mvarT])
+  where
+    stubField nm = newLazyBuiltinThunk
+        (error ("Handle__." <> nm <> ": field not populated "
+                <> "(host-backed handle, source buffer path not supported)"))
+
+-- | Map a host 'IOMode' to the source @HandleType@ constructor name used in
+-- the synthetic @Handle__@ value (see 'mkFileHandleVal').
+handleTypeForMode :: IOMode -> String
+handleTypeForMode ReadMode      = "ReadHandle"
+handleTypeForMode WriteMode     = "WriteHandle"
+handleTypeForMode AppendMode    = "AppendHandle"
+handleTypeForMode ReadWriteMode = "ReadWriteHandle"
 
 -- | Extract the host Handle from a source-loaded FileHandle/DuplexHandle
 -- or a legacy VPrimObj PrimHandle.
@@ -3330,7 +3390,7 @@ openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
-    mkFileHandleVal path h
+    mkFileHandleVal (handleTypeForMode mode) path h
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do
@@ -6755,6 +6815,72 @@ threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
     threadWaitWrite (fromIntegral n)
     pure VUnit
 
+-- | @threadWait :: Event -> Fd -> IO ()@ (GHC.Internal.Event.Thread).
+-- The source body dispatches to the RTS event manager (registerFd + an MVar
+-- handshake), which IHC does not run.  Delegate straight to the host RTS IO
+-- manager, selecting read vs. write from the 'Event' bitmask
+-- (@evtRead = Event 1@, @evtWrite = Event 2@; @Event@ is a newtype so the
+-- runtime value is either the bare Int or @Con [Int]@).
+threadWaitB :: IO Val
+threadWaitB = pure $ VFun $ \evtT -> pure $ VFun $ \fdT -> pure $ VIO $ do
+    fd  <- fdArgToInt fdT "threadWait"
+    evt <- eventBitsOf evtT
+    if evt .&. 2 /= 0
+        then threadWaitWrite (fromIntegral fd)
+        else threadWaitRead  (fromIntegral fd)
+    pure VUnit
+
+-- | Extract the 'GHC.Internal.Event.Internal.Types.Event' bitmask
+-- (@evtRead = Event 1@, @evtWrite = Event 2@) from a runtime value.  'Event'
+-- is a newtype, so the value is either the bare Int or @Con [Int]@.  Defaults
+-- to read (1) for any unexpected shape.
+eventBitsOf :: Thunk -> IO Int64
+eventBitsOf t = do
+    v <- force legacyHooks t
+    case v of
+        VInt n          -> pure n
+        VCon _ [innerT]  -> do
+            iv <- force legacyHooks innerT
+            case iv of
+                VInt n -> pure n
+                _      -> pure 1
+        _ -> pure 1
+
+-- | @registerFd :: EventManager -> IOCallback -> Fd -> Event -> Lifetime -> IO FdKey@
+-- (GHC.Internal.Event.Manager).  IHC does not run the RTS event manager, so we
+-- emulate a OneShot registration with a host thread: wait on the fd through the
+-- host RTS IO manager (read or write per the 'Event' bitmask), then fire the
+-- interpreted callback as @cb fdKey evt@.  This is the single choke point both
+-- the IO wait path ('threadWait') and the STM wait path ('threadWaitSTM', used
+-- by network/warp for cancellable recv) reduce to after 'getSystemEventManager_'.
+-- The 'EventManager' and 'FdKey' are opaque: the callback ignores the FdKey and
+-- our 'unregisterFd_' ignores both.
+registerFdB :: IO Val
+registerFdB = pure $ VFun $ \_mgrT -> pure $ VFun $ \cbT -> pure $ VFun $ \fdT ->
+    pure $ VFun $ \evtT -> pure $ VFun $ \_lifeT -> pure $ VIO $ do
+        fd  <- fdArgToInt fdT "registerFd"
+        evt <- eventBitsOf evtT
+        cbV <- force legacyHooks cbT
+        fdKeyT <- newWHNFThunk (VCon "FdKey" [])
+        _ <- forkIO $ do
+            if evt .&. 2 /= 0
+                then threadWaitWrite (fromIntegral fd)
+                else threadWaitRead  (fromIntegral fd)
+            -- cb fdKey evt :: IO ()
+            r1 <- apply legacyHooks cbV fdKeyT
+            r2 <- apply legacyHooks r1 evtT
+            _  <- runIOVal legacyHooks r2
+            pure ()
+        force legacyHooks fdKeyT
+
+-- | @unregisterFd_ :: EventManager -> FdKey -> IO Bool@.  The OneShot waiter
+-- 'registerFdB' spawned self-completes, so there is nothing to deregister;
+-- report success.  (On the cancel path the waiter may linger until the fd
+-- becomes ready — harmless for the common warp recv path.)
+unregisterFd_B :: IO Val
+unregisterFd_B = pure $ VFun $ \_mgrT -> pure $ VFun $ \_regT -> pure $ VIO $
+    pure (boolVal True)
+
 -- | Unwrap a @Fd@-like argument to its underlying @Int@.  Accepts the
 -- common shapes the source @System.Posix.Types.Fd@ newtype can take
 -- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
@@ -6770,8 +6896,16 @@ fdArgToInt t primName = do
                 _ -> error (primName <> ": Fd payload not VInt: " <> showValForDebug iv)
         _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
 
+-- | @getSystemEventManager :: IO (Maybe EventManager)@.  Returns a stub
+-- manager so the threaded socket-wait path (threadWait / threadWaitSTM via
+-- @Just mgr <- getSystemEventManager@) proceeds; the manager is opaque and only
+-- ever passed back to our host-backed 'registerFdB' / 'unregisterFd_B', which
+-- ignore it.  (Was @Nothing@; that dead-ended network/warp's recv on
+-- "Just mgr <- getSystemEventManager".)
 getSystemEventManagerB :: IO Val
-getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
+getSystemEventManagerB = pure $ VIO $ do
+    mgrT <- newWHNFThunk (VCon "IhcEventManager" [])
+    pure (VCon "Just" [mgrT])
 
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
