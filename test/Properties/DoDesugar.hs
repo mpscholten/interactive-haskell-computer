@@ -2,30 +2,23 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications   #-}
 
--- | Property: monadic-do blocks desugar to the documented
--- @>>=@ \/ @>>@ chains.
+-- | Property: do-block parsing preserves the statement list consumed by
+-- the evaluator's direct do-handler.
 --
 -- 'EDo' is intentionally absent from 'Properties.RoundTrip'
--- because the parser desugars do-notation at parse time
--- ('IHC.Parser.parseDo' lines 1310-1403): @do { e }@ collapses
--- to @e@; @do { x <- m; e }@ becomes @m >>= \\x -> e@; @do {
--- e1; e2 }@ becomes @e1 >> e2@; @do { let bs; e }@ becomes
--- @let bs in e@; and the applicative-do path produces an
--- @<$>@\/@<*>@ chain instead.  An 'EDo' built by a generator
--- never round-trips through any of those paths.
+-- because the parser keeps do-notation as @EDo [Stmt]@ now.  That
+-- shape is not representable by pretty-printing an arbitrary @EDo@
+-- through 'Properties.RoundTrip' without also preserving the exact
+-- statement syntax, so this property exercises do-blocks directly.
 --
 -- This module fills the gap with a /spec/ property: generate a
 -- 'Stmt' list, pretty-print it as a @do@-block, and assert the
--- parser produces the AST shape that the in-Haskell mirror of
--- the parser's @monadicDo@ predicts.
+-- parser produces the same 'EDo' statement list for 'evalDo'.
 --
--- To keep the spec tractable, the generator deliberately
--- bypasses the applicative-do path by always inserting at least
--- one middle 'SExpr' stmt.  Per parseDo's applicative-fire
--- conditions (header comment at @IHC.Parser:1296-1308@), the
--- presence of any non-bind non-final statement disqualifies the
--- block and routes it to monadicDo — exactly the path mirrored
--- by 'desugarDo' below.
+-- To keep the spec focused on the direct evaluator path, the
+-- generator always inserts at least one middle 'SExpr' stmt.  That
+-- shape is not eligible for the parked ApplicativeDo transform, even
+-- if it is re-enabled later.
 --
 -- Slice 2.N covered 'SExpr' \/ 'SBind' only.  This follow-up
 -- broadens to 'SLet' \/ 'SBangBind' \/ 'SImplicitLet' so the
@@ -67,32 +60,6 @@ import IHC.Pretty (prettyExpr)
 import IHC.Source (mkSource)
 
 import Properties.Generators (genExpr, genIdent)
-
-
---------------------------------------------------------------------------------
--- Spec — monadicDo, mirroring IHC.Parser:1377-1403
---------------------------------------------------------------------------------
-
--- | The AST shape the parser's monadic-do desugarer is expected
--- to produce, written in plain Haskell so the property test can
--- compare against it.  Mirror of @IHC.Parser.monadicDo@; any
--- divergence between the two surfaces here.
-desugarDo :: [Stmt] -> Expr
-desugarDo []                       = EDo []
-desugarDo [SExpr e]                = e
-desugarDo [SBind _ e]              = e   -- defensive: trailing bind is invalid
-desugarDo [SBangBind _ e]          = e   -- defensive
-desugarDo [SLet bs]                = ELet bs (EDo [])
-desugarDo [SImplicitLet bs]        = EImplicitLet bs (EDo [])
-desugarDo (SExpr e : rest)         =
-    EApp (EApp (EVar ">>") e) (desugarDo rest)
-desugarDo (SBind n e : rest)       =
-    EApp (EApp (EVar ">>=") e) (ELam n (desugarDo rest))
-desugarDo (SBangBind n e : rest)   =
-    EApp (EApp (EVar ">>=") e)
-         (ELam n (EApp (EApp (EVar "seq") (EVar n)) (desugarDo rest)))
-desugarDo (SLet bs : rest)         = ELet bs (desugarDo rest)
-desugarDo (SImplicitLet bs : rest) = EImplicitLet bs (desugarDo rest)
 
 
 --------------------------------------------------------------------------------
@@ -176,13 +143,13 @@ prettyImpBind (n, e) = "?" <> n <> " = " <> prettyExpr e
 prop_do_desugar :: Property
 prop_do_desugar = forAll genStmts $ \stmts -> ioProperty $ do
     let src      = prettyDo stmts
-        expected = desugarDo stmts
+        expected = EDo stmts
     r <- try @SomeException
         (parseExprAtEof (mkSource "<do>" src) defaultFixityTable)
     pure $ case r of
         Right actual ->
             counterexample
-                ( "do-block desugaring mismatch:\n  src      = "
+                ( "do-block statement mismatch:\n  src      = "
                   <> show src
                   <> "\n  stmts    = " <> show stmts
                   <> "\n  expected = " <> show expected
@@ -211,7 +178,7 @@ formatExn e = case fromException e of
 
 spec :: Spec
 spec =
-    describe "Property — do-block desugaring (Phase 2.N)" $
+    describe "Property — do-block statements (Phase 2.N)" $
         modifyMaxSuccess (const 500) $
-            prop "do { ...; e } desugars to the documented >>= / >> chain"
+            prop "do { ...; e } parses to the documented EDo statement list"
                 prop_do_desugar

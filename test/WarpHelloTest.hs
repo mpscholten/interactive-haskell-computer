@@ -2,6 +2,7 @@ module WarpHelloTest (spec) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket)
+import IhcTestBinary (ihcBin)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Exit (ExitCode(..))
 import System.IO (hClose, openTempFile)
@@ -9,14 +10,14 @@ import System.Process
 import System.Timeout (timeout)
 import Test.Hspec
 
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
-
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: end-to-end response path through warp's accept loop\
-                    \ not yet plumbed (see examples/warp_hello/README.md)."
+        pendingWith "Pending: socket setup, source-shaped Handle__,\
+                    \ Data.Text fusion Step.Done, Foldable NonEmpty defaults,\
+                    \ and source list folds now work; the request path still\
+                    \ loops through Warp's default exception renderer on a\
+                    \ Data.List.NonEmpty lazy `:|` pattern miss before serving."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle
@@ -31,8 +32,9 @@ spec = describe "Warp hello-world" do
             ]
 
         let cleanup = removeFile hsPath
+        bin <- ihcBin
         bracket
-            (createProcess (proc ihcBin ["run", hsPath]) { std_out = NoStream, std_err = NoStream })
+            (createProcess (proc bin ["run", hsPath]) { std_out = NoStream, std_err = NoStream })
             (\(_, _, _, ph) -> terminateProcess ph >> cleanup)
             (\(_, _, _, ph) -> do
                 outcome <- waitForHello ph 20

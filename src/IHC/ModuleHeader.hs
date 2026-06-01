@@ -290,10 +290,31 @@ parseExportList src cur0 = go [] cur0
                 TkIdent n -> loop (n : subs) c1
                 TkConId n -> loop (n : subs) c1
                 -- Operator in parens inside subs: Class((>>=), (>>), return).
-                -- Skip the parenthesised operator and continue.
+                -- Keep the operator name so class-method exports like
+                -- Bits((.&.), (.|.)) can be resolved through facade modules.
                 TkLParen  -> do
-                    cAfterOp <- skipToCloseParen s c1 1
-                    loop subs cAfterOp
+                    let (inner, c2) = nextSigTok s c1
+                    case operatorTokenName (tkKind inner) of
+                        Just op -> do
+                            let (close, c3) = nextSigTok s c2
+                            let c' = case tkKind close of
+                                    TkRParen -> c3
+                                    _        -> c2
+                            loop (op : subs) c'
+                        Nothing -> case tkKind inner of
+                            TkAt -> do
+                                let (rest, c3) = nextSigTok s c2
+                                let (fullOp, cAfterOp) = case tkKind rest of
+                                        TkSymOp suf -> (BC.pack "@" <> suf, c3)
+                                        _           -> (BC.pack "@", c2)
+                                let (close, c4) = nextSigTok s cAfterOp
+                                let c' = case tkKind close of
+                                        TkRParen -> c4
+                                        _        -> cAfterOp
+                                loop (fullOp : subs) c'
+                            _ -> do
+                                cAfterOp <- skipToCloseParen s c1 1
+                                loop subs cAfterOp
                 -- Bare operator (symbolic or backtick-wrapped): skip it.
                 TkSymOp _ -> loop subs c1
                 TkBacktick -> do
