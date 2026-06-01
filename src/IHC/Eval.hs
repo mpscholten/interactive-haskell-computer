@@ -271,32 +271,8 @@ eval hooks env ipm = go
         eval hooks env' ipm body
 
     go (ECase scrut alts) = do
-        v0 <- go scrut
-        -- Primops like `newByteArray#` return an internal VIO wrapper around
-        -- their unboxed-tuple result. A case expression must force that
-        -- wrapper before matching, but must not eagerly execute source-built
-        -- `IO` / `ST` constructors, which use `VCon`.
-        --
-        -- The exception combinators (`catch`, `mask`/`block`/`unblock`,
-        -- `bracket`, `finally`, `onException`, …) are source-loaded and
-        -- destructure the `IO` newtype carrier directly, e.g.
-        --   catch (IO io) handler   = IO $ catch# io handler'
-        --   unsafeUnmask (IO io)    = IO $ unmaskAsyncExceptions# io
-        -- When the scrutinee of such a match is a `VIO` action, running it
-        -- here (via `runIOVal`) would execute the protected computation
-        -- OUTSIDE the `catch#` frame, so an exception it raises escapes the
-        -- intended handler — and the exception-path cleanup (which lives in
-        -- that handler) never runs.  Suppress the eager run whenever an alt
-        -- destructures the `IO`/`ST`/`STM` newtype carrier: `matchPat`'s
-        -- @PCon "IO"@/@"ST"@/@"STM"@ arms wrap the `VIO` lazily as a
-        -- State#-passing function without forcing it, which is exactly the
-        -- newtype-coercion semantics this code needs.
-        let destructuresMonadCarrier =
-                any (\(Alt p _) -> patHeadIsMonadCarrier p) alts
-        v <- case v0 of
-            VIO _ | not destructuresMonadCarrier -> runIOVal hooks v0
-            _                                    -> pure v0
-        tryAlts v alts
+        scrutT <- newThunkIP env ipm scrut
+        tryAltsFromThunk scrutT alts
 
     go (EIf c t e) = do
         cv <- go c
@@ -672,6 +648,79 @@ eval hooks env ipm = go
 
     -- Pattern match alternatives. Returns the matched alt's body or
     -- raises PatternMatchFail.
+    tryAltsFromThunk :: Thunk -> [Alt] -> IO Val
+    tryAltsFromThunk scrutT alts0 = goAlts alts0
+      where
+        goAlts [] = do
+            v <- forceCaseScrut scrutT []
+            throwIO (PatternMatchFail
+                ("case: non-exhaustive patterns for "
+                 <> showValForDebug v
+                 <> " in alternatives "
+                 <> show (map (\(Alt p _) -> p) alts0)))
+        goAlts current@(Alt pat body : rest)
+            | Just inner <- lazyAltPat pat = do
+                bindings <- bindIrrefutablePat inner scrutT
+                r <- try (eval hooks (extendEnvMany bindings env) ipm body)
+                       :: IO (Either PatternMatchFail Val)
+                case r of
+                    Right result -> pure result
+                    Left (PatternMatchFail "guard failed") -> goAlts rest
+                    Left err -> throwIO err
+            | otherwise = do
+                v <- forceCaseScrut scrutT current
+                tryAlts v current
+
+        lazyAltPat (PIrref p) = Just p
+        lazyAltPat _          = Nothing
+
+    bindIrrefutablePat :: Pat -> Thunk -> IO [(Name, Thunk)]
+    bindIrrefutablePat pat scrutT =
+        traverse bindName (patternVars pat)
+      where
+        bindName name = do
+            t <- newLazyBuiltinThunk $ do
+                v <- force hooks scrutT
+                m <- matchPat hooks pat v
+                case m of
+                    Just bs -> case lookup name bs of
+                        Just t' -> force hooks t'
+                        Nothing ->
+                            error ("IHC.Eval: irrefutable pattern: variable `"
+                                   <> BC.unpack name
+                                   <> "` not bound by inner pattern "
+                                   <> show pat)
+                    Nothing ->
+                        error ("Irrefutable pattern failed for pattern "
+                               <> show pat)
+            pure (name, t)
+
+    forceCaseScrut :: Thunk -> [Alt] -> IO Val
+    forceCaseScrut scrutT altsForMatch = do
+        v0 <- force hooks scrutT
+        -- Primops like `newByteArray#` return an internal VIO wrapper around
+        -- their unboxed-tuple result. A refutable case must force that wrapper
+        -- before matching, but must not eagerly execute source-built `IO` /
+        -- `ST` constructors, which use `VCon`.
+        --
+        -- The exception combinators (`catch`, `mask`/`block`/`unblock`,
+        -- `bracket`, `finally`, `onException`, ...) are source-loaded and
+        -- destructure the `IO` newtype carrier directly, e.g.
+        --   catch (IO io) handler   = IO $ catch# io handler'
+        --   unsafeUnmask (IO io)    = IO $ unmaskAsyncExceptions# io
+        -- When the scrutinee of such a match is a `VIO` action, running it
+        -- here (via `runIOVal`) would execute the protected computation
+        -- OUTSIDE the `catch#` frame, so an exception it raises escapes the
+        -- intended handler. Suppress the eager run whenever a remaining alt
+        -- destructures the `IO`/`ST`/`STM` newtype carrier: `matchPat`'s
+        -- @PCon "IO"@/@"ST"@/@"STM"@ arms wrap the `VIO` lazily as a
+        -- State#-passing function without forcing it.
+        let destructuresMonadCarrier =
+                any (\(Alt p _) -> patHeadIsMonadCarrier p) altsForMatch
+        case v0 of
+            VIO _ | not destructuresMonadCarrier -> runIOVal hooks v0
+            _                                    -> pure v0
+
     tryAlts :: Val -> [Alt] -> IO Val
     tryAlts v alts0 = goAlts alts0
       where

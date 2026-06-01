@@ -357,8 +357,9 @@ parsePatsIn src fx (start, end) = do
                     Nothing -> pure (reverse acc)
             -- Operator infix LHS form: `arg1 OP arg2 = body`
             -- The symbolic operator (e.g. @?=, <>) between the two
-            -- argument patterns must be skipped.
-            TkSymOp _ -> loop ctx cur1 acc
+            -- argument patterns must be skipped. A leading `~` is the
+            -- irrefutable-pattern prefix, not an operator separator.
+            TkSymOp op | op /= BC.pack "~" -> loop ctx cur1 acc
             -- '@'-prefixed operator infix LHS: arg1 @?= arg2 = body
             -- '@' is TkAt (not isOpChar), followed by TkSymOp for the rest.
             -- Skip both tokens and continue collecting patterns.
@@ -396,7 +397,7 @@ parsePatsIn src fx (start, end) = do
                             TkBacktick -> loopInfix ctx cur3 acc
                             _          -> pure (reverse acc)
                     Nothing -> pure (reverse acc)
-            TkSymOp _ -> loopInfix ctx cur1 acc
+            TkSymOp op | op /= BC.pack "~" -> loopInfix ctx cur1 acc
             k | isDedicatedInfixOpKind k -> loopInfix ctx cur1 acc
             TkAt ->
                 let (peek2, cur2) = nextSig ctx cur1
@@ -455,7 +456,9 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
-            TkSymOp _  | depth == 0     -> pure True
+            TkSymOp op | depth == 0
+                       , op /= BC.pack "~" -> pure True
+            TkSymOp _  | depth == 0     -> go cur' depth sawPat
             TkBacktick | depth == 0     -> pure True
             TkMinus    | depth == 0
                        , sawPat         -> pure True
