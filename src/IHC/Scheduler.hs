@@ -3006,6 +3006,15 @@ classMethodDispatcher reg cls methodName = selfVal
                     -- not the Foldable container.  Carry it forward and
                     -- let the next argument drive the instance lookup.
                     pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isFoldablePreContainerArg accArgs
+                then
+                    -- Foldable.foldr/foldl/foldl' have shape
+                    --   (step-fn) -> accumulator -> t a -> ...
+                    -- Both pre-container arguments can themselves be
+                    -- dispatchable values (e.g. (:) or a NonEmpty
+                    -- accumulator), but neither is the Foldable
+                    -- structure.  Wait for the third argument.
+                    pure (dispatch (remaining - 1) (argT : accArgs))
             else if isDispatchableTag tag
                 then do
                     mSpecial <- specialClassApplication tag av argT accArgs
@@ -3022,16 +3031,6 @@ classMethodDispatcher reg cls methodName = selfVal
                               -- generic `(,)` instance.  Carry the bounds arg
                               -- forward and let the real index argument drive
                               -- dispatch.
-                              pure (dispatch (remaining - 1) (argT : accArgs))
-                        Nothing
-                          | isFoldableAccumulatorArg accArgs ->
-                              -- Foldable.foldr/foldl/foldl' have shape
-                              --   (step-fn) -> accumulator -> t a -> ...
-                              -- The accumulator can be a perfectly
-                              -- dispatchable scalar (e.g. length's 0),
-                              -- but it is not the Foldable container.
-                              -- Carry it forward so the next argument
-                              -- selects the instance.
                               pure (dispatch (remaining - 1) (argT : accArgs))
                         Nothing -> do
                           -- First lookup against the dispatcher's own classReg.
@@ -3359,10 +3358,10 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Ix"
         && methodName `elem` map BC.pack ["index", "unsafeIndex", "inRange"]
 
-    isFoldableAccumulatorArg accArgs =
+    isFoldablePreContainerArg accArgs =
         cls == BC.pack "Foldable"
         && methodName `elem` map BC.pack ["foldr", "foldr'", "foldl", "foldl'"]
-        && length accArgs == 1
+        && length accArgs < 2
 
     isPairVal (VCon "(,)" _) = True
     isPairVal _              = False
@@ -3657,7 +3656,19 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                         case Map.lookup methodName defaults of
                             Just lhs -> do
                                 t <- newLazyBuiltinThunk $ do
-                                    methodFvs <- bindingLhsFreeVars lm lhs
+                                    methodFvs0 <- bindingLhsFreeVars lm lhs
+                                    -- Class-local methods are already in
+                                    -- envForDefaults. Do not let import
+                                    -- rewrites turn e.g. Foldable's
+                                    -- default `foldl' = ... foldr ...`
+                                    -- into GHC.Internal.Base.foldr; that
+                                    -- list-only function will be called on
+                                    -- NonEmpty and other Foldables.
+                                    let methodFvs
+                                            | needsMethodScope =
+                                                methodFvs0 `Set.difference`
+                                                    Set.fromList methodNames
+                                            | otherwise = methodFvs0
                                     -- No eager discovery: env-fallback resolves on demand.
                                     rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
                                     evalDefaultMethodWith envForDefaults lm rw lhs
@@ -6910,17 +6921,24 @@ resolveFallbackSource mOwner name = do
             _ -> pure Nothing
 
     buildTargetedImportRewrites transientReg searchPath includeMap owner baseEnv existingRw expr = do
+        classDecls <- scanClassDecls (lmSource owner)
+            `catch` (\(_ :: SomeException) -> pure [])
+        let localClassMethods = Set.fromList
+                [ method
+                | ClassDecl _ methods _ _ <- classDecls
+                , method <- methods
+                ]
+            candidates =
+                [ fv
+                | fv <- nubBS (freeVars expr)
+                , not (BC.elem '.' fv)
+                , not (Map.member fv existingRw)
+                , not (HashMap.member fv baseEnv)
+                , not (Set.member fv localClassMethods)
+                ]
         pairs <- concat <$> mapM resolveOne candidates
         pure (Map.fromList pairs)
       where
-        candidates =
-            [ fv
-            | fv <- nubBS (freeVars expr)
-            , not (BC.elem '.' fv)
-            , not (Map.member fv existingRw)
-            , not (HashMap.member fv baseEnv)
-            ]
-
         resolveOne fv = do
             mProvider <- resolveImport transientReg searchPath includeMap owner fv
                             `catch` (\(_ :: SomeException) -> pure Nothing)

@@ -14,10 +14,10 @@ spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
         pendingWith "Pending: socket setup, source-shaped Handle__,\
-                    \ Data.Text fusion Step.Done, and lazy NonEmpty `:|`\
-                    \ patterns now work; the request path still loops through\
-                    \ Warp's default exception renderer on a source list\
-                    \ pattern miss before serving."
+                    \ Data.Text fusion Step.Done, Foldable NonEmpty defaults,\
+                    \ and source list folds now work; the request path still\
+                    \ loops through Warp's default exception renderer on a\
+                    \ Data.List.NonEmpty lazy `:|` pattern miss before serving."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle
