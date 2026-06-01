@@ -1920,13 +1920,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                 -- both 'lmTypeCtorReg's collapses them to one constructor
                 -- set and the wrong instance methods end up dispatched on
                 -- the wrong runtime ctor.  For bare type names, prefer
-                -- the owning module's local view first — that's the
-                -- @ByteString@ the instance head actually refers to —
-                -- and fall back to the global union for types only
-                -- visible through re-exports.
+                -- the owning module's local/import view first — that's the
+                -- @ByteString@ / @NonEmpty@ the instance head actually
+                -- refers to — and fall back to the global union only when
+                -- the type is visible solely through re-exports.
                 case Map.findWithDefault [] ty (lmTypeCtorReg lm) of
-                    [] -> pure (Map.findWithDefault [] ty typeCtors)
-                    ctors -> pure ctors
+                    ctors@(_:_) -> pure ctors
+                    [] -> do
+                        imported <- findRuntimeCtorsForType
+                            registry searchPath includeMap Set.empty lm ty
+                        if null imported
+                            then pure (Map.findWithDefault [] ty typeCtors)
+                            else pure imported
 
 findRuntimeCtorsForType
     :: ModuleRegistry
@@ -3018,6 +3023,16 @@ classMethodDispatcher reg cls methodName = selfVal
                               -- forward and let the real index argument drive
                               -- dispatch.
                               pure (dispatch (remaining - 1) (argT : accArgs))
+                        Nothing
+                          | isFoldableAccumulatorArg accArgs ->
+                              -- Foldable.foldr/foldl/foldl' have shape
+                              --   (step-fn) -> accumulator -> t a -> ...
+                              -- The accumulator can be a perfectly
+                              -- dispatchable scalar (e.g. length's 0),
+                              -- but it is not the Foldable container.
+                              -- Carry it forward so the next argument
+                              -- selects the instance.
+                              pure (dispatch (remaining - 1) (argT : accArgs))
                         Nothing -> do
                           -- First lookup against the dispatcher's own classReg.
                           mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
@@ -3344,6 +3359,11 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Ix"
         && methodName `elem` map BC.pack ["index", "unsafeIndex", "inRange"]
 
+    isFoldableAccumulatorArg accArgs =
+        cls == BC.pack "Foldable"
+        && methodName `elem` map BC.pack ["foldr", "foldr'", "foldl", "foldl'"]
+        && length accArgs == 1
+
     isPairVal (VCon "(,)" _) = True
     isPairVal _              = False
 
@@ -3619,6 +3639,20 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
     -- triggers Applicative dispatch → drains Applicative catalogue
     -- → discovers ALL Applicative default FVs eagerly → etc.
     registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers) = do
+            let needsMethodScope = cls == BC.pack "Foldable"
+            methodEnv <- if needsMethodScope
+                then HashMap.fromList <$> mapM
+                    (\mn -> do
+                        t <- newWHNFThunk (classMethodDispatcher classReg cls mn)
+                        pure (mn, t))
+                    methodNames
+                else pure HashMap.empty
+            -- Foldable defaults are scoped inside the class declaration:
+            -- length = foldl' ... must resolve foldl' to the Foldable
+            -- dispatcher before any imported list function is considered.
+            let envForDefaults
+                    | needsMethodScope = HashMap.union methodEnv env
+                    | otherwise        = env
             vals <- HashMap.fromList <$> mapM (\methodName ->
                         case Map.lookup methodName defaults of
                             Just lhs -> do
@@ -3626,7 +3660,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                                     methodFvs <- bindingLhsFreeVars lm lhs
                                     -- No eager discovery: env-fallback resolves on demand.
                                     rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
-                                    evalDefaultMethodWith env lm rw lhs
+                                    evalDefaultMethodWith envForDefaults lm rw lhs
                                 pure (methodName, VLazyMethod t)
                             Nothing -> pure (methodName, placeholder cls methodName))
                     methodNames
