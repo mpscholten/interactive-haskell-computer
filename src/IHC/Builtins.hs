@@ -1893,6 +1893,16 @@ eqVals reg av bv = case (av, bv) of
     (VInt x, VChar y)    -> pure (boolVal (toEnum (fromIntegral x) == y))
     (VChar x, VInt y)    -> pure (boolVal (x == toEnum (fromIntegral y)))
     (VStr x, VStr y)     -> pure (boolVal (x == y))
+    (VStr x, _) -> do
+        m <- charListBytes bv
+        case m of
+            Just y  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
+    (_, VStr y) -> do
+        m <- charListBytes av
+        case m of
+            Just x  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
     (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
         pure (boolVal (p1 == p2))
     (VUnit, VPrimObj (PrimPtr p)) ->
@@ -1971,7 +1981,15 @@ eqVals reg av bv = case (av, bv) of
                         eqVals reg v1 v2)
                         (zip ts1 ts2)
                     pure (boolVal (all isTruthy results))
-    _ -> do
+    _ -> fallbackNoBuiltinEq
+  where
+    charListBytes v = do
+        isChars <- isCharList v
+        if isChars
+            then Just . BC.pack <$> valToString v
+            else pure Nothing
+
+    fallbackNoBuiltinEq = do
         -- Try user-defined instance.
         let tag = typeTagOf av
         mEqMethod <- lookupInstanceMethod reg "Eq" tag "==" >>= forceInstanceMethod

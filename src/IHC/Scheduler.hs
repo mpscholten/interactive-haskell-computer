@@ -653,25 +653,34 @@ loadProgramFromSource searchPath src0 = do
     -- env the explicit pass above used.  Without this, a module loaded
     -- on demand after the knot has been tied would have its instances
     -- ignored entirely.
+    registeredInstanceModules <- newIORef (Set.fromList (map lmName loadedModules'))
     setRegisterInstancesHook legacyHooks $ \modName -> do
         globalMods <- readIORef globalLoadedModulesRef
         case Map.lookup modName globalMods of
             Just lm -> do
-                pure ()
-                registerInstancesFrom registry fullSearchPath includeMap
-                                      classReg unionedTypeCtors' classTable env lm
-                -- Also catalogue this module's @class C where m = ...@
-                -- defaults under the @<default>@ sentinel tag.  Without
-                -- this, a class declared in a lazily-loaded module
-                -- (e.g. @class Ord@ in ghc-prim's @GHC.Classes@,
-                -- pulled in on first reference to @(||)@ / @compare@)
-                -- never has its default body registered, so the
-                -- dispatcher's fallback to @defaultTypeTag@ for
-                -- (cls, tag) misses errors instead of running
-                -- @compare x y = if x == y then EQ else if x <= y
-                -- then LT else GT@.
-                registerClassDefaults registry fullSearchPath includeMap
-                                      classReg env [lm]
+                seen <- readIORef registeredInstanceModules
+                if Set.member modName seen
+                    then pure ()
+                    else do
+                        modifyIORef' registeredInstanceModules (Set.insert modName)
+                        let currentModules = Map.elems globalMods
+                            currentTypeCtors = foldr Map.union Map.empty
+                                (map lmTypeCtorReg currentModules)
+                        currentClassTable <- buildClassMethodTable currentModules
+                        registerInstancesFrom registry fullSearchPath includeMap
+                                              classReg currentTypeCtors currentClassTable env lm
+                        -- Also catalogue this module's @class C where m = ...@
+                        -- defaults under the @<default>@ sentinel tag.  Without
+                        -- this, a class declared in a lazily-loaded module
+                        -- (e.g. @class Ord@ in ghc-prim's @GHC.Classes@,
+                        -- pulled in on first reference to @(||)@ / @compare@)
+                        -- never has its default body registered, so the
+                        -- dispatcher's fallback to @defaultTypeTag@ for
+                        -- (cls, tag) misses errors instead of running
+                        -- @compare x y = if x == y then EQ else if x <= y
+                        -- then LT else GT@.
+                        registerClassDefaults registry fullSearchPath includeMap
+                                              classReg env [lm]
             Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
@@ -3221,6 +3230,9 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "MArray"
         , method `elem` map BC.pack ["newArray", "newArray_", "newListArray", "newGenArray"] =
             [BC.pack "STArray"]
+        | clsName == BC.pack "IArray"
+        , method `elem` map BC.pack ["unsafeArray", "array", "listArray", "accumArray", "genArray"] =
+            [BC.pack "Arr.Array", BC.pack "Array"]
         -- MonadParsec methods are parameterized by the parser monad
         -- @m@, which only appears in the result type (e.g. @takeWhileP
         -- :: Maybe String -> (Token s -> Bool) -> m (Tokens s)@).
@@ -4131,18 +4143,11 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
         regNow <- readIORef registry
         case Map.lookup (impModule imp) regNow of
             Just (Loaded tm) -> pure (Just tm)
-            _ | (allowLoadImports && shouldLoadRewriteImport imp)
+            _ | allowLoadImports
              || ambiguousQualifiedImport imp ->
                 (Just <$> loadModule registry searchPath includeMap (impModule imp))
                     `catch` (\(_ :: SomeException) -> pure Nothing)
               | otherwise -> pure Nothing
-
-    shouldLoadRewriteImport imp =
-        impModule imp == BC.pack "Prelude" ||
-        impQualified imp ||
-        case impSpec imp of
-            ImportOnly _ -> True
-            _            -> False
 
     requestedNamesForImport :: LoadedModule -> Set ByteString -> ImportDecl -> Maybe ByteString -> IO [ByteString]
     requestedNamesForImport tm needed imp qualRef =
@@ -4306,8 +4311,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
       where
         go []         = pure []
         go (imp:rest) =
-            case Map.lookup (impModule imp) reg of
-                Just (Loaded srcLm) -> do
+            let withLoaded srcLm = do
                     srcBodies <- readIORef (lmBodies srcLm)
                     case Map.lookup n srcBodies of
                       Just expr | not (isSelfAliasIn srcLm n expr) -> do
@@ -4324,7 +4328,16 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                             case deeper of
                                 [] -> go rest
                                 ps -> pure ps
-                _ -> go rest
+            in case Map.lookup (impModule imp) reg of
+                Just (Loaded srcLm) -> withLoaded srcLm
+                _
+                    | allowLoadImports -> do
+                        loaded <- try (loadModule registry searchPath includeMap (impModule imp))
+                                    :: IO (Either SomeException LoadedModule)
+                        case loaded of
+                            Right srcLm -> withLoaded srcLm
+                            Left _      -> go rest
+                    | otherwise -> go rest
 
     isSelfAliasIn tm n (EVar v) =
         v == n || v == lmName tm <> BC.pack "." <> n
@@ -4335,7 +4348,16 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
     rewritePairsFromReexport reg modName requestedNames =
         case Map.lookup modName reg of
             Just (Loaded reLm) -> directRewritePairs reg reLm requestedNames
-            _                  -> pure []
+            _
+                | allowLoadImports -> do
+                    loaded <- try (loadModule registry searchPath includeMap modName)
+                                :: IO (Either SomeException LoadedModule)
+                    case loaded of
+                        Left _     -> pure []
+                        Right reLm -> do
+                            reg' <- readIORef registry
+                            directRewritePairs reg' reLm requestedNames
+                | otherwise -> pure []
 
 -- | Rewrite every free 'EVar' in @expr@ whose name appears in the
 -- rewrite table (and isn't shadowed by an inner binder) to its
@@ -5409,6 +5431,7 @@ loadModuleSlow registry searchPath includeMap name = do
                                       -- referenced module. (Idempotent
                                       -- via per-run registry hits.)
                                       modifyIORef' registry (Map.insert name (Loaded lm))
+                                      triggerRegisterInstances legacyHooks name
                                       hydrateTransitiveImports registry searchPath includeMap lm
                                       pure lm
                         _ -> do
@@ -6299,7 +6322,9 @@ resolveFallbackSource mOwner name = do
                     Just owner -> do
                         exported <- moduleExportsClassMethod owner classes bareName
                         if exported
-                            then tryClassMethodFromRegistry bareName
+                            then do
+                                triggerRegisterInstances legacyHooks (lmName owner)
+                                tryClassMethodFromRegistry bareName
                             else pure Nothing
                     Nothing -> pure Nothing
 
