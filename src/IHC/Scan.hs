@@ -1804,7 +1804,13 @@ scanDataDecls src
                 curAfterDot <- skipForallBinders cur'
                 collectCtors tyName cIdx (dReg, fReg) curAfterDot
             TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
-            TkLParen -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
+            TkLParen -> do
+                isConstraint <- checkIfConstraint cur
+                if isConstraint
+                    then do
+                        curAfterArrow <- skipConstraintContext cur
+                        collectCtors tyName cIdx (dReg, fReg) curAfterArrow
+                    else collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             TkLBracket -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             -- Constructors with MagicHash suffixes, e.g. lazy ST's
             -- `data State s = S# (State# s)`, lex as TkPrimId rather
