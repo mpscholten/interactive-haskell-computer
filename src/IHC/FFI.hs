@@ -436,7 +436,7 @@ callForeign decl argVals = do
     mFp <- resolveSymbol (fdSymbol decl)
     case mFp of
         Nothing -> do
-            msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found"))
+            msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found: " <> fdSymbol decl))
             throwIO (IhcException
                 ("FFI: symbol '" <> fdSymbol decl <> "' not found in any loaded library")
                 msgT)
@@ -463,7 +463,7 @@ makeForeignVal decl
           mFp <- resolveSymbol (fdSymbol decl)
           case mFp of
               Nothing -> do
-                  msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found"))
+                  msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found (addr): " <> fdSymbol decl))
                   throwIO (IhcException
                       ("FFI: symbol '" <> fdSymbol decl
                        <> "' (address-of) not found in any loaded library")
