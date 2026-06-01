@@ -4582,13 +4582,19 @@ looksLikeAddrInfo flags family socktype protocol =
 
 peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
 peekAddrInfoVal p flags family socktype protocol = do
-    -- Linux struct addrinfo layout (64-bit):
-    -- offset 16: ai_addrlen (socklen_t, 4 bytes + padding)
-    -- offset 24: ai_addr (struct sockaddr*)
-    -- offset 32: ai_canonname (char*)
-    -- offset 40: ai_next (struct addrinfo*)
-    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
-    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    -- struct addrinfo layout differs in pointer field order:
+    -- Linux:  ai_addr at 24, ai_canonname at 32, ai_next at 40.
+    -- Darwin: ai_canonname at 24, ai_addr at 32, ai_next at 40.
+    (addrPtrWord, canonPtrWord) <-
+        if isDarwin
+            then do
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 24
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
+            else do
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 24
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
     flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
     familyT <- newWHNFThunk =<< oneFieldCon "Family" family
     socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype

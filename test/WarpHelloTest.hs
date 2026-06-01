@@ -13,8 +13,9 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: end-to-end response path through warp's accept loop\
-                    \ not yet plumbed (see examples/warp_hello/README.md)."
+        pendingWith "Pending: after socket setup succeeds, warp startup reaches\
+                    \ source-loaded text handle internals and fails on unbound\
+                    \ `haType` before serving a response."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle

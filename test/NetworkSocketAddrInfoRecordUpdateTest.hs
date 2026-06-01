@@ -10,10 +10,6 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Network.Socket AddrInfo record update" do
     it "allows defaultHints record updates used by getAddrInfo-based bind setup" do
-        pendingWith "Pending: AddrInfo's addrFlags/addrSocketType selectors are\
-                    \ not yet plumbed into the visible field registry for record\
-                    \ updates. The desugarer falls through to\
-                    \ 'record update: field(s) ... not in registry'."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-network-socket-addrinfo-record-update.hs"
         hClose hsHandle
@@ -31,7 +27,7 @@ spec = describe "Network.Socket AddrInfo record update" do
             ]
 
         bin <- ihcBin
-        (rc, _out, err) <- readProcessWithExitCode bin ["run", hsPath] ""
+        (rc, _out, _err) <- readProcessWithExitCode bin ["run", hsPath] ""
         rc `shouldBe` ExitSuccess
         contents <- readFile logPath
         contents `shouldContain` "family="
