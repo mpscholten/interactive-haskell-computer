@@ -13,9 +13,10 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: after socket setup succeeds, warp startup reaches\
-                    \ source-loaded text handle internals and fails on unbound\
-                    \ `haType` before serving a response."
+        pendingWith "Pending: socket setup and source-shaped Handle__ now\
+                    \ work; the request path loops through Warp's default\
+                    \ exception renderer on a NonEmpty `:|` pattern miss and\
+                    \ a Data.Text fusion Step pattern miss before serving."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle
