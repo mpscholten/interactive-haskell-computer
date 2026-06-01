@@ -4195,12 +4195,13 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                 , not (lmNoFieldSelectors tm)
                 , exportsNameDirect tm n
                 ]
-            -- Data constructors declared in tm.  These live in 'buildConEnv'
-            -- under their bare name (no module prefix), so the rewrite
-            -- target stays as the bare name — the import-rewrite for
-            -- e.g. @qualified Text.Megaparsec as Megaparsec@ then maps
-            -- @Megaparsec.SourcePos@ to bare @SourcePos@ which the env
-            -- already resolves.
+            -- Data constructors declared in tm.  Rewrite them to the
+            -- declaring module's FQN so later fallback can build the exact
+            -- constructor from that module instead of consulting the global
+            -- bare-name constructor union.  Bare constructor names collide
+            -- in real packages (e.g. text's nullary Step.Done vs bytestring's
+            -- arity-2 BuildSignal.Done), and arity heuristics are not a
+            -- substitute for Haskell's import scope.
             ctorExported =
                 [ n
                 | n <- requestedNames
@@ -4210,7 +4211,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
             localExportedNames = map fst localExported
             localPairs = localExported
                       ++ [(n, prefix <> n) | n <- fieldExported, n `notElem` localExportedNames]
-                      ++ [(n, n)            | n <- ctorExported, n `notElem` localExportedNames, n `notElem` fieldExported]
+                      ++ [(n, prefix <> n) | n <- ctorExported, n `notElem` localExportedNames, n `notElem` fieldExported]
         -- For ExportName entries not covered by local bodies, follow
         -- tm's own unqualified imports (named re-export chain).
         namedPairs <- namedReexportPairs reg tm bodiesMap requestedNames
@@ -6765,12 +6766,15 @@ resolveFallbackSource mOwner name = do
         if not (couldBeCtorName bareName)
             then pure Nothing
             else do
-                let unionedData =
-                        unionDataRegistries (lmDataReg owner : map lmDataReg (Map.elems mods))
-                conEnv <- buildConEnv unionedData
-                case HashMap.lookup bareName conEnv of
-                    Just slot -> pure (Just slot)
-                    Nothing   -> tryImportedConstructorSlot mods owner bareName
+                case Map.lookup bareName (lmDataReg owner) of
+                    Just _  -> mkCtorSlotFromModule owner bareName
+                    Nothing -> do
+                        let unionedData =
+                                unionDataRegistries (lmDataReg owner : map lmDataReg (Map.elems mods))
+                        conEnv <- buildConEnv unionedData
+                        case HashMap.lookup bareName conEnv of
+                            Just slot -> pure (Just slot)
+                            Nothing   -> tryImportedConstructorSlot mods owner bareName
 
     couldBeCtorName n =
         case BC.uncons n of
