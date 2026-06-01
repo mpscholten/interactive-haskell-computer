@@ -5977,6 +5977,14 @@ resolveFallback _mOwner name
     -- case-insensitive HTTP header keys.
     | BC.pack "CI." `BC.isPrefixOf` name =
         resolveFallback _mOwner (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
+    -- warp imports Network.HTTP.Types as H and reaches Status field
+    -- accessors through that facade.  Route the record fields to their
+    -- defining module so the normal source field-accessor path can build
+    -- them from the Status data declaration.
+    | name == BC.pack "H.statusCode" =
+        resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusCode")
+    | name == BC.pack "H.statusMessage" =
+        resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusMessage")
 resolveFallback mOwner name = do
     -- Builtins override the source-discovery path: an entry like
     -- @"Control.Exception.toException"@ in the base env (added by
@@ -8274,45 +8282,49 @@ resolveImport' registry searchPath includeMap lm name = do
                     case mTargetLm of
                         Nothing       -> tryImports rest
                         Just targetLm -> do
-                            tgtBodies <- readIORef (lmBodies targetLm)
-                            let ffiKey = ffiSynthKey (lmName targetLm) name
-                                isFfi  = case Map.lookup name tgtBodies of
-                                            Just (EVar k) -> k == ffiKey
-                                            _             -> False
-                            if isFfi && exportsName targetLm name
-                              then do
-                                -- FFI: discover eagerly so the FFI
-                                -- sentinel is in lmBodies for eval.
-                                discoverInModule registry searchPath includeMap targetLm name
-                                pure (Just (lmName targetLm))
-                              else do
-                                mLhs <- findOrResolveLhs (lmSource targetLm)
-                                                         (lmKnown targetLm) name
-                                case mLhs of
-                                    Just _ ->
-                                        if exportsName targetLm name
-                                            then do
-                                                -- Don't discover the target's body
-                                                -- eagerly — just return the module
-                                                -- name.  The caller stores an alias
-                                                -- (EVar "Mod.name") and the evaluator
-                                                -- discovers the body on demand via
-                                                -- the env-fallback / thunkByKey path.
-                                                pure (Just (lmName targetLm))
-                                            else tryImports rest
-                                    Nothing -> do
-                                        isClassMethod <- exportsClassMethod targetLm name
-                                        if isClassMethod
-                                            then pure (Just (lmName targetLm))
-                                            -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
-                                            -- the type's data registry has the field, the export
-                                            -- list admits it via `T(..)`. No separate binding; the
-                                            -- later-built fieldEnv will synthesize it.
-                                            else if Map.member name (lmFieldReg targetLm)
-                                                 && exportsName targetLm name
-                                                then pure (Just (lmName targetLm))
-                                                -- The name isn't defined locally in targetLm.
-                                                else continueMissing targetLm rest
+                            allowed <- specAllowsLoaded targetLm (impSpec imp) name
+                            if not allowed
+                                then tryImports rest
+                                else do
+                                    tgtBodies <- readIORef (lmBodies targetLm)
+                                    let ffiKey = ffiSynthKey (lmName targetLm) name
+                                        isFfi  = case Map.lookup name tgtBodies of
+                                                    Just (EVar k) -> k == ffiKey
+                                                    _             -> False
+                                    if isFfi && exportsName targetLm name
+                                      then do
+                                        -- FFI: discover eagerly so the FFI
+                                        -- sentinel is in lmBodies for eval.
+                                        discoverInModule registry searchPath includeMap targetLm name
+                                        pure (Just (lmName targetLm))
+                                      else do
+                                        mLhs <- findOrResolveLhs (lmSource targetLm)
+                                                                 (lmKnown targetLm) name
+                                        case mLhs of
+                                            Just _ ->
+                                                if exportsName targetLm name
+                                                    then do
+                                                        -- Don't discover the target's body
+                                                        -- eagerly — just return the module
+                                                        -- name.  The caller stores an alias
+                                                        -- (EVar "Mod.name") and the evaluator
+                                                        -- discovers the body on demand via
+                                                        -- the env-fallback / thunkByKey path.
+                                                        pure (Just (lmName targetLm))
+                                                    else tryImports rest
+                                            Nothing -> do
+                                                isClassMethod <- exportsClassMethod targetLm name
+                                                if isClassMethod
+                                                    then pure (Just (lmName targetLm))
+                                                    -- Record-field accessor (e.g. `runIdentity` of `Identity(..)`):
+                                                    -- the type's data registry has the field, the export
+                                                    -- list admits it via `T(..)`. No separate binding; the
+                                                    -- later-built fieldEnv will synthesize it.
+                                                    else if Map.member name (lmFieldReg targetLm)
+                                                         && exportsName targetLm name
+                                                        then pure (Just (lmName targetLm))
+                                                        -- The name isn't defined locally in targetLm.
+                                                        else continueMissing targetLm rest
 
     continueMissing targetLm rest
         | exportsMissingName targetLm name = followNamedReexport targetLm rest
@@ -8415,60 +8427,70 @@ resolveImport' registry searchPath includeMap lm name = do
                         && not (isAllowedTargetedGhc (impModule imp))
         case Map.lookup (impModule imp) reg of
             Just (Loaded srcLm) -> do
-                mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
-                case mLhs of
-                    Just _ ->
-                        if exportsName srcLm name
-                            then do
-                                discoverInModule registry searchPath includeMap srcLm name
-                                pure (Just (lmName srcLm))
-                            else tryViaImports moreImps depth rest
-                    Nothing -> do
-                        -- The provider may export a class method through
-                        -- Class(..) rather than a top-level binding.
-                        exportsMethod <- exportsClassMethod srcLm name
-                        if exportsMethod
-                            then pure (Just (lmName srcLm))
-                            -- srcLm might itself re-export via unqualified imports
-                            -- (go one level deeper, decrementing the depth cap).
-                            else if exportsMissingName srcLm name
-                                then followNamedReexportD (depth - 1) srcLm rest >>= \case
-                                        Just m  -> pure (Just m)
-                                        Nothing -> tryViaImports moreImps depth rest
-                                else tryViaImports moreImps depth rest
+                allowed <- specAllowsLoaded srcLm (impSpec imp) name
+                if not allowed
+                    then tryViaImports moreImps depth rest
+                    else do
+                        mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
+                        case mLhs of
+                            Just _ ->
+                                if exportsName srcLm name
+                                    then do
+                                        discoverInModule registry searchPath includeMap srcLm name
+                                        pure (Just (lmName srcLm))
+                                    else tryViaImports moreImps depth rest
+                            Nothing -> do
+                                -- The provider may export a class method through
+                                -- Class(..) rather than a top-level binding.
+                                exportsMethod <- exportsClassMethod srcLm name
+                                if exportsMethod
+                                    then pure (Just (lmName srcLm))
+                                    -- srcLm might itself re-export via unqualified imports
+                                    -- (go one level deeper, decrementing the depth cap).
+                                    else if exportsMissingName srcLm name
+                                        then followNamedReexportD (depth - 1) srcLm rest >>= \case
+                                                Just m  -> pure (Just m)
+                                                Nothing -> tryViaImports moreImps depth rest
+                                        else tryViaImports moreImps depth rest
             _ ->
                 -- Module not yet loaded.
                 if isBlockedGhc
                     then tryViaImports moreImps depth rest
                     else do
-                    r <- try (loadModule registry searchPath includeMap (impModule imp))
-                                :: IO (Either SomeException LoadedModule)
-                    case r of
-                        Left  _     -> tryViaImports moreImps depth rest
-                        Right srcLm -> do
-                            mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
-                            case mLhs of
-                                Just _ ->
-                                    if exportsName srcLm name
-                                        then do
-                                            discoverInModule registry searchPath includeMap srcLm name
-                                            pure (Just (lmName srcLm))
-                                        else do
-                                            modifyIORef' registry (Map.delete (impModule imp))
-                                            tryViaImports moreImps depth rest
-                                Nothing -> do
-                                    exportsMethod <- exportsClassMethod srcLm name
-                                    if exportsMethod
-                                        then pure (Just (lmName srcLm))
-                                        else if exportsMissingName srcLm name && depth > 1
-                                            then followNamedReexportD (depth - 1) srcLm rest >>= \case
-                                                    Just m  -> pure (Just m)
-                                                    Nothing -> do
+                        r <- try (loadModule registry searchPath includeMap (impModule imp))
+                                    :: IO (Either SomeException LoadedModule)
+                        case r of
+                            Left  _     -> tryViaImports moreImps depth rest
+                            Right srcLm -> do
+                                allowed <- specAllowsLoaded srcLm (impSpec imp) name
+                                if not allowed
+                                    then do
+                                        modifyIORef' registry (Map.delete (impModule imp))
+                                        tryViaImports moreImps depth rest
+                                    else do
+                                        mLhs  <- findOrResolveLhs (lmSource srcLm) (lmKnown srcLm) name
+                                        case mLhs of
+                                            Just _ ->
+                                                if exportsName srcLm name
+                                                    then do
+                                                        discoverInModule registry searchPath includeMap srcLm name
+                                                        pure (Just (lmName srcLm))
+                                                    else do
                                                         modifyIORef' registry (Map.delete (impModule imp))
                                                         tryViaImports moreImps depth rest
-                                            else do
-                                                modifyIORef' registry (Map.delete (impModule imp))
-                                                tryViaImports moreImps depth rest
+                                            Nothing -> do
+                                                exportsMethod <- exportsClassMethod srcLm name
+                                                if exportsMethod
+                                                    then pure (Just (lmName srcLm))
+                                                    else if exportsMissingName srcLm name && depth > 1
+                                                        then followNamedReexportD (depth - 1) srcLm rest >>= \case
+                                                                Just m  -> pure (Just m)
+                                                                Nothing -> do
+                                                                    modifyIORef' registry (Map.delete (impModule imp))
+                                                                    tryViaImports moreImps depth rest
+                                                        else do
+                                                            modifyIORef' registry (Map.delete (impModule imp))
+                                                            tryViaImports moreImps depth rest
 
     -- | Chase every `module Foo` entry in the export list of @via@ to
     -- see whether any of them provides @name@.  We recurse through

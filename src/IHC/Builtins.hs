@@ -47,7 +47,7 @@ import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (chr, ord)
+import Data.Char (chr, ord, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
@@ -6689,6 +6689,12 @@ buildFieldEnv reg = do
         | any ((BC.pack "StaticString" ==) . fst) clauses
         , fieldName == BC.pack "getString"
         = Just (pure (charListAppender listVal))
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "original"
+        = Just (pure listVal)
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "foldedCase"
+        = Just (VStr . BC.pack . map toLower <$> valToString listVal)
         | otherwise = Nothing
 
     -- @(listVal ++)@: a 'VFun' that, given another list, returns

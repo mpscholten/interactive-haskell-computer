@@ -2098,23 +2098,48 @@ parseLet ctx cur0 = do
             TkIn -> pure ()
             _    -> parseErr ctx "expected `in` in let-binding" inTok
         (body0, curBody) <- parseExpr ctx curIn
-        -- Desugar all items: normal bindings accumulate into ELet,
-        -- pattern bindings get a fresh temp name + body wrapped in ECase.
+        -- Desugar all items into one recursive let group. Pattern-bound
+        -- variables must be in scope for sibling bindings too, e.g.
+        --   let (a, b) = rhs
+        --       c = b
+        --   in c
+        -- so expose each variable as its own lazy projection binding instead
+        -- of wrapping only the final body in a case.
         let (normalBinds, body1) = foldl desugarItem ([], body0) (reverse items)
         pure (if null normalBinds then body1 else ELet normalBinds body1, curBody)
       where
         desugarItem (normalAcc, bodyAcc) (Left (n, e)) =
             ((n, e) : normalAcc, bodyAcc)
         desugarItem (normalAcc, bodyAcc) (Right (pat, rhsE)) =
-            -- let (a, b) = rhs in body
-            -- desugars to: let $patN = rhs in case $patN of { pat -> body; _ -> error }
+            -- let (a, b) = rhs
+            -- desugars to:
+            --   let $patN = rhs
+            --       a = case $patN of { (a, _) -> a; _ -> error }
+            --       b = case $patN of { (_, b) -> b; _ -> error }
             let tmpName = BC.pack ("$pat" ++ show (length normalAcc))
-                newBody = ECase (EVar tmpName)
-                            [ Alt pat bodyAcc
-                            , Alt PWild (EApp (EVar "error")
-                                          (stringToConsList "Non-exhaustive pattern in let"))
-                            ]
-            in ((tmpName, rhsE) : normalAcc, newBody)
+                vars = letPatVars pat
+                perVarBind v =
+                    ( v
+                    , ECase (EVar tmpName)
+                        [ Alt pat (EVar v)
+                        , Alt PWild (EApp (EVar "error")
+                                      (stringToConsList
+                                        "Non-exhaustive pattern in let"))
+                        ]
+                    )
+            in ((tmpName, rhsE) : map perVarBind vars ++ normalAcc, bodyAcc)
+
+        letPatVars (PVar n)        = [n]
+        letPatVars (PAs n p)       = n : letPatVars p
+        letPatVars (PBang p)       = letPatVars p
+        letPatVars (PIrref p)      = letPatVars p
+        letPatVars (PTuple ps)     = concatMap letPatVars ps
+        letPatVars (PCon _ ps)     = concatMap letPatVars ps
+        letPatVars (PRecord _ fps) = concatMap (letPatVars . snd) fps
+        letPatVars (PRecordWild _) = []
+        letPatVars (PView _ p)     = letPatVars p
+        letPatVars PWild           = []
+        letPatVars (PLit _)        = []
 
     finishLet binds curEnd = do
         let (inTok, curIn) = nextSig ctx curEnd
