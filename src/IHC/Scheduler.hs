@@ -80,7 +80,7 @@ import IHC.CabalProject
     ( cachedPackageSearchPathWithIncludes
     , cachedPackageTable, pkgExtraLibs
     )
-import IHC.Diagnostics (warnStub, memDebugEnabled, memDebugEvery)
+import IHC.Diagnostics (warnStub, traceEnabled, traceLine, memDebugEnabled, memDebugEvery)
 import IHC.MemDebug (dumpMemStats)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
@@ -2608,12 +2608,13 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
         existing <- lookupInstance classReg (BC.pack "Bounded") tyName
         case existing of
             Just _  -> pure ()
-            Nothing -> do
+            Nothing | Just (firstCtor, lastCtor) <- firstLast ctors -> do
                 let methods = HashMap.fromList
-                        [ (BC.pack "minBound", VCon (head ctors) [])
-                        , (BC.pack "maxBound", VCon (last ctors) [])
+                        [ (BC.pack "minBound", VCon firstCtor [])
+                        , (BC.pack "maxBound", VCon lastCtor [])
                         ]
                 registerUnderTypeAndCtors (BC.pack "Bounded") tyName ctors methods
+            Nothing -> pure ()
 
     registerEnum tyName ctors = do
         existing <- lookupInstance classReg (BC.pack "Enum") tyName
@@ -2642,6 +2643,12 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                 , arity == 0
                 ]
         in map snd (sortOn fst annotated)
+
+    firstLast [] = Nothing
+    firstLast (x:xs) = Just (x, go x xs)
+      where
+        go current []     = current
+        go _       (y:ys) = go y ys
 
     derivedFromEnum ctorIndex = VFun $ \xT -> do
         xv <- force legacyHooks xT
@@ -2747,21 +2754,28 @@ registerOneEnum classReg (tyName, ctors) = do
 
 registerOneBounded :: ClassRegistry -> (ByteString, [ByteString]) -> IO ()
 registerOneBounded classReg (tyName, ctors) = do
-    let boundedCls = BC.pack "Bounded"
-        firstCtor  = head ctors
-        lastCtor   = last ctors
-        minBoundV  = VCon firstCtor []
-        maxBoundV  = VCon lastCtor  []
-        methods    = HashMap.fromList
-                        [ (BC.pack "minBound", minBoundV)
-                        , (BC.pack "maxBound", maxBoundV)
-                        ]
-    existing <- lookupInstance classReg boundedCls tyName
-    case existing of
-        Just _  -> pure ()
-        Nothing -> do
-            registerInstance classReg boundedCls tyName methods
-            mapM_ (\c -> registerInstance classReg boundedCls c methods) ctors
+    case firstLastCtor ctors of
+        Nothing -> pure ()
+        Just (firstCtor, lastCtor) -> do
+            let boundedCls = BC.pack "Bounded"
+                minBoundV  = VCon firstCtor []
+                maxBoundV  = VCon lastCtor  []
+                methods    = HashMap.fromList
+                                [ (BC.pack "minBound", minBoundV)
+                                , (BC.pack "maxBound", maxBoundV)
+                                ]
+            existing <- lookupInstance classReg boundedCls tyName
+            case existing of
+                Just _  -> pure ()
+                Nothing -> do
+                    registerInstance classReg boundedCls tyName methods
+                    mapM_ (\c -> registerInstance classReg boundedCls c methods) ctors
+  where
+    firstLastCtor [] = Nothing
+    firstLastCtor (x:xs) = Just (x, go x xs)
+      where
+        go current []     = current
+        go _       (y:ys) = go y ys
 
 -- | Build the @fromEnum@ Val for a derived-Enum sum type.
 -- @fromEnum v@ forces @v@ to a 'VCon', locates its constructor name in
@@ -2777,6 +2791,7 @@ synthFromEnumForCtors ctors = VFun $ \t -> do
         _ -> error ("derived fromEnum: expected constructor, got "
                     <> shortShow v)
   where
+    indexOf :: ByteString -> [ByteString] -> Int -> Maybe Int
     indexOf _ []       _ = Nothing
     indexOf x (c : cs) i
         | x == c    = Just i
@@ -7669,12 +7684,13 @@ discoverInModuleWith
     -> ByteString
     -> IO ()
 discoverInModuleWith builtins registry searchPath includeMap lm name = do
-    -- INSTRUMENTATION: total discover-call counter.  Logs every 1000.
+    -- Instrumentation: total discover-call counter.  The periodic heartbeat
+    -- is trace-gated; only the runaway cap remains unconditionally visible.
     modifyIORef' _discoverTotalRef (+1)
     cntT <- readIORef _discoverTotalRef
-    when (cntT `mod` 1000 == 0) $ do
-        System.IO.hPutStrLn System.IO.stderr
-            ("[ihc:discover] total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
+    when (traceEnabled && cntT `mod` 1000 == 0) $
+        traceLine
+            ("discover total=" <> show cntT <> " latest=" <> BC.unpack (lmName lm) <> "::" <> BC.unpack name)
 
     -- Safety net: if the counter blows past a generous cap, abort
     -- fast with a useful trace.  The expected workload across the full
