@@ -501,6 +501,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "GET\nDELETE\n"
 
+    it "module: ambiguous bare `map` (NonEmpty in scope) must not derail sig-directed bounds resolution" do
+        -- Regression: importing Data.List.NonEmpty makes bare `map` ambiguous in
+        -- the flat sig table; the elaborator must decline to guess (treat it as
+        -- opaque) so the methodArray bounds still resolve to M instead of
+        -- defaulting to Int (`Ix Int.index`). See globalAmbiguousSigsRef.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/ambiguous_map_sig/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "GET\nDELETE\n"
+
     it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do
         -- Regression for the warp hello-world startup crash: loading
         -- 'GHC.Event.KQueue' (Darwin's event backend, whose 'Event' record

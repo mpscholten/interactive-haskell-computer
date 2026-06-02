@@ -34,7 +34,7 @@ import IHC.AST
 import IHC.Classes (ClassRegistry)
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
-import IHC.TypeGlobals (globalClassMethodNamesRef)
+import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import IHC.TypeUnify
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
@@ -268,9 +268,18 @@ elaborateVar ienv name =
   where
     -- Try the name as written, then its bare last component, so FQNs from a
     -- non-entry module's import-rewritten RHS still find the bare-keyed sig.
-    lookupSig = case Map.lookup name (ieSigs ienv) of
-        Just s  -> Just s
-        Nothing -> Map.lookup (bareName name) (ieSigs ienv)
+    -- BUT decline if the bare name is AMBIGUOUS (conflicting sigs across
+    -- loaded modules, e.g. @map@ once @Data.List.NonEmpty@ is in scope): the
+    -- flat table holds only the last-writer's scheme, so using it would unify
+    -- against the wrong shape (@NonEmpty a@ vs @[]@) and abort the whole
+    -- rewrite.  Treating it as opaque (Nothing → fresh tyvar) is safe — a
+    -- non-class-method like @map@ doesn't need a sig for the surrounding
+    -- signature-directed resolution to succeed.
+    lookupSig
+        | isAmbiguousSig (bareName name) = Nothing
+        | otherwise = case Map.lookup name (ieSigs ienv) of
+            Just s  -> Just s
+            Nothing -> Map.lookup (bareName name) (ieSigs ienv)
 
 -- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
 bareName :: Name -> Name
@@ -302,6 +311,14 @@ classMethodHint methodName preds body = case preds of
 isActualClassMethod :: Name -> Bool
 isActualClassMethod name =
     name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)
+
+-- | Does this bare name have CONFLICTING signatures across the loaded modules
+-- (so the flat 'globalTypeSigsRef' entry is whichever module loaded last)?
+-- See 'IHC.Scheduler.mirrorTypeSigsGlobal' / 'globalAmbiguousSigsRef'.  Same
+-- 'unsafePerformIO' justification as 'isActualClassMethod'.
+isAmbiguousSig :: Name -> Bool
+isAmbiguousSig name =
+    name `Set.member` unsafePerformIO (readIORef globalAmbiguousSigsRef)
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)

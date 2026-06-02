@@ -117,7 +117,7 @@ import qualified IHC.PatSyn as PatSyn
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -5648,8 +5648,7 @@ loadModuleSlow registry searchPath includeMap name = do
                                       -- 'registerGlobalLoadedModule' is the
                                       -- usual mirror site, but we don't
                                       -- call it on cache hits.
-                                      modifyIORef' globalTypeSigsRef
-                                          (Map.union (lmTypeSigs fresh))
+                                      mirrorTypeSigsGlobal (lmTypeSigs fresh)
                                       modifyIORef' globalTypeSynonymsRef
                                           (Map.union (lmTypeSynonyms fresh))
                                       -- Catalogue instances against this
@@ -5872,6 +5871,7 @@ resetPerRunGlobals = do
     writeIORef envFallbackCacheGenRef 0
     writeIORef envBaseForFallbackRef  HashMap.empty
     writeIORef globalTypeSigsRef      Map.empty
+    writeIORef globalAmbiguousSigsRef Set.empty
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
     writeIORef globalMethodClassRef   Map.empty
@@ -5939,6 +5939,25 @@ resetPerRunGlobals = do
     -- captured against the previous registry.
     resetExportedFieldRegistryMemo
 
+-- | Mirror a module's top-level signatures into the flat global table
+-- ('globalTypeSigsRef'), recording any bare name whose new scheme CONFLICTS
+-- with one already present into 'globalAmbiguousSigsRef'.  The flat table is
+-- bare-keyed last-writer-wins; without conflict tracking a name defined with
+-- different signatures in two modules (e.g. @map@ in @GHC.List@ vs
+-- @Data.List.NonEmpty@) silently resolves to whichever loaded last, which
+-- makes the elaborator unify against the wrong shape.  The elaborator declines
+-- to use a sig for an ambiguous name (see 'IHC.Elaborate.elaborateVar').
+mirrorTypeSigsGlobal :: Map ByteString Scheme -> IO ()
+mirrorTypeSigsGlobal new = do
+    old <- readIORef globalTypeSigsRef
+    let conflicts = Map.keysSet
+            (Map.filterWithKey
+                (\k v -> maybe False (/= v) (Map.lookup k old))
+                new)
+    when (not (Set.null conflicts)) $
+        modifyIORef' globalAmbiguousSigsRef (Set.union conflicts)
+    modifyIORef' globalTypeSigsRef (Map.union new)
+
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
@@ -5946,10 +5965,10 @@ registerGlobalLoadedModule lm = do
     -- might now resolve via this module.
     bumpEnvFallbackGen
     -- Mirror per-module type sigs + synonyms into the flat global
-    -- registries used by 'IHC.Elaborate'.  Last-writer-wins for name
-    -- collisions across modules (rare in practice — sigs are
-    -- module-scoped in source).
-    modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
+    -- registries used by 'IHC.Elaborate'.  Conflicting bare names are
+    -- recorded as ambiguous (see 'mirrorTypeSigsGlobal') so the
+    -- elaborator won't guess the wrong one.
+    mirrorTypeSigsGlobal (lmTypeSigs lm)
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
     -- Mirror per-module class declarations into the global
     -- method->class registry so the env-fallback's
