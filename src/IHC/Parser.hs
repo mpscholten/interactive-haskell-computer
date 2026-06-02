@@ -131,6 +131,34 @@ defaultFixityTable = Map.fromList
     , ("!",   (AssocL, 9))
     , (".",   (AssocR, 9))
     , ("!!",  (AssocL, 9))
+    -- GHC.Prim unboxed operators.  GHC.Prim has no .hs source, so its
+    -- primop fixities are never scanned from a module — they must be
+    -- seeded here, or mixed expressions mis-parse at the default
+    -- (AssocL, 9).  Concretely: GHC.Arr.listArray's fill loop tests
+    -- @i# ==# n# -# 1#@; without these, @==#@ and @-#@ share precedence 9
+    -- and it parses as @(i# ==# n#) -# 1#@ → @isTrue#@ of a nonzero diff →
+    -- the loop stops after the first element, dropping the array's last
+    -- entry.  Fixities match GHC's primops.txt.pp.
+    , ("+#",   (AssocL, 6))
+    , ("-#",   (AssocL, 6))
+    , ("*#",   (AssocL, 7))
+    , ("==#",  (AssocN, 4))
+    , ("/=#",  (AssocN, 4))
+    , ("<#",   (AssocN, 4))
+    , ("<=#",  (AssocN, 4))
+    , (">#",   (AssocN, 4))
+    , (">=#",  (AssocN, 4))
+    , ("+##",  (AssocL, 6))
+    , ("-##",  (AssocL, 6))
+    , ("*##",  (AssocL, 7))
+    , ("/##",  (AssocL, 7))
+    , ("**##", (AssocR, 8))
+    , ("==##", (AssocN, 4))
+    , ("/=##", (AssocN, 4))
+    , ("<##",  (AssocN, 4))
+    , ("<=##", (AssocN, 4))
+    , (">##",  (AssocN, 4))
+    , (">=##", (AssocN, 4))
     ]
 
 lookupFixity :: FixityTable -> Name -> (Assoc, Int)
