@@ -500,7 +500,7 @@ loadProgramFromSource searchPath src0 = do
     -- Bare field-selector accessors are gated on EXPORT visibility so an
     -- un-exported field (e.g. GHC.Event.KQueue's internal 'filter') can't
     -- shadow a Prelude function of the same name. See 'exportedPublicFields'.
-    publicFields <- exportedPublicFields registry fullSearchPath includeMap loadedModules
+    let publicFields = exportedPublicFields loadedModules
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
     builtins <- builtinEnv classReg
@@ -4880,18 +4880,30 @@ partitionFieldRegistries lms =
 -- @module M@ re-exports). The full union is still used elsewhere for
 -- record-dot desugaring and qualified accessors — only the bare names are
 -- export-gated. @NoFieldSelectors@ modules contribute nothing, as before.
-exportedPublicFields
-    :: ModuleRegistry
-    -> [FilePath]
-    -> Map FilePath [FilePath]
-    -> [LoadedModule]
-    -> IO FieldRegistry
-exportedPublicFields registry searchPath includeMap lms =
-    unionFieldRegistries <$> mapM perModule lms
+--
+-- PURE and cheap on purpose. An earlier IO version called
+-- 'exportedFieldRegistry' (which chases @module M@ / imported-name re-exports
+-- via 'loadModule'); run per name-resolution in the hot fallback paths
+-- ('tryGlobalFieldSlot' / 'buildSlotFromOwner') those repeated loads blew the
+-- test suite up from ~7 min to a 6 h CI timeout. We therefore consult only each
+-- module's OWN export list (already parsed in 'lmHeader'). That's sufficient for
+-- gating bare accessors: a field re-exported by a gateway module is also
+-- exported by its DEFINING module, which is itself in @lms@ and contributes the
+-- field to this union.
+exportedPublicFields :: [LoadedModule] -> FieldRegistry
+exportedPublicFields lms =
+    unionFieldRegistries
+        [ exportedFieldRegistryOwn lm | lm <- lms, not (lmNoFieldSelectors lm) ]
+
+-- | Fields a module exports per its OWN export list (no re-export-chain walk).
+exportedFieldRegistryOwn :: LoadedModule -> FieldRegistry
+exportedFieldRegistryOwn lm = case mhExports (lmHeader lm) of
+    ExportAll        -> lmFieldReg lm
+    ExportList items -> unionFieldRegistries (map exportItem items)
   where
-    perModule lm
-        | lmNoFieldSelectors lm = pure Map.empty
-        | otherwise = exportedFieldRegistry registry searchPath includeMap lm []
+    exportItem (ExportName n)        = fieldByName (lmFieldReg lm) (visibleExportName n)
+    exportItem (ExportType ty mbSubs) = typeFieldRegistry lm ty mbSubs
+    exportItem (ExportModule _)      = Map.empty
 
 -- | Build the combined field-accessor env: every field is bound under
 -- its 'fieldProjName' prefix (for record-dot), and fields from modules
@@ -6732,8 +6744,8 @@ resolveFallbackSource mOwner name = do
                 -- union the owner's full field registry back in — that keeps
                 -- same-module field access (eventFilter = filter e) working
                 -- while still gating cross-module leakage.
-                exportedPF <- exportedPublicFields transientReg searchPath includeMap (Map.elems mods)
-                let publicFields = unionFieldRegistries [exportedPF, lmFieldReg owner]
+                let publicFields = unionFieldRegistries
+                                       [exportedPublicFields (Map.elems mods), lmFieldReg owner]
                 fieldEnvAll <- buildFieldAccessorEnv
                                     (Map.elems mods) publicFields unionedFields
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
@@ -7050,19 +7062,16 @@ resolveFallbackSource mOwner name = do
                     _ -> pure (Just slot)
 
     tryGlobalFieldSlot mods bareName = do
-        searchPath <- readIORef globalSearchPathRef
-        includeMap <- readIORef globalIncludeMapRef
-        transientReg <- newIORef (Map.map Loaded mods)
         let loaded = Map.elems mods
             (_unexportedPublicFields, unionedFields) = partitionFieldRegistries loaded
-        -- Gate bare accessors on EXPORT visibility (see 'exportedPublicFields').
-        -- An un-exported field selector (e.g. GHC.Event.KQueue's internal
-        -- 'filter') must not resolve here and shadow a Prelude function of the
-        -- same name. A module's OWN field selectors are served by its
-        -- owner-scoped closure ('buildSlotFromOwner' unions the owner's field
-        -- registry back in), so this cross-module gate leaves same-module field
-        -- access intact.
-        publicFields <- exportedPublicFields transientReg searchPath includeMap loaded
+            -- Gate bare accessors on EXPORT visibility (see 'exportedPublicFields').
+            -- An un-exported field selector (e.g. GHC.Event.KQueue's internal
+            -- 'filter') must not resolve here and shadow a Prelude function of the
+            -- same name. A module's OWN field selectors are served by its
+            -- owner-scoped closure ('buildSlotFromOwner' unions the owner's field
+            -- registry back in), so this cross-module gate leaves same-module field
+            -- access intact.
+            publicFields = exportedPublicFields loaded
         fieldEnvAll <- buildFieldAccessorEnv loaded publicFields unionedFields
         pure (HashMap.lookup bareName fieldEnvAll)
 
