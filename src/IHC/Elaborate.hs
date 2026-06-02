@@ -231,15 +231,28 @@ elaborateVar ienv name =
         Just sch -> do
             (preds, ty) <- instantiate (ieFresh ienv) sch
             pure (EVar name, ty, preds, emptySubst)
-        Nothing -> case Map.lookup name (ieSigs ienv) of
+        Nothing -> case lookupSig of
             Just sch -> do
                 (preds, ty) <- instantiate (ieFresh ienv) sch
-                case classMethodHint name preds ty of
+                -- Use the BARE (unqualified) name for class-method detection
+                -- and the emitted node.  In a non-entry module the binding's
+                -- RHS has had its free vars import-rewritten to FQNs (e.g.
+                -- @GHC.Enum.minBound@, @Data.Array.Base.listArray@), but the
+                -- sig table and 'globalClassMethodNamesRef' are bare-keyed, and
+                -- an 'ETypedMethod's method is looked up by bare name at eval
+                -- time.  Without this, signature-directed elaboration fired
+                -- only for the entry module (where names stay bare) — e.g.
+                -- http-types' @methodArray@ resolved its @(minBound,maxBound)@
+                -- bounds in a single-file repro but defaulted to Int when
+                -- imported (the warp request path), surfacing as
+                -- @Ix Int.index: non-Int index@.
+                let bare = bareName name
+                case classMethodHint bare preds ty of
                     Just (cls, paramVar) ->
-                        -- Emit ETypedMethod with placeholder tag.
-                        -- The tag is the fresh tyvar's name;
+                        -- Emit ETypedMethod with placeholder tag (bare method
+                        -- name).  The tag is the fresh tyvar's name;
                         -- 'applyMethodSubst' resolves it later.
-                        pure ( ETypedMethod cls name paramVar
+                        pure ( ETypedMethod cls bare paramVar
                              , ty
                              , preds
                              , emptySubst
@@ -252,6 +265,18 @@ elaborateVar ienv name =
                 -- doesn't participate in class dispatch.
                 do fresh <- TyVar <$> freshVar (ieFresh ienv)
                    pure (EVar name, fresh, [], emptySubst)
+  where
+    -- Try the name as written, then its bare last component, so FQNs from a
+    -- non-entry module's import-rewritten RHS still find the bare-keyed sig.
+    lookupSig = case Map.lookup name (ieSigs ienv) of
+        Just s  -> Just s
+        Nothing -> Map.lookup (bareName name) (ieSigs ienv)
+
+-- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
+bareName :: Name -> Name
+bareName n = case BC.elemIndexEnd '.' n of
+    Just i | i + 1 < BC.length n -> BC.drop (i + 1) n
+    _ -> n
 
 -- | If the signature has a single-parameter class constraint whose
 -- argument is a plain type variable that also appears in the body

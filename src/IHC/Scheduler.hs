@@ -3970,57 +3970,69 @@ exportBodies registry searchPath includeMap builtinNames lm = do
         -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
         -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
         [ ( keyPrefix <> n
-          , preserveNullaryClassResultType n
+          , wrapNullaryResultSig lm n
                 (maybe (transform e) EVar (specialSelfAliasTarget lm n e))
           )
         | (n, e) <- Map.toList bs
         , not (isSelfAliasIn lm n e) || isJust (specialSelfAliasTarget lm n e)
         ]
-  where
-    preserveNullaryClassResultType n e =
-        case e of
-            -- RHS is literally a bare nullary class method
-            -- (@x :: T; x = minBound@): annotate with the result-type tag.
-            EVar v
-                | isNullaryClassMethodName (lastNameComponent v)
-                , Just sig <- Map.lookup n (lmTypeSigs lm)
-                , Just tag <- schemeResultTag sig
-                -> ETyApp e tag
-            -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary
-            -- class method nested inside an application/tuple — e.g.
-            -- @methodArray :: Array StdMethod Method;
-            --  methodArray = listArray (minBound, maxBound) …@.  Wrap the
-            -- whole RHS in the binding's full result type so the eval-time
-            -- elaborator (ETyApp → tryElaborateTyAnn) can drive the nested
-            -- minBound/maxBound to the right Bounded instance instead of
-            -- the Int default.  Guarded (arity-0 + actually mentions a
-            -- nullary method) so only the rare binding pays the lazy,
-            -- once-per-thunk elaboration; the elaborator self-validates
-            -- ('allTypedMethodsResolvable') and falls back to @e@ on a miss.
-            _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
-              , ([], resultTy) <- tyArrowArgs body
-              , any (isNullaryClassMethodName . lastNameComponent) (freeVars e)
-              , Just tyBytes <- renderTypeForAnnotation resultTy
-              -> ETyApp e tyBytes
-            _ -> e
 
-    isNullaryClassMethodName n =
-        n == BC.pack "maxBound"
-     || n == BC.pack "minBound"
-     || n == BC.pack "mempty"
+-- | If a binding is an arity-0 CAF whose signature is known and whose RHS
+-- mentions a nullary class method (@minBound@/@maxBound@/@mempty@) — directly,
+-- or nested inside an application/tuple — wrap the RHS in
+-- @ETyApp ... <result type>@ so the eval-time elaborator
+-- ('IHC.Eval.tryElaborateTyAnn') can drive those methods to the right instance
+-- instead of the Int default.  The elaborator self-validates
+-- ('allTypedMethodsResolvable') and falls back to the original RHS on a miss,
+-- so this is strictly additive.
+--
+-- Applied on BOTH the eager export path ('exportBodies') and the lazy
+-- same-module fallback ('buildSlotFromOwner').  A same-module reference — e.g.
+-- @renderStdMethod m = methodArray ! m@ inside http-types — resolves
+-- @methodArray@ through the latter, so wrapping only in 'exportBodies' left the
+-- imported methodArray with Int bounds (@Ix Int.index: non-Int index@ on the
+-- warp request path) even though the single-file repro worked.
+wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
+wrapNullaryResultSig lm n e =
+    case e of
+        -- RHS is literally a bare nullary class method
+        -- (@x :: T; x = minBound@): annotate with the result-type tag.
+        EVar v
+            | isNullaryClassMethodName (lastNameComponent v)
+            , Just sig <- Map.lookup n (lmTypeSigs lm)
+            , Just tag <- schemeResultTag sig
+            -> ETyApp e tag
+        -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary class
+        -- method nested inside an application/tuple — e.g.
+        -- @methodArray :: Array StdMethod Method;
+        --  methodArray = listArray (minBound, maxBound) …@.  Wrap the whole
+        -- RHS in the binding's full result type.  Guarded (arity-0 + actually
+        -- mentions a nullary method) so only the rare binding pays the lazy,
+        -- once-per-thunk elaboration.
+        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+          , ([], resultTy) <- tyArrowArgs body
+          , any (isNullaryClassMethodName . lastNameComponent) (freeVars e)
+          , Just tyBytes <- renderTypeForAnnotation resultTy
+          -> ETyApp e tyBytes
+        _ -> e
+  where
+    isNullaryClassMethodName nm =
+        nm == BC.pack "maxBound"
+     || nm == BC.pack "minBound"
+     || nm == BC.pack "mempty"
 
     schemeResultTag (Scheme _ _ body) =
         let (_, resultTy) = tyArrowArgs body
         in typeResultTag resultTy
 
     typeResultTag ty = case ty of
-        TyCon n -> Just (lastNameComponent n)
+        TyCon nm -> Just (lastNameComponent nm)
         -- The type scanner can represent an alias-qualified constructor
         -- like @P.Int@ as @TyApp (TyCon "P") (TyCon "Int")@.  That is a
         -- qualifier, not a real type application, so the dispatch tag is
         -- the RHS constructor.
-        TyApp (TyCon q) (TyCon n)
-            | q `Set.member` importedTypeQualifiers -> Just (lastNameComponent n)
+        TyApp (TyCon q) (TyCon nm)
+            | q `Set.member` importedTypeQualifiers -> Just (lastNameComponent nm)
         TyApp h _ -> typeResultTag h
         _ -> Nothing
 
@@ -4031,10 +4043,10 @@ exportBodies registry searchPath includeMap builtinNames lm = do
             , q <- maybe [impModule imp] (:[]) (impAlias imp)
             ]
 
-    lastNameComponent n =
-        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
-            Just idx -> BC.drop (idx + 1) n
-            Nothing  -> n
+    lastNameComponent nm =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) nm of
+            Just idx -> BC.drop (idx + 1) nm
+            Nothing  -> nm
 
 -- | Render a 'Type' back to source-level bytes that
 -- 'IHC.Elaborate.parseRawTypeExpr' can re-parse, for use as the annotation
@@ -6995,8 +7007,14 @@ resolveFallbackSource mOwner name = do
                                 , ffiEnvAll
                                 , baseEnv
                                 ]
+                -- Same signature-directed nullary-method wrap as the eager
+                -- 'exportBodies' path.  A same-module reference resolves the
+                -- binding through HERE (the lazy fallback), so without this an
+                -- imported @methodArray = listArray (minBound,maxBound) …@ keeps
+                -- Int bounds and dies with @Ix Int.index@ on the warp path.
                 writeIORef slot
-                    (Unevaluated (Closure richEnv emptyIPMap expr'))
+                    (Unevaluated (Closure richEnv emptyIPMap
+                        (wrapNullaryResultSig owner bareName expr')))
                 modifyIORef' envFallbackCache
                     (Map.insert name slot . Map.insert selfKey slot)
                 pure (Just slot)
