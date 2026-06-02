@@ -2645,6 +2645,19 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                     methods = HashMap.fromList
                         [ (BC.pack "fromEnum", derivedFromEnum ctorIndex)
                         , (BC.pack "toEnum", derivedToEnum ctors)
+                        -- The stock @enumFromTo@ default (@map toEnum [fromEnum
+                        -- x .. fromEnum y]@) needs a type hint on @toEnum@ to
+                        -- pick this instance; under deferred typing it falls to
+                        -- the Int identity and the range comes back as Ints
+                        -- (e.g. @[minBound :: StdMethod .. maxBound]@ —
+                        -- http-types' methodArray element list — yielded Ints /
+                        -- a 1-element list).  Synthesize the range methods
+                        -- directly from constructor order, exactly like GHC's
+                        -- derived Enum for an enumeration.
+                        , (BC.pack "enumFrom",       derivedEnumFrom ctorIndex ctors)
+                        , (BC.pack "enumFromTo",     derivedEnumFromTo ctorIndex ctors)
+                        , (BC.pack "enumFromThen",   derivedEnumFromThen ctorIndex ctors)
+                        , (BC.pack "enumFromThenTo", derivedEnumFromThenTo ctorIndex ctors)
                         ]
                 registerUnderTypeAndCtors (BC.pack "Enum") tyName ctors methods
 
@@ -2772,6 +2785,56 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                     error ("derived Enum.toEnum: index out of range " <> show n)
             other -> error ("derived Enum.toEnum: expected Int, got "
                           <> showValForDebug other)
+
+    -- Constructor index of an Enum value.  VInt-tolerant: an unannotated
+    -- bound that defaulted to the Int instance (e.g. the @maxBound@ in
+    -- @[minBound :: M .. maxBound]@ under deferred typing) arrives as a
+    -- 'VInt'; treat it as a raw index and let 'clampIdx' pull it into range.
+    enumIdx ctorIndex v = case v of
+        VCon ctor _ -> Map.lookup ctor ctorIndex
+        VInt nn     -> Just (fromIntegral nn)
+        _           -> Nothing
+
+    clampIdx n i = max 0 (min (n - 1) i)
+
+    derivedEnumFromTo ctorIndex ctors = VFun $ \loT -> pure $ VFun $ \hiT -> do
+        lo <- force legacyHooks loT
+        hi <- force legacyHooks hiT
+        let n   = length ctors
+            loI = maybe 0       (clampIdx n) (enumIdx ctorIndex lo)
+            hiI = maybe (n - 1) (clampIdx n) (enumIdx ctorIndex hi)
+        ixConsList [ VCon (ctors !! k) [] | k <- [loI .. hiI] ]
+
+    derivedEnumFrom ctorIndex ctors = VFun $ \loT -> do
+        lo <- force legacyHooks loT
+        let n   = length ctors
+            loI = maybe 0 (clampIdx n) (enumIdx ctorIndex lo)
+        ixConsList [ VCon (ctors !! k) [] | k <- [loI .. n - 1] ]
+
+    derivedEnumFromThenTo ctorIndex ctors =
+        VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \cT -> do
+            a <- force legacyHooks aT
+            b <- force legacyHooks bT
+            c <- force legacyHooks cT
+            let n  = length ctors
+                ai = maybe 0       (clampIdx n) (enumIdx ctorIndex a)
+                bi = maybe ai      (clampIdx n) (enumIdx ctorIndex b)
+                ci = maybe (n - 1) (clampIdx n) (enumIdx ctorIndex c)
+                idxs | ai == bi  = [ ai | ai <= ci ]   -- step 0: stop (finite)
+                     | otherwise = take n [ ai, bi .. ci ]
+            ixConsList [ VCon (ctors !! k) [] | k <- idxs ]
+
+    derivedEnumFromThen ctorIndex ctors =
+        VFun $ \aT -> pure $ VFun $ \bT -> do
+            a <- force legacyHooks aT
+            b <- force legacyHooks bT
+            let n   = length ctors
+                ai  = maybe 0  (clampIdx n) (enumIdx ctorIndex a)
+                bi  = maybe ai (clampIdx n) (enumIdx ctorIndex b)
+                end = if bi >= ai then n - 1 else 0
+                idxs | ai == bi  = [ai]
+                     | otherwise = take n [ ai, bi .. end ]
+            ixConsList [ VCon (ctors !! k) [] | k <- idxs ]
 
 shortShow :: Val -> String
 shortShow (VCon n _) = "VCon " <> BC.unpack n

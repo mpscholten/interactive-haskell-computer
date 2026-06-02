@@ -1181,6 +1181,13 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkRBracket | b == 0 && p == 0 && c == 0 -> pure cur
             TkRBrace | b == 0 && p == 0 && c == 0 -> pure cur
             TkComma | b == 0 && p == 0 && c == 0 -> pure cur
+            -- `..` ends the annotation in an arithmetic sequence like
+            -- @[minBound :: StdMethod .. maxBound]@ (http-types' methodArray);
+            -- a type annotation never contains a top-level @..@, so this only
+            -- fires on the range operator.  Without it the scanner swallows
+            -- @StdMethod .. maxBound@ as the type and the range collapses to a
+            -- 1-element list.
+            TkDotDot | b == 0 && p == 0 && c == 0 -> pure cur
             TkOf    | b == 0 && p == 0 && c == 0 -> pure cur   -- `case e :: T of …`
             TkThen  | b == 0 && p == 0 && c == 0 -> pure cur
             TkElse  | b == 0 && p == 0 && c == 0 -> pure cur
@@ -4088,8 +4095,8 @@ parseListLit ctx cur0 = do
                 let (peek, _) = nextSig ctx cur1
                 case tkKind peek of
                     TkRBracket ->
-                        -- [first ..] — infinite range, not yet supported; skip
-                        pure (buildCons [first], snd (nextSig ctx cur1))
+                        -- [first ..] — open-ended range = enumFrom first.
+                        pure (EApp (EVar "enumFrom") first, snd (nextSig ctx cur1))
                     _ -> do
                         (hi, cur3) <- parseExpr ctx cur1
                         let (close, cur4) = nextSig ctx cur3
@@ -4106,8 +4113,9 @@ parseListLit ctx cur0 = do
                         let (peek3, _) = nextSig ctx cur3
                         case tkKind peek3 of
                             TkRBracket ->
-                                -- [first, second ..] — infinite stepped range, skip
-                                pure (buildCons [first, second], snd (nextSig ctx cur3))
+                                -- [first, second ..] — open-ended stepped range = enumFromThen.
+                                pure ( EApp (EApp (EVar "enumFromThen") first) second
+                                     , snd (nextSig ctx cur3) )
                             _ -> do
                                 (hi, cur4) <- parseExpr ctx cur3
                                 let (close, cur5) = nextSig ctx cur4
