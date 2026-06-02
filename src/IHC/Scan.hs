@@ -2122,7 +2122,7 @@ data FunctorDerivDecl = FunctorDerivDecl
 
 -- | One data/newtype declaration with the classes mentioned in its deriving
 -- clause. Used for small stock-derived dictionaries whose implementation only
--- needs constructor order, e.g. nullary Enum/Bounded.
+-- needs constructor order, e.g. nullary Enum/Bounded/Ix.
 data SimpleDerivDecl = SimpleDerivDecl
     { sdTyName  :: !ByteString
     , sdClasses :: ![ByteString]
@@ -2149,7 +2149,7 @@ scanSimpleDerivingsRaw src
             Nothing -> go acc cur0
             Just tyName -> do
                 (classes, curAfter) <- findDeriving cur0
-                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded"]) classes
+                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded", "Ix"]) classes
                 if null wanted
                     then go acc curAfter
                     else go (SimpleDerivDecl tyName wanted : acc) curAfter

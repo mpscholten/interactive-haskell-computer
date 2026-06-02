@@ -118,7 +118,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -2621,6 +2621,8 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                 registerBounded tyName ctors
             when (BC.pack "Enum" `elem` classes) $
                 registerEnum tyName ctors
+            when (BC.pack "Ix" `elem` classes) $
+                registerIx tyName ctors
 
     registerBounded tyName ctors = do
         existing <- lookupInstance classReg (BC.pack "Bounded") tyName
@@ -2645,6 +2647,86 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                         , (BC.pack "toEnum", derivedToEnum ctors)
                         ]
                 registerUnderTypeAndCtors (BC.pack "Enum") tyName ctors methods
+
+    -- Derived 'Ix' for an all-nullary (enumeration) type — GHC's
+    -- stock-derivable Ix shape.  Every method reduces to constructor-order
+    -- arithmetic (the same @ctorIndex@ used for derived Enum), so there is
+    -- no source body to load: this is deriving codegen, exactly like the
+    -- Enum/Bounded synthesis above.  Keyed under the type name and each
+    -- ctor name so both annotation- and value-directed dispatch resolve.
+    --
+    -- Calling convention (see 'specialClassApplication' Ix branch + the
+    -- @Just specialVal -> pure specialVal@ dispatch arm): the method is
+    -- applied to the bounds tuple first, so 2-arg methods (@index@,
+    -- @unsafeIndex@, @inRange@) consume the bounds and return a 'VFun' of
+    -- the index; 1-arg methods (@range@, @rangeSize@, @unsafeRangeSize@)
+    -- return their result directly.  (This differs from the host @Ix Int@
+    -- shim, which has the bounds pre-applied by 'ixHostMethod'.)
+    registerIx tyName ctors = do
+        existing <- lookupInstance classReg (BC.pack "Ix") tyName
+        case existing of
+            Just _  -> pure ()
+            Nothing -> do
+                let ctorIndex = Map.fromList (zip ctors [0 :: Int ..])
+                    methods = HashMap.fromList
+                        [ (BC.pack "index",           ixIndex ctorIndex)
+                        , (BC.pack "unsafeIndex",     ixIndex ctorIndex)
+                        , (BC.pack "inRange",         ixInRange ctorIndex)
+                        , (BC.pack "range",           ixRange ctorIndex ctors)
+                        , (BC.pack "rangeSize",       ixRangeSize True ctorIndex)
+                        , (BC.pack "unsafeRangeSize", ixRangeSize False ctorIndex)
+                        ]
+                registerUnderTypeAndCtors (BC.pack "Ix") tyName ctors methods
+
+    ixCtorIdx ctorIndex v = case v of
+        VCon ctor _ -> case Map.lookup ctor ctorIndex of
+            Just i  -> i
+            Nothing -> error ("derived Ix: unknown constructor " <> BC.unpack ctor)
+        other -> error ("derived Ix: expected constructor, got " <> showValForDebug other)
+
+    ixForceBounds boundsT = do
+        bv <- force legacyHooks boundsT
+        case bv of
+            VCon name [loT, hiT] | name == BC.pack "(,)" -> do
+                lo <- force legacyHooks loT
+                hi <- force legacyHooks hiT
+                pure (lo, hi)
+            other -> error ("derived Ix: expected bounds pair, got " <> showValForDebug other)
+
+    ixIndex ctorIndex = VFun $ \boundsT -> do
+        (lo, _hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+        pure $ VFun $ \iT -> do
+            i <- force legacyHooks iT
+            pure (VInt (fromIntegral (ixCtorIdx ctorIndex i - loI)))
+
+    ixInRange ctorIndex = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+            hiI = ixCtorIdx ctorIndex hi
+        pure $ VFun $ \iT -> do
+            i <- force legacyHooks iT
+            let ii = ixCtorIdx ctorIndex i
+            pure (VCon (BC.pack (if loI <= ii && ii <= hiI then "True" else "False")) [])
+
+    ixRangeSize clamp ctorIndex = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let sz = ixCtorIdx ctorIndex hi - ixCtorIdx ctorIndex lo + 1
+        pure (VInt (fromIntegral (if clamp then max 0 sz else sz)))
+
+    ixRange ctorIndex ctors = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+            hiI = ixCtorIdx ctorIndex hi
+            elemsV = [ VCon (ctors !! k) []
+                     | k <- [loI .. hiI], k >= 0, k < length ctors ]
+        ixConsList elemsV
+
+    ixConsList []     = pure (VCon (BC.pack "[]") [])
+    ixConsList (v:vs) = do
+        hd <- newWHNFThunk v
+        tl <- ixConsList vs >>= newWHNFThunk
+        pure (VCon (BC.pack ":") [hd, tl])
 
     registerUnderTypeAndCtors cls tyName ctors methods = do
         registerInstance classReg cls tyName methods
@@ -3834,11 +3916,29 @@ exportBodies registry searchPath includeMap builtinNames lm = do
   where
     preserveNullaryClassResultType n e =
         case e of
+            -- RHS is literally a bare nullary class method
+            -- (@x :: T; x = minBound@): annotate with the result-type tag.
             EVar v
                 | isNullaryClassMethodName (lastNameComponent v)
                 , Just sig <- Map.lookup n (lmTypeSigs lm)
                 , Just tag <- schemeResultTag sig
                 -> ETyApp e tag
+            -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary
+            -- class method nested inside an application/tuple — e.g.
+            -- @methodArray :: Array StdMethod Method;
+            --  methodArray = listArray (minBound, maxBound) …@.  Wrap the
+            -- whole RHS in the binding's full result type so the eval-time
+            -- elaborator (ETyApp → tryElaborateTyAnn) can drive the nested
+            -- minBound/maxBound to the right Bounded instance instead of
+            -- the Int default.  Guarded (arity-0 + actually mentions a
+            -- nullary method) so only the rare binding pays the lazy,
+            -- once-per-thunk elaboration; the elaborator self-validates
+            -- ('allTypedMethodsResolvable') and falls back to @e@ on a miss.
+            _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+              , ([], resultTy) <- tyArrowArgs body
+              , any (isNullaryClassMethodName . lastNameComponent) (freeVars e)
+              , Just tyBytes <- renderTypeForAnnotation resultTy
+              -> ETyApp e tyBytes
             _ -> e
 
     isNullaryClassMethodName n =
@@ -3872,6 +3972,63 @@ exportBodies registry searchPath includeMap builtinNames lm = do
         case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
             Just idx -> BC.drop (idx + 1) n
             Nothing  -> n
+
+-- | Render a 'Type' back to source-level bytes that
+-- 'IHC.Elaborate.parseRawTypeExpr' can re-parse, for use as the annotation
+-- in a synthesised 'ETyApp' (see 'preserveNullaryClassResultType').  Handles
+-- the shapes that parser supports — type constructors, left-associated
+-- applications, tuples, and lists — stripping module/alias qualifiers
+-- (derived/source instances are keyed by bare type name).  Returns 'Nothing'
+-- for shapes the parser can't represent (arrows, foralls); the caller then
+-- leaves the RHS unannotated.
+renderTypeForAnnotation :: Type -> Maybe ByteString
+renderTypeForAnnotation = top
+  where
+    top t = case t of
+        TyVar v   -> Just (bareTypeName v)
+        TyCon c   -> Just (bareTypeName c)
+        TyApp _ _ -> let (h, args) = tyApps t in renderApp h args
+        _         -> Nothing                  -- TyArrow / TyForall: unsupported
+
+    renderApp h args = case h of
+        TyCon c
+            | isTupleCon c, length args == tupleArity c -> do
+                parts <- mapM top args
+                Just (BC.concat [ BC.singleton '('
+                                , BC.intercalate (BC.pack ", ") parts
+                                , BC.singleton ')' ])
+            | c == BC.pack "[]", [a] <- args -> do
+                ab <- top a
+                Just (BC.concat [ BC.singleton '[', ab, BC.singleton ']' ])
+        _ -> do
+            hb    <- atom h
+            parts <- mapM atom args
+            Just (BC.intercalate (BC.singleton ' ') (hb : parts))
+
+    -- Argument position: wrap compound applications in parens.
+    atom t = case t of
+        TyVar v   -> Just (bareTypeName v)
+        TyCon c   -> Just (bareTypeName c)
+        TyApp _ _ ->
+            let (h, args) = tyApps t
+            in case h of
+                TyCon c | isTupleCon c || c == BC.pack "[]" -> top t
+                _ -> do
+                    inner <- renderApp h args
+                    Just (BC.concat [ BC.singleton '(', inner, BC.singleton ')' ])
+        _ -> Nothing
+
+    bareTypeName c =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) c of
+            Just idx | idx + 1 < BC.length c -> BC.drop (idx + 1) c
+            _ -> c
+
+    isTupleCon c =
+        BC.length c >= 2 && BC.head c == '(' && BC.last c == ')'
+        && not (BC.null (BC.init (BC.tail c)))
+        && BC.all (== ',') (BC.init (BC.tail c))
+
+    tupleArity c = BC.length (BC.filter (== ',') c) + 1
 
 -- | Names of builtins that are FFI/primop-backed and should ALWAYS resolve
 -- to the host builtin, never to source definitions. These are excluded from
