@@ -392,16 +392,37 @@ elaborateDo ienv stmts = do
 applyMethodSubst :: Subst -> Expr -> Expr
 applyMethodSubst sub = go
   where
-    resolveTag :: Name -> Name
+    -- Resolve a placeholder tag to its concrete head constructor.  Returns
+    -- 'Nothing' when the class parameter is still ambiguous after inference
+    -- (the tag is a type variable, not a real type head) — the caller then
+    -- reverts the node to a bare 'EVar' (see 'go').
+    resolveTag :: Name -> Maybe Name
     resolveTag tag = case Map.lookup tag sub of
-        Just ty -> case tyHead (applySubst sub ty) of
-            Just h  -> h
-            Nothing -> tag   -- still a tyvar or arrow; eval will error
-        Nothing -> tag        -- tag is already a concrete head (direct rewrite)
+        Just ty -> tyHead (applySubst sub ty)   -- Just head, or Nothing if still a tyvar/arrow
+        Nothing
+          | isHeadName tag -> Just tag           -- already a concrete head (direct rewrite)
+          | otherwise      -> Nothing            -- unresolved placeholder type variable
+
+    -- A resolved type head is a constructor: an uppercase name, or the list /
+    -- tuple constructors.  Type-variable placeholders (lowercase, or the
+    -- fresh-var @$t…@ names) are not heads.
+    isHeadName t = case BC.uncons t of
+        Just (c, _) -> (c >= 'A' && c <= 'Z') || c == '[' || c == '('
+        Nothing     -> False
 
     go e = case e of
         ETypedMethod cls method tag ->
-            ETypedMethod cls method (resolveTag tag)
+            case resolveTag tag of
+                Just h  -> ETypedMethod cls method h
+                -- Tag stayed ambiguous (a type variable).  Revert to the bare
+                -- name rather than emitting a broken 'ETypedMethod' whose tag
+                -- has no instance: that node would (a) make the eval-site's
+                -- 'allTypedMethodsResolvable' reject the WHOLE rewrite — losing
+                -- the siblings that DID resolve (e.g. listArray's
+                -- @(minBound,maxBound)@ bounds while an element-list @maxBound@
+                -- stayed ambiguous) — and (b) error at eval.  A bare 'EVar'
+                -- falls to runtime value-directed dispatch / defaults instead.
+                Nothing -> EVar method
         EApp f x     -> EApp (go f) (go x)
         ELam n body  -> ELam n (go body)
         ELet bs body -> ELet [(n, go b) | (n, b) <- bs] (go body)
