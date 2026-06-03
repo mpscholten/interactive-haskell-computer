@@ -39,6 +39,7 @@ module IHC.Scheduler
     , ModuleRegistry
     , freeVars
     , splitQualified
+    , schemesCompatible
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
