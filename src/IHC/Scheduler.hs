@@ -119,6 +119,7 @@ import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps)
+import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -5950,13 +5951,51 @@ resetPerRunGlobals = do
 mirrorTypeSigsGlobal :: Map ByteString Scheme -> IO ()
 mirrorTypeSigsGlobal new = do
     old <- readIORef globalTypeSigsRef
-    let conflicts = Map.keysSet
-            (Map.filterWithKey
-                (\k v -> maybe False (/= v) (Map.lookup k old))
-                new)
-    when (not (Set.null conflicts)) $
-        modifyIORef' globalAmbiguousSigsRef (Set.union conflicts)
+    -- Candidate conflicts: a bare name already present with a STRUCTURALLY
+    -- different scheme.  But structural inequality is too coarse: the same
+    -- function re-exported through different modules can carry sigs that
+    -- differ yet are UNIFIABLE and so agree on every instantiation that
+    -- matters — e.g. @GHC.Arr.listArray :: Ix i => (i,i) -> [e] -> Array i e@
+    -- vs @Data.Array.Base.listArray :: (IArray a e, Ix i) => (i,i) -> [e] ->
+    -- a i e@ (the second is the first with @a := Array@).  Flagging those as
+    -- ambiguous made 'elaborateVar' decline @listArray@, so http-types'
+    -- @methodArray = listArray (minBound,maxBound) …@ never got @i := StdMethod@
+    -- pushed onto its bounds tuple and they defaulted to Int — the
+    -- @Ix Int.index: non-Int index@ crash on warp's request path (the bug only
+    -- surfaced at warp SCALE, where enough modules load that both listArray
+    -- sigs are present to conflict).
+    --
+    -- So flag a name ambiguous ONLY when its two schemes are not even
+    -- UNIFIABLE.  Genuinely incompatible sigs still get flagged — e.g.
+    -- @Prelude.map :: (a->b) -> [a] -> [b]@ vs @NonEmpty.map :: (a->b) ->
+    -- NonEmpty a -> NonEmpty b@ fail to unify (@[] /~ NonEmpty@), preserving
+    -- the conservatism that fixed the @map (B8.pack.show)@ elaboration.
+    let candidates =
+            [ (k, v, oldV)
+            | (k, v) <- Map.toList new
+            , Just oldV <- [Map.lookup k old]
+            , v /= oldV
+            ]
+    realConflicts <- filterM (\(_, v, oldV) -> not <$> schemesCompatible v oldV) candidates
+    let conflictKeys = Set.fromList [ k | (k, _, _) <- realConflicts ]
+    when (not (Set.null conflictKeys)) $
+        modifyIORef' globalAmbiguousSigsRef (Set.union conflictKeys)
     modifyIORef' globalTypeSigsRef (Map.union new)
+
+-- | Are two type schemes UNIFIABLE — i.e. could they be the same function
+-- (one re-exported, or one a specialisation of the other)?  Instantiate both
+-- with fresh flexible variables (so their bound vars can't clash) and try to
+-- 'TU.mgu' the bodies.  'Right' (a unifier exists) ⇒ compatible (NOT a real
+-- conflict); 'Left' ⇒ genuinely different.  Used by 'mirrorTypeSigsGlobal' so
+-- re-exports aren't false-flagged as ambiguous.
+schemesCompatible :: Scheme -> Scheme -> IO Bool
+schemesCompatible s1 s2 = do
+    fs <- TU.newFreshSource
+    (_, t1) <- TU.instantiate fs s1
+    (_, t2) <- TU.instantiate fs s2
+    pure $ case TU.mgu t1 t2 of
+        Right _ -> True
+        Left _  -> False
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
