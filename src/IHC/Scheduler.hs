@@ -6493,10 +6493,33 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
+                                     -- A bare name the owner-scoped lookup couldn't
+                                     -- resolve to an in-scope top-level binding, but
+                                     -- which IS a registered class method, must
+                                     -- dispatch AS a class method — it must NOT be
+                                     -- scavenged from an unrelated module's same-named
+                                     -- top-level binding by the UNSCOPED global scans
+                                     -- below.  Concretely: GHC.Internal.Ix's default
+                                     -- @index@/@rangeSize@ call @unsafeIndex@/@index@
+                                     -- (both Ix methods); once Data.ByteString is
+                                     -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
+                                     -- otherwise win 'tryGlobalImportScan' and
+                                     -- pattern-fail on the Ix bounds tuple
+                                     -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
+                                     -- such collision) already resolved correctly via
+                                     -- the class-method tail below; this lifts the same
+                                     -- dispatch ahead of the scope-blind scan for the
+                                     -- colliding names.  Cheap (one IORef read on miss,
+                                     -- no module loads) so it respects the per-name
+                                     -- fallback hot-path rule.
                                      -- Try ALL loaded modules' imports — the owner
                                      -- might be wrong (e.g. class default method
                                      -- evaluated in a different module's context).
-                                     mGlobal <- tryGlobalImportScan mods bareName
+                                     mGlobal <- do
+                                         mClassFirst <- tryKnownClassMethodSlot bareName
+                                         case mClassFirst of
+                                             Just s  -> pure (Just s)
+                                             Nothing -> tryGlobalImportScan mods bareName
                                      case mGlobal of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
@@ -6592,6 +6615,16 @@ resolveFallbackSource mOwner name = do
                         pure (Just slot)
                     Nothing -> pure Nothing
             _ -> pure Nothing
+
+    -- | If @bareName@ is a registered class method, build its dispatcher
+    -- slot; otherwise 'Nothing'.  One IORef read on miss, no module loads
+    -- or re-export walks, so it is safe to call ahead of the scope-blind
+    -- global scans on the per-name fallback path ('resolveBarePrelude').
+    tryKnownClassMethodSlot bareName = do
+        methodClasses <- readIORef globalMethodClassRef
+        if Map.member bareName methodClasses
+            then tryClassMethodFromRegistry bareName
+            else pure Nothing
 
     tryQualifiedClassMethodSlot mods modName bareName = do
         methodClasses <- readIORef globalMethodClassRef
