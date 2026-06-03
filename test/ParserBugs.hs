@@ -399,3 +399,33 @@ methodArrayParserSpec =
                             ("unexpected lower bound in range: " <> show lo)
                 _ -> expectationFailure
                     ("expected two-endpoint enumFromTo, got: " <> show e)
+
+    -- A '|'-run longer than two must lex as ONE operator, not be greedily
+    -- split into TkOr (||) + TkBar (|).  http-types' Method.hs opens with
+    -- @import Control.Arrow ((|||))@; the split made the import-list parser
+    -- capture "||", choke on the stray TkBar (no closing ')'), return early,
+    -- and silently DROP the next import line (@import … as B8@ → unbound
+    -- B8.pack on the warp request path).  &&&/>>>/*** already lexed correctly
+    -- (no early special-case); '||' had one and lacked the third-char guard.
+    describe "long '|'-run operator lexing (Control.Arrow ((|||)))" $ do
+        it "lexes '|||' as a single TkSymOp, not TkOr + TkBar" $ do
+            r <- lexOne "|||"
+            case r of
+                Right (TkSymOp op) -> op `shouldBe` "|||"
+                Right other -> expectationFailure ("expected TkSymOp \"|||\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed on |||: " <> show e)
+        it "still lexes '||' as TkOr" $ do
+            r <- lexOne "||"
+            case r of
+                Right TkOr -> pure ()
+                Right other -> expectationFailure ("expected TkOr, got " <> show other)
+                Left e -> expectationFailure ("lexer crashed on ||: " <> show e)
+        it "still lexes '|' as TkBar" $ do
+            r <- lexOne "|"
+            case r of
+                Right TkBar -> pure ()
+                Right other -> expectationFailure ("expected TkBar, got " <> show other)
+                Left e -> expectationFailure ("lexer crashed on |: " <> show e)
+        it "parses 'a ||| b' as the operator application (|||) a b" $ do
+            e <- parseExprOnly (mkSrc "a ||| b") defaultFixityTable
+            topOp e `shouldBe` Just "|||"
