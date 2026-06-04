@@ -1804,20 +1804,14 @@ scanDataDecls src
                 curAfterDot <- skipForallBinders cur'
                 collectCtors tyName cIdx (dReg, fReg) curAfterDot
             TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
-            -- A '(' at constructor-start is usually an infix constructor
-            -- (parenthesised operator/LHS field), but it can also begin a
-            -- TUPLE constraint context of an existential ctor, e.g.
-            --   forall a. (C1 a, C2 a) => Ctor { f :: ... }
-            -- (warp's @Handle__@ has exactly this shape). The single-
-            -- constraint form starts with a ConId and is already constraint-
-            -- checked below; mirror that here so the record's fields are
-            -- registered rather than mis-scanned as an infix ctor — otherwise
-            -- the field accessors come out as unbound variables.
+            -- A '(' at constructor-start is usually an infix constructor,
+            -- but it can also begin a tuple constraint context of an
+            -- existential ctor, e.g. `forall a. (C1 a, C2 a) => Ctor {..}`.
             TkLParen -> do
-                isConstraint <- checkIfConstraint cur'
+                isConstraint <- checkIfConstraint cur
                 if isConstraint
                     then do
-                        curAfterArrow <- skipConstraintContext cur'
+                        curAfterArrow <- skipConstraintContext cur
                         collectCtors tyName cIdx (dReg, fReg) curAfterArrow
                     else collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             TkLBracket -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'

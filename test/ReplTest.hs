@@ -6,6 +6,7 @@
 -- have the binary on PATH.
 module ReplTest (spec) where
 
+import IhcTestBinary (ihcBin)
 import System.IO (hPutStr, hFlush, hClose, openTempFile)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
@@ -13,17 +14,17 @@ import System.Exit (ExitCode(..))
 import System.Timeout (timeout)
 import Test.Hspec
 
--- | Locate the ihc binary built by cabal.
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
-
 runRepl :: String -> IO (ExitCode, String, String)
-runRepl input = do
-    result <- timeout (20 * 1000000) (readProcessWithExitCode ihcBin ["repl"] input)
+runRepl = runReplWithin 20
+
+runReplWithin :: Int -> String -> IO (ExitCode, String, String)
+runReplWithin seconds input = do
+    bin <- ihcBin
+    result <- timeout (seconds * 1000000) (readProcessWithExitCode bin ["repl"] input)
     case result of
         Just triple -> pure triple
         Nothing -> do
-            expectationFailure "REPL timed out"
+            expectationFailure ("REPL timed out after " <> show seconds <> "s")
             pure (ExitFailure 124, "", "")
 
 spec :: Spec
@@ -113,6 +114,17 @@ spec = describe "REPL smoke tests" do
         (code, out, _err) <- runRepl "import qualified Data.ByteString as BS\n:q\n"
         code `shouldBe` ExitSuccess
         out `shouldContain` "imported Data.ByteString (deferred)"
+
+    it "import qualified Data.ByteString as BS: BS.length materializes promptly" do
+        -- Regression guard for the targeted ImportOnly alias path.  A request
+        -- for just `length` previously walked broad Prelude/Data.List
+        -- re-export aliases and hung until the outer REPL timeout fired.
+        (code, out, _err) <- runReplWithin 8
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "<function>"
 
     it "import qualified Data.ByteString as BS: BS.length (BS.pack [97,98,99]) = 3" do
         -- REPL imports route this through source-loaded

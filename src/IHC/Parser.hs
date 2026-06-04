@@ -357,8 +357,9 @@ parsePatsIn src fx (start, end) = do
                     Nothing -> pure (reverse acc)
             -- Operator infix LHS form: `arg1 OP arg2 = body`
             -- The symbolic operator (e.g. @?=, <>) between the two
-            -- argument patterns must be skipped.
-            TkSymOp _ -> loop ctx cur1 acc
+            -- argument patterns must be skipped. A leading `~` is the
+            -- irrefutable-pattern prefix, not an operator separator.
+            TkSymOp op | op /= BC.pack "~" -> loop ctx cur1 acc
             -- '@'-prefixed operator infix LHS: arg1 @?= arg2 = body
             -- '@' is TkAt (not isOpChar), followed by TkSymOp for the rest.
             -- Skip both tokens and continue collecting patterns.
@@ -396,7 +397,7 @@ parsePatsIn src fx (start, end) = do
                             TkBacktick -> loopInfix ctx cur3 acc
                             _          -> pure (reverse acc)
                     Nothing -> pure (reverse acc)
-            TkSymOp _ -> loopInfix ctx cur1 acc
+            TkSymOp op | op /= BC.pack "~" -> loopInfix ctx cur1 acc
             k | isDedicatedInfixOpKind k -> loopInfix ctx cur1 acc
             TkAt ->
                 let (peek2, cur2) = nextSig ctx cur1
@@ -455,7 +456,9 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
-            TkSymOp _  | depth == 0     -> pure True
+            TkSymOp op | depth == 0
+                       , op /= BC.pack "~" -> pure True
+            TkSymOp _  | depth == 0     -> go cur' depth sawPat
             TkBacktick | depth == 0     -> pure True
             TkMinus    | depth == 0
                        , sawPat         -> pure True
@@ -2095,23 +2098,48 @@ parseLet ctx cur0 = do
             TkIn -> pure ()
             _    -> parseErr ctx "expected `in` in let-binding" inTok
         (body0, curBody) <- parseExpr ctx curIn
-        -- Desugar all items: normal bindings accumulate into ELet,
-        -- pattern bindings get a fresh temp name + body wrapped in ECase.
+        -- Desugar all items into one recursive let group. Pattern-bound
+        -- variables must be in scope for sibling bindings too, e.g.
+        --   let (a, b) = rhs
+        --       c = b
+        --   in c
+        -- so expose each variable as its own lazy projection binding instead
+        -- of wrapping only the final body in a case.
         let (normalBinds, body1) = foldl desugarItem ([], body0) (reverse items)
         pure (if null normalBinds then body1 else ELet normalBinds body1, curBody)
       where
         desugarItem (normalAcc, bodyAcc) (Left (n, e)) =
             ((n, e) : normalAcc, bodyAcc)
         desugarItem (normalAcc, bodyAcc) (Right (pat, rhsE)) =
-            -- let (a, b) = rhs in body
-            -- desugars to: let $patN = rhs in case $patN of { pat -> body; _ -> error }
+            -- let (a, b) = rhs
+            -- desugars to:
+            --   let $patN = rhs
+            --       a = case $patN of { (a, _) -> a; _ -> error }
+            --       b = case $patN of { (_, b) -> b; _ -> error }
             let tmpName = BC.pack ("$pat" ++ show (length normalAcc))
-                newBody = ECase (EVar tmpName)
-                            [ Alt pat bodyAcc
-                            , Alt PWild (EApp (EVar "error")
-                                          (stringToConsList "Non-exhaustive pattern in let"))
-                            ]
-            in ((tmpName, rhsE) : normalAcc, newBody)
+                vars = letPatVars pat
+                perVarBind v =
+                    ( v
+                    , ECase (EVar tmpName)
+                        [ Alt pat (EVar v)
+                        , Alt PWild (EApp (EVar "error")
+                                      (stringToConsList
+                                        "Non-exhaustive pattern in let"))
+                        ]
+                    )
+            in ((tmpName, rhsE) : map perVarBind vars ++ normalAcc, bodyAcc)
+
+        letPatVars (PVar n)        = [n]
+        letPatVars (PAs n p)       = n : letPatVars p
+        letPatVars (PBang p)       = letPatVars p
+        letPatVars (PIrref p)      = letPatVars p
+        letPatVars (PTuple ps)     = concatMap letPatVars ps
+        letPatVars (PCon _ ps)     = concatMap letPatVars ps
+        letPatVars (PRecord _ fps) = concatMap (letPatVars . snd) fps
+        letPatVars (PRecordWild _) = []
+        letPatVars (PView _ p)     = letPatVars p
+        letPatVars PWild           = []
+        letPatVars (PLit _)        = []
 
     finishLet binds curEnd = do
         let (inTok, curIn) = nextSig ctx curEnd
@@ -2809,6 +2837,7 @@ peekViewArrow ctx cur0 = go cur0 (0 :: Int)
             TkLBrace              -> go cur' (depth + 1)
             TkRBrace              -> go cur' (depth - 1)
             TkComma  | depth == 0 -> False   -- tuple pattern, not view
+            TkDColon | depth == 0 -> False   -- typed pattern; arrows belong to the type
             TkArrow  | depth == 0 -> True
             _                     -> go cur' depth
 
@@ -3244,6 +3273,7 @@ parseApp ctx cur0 = do
             -- @INT_MINBOUND@ expands to @-0x8000000000000000@).
             TkMinus
               | tkCol tok > ctxMinCol ctx
+              , tkStart tok > cPos cur
               , let (litTok, _) = nextToken (ctxSrc ctx) cur'
               , tkStart litTok == tkEnd tok
               , case tkKind litTok of

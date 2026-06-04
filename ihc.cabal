@@ -165,6 +165,7 @@ test-suite ihc-test
       , Properties.TupleSectionDesugar
       , HsExtTypeFams
       , HsExtMisc
+      , IhcTestBinary
       , HsExtRecords
       , Hs2010LexNum
       , HsExtTypeApps
@@ -220,6 +221,8 @@ test-suite ihc-test
       -- "random Haskell programs" plan — see
       -- plans/can-we-convert-the-temporal-castle.md).
       , QuickCheck       >= 2.14
+    build-tool-depends:
+        ihc:ihc
     -- Tests run sequentially under hspec; -N1 pins a single capability
     -- so parallel GC doesn't spin every core on this single-threaded
     -- workload.  (The shutdown hang a leaked unkillable masked fixture

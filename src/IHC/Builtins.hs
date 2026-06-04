@@ -47,7 +47,7 @@ import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (chr, ord)
+import Data.Char (chr, ord, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Int (Int64)
 import Data.List (intercalate)
@@ -227,9 +227,9 @@ builtinEnv reg = do
         , "NoBuffering", "LineBuffering", "BlockBuffering"
         ]
     -- Standard handles — source-loaded FileHandle constructors.
-    stdinT  <- newWHNFThunk =<< mkFileHandleVal "ReadHandle"  "<stdin>"  stdin
-    stdoutT <- newWHNFThunk =<< mkFileHandleVal "WriteHandle" "<stdout>" stdout
-    stderrT <- newWHNFThunk =<< mkFileHandleVal "WriteHandle" "<stderr>" stderr
+    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin  ReadMode
+    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout WriteMode
+    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr WriteMode
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
@@ -930,6 +930,7 @@ builtins reg =
     , ("int2Word#",         int2WordB)
     , ("word2Int#",         word2IntB)
     , ("word8ToWord#",      word8ToWordB)
+    , ("wordToWord8#",      wordToWord8B)
     , ("setAddrRange#",     setAddrRangeB)
     , ("copyAddrToAddrNonOverlapping#", copyAddrToAddrNonOverlappingB)
     , ("copyAddrToAddr#",   copyAddrToAddrB)
@@ -1010,6 +1011,14 @@ builtins reg =
     , ("eqWord#",   eqWordB)
     , ("gtWord#",   gtWordB)
     , ("geWord#",   geWordB)
+    -- Word8# comparison primops are compiler intrinsics used by
+    -- source-loaded GHC.Internal.Word and text's UTF-8 paths.
+    , ("ltWord8#",  ltWord8B)
+    , ("leWord8#",  leWord8B)
+    , ("eqWord8#",  eqWord8B)
+    , ("gtWord8#",  gtWord8B)
+    , ("geWord8#",  geWord8B)
+    , ("neWord8#",  neWord8B)
     , ("minusWord#", minusWordB)
     , ("plusWord#",  plusWordB)
     , ("timesWord#", timesWordB)
@@ -1827,6 +1836,16 @@ makeWordArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VInt (fromIntegral (op (fromIntegral x) (fromIntegral y))))
         _ -> error (name <> ": bad args")
 
+-- | Binary Word8# comparison primop. IHC stores unboxed Word8# as
+-- 'VInt', so truncate to 'Word8' before comparing.
+makeWord8CmpOp :: String -> (Word8 -> Word8 -> Bool) -> IO Val
+makeWord8CmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    case (av, bv) of
+        (VInt x, VInt y) ->
+            pure (primBoolVal (op (fromIntegral x) (fromIntegral y)))
+        _ -> error (name <> ": bad args")
+
 -- | Extract a host IORef from a 'VPrimObj' or fail with a
 -- context-tagged error. Used by readIORef / writeIORef /
 -- modifyIORef / atomicModifyIORef'.
@@ -1894,6 +1913,16 @@ eqVals reg av bv = case (av, bv) of
     (VInt x, VChar y)    -> pure (boolVal (toEnum (fromIntegral x) == y))
     (VChar x, VInt y)    -> pure (boolVal (x == toEnum (fromIntegral y)))
     (VStr x, VStr y)     -> pure (boolVal (x == y))
+    (VStr x, _) -> do
+        m <- charListBytes bv
+        case m of
+            Just y  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
+    (_, VStr y) -> do
+        m <- charListBytes av
+        case m of
+            Just x  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
     (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
         pure (boolVal (p1 == p2))
     (VUnit, VPrimObj (PrimPtr p)) ->
@@ -1972,7 +2001,15 @@ eqVals reg av bv = case (av, bv) of
                         eqVals reg v1 v2)
                         (zip ts1 ts2)
                     pure (boolVal (all isTruthy results))
-    _ -> do
+    _ -> fallbackNoBuiltinEq
+  where
+    charListBytes v = do
+        isChars <- isCharList v
+        if isChars
+            then Just . BC.pack <$> valToString v
+            else pure Nothing
+
+    fallbackNoBuiltinEq = do
         -- Try user-defined instance.
         let tag = typeTagOf av
         mEqMethod <- lookupInstanceMethod reg "Eq" tag "==" >>= forceInstanceMethod
@@ -3285,64 +3322,79 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 --------------------------------------------------------------------------------
 
 -- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
---
--- The MVar holds a @VCon "Handle__"@ carrying ALL 13 source fields, in the
--- declaration order of @GHC.Internal.IO.Handle.Types.Handle__@:
---
---   0 haDevice   1 haType       2 haByteBuffer  3 haBufferMode
---   4 haLastDecode  5 haCharBuffer  6 haBuffers   7 haEncoder
---   8 haDecoder   9 haCodec     10 haInputNL    11 haOutputNL
---   12 haOtherSide
---
--- This matters because the scanner now registers @Handle__@'s fields, so
--- @desugarRecordPats@ expands @Handle__{..}@ into a 13-field positional
--- pattern (e.g. @checkWritableHandle act h_\@Handle__{..}@) and accessors
--- like @haType@/@haBufferMode@ index into the constructor by position. A
--- 1-field stub failed both ("only 1 fields, index 1 out of range" /
--- non-exhaustive @Handle__{..}@).
---
--- @haDevice@ (idx 0) carries the host 'Handle' — RTS-exclusive; requireHandle
--- extracts it, and 'checkWritableHandle' for a 'WriteHandle' short-circuits to
--- @act h_@ without touching the buffers. The buffer/decode IORef fields are
--- therefore lazy "not populated" stubs: real IO is host-backed (hPutStr etc.),
--- so the source-level buffered path (only reached for @ReadWriteHandle@) is
--- never exercised; if it ever is, the stub names the exact field it needed.
-mkFileHandleVal :: String -> String -> Handle -> IO Val
-mkFileHandleVal htypeCon path h = do
+-- The MVar keeps the host 'Handle' in @haDevice@ and exposes enough of
+-- GHC's source-level @Handle__@ record shape for source handle helpers
+-- to pattern-match on @Handle__ {..}@.  Buffers are deliberately
+-- no-buffering placeholders: ordinary byte/char IO is still performed by
+-- host-backed primitives such as 'hPutCharB' and 'hGetLineB'.
+mkFileHandleVal :: String -> Handle -> IOMode -> IO Val
+mkFileHandleVal path h mode = do
     pathT <- newWHNFThunk =<< stringToListValIO path
-    -- idx 0: the host Handle (requireHandle reads the first field).
-    haDeviceT     <- newWHNFThunk (VPrimObj (PrimHandle h))
-    haTypeT       <- newWHNFThunk (VCon (BC.pack htypeCon) [])
-    haBufferModeT <- newWHNFThunk (VCon "LineBuffering" [])
-    haEncoderT    <- newWHNFThunk (VCon "Nothing" [])
-    haDecoderT    <- newWHNFThunk (VCon "Nothing" [])
-    haCodecT      <- newWHNFThunk (VCon "Nothing" [])
-    haInputNLT    <- newWHNFThunk (VCon "LF" [])
-    haOutputNLT   <- newWHNFThunk (VCon "LF" [])
-    haOtherSideT  <- newWHNFThunk (VCon "Nothing" [])
-    -- Buffer/decode IORefs: never forced on the host-backed write path.
-    haByteBufferT <- stubField "haByteBuffer"
-    haLastDecodeT <- stubField "haLastDecode"
-    haCharBufferT <- stubField "haCharBuffer"
-    haBuffersT    <- stubField "haBuffers"
-    let fields = [ haDeviceT, haTypeT, haByteBufferT, haBufferModeT
-                 , haLastDecodeT, haCharBufferT, haBuffersT, haEncoderT
-                 , haDecoderT, haCodecT, haInputNLT, haOutputNLT, haOtherSideT ]
-    mv    <- newMVar (VCon "Handle__" fields)
+    handleState <- mkHandleStateVal h mode
+    mv    <- newMVar handleState
     mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
     pure (VCon "FileHandle" [pathT, mvarT])
-  where
-    stubField nm = newLazyBuiltinThunk
-        (error ("Handle__." <> nm <> ": field not populated "
-                <> "(host-backed handle, source buffer path not supported)"))
 
--- | Map a host 'IOMode' to the source @HandleType@ constructor name used in
--- the synthetic @Handle__@ value (see 'mkFileHandleVal').
-handleTypeForMode :: IOMode -> String
-handleTypeForMode ReadMode      = "ReadHandle"
-handleTypeForMode WriteMode     = "WriteHandle"
-handleTypeForMode AppendMode    = "AppendHandle"
-handleTypeForMode ReadWriteMode = "ReadWriteHandle"
+mkHandleStateVal :: Handle -> IOMode -> IO Val
+mkHandleStateVal h mode = do
+    handleT     <- newWHNFThunk (VPrimObj (PrimHandle h))
+    typeT       <- newWHNFThunk (handleTypeVal mode)
+    byteBufT    <- newWHNFThunk =<< (mkEmptyReadBufferVal >>= mkIORefVal)
+    modeT       <- newWHNFThunk (VCon "NoBuffering" [])
+    unitT       <- newWHNFThunk VUnit
+    lastBufT    <- newWHNFThunk =<< mkEmptyReadBufferVal
+    lastDecodeT <- newWHNFThunk =<< mkIORefVal (VCon "(,)" [unitT, lastBufT])
+    charBufT    <- newWHNFThunk =<< (mkEmptyReadBufferVal >>= mkIORefVal)
+    spareBufsT  <- newWHNFThunk =<< mkIORefVal (VCon "BufferListNil" [])
+    encoderT    <- newWHNFThunk nothingVal
+    decoderT    <- newWHNFThunk nothingVal
+    codecT      <- newWHNFThunk nothingVal
+    inputNLT    <- newWHNFThunk newlineVal
+    outputNLT   <- newWHNFThunk newlineVal
+    otherSideT  <- newWHNFThunk nothingVal
+    pure (VCon "Handle__"
+        [ handleT
+        , typeT
+        , byteBufT
+        , modeT
+        , lastDecodeT
+        , charBufT
+        , spareBufsT
+        , encoderT
+        , decoderT
+        , codecT
+        , inputNLT
+        , outputNLT
+        , otherSideT
+        ])
+
+mkIORefVal :: Val -> IO Val
+mkIORefVal v = do
+    t <- newWHNFThunk v
+    ref <- newIORef t
+    pure (VPrimObj (PrimIORef ref))
+
+handleTypeVal :: IOMode -> Val
+handleTypeVal ReadMode      = VCon "ReadHandle" []
+handleTypeVal WriteMode     = VCon "WriteHandle" []
+handleTypeVal AppendMode    = VCon "AppendHandle" []
+handleTypeVal ReadWriteMode = VCon "ReadWriteHandle" []
+
+mkEmptyReadBufferVal :: IO Val
+mkEmptyReadBufferVal = do
+    rawT    <- newWHNFThunk (VPrimObj (PrimPtr nullPtr))
+    stateT  <- newWHNFThunk (VCon "ReadBuffer" [])
+    sizeT   <- newWHNFThunk (VInt 1)
+    offsetT <- newWHNFThunk (VInt 0)
+    leftT   <- newWHNFThunk (VInt 0)
+    rightT  <- newWHNFThunk (VInt 0)
+    pure (VCon "Buffer" [rawT, stateT, sizeT, offsetT, leftT, rightT])
+
+nothingVal :: Val
+nothingVal = VCon "Nothing" []
+
+newlineVal :: Val
+newlineVal = VCon "LF" []
 
 -- | Extract the host Handle from a source-loaded FileHandle/DuplexHandle
 -- or a legacy VPrimObj PrimHandle.
@@ -3390,7 +3442,7 @@ openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
-    mkFileHandleVal (handleTypeForMode mode) path h
+    mkFileHandleVal path h mode
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do
@@ -4421,6 +4473,14 @@ copyAddrToAddrB =
 word8ToWordB :: IO Val
 word8ToWordB = pure $ VFun $ \t -> force legacyHooks t
 
+-- | @wordToWord8# :: Word# -> Word8#@ — narrowing to the low 8 bits.
+wordToWord8B :: IO Val
+wordToWord8B = pure $ VFun $ \t -> do
+    v <- force legacyHooks t
+    case v of
+        VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word8)))
+        _      -> error ("wordToWord8#: bad arg: " <> showValForDebug v)
+
 -- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
 -- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
 -- All six produce @Int#@ in source semantics (1 / 0); we map to the
@@ -4642,13 +4702,19 @@ looksLikeAddrInfo flags family socktype protocol =
 
 peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
 peekAddrInfoVal p flags family socktype protocol = do
-    -- Linux struct addrinfo layout (64-bit):
-    -- offset 16: ai_addrlen (socklen_t, 4 bytes + padding)
-    -- offset 24: ai_addr (struct sockaddr*)
-    -- offset 32: ai_canonname (char*)
-    -- offset 40: ai_next (struct addrinfo*)
-    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
-    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    -- struct addrinfo layout differs in pointer field order:
+    -- Linux:  ai_addr at 24, ai_canonname at 32, ai_next at 40.
+    -- Darwin: ai_canonname at 24, ai_addr at 32, ai_next at 40.
+    (addrPtrWord, canonPtrWord) <-
+        if isDarwin
+            then do
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 24
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
+            else do
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 24
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
     flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
     familyT <- newWHNFThunk =<< oneFieldCon "Family" family
     socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype
@@ -5918,6 +5984,14 @@ eqWordB = makeWordCmpOp "eqWord#" (==)
 gtWordB = makeWordCmpOp "gtWord#" (>)
 geWordB = makeWordCmpOp "geWord#" (>=)
 
+ltWord8B, leWord8B, eqWord8B, gtWord8B, geWord8B, neWord8B :: IO Val
+ltWord8B = makeWord8CmpOp "ltWord8#" (<)
+leWord8B = makeWord8CmpOp "leWord8#" (<=)
+eqWord8B = makeWord8CmpOp "eqWord8#" (==)
+gtWord8B = makeWord8CmpOp "gtWord8#" (>)
+geWord8B = makeWord8CmpOp "geWord8#" (>=)
+neWord8B = makeWord8CmpOp "neWord8#" (/=)
+
 plusWordB, minusWordB, timesWordB, quotWordB, remWordB :: IO Val
 plusWordB  = makeWordArithOp "plusWord#"  (+)
 minusWordB = makeWordArithOp "minusWord#" (-)
@@ -6653,6 +6727,12 @@ buildFieldEnv reg = do
         | any ((BC.pack "StaticString" ==) . fst) clauses
         , fieldName == BC.pack "getString"
         = Just (pure (charListAppender listVal))
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "original"
+        = Just (pure listVal)
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "foldedCase"
+        = Just (VStr . BC.pack . map toLower <$> valToString listVal)
         | otherwise = Nothing
 
     -- @(listVal ++)@: a 'VFun' that, given another list, returns

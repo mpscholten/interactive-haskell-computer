@@ -17,6 +17,7 @@
 -- output and program output.
 module IHC.Diagnostics
     ( warnStub
+    , warnStubOnce
     , warnStubsEnabled
     , traceLine
     , traceEnabled
@@ -25,6 +26,7 @@ module IHC.Diagnostics
     ) where
 
 import Data.Char (toLower)
+import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import System.Environment (lookupEnv)
 import System.IO (hFlush, hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
@@ -53,10 +55,34 @@ warnStub :: String -> IO ()
 warnStub msg = do
     enabled <- warnStubsEnabled
     if enabled
-        then do
-            hPutStrLn stderr ("[ihc:warn] " <> msg)
-            hFlush stderr
+        then emitWarn msg
         else pure ()
+
+-- | Like 'warnStub', but suppresses duplicate messages in the current
+-- process. Use this for expected per-run fallbacks where repeated
+-- identical lines drown out fixture output.
+warnStubOnce :: String -> IO ()
+warnStubOnce msg = do
+    enabled <- warnStubsEnabled
+    if enabled
+        then do
+            shouldEmit <- atomicModifyIORef' warnedOnceRef $ \seen ->
+                if msg `elem` seen
+                    then (seen, False)
+                    else (msg : seen, True)
+            if shouldEmit
+                then emitWarn msg
+                else pure ()
+        else pure ()
+
+emitWarn :: String -> IO ()
+emitWarn msg = do
+    hPutStrLn stderr ("[ihc:warn] " <> msg)
+    hFlush stderr
+
+warnedOnceRef :: IORef [String]
+warnedOnceRef = unsafePerformIO (newIORef [])
+{-# NOINLINE warnedOnceRef #-}
 
 -- | 'True' iff the @IHC_TRACE@ env var is set to an enabling value
 -- (@1@ / @true@ / @yes@ / @on@, case-insensitive). Default (unset) is
