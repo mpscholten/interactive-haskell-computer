@@ -98,7 +98,15 @@ executable ihc
       , filepath
       , ihc
       , text
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2
+    -- -rdynamic exports the executable's own symbols (including the
+    -- statically-linked GHC RTS) into the dynamic symbol table, so that
+    -- interpreted FFI imports of RTS-exclusive symbols (rtsSupportsBoundThreads,
+    -- getNumberOfProcessors, getMonotonicNSec, getOrSet* stores, …) resolve via
+    -- IHC.FFI.resolveSymbol's dlsym(RTLD_DEFAULT) fallback. These have no
+    -- Haskell source and live only in the RTS; this is the same RTS-exclusive
+    -- carve-out as the VIO/State# bridges (see CLAUDE.md). Portable: GHC maps
+    -- -rdynamic to --export-dynamic (ELF) / -export_dynamic (mach-o).
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2 -rdynamic
 
 executable ihc-parse-probe
     import:           warnings, lang
