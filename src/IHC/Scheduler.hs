@@ -75,7 +75,9 @@ import System.Mem (performMajorGC)
 import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
-    , clearCtorIndex, clearForeignPtrWord8Ranges, reapSpawnedThreads
+    , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
+    , isHostWord8PtrVal, pokeHostWord8ByteOff
+    , reapSpawnedThreads
     )
 import IHC.CabalProject
     ( cachedPackageSearchPathWithIncludes
@@ -774,6 +776,15 @@ buildBaseEnv = do
     -- for why this matters for QQ dispatch.
     env3 <- preDiscoverTHQuoteConstructors env2
                 `catch` (\(_ :: SomeException) -> pure env2)
+    -- REPL expressions do not go through the entry-module discovery pass
+    -- that run-file mode uses to preload class-instance providers for
+    -- source-loaded numeric operators.  Load GHC.Internal.Num from source
+    -- here so bare prompt expressions like `1 + 2` dispatch through the
+    -- real Num Int instance instead of falling back to an unbacked class
+    -- dispatcher.  Best-effort keeps startup usable when the source cache
+    -- is absent.
+    preloadReplNumInstances classReg env3
+        `catch` (\(_ :: SomeException) -> pure ())
     -- Seed the env-fallback's base env so Closures built by
     -- 'resolveFallback' can reach builtins + class dispatchers.
     writeIORef envBaseForFallbackRef env3
@@ -797,6 +808,32 @@ buildBaseEnv = do
     -- 'IHC.Eval'; the hook breaks the would-be cycle.
     setThExpToExpr legacyHooks thExpToExpr
     pure (env3, classReg)
+
+preloadReplNumInstances :: ClassRegistry -> Env -> IO ()
+preloadReplNumInstances classReg baseEnv = do
+    cacheWithIncludes <- cachedPackageSearchPathWithIncludes
+    let searchPath = map fst cacheWithIncludes
+        includeMap = Map.fromList cacheWithIncludes
+    registry <- newIORef Map.empty
+    loaded <- mapMaybe id <$> mapM (loadOne registry searchPath includeMap)
+        [ BC.pack "GHC.Internal.Num" ]
+    case loaded of
+        [] -> pure ()
+        _  -> do
+            mergeGlobalLoadedModules (Map.fromList [(lmName lm, lm) | lm <- loaded])
+            unionInstanceScope (Set.fromList (map lmName loaded))
+            classTable <- buildClassMethodTable loaded
+            let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg loaded)
+            mapM_ (registerInstancesFrom registry searchPath includeMap
+                                         classReg tyCtors classTable baseEnv)
+                  loaded
+  where
+    loadOne registry searchPath includeMap modName = do
+        r <- try (loadModule registry searchPath includeMap modName)
+                :: IO (Either SomeException LoadedModule)
+        case r of
+            Right lm -> pure (Just lm)
+            Left _   -> pure Nothing
 
 -- | Install a per-class hook that force-loads the modules the
 -- 'IHC.InstanceManifest' identifies as providing instances for the
@@ -1414,8 +1451,14 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     seenSet' = Set.union seenSet (Set.fromList thisBatch)
                     frontier' = nubBS (rest ++ filter (not . (`Set.member` seenSet')) next)
                 preloadBFS (remaining - loadedThisPass) seenSet' frontier'
-    preloadBFS preloadBudget (Set.singleton (lmName targetLm))
-        (map impModule (mhImports (lmHeader targetLm)))
+    regBeforePreload <- readIORef registry
+    let loadedBeforePreload = [ lm | (_, Loaded lm) <- Map.toList regBeforePreload ]
+    requestedHaveBodies <- forM requested $ \n ->
+        anyM (\lm -> Map.member n <$> readIORef (lmBodies lm))
+             loadedBeforePreload
+    when (not (and requestedHaveBodies)) $
+        preloadBFS preloadBudget (Set.singleton (lmName targetLm))
+            (map impModule (mhImports (lmHeader targetLm)))
     -- ImportOnly is the REPL's deferred-name path: keep it targeted.
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
@@ -3158,7 +3201,43 @@ classMethodDispatcher reg cls methodName = selfVal
                     | otherwise
                         = rawTag
                 tag = dispatchTagForValue normTag
-            if isFoldableElementArg && null accArgs
+            if isStorablePreValueArg accArgs
+                then do
+                    -- Storable.pokeElemOff/pokeByteOff have shape
+                    --   Ptr a -> Int -> a -> IO ()
+                    -- so the instance type is the value argument, not
+                    -- the pointer or offset.  In optimistic mode there is
+                    -- no typechecker to recover @a@ from @Ptr a@.
+                    pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isNumFromIntegerArg accArgs
+                then do
+                    -- Num.fromInteger :: Integer -> a is result-polymorphic:
+                    -- the Integer argument is not the Num instance type.
+                    -- Without a typechecker, use the normal defaulting path
+                    -- instead of dispatching to Num Integer.
+                    mResult <- resultPolymorphicMethod
+                    case mResult of
+                        Just resultVal ->
+                            applyAll resultVal [argT]
+                        Nothing ->
+                            pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isStorableResultReadyArg accArgs
+                then do
+                    mResult <- resultPolymorphicMethod
+                    case mResult of
+                        Just resultVal ->
+                            applyAll resultVal (reverse (argT : accArgs))
+                        Nothing ->
+                            pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isStorablePreResultArg accArgs
+                then do
+                    -- Storable.peekElemOff/peekByteOff have shape
+                    --   Ptr a -> Int -> IO a
+                    -- so both value arguments are pre-result plumbing.
+                    -- The fallback below handles the result-polymorphic
+                    -- default when no later value can drive dispatch.
+                    pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isFoldableElementArg && null accArgs
                 then
                     -- Foldable.elem/notElem have shape
                     --   Eq a => a -> t a -> Bool
@@ -3175,6 +3254,17 @@ classMethodDispatcher reg cls methodName = selfVal
                     -- accumulator), but neither is the Foldable
                     -- structure.  Wait for the third argument.
                     pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isBufferedIOHostHandleArg tag accArgs
+                then do
+                    -- Host-backed FileHandle values store the real device
+                    -- as PrimHandle.  That tag is deliberately not a
+                    -- general class-dispatch key, but BufferedIO's device
+                    -- flush is exactly the RTS-exclusive operation this
+                    -- synthetic handle needs.
+                    mSpecial <- specialClassApplication tag av argT accArgs
+                    case mSpecial of
+                        Just specialVal -> pure specialVal
+                        Nothing         -> pure (dispatch (remaining - 1) (argT : accArgs))
             else if isDispatchableTag tag
                 then do
                     mSpecial <- specialClassApplication tag av argT accArgs
@@ -3384,6 +3474,15 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "IArray"
         , method `elem` map BC.pack ["unsafeArray", "array", "listArray", "accumArray", "genArray"] =
             [BC.pack "Arr.Array", BC.pack "Array"]
+        | clsName == BC.pack "Storable"
+        , method == BC.pack "peekElemOff" =
+            [BC.pack "Char"]
+        | clsName == BC.pack "Storable"
+        , method == BC.pack "peekByteOff" =
+            [BC.pack "Word8"]
+        | clsName == BC.pack "Num"
+        , method == BC.pack "fromInteger" =
+            [BC.pack "Int", BC.pack "Integer"]
         -- MonadParsec methods are parameterized by the parser monad
         -- @m@, which only appears in the result type (e.g. @takeWhileP
         -- :: Maybe String -> (Token s -> Bool) -> m (Tokens s)@).
@@ -3486,6 +3585,43 @@ classMethodDispatcher reg cls methodName = selfVal
                 Just slot -> do
                     methodVal <- force legacyHooks slot
                     Just <$> apply legacyHooks methodVal argT
+        | cls == BC.pack "BufferedIO"
+        , methodName == BC.pack "flushWriteBuffer"
+        , tag == BC.pack "<Handle>"
+        , null accArgs
+        = do
+            pure (Just (VFun $ \bufT -> pure $ VIO $ do
+                bufV <- force legacyHooks bufT
+                mFlushed <- flushHostHandleBuffer av bufV
+                case mFlushed of
+                    Just flushed -> pure flushed
+                    Nothing -> error "BufferedIO.flushWriteBuffer: unsupported host handle buffer"))
+        | cls == BC.pack "Storable"
+        , methodName == BC.pack "pokeByteOff"
+        , length accArgs == 2
+        = case reverse accArgs of
+            [ptrT, offT] -> do
+                ptrV <- force legacyHooks ptrT
+                isWord8 <- isHostWord8PtrVal ptrV
+                    `catch` (\(_ :: SomeException) -> pure False)
+                if isWord8
+                    then pure (Just (VIO $ do
+                        offV <- force legacyHooks offT
+                        pokeHostWord8ByteOff ptrV offV av))
+                    else pure Nothing
+            _ -> pure Nothing
+        | cls == BC.pack "Storable"
+        , methodName == BC.pack "poke"
+        , length accArgs == 1
+        = case reverse accArgs of
+            [ptrT] -> do
+                ptrV <- force legacyHooks ptrT
+                isWord8 <- isHostWord8PtrVal ptrV
+                    `catch` (\(_ :: SomeException) -> pure False)
+                if isWord8
+                    then pure (Just (VIO (pokeHostWord8ByteOff ptrV (VInt 0) av)))
+                    else pure Nothing
+            _ -> pure Nothing
         | cls == BC.pack "Ix"
         , methodName `elem` map BC.pack ["range", "index", "unsafeIndex", "inRange", "rangeSize", "unsafeRangeSize"]
         = do
@@ -3525,6 +3661,32 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Foldable"
         && methodName `elem` map BC.pack ["foldr", "foldr'", "foldl", "foldl'"]
         && length accArgs < 2
+
+    isStorablePreValueArg accArgs =
+        cls == BC.pack "Storable"
+        && methodName `elem` map BC.pack ["pokeElemOff", "pokeByteOff"]
+        && length accArgs < 2
+
+    isStorablePreResultArg accArgs =
+        cls == BC.pack "Storable"
+        && methodName `elem` map BC.pack ["peekElemOff", "peekByteOff"]
+        && null accArgs
+
+    isStorableResultReadyArg accArgs =
+        cls == BC.pack "Storable"
+        && methodName `elem` map BC.pack ["peekElemOff", "peekByteOff"]
+        && length accArgs == 1
+
+    isNumFromIntegerArg accArgs =
+        cls == BC.pack "Num"
+        && methodName == BC.pack "fromInteger"
+        && null accArgs
+
+    isBufferedIOHostHandleArg tag accArgs =
+        cls == BC.pack "BufferedIO"
+        && methodName == BC.pack "flushWriteBuffer"
+        && tag == BC.pack "<Handle>"
+        && null accArgs
 
     isPairVal (VCon "(,)" _) = True
     isPairVal _              = False
@@ -6650,6 +6812,7 @@ resolveFallbackSource mOwner name = do
                 mReg <- getSharedClassReg legacyHooks
                 case mReg of
                     Just reg -> do
+                        triggerCoreInstanceLoad legacyHooks cls
                         let v = classMethodDispatcher reg cls bareName
                         slot <- newWHNFThunk v
                         pure (Just slot)

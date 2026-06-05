@@ -220,7 +220,9 @@ eval hooks env ipm = go
 
     go (EVar name) = case lookupEnv name env of
         Just t  -> force hooks t
-        Nothing -> do
+        Nothing
+            | Just ctor <- unboxedTupleCtorValue name -> pure ctor
+            | otherwise -> do
             -- Demand-driven fallback (Haskell 2010 §4.3.2 scope + lazy
             -- body eval): a closure's frozen env may be missing a
             -- fully-qualified name whose body only became visible after
@@ -1156,6 +1158,11 @@ matchPat hooks pat@(PCon boolCtor []) (VCon wrapper [innerT])
 matchPat hooks (PCon "I#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInt (fromInteger n))
+        matchFields hooks [(p, t)] []
 -- Cross-rep match: source-loaded code that destructures a boxed
 -- scalar via @I# d@ / @W# d@ / @W8# d@ can be handed a value
 -- originally constructed through the 'Integer' path — small Integers
@@ -1176,9 +1183,19 @@ matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =
 matchPat hooks (PCon "W#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W#" [p]) (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = do
+        t <- newWHNFThunk (VInt (fromInteger n))
+        matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W8#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
+matchPat hooks (PCon "W8#" [p]) (VInteger n)
+    | n >= 0
+    , n <= 255 = do
+        t <- newWHNFThunk (VInt (fromInteger n))
+        matchFields hooks [(p, t)] []
 matchPat hooks (PCon "C#" [p]) (VChar c) = do
     t <- newWHNFThunk (VChar c)
     matchFields hooks [(p, t)] []
@@ -1324,7 +1341,15 @@ matchPat hooks (PCon name pats) v@(VCon vname vthunks)
         -- and laziness -- we never force the field). For any other
         -- sub-pattern we MUST force the thunk to pattern-match its
         -- structure, then recurse.
-        matchFieldsLocal (zip pats vthunks) []
+        do
+            -- State-threading primops return unboxed tuples whose first field
+            -- is usually an unlifted State# token.  In IHC that token is held
+            -- in a thunk so forcing it is what triggers delayed side effects
+            -- such as writeWord8OffAddr#.  A source case/let that destructures
+            -- (# State#, ... #) must therefore demand the first slot even when
+            -- the pattern is a plain variable.
+            forceUnboxedTupleStateSlot name vthunks
+            matchFieldsLocal (zip pats vthunks) []
     | otherwise =
         -- Constructor name doesn't match the value's constructor.
         -- May still succeed via a pattern synonym (e.g.
@@ -1359,6 +1384,14 @@ matchPat hooks (PCon name pats) v@(VCon vname vthunks)
         case m of
             Nothing   -> pure Nothing
             Just subs -> matchFieldsLocal rest (reverse subs ++ acc)
+
+    forceUnboxedTupleStateSlot ctor (stateT : _)
+        | isUnboxedTupleCtor ctor = () <$ force hooks stateT
+    forceUnboxedTupleStateSlot _ _ = pure ()
+
+    isUnboxedTupleCtor ctor =
+        BC.pack "(#" `BS.isPrefixOf` ctor
+        && BC.pack "#)" `BS.isSuffixOf` ctor
 -- IO constructor: VIO wraps a suspended (IO Val). When source code
 -- pattern-matches on IO (e.g. `IO act`), expose the underlying
 -- State# RealWorld -> (# State# RealWorld, a #) function so that
@@ -1702,6 +1735,7 @@ evalDo hooks env ipm (SLet bs : rest) = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure env' ipm rhs)))
           (zip bs slots)
+    forceStrictDoLetBinds hooks env' bs
     evalDo hooks env' ipm rest
 evalDo hooks _   _   [SImplicitLet _] = pure (VIO (pure VUnit))
 evalDo hooks env ipm (SImplicitLet bs : rest) = do
@@ -1751,6 +1785,7 @@ evalDoMaybe hooks env ipm (SLet bs : rest) = do
     mapM_ (\((_, rhs), slot) ->
                writeIORef slot (Unevaluated (Closure env' ipm rhs)))
           (zip bs slots)
+    forceStrictDoLetBinds hooks env' bs
     evalDoMaybe hooks env' ipm rest
 evalDoMaybe hooks env ipm [SImplicitLet _] = do
     unitT <- newWHNFThunk VUnit
@@ -1794,6 +1829,18 @@ evalMaybeFinal hooks env ipm e =
     mkJust v = do
         t <- newWHNFThunk v
         pure (VCon "Just" [t])
+
+forceStrictDoLetBinds :: IHCHooks -> Env -> [Bind] -> IO ()
+forceStrictDoLetBinds hooks env binds =
+    mapM_ forceOne
+        [ n
+        | (n, _) <- binds
+        , BC.pack "$doPatStrict" `BS.isPrefixOf` n
+        ]
+  where
+    forceOne n = case lookupEnv n env of
+        Just t  -> () <$ force hooks t
+        Nothing -> pure ()
 
 -- | Force one 'IO' layer to execute its suspended action. Any other value
 -- is returned as-is (treated as a "pure" IO result -- shouldn't happen
@@ -1889,6 +1936,12 @@ runIOVal hooks (VFun fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv rwT
     case result of
+        VCon _ [stT, progT, fromT, toT] -> do
+            _ <- force hooks stT
+            prog <- force hooks progT
+            if isCodingProgressVal prog
+                then pure (VCon "(,)" [fromT, toT])
+                else pure result
         VCon _ [stT, resT] -> do
             -- Side-effecting primops (e.g. @setAddrRange#@,
             -- @writeAddr#@) are wired into the *state* slot of the IO
@@ -1907,6 +1960,12 @@ runIOVal hooks (VFunIP _ipm fv) = do
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     result <- fv Map.empty rwT
     case result of
+        VCon _ [stT, progT, fromT, toT] -> do
+            _ <- force hooks stT
+            prog <- force hooks progT
+            if isCodingProgressVal prog
+                then pure (VCon "(,)" [fromT, toT])
+                else pure result
         VCon _ [stT, resT] -> do
             -- Side-effecting primops (e.g. @setAddrRange#@,
             -- @writeAddr#@) are wired into the *state* slot of the IO
@@ -1928,6 +1987,33 @@ isStateTokenNewtypeCtor n =
        n == BC.pack "IO"
     || n == BC.pack "ST"
     || n == BC.pack "STM"
+
+isCodingProgressVal :: Val -> Bool
+isCodingProgressVal (VCon n []) =
+    n == BC.pack "InputUnderflow"
+    || n == BC.pack "OutputUnderflow"
+    || n == BC.pack "InvalidSequence"
+isCodingProgressVal _ = False
+
+unboxedTupleCtorValue :: Name -> Maybe Val
+unboxedTupleCtorValue name = do
+    arity <- unboxedTupleArity name
+    pure (mkCtor arity [])
+  where
+    mkCtor 0 args = VCon name (reverse args)
+    mkCtor n args = VFun $ \arg -> pure (mkCtor (n - 1) (arg : args))
+
+unboxedTupleArity :: Name -> Maybe Int
+unboxedTupleArity name
+    | BC.pack "(#" `BS.isPrefixOf` name
+    , BC.pack "#)" `BS.isSuffixOf` name =
+        let middle = BC.drop 2 (BC.take (BC.length name - 2) name)
+        in if BC.null middle
+              then Just 0
+              else if all (== ',') (BC.unpack middle)
+                      then Just (BC.length middle + 1)
+                      else Nothing
+    | otherwise = Nothing
 
 --------------------------------------------------------------------------------
 -- Phase 2.12: TemplateHaskellQuotes — [| expr |] evaluation

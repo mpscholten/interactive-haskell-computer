@@ -28,7 +28,6 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
-import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry)
@@ -66,6 +65,8 @@ data InferEnv = InferEnv
     , ieSynonyms :: !(Map ByteString (Int, Type))
     , ieClassReg :: !ClassRegistry
     , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
+    , ieClassMethodNames :: !(Set.Set ByteString)
+    , ieAmbiguousSigs    :: !(Set.Set ByteString)
     }
 
 -- | Top-level entry point.  Elaborate a sub-expression under an
@@ -83,12 +84,16 @@ elaborate
     -> IO (Expr, Type)
 elaborate classReg sigs synonyms expected e = do
     fresh <- newFreshSource
+    classMethodNames <- readIORef globalClassMethodNamesRef
+    ambiguousSigs    <- readIORef globalAmbiguousSigsRef
     let ienv = InferEnv
             { ieFresh    = fresh
             , ieSigs     = sigs
             , ieSynonyms = synonyms
             , ieClassReg = classReg
             , ieLocals   = Map.empty
+            , ieClassMethodNames = classMethodNames
+            , ieAmbiguousSigs    = ambiguousSigs
             }
     (e', t, _preds, sub) <- elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
@@ -231,40 +236,42 @@ elaborateVar ienv name =
         Just sch -> do
             (preds, ty) <- instantiate (ieFresh ienv) sch
             pure (EVar name, ty, preds, emptySubst)
-        Nothing -> case lookupSig of
-            Just sch -> do
-                (preds, ty) <- instantiate (ieFresh ienv) sch
-                -- Use the BARE (unqualified) name for class-method detection
-                -- and the emitted node.  In a non-entry module the binding's
-                -- RHS has had its free vars import-rewritten to FQNs (e.g.
-                -- @GHC.Enum.minBound@, @Data.Array.Base.listArray@), but the
-                -- sig table and 'globalClassMethodNamesRef' are bare-keyed, and
-                -- an 'ETypedMethod's method is looked up by bare name at eval
-                -- time.  Without this, signature-directed elaboration fired
-                -- only for the entry module (where names stay bare) — e.g.
-                -- http-types' @methodArray@ resolved its @(minBound,maxBound)@
-                -- bounds in a single-file repro but defaulted to Int when
-                -- imported (the warp request path), surfacing as
-                -- @Ix Int.index: non-Int index@.
-                let bare = bareName name
-                case classMethodHint bare preds ty of
-                    Just (cls, paramVar) ->
-                        -- Emit ETypedMethod with placeholder tag (bare method
-                        -- name).  The tag is the fresh tyvar's name;
-                        -- 'applyMethodSubst' resolves it later.
-                        pure ( ETypedMethod cls bare paramVar
-                             , ty
-                             , preds
-                             , emptySubst
-                             )
-                    Nothing ->
-                        pure (EVar name, ty, preds, emptySubst)
-            Nothing ->
-                -- No signature available.  Return a fresh tyvar — the
-                -- enclosing context may still succeed if this var
-                -- doesn't participate in class dispatch.
-                do fresh <- TyVar <$> freshVar (ieFresh ienv)
-                   pure (EVar name, fresh, [], emptySubst)
+        Nothing -> do
+            mSig <- lookupSig
+            case mSig of
+                Just sch -> do
+                    (preds, ty) <- instantiate (ieFresh ienv) sch
+                    -- Use the BARE (unqualified) name for class-method detection
+                    -- and the emitted node.  In a non-entry module the binding's
+                    -- RHS has had its free vars import-rewritten to FQNs (e.g.
+                    -- @GHC.Enum.minBound@, @Data.Array.Base.listArray@), but the
+                    -- sig table and 'globalClassMethodNamesRef' are bare-keyed, and
+                    -- an 'ETypedMethod's method is looked up by bare name at eval
+                    -- time.  Without this, signature-directed elaboration fired
+                    -- only for the entry module (where names stay bare) — e.g.
+                    -- http-types' @methodArray@ resolved its @(minBound,maxBound)@
+                    -- bounds in a single-file repro but defaulted to Int when
+                    -- imported (the warp request path), surfacing as
+                    -- @Ix Int.index: non-Int index@.
+                    let bare = bareName name
+                    case classMethodHint ienv bare preds ty of
+                        Just (cls, paramVar) ->
+                            -- Emit ETypedMethod with placeholder tag (bare method
+                            -- name).  The tag is the fresh tyvar's name;
+                            -- 'applyMethodSubst' resolves it later.
+                            pure ( ETypedMethod cls bare paramVar
+                                 , ty
+                                 , preds
+                                 , emptySubst
+                                 )
+                        Nothing ->
+                            pure (EVar name, ty, preds, emptySubst)
+                Nothing ->
+                    -- No signature available.  Return a fresh tyvar — the
+                    -- enclosing context may still succeed if this var
+                    -- doesn't participate in class dispatch.
+                    do fresh <- TyVar <$> freshVar (ieFresh ienv)
+                       pure (EVar name, fresh, [], emptySubst)
   where
     -- Try the name as written, then its bare last component, so FQNs from a
     -- non-entry module's import-rewritten RHS still find the bare-keyed sig.
@@ -275,11 +282,12 @@ elaborateVar ienv name =
     -- rewrite.  Treating it as opaque (Nothing → fresh tyvar) is safe — a
     -- non-class-method like @map@ doesn't need a sig for the surrounding
     -- signature-directed resolution to succeed.
-    lookupSig
-        | isAmbiguousSig (bareName name) = Nothing
-        | otherwise = case Map.lookup name (ieSigs ienv) of
-            Just s  -> Just s
-            Nothing -> Map.lookup (bareName name) (ieSigs ienv)
+    lookupSig = do
+        if isAmbiguousSig ienv (bareName name)
+            then pure Nothing
+            else pure $ case Map.lookup name (ieSigs ienv) of
+                Just s  -> Just s
+                Nothing -> Map.lookup (bareName name) (ieSigs ienv)
 
 -- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
 bareName :: Name -> Name
@@ -291,11 +299,11 @@ bareName n = case BC.elemIndexEnd '.' n of
 -- argument is a plain type variable that also appears in the body
 -- type, return @(className, tyVarName)@ — the info needed to emit
 -- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
-classMethodHint :: Name -> [Pred] -> Type -> Maybe (Name, Name)
-classMethodHint methodName preds body = case preds of
+classMethodHint :: InferEnv -> Name -> [Pred] -> Type -> Maybe (Name, Name)
+classMethodHint ienv methodName preds body = case preds of
     [Pred cls (TyVar v)]
       | Set.member v (freeTyVars body)
-      , isActualClassMethod methodName ->
+      , isActualClassMethod ienv methodName ->
             Just (cls, v)
     _ -> Nothing
 
@@ -305,20 +313,16 @@ classMethodHint methodName preds body = case preds of
 -- tyvar appears in the body" shape (@array :: Ix i => (i, i) -> [(i,
 -- e)] -> Array i e@) through the class dispatcher.
 --
--- 'unsafePerformIO' is safe because the referenced 'IORef' is
--- write-once-mostly (populated by the scheduler at program start) and
--- reads are commutative.
-isActualClassMethod :: Name -> Bool
-isActualClassMethod name =
-    name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)
+isActualClassMethod :: InferEnv -> Name -> Bool
+isActualClassMethod ienv name =
+    Set.member name (ieClassMethodNames ienv)
 
 -- | Does this bare name have CONFLICTING signatures across the loaded modules
 -- (so the flat 'globalTypeSigsRef' entry is whichever module loaded last)?
 -- See 'IHC.Scheduler.mirrorTypeSigsGlobal' / 'globalAmbiguousSigsRef'.  Same
--- 'unsafePerformIO' justification as 'isActualClassMethod'.
-isAmbiguousSig :: Name -> Bool
-isAmbiguousSig name =
-    name `Set.member` unsafePerformIO (readIORef globalAmbiguousSigsRef)
+isAmbiguousSig :: InferEnv -> Name -> Bool
+isAmbiguousSig ienv name =
+    Set.member name (ieAmbiguousSigs ienv)
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)
@@ -655,4 +659,3 @@ tokenize bs
                      || c == '.'
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
-

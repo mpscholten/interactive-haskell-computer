@@ -15,6 +15,9 @@ module IHC.Builtins
     , stringToListValIO
     , clearCtorIndex
     , clearForeignPtrWord8Ranges
+    , flushHostHandleBuffer
+    , isHostWord8PtrVal
+    , pokeHostWord8ByteOff
     , reapSpawnedThreads
     ) where
 
@@ -151,6 +154,30 @@ isMarkedWord8Ptr p =
     let addr = ptrToIntPtr (castPtr p)
     in any (\(start, end) -> addr >= start && addr < end)
         <$> readIORef foreignPtrWord8RangesRef
+
+isHostWord8PtrVal :: Val -> IO Bool
+isHostWord8PtrVal v = do
+    p <- ptrValToPtr v
+    isMarkedWord8Ptr p
+
+pokeHostWord8ByteOff :: Val -> Val -> Val -> IO Val
+pokeHostWord8ByteOff ptrV offV valV = do
+    p <- ptrValToPtr ptrV
+    case offV of
+        VInt off -> do
+            byte <- word8FromVal valV
+            pokeByteOff (p :: Ptr Word8) (fromIntegral off) byte
+            pure VUnit
+        _ -> error ("pokeHostWord8ByteOff: bad offset: " <> showValForDebug offV)
+  where
+    word8FromVal (VInt n) =
+        pure (fromIntegral n :: Word8)
+    word8FromVal (VInteger n) =
+        pure (fromInteger n :: Word8)
+    word8FromVal (VChar c) =
+        pure (fromIntegral (ord c) :: Word8)
+    word8FromVal other =
+        error ("pokeHostWord8ByteOff: bad byte: " <> showValForDebug other)
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
@@ -820,11 +847,15 @@ builtins reg =
     , ("leAddr#",     addrCmpHashB (<=))
     , ("gtAddr#",     addrCmpHashB (>))
     , ("geAddr#",     addrCmpHashB (>=))
-    -- GHC.Prim-only raw-address Int access.  Source-loaded
-    -- GHC.Internal.Storable defines writeIntOffPtr/readIntOffPtr in terms of
+    -- GHC.Prim-only raw-address access.  Source-loaded
+    -- GHC.Internal.Storable defines write*OffPtr/read*OffPtr in terms of
     -- these primops; there is no .hs implementation to interpret below them.
     , ("readIntOffAddr#",  readIntOffAddrHashB)
     , ("writeIntOffAddr#", writeIntOffAddrHashB)
+    , ("readWord8OffAddr#",  readWord8OffAddrHashB)
+    , ("writeWord8OffAddr#", writeWord8OffAddrHashB)
+    , ("readWideCharOffAddr#",  readWideCharOffAddrHashB)
+    , ("writeWideCharOffAddr#", writeWideCharOffAddrHashB)
     -- Ptr arithmetic (plusPtr/minusPtr/nullPtr/castPtr) is now
     -- source-loaded from GHC.Internal.Ptr — its bodies bottom on
     -- plusAddr#/minusAddr#/nullAddr#/coerce, all already available.
@@ -3324,9 +3355,10 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
 -- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
 -- The MVar keeps the host 'Handle' in @haDevice@ and exposes enough of
 -- GHC's source-level @Handle__@ record shape for source handle helpers
--- to pattern-match on @Handle__ {..}@.  Buffers are deliberately
--- no-buffering placeholders: ordinary byte/char IO is still performed by
--- host-backed primitives such as 'hPutCharB' and 'hGetLineB'.
+-- to pattern-match on @Handle__ {..}@.  The buffers only carry enough
+-- shape for source handle helpers to allocate their own spare buffers;
+-- ordinary byte/char IO is still performed by host-backed primitives such
+-- as 'hPutCharB' and 'hGetLineB'.
 mkFileHandleVal :: String -> Handle -> IOMode -> IO Val
 mkFileHandleVal path h mode = do
     pathT <- newWHNFThunk =<< stringToListValIO path
@@ -3340,7 +3372,7 @@ mkHandleStateVal h mode = do
     handleT     <- newWHNFThunk (VPrimObj (PrimHandle h))
     typeT       <- newWHNFThunk (handleTypeVal mode)
     byteBufT    <- newWHNFThunk =<< (mkEmptyReadBufferVal >>= mkIORefVal)
-    modeT       <- newWHNFThunk (VCon "NoBuffering" [])
+    modeT       <- newWHNFThunk (VCon "LineBuffering" [])
     unitT       <- newWHNFThunk VUnit
     lastBufT    <- newWHNFThunk =<< mkEmptyReadBufferVal
     lastDecodeT <- newWHNFThunk =<< mkIORefVal (VCon "(,)" [unitT, lastBufT])
@@ -3382,13 +3414,52 @@ handleTypeVal ReadWriteMode = VCon "ReadWriteHandle" []
 
 mkEmptyReadBufferVal :: IO Val
 mkEmptyReadBufferVal = do
-    rawT    <- newWHNFThunk (VPrimObj (PrimPtr nullPtr))
+    fp      <- mallocForeignPtrBytes (handleBufferSize * 4)
+    markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (handleBufferSize * 4)
+    rawT    <- newWHNFThunk =<< mkForeignPtrVal fp
     stateT  <- newWHNFThunk (VCon "ReadBuffer" [])
-    sizeT   <- newWHNFThunk (VInt 1)
+    -- GHC's source text output path asks for a spare char buffer sized
+    -- from haCharBuffer.  A one-slot placeholder makes writeLines commit
+    -- zero chars forever because it always keeps room for the next char.
+    sizeT   <- newWHNFThunk (VInt (fromIntegral handleBufferSize))
     offsetT <- newWHNFThunk (VInt 0)
     leftT   <- newWHNFThunk (VInt 0)
     rightT  <- newWHNFThunk (VInt 0)
     pure (VCon "Buffer" [rawT, stateT, sizeT, offsetT, leftT, rightT])
+
+handleBufferSize :: Int
+handleBufferSize = 4096
+
+-- | Flush a source-level @Buffer Word8@ through a synthetic host-backed
+-- Handle__ device.  The source @BufferedIO FD@ instance cannot apply to
+-- our @PrimHandle@ device, but the actual device write is RTS-exclusive:
+-- copy the pending byte range to the host 'Handle' and return an emptied
+-- source buffer.
+flushHostHandleBuffer :: Val -> Val -> IO (Maybe Val)
+flushHostHandleBuffer devV bufV = case (devV, bufV) of
+    (VPrimObj (PrimHandle h), VCon "Buffer" [rawT, stateT, sizeT, offsetT, leftT, rightT]) -> do
+        rawV   <- force legacyHooks rawT
+        stateV <- force legacyHooks stateT
+        sizeV  <- force legacyHooks sizeT
+        offV   <- force legacyHooks offsetT
+        leftV  <- force legacyHooks leftT
+        rightV <- force legacyHooks rightT
+        fp <- foreignPtrValToForeignPtr rawV
+        case (leftV, rightV) of
+            (VInt l, VInt r)
+                | r > l -> withForeignPtr fp $ \p ->
+                    hPutBuf h (castPtr (p `plusPtr` fromIntegral l))
+                        (fromIntegral (r - l))
+            _ -> pure ()
+        hFlush h
+        rawT'   <- newWHNFThunk rawV
+        stateT' <- newWHNFThunk stateV
+        sizeT'  <- newWHNFThunk sizeV
+        offT'   <- newWHNFThunk offV
+        leftT'  <- newWHNFThunk (VInt 0)
+        rightT' <- newWHNFThunk (VInt 0)
+        pure (Just (VCon "Buffer" [rawT', stateT', sizeT', offT', leftT', rightT']))
+    _ -> pure Nothing
 
 nothingVal :: Val
 nothingVal = VCon "Nothing" []
@@ -4542,6 +4613,76 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                         (fromIntegral n :: Int)
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @readWord8OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Word8# #)@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Word8@.
+readWord8OffAddrHashB :: IO Val
+readWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                        pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            nT  <- newWHNFThunk (VInt (fromIntegral n))
+            pure (VCon "(#,#)" [stT, nT])
+        _ -> error ("readWord8OffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeWord8OffAddr# :: Addr# -> Int# -> Word8# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Word8@.
+writeWord8OffAddrHashB :: IO Val
+writeWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                         pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV  <- force legacyHooks valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
+            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
+                        (fromIntegral n :: Word8)
+            pure (VPrimObj PrimRealWorld)
+        (VPrimObj (PrimPtr p), VInt i, VInteger n) -> do
+            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
+                        (fromInteger n :: Word8)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeWord8OffAddr#: bad args: "
+                    <> showValForDebug addrV <> ", "
+                    <> showValForDebug idxV <> ", "
+                    <> showValForDebug valV)
+
+-- | @readWideCharOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Char# #)@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Char@.
+readWideCharOffAddrHashB :: IO Val
+readWideCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                           pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (castPtr p :: Ptr Word32) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            cT  <- newWHNFThunk (VChar (chr (fromIntegral n)))
+            pure (VCon "(#,#)" [stT, cT])
+        _ -> error ("readWideCharOffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeWideCharOffAddr# :: Addr# -> Int# -> Char# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Char@.
+writeWideCharOffAddrHashB :: IO Val
+writeWideCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                            pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV  <- force legacyHooks valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VChar c) -> do
+            pokeElemOff (castPtr p :: Ptr Word32) (fromIntegral i)
+                        (fromIntegral (ord c) :: Word32)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeWideCharOffAddr#: bad args: "
+                    <> showValForDebug addrV <> ", "
+                    <> showValForDebug idxV <> ", "
+                    <> showValForDebug valV)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: ForeignPtr

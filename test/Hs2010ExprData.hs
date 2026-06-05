@@ -47,16 +47,16 @@ spec = describe "Hs2010 — Expression collections & records" $ do
                 EApp (EApp (EVar ":") (ELit (LInt 1)))
                     (EApp (EApp (EVar ":") (ELit (LInt 2)))
                         (EApp (EApp (EVar ":") (ELit (LInt 3))) (EVar "[]")))
-        it "5.8.4 arithmetic seq, from `[1..]` (parser drops `..`, gap)" $
+        it "5.8.4 arithmetic seq, from `[1..]`" $
             "[1..]" `shouldParseTo`
-                EApp (EApp (EVar ":") (ELit (LInt 1))) (EVar "[]")
+                EApp (EVar "enumFrom") (ELit (LInt 1))
         it "5.8.5 arithmetic seq, from-to `[1..10]`" $
             "[1..10]" `shouldParseTo`
                 EApp (EApp (EVar "enumFromTo") (ELit (LInt 1))) (ELit (LInt 10))
-        it "5.8.6 arithmetic seq, from-then `[1,3..]` (parser drops `..`, gap)" $
+        it "5.8.6 arithmetic seq, from-then `[1,3..]`" $
             "[1,3..]" `shouldParseTo`
-                EApp (EApp (EVar ":") (ELit (LInt 1)))
-                    (EApp (EApp (EVar ":") (ELit (LInt 3))) (EVar "[]"))
+                EApp (EApp (EVar "enumFromThen") (ELit (LInt 1)))
+                    (ELit (LInt 3))
         it "5.8.7 arithmetic seq, from-then-to `[1,3..9]`" $
             "[1,3..9]" `shouldParseTo`
                 EApp (EApp (EApp (EVar "enumFromThenTo") (ELit (LInt 1)))

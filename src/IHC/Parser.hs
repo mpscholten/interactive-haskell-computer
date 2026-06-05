@@ -1754,7 +1754,7 @@ parseDoLet ctx cur0 = do
                     pure ([SImplicitLet iBinds], curEnd)
                 _ -> do
                     (binds, curEnd) <- bracedBinds curAfter []
-                    pure ([SLet binds], curEnd)
+                    pure (doLetStmts binds, curEnd)
         -- Per Haskell Report §3.17.2 + GHC BangPatterns: `let !x = e`
         -- inside a do-block must force e to WHNF before the rest of the
         -- block runs. Lower the simple single-binding form to
@@ -1783,7 +1783,7 @@ parseDoLet ctx cur0 = do
                                 else do
                                     -- Multi-binding let; fall back to layout.
                                     (binds, curEnd) <- layoutBinds bindCol cur0 []
-                                    pure ([SLet binds], curEnd)
+                                    pure (doLetStmts binds, curEnd)
                         _ -> fallbackLayout firstTok
                 _ -> fallbackLayout firstTok
         _ -> fallbackLayout firstTok
@@ -1792,7 +1792,9 @@ parseDoLet ctx cur0 = do
         let bindCol = tkCol firstTok
         in do
             (binds, curEnd) <- layoutBinds bindCol cur0 []
-            pure ([SLet binds], curEnd)
+            pure (doLetStmts binds, curEnd)
+
+    doLetStmts binds = [SLet binds]
 
     parseImplicitDoBinds bindCol cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
@@ -1861,6 +1863,7 @@ parseDoLet ctx cur0 = do
                 pure (desugarClauses [([], RhsGuards branches)] 0, cur3')
             _ -> parseErr ctx "expected `=` or `|` in pattern let-binding" sepTok
         let tmpName = BC.pack ("$doPat" ++ show n)
+            strictName = BC.pack ("$doPatStrict" ++ show n)
             vars    = doLetPatVars pat
             perVar v =
                 ( v
@@ -1871,8 +1874,23 @@ parseDoLet ctx cur0 = do
                                     "Non-exhaustive pattern in let"))
                     ]
                 )
-            newBinds = (tmpName, rhsE) : map perVar vars
+            strictBind =
+                ( strictName
+                , ECase (EVar tmpName)
+                    [ Alt pat (EVar "()")
+                    , Alt PWild (EApp (EVar "error")
+                                  (stringToConsList
+                                    "Non-exhaustive pattern in strict let"))
+                    ]
+                )
+            newBinds =
+                (tmpName, rhsE)
+                : map perVar vars
+                ++ [strictBind | isStrictDoLetPat pat]
         pure (newBinds, cur3)
+
+    isStrictDoLetPat (PBang _) = True
+    isStrictDoLetPat _         = False
 
     parseDoLetClauseRaw bindCol cur = do
         let (nameTok, cur1) = nextSig ctx cur
@@ -2151,6 +2169,11 @@ parseLet ctx cur0 = do
             --   let $patN = rhs
             --       a = case $patN of { (a, _) -> a; _ -> error }
             --       b = case $patN of { (_, b) -> b; _ -> error }
+            -- For a strict pattern binding (`let !pat = rhs`), also wrap
+            -- the body in a case on the shared temporary.  The projection
+            -- bindings stay in the recursive let group so sibling RHSs can
+            -- still refer to the pattern variables, but the body now has the
+            -- strictness edge that source IO/state loops rely on.
             let tmpName = BC.pack ("$pat" ++ show (length normalAcc))
                 vars = letPatVars pat
                 perVarBind v =
@@ -2162,7 +2185,19 @@ parseLet ctx cur0 = do
                                         "Non-exhaustive pattern in let"))
                         ]
                     )
-            in ((tmpName, rhsE) : map perVarBind vars ++ normalAcc, bodyAcc)
+                bodyAcc'
+                    | isStrictLetPat pat =
+                        ECase (EVar tmpName)
+                            [ Alt pat bodyAcc
+                            , Alt PWild (EApp (EVar "error")
+                                          (stringToConsList
+                                            "Non-exhaustive pattern in strict let"))
+                            ]
+                    | otherwise = bodyAcc
+            in ((tmpName, rhsE) : map perVarBind vars ++ normalAcc, bodyAcc')
+
+        isStrictLetPat (PBang _) = True
+        isStrictLetPat _         = False
 
         letPatVars (PVar n)        = [n]
         letPatVars (PAs n p)       = n : letPatVars p
@@ -2227,20 +2262,7 @@ parseLet ctx cur0 = do
                 case tkKind eqTok of
                     TkEq -> do
                         (e, cur4) <- parseExpr rhsCtx cur3
-                        -- @let !x = e@ is just a strict simple-name binding;
-                        -- since IHC currently ignores the strictness annotation
-                        -- (Parser.hs:20) we strip the bang and treat it as a
-                        -- normal @Left (x, e)@ binding.  This matters for
-                        -- mixed multi-binding lets like
-                        --   @let !d = ...; go_up x = ... d ... in ...@
-                        -- (e.g. @GHC.Enum.efdtIntUp@): pattern bindings are
-                        -- desugared via a @case@-projection that only binds the
-                        -- pattern's variables inside the alt's body, not in
-                        -- the surrounding @ELet@ siblings, so without this
-                        -- strip the inner @go_up@ would see @d@ as unbound.
-                        case pat of
-                            PBang (PVar n) -> pure (Left (n, e), cur4)
-                            _              -> pure (Right (pat, e), cur4)
+                        pure (Right (pat, e), cur4)
                     _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
               | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
 
