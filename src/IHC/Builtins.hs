@@ -1364,10 +1364,27 @@ builtins reg =
     , ("GHC.Conc.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Conc.IO.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Internal.Conc.IO.threadWaitWrite", threadWaitWriteB)
-    -- IHC does not run GHC's RTS event manager.  Source modules such as
-    -- auto-update branch on this probe; returning Nothing selects their
-    -- ordinary threadDelay/forkIO implementation instead of the event-manager
-    -- backend.
+    -- GHC.Internal.Event.Thread.threadWait — single choke point for the IO
+    -- socket-wait path; delegates to the host RTS IO manager.
+    , ("threadWait", threadWaitB)
+    , ("GHC.Event.Thread.threadWait", threadWaitB)
+    , ("GHC.Internal.Event.Thread.threadWait", threadWaitB)
+    -- GHC.Internal.Event.Manager.registerFd / unregisterFd_ — the event-manager
+    -- registration both threadWait (IO) and threadWaitSTM (the cancellable STM
+    -- wait network/warp use for recv) funnel through after getSystemEventManager_.
+    -- IHC does not run the RTS event manager; emulate a OneShot registration on
+    -- the host RTS IO manager (see 'registerFdB').
+    , ("registerFd", registerFdB)
+    , ("GHC.Event.Manager.registerFd", registerFdB)
+    , ("GHC.Internal.Event.Manager.registerFd", registerFdB)
+    , ("unregisterFd_", unregisterFd_B)
+    , ("GHC.Event.Manager.unregisterFd_", unregisterFd_B)
+    , ("GHC.Internal.Event.Manager.unregisterFd_", unregisterFd_B)
+    -- IHC does not run GHC's RTS event manager.  We return a stub 'Just mgr'
+    -- (see 'getSystemEventManagerB') so the threaded socket-wait path
+    -- (threadWait / threadWaitSTM) proceeds via our host-backed registerFd.
+    -- Code branching on this probe (auto-update's mkAutoUpdate) then takes the
+    -- event-manager backend, routed through the host-backed timer manager.
     , ("getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Event.Thread.getSystemEventManager", getSystemEventManagerB)
@@ -6875,6 +6892,66 @@ threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
     threadWaitWrite (fromIntegral n)
     pure VUnit
 
+threadWaitB :: IO Val
+threadWaitB = pure $ VFun $ \evtT -> pure $ VFun $ \fdT -> pure $ VIO $ do
+    fd  <- fdArgToInt fdT "threadWait"
+    evt <- eventBitsOf evtT
+    if evt .&. 2 /= 0
+        then threadWaitWrite (fromIntegral fd)
+        else threadWaitRead  (fromIntegral fd)
+    pure VUnit
+
+-- | Extract the 'GHC.Internal.Event.Internal.Types.Event' bitmask
+-- (@evtRead = Event 1@, @evtWrite = Event 2@) from a runtime value.  'Event'
+-- is a newtype, so the value is either the bare Int or @Con [Int]@.  Defaults
+-- to read (1) for any unexpected shape.
+eventBitsOf :: Thunk -> IO Int64
+eventBitsOf t = do
+    v <- force legacyHooks t
+    case v of
+        VInt n          -> pure n
+        VCon _ [innerT]  -> do
+            iv <- force legacyHooks innerT
+            case iv of
+                VInt n -> pure n
+                _      -> pure 1
+        _ -> pure 1
+
+-- | @registerFd :: EventManager -> IOCallback -> Fd -> Event -> Lifetime -> IO FdKey@
+-- (GHC.Internal.Event.Manager).  IHC does not run the RTS event manager, so we
+-- emulate a OneShot registration with a host thread: wait on the fd through the
+-- host RTS IO manager (read or write per the 'Event' bitmask), then fire the
+-- interpreted callback as @cb fdKey evt@.  This is the single choke point both
+-- the IO wait path ('threadWait') and the STM wait path ('threadWaitSTM', used
+-- by network/warp for cancellable recv) reduce to after 'getSystemEventManager_'.
+-- The 'EventManager' and 'FdKey' are opaque: the callback ignores the FdKey and
+-- our 'unregisterFd_' ignores both.
+registerFdB :: IO Val
+registerFdB = pure $ VFun $ \_mgrT -> pure $ VFun $ \cbT -> pure $ VFun $ \fdT ->
+    pure $ VFun $ \evtT -> pure $ VFun $ \_lifeT -> pure $ VIO $ do
+        fd  <- fdArgToInt fdT "registerFd"
+        evt <- eventBitsOf evtT
+        cbV <- force legacyHooks cbT
+        fdKeyT <- newWHNFThunk (VCon "FdKey" [])
+        _ <- forkIO $ do
+            if evt .&. 2 /= 0
+                then threadWaitWrite (fromIntegral fd)
+                else threadWaitRead  (fromIntegral fd)
+            -- cb fdKey evt :: IO ()
+            r1 <- apply legacyHooks cbV fdKeyT
+            r2 <- apply legacyHooks r1 evtT
+            _  <- runIOVal legacyHooks r2
+            pure ()
+        force legacyHooks fdKeyT
+
+-- | @unregisterFd_ :: EventManager -> FdKey -> IO Bool@.  The OneShot waiter
+-- 'registerFdB' spawned self-completes, so there is nothing to deregister;
+-- report success.  (On the cancel path the waiter may linger until the fd
+-- becomes ready — harmless for the common warp recv path.)
+unregisterFd_B :: IO Val
+unregisterFd_B = pure $ VFun $ \_mgrT -> pure $ VFun $ \_regT -> pure $ VIO $
+    pure (boolVal True)
+
 -- | Unwrap a @Fd@-like argument to its underlying @Int@.  Accepts the
 -- common shapes the source @System.Posix.Types.Fd@ newtype can take
 -- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
@@ -6891,7 +6968,9 @@ fdArgToInt t primName = do
         _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
 
 getSystemEventManagerB :: IO Val
-getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
+getSystemEventManagerB = pure $ VIO $ do
+    mgrT <- newWHNFThunk (VCon "IhcEventManager" [])
+    pure (VCon "Just" [mgrT])
 
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
