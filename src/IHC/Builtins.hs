@@ -89,9 +89,6 @@ import System.IO
     , stdin
     , stdout
     )
-import qualified System.Posix.IO as PosixIO
-import System.Posix.Types (Fd)
-
 import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
@@ -404,6 +401,10 @@ builtins reg =
     -- short-circuit the class-method dispatcher (separate workstream:
     -- @RealFloat Double.encodeFloat@ instance method registration
     -- isn't surfacing through dispatch; the host shim bypasses).
+    -- Kept for now: source @fromIntegral = fromInteger . toInteger@ needs the
+    -- result type to drive @fromInteger@ dispatch. IHC's current annotation
+    -- elaboration loses that, so @fromIntegral (toInteger n) :: Int@ reaches an
+    -- @Integral/toInteger@ placeholder (see prelude_to_integer).
     [ ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
@@ -1259,30 +1260,10 @@ builtins reg =
     -- registers all Settings fields in lmFieldReg, and tryFieldSlot
     -- synthesises the accessors automatically.  Helpers warpSettings*B
     -- and settingsFieldB went with them.
-    -- Network.Socket AddrInfo record-field accessors.  The host backing
-    -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
-    -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
-    -- 'Network.Wai.Handler.Warp.Run' calls @NS.addrFamily@ etc. on the
-    -- result, so each accessor needs a builtin that pulls the
-    -- corresponding field index.
-    , ("addrFlags",      addrInfoFieldB "addrFlags" 0)
-    , ("Network.Socket.addrFlags", addrInfoFieldB "addrFlags" 0)
-    , ("Network.Socket.Info.addrFlags", addrInfoFieldB "addrFlags" 0)
-    , ("addrFamily",     addrInfoFieldB "addrFamily" 1)
-    , ("Network.Socket.addrFamily", addrInfoFieldB "addrFamily" 1)
-    , ("Network.Socket.Info.addrFamily", addrInfoFieldB "addrFamily" 1)
-    , ("addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("Network.Socket.addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("Network.Socket.Info.addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("addrProtocol",   addrInfoFieldB "addrProtocol" 3)
-    , ("Network.Socket.addrProtocol", addrInfoFieldB "addrProtocol" 3)
-    , ("Network.Socket.Info.addrProtocol", addrInfoFieldB "addrProtocol" 3)
-    , ("addrAddress",    addrInfoFieldB "addrAddress" 4)
-    , ("Network.Socket.addrAddress", addrInfoFieldB "addrAddress" 4)
-    , ("Network.Socket.Info.addrAddress", addrInfoFieldB "addrAddress" 4)
-    , ("addrCanonName",  addrInfoFieldB "addrCanonName" 5)
-    , ("Network.Socket.addrCanonName", addrInfoFieldB "addrCanonName" 5)
-    , ("Network.Socket.Info.addrCanonName", addrInfoFieldB "addrCanonName" 5)
+    -- Network.Socket AddrInfo field accessors source-load from
+    -- Network.Socket.Info. The host getAddrInfo syscall below still builds the
+    -- source constructor shape, so the normal field registry can synthesize
+    -- addrFlags/addrFamily/etc.
     -- Network.Socket.getAddrInfo: host @getaddrinfo(3)@.  warp's listen
     -- pipeline calls it through streaming-commons' bindPortGenEx.  We
     -- ignore hints (NULL) for now — the OS gives back a TCP-stream-
@@ -1452,21 +1433,10 @@ builtins reg =
     , ("withHandleKillThread", timeManagerWithHandleB)
     , ("System.TimeManager.withHandle", timeManagerWithHandleB)
     , ("System.TimeManager.withHandleKillThread", timeManagerWithHandleB)
-    -- @System.TimeManager.initialize@ / @stopManager@ are RTS-tied helpers
-    -- (their upstream definitions just box / unbox a 'Manager Int' since the
-    -- timeout work itself is delegated to the GHC RTS timer manager).  IHC
-    -- skips that backend entirely, so the bare-name and qualified bindings
-    -- both resolve to no-op host shims that keep warp's @withII@ happy.
-    , ("initialize", timeManagerInitializeB)
-    , ("System.TimeManager.initialize", timeManagerInitializeB)
-    , ("stopManager", timeManagerStopManagerB)
-    , ("System.TimeManager.stopManager", timeManagerStopManagerB)
-    -- System.Posix.IO comes from the boot `unix` package, whose source is
-    -- not present in ~/.cache/ihc/sources for this run.  setFdOption mutates
-    -- an OS file descriptor flag; expose the host operation so Warp can mark
-    -- accepted/listening sockets CloseOnExec during startup.
-    , ("setFdOption", setFdOptionB)
-    , ("System.Posix.IO.setFdOption", setFdOptionB)
+    -- System.TimeManager.initialize / stopManager source-load: upstream
+    -- definitions are ordinary Haskell wrappers around the Manager newtype.
+    -- System.Posix.IO.setFdOption source-loads from unix and bottoms out in
+    -- System.Posix.Internals.c_fcntl_read/write foreign imports.
     -- Phase 2.10a: MVar
     --
     -- Source-loaded MVar operations (GHC.Internal.MVar.takeMVar etc.)
@@ -3668,7 +3638,7 @@ fromIntegralB = pure $ VFun $ \a -> do
         VFloat d -> pure (VFloat d)
         VChar c  -> pure (VInt (fromIntegral (ord c)))
         -- Newtype numeric wrappers we handle by name so we don't eat
-        -- every single-field constructor (ST, Identity, Maybe-Just, …).
+        -- every single-field constructor (ST, Identity, Maybe-Just, ...).
         VCon c [t]
           | c `elem` numericNewtypeCons -> do
               inner <- force legacyHooks t
@@ -3689,7 +3659,7 @@ fromIntegralB = pure $ VFun $ \a -> do
         --   data Integer = IS !Int# | IP !ByteArray# | IN !ByteArray#
         -- The 'IS' constructor (small Integer fitting in an Int) flows
         -- here when source-loaded numeric code constructs an Integer
-        -- and warp/wai then runs it through 'fromIntegral'.  Treat it
+        -- and warp/wai then runs it through 'fromIntegral'. Treat it
         -- as the Int it wraps.
         , "IS"
         ]
@@ -5379,18 +5349,6 @@ freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
     p <- ptrValToPtr ptrV
     free p
     pure VUnit
-
--- | Generic field accessor for the host-built @VCon "AddrInfo" [flags,
--- family, socktype, protocol, addr, canonName]@ value.  Used to back
--- @addrFamily@ / @addrAddress@ / etc. when warp's source code accesses
--- record fields on a host-constructed AddrInfo.
-addrInfoFieldB :: String -> Int -> IO Val
-addrInfoFieldB label idx = pure $ VFun $ \aiT -> do
-    aiV <- force legacyHooks aiT
-    case aiV of
-        VCon "AddrInfo" fields
-            | idx < length fields -> force legacyHooks (fields !! idx)
-        other -> error (label <> ": not AddrInfo: " <> showValForDebug other)
 
 sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
 sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
@@ -7183,46 +7141,6 @@ timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT 
         keyRefT <- newWHNFThunk VUnit
         stateT <- newWHNFThunk VUnit
         pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
-
--- | @System.TimeManager.initialize :: Int -> IO Manager@.  Upstream's
--- implementation since time-manager 0.3.0 is just @pure . Manager . max 0@,
--- since timeouts are implemented via the GHC RTS timer manager.  IHC does
--- not run the RTS timer manager either, so we mirror the same behaviour:
--- box the (clamped) timeout value into a @Manager@ constructor and hand it
--- back. 'timeManagerWithHandleB' / 'timeManagerStopManagerB' do not look at
--- the payload, so any well-formed @VCon "Manager" [VInt n]@ is fine.
-timeManagerInitializeB :: IO Val
-timeManagerInitializeB = pure $ VFun $ \timeoutT -> pure $ VIO $ do
-    timeoutV <- force legacyHooks timeoutT
-    case timeoutV of
-        VInt n -> do
-            nT <- newWHNFThunk (VInt (max 0 n))
-            pure (VCon "Manager" [nT])
-        other -> error ("System.TimeManager.initialize: not an Int: " <> showValForDebug other)
-
--- | @System.TimeManager.stopManager :: Manager -> IO ()@.  Upstream marked
--- this as deprecated in 0.3.0 and now defines it as @\\_ -> pure ()@; we do
--- the same.
-timeManagerStopManagerB :: IO Val
-timeManagerStopManagerB = pure $ VFun $ \_mgrT -> pure $ VIO $ pure VUnit
-
-setFdOptionB :: IO Val
-setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
-    fdV <- force legacyHooks fdT
-    enabledV <- force legacyHooks enabledT
-    fd <- unwrapFd fdV
-    PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
-    pure VUnit
-  where
-    -- Accept either a raw VInt (host-backed sockets pass the raw fd) or
-    -- the @Fd@ newtype wrapper @VCon "Fd" [VInt _]@ (source code that
-    -- imports @System.Posix.Types (Fd)@ and constructs values through
-    -- the constructor).
-    unwrapFd (VInt n) = pure n
-    unwrapFd (VCon "Fd" [innerT]) = do
-        innerV <- force legacyHooks innerT
-        unwrapFd innerV
-    unwrapFd other = error ("setFdOption: not an fd: " <> showValForDebug other)
 
 -- | @getNumCapabilities@ - return 1 (simplified).
 getNumCapabilitiesB :: IO Val
