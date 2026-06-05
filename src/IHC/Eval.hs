@@ -31,6 +31,7 @@ import Control.Concurrent (myThreadId, yield)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Char (ord)
 import Data.Int (Int64)
 import Data.IORef
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
@@ -1024,6 +1025,29 @@ patternVars (PRecord _ fps)  = concatMap (patternVars . snd) fps
 patternVars (PRecordWild _)  = []
 patternVars (PView _ p)      = patternVars p
 
+-- Numeric newtypes whose constructors are representation-transparent after
+-- source-loaded coerce/fromIntegral paths. Keep this explicit; unwrapping every
+-- single-field constructor would make ordinary ADTs match primitive patterns.
+numericNewtypeCons :: [Name]
+numericNewtypeCons =
+    [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
+    , "CShort", "CUShort", "CLLong", "CULLong"
+    , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
+    , "Int8", "Int16", "Int32", "Int64"
+    , "Word", "Word8", "Word16", "Word32", "Word64"
+    ]
+
+intSizedPrimCons :: [Name]
+intSizedPrimCons = ["I8#", "I16#", "I32#", "I64#"]
+
+wordSizedPrimCons :: [Name]
+wordSizedPrimCons = ["W8#", "W16#", "W32#", "W64#"]
+
+bareConName :: Name -> Name
+bareConName n = case BC.elemIndexEnd '.' n of
+    Just idx -> BC.drop (idx + 1) n
+    Nothing  -> n
+
 -- | Attempt to match a constructor pattern against a value via the
 -- pattern synonym registry: if @name@ is registered as a pattern
 -- synonym with parameters @ps@ and body @b@, substitute @ps -> args@
@@ -1152,11 +1176,16 @@ matchPat hooks pat@(PCon boolCtor []) (VCon wrapper [innerT])
 -- Boxed prim constructors are host-backed wrappers over the interpreter's
 -- primitive runtime values. Pattern matching must therefore treat
 -- @I# x@ / @W# x@ / @W8# x@ as wrappers around 'VInt' and @C# x@ as a
--- wrapper around 'VChar'; otherwise source bindings like
+-- wrapper around 'VChar'.  Some Char#/Int# source paths also cross this
+-- representation boundary: @chr#@ yields a 'VChar', while a later source
+-- @I#@ match wants the ordinal Int# payload.  Otherwise source bindings like
 -- @new (I# len#) = ...@ never match and libraries such as @text@ fail at
 -- first use after discovery succeeds.
 matchPat hooks (PCon "I#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VChar c) = do
+    t <- newWHNFThunk (VInt (fromIntegral (ord c)))
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "I#" [p]) (VInteger n)
     | n >= toInteger (minBound :: Int64)
@@ -1176,10 +1205,31 @@ matchPat hooks (PCon "I#" [p]) (VInteger n)
 -- Int#-shaped boxed scalar.
 matchPat hooks (PCon "I#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
+matchPat hooks pat@(PCon "I#" [_]) (VCon c [t])
+    | bareConName c `elem` numericNewtypeCons = do
+        inner <- force hooks t
+        matchPat hooks pat inner
+matchPat hooks (PCon "I#" [p]) (VCon c [t])
+    | bareConName c `elem` intSizedPrimCons =
+        matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
+matchPat hooks pat@(PCon "W#" [_]) (VCon c [t])
+    | bareConName c `elem` numericNewtypeCons = do
+        inner <- force hooks t
+        matchPat hooks pat inner
+matchPat hooks (PCon "W#" [p]) (VCon c [t])
+    | bareConName c `elem` wordSizedPrimCons =
+        matchFields hooks [(p, t)] []
+matchPat hooks pat@(PCon "W8#" [_]) (VCon c [t])
+    | bareConName c `elem` numericNewtypeCons = do
+        inner <- force hooks t
+        matchPat hooks pat inner
+matchPat hooks (PCon "W8#" [p]) (VCon c [t])
+    | bareConName c `elem` wordSizedPrimCons =
+        matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VInt n) = do
     t <- newWHNFThunk (VInt n)
     matchFields hooks [(p, t)] []
@@ -1198,6 +1248,9 @@ matchPat hooks (PCon "W8#" [p]) (VInteger n)
         matchFields hooks [(p, t)] []
 matchPat hooks (PCon "C#" [p]) (VChar c) = do
     t <- newWHNFThunk (VChar c)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "C#" [p]) v@(VInt _) = do
+    t <- newWHNFThunk v
     matchFields hooks [(p, t)] []
 -- F# / D#: source-loaded Num Float / Num Double instance bodies
 -- pattern-match on these to access the underlying Float# / Double#.
@@ -1282,6 +1335,12 @@ matchPat hooks (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
     t <- newWHNFThunk prim
+    matchFields hooks [(p, t)] []
+-- System.Posix.Types.Fd is a source-loaded newtype over a CInt.  Host-backed
+-- socket helpers expose the live fd as a plain VInt, so make Fd transparent at
+-- the pattern boundary for source code and FFI wrappers that unwrap it.
+matchPat hooks (PCon "Fd" [p]) v@(VInt _) = do
+    t <- newWHNFThunk v
     matchFields hooks [(p, t)] []
 -- (PCon "Ptr" against VPrimObj PrimPtr is already handled by the
 -- existing clause further down in this file — the source-loaded
