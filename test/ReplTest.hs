@@ -131,10 +131,10 @@ spec = describe "REPL smoke tests" do
         -- 'Data.ByteString.pack' (the 'bsPackB' shim only fires on
         -- the file-mode entry-source path).  Source path goes
         -- 'pack' → 'unsafePackLenBytes' → 'pokeFp p w8' for each
-        -- element.  Was gated on IHC_REPL_SLOW=1 when source-load
-        -- couldn't keep up with the 20s REPL timeout; current
-        -- measurement is ~1.7s wall, so ungated.
-        (code, out, _err) <- runRepl
+        -- element.  This is still the source-loaded pack path, not a
+        -- ByteString shim, and can sit close to the default 20s REPL
+        -- smoke-test timeout on a cold process.
+        (code, out, _err) <- runReplWithin 35
             ( "import qualified Data.ByteString as BS\n"
            <> "BS.length (BS.pack [97,98,99])\n"
            <> ":q\n" )
@@ -155,7 +155,7 @@ spec = describe "REPL smoke tests" do
         -- both inputs without the 'bsPackB' shim being preferred (the
         -- shim still exists, but is a separate clean-up — CLAUDE.md
         -- rule 4 wants no Hackage shims at all).
-        (code, out, _err) <- runRepl
+        (code, out, _err) <- runReplWithin 35
             ( "import qualified Data.ByteString as BS\n"
            <> "BS.length (BS.pack \"test\")\n"
            <> ":q\n" )

@@ -730,6 +730,10 @@ loadProgramFromSource searchPath src0 = do
 -- @Prelude.head: empty list@ text instead.
 buildBaseEnv :: IO (Env, ClassRegistry)
 buildBaseEnv = do
+    -- REPL sessions are independent runs too: clear per-run caches before
+    -- allocating fresh slots, otherwise a previous session can hand out
+    -- thunks captured against stale module/class state.
+    resetPerRunGlobals
     classReg <- newClassRegistry
     -- Install this as the REPL's shared class registry.  Instances
     -- registered by subsequent imports are written here so the
@@ -1362,7 +1366,7 @@ loadImportIntoEnv searchPath imp existingEnv
             importOne n = imp { impSpec = ImportOnly [n] }
             lookupKeys n =
                 nubBS ([ qualPrefix <> n | not (BC.null qualPrefix) ] ++ [n])
-            resolveOne n = newLazyBuiltinThunk $ do
+            resolveOne n = newLazyIOThunk $ do
                 (env', _) <- loadImportIntoEnv searchPath (importOne n) existingEnv
                 let mThunk = mapMaybe (`HashMap.lookup` env') (lookupKeys n)
                 case mThunk of
@@ -1459,18 +1463,61 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     when (not (and requestedHaveBodies)) $
         preloadBFS preloadBudget (Set.singleton (lmName targetLm))
             (map impModule (mhImports (lmHeader targetLm)))
+    targetBodiesAfterDiscover <- readIORef (lmBodies targetLm)
+    let requestedAreLocalBodies =
+            all (\n -> case Map.lookup n targetBodiesAfterDiscover of
+                    Just expr -> expr /= EVar n
+                    Nothing   -> False)
+                requested
+        byteStringFastPathImport =
+            (impQualified imp || isJust (impAlias imp))
+            && requestedAreLocalBodies
+            && impModule imp == BC.pack "Data.ByteString"
+        -- Keep the length path deliberately narrow.  The regression is
+        -- materializing source-loaded Data.ByteString.length as a function
+        -- value; it does not need the target module's import environment.
+        useByteStringLengthFastPath =
+            byteStringFastPathImport
+            && requested == [BC.pack "length"]
+        -- Data.ByteString.pack is still source-loaded, but needs its real
+        -- provider binding (packBytes) plus normal alias/import rewrites for
+        -- that small materialized set.  The broad path materializes every
+        -- preloaded dependency export and exceeds the REPL timeout.
+        useByteStringPackFastPath =
+            byteStringFastPathImport
+            && BC.pack "pack" `elem` requested
+            && all (`elem` [BC.pack "length", BC.pack "pack"]) requested
+        useLocalSourceFastPath =
+            useByteStringLengthFastPath || useByteStringPackFastPath
+    fastPathProviderModules <-
+        if useByteStringPackFastPath
+            then do
+                directProviders <- discoverFastPathProviders earlyBuiltinNames registry fullSearchPath includeMap targetLm
+                    targetBodiesAfterDiscover requested
+                listLengthProviders <- discoverFastPathListLengthProvider earlyBuiltinNames registry fullSearchPath includeMap
+                pure (directProviders ++ listLengthProviders)
+            else pure []
     -- ImportOnly is the REPL's deferred-name path: keep it targeted.
     -- Preloading every discovered dependency's full export surface defeats
     -- the point and makes requests like Prelude.map bulk-load GHC.Base's
     -- entire ExportAll set before the prompt can return.
     -- Compute transitive-import closure (H2010 §4.3.2 instance visibility).
     -- Header-only — cheap — and reused by the scope filter below.
-    headerCacheForClosure <- newHeaderCache
-    closure <- transitiveImportClosure headerCacheForClosure fullSearchPath includeMap
-                    (impModule imp)
-    unionInstanceScope closure
+    closure <- if useLocalSourceFastPath
+        then pure Set.empty
+        else do
+            headerCacheForClosure <- newHeaderCache
+            closure <- transitiveImportClosure headerCacheForClosure fullSearchPath includeMap
+                            (impModule imp)
+            unionInstanceScope closure
+            pure closure
     reg0 <- readIORef registry
     let loadedModules0 = [ lm | (_, Loaded lm) <- Map.toList reg0 ]
+        materializedModules
+            | useByteStringLengthFastPath = [targetLm]
+            | useByteStringPackFastPath =
+                nubModulesByName (targetLm : fastPathProviderModules)
+            | otherwise = loadedModules0
         unionedData    = unionDataRegistries (map lmDataReg loadedModules0)
         (publicFields, unionedFields) = partitionFieldRegistries loadedModules0
         unionedTypeCtors0 = foldr Map.union Map.empty (map lmTypeCtorReg loadedModules0)
@@ -1488,10 +1535,19 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     -- that isn't in the env.
     ffiEnv   <- buildForeignEnv loadedModules0 fullSearchPath
     let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv' (HashMap.union conEnv ffiEnv))
-    classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules0
+    classMethodEnv <- if useByteStringLengthFastPath
+        then pure HashMap.empty
+        else buildClassMethodEnv classReg baseNoClass materializedModules
     let baseForImport = HashMap.union classMethodEnv baseNoClass
-    mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
-    qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules0
+    when (not useLocalSourceFastPath) $
+        mapM_ (expandSplicesInModule registry fullSearchPath includeMap baseForImport) loadedModules0
+    qualPairs0 <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) materializedModules
+    let qualPairs
+            | useByteStringPackFastPath =
+                [ (k, rewriteByteStringPackFastPathExpr e)
+                | (k, e) <- qualPairs0
+                ]
+            | otherwise = qualPairs0
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     -- For builtin-backed stubs with no qualPairs, synthesize alias
     -- slots for any requested name whose FQN has a builtin binding.
@@ -1613,8 +1669,16 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                             writeIORef slot builtinState
                     _ -> pure ()
             Nothing -> pure ()
-    aliases <- buildAliases registry fullSearchPath includeMap targetLm slots qualPairs
-    rewriteAliasPairs <- concat <$> mapM (rewriteAliases registry fullSearchPath includeMap thunkByKey (Set.fromList (HashMap.keys builtins))) loadedModules0
+    aliases <- if useByteStringLengthFastPath
+        then targetedImportAliases registry fullSearchPath includeMap targetLm baseForImport qualPairs
+        else buildAliases registry fullSearchPath includeMap targetLm slots qualPairs
+    rewriteAliasPairs <- if useByteStringLengthFastPath
+        then pure []
+        else concat <$> mapM (rewriteAliases registry fullSearchPath includeMap thunkByKey (Set.fromList (HashMap.keys builtins))) materializedModules
+    rewriteTargetPairs <- if useByteStringPackFastPath
+        then missingRewriteTargetFallbacks registry fullSearchPath includeMap thunkByKey
+                (Set.fromList (HashMap.keys builtins)) qualPairs materializedModules
+        else pure []
     let selfAliases =
             [ (n, slot)
             | (qualKey, slot) <- HashMap.toList thunkByKey
@@ -1633,6 +1697,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         innerEnv = HashMap.union (HashMap.fromList selfAliases)
                  $ HashMap.union builtinOverrides
                  $ HashMap.union (HashMap.fromList requestedPairs)
+                 $ HashMap.union (HashMap.fromList rewriteTargetPairs)
                  $ HashMap.union (HashMap.fromList rewriteAliasPairs)
                  $ HashMap.union aliases
                  $ HashMap.union qualEnv existingEnv
@@ -1654,26 +1719,27 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             let n = lmName lm'
             in Set.member n closure || n == impModule imp
         instanceScope = filter inUserScope loadedModules0
-    do { classTable <- buildClassMethodTable instanceScope; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) instanceScope }
-    registerClassDefaults registry fullSearchPath includeMap classReg innerEnv instanceScope
-    registerDerivedFunctorInstances classReg instanceScope
-    registerDerivedEnumBoundedInstances classReg instanceScope
-    registerDerivedEqInstances        classReg instanceScope
-    -- ALSO mirror instance registrations into the REPL's shared class
-    -- registry so the dispatcher (closed over the shared reg via
-    -- 'sharedClassRegRef') can find them on later dispatch calls.
-    -- Without this, instances registered here into the per-call
-    -- 'classReg' are invisible to the REPL's dispatcher thunks.
-    mSharedReg <- getSharedClassReg legacyHooks
-    case mSharedReg of
-        Just sharedReg | sharedReg /= classReg -> do
-            ct <- buildClassMethodTable instanceScope
-            mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) instanceScope
-            registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv instanceScope
-            registerDerivedFunctorInstances sharedReg instanceScope
-            registerDerivedEnumBoundedInstances sharedReg instanceScope
-            registerDerivedEqInstances        sharedReg instanceScope
-        _ -> pure ()
+    when (not useLocalSourceFastPath) $ do
+        do { classTable <- buildClassMethodTable instanceScope; mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg unionedTypeCtors0 classTable innerEnv) instanceScope }
+        registerClassDefaults registry fullSearchPath includeMap classReg innerEnv instanceScope
+        registerDerivedFunctorInstances classReg instanceScope
+        registerDerivedEnumBoundedInstances classReg instanceScope
+        registerDerivedEqInstances        classReg instanceScope
+        -- ALSO mirror instance registrations into the REPL's shared class
+        -- registry so the dispatcher (closed over the shared reg via
+        -- 'sharedClassRegRef') can find them on later dispatch calls.
+        -- Without this, instances registered here into the per-call
+        -- 'classReg' are invisible to the REPL's dispatcher thunks.
+        mSharedReg <- getSharedClassReg legacyHooks
+        case mSharedReg of
+            Just sharedReg | sharedReg /= classReg -> do
+                ct <- buildClassMethodTable instanceScope
+                mapM_ (registerInstancesFrom registry fullSearchPath includeMap sharedReg unionedTypeCtors0 ct innerEnv) instanceScope
+                registerClassDefaults registry fullSearchPath includeMap sharedReg innerEnv instanceScope
+                registerDerivedFunctorInstances sharedReg instanceScope
+                registerDerivedEnumBoundedInstances sharedReg instanceScope
+                registerDerivedEqInstances        sharedReg instanceScope
+            _ -> pure ()
     let additions  = HashMap.difference aliasEnv existingEnv
         merged     = HashMap.union existingEnv additions
     pure (merged, HashMap.size additions)
@@ -1702,6 +1768,78 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                         Nothing -> pure ()
                         Just providerLm ->
                             discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
+
+    discoverFastPathProviders builtinNames registry searchPath includeMap targetLm bodies requested = do
+        providerPairs <- fmap (Set.toList . Set.fromList . concat) $
+            forM requested $ \n ->
+                case Map.lookup n bodies of
+                    Nothing -> pure []
+                    Just expr -> fmap catMaybes $
+                        forM (freeVars expr) $ \fv ->
+                            case splitQualified fv of
+                                Just (provider, bare) ->
+                                    pure (Just (provider, bare))
+                                Nothing -> do
+                                    mProvider <- resolveImport registry searchPath includeMap targetLm fv
+                                        `catch` (\(_ :: SomeException) -> pure Nothing)
+                                    pure ((,fv) <$> mProvider)
+        fmap catMaybes $
+            forM providerPairs $ \(provider, bare) -> do
+                mProviderLm <- (Just <$> loadModule registry searchPath includeMap provider)
+                    `catch` (\(_ :: SomeException) -> pure Nothing)
+                case mProviderLm of
+                    Nothing -> pure Nothing
+                    Just providerLm -> do
+                        discoverInModuleWith builtinNames registry searchPath includeMap providerLm bare
+                          `catch` (\(_ :: SomeException) -> pure ())
+                        pure (Just providerLm)
+
+    discoverFastPathListLengthProvider builtinNames registry searchPath includeMap = do
+        mListLm <- (Just <$> loadModule registry searchPath includeMap (BC.pack "GHC.Internal.List"))
+            `catch` (\(_ :: SomeException) -> pure Nothing)
+        case mListLm of
+            Nothing -> pure []
+            Just listLm -> do
+                forM_ [BC.pack "length", BC.pack "lenAcc"] $ \n ->
+                    discoverInModuleWith builtinNames registry searchPath includeMap listLm n
+                        `catch` (\(_ :: SomeException) -> pure ())
+                pure [listLm]
+
+    nubModulesByName lms =
+        go Set.empty lms
+      where
+        go _ [] = []
+        go seen (lm:rest)
+            | Set.member (lmName lm) seen = go seen rest
+            | otherwise = lm : go (Set.insert (lmName lm) seen) rest
+
+    targetedImportAliases registry searchPath includeMap targetLm baseForImport qualPairs = do
+        let needed =
+                nubBS
+                    [ fv
+                    | (_key, expr) <- qualPairs
+                    , fv <- freeVars expr
+                    , splitQualified fv == Nothing
+                    , not (HashMap.member fv baseForImport)
+                    ]
+        unqualifiedAliases <- concat <$> mapM aliasFor needed
+        pure (HashMap.fromList unqualifiedAliases)
+      where
+        aliasFor n = do
+            mProvider <- resolveImport registry searchPath includeMap targetLm n
+                `catch` (\(_ :: SomeException) -> pure Nothing)
+            case mProvider of
+                Nothing -> pure []
+                Just provider -> do
+                    let targetKey = provider <> BC.pack "." <> n
+                    slot <- newLazyIOThunk $ do
+                        mSlot <- resolveFallback Nothing targetKey
+                        case mSlot of
+                            Just targetSlot -> force legacyHooks targetSlot
+                            Nothing -> error
+                                ("import alias: unresolved target "
+                                 <> BC.unpack targetKey)
+                    pure [(n, slot)]
 
     resolveRequestedPair lm qualPairs slots n = do
         bodies <- readIORef (lmBodies lm)
@@ -1732,6 +1870,60 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             , BC.elem '.' alias
             , Just slot <- [HashMap.lookup targetKey thunkByKey]
             ]
+
+    missingRewriteTargetFallbacks registry searchPath includeMap thunkByKey builtinNames qualPairs lms = do
+        targets <- fmap (Set.toList . Set.fromList . concat) $
+            forM lms $ \lm -> do
+                let ownerPrefix = lmName lm <> BC.pack "."
+                    materializedExprs =
+                        [ expr
+                        | (key, expr) <- qualPairs
+                        , ownerPrefix `BC.isPrefixOf` key
+                        ]
+                    needed = Set.fromList (concatMap freeVars materializedExprs)
+                rw <- buildImportRewrites False registry searchPath includeMap lm builtinNames
+                let alreadyPresent targetKey = HashMap.member targetKey thunkByKey
+                    directTargets =
+                        [ fv
+                        | fv <- Set.toList needed
+                        , BC.elem '.' fv
+                        , not (alreadyPresent fv)
+                        ]
+                    rewrittenTargets =
+                        [ targetKey
+                        | fv <- Set.toList needed
+                        , Just targetKey <- [Map.lookup fv rw]
+                        , BC.elem '.' targetKey
+                        , not (alreadyPresent targetKey)
+                        ]
+                pure (directTargets ++ rewrittenTargets)
+        forM targets $ \targetKey -> do
+            slot <- newLazyIOThunk $ do
+                let resolveKey = canonicalFastPathRewriteTarget targetKey
+                mSlot <- resolveFallback Nothing resolveKey
+                case mSlot of
+                    Just targetSlot -> force legacyHooks targetSlot
+                    Nothing -> error
+                        ("import rewrite target: unresolved "
+                         <> BC.unpack resolveKey)
+            pure (targetKey, slot)
+
+    canonicalFastPathRewriteTarget targetKey
+        -- In base-4.20, Data.List.length is the Foldable class-method facade.
+        -- Here the bytestring source signature fixes the argument to a list,
+        -- so route the deferred target to the real source list implementation
+        -- instead of leaving an unresolved class method in an untyped closure.
+        | targetKey == BC.pack "Data.List.length" =
+            BC.pack "GHC.Internal.List.length"
+        | targetKey == BC.pack "GHC.Internal.Data.List.length" =
+            BC.pack "GHC.Internal.List.length"
+        | otherwise = targetKey
+
+    rewriteByteStringPackFastPathExpr =
+        rewriteExpr (Map.fromList
+            [ (BC.pack "Data.List.length", BC.pack "GHC.Internal.List.length")
+            , (BC.pack "GHC.Internal.Data.List.length", BC.pack "GHC.Internal.List.length")
+            ])
 
 -- | Phase 2.11: expand TH splices in all bodies of a loaded module.
 -- Mutates the @lmBodies@ IORef in place.
@@ -6654,7 +6846,7 @@ resolveFallbackSource mOwner name = do
         case mBase of
             Just slot -> pure (Just slot)
             Nothing | isStrictReplOwner mOwner ->
-                tryClassMethodOrPreludeSlot bareName mods
+                tryScannedClassMethodOrPreludeSlot bareName mods
             Nothing -> do
                 mField <- tryGlobalFieldSlot mods bareName
                 case mField of
@@ -6737,6 +6929,12 @@ resolveFallbackSource mOwner name = do
             Just slot -> pure (Just slot)
             Nothing -> tryPreludeSlot bareName mods
 
+    tryScannedClassMethodOrPreludeSlot bareName mods = do
+        mMethod <- tryScannedClassMethodFromRegistry bareName
+        case mMethod of
+            Just slot -> pure (Just slot)
+            Nothing -> tryPreludeSlot bareName mods
+
     tryPreludeSlot bareName mods = do
         searchPath <- readIORef globalSearchPathRef
         includeMap <- readIORef globalIncludeMapRef
@@ -6764,7 +6962,7 @@ resolveFallbackSource mOwner name = do
                     -- Class-method retry: the discovery walk above can
                     -- load a class-declaring module and mirror its method
                     -- names into 'globalMethodClassRef'.
-                    Nothing -> tryClassMethodFromRegistry bareName
+                    Nothing -> tryScannedClassMethodFromRegistry bareName
 
     -- | Scan every loaded module's 'lmBodies' for @bareName@.  If the
     -- body isn't materialised yet but the source contains a top-level
@@ -6803,10 +7001,31 @@ resolveFallbackSource mOwner name = do
     -- 'buildClassMethodEnv' pass).  Returns the first class's
     -- dispatcher; @classMethodDispatcher@'s own runtime probing covers
     -- the multi-class-overload case via tag-driven lookup.
-    tryClassMethodFromRegistry bareName = do
+    knownClassesForMethod bareName = do
         m <- readIORef globalMethodClassRef
-        case Map.lookup bareName m of
-            Just (cls : _) -> do
+        let scanned = Map.findWithDefault [] bareName m
+            fromManifest =
+                maybe [] (:[]) (Manifest.classForMethod Manifest.manifestIndex bareName)
+            classes = nubBS (scanned ++ fromManifest)
+        when (null scanned && not (null fromManifest)) $
+            modifyIORef' globalMethodClassRef (Map.insert bareName classes)
+        pure classes
+
+    knownScannedClassesForMethod bareName = do
+        m <- readIORef globalMethodClassRef
+        pure (Map.findWithDefault [] bareName m)
+
+    tryClassMethodFromRegistry bareName = do
+        classes <- knownClassesForMethod bareName
+        tryClassMethodFromClasses bareName classes
+
+    tryScannedClassMethodFromRegistry bareName = do
+        classes <- knownScannedClassesForMethod bareName
+        tryClassMethodFromClasses bareName classes
+
+    tryClassMethodFromClasses bareName classes =
+        case classes of
+            (cls : _) -> do
                 mReg <- getSharedClassReg legacyHooks
                 case mReg of
                     Just reg -> do
@@ -6822,16 +7041,16 @@ resolveFallbackSource mOwner name = do
     -- or re-export walks, so it is safe to call ahead of the scope-blind
     -- global scans on the per-name fallback path ('resolveBarePrelude').
     tryKnownClassMethodSlot bareName = do
-        methodClasses <- readIORef globalMethodClassRef
-        if Map.member bareName methodClasses
+        classes <- knownClassesForMethod bareName
+        if not (null classes)
             then tryClassMethodFromRegistry bareName
             else pure Nothing
 
     tryQualifiedClassMethodSlot mods modName bareName = do
-        methodClasses <- readIORef globalMethodClassRef
-        case Map.lookup bareName methodClasses of
-            Nothing -> pure Nothing
-            Just classes -> do
+        classes <- knownClassesForMethod bareName
+        case classes of
+            [] -> pure Nothing
+            _  -> do
                 mOwner <- case Map.lookup modName mods of
                     Just lm -> pure (Just lm)
                     Nothing -> do

@@ -16,6 +16,7 @@ module IHC.Val
     , newThunk
     , newThunkIP
     , newWHNFThunk
+    , newLazyIOThunk
     , newLazyBuiltinThunk
       -- * Environments
     , Env
@@ -195,13 +196,10 @@ data ThunkState
     -- thread to finish (concurrent evaluation of a shared thunk), not raise
     -- a spurious loop — see 'IHC.Eval.force'.
     | BlackHole  !(Maybe ThreadId) !String
-    -- | Lazy-init for builtins: a host @IO Val@ action that produces the
-    -- builtin's value on first force. Used by 'IHC.Builtins.builtinEnv'
-    -- so startup doesn't pay the cost of materialising every primop,
-    -- dispatch wrapper, and Typeable dict up-front. Semantics match
-    -- 'Unevaluated' — the value is produced once and memoised — but we
-    -- avoid building a Closure+Env+Expr around a host function that
-    -- doesn't come from source.
+    -- | Lazy-init for host @IO Val@ actions that should run once and memoise.
+    -- Used by 'IHC.Builtins.builtinEnv' for primops/RTS boundaries, and by a
+    -- few scheduler paths for deferred source-name resolution where there is no
+    -- local 'Expr' to close over.
     | LazyBuiltin !(IO Val)
 
 -- | Map of implicit-parameter names (@?x@) to thunks, threaded through
@@ -232,12 +230,15 @@ newThunkIP env ipm expr = newIORef (Unevaluated (Closure env ipm expr))
 newWHNFThunk :: Val -> IO Thunk
 newWHNFThunk v = newIORef (Evaluated v)
 
--- | Make a thunk whose evaluation runs a host @IO Val@ action. Used by
--- 'IHC.Builtins.builtinEnv' to defer materialisation of primop values
--- until they're actually referenced. The action runs at most once —
--- 'IHC.Eval.force' writes the produced 'Val' back with 'Evaluated'.
+-- | Make a thunk whose evaluation runs a host @IO Val@ action. The action
+-- runs at most once; 'IHC.Eval.force' writes the produced 'Val' back with
+-- 'Evaluated'.
+newLazyIOThunk :: IO Val -> IO Thunk
+newLazyIOThunk mkV = newIORef (LazyBuiltin mkV)
+
+-- | Builtin-facing name for 'newLazyIOThunk'.
 newLazyBuiltinThunk :: IO Val -> IO Thunk
-newLazyBuiltinThunk mkV = newIORef (LazyBuiltin mkV)
+newLazyBuiltinThunk = newLazyIOThunk
 
 --------------------------------------------------------------------------------
 -- Environments

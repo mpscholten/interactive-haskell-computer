@@ -59,6 +59,7 @@ import System.Directory
     , getXdgDirectory
     , listDirectory
     )
+import System.Environment (lookupEnv)
 import System.FilePath ((</>))
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -242,29 +243,38 @@ scanModuleUnsafe fp = do
 manifestIndex :: ManifestIndex
 manifestIndex = unsafePerformIO buildIndexFromCache
 
--- | Walk @~/.cache/ihc/sources/<pkg>@ directories, scan every
--- @.hs@ file once, and merge into a single index.
+-- | Walk source-cache package directories, scan every @.hs@ file once,
+-- and merge into a single index.
 buildIndexFromCache :: IO ManifestIndex
 buildIndexFromCache = do
-    sourcesDir <- sourcesCacheDir
-    sourcesExist <- doesDirectoryExist sourcesDir
-    if not sourcesExist
-        then pure emptyIndex
-        else do
-            entries <- listDirectory sourcesDir
-            let candidates = filter (not . isPrefixOfDot) entries
-            packages <- filterM (\p -> doesDirectoryExist (sourcesDir </> p)) candidates
-            manifests <- mapM (\p -> generatePackageManifest (BC.pack p) (sourcesDir </> p))
-                              packages
+    sourceDirs <- sourcesCacheDirs
+    packageDirs <- concat <$> mapM packagesUnder sourceDirs
+    case packageDirs of
+        [] -> pure emptyIndex
+        _  -> do
+            manifests <- mapM
+                (\(pkg, dir) -> generatePackageManifest (BC.pack pkg) dir)
+                (List.sort packageDirs)
             pure (buildIndex (concatMap (Map.elems . pmModules) manifests))
   where
+    packagesUnder sourcesDir = do
+        sourcesExist <- doesDirectoryExist sourcesDir
+        if not sourcesExist
+            then pure []
+            else do
+                entries <- listDirectory sourcesDir
+                let candidates = filter (not . isPrefixOfDot) entries
+                packages <- filterM (\p -> doesDirectoryExist (sourcesDir </> p)) candidates
+                pure [ (p, sourcesDir </> p) | p <- packages ]
+
     isPrefixOfDot ('.' : _) = True
     isPrefixOfDot _         = False
 
-sourcesCacheDir :: IO FilePath
-sourcesCacheDir = do
+sourcesCacheDirs :: IO [FilePath]
+sourcesCacheDirs = do
     h <- getXdgDirectory XdgCache ""
-    pure (h </> "ihc" </> "sources")
+    mNix <- lookupEnv "IHC_NIX_SOURCE_DIR"
+    pure (List.nub (maybe id (:) mNix [h </> "ihc" </> "sources"]))
 
 -- | Fold a list of 'ModuleManifest' into the denormalised lookup
 -- tables.  Multiple modules can provide instances for the same class;
