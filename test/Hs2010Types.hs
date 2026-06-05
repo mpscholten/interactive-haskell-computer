@@ -10,6 +10,7 @@ import Test.Hspec
 import IHC.AST
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scan (scanTypeSigs)
+import IHC.Scheduler (schemesCompatible)
 import IHC.Source (Source, mkSource)
 import IHC.TypeAST (Scheme(..), Type(..))
 
@@ -31,6 +32,15 @@ shouldParseTo bs expected = do
         Right got -> got `shouldBe` expected
         Left e    -> expectationFailure
             ("expected parse success on " <> show bs <> ", got " <> show e)
+
+-- | Parse a single type signature string into its 'Scheme' (via the same
+-- top-level scanner the scheduler uses).
+schemeOf :: ByteString -> IO Scheme
+schemeOf sig = do
+    sigs <- scanTypeSigs (mkSrc ("f :: " <> sig <> "\nf = undefined\n"))
+    case lookup "f" sigs of
+        Just s  -> pure s
+        Nothing -> error ("schemeOf: no scheme parsed from " <> show sig)
 
 spec :: Spec
 spec = describe "Hs2010 — Types" $ do
@@ -106,3 +116,34 @@ spec = describe "Hs2010 — Types" $ do
                 Left e | isParseError e -> pure ()
                 Left e -> expectationFailure
                     ("expected ParseError or pending, got " <> show e)
+
+    -- 'schemesCompatible' decides whether two sigs for one (re-exported) bare
+    -- name are the SAME function (unifiable → not ambiguous) or genuinely
+    -- different (→ ambiguous, the elaborator declines).  Drives
+    -- 'mirrorTypeSigsGlobal': over-flagging here made the elaborator decline
+    -- 'listArray' at warp scale, defaulting http-types' methodArray bounds to
+    -- Int ("Ix Int.index: non-Int index" on the request path).
+    describe "schemesCompatible (sig ambiguity = non-unifiable schemes)" $ do
+        it "listArray's Array-specialised vs IArray-general sigs are compatible" $ do
+            -- GHC.Arr vs Data.Array.Base re-exports of the SAME function; the
+            -- second generalises the first (a := Array) so they must unify.
+            s1 <- schemeOf "Ix i => (i, i) -> [e] -> Array i e"
+            s2 <- schemeOf "(IArray a e, Ix i) => (i, i) -> [e] -> a i e"
+            c <- schemesCompatible s1 s2
+            c `shouldBe` True
+        it "map's list vs NonEmpty sigs are NOT compatible (stay flagged)" $ do
+            -- Prelude.map vs Data.List.NonEmpty.map — [] /~ NonEmpty, so the
+            -- conservatism that declines `map (B8.pack.show)` is preserved.
+            s1 <- schemeOf "(a -> b) -> [a] -> [b]"
+            s2 <- schemeOf "(a -> b) -> NonEmpty a -> NonEmpty b"
+            c <- schemesCompatible s1 s2
+            c `shouldBe` False
+        it "a scheme is compatible with itself" $ do
+            s <- schemeOf "Ord a => a -> a -> Bool"
+            c <- schemesCompatible s s
+            c `shouldBe` True
+        it "different argument structure is not compatible" $ do
+            s1 <- schemeOf "Int -> Int"
+            s2 <- schemeOf "Bool -> Bool"
+            c <- schemesCompatible s1 s2
+            c `shouldBe` False

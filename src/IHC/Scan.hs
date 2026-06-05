@@ -2125,7 +2125,7 @@ data FunctorDerivDecl = FunctorDerivDecl
 
 -- | One data/newtype declaration with the classes mentioned in its deriving
 -- clause. Used for small stock-derived dictionaries whose implementation only
--- needs constructor order, e.g. nullary Enum/Bounded.
+-- needs constructor order, e.g. nullary Enum/Bounded/Ix.
 data SimpleDerivDecl = SimpleDerivDecl
     { sdTyName  :: !ByteString
     , sdClasses :: ![ByteString]
@@ -2152,7 +2152,7 @@ scanSimpleDerivingsRaw src
             Nothing -> go acc cur0
             Just tyName -> do
                 (classes, curAfter) <- findDeriving cur0
-                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded"]) classes
+                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded", "Ix"]) classes
                 if null wanted
                     then go acc curAfter
                     else go (SimpleDerivDecl tyName wanted : acc) curAfter
@@ -2188,6 +2188,18 @@ scanSimpleDerivingsRaw src
             TkIdent s | s == BC.pack "stock"
                      || s == BC.pack "anyclass" -> scanClasses cur'
             TkNewtype -> scanClasses cur'
+            -- A multi-line deriving clause puts the class list on the line(s)
+            -- AFTER the `deriving` keyword (or after a `stock`/`anyclass`
+            -- strategy), e.g. http-types' StdMethod:
+            --     deriving
+            --         ( Read, Show, …, Bounded, Ix, … )
+            -- Skip the intervening newline(s) so the `(`/class name is still
+            -- found.  Without this, `deriving\n(` hits the catch-all below and
+            -- returns ZERO classes — so derived Enum/Bounded/Ix were silently
+            -- dropped and e.g. `minBound :: StdMethod` fell back to the Int
+            -- instance (heap-exhausting `[minBound..maxBound]`, and Int-bounds
+            -- `methodArray` → "Ix Int.index: non-Int index" on the warp path).
+            TkNewline -> scanClasses cur'
             TkLParen  -> collectClassList [] cur'
             TkConId c -> pure [c]
             _         -> pure []
@@ -2609,6 +2621,10 @@ scanFunctorDerivingsRaw src
             TkIdent s | s == BC.pack "stock"
                      || s == BC.pack "anyclass" -> scanClasses cur'
             TkNewtype  -> scanClasses cur'
+            -- Multi-line deriving clause (`deriving\n    ( … )`): skip the
+            -- newline(s) so the class list is still found.  (Same defect/fix
+            -- as 'scanSimpleDerivingsRaw'.)
+            TkNewline -> scanClasses cur'
             TkLParen  -> collectClassList [] cur'
             TkConId c -> pure [c]
             _         -> pure []

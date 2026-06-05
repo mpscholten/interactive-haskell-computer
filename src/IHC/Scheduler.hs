@@ -39,6 +39,7 @@ module IHC.Scheduler
     , ModuleRegistry
     , freeVars
     , splitQualified
+    , schemesCompatible
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
@@ -117,8 +118,9 @@ import qualified IHC.PatSyn as PatSyn
 import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps)
+import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -487,7 +489,7 @@ loadProgramFromSource searchPath src0 = do
     -- 'loadedModules'' below; the earlier-snapshot version is intentionally
     -- not bound here so we don't accidentally use a stale type-ctor map.
     let unionedData  = unionDataRegistries (map lmDataReg loadedModules)
-        (publicFields, unionedFields) = partitionFieldRegistries loadedModules
+        (_unexportedPublicFields, unionedFields) = partitionFieldRegistries loadedModules
         -- Union type-family registries across all loaded modules and
         -- publish the merged result into the global 'TR.globalRegistry'
         -- so the ETyApp path in 'IHC.Eval' can look up reductions for
@@ -497,6 +499,10 @@ loadProgramFromSource searchPath src0 = do
         unionedTFReg = foldr (Map.unionWith (++)) Map.empty
                          (map lmTypeFamilies loadedModules)
     TR.setGlobalRegistry unionedTFReg
+    -- Bare field-selector accessors are gated on EXPORT visibility so an
+    -- un-exported field (e.g. GHC.Event.KQueue's internal 'filter') can't
+    -- shadow a Prelude function of the same name. See 'exportedPublicFields'.
+    let publicFields = exportedPublicFields loadedModules
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
     builtins <- builtinEnv classReg
@@ -2617,6 +2623,8 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                 registerBounded tyName ctors
             when (BC.pack "Enum" `elem` classes) $
                 registerEnum tyName ctors
+            when (BC.pack "Ix" `elem` classes) $
+                registerIx tyName ctors
 
     registerBounded tyName ctors = do
         existing <- lookupInstance classReg (BC.pack "Bounded") tyName
@@ -2639,8 +2647,101 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                     methods = HashMap.fromList
                         [ (BC.pack "fromEnum", derivedFromEnum ctorIndex)
                         , (BC.pack "toEnum", derivedToEnum ctors)
+                        -- The stock @enumFromTo@ default (@map toEnum [fromEnum
+                        -- x .. fromEnum y]@) needs a type hint on @toEnum@ to
+                        -- pick this instance; under deferred typing it falls to
+                        -- the Int identity and the range comes back as Ints
+                        -- (e.g. @[minBound :: StdMethod .. maxBound]@ —
+                        -- http-types' methodArray element list — yielded Ints /
+                        -- a 1-element list).  Synthesize the range methods
+                        -- directly from constructor order, exactly like GHC's
+                        -- derived Enum for an enumeration.
+                        , (BC.pack "enumFrom",       derivedEnumFrom ctorIndex ctors)
+                        , (BC.pack "enumFromTo",     derivedEnumFromTo ctorIndex ctors)
+                        , (BC.pack "enumFromThen",   derivedEnumFromThen ctorIndex ctors)
+                        , (BC.pack "enumFromThenTo", derivedEnumFromThenTo ctorIndex ctors)
                         ]
                 registerUnderTypeAndCtors (BC.pack "Enum") tyName ctors methods
+
+    -- Derived 'Ix' for an all-nullary (enumeration) type — GHC's
+    -- stock-derivable Ix shape.  Every method reduces to constructor-order
+    -- arithmetic (the same @ctorIndex@ used for derived Enum), so there is
+    -- no source body to load: this is deriving codegen, exactly like the
+    -- Enum/Bounded synthesis above.  Keyed under the type name and each
+    -- ctor name so both annotation- and value-directed dispatch resolve.
+    --
+    -- Calling convention (see 'specialClassApplication' Ix branch + the
+    -- @Just specialVal -> pure specialVal@ dispatch arm): the method is
+    -- applied to the bounds tuple first, so 2-arg methods (@index@,
+    -- @unsafeIndex@, @inRange@) consume the bounds and return a 'VFun' of
+    -- the index; 1-arg methods (@range@, @rangeSize@, @unsafeRangeSize@)
+    -- return their result directly.  (This differs from the host @Ix Int@
+    -- shim, which has the bounds pre-applied by 'ixHostMethod'.)
+    registerIx tyName ctors = do
+        existing <- lookupInstance classReg (BC.pack "Ix") tyName
+        case existing of
+            Just _  -> pure ()
+            Nothing -> do
+                let ctorIndex = Map.fromList (zip ctors [0 :: Int ..])
+                    methods = HashMap.fromList
+                        [ (BC.pack "index",           ixIndex ctorIndex)
+                        , (BC.pack "unsafeIndex",     ixIndex ctorIndex)
+                        , (BC.pack "inRange",         ixInRange ctorIndex)
+                        , (BC.pack "range",           ixRange ctorIndex ctors)
+                        , (BC.pack "rangeSize",       ixRangeSize True ctorIndex)
+                        , (BC.pack "unsafeRangeSize", ixRangeSize False ctorIndex)
+                        ]
+                registerUnderTypeAndCtors (BC.pack "Ix") tyName ctors methods
+
+    ixCtorIdx ctorIndex v = case v of
+        VCon ctor _ -> case Map.lookup ctor ctorIndex of
+            Just i  -> i
+            Nothing -> error ("derived Ix: unknown constructor " <> BC.unpack ctor)
+        other -> error ("derived Ix: expected constructor, got " <> showValForDebug other)
+
+    ixForceBounds boundsT = do
+        bv <- force legacyHooks boundsT
+        case bv of
+            VCon name [loT, hiT] | name == BC.pack "(,)" -> do
+                lo <- force legacyHooks loT
+                hi <- force legacyHooks hiT
+                pure (lo, hi)
+            other -> error ("derived Ix: expected bounds pair, got " <> showValForDebug other)
+
+    ixIndex ctorIndex = VFun $ \boundsT -> do
+        (lo, _hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+        pure $ VFun $ \iT -> do
+            i <- force legacyHooks iT
+            pure (VInt (fromIntegral (ixCtorIdx ctorIndex i - loI)))
+
+    ixInRange ctorIndex = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+            hiI = ixCtorIdx ctorIndex hi
+        pure $ VFun $ \iT -> do
+            i <- force legacyHooks iT
+            let ii = ixCtorIdx ctorIndex i
+            pure (VCon (BC.pack (if loI <= ii && ii <= hiI then "True" else "False")) [])
+
+    ixRangeSize clamp ctorIndex = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let sz = ixCtorIdx ctorIndex hi - ixCtorIdx ctorIndex lo + 1
+        pure (VInt (fromIntegral (if clamp then max 0 sz else sz)))
+
+    ixRange ctorIndex ctors = VFun $ \boundsT -> do
+        (lo, hi) <- ixForceBounds boundsT
+        let loI = ixCtorIdx ctorIndex lo
+            hiI = ixCtorIdx ctorIndex hi
+            elemsV = [ VCon (ctors !! k) []
+                     | k <- [loI .. hiI], k >= 0, k < length ctors ]
+        ixConsList elemsV
+
+    ixConsList []     = pure (VCon (BC.pack "[]") [])
+    ixConsList (v:vs) = do
+        hd <- newWHNFThunk v
+        tl <- ixConsList vs >>= newWHNFThunk
+        pure (VCon (BC.pack ":") [hd, tl])
 
     registerUnderTypeAndCtors cls tyName ctors methods = do
         registerInstance classReg cls tyName methods
@@ -2686,6 +2787,56 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                     error ("derived Enum.toEnum: index out of range " <> show n)
             other -> error ("derived Enum.toEnum: expected Int, got "
                           <> showValForDebug other)
+
+    -- Constructor index of an Enum value.  VInt-tolerant: an unannotated
+    -- bound that defaulted to the Int instance (e.g. the @maxBound@ in
+    -- @[minBound :: M .. maxBound]@ under deferred typing) arrives as a
+    -- 'VInt'; treat it as a raw index and let 'clampIdx' pull it into range.
+    enumIdx ctorIndex v = case v of
+        VCon ctor _ -> Map.lookup ctor ctorIndex
+        VInt nn     -> Just (fromIntegral nn)
+        _           -> Nothing
+
+    clampIdx n i = max 0 (min (n - 1) i)
+
+    derivedEnumFromTo ctorIndex ctors = VFun $ \loT -> pure $ VFun $ \hiT -> do
+        lo <- force legacyHooks loT
+        hi <- force legacyHooks hiT
+        let n   = length ctors
+            loI = maybe 0       (clampIdx n) (enumIdx ctorIndex lo)
+            hiI = maybe (n - 1) (clampIdx n) (enumIdx ctorIndex hi)
+        ixConsList [ VCon (ctors !! k) [] | k <- [loI .. hiI] ]
+
+    derivedEnumFrom ctorIndex ctors = VFun $ \loT -> do
+        lo <- force legacyHooks loT
+        let n   = length ctors
+            loI = maybe 0 (clampIdx n) (enumIdx ctorIndex lo)
+        ixConsList [ VCon (ctors !! k) [] | k <- [loI .. n - 1] ]
+
+    derivedEnumFromThenTo ctorIndex ctors =
+        VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \cT -> do
+            a <- force legacyHooks aT
+            b <- force legacyHooks bT
+            c <- force legacyHooks cT
+            let n  = length ctors
+                ai = maybe 0       (clampIdx n) (enumIdx ctorIndex a)
+                bi = maybe ai      (clampIdx n) (enumIdx ctorIndex b)
+                ci = maybe (n - 1) (clampIdx n) (enumIdx ctorIndex c)
+                idxs | ai == bi  = [ ai | ai <= ci ]   -- step 0: stop (finite)
+                     | otherwise = take n [ ai, bi .. ci ]
+            ixConsList [ VCon (ctors !! k) [] | k <- idxs ]
+
+    derivedEnumFromThen ctorIndex ctors =
+        VFun $ \aT -> pure $ VFun $ \bT -> do
+            a <- force legacyHooks aT
+            b <- force legacyHooks bT
+            let n   = length ctors
+                ai  = maybe 0  (clampIdx n) (enumIdx ctorIndex a)
+                bi  = maybe ai (clampIdx n) (enumIdx ctorIndex b)
+                end = if bi >= ai then n - 1 else 0
+                idxs | ai == bi  = [ai]
+                     | otherwise = take n [ ai, bi .. end ]
+            ixConsList [ VCon (ctors !! k) [] | k <- idxs ]
 
 shortShow :: Val -> String
 shortShow (VCon n _) = "VCon " <> BC.unpack n
@@ -3821,39 +3972,69 @@ exportBodies registry searchPath includeMap builtinNames lm = do
         -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
         -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
         [ ( keyPrefix <> n
-          , preserveNullaryClassResultType n
+          , wrapNullaryResultSig lm n
                 (maybe (transform e) EVar (specialSelfAliasTarget lm n e))
           )
         | (n, e) <- Map.toList bs
         , not (isSelfAliasIn lm n e) || isJust (specialSelfAliasTarget lm n e)
         ]
-  where
-    preserveNullaryClassResultType n e =
-        case e of
-            EVar v
-                | isNullaryClassMethodName (lastNameComponent v)
-                , Just sig <- Map.lookup n (lmTypeSigs lm)
-                , Just tag <- schemeResultTag sig
-                -> ETyApp e tag
-            _ -> e
 
-    isNullaryClassMethodName n =
-        n == BC.pack "maxBound"
-     || n == BC.pack "minBound"
-     || n == BC.pack "mempty"
+-- | If a binding is an arity-0 CAF whose signature is known and whose RHS
+-- mentions a nullary class method (@minBound@/@maxBound@/@mempty@) — directly,
+-- or nested inside an application/tuple — wrap the RHS in
+-- @ETyApp ... <result type>@ so the eval-time elaborator
+-- ('IHC.Eval.tryElaborateTyAnn') can drive those methods to the right instance
+-- instead of the Int default.  The elaborator self-validates
+-- ('allTypedMethodsResolvable') and falls back to the original RHS on a miss,
+-- so this is strictly additive.
+--
+-- Applied on BOTH the eager export path ('exportBodies') and the lazy
+-- same-module fallback ('buildSlotFromOwner').  A same-module reference — e.g.
+-- @renderStdMethod m = methodArray ! m@ inside http-types — resolves
+-- @methodArray@ through the latter, so wrapping only in 'exportBodies' left the
+-- imported methodArray with Int bounds (@Ix Int.index: non-Int index@ on the
+-- warp request path) even though the single-file repro worked.
+wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
+wrapNullaryResultSig lm n e =
+    case e of
+        -- RHS is literally a bare nullary class method
+        -- (@x :: T; x = minBound@): annotate with the result-type tag.
+        EVar v
+            | isNullaryClassMethodName (lastNameComponent v)
+            , Just sig <- Map.lookup n (lmTypeSigs lm)
+            , Just tag <- schemeResultTag sig
+            -> ETyApp e tag
+        -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary class
+        -- method nested inside an application/tuple — e.g.
+        -- @methodArray :: Array StdMethod Method;
+        --  methodArray = listArray (minBound, maxBound) …@.  Wrap the whole
+        -- RHS in the binding's full result type.  Guarded (arity-0 + actually
+        -- mentions a nullary method) so only the rare binding pays the lazy,
+        -- once-per-thunk elaboration.
+        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+          , ([], resultTy) <- tyArrowArgs body
+          , any (isNullaryClassMethodName . lastNameComponent) (freeVars e)
+          , Just tyBytes <- renderTypeForAnnotation resultTy
+          -> ETyApp e tyBytes
+        _ -> e
+  where
+    isNullaryClassMethodName nm =
+        nm == BC.pack "maxBound"
+     || nm == BC.pack "minBound"
+     || nm == BC.pack "mempty"
 
     schemeResultTag (Scheme _ _ body) =
         let (_, resultTy) = tyArrowArgs body
         in typeResultTag resultTy
 
     typeResultTag ty = case ty of
-        TyCon n -> Just (lastNameComponent n)
+        TyCon nm -> Just (lastNameComponent nm)
         -- The type scanner can represent an alias-qualified constructor
         -- like @P.Int@ as @TyApp (TyCon "P") (TyCon "Int")@.  That is a
         -- qualifier, not a real type application, so the dispatch tag is
         -- the RHS constructor.
-        TyApp (TyCon q) (TyCon n)
-            | q `Set.member` importedTypeQualifiers -> Just (lastNameComponent n)
+        TyApp (TyCon q) (TyCon nm)
+            | q `Set.member` importedTypeQualifiers -> Just (lastNameComponent nm)
         TyApp h _ -> typeResultTag h
         _ -> Nothing
 
@@ -3864,10 +4045,67 @@ exportBodies registry searchPath includeMap builtinNames lm = do
             , q <- maybe [impModule imp] (:[]) (impAlias imp)
             ]
 
-    lastNameComponent n =
-        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
-            Just idx -> BC.drop (idx + 1) n
-            Nothing  -> n
+    lastNameComponent nm =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) nm of
+            Just idx -> BC.drop (idx + 1) nm
+            Nothing  -> nm
+
+-- | Render a 'Type' back to source-level bytes that
+-- 'IHC.Elaborate.parseRawTypeExpr' can re-parse, for use as the annotation
+-- in a synthesised 'ETyApp' (see 'preserveNullaryClassResultType').  Handles
+-- the shapes that parser supports — type constructors, left-associated
+-- applications, tuples, and lists — stripping module/alias qualifiers
+-- (derived/source instances are keyed by bare type name).  Returns 'Nothing'
+-- for shapes the parser can't represent (arrows, foralls); the caller then
+-- leaves the RHS unannotated.
+renderTypeForAnnotation :: Type -> Maybe ByteString
+renderTypeForAnnotation = top
+  where
+    top t = case t of
+        TyVar v   -> Just (bareTypeName v)
+        TyCon c   -> Just (bareTypeName c)
+        TyApp _ _ -> let (h, args) = tyApps t in renderApp h args
+        _         -> Nothing                  -- TyArrow / TyForall: unsupported
+
+    renderApp h args = case h of
+        TyCon c
+            | isTupleCon c, length args == tupleArity c -> do
+                parts <- mapM top args
+                Just (BC.concat [ BC.singleton '('
+                                , BC.intercalate (BC.pack ", ") parts
+                                , BC.singleton ')' ])
+            | c == BC.pack "[]", [a] <- args -> do
+                ab <- top a
+                Just (BC.concat [ BC.singleton '[', ab, BC.singleton ']' ])
+        _ -> do
+            hb    <- atom h
+            parts <- mapM atom args
+            Just (BC.intercalate (BC.singleton ' ') (hb : parts))
+
+    -- Argument position: wrap compound applications in parens.
+    atom t = case t of
+        TyVar v   -> Just (bareTypeName v)
+        TyCon c   -> Just (bareTypeName c)
+        TyApp _ _ ->
+            let (h, args) = tyApps t
+            in case h of
+                TyCon c | isTupleCon c || c == BC.pack "[]" -> top t
+                _ -> do
+                    inner <- renderApp h args
+                    Just (BC.concat [ BC.singleton '(', inner, BC.singleton ')' ])
+        _ -> Nothing
+
+    bareTypeName c =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) c of
+            Just idx | idx + 1 < BC.length c -> BC.drop (idx + 1) c
+            _ -> c
+
+    isTupleCon c =
+        BC.length c >= 2 && BC.head c == '(' && BC.last c == ')'
+        && not (BC.null (BC.init (BC.tail c)))
+        && BC.all (== ',') (BC.init (BC.tail c))
+
+    tupleArity c = BC.length (BC.filter (== ',') c) + 1
 
 -- | Names of builtins that are FFI/primop-backed and should ALWAYS resolve
 -- to the host builtin, never to source definitions. These are excluded from
@@ -4858,6 +5096,49 @@ partitionFieldRegistries lms =
                          [ lmFieldReg lm | lm <- lms, not (lmNoFieldSelectors lm) ]
     in (publicFields, allFields)
 
+-- | The field selectors that may become globally-nameable BARE accessors.
+--
+-- 'partitionFieldRegistries' returns @publicFields@ as the union of every
+-- loaded module's *entire* field registry. That over-approximates scope: a
+-- record field is a top-level selector only if its owning module actually
+-- EXPORTS it. An un-exported field selector is module-private (GHC §5.2) and
+-- must not be nameable elsewhere — otherwise e.g. @GHC.Event.KQueue@'s internal
+-- @filter@ field (@data Event = KEvent { ..., filter :: !Filter }@; KQueue
+-- exports only @new@/@available@) registers a bare @filter@ accessor that
+-- shadows @Prelude.filter@ at every unrelated use site, crashing the warp
+-- hello-world startup with "record accessor `filter` applied to
+-- non-constructor value".
+--
+-- We therefore restrict the bare-accessor registry to each module's EXPORTED
+-- fields via 'exportedFieldRegistry' (which also follows @T(..)@ and
+-- @module M@ re-exports). The full union is still used elsewhere for
+-- record-dot desugaring and qualified accessors — only the bare names are
+-- export-gated. @NoFieldSelectors@ modules contribute nothing, as before.
+--
+-- PURE and cheap on purpose. An earlier IO version called
+-- 'exportedFieldRegistry' (which chases @module M@ / imported-name re-exports
+-- via 'loadModule'); run per name-resolution in the hot fallback paths
+-- ('tryGlobalFieldSlot' / 'buildSlotFromOwner') those repeated loads blew the
+-- test suite up from ~7 min to a 6 h CI timeout. We therefore consult only each
+-- module's OWN export list (already parsed in 'lmHeader'). That's sufficient for
+-- gating bare accessors: a field re-exported by a gateway module is also
+-- exported by its DEFINING module, which is itself in @lms@ and contributes the
+-- field to this union.
+exportedPublicFields :: [LoadedModule] -> FieldRegistry
+exportedPublicFields lms =
+    unionFieldRegistries
+        [ exportedFieldRegistryOwn lm | lm <- lms, not (lmNoFieldSelectors lm) ]
+
+-- | Fields a module exports per its OWN export list (no re-export-chain walk).
+exportedFieldRegistryOwn :: LoadedModule -> FieldRegistry
+exportedFieldRegistryOwn lm = case mhExports (lmHeader lm) of
+    ExportAll        -> lmFieldReg lm
+    ExportList items -> unionFieldRegistries (map exportItem items)
+  where
+    exportItem (ExportName n)        = fieldByName (lmFieldReg lm) (visibleExportName n)
+    exportItem (ExportType ty mbSubs) = typeFieldRegistry lm ty mbSubs
+    exportItem (ExportModule _)      = Map.empty
+
 -- | Build the combined field-accessor env: every field is bound under
 -- its 'fieldProjName' prefix (for record-dot), and fields from modules
 -- that do NOT have 'NoFieldSelectors' are also bound under their bare
@@ -5369,8 +5650,7 @@ loadModuleSlow registry searchPath includeMap name = do
                                       -- 'registerGlobalLoadedModule' is the
                                       -- usual mirror site, but we don't
                                       -- call it on cache hits.
-                                      modifyIORef' globalTypeSigsRef
-                                          (Map.union (lmTypeSigs fresh))
+                                      mirrorTypeSigsGlobal (lmTypeSigs fresh)
                                       modifyIORef' globalTypeSynonymsRef
                                           (Map.union (lmTypeSynonyms fresh))
                                       -- Catalogue instances against this
@@ -5593,6 +5873,7 @@ resetPerRunGlobals = do
     writeIORef envFallbackCacheGenRef 0
     writeIORef envBaseForFallbackRef  HashMap.empty
     writeIORef globalTypeSigsRef      Map.empty
+    writeIORef globalAmbiguousSigsRef Set.empty
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
     writeIORef globalMethodClassRef   Map.empty
@@ -5660,6 +5941,63 @@ resetPerRunGlobals = do
     -- captured against the previous registry.
     resetExportedFieldRegistryMemo
 
+-- | Mirror a module's top-level signatures into the flat global table
+-- ('globalTypeSigsRef'), recording any bare name whose new scheme CONFLICTS
+-- with one already present into 'globalAmbiguousSigsRef'.  The flat table is
+-- bare-keyed last-writer-wins; without conflict tracking a name defined with
+-- different signatures in two modules (e.g. @map@ in @GHC.List@ vs
+-- @Data.List.NonEmpty@) silently resolves to whichever loaded last, which
+-- makes the elaborator unify against the wrong shape.  The elaborator declines
+-- to use a sig for an ambiguous name (see 'IHC.Elaborate.elaborateVar').
+mirrorTypeSigsGlobal :: Map ByteString Scheme -> IO ()
+mirrorTypeSigsGlobal new = do
+    old <- readIORef globalTypeSigsRef
+    -- Candidate conflicts: a bare name already present with a STRUCTURALLY
+    -- different scheme.  But structural inequality is too coarse: the same
+    -- function re-exported through different modules can carry sigs that
+    -- differ yet are UNIFIABLE and so agree on every instantiation that
+    -- matters — e.g. @GHC.Arr.listArray :: Ix i => (i,i) -> [e] -> Array i e@
+    -- vs @Data.Array.Base.listArray :: (IArray a e, Ix i) => (i,i) -> [e] ->
+    -- a i e@ (the second is the first with @a := Array@).  Flagging those as
+    -- ambiguous made 'elaborateVar' decline @listArray@, so http-types'
+    -- @methodArray = listArray (minBound,maxBound) …@ never got @i := StdMethod@
+    -- pushed onto its bounds tuple and they defaulted to Int — the
+    -- @Ix Int.index: non-Int index@ crash on warp's request path (the bug only
+    -- surfaced at warp SCALE, where enough modules load that both listArray
+    -- sigs are present to conflict).
+    --
+    -- So flag a name ambiguous ONLY when its two schemes are not even
+    -- UNIFIABLE.  Genuinely incompatible sigs still get flagged — e.g.
+    -- @Prelude.map :: (a->b) -> [a] -> [b]@ vs @NonEmpty.map :: (a->b) ->
+    -- NonEmpty a -> NonEmpty b@ fail to unify (@[] /~ NonEmpty@), preserving
+    -- the conservatism that fixed the @map (B8.pack.show)@ elaboration.
+    let candidates =
+            [ (k, v, oldV)
+            | (k, v) <- Map.toList new
+            , Just oldV <- [Map.lookup k old]
+            , v /= oldV
+            ]
+    realConflicts <- filterM (\(_, v, oldV) -> not <$> schemesCompatible v oldV) candidates
+    let conflictKeys = Set.fromList [ k | (k, _, _) <- realConflicts ]
+    when (not (Set.null conflictKeys)) $
+        modifyIORef' globalAmbiguousSigsRef (Set.union conflictKeys)
+    modifyIORef' globalTypeSigsRef (Map.union new)
+
+-- | Are two type schemes UNIFIABLE — i.e. could they be the same function
+-- (one re-exported, or one a specialisation of the other)?  Instantiate both
+-- with fresh flexible variables (so their bound vars can't clash) and try to
+-- 'TU.mgu' the bodies.  'Right' (a unifier exists) ⇒ compatible (NOT a real
+-- conflict); 'Left' ⇒ genuinely different.  Used by 'mirrorTypeSigsGlobal' so
+-- re-exports aren't false-flagged as ambiguous.
+schemesCompatible :: Scheme -> Scheme -> IO Bool
+schemesCompatible s1 s2 = do
+    fs <- TU.newFreshSource
+    (_, t1) <- TU.instantiate fs s1
+    (_, t2) <- TU.instantiate fs s2
+    pure $ case TU.mgu t1 t2 of
+        Right _ -> True
+        Left _  -> False
+
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
@@ -5667,10 +6005,10 @@ registerGlobalLoadedModule lm = do
     -- might now resolve via this module.
     bumpEnvFallbackGen
     -- Mirror per-module type sigs + synonyms into the flat global
-    -- registries used by 'IHC.Elaborate'.  Last-writer-wins for name
-    -- collisions across modules (rare in practice — sigs are
-    -- module-scoped in source).
-    modifyIORef' globalTypeSigsRef (Map.union (lmTypeSigs lm))
+    -- registries used by 'IHC.Elaborate'.  Conflicting bare names are
+    -- recorded as ambiguous (see 'mirrorTypeSigsGlobal') so the
+    -- elaborator won't guess the wrong one.
+    mirrorTypeSigsGlobal (lmTypeSigs lm)
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
     -- Mirror per-module class declarations into the global
     -- method->class registry so the env-fallback's
@@ -6195,10 +6533,33 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
+                                     -- A bare name the owner-scoped lookup couldn't
+                                     -- resolve to an in-scope top-level binding, but
+                                     -- which IS a registered class method, must
+                                     -- dispatch AS a class method — it must NOT be
+                                     -- scavenged from an unrelated module's same-named
+                                     -- top-level binding by the UNSCOPED global scans
+                                     -- below.  Concretely: GHC.Internal.Ix's default
+                                     -- @index@/@rangeSize@ call @unsafeIndex@/@index@
+                                     -- (both Ix methods); once Data.ByteString is
+                                     -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
+                                     -- otherwise win 'tryGlobalImportScan' and
+                                     -- pattern-fail on the Ix bounds tuple
+                                     -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
+                                     -- such collision) already resolved correctly via
+                                     -- the class-method tail below; this lifts the same
+                                     -- dispatch ahead of the scope-blind scan for the
+                                     -- colliding names.  Cheap (one IORef read on miss,
+                                     -- no module loads) so it respects the per-name
+                                     -- fallback hot-path rule.
                                      -- Try ALL loaded modules' imports — the owner
                                      -- might be wrong (e.g. class default method
                                      -- evaluated in a different module's context).
-                                     mGlobal <- tryGlobalImportScan mods bareName
+                                     mGlobal <- do
+                                         mClassFirst <- tryKnownClassMethodSlot bareName
+                                         case mClassFirst of
+                                             Just s  -> pure (Just s)
+                                             Nothing -> tryGlobalImportScan mods bareName
                                      case mGlobal of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
@@ -6294,6 +6655,16 @@ resolveFallbackSource mOwner name = do
                         pure (Just slot)
                     Nothing -> pure Nothing
             _ -> pure Nothing
+
+    -- | If @bareName@ is a registered class method, build its dispatcher
+    -- slot; otherwise 'Nothing'.  One IORef read on miss, no module loads
+    -- or re-export walks, so it is safe to call ahead of the scope-blind
+    -- global scans on the per-name fallback path ('resolveBarePrelude').
+    tryKnownClassMethodSlot bareName = do
+        methodClasses <- readIORef globalMethodClassRef
+        if Map.member bareName methodClasses
+            then tryClassMethodFromRegistry bareName
+            else pure Nothing
 
     tryQualifiedClassMethodSlot mods modName bareName = do
         methodClasses <- readIORef globalMethodClassRef
@@ -6684,9 +7055,21 @@ resolveFallbackSource mOwner name = do
                         -- decides names the owner neither defines nor scans.
                         Map.union (lmDataReg owner)
                                   (unionDataRegistries (map lmDataReg (Map.elems mods)))
-                    (publicFields, unionedFields) =
+                    (_unexportedPublicFields, unionedFields) =
                         partitionFieldRegistries (Map.elems mods)
                 conEnvAll   <- buildConEnv unionedData
+                -- Bare field-selector accessors from OTHER modules are gated on
+                -- EXPORT visibility (see 'exportedPublicFields'). Without this,
+                -- an un-exported field (e.g. GHC.Event.KQueue's internal
+                -- 'filter') leaks a bare accessor into this lazily-resolved
+                -- body's closure and shadows a Prelude function of the same
+                -- name. The OWNER's own field selectors, however, are always in
+                -- scope unqualified within the owner module (GHC §5.2), so we
+                -- union the owner's full field registry back in — that keeps
+                -- same-module field access (eventFilter = filter e) working
+                -- while still gating cross-module leakage.
+                let publicFields = unionFieldRegistries
+                                       [exportedPublicFields (Map.elems mods), lmFieldReg owner]
                 fieldEnvAll <- buildFieldAccessorEnv
                                     (Map.elems mods) publicFields unionedFields
                 ffiEnvAll <- buildForeignEnv (Map.elems mods) searchPath
@@ -6716,8 +7099,14 @@ resolveFallbackSource mOwner name = do
                                 , ffiEnvAll
                                 , baseEnv
                                 ]
+                -- Same signature-directed nullary-method wrap as the eager
+                -- 'exportBodies' path.  A same-module reference resolves the
+                -- binding through HERE (the lazy fallback), so without this an
+                -- imported @methodArray = listArray (minBound,maxBound) …@ keeps
+                -- Int bounds and dies with @Ix Int.index@ on the warp path.
                 writeIORef slot
-                    (Unevaluated (Closure richEnv emptyIPMap expr'))
+                    (Unevaluated (Closure richEnv emptyIPMap
+                        (wrapNullaryResultSig owner bareName expr')))
                 modifyIORef' envFallbackCache
                     (Map.insert name slot . Map.insert selfKey slot)
                 pure (Just slot)
@@ -7004,7 +7393,15 @@ resolveFallbackSource mOwner name = do
 
     tryGlobalFieldSlot mods bareName = do
         let loaded = Map.elems mods
-            (publicFields, unionedFields) = partitionFieldRegistries loaded
+            (_unexportedPublicFields, unionedFields) = partitionFieldRegistries loaded
+            -- Gate bare accessors on EXPORT visibility (see 'exportedPublicFields').
+            -- An un-exported field selector (e.g. GHC.Event.KQueue's internal
+            -- 'filter') must not resolve here and shadow a Prelude function of the
+            -- same name. A module's OWN field selectors are served by its
+            -- owner-scoped closure ('buildSlotFromOwner' unions the owner's field
+            -- registry back in), so this cross-module gate leaves same-module field
+            -- access intact.
+            publicFields = exportedPublicFields loaded
         fieldEnvAll <- buildFieldAccessorEnv loaded publicFields unionedFields
         pure (HashMap.lookup bareName fieldEnvAll)
 

@@ -487,6 +487,52 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "before\n8080\nafter\n"
 
+    it "module: imported methodArray resolves (minBound,maxBound) bounds — sig-directed nullary propagation on the lazy fallback path" do
+        -- Regression: an IMPORTED @methodArray :: Array M String =
+        -- listArray (minBound, maxBound) …@ is resolved (by the same-module
+        -- @render m = methodArray ! m@) through 'buildSlotFromOwner', not the
+        -- eager 'exportBodies' path.  The signature-directed wrap is now applied
+        -- on both paths, and the elaborator's bare-name fallback resolves the
+        -- import-rewritten FQNs, so the bounds resolve to @M@ instead of
+        -- defaulting to Int (@Ix Int.index: non-Int index@).
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/cross_module_methodarray/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "GET\nDELETE\n"
+
+    it "module: ambiguous bare `map` (NonEmpty in scope) must not derail sig-directed bounds resolution" do
+        -- Regression: importing Data.List.NonEmpty makes bare `map` ambiguous in
+        -- the flat sig table; the elaborator must decline to guess (treat it as
+        -- opaque) so the methodArray bounds still resolve to M instead of
+        -- defaulting to Int (`Ix Int.index`). See globalAmbiguousSigsRef.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/ambiguous_map_sig/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "GET\nDELETE\n"
+
+    it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do
+        -- Regression for the warp hello-world startup crash: loading
+        -- 'GHC.Event.KQueue' (Darwin's event backend, whose 'Event' record
+        -- has a 'filter' field that KQueue does NOT export) registered a bare
+        -- 'filter' accessor in the global field env, so unrelated modules'
+        -- unqualified 'filter' resolved to the leaked accessor and died with
+        -- "record accessor `filter` applied to non-constructor value".
+        -- EventBackend owns 'filter' but doesn't export it; Main imports only
+        -- the type. Exercises all three resolution paths: the owner's own
+        -- field accessor (eventFilter -> 99), a NON-entry module using
+        -- Prelude.filter (evens -> [2,4,6], the path warp actually hits via
+        -- lazy buildSlotFromOwner), and the entry module's Prelude.filter
+        -- ([1,3,5]). Fixed by gating bare field-selector accessors on export
+        -- visibility ('exportedPublicFields') in loadProgramFromSource,
+        -- buildSlotFromOwner, and tryGlobalFieldSlot.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/record_field_prelude_collision/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "99\n[2,4,6]\n[1,3,5]\n"
+
     it "module: PackageImports `import \"base\" Data.List (sort)` parses + runs" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/Modules/package_import.hs")

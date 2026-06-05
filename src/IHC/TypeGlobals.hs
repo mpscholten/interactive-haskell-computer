@@ -11,6 +11,7 @@ module IHC.TypeGlobals
     , globalTypeSynonymsRef
     , globalClassMethodNamesRef
     , globalMethodClassRef
+    , globalAmbiguousSigsRef
       -- * Bundle that backs the four legacy registries
     , LegacyTypeState(..)
     , legacyTypeState
@@ -43,9 +44,10 @@ data LegacyTypeState = LegacyTypeState
     , ltsTypeSynonyms       :: !(IORef (Map ByteString (Int, Type)))
     , ltsClassMethodNames   :: !(IORef (Set ByteString))
     , ltsMethodClass        :: !(IORef (Map ByteString [ByteString]))
+    , ltsAmbiguousSigs      :: !(IORef (Set ByteString))
     }
 
--- | One-shot allocation of the four type-registry IORefs.
+-- | One-shot allocation of the type-registry IORefs.
 {-# NOINLINE legacyTypeState #-}
 legacyTypeState :: LegacyTypeState
 legacyTypeState = unsafePerformIO $ do
@@ -53,11 +55,13 @@ legacyTypeState = unsafePerformIO $ do
     synonyms    <- newIORef Map.empty
     classNames  <- newIORef Set.empty
     methodClass <- newIORef Map.empty
+    ambiguous   <- newIORef Set.empty
     pure LegacyTypeState
         { ltsTypeSigs         = sigs
         , ltsTypeSynonyms     = synonyms
         , ltsClassMethodNames = classNames
         , ltsMethodClass      = methodClass
+        , ltsAmbiguousSigs    = ambiguous
         }
 
 -- | Flat union of every loaded module's top-level type signatures.
@@ -98,6 +102,18 @@ globalClassMethodNamesRef = ltsClassMethodNames legacyTypeState
 -- dispatcher resolves.
 globalMethodClassRef :: IORef (Map ByteString [ByteString])
 globalMethodClassRef = ltsMethodClass legacyTypeState
+
+-- | Bare names whose top-level signatures CONFLICT across the loaded modules
+-- (e.g. @Prelude.map :: (a->b)->[a]->[b]@ vs @Data.List.NonEmpty.map ::
+-- (a->b)->NonEmpty a->NonEmpty b@).  'globalTypeSigsRef' is a flat bare-keyed
+-- union with last-writer-wins, so a colliding name silently resolves to
+-- whichever module loaded last — and once a library pulls in @NonEmpty@,
+-- elaborating @map f [xs]@ unifies @NonEmpty a@ against @[]@ and the whole
+-- signature-directed rewrite is discarded.  'IHC.Elaborate.elaborateVar'
+-- consults this set and treats an ambiguous bare name as opaque (no sig)
+-- rather than guess the wrong one — strictly safer than the last-writer guess.
+globalAmbiguousSigsRef :: IORef (Set ByteString)
+globalAmbiguousSigsRef = ltsAmbiguousSigs legacyTypeState
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only

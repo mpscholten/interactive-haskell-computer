@@ -298,7 +298,17 @@ nextToken s c0 =
                                -> let c' = step (step (step c)) in (mkTok TkCQuoteTy c c', c')
             | b == 0x7C, Just 0x5D <- peekByte s (cPos c + 1)
                                -> let c' = step (step c) in (mkTok TkCQuote c c', c')
+            -- '||' is TkOr ONLY when it is exactly two bars (not the prefix
+            -- of a longer operator like '|||', '||.', '||>').  Without the
+            -- peek+2 guard, '|||' was greedily split into TkOr + TkBar, which
+            -- broke @import Control.Arrow ((|||))@: the import-list parser
+            -- captured '||', choked on the stray TkBar (no closing ')'),
+            -- returned early, and the leftover corrupted the NEXT import line
+            -- (silently dropping e.g. @import qualified … as B8@ below it).
+            -- A longer '|'-run now falls through to 'lexSymOp' (maximal munch
+            -- → TkSymOp "|||"), matching '&&&'/'>>>'/'***' which already do.
             | b == 0x7C, Just 0x7C <- peekByte s (cPos c + 1)
+                        , not (isOpChar (peekByte s (cPos c + 2)))
                                -> let c' = step (step c) in (mkTok TkOr c c', c')
             | b == 0x7C, not (isOpChar (peekByte s (cPos c + 1)))
                                -> (mkTok TkBar c (step c), step c)       -- '|'
