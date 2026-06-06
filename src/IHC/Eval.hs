@@ -32,13 +32,15 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (ord)
-import Data.Int (Int64)
+import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
+import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
-import Foreign.Ptr (castPtr)
+import Foreign.Ptr (Ptr, castPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
+import qualified Foreign.Storable as FStorable
 import qualified Data.Map.Strict as Map
 
 import Control.Exception (try, SomeException)
@@ -431,10 +433,14 @@ eval hooks env ipm = go
         let ty = case TR.reduceTypeExpr reg ty0 of
                      Just reduced -> reduced
                      Nothing      -> ty0
-        mTypedNullary <- tryTypedNullaryClassMethod e ty
-        case mTypedNullary of
-            Just v  -> pure v
+        mTypedPeek <- tryTypedPeekByteOff e ty
+        case mTypedPeek of
+            Just v -> pure v
             Nothing -> do
+                mTypedNullary <- tryTypedNullaryClassMethod e ty
+                case mTypedNullary of
+                    Just v  -> pure v
+                    Nothing -> do
         -- Trigger on-demand elaboration: if the annotation parses to a
         -- concrete type AND the shared class registry is installed,
         -- run inference on @e@ with expected type @ty@.  The elaborator
@@ -443,10 +449,10 @@ eval hooks env ipm = go
         -- (or if inference doesn't change anything) we fall through to
         -- the original 'goTyApp' path — preserving all existing
         -- value-directed dispatch behaviour.
-                mElab <- tryElaborateTyAnn e ty
-                case mElab of
-                    Just e' -> goTyApp e' ty
-                    Nothing -> goTyApp e ty
+                        mElab <- tryElaborateTyAnn e ty
+                        case mElab of
+                            Just e' -> goTyApp e' ty
+                            Nothing -> goTyApp e ty
 
     tryTypedNullaryClassMethod e ty =
         case e of
@@ -634,7 +640,132 @@ eval hooks env ipm = go
                                         apply hooks flv lblT
                                     _ -> pure v
                             Nothing -> pure v
+                VIO action
+                    | Just resultTy <- ioResultAnnotation ty ->
+                        pure (VIO (applyNumericTyAnnotation resultTy <$> action))
                 _               -> pure (applyNumericTyAnnotation ty v)
+
+    tryTypedPeekByteOff :: Expr -> ByteString -> IO (Maybe Val)
+    tryTypedPeekByteOff e ty =
+        case (ioResultAnnotation ty, peekByteOffArgs e) of
+            (Just resultTy, Just (ptrE, offE)) ->
+                pure (Just (VIO (typedPeekByteOff resultTy ptrE offE)))
+            _ -> pure Nothing
+
+    typedPeekByteOff :: ByteString -> Expr -> Expr -> IO Val
+    typedPeekByteOff resultTy ptrE offE = do
+        ptrV <- go ptrE
+        offV <- go offE
+        p <- valToHostPtr ptrV
+        off <- case offV of
+            VInt n     -> pure (fromIntegral n)
+            VInteger n -> pure (fromInteger n)
+            _ -> error ("peekByteOff: offset is not an Int: "
+                        <> showValForDebug offV)
+        readTypedPeek resultTy p off
+
+    readTypedPeek :: ByteString -> Ptr Word8 -> Int -> IO Val
+    readTypedPeek ty p off =
+        case tyAnnotationHead ty of
+            "Ptr"      -> readPtr
+            "FunPtr"   -> readPtr
+            "Double"   -> VFloat <$> (FStorable.peekByteOff (castPtr p :: Ptr Double) off :: IO Double)
+            "Float"    -> do
+                x <- FStorable.peekByteOff (castPtr p :: Ptr Float) off :: IO Float
+                pure (VFloat (realToFrac x))
+            "Word8"    -> readWord8
+            "Word16"   -> readWord16
+            "Word32"   -> readWord32
+            "Word64"   -> readWord64
+            "Word"     -> readWord
+            "Int8"     -> readInt8
+            "Int16"    -> readInt16
+            "Int32"    -> readInt32
+            "Int64"    -> readInt64
+            "Int"      -> readInt
+            "CChar"    -> readInt8
+            "CUChar"   -> readWord8
+            "CBool"    -> readWord8
+            "CShort"   -> readInt16
+            "CUShort"  -> readWord16
+            "CInt"     -> readInt32
+            "CUInt"    -> readWord32
+            "CLong"    -> readInt64
+            "CULong"   -> readWord64
+            "CLLong"   -> readInt64
+            "CULLong"  -> readWord64
+            "CSize"    -> readWord
+            "CSsize"   -> readInt64
+            "CSSize"   -> readInt64
+            "CIntPtr"  -> readInt64
+            "CUIntPtr" -> readWord64
+            "CPtrdiff" -> readInt64
+            _          -> readWord8
+      where
+        readPtr = do
+            raw <- FStorable.peekByteOff (castPtr p :: Ptr Word64) off :: IO Word64
+            pure (VPrimObj (PrimPtr (castPtr (intPtrToPtr (fromIntegral raw)))))
+        readWord8 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Word8) off :: IO Word8
+            pure (VInt (fromIntegral x))
+        readWord16 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Word16) off :: IO Word16
+            pure (VInt (fromIntegral x))
+        readWord32 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Word32) off :: IO Word32
+            pure (VInt (fromIntegral x))
+        readWord64 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Word64) off :: IO Word64
+            pure (VInt (fromIntegral x))
+        readWord = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Word) off :: IO Word
+            pure (VInt (fromIntegral x))
+        readInt8 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Int8) off :: IO Int8
+            pure (VInt (fromIntegral x))
+        readInt16 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Int16) off :: IO Int16
+            pure (VInt (fromIntegral x))
+        readInt32 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Int32) off :: IO Int32
+            pure (VInt (fromIntegral x))
+        readInt64 = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Int64) off :: IO Int64
+            pure (VInt x)
+        readInt = do
+            x <- FStorable.peekByteOff (castPtr p :: Ptr Int) off :: IO Int
+            pure (VInt (fromIntegral x))
+
+    valToHostPtr :: Val -> IO (Ptr Word8)
+    valToHostPtr (VPrimObj (PrimPtr p)) = pure (castPtr p)
+    valToHostPtr (VCon "Ptr" [t]) = force hooks t >>= valToHostPtr
+    valToHostPtr (VInt n) = pure (intPtrToPtr (fromIntegral n))
+    valToHostPtr (VInteger n) = pure (intPtrToPtr (fromInteger n))
+    valToHostPtr VUnit = pure nullPtr
+    valToHostPtr other =
+        error ("peekByteOff: expected Ptr, got " <> showValForDebug other)
+
+    peekByteOffArgs :: Expr -> Maybe (Expr, Expr)
+    peekByteOffArgs expr = case stripTyApps expr of
+        EApp (EApp fn ptrE) offE
+            | isPeekByteOffHead fn -> Just (ptrE, offE)
+        EApp (ELam n body) ptrE ->
+            case stripTyApps body of
+                EApp (EApp fn (EVar v)) offE
+                    | v == n
+                    , isPeekByteOffHead fn -> Just (ptrE, offE)
+                _ -> Nothing
+        _ -> Nothing
+
+    isPeekByteOffHead :: Expr -> Bool
+    isPeekByteOffHead (EVar n) =
+        lastNameComponent n == BC.pack "peekByteOff"
+    isPeekByteOffHead (ETyApp inner _) = isPeekByteOffHead inner
+    isPeekByteOffHead _ = False
+
+    stripTyApps :: Expr -> Expr
+    stripTyApps (ETyApp inner _) = stripTyApps inner
+    stripTyApps other           = other
 
     -- Explicit numeric ascriptions stand in for the typechecker when an
     -- overloaded expression has already evaluated to IHC's default integral
@@ -646,11 +777,37 @@ eval hooks env ipm = go
         case tyAnnotationHead ty of
             "Double" -> toFloat v
             "Float"  -> toFloat v
+            h | h `elem` integralAnnotationHeads -> toIntegral v
             _        -> v
       where
         toFloat (VInt n)     = VFloat (fromIntegral n)
         toFloat (VInteger n) = VFloat (fromInteger n)
         toFloat other        = other
+
+        toIntegral (VPrimObj (PrimPtr p)) =
+            VInt (fromIntegral (ptrToIntPtr p))
+        toIntegral other = other
+
+        integralAnnotationHeads =
+            [ "Int", "Word", "Word8", "Word16", "Word32", "Word64"
+            , "Int8", "Int16", "Int32", "Int64"
+            , "CSize", "CInt", "CLong", "CULong", "CUInt"
+            , "CChar", "CUChar", "CShort", "CUShort"
+            , "CLLong", "CULLong", "CBool"
+            , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
+            ]
+
+    ioResultAnnotation :: ByteString -> Maybe ByteString
+    ioResultAnnotation ty = do
+        parsed <- Elab.parseRawTypeExpr ty
+        let (headTy, args) = TA.tyApps parsed
+        case (headTy, args) of
+            (TA.TyCon h, [arg])
+                | lastNameComponent (normalizeTyTag h) == BC.pack "IO" ->
+                    case TA.tyHead arg of
+                        Just argHead -> Just argHead
+                        Nothing      -> Nothing
+            _ -> Nothing
 
     tyAnnotationHead :: ByteString -> ByteString
     tyAnnotationHead ty =

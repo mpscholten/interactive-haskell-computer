@@ -1303,6 +1303,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello text\n"
 
+    it "GHC.RTS.Flags source-loads through typed Storable reads" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/rts_flags_source_loaded.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "rts flags ok\ngc flags ok\nprof flags ok\nticky flags ok\n"
+
     it "UserInfixOp: (|>) defined via section form `x |> f = f x`" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator.hs")
         n   `shouldBe` 0

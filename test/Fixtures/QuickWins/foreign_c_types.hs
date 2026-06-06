@@ -4,9 +4,8 @@
 -- hsc2hs preprocessing step (flake.nix ihcSourceRootWithHsc) handles
 -- any residual .hsc files in the nix-pinned source tree, and the
 -- handful of .hsc-only modules in base/ghc-internal that have no .hs
--- sibling are all either Windows-only or whitelisted as
--- compiler-backed stubs (e.g. GHC.RTS.Flags in
--- Scheduler.isBuiltinBackedModule).
+-- sibling are Windows-only.  Source-backed modules such as
+-- GHC.RTS.Flags must still route through the preprocessed .hs files.
 --
 -- This fixture locks in a round-trip of CInt as an ordinary import so
 -- a regression — e.g. a .hsc resurfacing to the scheduler because the

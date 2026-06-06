@@ -4358,7 +4358,8 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 -- warp request path) even though the single-file repro worked.
 wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig lm n e =
-    case e of
+    let e' = annotateBindInputTypes e
+    in case e' of
         -- RHS is literally a bare nullary class method
         -- (@x :: T; x = minBound@): annotate with the result-type tag.
         EVar v
@@ -4375,11 +4376,102 @@ wrapNullaryResultSig lm n e =
         -- once-per-thunk elaboration.
         _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
           , ([], resultTy) <- tyArrowArgs body
-          , any (isNullaryClassMethodName . lastNameComponent) (freeVars e)
+          , any (isNullaryClassMethodName . lastNameComponent) (freeVars e')
           , Just tyBytes <- renderTypeForAnnotation resultTy
-          -> ETyApp e tyBytes
-        _ -> e
+          -> ETyApp e' tyBytes
+        _ -> e'
   where
+    annotateBindInputTypes :: Expr -> Expr
+    annotateBindInputTypes = go
+      where
+        go expr = case expr of
+            EApp (EApp op f) action
+                | isBindFromRight op
+                , actionHasTypedPeekShape action
+                , Just argTy <- firstArgType f
+                , Just tyBytes <- renderTypeForAnnotation
+                    (TyApp (TyCon (BC.pack "IO")) argTy)
+                -> EApp (EApp (go op) (go f)) (annotateAction tyBytes action)
+            EApp (EApp op action) f
+                | isBind op
+                , actionHasTypedPeekShape action
+                , Just argTy <- firstArgType f
+                , Just tyBytes <- renderTypeForAnnotation
+                    (TyApp (TyCon (BC.pack "IO")) argTy)
+                -> EApp (EApp (go op) (annotateAction tyBytes action)) (go f)
+            EApp f x     -> EApp (go f) (go x)
+            ELam a body  -> ELam a (go body)
+            ELet bs body -> ELet [(bn, go rhs) | (bn, rhs) <- bs] (go body)
+            ECase s as   -> ECase (go s) [Alt p (go rhs) | Alt p rhs <- as]
+            EIf c t f    -> EIf (go c) (go t) (go f)
+            EDo stmts    -> EDo (map goStmt stmts)
+            ENeg inner   -> ENeg (go inner)
+            ETuple xs    -> ETuple (map go xs)
+            ERecordCon c fs -> ERecordCon c [(fn, go rhs) | (fn, rhs) <- fs]
+            ERecordUpdate base fs ->
+                ERecordUpdate (go base) [(fn, go rhs) | (fn, rhs) <- fs]
+            ETyApp inner ty -> ETyApp (go inner) ty
+            other -> other
+
+        goStmt stmt = case stmt of
+            SExpr rhs         -> SExpr (go rhs)
+            SBind bn rhs      -> SBind bn (go rhs)
+            SBangBind bn rhs  -> SBangBind bn (go rhs)
+            SLet bs           -> SLet [(bn, go rhs) | (bn, rhs) <- bs]
+            SImplicitLet bs   -> SImplicitLet [(bn, go rhs) | (bn, rhs) <- bs]
+
+        annotateAction _ action@ETyApp{} = go action
+        annotateAction tyBytes action    = ETyApp (go action) tyBytes
+
+    actionHasTypedPeekShape :: Expr -> Bool
+    actionHasTypedPeekShape expr = case stripTyApps expr of
+        EApp (EApp fn _) _
+            | isPeekByteOffHead fn -> True
+        EApp (ELam n body) _ ->
+            case stripTyApps body of
+                EApp (EApp fn (EVar v)) _
+                    | v == n
+                    , isPeekByteOffHead fn -> True
+                _ -> False
+        _ -> False
+
+    firstArgType :: Expr -> Maybe Type
+    firstArgType expr = case expr of
+        EVar fn -> do
+            Scheme _ _ body <- lookupSig fn
+            case tyArrowArgs body of
+                (argTy : _, _) -> Just argTy
+                _              -> Nothing
+        ETyApp inner _ -> firstArgType inner
+        _ -> Nothing
+
+    lookupSig fn =
+        Map.lookup fn (lmTypeSigs lm)
+        <|> Map.lookup (lastNameComponent fn) (lmTypeSigs lm)
+
+    isBindFromRight op =
+        case op of
+            EVar name -> lastNameComponent name == BC.pack "=<<"
+            ETyApp inner _ -> isBindFromRight inner
+            _ -> False
+
+    isBind op =
+        case op of
+            EVar name -> lastNameComponent name == BC.pack ">>="
+            ETyApp inner _ -> isBind inner
+            _ -> False
+
+    isPeekByteOffHead op =
+        case op of
+            EVar name -> lastNameComponent name == BC.pack "peekByteOff"
+            ETyApp inner _ -> isPeekByteOffHead inner
+            _ -> False
+
+    stripTyApps expr =
+        case expr of
+            ETyApp inner _ -> stripTyApps inner
+            other          -> other
+
     isNullaryClassMethodName nm =
         nm == BC.pack "maxBound"
      || nm == BC.pack "minBound"
@@ -7990,8 +8082,6 @@ isBuiltinBackedModule n =
     || n == "GHC.Prim.Ext"
     -- GHC.Prim.Exception has Haskell source in ghc-prim; it source-loads and
     -- bottoms out on the raw raise*# primops registered in IHC.Builtins.
-    -- GHC.RTS.Flags: RTS runtime flags; generated from RtsFlags.c, no .hs source.
-    || n == "GHC.RTS.Flags"
     -- GHC.Integer.Type: GMP integer internals; generated by GHC/integer-gmp build.
     || n == "GHC.Integer.Type"
     -- Unsafe.Coerce: has .hs source, but the source defines unsafeCoerce in

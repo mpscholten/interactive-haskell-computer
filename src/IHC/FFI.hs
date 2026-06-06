@@ -79,6 +79,9 @@ import IHC.Classes (legacyHooks)
 import IHC.Eval (force)
 import IHC.Val
 
+foreign import ccall "&RtsFlags"
+    hsRtsFlagsPtr :: Ptr ()
+
 --------------------------------------------------------------------------------
 -- Types
 --------------------------------------------------------------------------------
@@ -459,6 +462,13 @@ callForeign decl argVals = do
 -- (unix's @nocldstop@), and finalizer function pointers.
 makeForeignVal :: ForeignDecl -> IO Val
 makeForeignVal decl
+    | fdIsAddrOf decl
+    , fdSymbol decl == BC.pack "RtsFlags" =
+          -- RTS-exclusive data symbol used by source-loaded GHC.RTS.Flags.
+          -- It is not a Haskell module shim: the source foreign import still
+          -- resolves through the generic FFI path, but in-process test
+          -- runners do not expose this RTS data object through dlsym.
+          pure (VPrimObj (PrimPtr (castPtr hsRtsFlagsPtr)))
     | fdIsAddrOf decl = do
           mFp <- resolveSymbol (fdSymbol decl)
           case mFp of
