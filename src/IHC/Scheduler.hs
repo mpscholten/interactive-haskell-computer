@@ -50,11 +50,13 @@ module IHC.Scheduler
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try)
 import Control.Applicative ((<|>))
+import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (nullPtr)
 import qualified Foreign.Ptr as FP
 import Data.ByteString (ByteString, isSuffixOf)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Word (Word8)
 import Data.IORef
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
@@ -76,6 +78,7 @@ import IHC.AST
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
+    , foreignPtrValToForeignPtr
     , isHostWord8PtrVal, pokeHostWord8ByteOff
     , reapSpawnedThreads
     )
@@ -689,6 +692,12 @@ loadProgramFromSource searchPath src0 = do
                         -- then LT else GT@.
                         registerClassDefaults registry fullSearchPath includeMap
                                               classReg env [lm]
+                        -- Lazily-loaded modules can carry standalone-derived
+                        -- Eq instances rather than explicit @instance Eq@
+                        -- bodies.  The source-loaded @GHC.Classes@ path uses
+                        -- this for @Bool@ and @Ordering@, so first-use Eq
+                        -- dispatch must run the derived registrar here too.
+                        registerDerivedEqInstances classReg currentModules
             Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
@@ -930,6 +939,7 @@ loadCoreInstanceModules classReg baseEnv cls = do
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                          classReg tyCtors classTable baseEnv) loaded
             registerDerivedEnumBoundedInstances classReg loadedAll
+            registerDerivedEqInstances classReg loadedAll
             -- Also mirror into the shared reg (matches the loadImport path).
             mSharedReg <- getSharedClassReg legacyHooks
             case mSharedReg of
@@ -937,6 +947,7 @@ loadCoreInstanceModules classReg baseEnv cls = do
                     mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                                  sharedReg tyCtors classTable baseEnv) loaded
                     registerDerivedEnumBoundedInstances sharedReg loadedAll
+                    registerDerivedEqInstances sharedReg loadedAll
                 _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
@@ -2735,23 +2746,14 @@ registerDerivedEqInstances classReg loadedModules = do
 -- | Register one in-line-derived @Eq T@ instance.  Skipped if a
 -- user-written or earlier-registered @instance Eq T@ already exists.
 --
--- Unlike the sibling Functor/Enum/Bounded registrars (which also key
--- the dictionary under every ctor name of @T@), Eq is only keyed
--- under the type name.  The 'typeTagOf' hook installed by
--- 'installCtorTypeHook' already maps any @VCon ctor _@ value to its
--- defining type name via 'lmDataReg', so a @VCon "MkPt" [..]@ value
--- dispatches as @"Pt"@ — the type-name key is sufficient.
---
--- Why differ from Functor here?  Constructor-keyed registration is
--- safe for Functor (a ctor name collision with a primitive type is
--- unlikely and the worst case is a stale fmap on a runtime VInt that
--- would fail anyway), but for @Eq@ a primitive collision is fatal:
--- @data Lexeme = Char Char | String String | …@ in
--- @GHC.Internal.Text.Read.Lex@ has a ctor named @Char@.  Keying
--- @Eq Lexeme@ under @"Char"@ would shadow the legitimate
--- @Eq Char@ from @GHC.Classes@ for any @VChar _@ comparison
--- (@'a' == 'b'@ would route to Lexeme's structural compare and
--- error on the non-VCon argument).
+-- The primary dictionary is keyed under the type name.  Source ADT
+-- values usually dispatch by runtime constructor name, so we also key
+-- under each safe constructor.  Constructor keys are skipped when they
+-- collide with primitive/common runtime tags (e.g. @Char@) or when an
+-- existing Eq instance is already registered for that constructor.
+-- This preserves the old Lexeme safeguard while allowing ordinary
+-- @data T = A | B deriving Eq@ values to reach their derived method
+-- without the retired global @==@ shim.
 registerOneEq :: ClassRegistry -> FunctorDerivDecl -> IO ()
 registerOneEq classReg decl = do
     let eqVal     = synthStructuralEq classReg (fdTyName decl)
@@ -2760,7 +2762,29 @@ registerOneEq classReg decl = do
     existing <- lookupInstance classReg eqCls (fdTyName decl)
     case existing of
         Just _  -> pure ()    -- user / earlier instance wins
-        Nothing -> registerInstance classReg eqCls (fdTyName decl) methods
+        Nothing -> do
+            registerInstance classReg eqCls (fdTyName decl) methods
+            mapM_ (registerCtorKey eqCls methods) (map fcName (fdCtors decl))
+  where
+    registerCtorKey eqCls methods ctor
+        | not (safeDerivedEqCtorKey ctor) = pure ()
+        | otherwise = do
+            existing <- lookupInstance classReg eqCls ctor
+            case existing of
+                Just _  -> pure ()
+                Nothing -> registerInstance classReg eqCls ctor methods
+
+safeDerivedEqCtorKey :: ByteString -> Bool
+safeDerivedEqCtorKey ctor =
+    ctor `notElem` map BC.pack
+        [ "Int", "Integer", "Double", "Float", "Char", "String"
+        , "[]", ":", "()", "(,)", "(,,)"
+        , "True", "False", "Bool"
+        , "LT", "EQ", "GT", "Ordering"
+        , "Just", "Nothing", "Maybe", "Left", "Right", "Either"
+        , "IS", "IP", "IN"
+        , "Ptr", "ForeignPtr", "BS"
+        ]
 
 -- | Register one standalone-derived @Eq T@ instance.  Mirrors
 -- 'registerOneEq' but the constructor list comes from the union of
@@ -3707,27 +3731,31 @@ classMethodDispatcher reg cls methodName = selfVal
                                          <> "` and no result-polymorphic / default instance" )
                     else do
                         -- Non-dispatchable tag (function / primitive object
-                        -- / unit @()@).  For @Show.show@ specifically,
-                        -- try the host fallback first: 'show ()' /
-                        -- 'show <function>' / etc. used to flow through
-                        -- the bare-name @showDispatch@ shim before that
-                        -- shim was retired, and the source-loaded
-                        -- @class Show a@ has no dispatchable handle for
-                        -- these tags ('isDispatchableTag' excludes them
-                        -- precisely because they're singletons whose
+                        -- / unit @()@).  First try narrow RTS-representation
+                        -- bridges such as Eq ForeignPtr; these are not general
+                        -- Hackage shims, but the host value shape that source
+                        -- methods like @unsafeForeignPtrToPtr p == ...@ bottom
+                        -- out on.  For @Show.show@ specifically, then try the
+                        -- host fallback: 'show ()' / 'show <function>' / etc.
+                        -- used to flow through the bare-name @showDispatch@
+                        -- shim before that shim was retired, and the
+                        -- source-loaded @class Show a@ has no dispatchable
+                        -- handle for these tags ('isDispatchableTag' excludes
+                        -- them precisely because they're singletons whose
                         -- runtime shape can't drive a class lookup).
-                        -- 'hostShowFallback' returns 'Nothing' for any
-                        -- other class/method, so non-Show classes keep
-                        -- the original stash-and-wait behaviour.
-                        mHostNonDisp <- hostShowFallback reg cls tag methodName av
-                        case mHostNonDisp of
-                          Just hostVal -> pure hostVal
+                        mSpecialNonDisp <- specialClassApplication tag av argT accArgs
+                        case mSpecialNonDisp of
+                          Just specialVal -> pure specialVal
                           Nothing -> do
-                            -- Stash and wait for the next arg so the
-                            -- dispatcher can look at a dispatchable
-                            -- argument later in the application chain.
-                            let v = dispatch (remaining - 1) (argT : accArgs)
-                            pure v
+                            mHostNonDisp <- hostShowFallback reg cls tag methodName av
+                            case mHostNonDisp of
+                              Just hostVal -> pure hostVal
+                              Nothing -> do
+                                -- Stash and wait for the next arg so the
+                                -- dispatcher can look at a dispatchable
+                                -- argument later in the application chain.
+                                let v = dispatch (remaining - 1) (argT : accArgs)
+                                pure v
 
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
@@ -3878,6 +3906,11 @@ classMethodDispatcher reg cls methodName = selfVal
         ]
 
     specialClassApplication tag av argT accArgs
+        | cls == BC.pack "Eq"
+        , methodName `elem` map BC.pack ["==", "/="]
+        , tag == BC.pack "<ForeignPtr>" || tag == BC.pack "ForeignPtr"
+        , null accArgs
+        = Just <$> foreignPtrEqMethod methodName av
         | cls == BC.pack "IsString"
         , methodName == BC.pack "fromString"
         , tag == BC.pack "[]"
@@ -3950,6 +3983,21 @@ classMethodDispatcher reg cls methodName = selfVal
                                         Just <$> applyAll methodVal (reverse (argT : accArgs))
                                 _ -> pure Nothing
         | otherwise = pure Nothing
+
+    foreignPtrEqMethod method left =
+        pure $ VFun $ \rightT -> do
+            right <- force legacyHooks rightT
+            l <- try (foreignPtrValToForeignPtr left)
+                    :: IO (Either SomeException (ForeignPtr Word8))
+            r <- try (foreignPtrValToForeignPtr right)
+                    :: IO (Either SomeException (ForeignPtr Word8))
+            let same = case (l, r) of
+                    (Right lf, Right rf) -> lf == rf
+                    _                    -> False
+                result
+                    | method == BC.pack "/=" = not same
+                    | otherwise              = same
+            pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
 
     ixBoundsTag (VCon "(,)" [loT, hiT]) = do
         lo <- force legacyHooks loT

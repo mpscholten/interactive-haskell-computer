@@ -15,6 +15,7 @@ module IHC.Builtins
     , stringToListValIO
     , clearCtorIndex
     , clearForeignPtrWord8Ranges
+    , foreignPtrValToForeignPtr
     , flushHostHandleBuffer
     , isHostWord8PtrVal
     , pokeHostWord8ByteOff
@@ -407,25 +408,17 @@ builtins reg =
     -- 'maxBound' / 'minBound' source-load via Bounded in
     -- GHC.Internal.Enum.  Nullary dispatch is type-directed through
     -- ETyApp / wrapNullaryResultSig instead of a host Int default.
-    -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
-    -- Builtin instances for Int, Char, Bool, [] are handled inline;
-    -- user-defined instances are looked up from the registry.
+    -- Comparisons: @==@ and @/=@ are deliberately omitted.  They have
+    -- real source in @GHC.Classes@'s @class Eq@ and route through the
+    -- source-loaded class-method dispatcher seeded in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.  The discovery
+    -- cascade that previously blocked this removal is covered by
+    -- @test/Fixtures/Coverage/discovery_compare_eq_ordering.hs@.
     --
-    -- TODO (slice-2 follow-up): drop @==@ / @/=@ — they have real
-    -- source in @GHC.Classes@ and the doctrine says interpret it.
-    -- The discovery-cascade blocker is FIXED: the per-FV chase from
-    -- @registerInstancesFrom@ / @registerClassDefaults@ now goes
-    -- through @IHC.Scheduler.discoverInModuleForChase@ (curated
-    -- 'perFVChaseShortCircuit'), so a source-loaded @GHC.Classes@ no
-    -- longer fans the chase out across @base@ + @ghc-internal@ until
-    -- the 4 GB heap exhausts.  Reproducer: @main = print (compare 1 2
-    -- == LT)@ (was: discovery >2400 → OOM; now ~master's ~1000).
-    -- Remaining before removal: route the @eqVals@ representation
-    -- bridges (cross-numeric, VStr, ByteString/ForeignPtr, null-ptr)
-    -- through source — there is no host Eq fallback in the dispatcher.
-    [ ("==",       eqDispatch reg)
-    , ("/=",       neqDispatch reg)
-    , ("<",        ordDispatch reg 0)
+    -- The Ord relation operators are still host-backed temporarily:
+    -- their source path needs the same representation-bridge coverage
+    -- that @ordDispatch@ currently provides for mixed runtime shapes.
+    [ ("<",        ordDispatch reg 0)
     , ("<=",       ordDispatch reg 1)
     , (">",        ordDispatch reg 2)
     , (">=",       ordDispatch reg 3)
@@ -1767,7 +1760,8 @@ unaryOpFloat op = pure $ VFun $ \a -> do
         VInt n   -> pure (VFloat (op (fromIntegral n)))
         _ -> error ("unaryOpFloat: non-numeric arg: " <> showValForDebug av)
 
--- cmpInt removed in Phase 2.3 — replaced by eqDispatch/ordDispatch
+-- cmpInt removed in Phase 2.3 — replaced by Eq/Ord class dispatch
+-- and the remaining Ord relation dispatcher below.
 
 -- | Boolean-returning version of a comparison: returns VCon "True" or "False".
 boolVal :: Bool -> Val
@@ -1849,29 +1843,13 @@ isTruthy (VInt _)         = True
 isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
 
 --------------------------------------------------------------------------------
--- Phase 2.3: type-class dispatch for Eq, Ord, Show
+-- Phase 2.3: type-class dispatch helpers for Eq, Ord, Show
 --
--- For Int, Char, Bool, List: handled inline.
--- For user-defined types: look up the ClassRegistry.
+-- Eq class methods source-load through the scheduler's class-method
+-- dispatcher.  'eqVals' remains as an internal helper for derived
+-- instances and the temporary Ord relation bridge.
 --------------------------------------------------------------------------------
 
--- | Eq dispatch: look up "==" method from the class registry.
--- Method slot 0 = (==), slot 1 = (/=).
-eqDispatch :: ClassRegistry -> IO Val
-eqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    eqVals reg av bv
-
--- | /= dispatch.
-neqDispatch :: ClassRegistry -> IO Val
-neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    r <- eqVals reg av bv
-    pure (boolVal (not (isTruthy r)))
-
--- | Core equality test on WHNF values.
 -- | Force a 'VLazyMethod' result from 'lookupInstanceMethod', tolerating
 -- parse/eval failures by treating them as "no instance".  Instance method
 -- bodies are registered lazily in the class registry (see
@@ -1890,6 +1868,7 @@ forceInstanceMethod (Just v) = do
     isPlaceholder (VCon n []) = BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
     isPlaceholder _           = False
 
+-- | Core equality test on WHNF values.
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
 eqVals reg av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (x == y))

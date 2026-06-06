@@ -3,11 +3,9 @@
 -- @data ... deriving Eq@ shape.
 --
 -- A polymorphic @eqIt :: Eq a => a -> a -> Bool@ forces the
--- elaborator to emit @ETypedMethod \"Eq\" \"==\" tag@ rather than the
--- bare @EVar \"==\"@ that resolves to the @eqDispatch@ builtin
--- shim — so the synthesised structural body actually fires for
--- @MkPt 1 2 == MkPt 1 2@ and friends instead of being shadowed by
--- the host @eqVals@ inline.
+-- elaborator to emit @ETypedMethod \"Eq\" \"==\" tag@, so the
+-- synthesised structural body fires for @MkPt 1 2 == MkPt 1 2@
+-- and friends through the same class-dispatch path as bare @==@.
 --
 -- The synthesised body is mechanically equivalent to what GHC emits:
 --

@@ -345,6 +345,9 @@ typeTagOf (VCon "[]" _) = BC.pack "[]"
 typeTagOf (VCon ":" _)  = BC.pack "[]"
 typeTagOf (VCon "True"  _) = BC.pack "Bool"
 typeTagOf (VCon "False" _) = BC.pack "Bool"
+typeTagOf (VCon "LT" _) = BC.pack "Ordering"
+typeTagOf (VCon "EQ" _) = BC.pack "Ordering"
+typeTagOf (VCon "GT" _) = BC.pack "Ordering"
 typeTagOf (VCon "(,)" _)   = BC.pack "(,)"
 typeTagOf (VCon "(,,)" _)  = BC.pack "(,,)"
 -- Common-case ctor -> type-name normalisation for built-in data types
@@ -373,7 +376,8 @@ typeTagOf (VCon n _) =
     -- the bare type name) caused the strict-vs-lazy ByteString
     -- collision: both registered under @\"ByteString\"@ and last-write
     -- won.  See typeTagOf's special cases above for the hand-coded
-    -- common types (@Just@, @Nothing@, @Left@, @Right@, @True@, etc.)
+    -- common types (@Just@, @Nothing@, @Left@, @Right@, @True@, @LT@,
+    -- etc.)
     -- whose instances are only keyed under the type name.
     n
 typeTagOf (VFun _)      = BC.pack "<function>"

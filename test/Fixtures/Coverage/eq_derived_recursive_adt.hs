@@ -1,8 +1,8 @@
 -- @deriving Eq@ structural synthesis (registerDerivedEqInstances /
 -- synthStructuralEq) on a recursive sum+product ADT, driven through a
 -- polymorphic @eqIt@ so the elaborator emits @ETypedMethod "Eq" "=="@
--- and the SOURCE/synth path fires even while the @eqDispatch@ shim
--- still exists (so this locks correctness before the Stage-2 removal).
+-- and the source/synth path fires through class dispatch rather than
+-- a host-backed global @==@ shim.
 data Tree = Leaf Int | Node Tree Tree deriving (Eq, Show)
 
 eqIt :: Eq a => a -> a -> Bool

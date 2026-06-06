@@ -15,9 +15,8 @@
 -- module's 'lmTypeCtorReg' to find @T@'s constructors.
 --
 -- Polymorphic @eqIt@ forces the elaborator to emit
--- @ETypedMethod \"Eq\" \"==\" tag@, bypassing the still-present
--- @eqDispatch@ builtin shim so the synthesised structural body
--- actually fires.
+-- @ETypedMethod \"Eq\" \"==\" tag@, so the synthesised structural body
+-- fires through the same class-dispatch path used by bare @==@.
 eqIt :: Eq a => a -> a -> Bool
 eqIt x y = x == y
 {-# NOINLINE eqIt #-}
