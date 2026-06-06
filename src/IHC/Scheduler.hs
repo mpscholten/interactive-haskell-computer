@@ -2105,7 +2105,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                 -- rewritten to their real source module before eval.
                 methodFvs <- bindingLhsFreeVars lm lhs
                 rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
-                r <- try (evalMethodWithLazy env lm rw (Just (cls, typ, mn)) (mn, lhs))
+                r <- try (evalMethodWithLazy classReg env lm rw (Just (cls, typ, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
                     Right (VLazyMethod innerT) -> force legacyHooks innerT
@@ -2273,13 +2273,14 @@ findRuntimeCtorsForType registry searchPath includeMap seen lm ty
 -- 'registerOne' itself, or via later REPL-level discovery), so the
 -- thunk's captured env resolves successfully.
 evalMethodWithLazy
-    :: Env
+    :: ClassRegistry
+    -> Env
     -> LoadedModule
     -> Map ByteString ByteString
     -> Maybe (ByteString, ByteString, ByteString)
     -> (ByteString, BindingLhs)
     -> IO Val
-evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
+evalMethodWithLazy classReg env lm rewrites methodCtx (methodName, lhs) = do
     expr0 <- Parser.parseBodyExprWithFixity
                 (lmSource lm) (lmFixity lm) (lhsClauses lhs)
     let expr0' = lowerInstanceCoerceMethod methodCtx
@@ -2288,9 +2289,44 @@ evalMethodWithLazy env lm rewrites methodCtx (methodName, lhs) = do
                  (desugarRecordCons (lmFieldReg lm) expr0')
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
-    let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk env
+    typedNullaryEnv <- instanceTypedNullaryEnv classReg methodCtx
+    let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
+                     $ HashMap.union typedNullaryEnv env
     t <- newThunk envWithOwner expr
     pure (VLazyMethod t)
+
+instanceTypedNullaryEnv
+    :: ClassRegistry
+    -> Maybe (ByteString, ByteString, ByteString)
+    -> IO Env
+instanceTypedNullaryEnv _ Nothing = pure HashMap.empty
+instanceTypedNullaryEnv classReg (Just (_cls, typ, _methodName)) = do
+    -- Source instance methods can mention nullary class methods whose
+    -- type is fixed by the instance head.  Example: Enum Int.succ has
+    -- `x == maxBound`; with no typechecker, bare maxBound otherwise
+    -- remains an unapplied Bounded dispatcher and Eq Int sees a function.
+    let boundedCls = BC.pack "Bounded"
+        tag = normalizeTyTag typ
+        names = [BC.pack "minBound", BC.pack "maxBound"]
+    HashMap.fromList <$> mapM (mkEntry boundedCls tag) names
+  where
+    mkEntry cls tag methodName = do
+        t <- newLazyBuiltinThunk $ resolveTypedNullaryInstanceMethod cls tag methodName
+        pure (methodName, t)
+
+    resolveTypedNullaryInstanceMethod cls tag methodName = do
+        mv0 <- lookupInstanceMethod classReg cls tag methodName
+        mv <- case mv0 of
+            Just _  -> pure mv0
+            Nothing -> do
+                triggerCoreInstanceLoad legacyHooks cls
+                lookupInstanceMethod classReg cls tag methodName
+        case mv of
+            Just v -> forceMethodVal legacyHooks v
+            Nothing -> error
+                ( "instance method source: no `"
+               <> BC.unpack cls <> " " <> BC.unpack tag
+               <> "` method `" <> BC.unpack methodName <> "`" )
 
 -- | Collect the union of free variables across all method bodies of an
 -- instance.  Used to seed 'buildImportRewritesForNames' with the exact
