@@ -3676,6 +3676,13 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "Num"
         , method == BC.pack "fromInteger" =
             [BC.pack "Int", BC.pack "Integer"]
+        -- RealFloat.encodeFloat :: Integer -> Int -> a has the
+        -- instance type only in the result.  In optimistic mode type
+        -- annotations may not survive to dispatch, and IHC represents both
+        -- Float and Double as VFloat, whose runtime tag is "Double".
+        | clsName == BC.pack "RealFloat"
+        , method == BC.pack "encodeFloat" =
+            [BC.pack "Double"]
         -- MonadParsec methods are parameterized by the parser monad
         -- @m@, which only appears in the result type (e.g. @takeWhileP
         -- :: Maybe String -> (Token s -> Bool) -> m (Tokens s)@).

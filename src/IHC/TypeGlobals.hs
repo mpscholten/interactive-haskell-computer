@@ -257,6 +257,21 @@ seedBuiltinClassMethodSigs = do
             , ("round",      "RealFrac")
             , ("ceiling",    "RealFrac")
             , ("floor",      "RealFrac")
+            -- RealFloat
+            , ("floatRadix",     "RealFloat")
+            , ("floatDigits",    "RealFloat")
+            , ("floatRange",     "RealFloat")
+            , ("decodeFloat",    "RealFloat")
+            , ("encodeFloat",    "RealFloat")
+            , ("exponent",       "RealFloat")
+            , ("significand",    "RealFloat")
+            , ("scaleFloat",     "RealFloat")
+            , ("isNaN",          "RealFloat")
+            , ("isInfinite",     "RealFloat")
+            , ("isDenormalized", "RealFloat")
+            , ("isNegativeZero", "RealFloat")
+            , ("isIEEE",         "RealFloat")
+            , ("atan2",          "RealFloat")
             -- Bits
             --
             -- Builtins-removal companion: the @popCount@ / @bit@ /

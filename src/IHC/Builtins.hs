@@ -397,10 +397,10 @@ builtins reg =
     --   ==##, /=##, <##, <=##, >##, >=##  — Double# comparisons
     --   fabsDouble#, negateFloat#  — Double# unary
     --
-    -- Plus host shims for 'encodeFloat' / 'decodeFloat' that
-    -- short-circuit the class-method dispatcher (separate workstream:
-    -- @RealFloat Double.encodeFloat@ instance method registration
-    -- isn't surfacing through dispatch; the host shim bypasses).
+    -- 'encodeFloat' / 'decodeFloat' also source-load via RealFloat
+    -- now.  'encodeFloat' is result-polymorphic, so the dispatcher
+    -- defaults it to Double (the runtime representation for VFloat)
+    -- when no static type survives optimistic interpretation.
     -- Kept for now: source @fromIntegral = fromInteger . toInteger@ needs the
     -- result type to drive @fromInteger@ dispatch. IHC's current annotation
     -- elaboration loses that, so @fromIntegral (toInteger n) :: Int@ reaches an
@@ -408,18 +408,6 @@ builtins reg =
     [ ("fromIntegral", fromIntegralB)
     , ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
-    -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  Kept:
-    -- graduation is blocked on the @RealFloat Double@ *instance-method
-    -- registration* gap (a distinct root cause from the integerMul
-    -- parse/qualified-resolution gap fixed in this PR — verified:
-    -- @integerEncodeDouble#@ source-loads and runs fine, but the
-    -- @RealFloat Double.encodeFloat@ instance method still dispatches
-    -- to a @<<ihc-method-placeholder>:RealFloat/encodeFloat>@).
-    -- Registering the shims in the builtin env makes the env-fallback
-    -- short-circuit the dispatcher.  Tracked for the instance-
-    -- registration workstream.
-    , ("encodeFloat",  encodeFloatB)
-    , ("decodeFloat",  decodeFloatB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
@@ -3589,47 +3577,6 @@ maxBoundB = pure (VInt maxBound)
 minBoundB :: IO Val
 minBoundB = pure (VInt minBound)
 
--- | @encodeFloat m e@ — @m * 2^e@ as a 'Double' (or 'Float', we
--- represent both as 'VFloat').  Host shim because the source-loaded
--- @RealFloat Double.encodeFloat@ instance method isn't being routed
--- by the class dispatcher (instance-method-registration gap; the
--- underlying 'integerEncodeDouble#' source-loads fine).  Accepts
--- 'VInt' or 'VInteger' for the mantissa.
-encodeFloatB :: IO Val
-encodeFloatB = pure $ VFun $ \mT -> pure $ VFun $ \eT -> do
-    mv <- force legacyHooks mT
-    ev <- force legacyHooks eT
-    let mInt = case mv of
-            VInt n     -> toInteger n
-            VInteger n -> n
-            VPrimObj (PrimBigNat n) -> toInteger n
-            _ -> error ("encodeFloat: bad mantissa: " <> showValForDebug mv)
-        eInt = case ev of
-            VInt n -> fromIntegral n :: Int
-            _      -> error ("encodeFloat: bad exponent: " <> showValForDebug ev)
-    pure (VFloat (encodeFloat mInt eInt :: Double))
-
--- | @decodeFloat x@ — @(m, e)@ such that @x == m * 2^e@.  Returns
--- a tuple of '(Integer, Int)'.  Source-loaded path bottoms out at
--- 'decodeDouble_Int64#' (already shipped) but the surrounding
--- 'RealFloat Double.decodeFloat' instance method dispatch is
--- blocked on the same instance-registration gap as 'encodeFloat'.
-decodeFloatB :: IO Val
-decodeFloatB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VFloat d -> do
-            let (m, e) = decodeFloat d :: (Integer, Int)
-            -- Mantissa is Integer; Phase 3 collapse handles the wrapping
-            mV <- pure $ if m >= toInteger (minBound :: Int64)
-                         && m <= toInteger (maxBound :: Int64)
-                            then VInt (fromInteger m)
-                            else VInteger m
-            mT <- newWHNFThunk mV
-            eT <- newWHNFThunk (VInt (fromIntegral e))
-            pure (VCon "(,)" [mT, eT])
-        _ -> error ("decodeFloat: not a Double: " <> showValForDebug av)
-
 fromIntegralB :: IO Val
 fromIntegralB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
@@ -6234,10 +6181,9 @@ identityIntPrimop = pure $ VFun $ \a -> do
 -- source-loaded code where literal overflow routed an
 -- in-range value through 'LInteger' (e.g. @-2^63@ via
 -- NegativeLiterals on @-0x8000000000000000@).
--- 'floatToIntB' removed in Phase 5 — host shims for
--- floor / ceiling / round / truncate graduated out.  If the
--- source-loaded RealFrac chain regresses, restore from git
--- history.
+-- 'floatToIntB' and the floor / ceiling / round / truncate shims were
+-- removed in Phase 5.  Those methods now source-load through RealFrac /
+-- RealFloat and bottom out on the Double#/Integer primops below.
 
 
 asInt64 :: Val -> Maybe Int64
