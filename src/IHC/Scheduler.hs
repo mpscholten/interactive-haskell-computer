@@ -1551,8 +1551,9 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     -- For builtin-backed stubs with no qualPairs, synthesize alias
     -- slots for any requested name whose FQN has a builtin binding.
-    -- This makes e.g. `BS.length` resolve to the host `Data.ByteString.length`
-    -- shim when Data.ByteString is on the builtin-backed list.
+    -- This is only for compiler-built / RTS-backed modules with no source;
+    -- ordinary modules such as Data.ByteString must provide qualPairs from
+    -- their source-loaded bodies instead.
     let synthFromBuiltin n =
             let fqn = lmName targetLm <> BC.pack "." <> n
                 -- Data constructors live in 'conEnv' under their

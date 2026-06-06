@@ -128,8 +128,7 @@ spec = describe "REPL smoke tests" do
 
     it "import qualified Data.ByteString as BS: BS.length (BS.pack [97,98,99]) = 3" do
         -- REPL imports route this through source-loaded
-        -- 'Data.ByteString.pack' (the 'bsPackB' shim only fires on
-        -- the file-mode entry-source path).  Source path goes
+        -- 'Data.ByteString.pack'.  Source path goes
         -- 'pack' → 'unsafePackLenBytes' → 'pokeFp p w8' for each
         -- element.  This is still the source-loaded pack path, not a
         -- ByteString shim, and can sit close to the default 20s REPL
@@ -152,9 +151,7 @@ spec = describe "REPL smoke tests" do
         -- matching the explicit @c2w@ coercion used by
         -- 'Data.ByteString.Char8.pack' for the strict-typed Char
         -- path.  Source-loaded 'Data.ByteString.pack' now handles
-        -- both inputs without the 'bsPackB' shim being preferred (the
-        -- shim still exists, but is a separate clean-up — CLAUDE.md
-        -- rule 4 wants no Hackage shims at all).
+        -- both inputs without any ByteString API shim being preferred.
         (code, out, _err) <- runReplWithin 35
             ( "import qualified Data.ByteString as BS\n"
            <> "BS.length (BS.pack \"test\")\n"

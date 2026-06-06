@@ -475,7 +475,7 @@ builtins reg =
     -- (show, length via Foldable), through source-loaded module bodies
     -- for plain Haskell functions (concatMap from GHC.Internal.List,
     -- everything in Data.ByteString.Internal.Type), and through the
-    -- RTS-level primitives still shimmed below (mallocPlainForeignPtrBytes,
+    -- RTS-level primitives still host-backed below (mallocPlainForeignPtrBytes,
     -- minusAddr#, etc.) for actual allocation/pointer boundaries.
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
@@ -1967,10 +1967,10 @@ eqVals reg av bv = case (av, bv) of
     (VCon "False" _, VCon "False" _) -> pure (boolVal True)
     (VCon "True" _, VCon "False" _)  -> pure (boolVal False)
     (VCon "False" _, VCon "True" _)  -> pure (boolVal False)
-    -- Data.ByteString shim (see isBuiltinBackedModule): compare by
-    -- content via the host Eq ByteString, not by ForeignPtr identity.
-    -- Default VCon field-by-field would compare fp1 == fp2 which is
-    -- always False for freshly-allocated buffers with the same bytes.
+    -- ByteString's source-loaded Eq instance eventually needs byte-content
+    -- equality.  Keep that representation bridge here rather than reviving
+    -- any Data.ByteString API shim: default VCon field-by-field equality
+    -- would compare ForeignPtr identity and fail for equal fresh buffers.
     (VCon "BS" _, VCon "BS" _) -> do
         ba <- bsValToBS av
         bb <- bsValToBS bv
@@ -2049,9 +2049,9 @@ ordCmp _reg slot av bv = case (av, bv) of
         pure (boolVal (ptrOrdSlot slot p1 p2))
     (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
         pure (boolVal (foreignPtrOrdSlot slot fp1 fp2))
-    -- Data.ByteString shim (see eqVals): compare by content via the
-    -- host Ord, not structural VCon-field compare (which compares
-    -- ForeignPtr addresses and gives meaningless results).
+    -- ByteString's source-loaded Ord instance eventually needs byte-content
+    -- ordering.  This is a representation bridge, not a Data.ByteString API
+    -- shim; structural VCon comparison would order by ForeignPtr address.
     (VCon "BS" _, VCon "BS" _) -> do
         ba <- bsValToBS av
         bb <- bsValToBS bv
@@ -4669,16 +4669,13 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
--- Data.ByteString shims
---
--- Temporary short-circuits for Data.ByteString operations. Data.ByteString.hs
--- source-loads correctly but takes ~9 minutes to complete because discovery
--- of GHC.Internal.Show's transitive closure cascades through thousands of
--- bindings. See isBuiltinBackedModule comment. Remove once the perf fix
--- lands on Scheduler discovery.
+-- ByteString representation helpers
 --
 -- A ByteString is represented at runtime as @VCon "BS" [ForeignPtr, length]@,
 -- matching Data.ByteString.Internal.Type.ByteString's real constructor.
+-- These helpers unpack that runtime representation for class-dispatch
+-- bridges and RTS/FFI boundaries. They are not registered as Data.ByteString
+-- API functions; pack/length/append/etc. source-load from bytestring.
 --------------------------------------------------------------------------------
 
 -- | Unpack a bytestring into its '(ForeignPtr Word8, Int)' payload.
