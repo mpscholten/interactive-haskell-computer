@@ -925,14 +925,18 @@ loadCoreInstanceModules classReg baseEnv cls = do
             unionInstanceScope (Set.fromList (map lmName loaded))
             classTable <- buildClassMethodTable loaded
             let tyCtors = foldr Map.union Map.empty (map lmTypeCtorReg loaded)
+            reg <- readIORef registry
+            let loadedAll = [ lm | (_, Loaded lm) <- Map.toList reg ]
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                          classReg tyCtors classTable baseEnv) loaded
+            registerDerivedEnumBoundedInstances classReg loadedAll
             -- Also mirror into the shared reg (matches the loadImport path).
             mSharedReg <- getSharedClassReg legacyHooks
             case mSharedReg of
-                Just sharedReg | sharedReg /= classReg ->
+                Just sharedReg | sharedReg /= classReg -> do
                     mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                                  sharedReg tyCtors classTable baseEnv) loaded
+                    registerDerivedEnumBoundedInstances sharedReg loadedAll
                 _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
@@ -2847,10 +2851,28 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
     _ <- drainCataloguedInstancesForClass (BC.pack "Enum")
     _ <- drainCataloguedInstancesForClass (BC.pack "Bounded")
     mapM_ oneModule loadedModules
+    -- Standalone @deriving instance Bounded T@ is used by boot
+    -- modules such as GHC.Internal.Enum for Bool and Ordering, whose
+    -- data declarations live in GHC.Types.  Cross-reference the
+    -- standalone deriving declaration with the unioned constructor
+    -- registries from every loaded module, mirroring the standalone Eq
+    -- registrar.
+    let unionedTyCtors =
+            foldr (Map.unionWith (\a b -> a ++ filter (`notElem` a) b))
+                  Map.empty
+                  (map lmTypeCtorReg loadedModules)
+        unionedDataReg =
+            foldr Map.union Map.empty (map lmDataReg loadedModules)
+    mapM_ (oneModuleStandalone unionedTyCtors unionedDataReg) loadedModules
   where
     oneModule lm = do
         decls <- scanSimpleDerivings (lmSource lm)
         mapM_ (registerOne lm) decls
+
+    oneModuleStandalone tyCtors dataReg lm = do
+        decls <- scanStandaloneDerivings (lmSource lm)
+        let hits = filter ((BC.pack "Bounded" ==) . sddClassName) decls
+        mapM_ (registerStandalone tyCtors dataReg) hits
 
     registerOne lm (SimpleDerivDecl tyName classes) = do
         let ctors = nullaryCtorOrder lm tyName
@@ -2865,14 +2887,30 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
     registerBounded tyName ctors = do
         existing <- lookupInstance classReg (BC.pack "Bounded") tyName
         case existing of
-            Just _  -> pure ()
-            Nothing | Just (firstCtor, lastCtor) <- firstLast ctors -> do
+            -- A standalone deriving declaration without method bodies is
+            -- catalogued as a placeholder-only instance.  It should not block
+            -- the derived constructor bounds we can synthesize here.
+            Just methods | hasConcreteBoundedMethod methods -> pure ()
+            _ | Just (firstCtor, lastCtor) <- firstLast ctors -> do
                 let methods = HashMap.fromList
                         [ (BC.pack "minBound", VCon firstCtor [])
                         , (BC.pack "maxBound", VCon lastCtor [])
                         ]
                 registerUnderTypeAndCtors (BC.pack "Bounded") tyName ctors methods
-            Nothing -> pure ()
+            _ -> pure ()
+
+    hasConcreteBoundedMethod methods =
+        any hasConcrete [BC.pack "minBound", BC.pack "maxBound"]
+      where
+        hasConcrete methodName =
+            case HashMap.lookup methodName methods of
+                Just v  -> not (isMethodPlaceholder v)
+                Nothing -> False
+
+    registerStandalone tyCtors dataReg (StandaloneDerivDecl _cls tyName) =
+        case standaloneNullaryCtorOrder tyCtors dataReg tyName of
+            []    -> pure ()
+            ctors -> registerBounded tyName ctors
 
     registerEnum tyName ctors = do
         existing <- lookupInstance classReg (BC.pack "Enum") tyName
@@ -2994,6 +3032,41 @@ registerDerivedEnumBoundedInstances classReg loadedModules = do
                 , arity == 0
                 ]
         in map snd (sortOn fst annotated)
+
+    standaloneNullaryCtorOrder tyCtors dataReg tyName =
+        let ctors = Map.findWithDefault [] tyName tyCtors
+            annotated =
+                [ (idx, ctor)
+                | ctor <- ctors
+                , Just (owner, arity, idx) <- [Map.lookup ctor dataReg]
+                , owner == tyName
+                , arity == 0
+                ]
+            sourceCtors = map snd (sortOn fst annotated)
+        in if null sourceCtors
+              then compilerBuiltNullaryCtorOrder tyName
+              else sourceCtors
+
+    compilerBuiltNullaryCtorOrder tyName =
+        case bareTypeName tyName of
+            -- These type constructors are compiler-built / builtin-backed, so
+            -- no loaded Haskell data declaration contributes constructor
+            -- order.  GHC.Internal.Enum still has real standalone deriving
+            -- source for their Bounded instances; synthesize that deriving
+            -- codegen from the compiler-built constructor order.
+            n | n == BC.pack "()" ->
+                    [BC.pack "()"]
+              | n == BC.pack "Bool" ->
+                    [BC.pack "False", BC.pack "True"]
+              | n == BC.pack "Ordering" ->
+                    [BC.pack "LT", BC.pack "EQ", BC.pack "GT"]
+              | otherwise ->
+                    []
+
+    bareTypeName name =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) name of
+            Just idx -> BC.drop (idx + 1) name
+            Nothing  -> name
 
     firstLast [] = Nothing
     firstLast (x:xs) = Just (x, go x xs)
@@ -7419,6 +7492,11 @@ resolveFallbackSource mOwner name = do
         -- host shim, demand discovery should go straight to its source
         -- owner instead of walking unrelated loaded imports first.
         | bareName == BC.pack "fromIntegral" = Just (BC.pack "GHC.Internal.Real")
+        -- 'minBound' / 'maxBound' are Bounded methods defined in
+        -- GHC.Internal.Enum.  They are nullary, so source-loading them
+        -- depends on the type-directed class-method path rather than a
+        -- host Int default.
+        | bareName `elem` [ "minBound", "maxBound" ] = Just (BC.pack "GHC.Internal.Enum")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         -- Warp Settings field selectors: when source uses
         -- @Network.Wai.Handler.Warp.Internal (settingsPort, ...)@,

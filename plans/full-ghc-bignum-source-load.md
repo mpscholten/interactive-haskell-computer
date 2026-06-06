@@ -116,6 +116,10 @@ the slow path (BigNat).
   graduations; it now source-loads through
   `fromInteger . toInteger`, with `IS`/`IP`/`IN` normalized to the
   `Integer` dispatch tag.
+- Graduate `minBound` / `maxBound` — done after `fromIntegral`;
+  they now source-load through `Bounded` in `GHC.Internal.Enum`, with
+  typed-nullary dispatch triggering the manifest-driven core instance
+  load on first miss.
 - Remove the inline carve-out comments that today's session
   added at `src/IHC/Builtins.hs` around line 290.
 

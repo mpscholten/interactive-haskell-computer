@@ -5,8 +5,7 @@
 -- http-types builds @methodArray = listArray (minBound, maxBound) …@
 -- with @methodArray :: Array StdMethod Method@.  The bounds tuple is
 -- unannotated, so under deferred typing @minBound@/@maxBound@ default
--- to the @Int@ instance ('IHC.Builtins.minBoundB'/'maxBoundB' → VInt)
--- and the array ends up with Int bounds.
+-- to the @Int@ instance and the array ends up with Int bounds.
 --
 -- This fixture isolates the type-propagation half (no Array / Ix):
 -- @bounds :: (Method, Method)@ with RHS @(minBound, maxBound)@.  The

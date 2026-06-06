@@ -465,10 +465,20 @@ eval hooks env ipm = go
                         Nothing -> pure Nothing
                         Just classReg -> do
                             let tag = normalizeTyTag ty
+                                boundedCls = BC.pack "Bounded"
                             -- 'lookupInstanceMethod' drains the Stage-2
-                            -- lazy-instance catalogue on miss.
-                            mv <- lookupInstanceMethod classReg
-                                    (BC.pack "Bounded") tag bareMethod
+                            -- lazy-instance catalogue on miss.  If the
+                            -- core Bounded providers have not been loaded
+                            -- yet, mirror the ETypedMethod path and trigger
+                            -- the manifest-driven class load once.
+                            mv0 <- lookupInstanceMethod classReg
+                                    boundedCls tag bareMethod
+                            mv <- case mv0 of
+                                Just _  -> pure mv0
+                                Nothing -> do
+                                    triggerCoreInstanceLoad legacyHooks boundedCls
+                                    lookupInstanceMethod classReg
+                                        boundedCls tag bareMethod
                             case mv of
                                 Nothing -> pure Nothing
                                 Just v -> do

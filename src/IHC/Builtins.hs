@@ -403,8 +403,10 @@ builtins reg =
     -- The source path relies on class dispatch for Integral.toInteger
     -- and Num.fromInteger; ghc-bignum's IS/IP/IN constructors normalize
     -- to the Integer type tag in 'IHC.Classes.typeTagOf'.
-    [ ("maxBound",     maxBoundB)
-    , ("minBound",     minBoundB)
+    --
+    -- 'maxBound' / 'minBound' source-load via Bounded in
+    -- GHC.Internal.Enum.  Nullary dispatch is type-directed through
+    -- ETyApp / wrapNullaryResultSig instead of a host Int default.
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
     -- user-defined instances are looked up from the registry.
@@ -421,7 +423,7 @@ builtins reg =
     -- Remaining before removal: route the @eqVals@ representation
     -- bridges (cross-numeric, VStr, ByteString/ForeignPtr, null-ptr)
     -- through source — there is no host Eq fallback in the dispatcher.
-    , ("==",       eqDispatch reg)
+    [ ("==",       eqDispatch reg)
     , ("/=",       neqDispatch reg)
     , ("<",        ordDispatch reg 0)
     , ("<=",       ordDispatch reg 1)
@@ -3558,18 +3560,6 @@ isTrueHashB = pure $ VFun $ \a -> do
         VInt 0 -> pure (VCon (BC.pack "False") [])
         VInt _ -> pure (VCon (BC.pack "True")  [])
         _      -> error ("isTrue#: not an Int: " <> showValForDebug av)
-
--- | 'maxBound' / 'minBound' — class methods of Bounded.  Nullary, so our
--- arg-directed dispatcher can't pick an instance without a type hint.
--- Default to Int bounds, which is what most real-world code wants
--- (`maxBound :: Int` shows up in text's `length` and many others).
--- Code that explicitly asks for `maxBound :: Word8` via @TypeApplications@
--- is handled separately by the @VClassMethod + @T@ path.
-maxBoundB :: IO Val
-maxBoundB = pure (VInt maxBound)
-
-minBoundB :: IO Val
-minBoundB = pure (VInt minBound)
 
 --------------------------------------------------------------------------------
 -- Phase 1+2.A: BigNat# runtime representation + comparison primops
