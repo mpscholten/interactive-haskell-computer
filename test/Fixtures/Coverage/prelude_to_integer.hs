@@ -1,29 +1,26 @@
--- Builtins-removal: 'toInteger' must resolve via the source-loaded
--- 'Integral Int' instance (GHC.Internal.Real:442) — body is
--- @toInteger (I# i) = IS i@.  Pre-graduation, the host shim
--- 'fromIntegralB' returned the bare 'VInt' (representation loss);
--- post-graduation, the result is a proper 'VCon "IS" [VInt n]' that
--- can flow through Integer arithmetic.
+-- Builtins-removal: 'toInteger' and 'fromIntegral' must both resolve
+-- through source-loaded class methods.
 --
--- This fixture verifies the source-loaded path end-to-end by
--- round-tripping through 'fromIntegral': the IS-wrapped Integer
--- produced by 'toInteger' flows back through the @fromIntegralB@
--- shim (which structurally unwraps IS at Builtins.hs:3164) to a
--- 'VInt'.  If 'toInteger' were still shimmed (returning VInt
--- directly), the round-trip would still print the same numbers —
--- but the intermediate step would skip the IS bridge entirely.
+-- 'toInteger' uses the source-loaded Integral Int instance
+-- (GHC.Internal.Real:442):
 --
--- (Showing the raw Integer via 'print' currently displays the
--- 'IS X' structural fallback because IHC's value-directed dispatch
--- looks up @Show.IS.show@ rather than @Show.Integer.show@.  That
--- 'typeTagOf' normalisation for IS/IP/IN is tracked separately;
--- not in scope for the toInteger graduation slice.)
+--   toInteger (I# i) = IS i
+--
+-- 'fromIntegral' is now source-loaded from GHC.Internal.Real:
+--
+--   fromIntegral = fromInteger . toInteger
+--
+-- This fixture verifies the end-to-end round-trip.  The Integer
+-- produced by 'toInteger' can arrive as ghc-bignum's 'IS' constructor;
+-- 'IHC.Classes.typeTagOf' normalizes IS/IP/IN to the Integer dispatch
+-- tag so source-loaded 'Integral Integer.toInteger' handles the input
+-- side of 'fromIntegral'.
 module Main where
 
 main :: IO ()
 main = do
-    -- Round-trip: Int → Integer → Int.  Verifies toInteger produces
-    -- a real IS-wrapped Integer that fromIntegral can unwrap.
+    -- Round-trip: Int -> Integer -> Int through source-loaded
+    -- Integral.toInteger and source-loaded fromIntegral.
     print (fromIntegral (toInteger (0    :: Int)) :: Int)
     print (fromIntegral (toInteger (5    :: Int)) :: Int)
     print (fromIntegral (toInteger (-7   :: Int)) :: Int)

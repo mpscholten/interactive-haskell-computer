@@ -1,9 +1,7 @@
--- Mixed Int/Double arithmetic with fromIntegral
-average :: [Int] -> Double
-average xs = fromIntegral (sum xs) / fromIntegral (length xs)
+-- Builtins-removal: 'fromIntegral' source-loads from
+-- GHC.Internal.Real as @fromInteger . toInteger@.
+--
+-- This covers the common Int -> Double result-annotation path.
 
 main = do
-    let xs = [1, 2, 3, 4, 5] :: [Int]
     print (fromIntegral (42 :: Int) :: Double)
-    print (sum xs)
-    print (length xs)

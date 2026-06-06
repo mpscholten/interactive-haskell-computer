@@ -355,6 +355,12 @@ typeTagOf (VCon "Just"    _) = BC.pack "Maybe"
 typeTagOf (VCon "Nothing" _) = BC.pack "Maybe"
 typeTagOf (VCon "Left"    _) = BC.pack "Either"
 typeTagOf (VCon "Right"   _) = BC.pack "Either"
+-- ghc-bignum's source Integer constructors all share the Integer
+-- instance set.  Some small Integers survive as VCon "IS" before the
+-- construct-collapse path runs, so class dispatch must see the type.
+typeTagOf (VCon "IS" _) = BC.pack "Integer"
+typeTagOf (VCon "IP" _) = BC.pack "Integer"
+typeTagOf (VCon "IN" _) = BC.pack "Integer"
 typeTagOf (VCon n _) =
     -- For source-loaded ADTs we now key dispatch on the constructor
     -- name directly. 'IHC.Scheduler.registerOne' (line ~1779) registers

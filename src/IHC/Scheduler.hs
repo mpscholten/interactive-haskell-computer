@@ -6985,43 +6985,43 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
-                                     -- A bare name the owner-scoped lookup couldn't
-                                     -- resolve to an in-scope top-level binding, but
-                                     -- which IS a registered class method, must
-                                     -- dispatch AS a class method — it must NOT be
-                                     -- scavenged from an unrelated module's same-named
-                                     -- top-level binding by the UNSCOPED global scans
-                                     -- below.  Concretely: GHC.Internal.Ix's default
-                                     -- @index@/@rangeSize@ call @unsafeIndex@/@index@
-                                     -- (both Ix methods); once Data.ByteString is
-                                     -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
-                                     -- otherwise win 'tryGlobalImportScan' and
-                                     -- pattern-fail on the Ix bounds tuple
-                                     -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
-                                     -- such collision) already resolved correctly via
-                                     -- the class-method tail below; this lifts the same
-                                     -- dispatch ahead of the scope-blind scan for the
-                                     -- colliding names.  Cheap (one IORef read on miss,
-                                     -- no module loads) so it respects the per-name
-                                     -- fallback hot-path rule.
-                                     -- Try ALL loaded modules' imports — the owner
-                                     -- might be wrong (e.g. class default method
-                                     -- evaluated in a different module's context).
-                                     mGlobal <- do
-                                         mClassFirst <- tryKnownClassMethodSlot bareName
-                                         case mClassFirst of
-                                             Just s  -> pure (Just s)
-                                             Nothing -> tryGlobalImportScan mods bareName
-                                     case mGlobal of
+                                     mDirect <- case mOwner >>= (`Map.lookup` mods) of
+                                         Just owner -> tryKnownDirectOwnerSlot mods owner bareName
+                                         Nothing    -> pure Nothing
+                                     case mDirect of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
-                                       mDirect <- case mOwner >>= (`Map.lookup` mods) of
-                                           Just owner -> tryKnownDirectOwnerSlot mods owner bareName
-                                           Nothing    -> pure Nothing
-                                       case mDirect of
-                                        Just slot -> pure (Just slot)
-                                        Nothing -> do
-                                            tryClassMethodOrPreludeSlot bareName mods
+                                        -- A bare name the owner-scoped lookup couldn't
+                                        -- resolve to an in-scope top-level binding, but
+                                        -- which IS a registered class method, must
+                                        -- dispatch AS a class method — it must NOT be
+                                        -- scavenged from an unrelated module's same-named
+                                        -- top-level binding by the UNSCOPED global scans
+                                        -- below.  Concretely: GHC.Internal.Ix's default
+                                        -- @index@/@rangeSize@ call @unsafeIndex@/@index@
+                                        -- (both Ix methods); once Data.ByteString is
+                                        -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
+                                        -- otherwise win 'tryGlobalImportScan' and
+                                        -- pattern-fail on the Ix bounds tuple
+                                        -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
+                                        -- such collision) already resolved correctly via
+                                        -- the class-method tail below; this lifts the same
+                                        -- dispatch ahead of the scope-blind scan for the
+                                        -- colliding names.  Cheap (one IORef read on miss,
+                                        -- no module loads) so it respects the per-name
+                                        -- fallback hot-path rule.
+                                        -- Try ALL loaded modules' imports — the owner
+                                        -- might be wrong (e.g. class default method
+                                        -- evaluated in a different module's context).
+                                        mGlobal <- do
+                                            mClassFirst <- tryKnownClassMethodSlot bareName
+                                            case mClassFirst of
+                                                Just s  -> pure (Just s)
+                                                Nothing -> tryGlobalImportScan mods bareName
+                                        case mGlobal of
+                                         Just slot -> pure (Just slot)
+                                         Nothing -> do
+                                          tryClassMethodOrPreludeSlot bareName mods
 
     tryClassMethodOrPreludeSlot bareName mods = do
         mMethod <- tryClassMethodFromRegistry bareName
@@ -7415,6 +7415,10 @@ resolveFallbackSource mOwner name = do
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter", "sum" ] = Just (BC.pack "GHC.List")
+        -- 'fromIntegral' is a Prelude re-export; after removing the
+        -- host shim, demand discovery should go straight to its source
+        -- owner instead of walking unrelated loaded imports first.
+        | bareName == BC.pack "fromIntegral" = Just (BC.pack "GHC.Internal.Real")
         | bareName == BC.pack "defaultSettings" = Just (BC.pack "Network.Wai.Handler.Warp.Settings")
         -- Warp Settings field selectors: when source uses
         -- @Network.Wai.Handler.Warp.Internal (settingsPort, ...)@,

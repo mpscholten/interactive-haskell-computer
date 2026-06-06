@@ -397,16 +397,13 @@ builtins reg =
     --   ==##, /=##, <##, <=##, >##, >=##  — Double# comparisons
     --   fabsDouble#, negateFloat#  — Double# unary
     --
-    -- 'encodeFloat' / 'decodeFloat' also source-load via RealFloat
-    -- now.  'encodeFloat' is result-polymorphic, so the dispatcher
-    -- defaults it to Double (the runtime representation for VFloat)
-    -- when no static type survives optimistic interpretation.
-    -- Kept for now: source @fromIntegral = fromInteger . toInteger@ needs the
-    -- result type to drive @fromInteger@ dispatch. IHC's current annotation
-    -- elaboration loses that, so @fromIntegral (toInteger n) :: Int@ reaches an
-    -- @Integral/toInteger@ placeholder (see prelude_to_integer).
-    [ ("fromIntegral", fromIntegralB)
-    , ("maxBound",     maxBoundB)
+    -- 'encodeFloat' / 'decodeFloat' source-load via RealFloat now.
+    -- 'fromIntegral' also source-loads from GHC.Internal.Real:
+    --   fromIntegral = fromInteger . toInteger
+    -- The source path relies on class dispatch for Integral.toInteger
+    -- and Num.fromInteger; ghc-bignum's IS/IP/IN constructors normalize
+    -- to the Integer type tag in 'IHC.Classes.typeTagOf'.
+    [ ("maxBound",     maxBoundB)
     , ("minBound",     minBoundB)
     -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
     -- Builtin instances for Int, Char, Bool, [] are handled inline;
@@ -647,7 +644,6 @@ builtins reg =
     -- of a comparison primop result (@==#@, @<#@, etc.) into a regular
     -- Bool.  Our Int# is VInt, so it's a plain @/= 0@.
     , ("isTrue#",     isTrueHashB)
-    , ("fromIntegral", fromIntegralB)
     -- Phase 1: BigNat# runtime representation (first slice of the
     -- full source-loaded Integer roadmap, see
     -- @plans/full-ghc-bignum-source-load.md@).  Source-loading the
@@ -1267,8 +1263,8 @@ builtins reg =
     --   * 'toInteger' (Integral class) → 'Integral Int.toInteger'
     --     at GHC/Internal/Real.hs:442 — body @toInteger (I# i) = IS i@.
     --     Returns 'VCon "IS" [VInt n]'; downstream consumers either
-    --     pattern-match through the IS bridge or call 'fromIntegral'
-    --     (line 301), whose 'numericNewtypeCons' covers IS.
+    --     pattern-match through the IS bridge or dispatch on the
+    --     normalized Integer tag in 'IHC.Classes.typeTagOf'.
     --   * 'quot' / 'rem' (Integral class) → 'Integral Int.{quot,rem}'
     --     at Real.hs:445-455, routed through quotInt / remInt
     --     (Base.hs:2376-2390) bottoming on quotInt# / remInt# primops.
@@ -3563,8 +3559,6 @@ isTrueHashB = pure $ VFun $ \a -> do
         VInt _ -> pure (VCon (BC.pack "True")  [])
         _      -> error ("isTrue#: not an Int: " <> showValForDebug av)
 
--- | 'fromIntegral' / 'fromInteger' coercion. Accepts Int or Float/Double;
--- returns the value unchanged (we have one Int type and one Float type).
 -- | 'maxBound' / 'minBound' — class methods of Bounded.  Nullary, so our
 -- arg-directed dispatcher can't pick an instance without a type hint.
 -- Default to Int bounds, which is what most real-world code wants
@@ -3576,40 +3570,6 @@ maxBoundB = pure (VInt maxBound)
 
 minBoundB :: IO Val
 minBoundB = pure (VInt minBound)
-
-fromIntegralB :: IO Val
-fromIntegralB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n   -> pure (VInt n)
-        VFloat d -> pure (VFloat d)
-        VChar c  -> pure (VInt (fromIntegral (ord c)))
-        -- Newtype numeric wrappers we handle by name so we don't eat
-        -- every single-field constructor (ST, Identity, Maybe-Just, ...).
-        VCon c [t]
-          | c `elem` numericNewtypeCons -> do
-              inner <- force legacyHooks t
-              case inner of
-                  VInt n   -> pure (VInt n)
-                  VFloat d -> pure (VFloat d)
-                  _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
-        _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
-  where
-    numericNewtypeCons =
-        [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
-        , "CShort", "CUShort", "CLLong", "CULLong"
-        , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
-        , "Int8", "Int16", "Int32", "Int64"
-        , "Word", "Word8", "Word16", "Word32", "Word64"
-        , "CFloat", "CDouble"
-        -- 'Integer' has a multi-ctor representation in @ghc-bignum@:
-        --   data Integer = IS !Int# | IP !ByteArray# | IN !ByteArray#
-        -- The 'IS' constructor (small Integer fitting in an Int) flows
-        -- here when source-loaded numeric code constructs an Integer
-        -- and warp/wai then runs it through 'fromIntegral'. Treat it
-        -- as the Int it wraps.
-        , "IS"
-        ]
 
 --------------------------------------------------------------------------------
 -- Phase 1+2.A: BigNat# runtime representation + comparison primops
