@@ -1531,7 +1531,7 @@ builtins reg =
     -- source-loaded `catch` / `mask` chain.
     -- throwTo source-loads from GHC.Internal.Conc.Sync and bottoms out
     -- on the killThread# primop above.
-    , ("displayException", displayExceptionB)
+    -- displayException is a source Exception class method.
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
     , ("typeRep",        typeRepB)
     , ("typeOf",         typeOfB)
@@ -7251,15 +7251,6 @@ runStateTransformer stateFnT = do
     case res of
         VCon "(#,#)" [_stateT, resultT] -> force legacyHooks resultT
         _ -> pure res
-
-displayExceptionB :: IO Val
-displayExceptionB = pure $ VFun $ \eT -> do
-    ev <- force legacyHooks eT
-    let s = case ev of
-                VStr msg  -> BC.unpack msg
-                VCon n _  -> BC.unpack n
-                _         -> showValForDebug ev
-    stringToListValIO s
 
 --------------------------------------------------------------------------------
 -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic builtins
