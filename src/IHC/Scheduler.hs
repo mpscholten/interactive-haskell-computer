@@ -80,6 +80,7 @@ import IHC.Builtins
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
     , isHostWord8PtrVal, pokeHostWord8ByteOff
+    , ordCmp
     , reapSpawnedThreads
     )
 import IHC.CabalProject
@@ -697,7 +698,8 @@ loadProgramFromSource searchPath src0 = do
                         -- bodies.  The source-loaded @GHC.Classes@ path uses
                         -- this for @Bool@ and @Ordering@, so first-use Eq
                         -- dispatch must run the derived registrar here too.
-                        registerDerivedEqInstances classReg currentModules
+                        registerDerivedEqInstances  classReg currentModules
+                        registerDerivedOrdInstances classReg currentModules
             Nothing -> pure ()
     -- Register class-level default method bodies under the sentinel tag
     -- "<default>" so that the dispatcher can fall back to them when no
@@ -706,6 +708,7 @@ loadProgramFromSource searchPath src0 = do
     registerDerivedFunctorInstances classReg loadedModules'
     registerDerivedEnumBoundedInstances classReg loadedModules'
     registerDerivedEqInstances        classReg loadedModules'
+    registerDerivedOrdInstances       classReg loadedModules'
     case lookupEnv "main" env of
         Just t  -> pure (env, t)
         Nothing -> error ("IHC.Scheduler: no `main` binding in module "
@@ -939,7 +942,8 @@ loadCoreInstanceModules classReg baseEnv cls = do
             mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                          classReg tyCtors classTable baseEnv) loaded
             registerDerivedEnumBoundedInstances classReg loadedAll
-            registerDerivedEqInstances classReg loadedAll
+            registerDerivedEqInstances  classReg loadedAll
+            registerDerivedOrdInstances classReg loadedAll
             -- Also mirror into the shared reg (matches the loadImport path).
             mSharedReg <- getSharedClassReg legacyHooks
             case mSharedReg of
@@ -947,7 +951,8 @@ loadCoreInstanceModules classReg baseEnv cls = do
                     mapM_ (registerInstancesFrom registry fullSearchPath includeMap
                                                  sharedReg tyCtors classTable baseEnv) loaded
                     registerDerivedEnumBoundedInstances sharedReg loadedAll
-                    registerDerivedEqInstances sharedReg loadedAll
+                    registerDerivedEqInstances  sharedReg loadedAll
+                    registerDerivedOrdInstances sharedReg loadedAll
                 _ -> pure ()
 
 -- | Source-load @errorCallWithCallStackException@, @errorCallException@,
@@ -1172,6 +1177,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     registerDerivedEnumInstances    classReg loadedModules
     registerDerivedBoundedInstances classReg loadedModules
     registerDerivedEqInstances      classReg loadedModules
+    registerDerivedOrdInstances     classReg loadedModules
     -- If the file has no `main` binding, inject `main = ()` so that the
     -- REPL user can type `main` without getting "unbound variable main".
     -- This matches the old :load behaviour and keeps the no_main regression
@@ -1741,6 +1747,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         registerDerivedFunctorInstances classReg instanceScope
         registerDerivedEnumBoundedInstances classReg instanceScope
         registerDerivedEqInstances        classReg instanceScope
+        registerDerivedOrdInstances       classReg instanceScope
         -- ALSO mirror instance registrations into the REPL's shared class
         -- registry so the dispatcher (closed over the shared reg via
         -- 'sharedClassRegRef') can find them on later dispatch calls.
@@ -1755,6 +1762,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                 registerDerivedFunctorInstances sharedReg instanceScope
                 registerDerivedEnumBoundedInstances sharedReg instanceScope
                 registerDerivedEqInstances        sharedReg instanceScope
+                registerDerivedOrdInstances       sharedReg instanceScope
             _ -> pure ()
     let additions  = HashMap.difference aliasEnv existingEnv
         merged     = HashMap.union existingEnv additions
@@ -2899,6 +2907,176 @@ synthStructuralEq classReg tyName =
     compareFields _ _ _ = pure boolFalseV   -- arity mismatch (defensive)
 
 --------------------------------------------------------------------------------
+-- Deriving Ord synthesis
+--
+-- Stock @deriving Ord@ is compiler codegen, not library source.  Once
+-- the bare @<@/@<=@/@>@/@>=@ builtins are removed, derived ADTs need a
+-- concrete dictionary in the class registry just like derived Eq does.
+-- The generated methods compare constructors by declaration order and
+-- then compare fields lexicographically through the source-loaded
+-- @Ord.compare@ dispatcher, so primitive/user field instances still win.
+--------------------------------------------------------------------------------
+
+registerDerivedOrdInstances :: ClassRegistry -> [LoadedModule] -> IO ()
+registerDerivedOrdInstances classReg loadedModules = do
+    _ <- drainCataloguedInstancesForClass (BC.pack "Ord")
+    mapM_ oneModuleInline loadedModules
+    let unionedTyCtors =
+            foldr (Map.unionWith (\a b -> a ++ filter (`notElem` a) b))
+                  Map.empty
+                  (map lmTypeCtorReg loadedModules)
+        unionedDataReg =
+            foldr Map.union Map.empty (map lmDataReg loadedModules)
+    mapM_ (oneModuleStandalone unionedTyCtors unionedDataReg) loadedModules
+  where
+    ordCls = BC.pack "Ord"
+
+    oneModuleInline lm = do
+        decls <- scanFunctorDerivings (lmSource lm)
+        let hits = filter (elem ordCls . fdDerivClasses) decls
+        mapM_ registerOneOrd hits
+
+    oneModuleStandalone tyCtors dataReg lm = do
+        decls <- scanStandaloneDerivings (lmSource lm)
+        let hits = filter ((ordCls ==) . sddClassName) decls
+        mapM_ (registerOneStandaloneOrd tyCtors dataReg) hits
+
+    registerOneOrd decl = do
+        let tyName  = fdTyName decl
+            ctors   = map fcName (fdCtors decl)
+            methods = synthStructuralOrd classReg tyName ctors
+        existing <- lookupInstance classReg ordCls tyName
+        case existing of
+            Just methods0 | hasConcreteOrdMethod methods0 -> pure ()
+            _ -> do
+                registerInstance classReg ordCls tyName methods
+                mapM_ (registerCtorKey methods) ctors
+
+    registerOneStandaloneOrd tyCtors dataReg (StandaloneDerivDecl _cls tyName) = do
+        let ctors   = standaloneCtorOrder tyCtors dataReg tyName
+            methods = synthStructuralOrd classReg tyName ctors
+        existing <- lookupInstance classReg ordCls tyName
+        case existing of
+            Just methods0 | hasConcreteOrdMethod methods0 -> pure ()
+            _ -> do
+                registerInstance classReg ordCls tyName methods
+                mapM_ (registerCtorKey methods) ctors
+
+    registerCtorKey methods ctor
+        | not (safeDerivedOrdCtorKey ctor) = pure ()
+        | otherwise = do
+            existing <- lookupInstance classReg ordCls ctor
+            case existing of
+                Just methods0 | hasConcreteOrdMethod methods0 -> pure ()
+                _ -> registerInstance classReg ordCls ctor methods
+
+    hasConcreteOrdMethod methods =
+        any hasConcrete (map BC.pack ["compare", "<", "<=", ">", ">="])
+      where
+        hasConcrete method =
+            case HashMap.lookup method methods of
+                Just v  -> not (isMethodPlaceholder v)
+                Nothing -> False
+
+    standaloneCtorOrder tyCtors dataReg tyName =
+        let ctors = Map.findWithDefault [] tyName tyCtors
+            annotated =
+                [ (idx, ctor)
+                | ctor <- ctors
+                , Just (owner, _arity, idx) <- [Map.lookup ctor dataReg]
+                , owner == tyName
+                ]
+            sourceCtors = map snd (sortOn fst annotated)
+        in if null sourceCtors
+              then compilerBuiltOrdCtorOrder tyName
+              else sourceCtors
+
+    compilerBuiltOrdCtorOrder tyName =
+        case bareTypeName tyName of
+            n | n == BC.pack "()" ->
+                    [BC.pack "()"]
+              | n == BC.pack "Bool" ->
+                    [BC.pack "False", BC.pack "True"]
+              | n == BC.pack "Ordering" ->
+                    [BC.pack "LT", BC.pack "EQ", BC.pack "GT"]
+              | otherwise ->
+                    []
+
+    bareTypeName name =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) name of
+            Just idx -> BC.drop (idx + 1) name
+            Nothing  -> name
+
+safeDerivedOrdCtorKey :: ByteString -> Bool
+safeDerivedOrdCtorKey = safeDerivedEqCtorKey
+
+synthStructuralOrd :: ClassRegistry -> ByteString -> [ByteString] -> HashMap.HashMap ByteString Val
+synthStructuralOrd classReg tyName ctors =
+    HashMap.fromList
+        [ (BC.pack "compare", compareVal)
+        , (BC.pack "<",       relVal (== LT))
+        , (BC.pack "<=",      relVal (`elem` [LT, EQ]))
+        , (BC.pack ">",       relVal (== GT))
+        , (BC.pack ">=",      relVal (`elem` [GT, EQ]))
+        ]
+  where
+    ctorIndex = Map.fromList (zip ctors [0 :: Int ..])
+    compareDispatcher = classMethodDispatcher classReg (BC.pack "Ord") (BC.pack "compare")
+
+    compareVal = VFun $ \xT -> pure $ VFun $ \yT -> do
+        xv <- force legacyHooks xT
+        yv <- force legacyHooks yT
+        orderingVal <$> compareVals xv yv
+
+    relVal predO = VFun $ \xT -> pure $ VFun $ \yT -> do
+        xv <- force legacyHooks xT
+        yv <- force legacyHooks yT
+        o <- compareVals xv yv
+        pure (boolVal (predO o))
+
+    boolVal True  = VCon (BC.pack "True") []
+    boolVal False = VCon (BC.pack "False") []
+
+    orderingVal LT = VCon (BC.pack "LT") []
+    orderingVal EQ = VCon (BC.pack "EQ") []
+    orderingVal GT = VCon (BC.pack "GT") []
+
+    compareVals VUnit VUnit = pure EQ
+    compareVals (VCon n1 fs1) (VCon n2 fs2)
+        | n1 == n2 && length fs1 == length fs2 =
+            compareFields fs1 fs2
+        | n1 == n2 =
+            pure (compare (length fs1) (length fs2))
+        | otherwise =
+            pure (compareCtor n1 n2)
+    compareVals other1 other2 = error
+        ( "derived Ord for " <> BC.unpack tyName
+          <> ": expected constructor values, got "
+          <> shortShow other1 <> " and " <> shortShow other2 )
+
+    compareCtor n1 n2 =
+        case (Map.lookup n1 ctorIndex, Map.lookup n2 ctorIndex) of
+            (Just i1, Just i2) -> compare i1 i2
+            _                  -> compare n1 n2
+
+    compareFields [] [] = pure EQ
+    compareFields (xT : xs) (yT : ys) = do
+        r1 <- apply legacyHooks compareDispatcher xT
+        result <- apply legacyHooks r1 yT
+        case orderingFromVal result of
+            EQ -> compareFields xs ys
+            o  -> pure o
+    compareFields xs ys = pure (compare (length xs) (length ys))
+
+    orderingFromVal (VCon n _)
+        | n == BC.pack "LT" = LT
+        | n == BC.pack "EQ" = EQ
+        | n == BC.pack "GT" = GT
+    orderingFromVal other = error
+        ( "derived Ord for " <> BC.unpack tyName
+          <> ": field compare returned non-Ordering: " <> shortShow other )
+
+--------------------------------------------------------------------------------
 -- Deriving Enum / Bounded synthesis
 --------------------------------------------------------------------------------
 
@@ -3689,15 +3867,19 @@ classMethodDispatcher reg cls methodName = selfVal
                                                               baseId = VFun $ \a -> force legacyHooks a
                                                               impl = if methodName == BC.pack "." then baseDot else baseId
                                                           applyAll impl (reverse (argT : accArgs))
-                                                      _ ->
-                                                          -- No instance and no default — try the
-                                                          -- next argument position (the class
-                                                          -- variable may not be in the first
-                                                          -- dispatchable slot, e.g. SocketAddress).
-                                                          -- Exhausting all positions terminates at
-                                                          -- 'fallback', which raises the no-instance
-                                                          -- error.
-                                                          pure (dispatch (remaining - 1) (argT : accArgs))
+                                                      _ -> do
+                                                          mOrdFallback <- tryOrdRelationFallback (reverse (argT : accArgs))
+                                                          case mOrdFallback of
+                                                              Just ordVal -> pure ordVal
+                                                              Nothing ->
+                                                                  -- No instance and no default — try the
+                                                                  -- next argument position (the class
+                                                                  -- variable may not be in the first
+                                                                  -- dispatchable slot, e.g. SocketAddress).
+                                                                  -- Exhausting all positions terminates at
+                                                                  -- 'fallback', which raises the no-instance
+                                                                  -- error.
+                                                                  pure (dispatch (remaining - 1) (argT : accArgs))
                 else if isUnaryResultPolymorphicMethod cls methodName
                     then do
                         -- Arity-1 methods like @Applicative.pure@ /
@@ -3769,11 +3951,15 @@ classMethodDispatcher reg cls methodName = selfVal
                 case mResult of
                     Just resultVal ->
                         applyAll resultVal (reverse (finalArgT : accArgs))
-                    Nothing -> error
-                        ( "class-method dispatch: no dispatchable instance of `"
-                         <> BC.unpack cls
-                         <> "` for method `" <> BC.unpack methodName
-                         <> "` (after trying " <> show (length accArgs + 1) <> " arguments)" )
+                    Nothing -> do
+                        mOrdFallback <- tryOrdRelationFallback (reverse (finalArgT : accArgs))
+                        case mOrdFallback of
+                            Just ordVal -> pure ordVal
+                            Nothing -> error
+                                ( "class-method dispatch: no dispatchable instance of `"
+                                 <> BC.unpack cls
+                                 <> "` for method `" <> BC.unpack methodName
+                                 <> "` (after trying " <> show (length accArgs + 1) <> " arguments)" )
 
     resultPolymorphicMethod = tryTags (resultPolymorphicDefaultTags cls methodName)
       where
@@ -3906,6 +4092,9 @@ classMethodDispatcher reg cls methodName = selfVal
         ]
 
     specialClassApplication tag av argT accArgs
+        | isOrdRelationMethod
+        , not (isDispatchableTag tag)
+        = tryOrdRelationFallback (reverse (argT : accArgs))
         | cls == BC.pack "Eq"
         , methodName `elem` map BC.pack ["==", "/="]
         , tag == BC.pack "<ForeignPtr>" || tag == BC.pack "ForeignPtr"
@@ -3998,6 +4187,32 @@ classMethodDispatcher reg cls methodName = selfVal
                     | method == BC.pack "/=" = not same
                     | otherwise              = same
             pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
+
+    isOrdRelationMethod =
+        cls == BC.pack "Ord"
+        && methodName `elem` map BC.pack ["<", "<=", ">", ">="]
+
+    ordRelationSlot
+        | methodName == BC.pack "<"  = Just 0
+        | methodName == BC.pack "<=" = Just 1
+        | methodName == BC.pack ">"  = Just 2
+        | methodName == BC.pack ">=" = Just 3
+        | otherwise                  = Nothing
+
+    tryOrdRelationFallback argTs
+        | not isOrdRelationMethod = pure Nothing
+        | otherwise =
+            case (ordRelationSlot, argTs) of
+                (Just slot, [leftT]) -> do
+                    left <- force legacyHooks leftT
+                    pure (Just (VFun $ \rightT -> do
+                        right <- force legacyHooks rightT
+                        ordCmp reg slot left right))
+                (Just slot, [leftT, rightT]) -> do
+                    left  <- force legacyHooks leftT
+                    right <- force legacyHooks rightT
+                    Just <$> ordCmp reg slot left right
+                _ -> pure Nothing
 
     ixBoundsTag (VCon "(,)" [loT, hiT]) = do
         lo <- force legacyHooks loT
@@ -10243,7 +10458,7 @@ discoveryFreeVars = go []
 -- carve-out.
 extraDiscoverShortCircuit :: Set ByteString
 extraDiscoverShortCircuit = Set.fromList $ map BC.pack
-    [ "==", "/=", "compare", "show", "showsPrec"
+    [ "==", "/=", "compare", "<", "<=", ">", ">=", "show", "showsPrec"
     , "<>", "mappend", "mconcat", "mempty"
     , "fmap", "<*>", ">>=", ">>", "pure", "return"
     ]
@@ -10253,8 +10468,9 @@ extraDiscoverShortCircuit = Set.fromList $ map BC.pack
 -- 'discoverInModuleForChase' (NOT just entry-point discovery).
 --
 -- Membership criterion: the name's instances reach the
--- 'ClassRegistry' WITHOUT a per-FV source walk — Eq via
--- 'registerDerivedEqInstances' / 'synthStructuralEq' + explicit-
+-- 'ClassRegistry' WITHOUT a per-FV source walk — Eq/Ord via
+-- 'registerDerivedEqInstances' / 'synthStructuralEq' and
+-- 'registerDerivedOrdInstances' / 'synthStructuralOrd' + explicit-
 -- instance catalogue draining ('drainCataloguedInstancesForClass');
 -- Eq/Ord comparison via the eval-time 'classMethodDispatcher', plus
 -- the @class Ord@ default
@@ -10274,9 +10490,9 @@ extraDiscoverShortCircuit = Set.fromList $ map BC.pack
 -- @==@/@/=@ removal.
 --
 -- @min@ / @max@ are the one pair beyond what 'extraDiscoverShortCircuit'
--- proved safe at entry-point; they sit on the same @class Ord@ surface
--- and are served by 'ordDispatch'.  If a fixture's discovery total
--- *rises* after this lands, drop them first.
+-- proved safe at entry-point; they sit on the same source-loaded
+-- @class Ord@ surface and dispatch through the same eval-time path. If
+-- a fixture's discovery total rises after this lands, drop them first.
 perFVChaseShortCircuit :: Set ByteString
 perFVChaseShortCircuit = Set.fromList $ map BC.pack
     [ "==", "/=", "compare", "<", "<=", ">", ">=", "min", "max" ]

@@ -18,6 +18,7 @@ module IHC.Builtins
     , foreignPtrValToForeignPtr
     , flushHostHandleBuffer
     , isHostWord8PtrVal
+    , ordCmp
     , pokeHostWord8ByteOff
     , reapSpawnedThreads
     ) where
@@ -357,9 +358,8 @@ builtins reg =
     -- @GHC.Classes@'s @class Ord@ defaults
     --   max x y = if x <= y then y else x
     --   min x y = if x <= y then x else y
-    -- and resolve through the @<=@ builtin (registered below as slot 1
-    -- of 'ordDispatch') plus the source-loaded class-method dispatcher
-    -- via the env-fallback's 'tryClassMethodFromRegistry'.
+    -- and resolve through the source-loaded @<=@ class method via the
+    -- env-fallback's 'tryClassMethodFromRegistry'.
     --
     -- 'gcd' graduated to source-loaded.  Body lives at
     --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:928-930
@@ -408,20 +408,13 @@ builtins reg =
     -- 'maxBound' / 'minBound' source-load via Bounded in
     -- GHC.Internal.Enum.  Nullary dispatch is type-directed through
     -- ETyApp / wrapNullaryResultSig instead of a host Int default.
-    -- Comparisons: @==@ and @/=@ are deliberately omitted.  They have
-    -- real source in @GHC.Classes@'s @class Eq@ and route through the
+    -- Comparisons: @==@, @/=@, @<@, @<=@, @>@, and @>=@ are
+    -- deliberately omitted.  They have real source in @GHC.Classes@'s
+    -- @class Eq@ / @class Ord@ methods and route through the
     -- source-loaded class-method dispatcher seeded in
     -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.  The discovery
     -- cascade that previously blocked this removal is covered by
     -- @test/Fixtures/Coverage/discovery_compare_eq_ordering.hs@.
-    --
-    -- The Ord relation operators are still host-backed temporarily:
-    -- their source path needs the same representation-bridge coverage
-    -- that @ordDispatch@ currently provides for mixed runtime shapes.
-    [ ("<",        ordDispatch reg 0)
-    , ("<=",       ordDispatch reg 1)
-    , (">",        ordDispatch reg 2)
-    , (">=",       ordDispatch reg 3)
     --
     -- @compare@ is deliberately omitted: source body lives in
     -- @GHC.Classes@'s @class Ord@ default
@@ -460,7 +453,7 @@ builtins reg =
     -- Unique generation is an RTS/global-state service. Vault uses these as
     -- ordered map keys, so represent them as Unique Integer-style constructors
     -- backed by a host counter.
-    , ("newUnique", newUniqueB)
+    [ ("newUnique", newUniqueB)
     , ("hashUnique", hashUniqueB)
     , ("Data.Unique.newUnique", newUniqueB)
     , ("Data.Unique.hashUnique", hashUniqueB)
@@ -1760,8 +1753,9 @@ unaryOpFloat op = pure $ VFun $ \a -> do
         VInt n   -> pure (VFloat (op (fromIntegral n)))
         _ -> error ("unaryOpFloat: non-numeric arg: " <> showValForDebug av)
 
--- cmpInt removed in Phase 2.3 — replaced by Eq/Ord class dispatch
--- and the remaining Ord relation dispatcher below.
+-- cmpInt removed in Phase 2.3 — replaced by source-loaded Eq/Ord
+-- class dispatch.  The primitive comparison helpers below remain only
+-- for GHC.Prim-level operations with no .hs source.
 
 -- | Boolean-returning version of a comparison: returns VCon "True" or "False".
 boolVal :: Bool -> Val
@@ -1845,9 +1839,9 @@ isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
 --------------------------------------------------------------------------------
 -- Phase 2.3: type-class dispatch helpers for Eq, Ord, Show
 --
--- Eq class methods source-load through the scheduler's class-method
+-- Eq/Ord class methods source-load through the scheduler's class-method
 -- dispatcher.  'eqVals' remains as an internal helper for derived
--- instances and the temporary Ord relation bridge.
+-- instances and structural Ord fallback.
 --------------------------------------------------------------------------------
 
 -- | Force a 'VLazyMethod' result from 'lookupInstanceMethod', tolerating
@@ -1990,16 +1984,11 @@ eqVals reg av bv = case (av, bv) of
                         <> showValForDebug av
                         <> " vs " <> showValForDebug bv)
 
--- | Ord dispatch. Slot in the method list:
+-- | Internal Ord relation helper. Slot in the method list:
 --   0 = (<), 1 = (<=), 2 = (>), 3 = (>=), 4 = compare
--- We implement all four directly for builtin types and use
--- registry lookup for user-defined types.
-ordDispatch :: ClassRegistry -> Int -> IO Val
-ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    ordCmp reg slot av bv
-
+-- Top-level relation operators are not registered as builtins; they
+-- source-load through @GHC.Classes@.  This helper is kept for derived /
+-- structural comparisons and representation-level recursion.
 ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
 ordCmp _reg slot av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (intOrdSlot slot x y))

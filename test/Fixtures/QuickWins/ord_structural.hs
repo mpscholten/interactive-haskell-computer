@@ -1,10 +1,10 @@
--- Structural Ord fallback for user-derived data types.
+-- Structural Ord synthesis for user-derived data types.
 --
--- Builtins.ordCmp walks VCon values field-by-field when no user Ord
--- instance is registered, mirroring the existing eqVals fallback. For
--- cross-constructor ordering the DataRegistry carries the 0-based
--- declaration index of every constructor, so @Red < Green < Blue@
--- matches GHC's derived-Ord semantics.
+-- registerDerivedOrdInstances walks VCon values field-by-field for
+-- stock @deriving Ord@ dictionaries. For cross-constructor ordering
+-- the DataRegistry carries the 0-based declaration index of every
+-- constructor, so @Red < Green < Blue@ matches GHC's derived-Ord
+-- semantics.
 import Data.List (sort)
 
 data Color = Red | Green | Blue deriving (Eq, Ord, Show)

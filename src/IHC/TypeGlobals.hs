@@ -305,6 +305,17 @@ seedBuiltinClassMethodSigs = do
             -- without relying on a host-backed class-method shim.
             , ("==",         "Eq")
             , ("/=",         "Eq")
+            -- Ord.  These source-load from @GHC.Classes@; pre-seeding
+            -- the method→class mapping lets the env-fallback synthesize
+            -- an @Ord@ dispatcher on the first bare relation / @compare@
+            -- lookup, now that the relation-operator builtins are gone.
+            , ("compare",    "Ord")
+            , ("<",          "Ord")
+            , ("<=",         "Ord")
+            , (">",          "Ord")
+            , (">=",         "Ord")
+            , ("min",        "Ord")
+            , ("max",        "Ord")
             -- Show
             --
             -- Lets the env-fallback's 'tryClassMethodFromRegistry'

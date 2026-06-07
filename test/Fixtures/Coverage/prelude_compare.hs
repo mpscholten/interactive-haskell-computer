@@ -15,8 +15,8 @@
 --   * The dispatcher tries the @Ord T.compare@ instance first; on
 --     miss it consults the class default body
 --     @compare x y = if x == y then EQ else if x <= y then LT else GT@,
---     which routes through the still-builtin @==@ / @<=@ dispatchers
---     (those keep their VCon structural fallback for derived types).
+--     which routes through source-loaded @==@ / @<=@ class methods
+--     (derived ADTs get compiler-synthesized Ord dictionaries).
 --
 -- Lock down the cases the source path covers:
 --
@@ -26,8 +26,7 @@
 --   * @[Char]@ string compare (recurses into Char element compare via
 --     the @Ord [a]@ source instance @compare (x:xs) (y:ys) = ...@),
 --   * @deriving Ord@ on a sum type (declaration-index ordering via
---     @ordDispatch@'s structural fallback driven by the default
---     @compare@ body),
+--     @registerDerivedOrdInstances@),
 --   * @deriving Ord@ on a product type (lexicographic field compare),
 --   * a user @instance Ord@ providing 'compare' explicitly (custom
 --     instance wins over the source default),
