@@ -782,14 +782,10 @@ builtins reg =
     -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
     -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
     , ("newForeignPtr_",             newForeignPtr_B)
-    , ("newForeignPtr",              newForeignPtrB)
+    -- newForeignPtr source-loads from ForeignPtr.Imp:
+    -- newForeignPtr finalizer p = newForeignPtr_ p >>= \fp ->
+    -- addForeignPtrFinalizer finalizer fp >> pure fp.
     , ("addForeignPtrFinalizer",     addForeignPtrFinalizerB)
-    , ("Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.newForeignPtr", newForeignPtrB)
-    , ("GHC.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
     , ("Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Safe.addForeignPtrFinalizer", addForeignPtrFinalizerB)
@@ -4190,13 +4186,6 @@ bsValToBS v = do
 
 newForeignPtr_B :: IO Val
 newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force legacyHooks pT
-    p <- ptrValToPtr pv
-    fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
-
-newForeignPtrB :: IO Val
-newForeignPtrB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
     pv <- force legacyHooks pT
     p <- ptrValToPtr pv
     fp <- newForeignPtr_ (castPtr p)
