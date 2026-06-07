@@ -1360,8 +1360,9 @@ builtins reg =
     -- and the public Control.Concurrent.STM re-exports have real source;
     -- they lower to the STM/TVar# primops below.
     -- Phase 2.10a: exceptions
-    , ("throwIO",         throwIOB)
-    , ("throw",           throwIOB)
+    -- throwIO / throw are deliberately omitted. GHC.Internal.IO.throwIO
+    -- and GHC.Internal.Exception.throw have real source; they lower to
+    -- toExceptionWithBacktrace plus the raiseIO# / raise# primops below.
     -- GHC primops from GHC.Prim: compiler-intrinsic, no Haskell source.
     -- Source-loaded `error`, `throw`, `undefined`, `head []`, numeric
     -- overflow paths etc. all bottom out into these. See commit message
@@ -6807,12 +6808,6 @@ extractExceptionMessage val = case val of
 -- | Extract the 'Val' from an 'IhcException'.
 ihcExceptionToVal :: IhcException -> IO Val
 ihcExceptionToVal (IhcException _ t) = force legacyHooks t
-
-throwIOB :: IO Val
-throwIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av  <- force legacyHooks aT
-    exc <- valToIhcException av
-    throwIO exc
 
 -- | @raise# :: a -> b@ — GHC primop. Compiler-intrinsic; no Haskell
 -- source. Source-loaded @error@ / @throw@ / @undefined@ and the
