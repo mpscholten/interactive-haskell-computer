@@ -552,8 +552,8 @@ builtins reg =
     , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
-    , ("error",       errorB)
-    , ("undefined",   undefinedB)
+    -- error / undefined source-load from GHC.Internal.Err and bottom out
+    -- in errorCall* helpers plus the raise# primop below.
     -- B.1: debug-only superclass-relation probe.  Source-loaded code
     -- can call @__ihc_class_supers \"MyOrd\"@ to inspect the global
     -- superclass map; useful for testing that the scanner captured
@@ -2599,17 +2599,6 @@ classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
             restT <- newWHNFThunk restV
             pure (VCon ":" [headT, restT])
     buildList supers
-
-errorB :: IO Val
-errorB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    s  <- valToString av
-    hPutStrLn stderr ("ihc error called: " <> s)
-    hFlush stderr
-    error ("ihc: " <> s)
-
-undefinedB :: IO Val
-undefinedB = pure (VIO (error "Prelude.undefined"))
 
 -- | Dispatching @fmap@. Forces the container argument and looks up a
 -- @(Functor, typeTagOf mv)@ entry in the 'ClassRegistry'. If one is
