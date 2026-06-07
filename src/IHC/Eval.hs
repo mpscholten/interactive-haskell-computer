@@ -1686,8 +1686,8 @@ matchPat hooks (PCon "IO" [p]) (VIO action) = do
     matchPat hooks p stFn
 matchPat hooks (PCon "IO" [p]) v =
     matchPat hooks p (pureStateFn v)
--- ST bridge: VIO-valued ST computations (e.g. `return 42 :: ST s Int`
--- produces `VIO (pure 42)` via the builtin `returnB`). When source code
+-- ST bridge: VIO-valued ST computations can arise from IO-shaped
+-- result-polymorphic dispatch or older source paths. When source code
 -- pattern-matches `ST f` on such a value -- e.g. `runST (ST m)` in
 -- GHC.ST -- expose the same State#-passing function the ST constructor
 -- expects, so the pure ST = IO bridge is transparent at the match layer.

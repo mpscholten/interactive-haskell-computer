@@ -520,12 +520,10 @@ builtins reg =
     , (">>",       seqDispatch reg)
     , ("GHC.Internal.Base.>>", seqDispatch reg)
     , ("Prelude.>>", seqDispatch reg)
-    , ("return",   returnB)
-    , ("GHC.Internal.Base.return", returnB)
-    , ("Prelude.return", returnB)
-    , ("pure",     returnB)
-    , ("GHC.Internal.Base.pure", returnB)
-    , ("Prelude.pure", returnB)
+    -- 'pure' / 'return' deliberately omitted: both are class methods
+    -- with real source in @GHC.Internal.Base@.  Bare references route
+    -- through the seeded class-method dispatcher and its
+    -- result-polymorphic fallback.
     -- fmap: source-loaded from `instance Functor IO` in GHC.Internal.Base.
     -- No host-backed dispatcher — per CLAUDE.md "No host-backed class
     -- method dispatchers".  Resolved via classMethodDispatcher.
@@ -2770,18 +2768,6 @@ errorB = pure $ VFun $ \a -> do
 undefinedB :: IO Val
 undefinedB = pure (VIO (error "Prelude.undefined"))
 
---------------------------------------------------------------------------------
--- Monad core. Every builtin here is a plain global binding so Phase
--- 2.3 class-dispatch can later overlay it with dictionary-threaded
--- versions. The IO monad appears either as host-backed 'VIO' or as the
--- source-loaded @IO@ newtype, depending on how far evaluation has gone.
---------------------------------------------------------------------------------
-
--- | @return x = VIO (pure x)@. The @x@ thunk is not forced until the
--- receiver runs the action (preserving Haskell laziness).
-returnB :: IO Val
-returnB = pure $ VFun $ \a -> pure (VIO (force legacyHooks a))
-
 -- | Class-dispatched @>>=@.  For 'VIO' values (the common IO case) this
 -- is the same as the old 'bindB'.  For ST computations (VCon "ST" _), the
 -- ST monad bind is implemented directly: build a new ST computation that
@@ -2796,7 +2782,7 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         -- ST monad bind:
         -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
         -- Note: primop state functions may return VIO actions; run them with runIOVal.
-        -- If k r returns VIO (from `return`/`pure` via the IO-backed builtin),
+        -- If k r returns VIO (from IO-shaped return/pure dispatch),
         -- we run it eagerly and wrap the result in a new (# s', a #) tuple --
         -- the ST ≈ IO bridge (CLAUDE.md: ST is compiler-intrinsic, IO machinery reused).
         VCon "ST" [mFuncT] -> do
