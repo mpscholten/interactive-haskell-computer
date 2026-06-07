@@ -1472,5 +1472,4 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                     (\m -> "concatMap: not a list" `isInfixOf` m
                         || "unbound variable `Text.Blaze.Html.Renderer.String.renderHtml`" `isInfixOf` m
                         || "unbound variable `H.toHtml`" `isInfixOf` m
-                        || "<ihc-method-placeholder>:ToMarkup/toMarkup" `isInfixOf` m
-                        || "<>: no Semigroup instance registered for type `Char`" `isInfixOf` m)
+                        || "<ihc-method-placeholder>:ToMarkup/toMarkup" `isInfixOf` m)
