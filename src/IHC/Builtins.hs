@@ -1052,9 +1052,9 @@ builtins reg =
     , ("withCString",     withCStringB)
     , ("withCStringLen",  withCStringLenB)
     , ("withCStringLen0", withCStringLenB)
-    , ("with",            withB)
-    , ("Foreign.Marshal.Utils.with", withB)
-    , ("GHC.Internal.Foreign.Marshal.Utils.with", withB)
+    -- Foreign.Marshal.Utils.with source-loads from
+    -- GHC.Internal.Foreign.Marshal.Utils:
+    -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
     , ("peekCAString",    peekCStringB)
     , ("newCString",      newCStringB)
@@ -5883,19 +5883,6 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
     BS.useAsCString bs $ \src -> copyBytes cp (castPtr src) len
     poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
     pure (VPrimObj (PrimPtr cp))
-
-withB :: IO Val
-withB = pure $ VFun $ \valT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    valV <- force legacyHooks valT
-    fV <- force legacyHooks fT
-    p <- mallocBytes 8
-    fillBytes p 0 8
-    case valV of
-        VInt n -> poke (castPtr p :: Ptr CInt) (fromIntegral n)
-        _      -> pure ()
-    ptrT <- newWHNFThunk (VPrimObj (PrimPtr p))
-    r <- apply legacyHooks fV ptrT
-    runIOVal legacyHooks r
 
 sizeOfB :: IO Val
 sizeOfB = pure $ VFun $ \a -> do
