@@ -1883,9 +1883,12 @@ applyIP hooks _         v                          arg  = do
 --------------------------------------------------------------------------------
 -- Do-block desugaring
 --
--- Desugars at eval time (not parse time) into a single 'VIO' value
--- that the driver runs. Each statement sees the env augmented by any
--- earlier 'SBind' / 'SLet' stmts.
+-- Desugars at eval time (not parse time) into a single monadic action.
+-- IO-shaped blocks use 'VIO'; ST-shaped blocks preserve the 'ST'
+-- carrier so source-loaded callers like @runSTArray st = runST
+-- (st >>= unsafeFreezeSTArray)@ keep dispatching through the real
+-- @Monad (ST s)@ instance. Each statement sees the env augmented by
+-- any earlier 'SBind' / 'SLet' stmts.
 --
 -- Semantics:
 --   []               -- empty do is a no-op IO, per GHC, but we never
@@ -1917,6 +1920,8 @@ evalDo hooks env ipm (SExpr e : rest) =
                 evalDoMaybe hooks env ipm rest
             VCon "Nothing" [] ->
                 pure mv
+            VCon "ST" [stateFnT] ->
+                doSTSequence hooks env ipm stateFnT Nothing rest
             _ -> pure $ VIO $ do
                 _  <- runIOVal hooks mv                   -- run and discard
                 restV <- evalDo hooks env ipm rest
@@ -1929,6 +1934,8 @@ evalDo hooks env ipm (SBind name e : rest) =
                 evalDoMaybe hooks (extendEnv name vT env) ipm rest
             VCon "Nothing" [] ->
                 pure mv
+            VCon "ST" [stateFnT] ->
+                doSTSequence hooks env ipm stateFnT (Just (name, False)) rest
             _ -> pure $ VIO $ do
                 v  <- runIOVal hooks mv
                 vT <- newWHNFThunk v
@@ -1944,14 +1951,18 @@ evalDo hooks env ipm (SBangBind name e : rest) =
     -- parser desugars do-blocks to (>>=)/(>>)/lambda chains, so this
     -- branch is only hit on the defensive EDo fallback path; we still
     -- preserve the strictness contract here for completeness.
-    pure $ VIO $ do
+    do
         mv <- eval hooks env ipm e
-        v  <- runIOVal hooks mv
-        vT <- newWHNFThunk v
-        _  <- force hooks vT  -- bang: force to WHNF before continuing
-        let env' = extendEnv name vT env
-        restV <- evalDo hooks env' ipm rest
-        runIOVal hooks restV
+        case mv of
+            VCon "ST" [stateFnT] ->
+                doSTSequence hooks env ipm stateFnT (Just (name, True)) rest
+            _ -> pure $ VIO $ do
+                v  <- runIOVal hooks mv
+                vT <- newWHNFThunk v
+                _  <- force hooks vT  -- bang: force to WHNF before continuing
+                let env' = extendEnv name vT env
+                restV <- evalDo hooks env' ipm rest
+                runIOVal hooks restV
 evalDo hooks env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
@@ -1973,6 +1984,65 @@ evalDo hooks env ipm (SImplicitLet bs : rest) = do
                writeIORef slot (Unevaluated (Closure env ipm rhs)))
           (zip bs slots)
     evalDo hooks env ipm' rest
+
+doSTSequence
+    :: IHCHooks
+    -> Env
+    -> ImplicitParamMap
+    -> Thunk
+    -> Maybe (Name, Bool)
+    -> [Stmt]
+    -> IO Val
+doSTSequence hooks env ipm stateFnT mBind rest = do
+    stFuncT <- newWHNFThunk $ VFun $ \sT -> do
+        stepResult <- runSTStateFunction hooks stateFnT sT
+        case stDoResultComponents stepResult of
+            Just (newST, resultT) -> do
+                env' <- case mBind of
+                    Nothing -> pure env
+                    Just (name, isBang) -> do
+                        -- BangPatterns on a do-bind force the bound result
+                        -- before the remaining statements execute.
+                        if isBang then force hooks resultT >> pure () else pure ()
+                        pure (extendEnv name resultT env)
+                restV <- evalDo hooks env' ipm rest
+                runSTContinuation hooks newST restV
+            Nothing ->
+                pure stepResult
+    pure (VCon "ST" [stFuncT])
+
+runSTStateFunction :: IHCHooks -> Thunk -> Thunk -> IO Val
+runSTStateFunction hooks stateFnT sT = do
+    stateFn <- force hooks stateFnT
+    raw <- apply hooks stateFn sT
+    runIOVal hooks raw
+
+runSTContinuation :: IHCHooks -> Thunk -> Val -> IO Val
+runSTContinuation hooks newST restV =
+    case restV of
+        VCon "ST" [nextFnT] ->
+            runSTStateFunction hooks nextFnT newST
+        -- Result-polymorphic methods can still default to IO in optimistic
+        -- mode when a surrounding ST result type is not visible at runtime.
+        -- Treat that IO-shaped value as the continuation action and rewrap
+        -- its result in the current ST state.
+        VIO io -> do
+            result <- io
+            resultT <- newWHNFThunk result
+            pure (VCon "(#,#)" [newST, resultT])
+        other -> do
+            result <- runIOVal hooks other
+            case result of
+                VCon "ST" [nextFnT] ->
+                    runSTStateFunction hooks nextFnT newST
+                _ -> do
+                    resultT <- newWHNFThunk result
+                    pure (VCon "(#,#)" [newST, resultT])
+
+stDoResultComponents :: Val -> Maybe (Thunk, Thunk)
+stDoResultComponents (VCon "(#,#)" [stateT, valueT]) = Just (stateT, valueT)
+stDoResultComponents (VCon "(,)" [valueT, stateT])   = Just (stateT, valueT)
+stDoResultComponents _                               = Nothing
 
 evalDoMaybe :: IHCHooks -> Env -> ImplicitParamMap -> [Stmt] -> IO Val
 evalDoMaybe _     _   _   []              = do

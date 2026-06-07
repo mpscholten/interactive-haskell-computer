@@ -3705,7 +3705,23 @@ classMethodDispatcher reg cls methodName = selfVal
                     | otherwise
                         = rawTag
                 tag = dispatchTagForValue normTag
-            if isStorablePreValueArg accArgs
+            if isUnaryResultPolymorphicMethod cls methodName && null accArgs
+                then do
+                    -- @pure :: a -> f a@ and @return :: a -> m a@
+                    -- are result-polymorphic: the lone value argument is
+                    -- not the Applicative/Monad instance type.  Dispatching
+                    -- on that argument misroutes source code like
+                    -- @return (Right v)@ inside @try@ to the @Either@
+                    -- instance, producing @Right (Right v)@ instead of an
+                    -- @IO (Right v)@ action.  Prefer the result-context
+                    -- default path before any tag-directed lookup.
+                    mResult <- resultPolymorphicMethodForArg (Just tag)
+                    case mResult of
+                        Just resultVal ->
+                            applyAll resultVal [argT]
+                        Nothing ->
+                            pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isStorablePreValueArg accArgs
                 then do
                     -- Storable.pokeElemOff/pokeByteOff have shape
                     --   Ptr a -> Int -> a -> IO ()
@@ -3798,7 +3814,7 @@ classMethodDispatcher reg cls methodName = selfVal
                           case mMethod of
                             Just methodVal
                               | not (isMethodPlaceholder methodVal) ->
-                                    applyAll methodVal (reverse (argT : accArgs))
+                                    applyAllForTag tag methodVal (reverse (argT : accArgs))
                             _ -> do
                               mHost <- hostShowFallback reg cls tag methodName av
                               case mHost of
@@ -3836,7 +3852,7 @@ classMethodDispatcher reg cls methodName = selfVal
                                   case mMethod2 of
                                       Just methodVal
                                         | not (isMethodPlaceholder methodVal) ->
-                                              applyAll methodVal (reverse (argT : accArgs))
+                                              applyAllForTag tag methodVal (reverse (argT : accArgs))
                                       _ -> do
                                           mResult <- resultPolymorphicMethod
                                           case mResult of
@@ -3880,7 +3896,7 @@ classMethodDispatcher reg cls methodName = selfVal
                                                                   -- 'fallback', which raises the no-instance
                                                                   -- error.
                                                                   pure (dispatch (remaining - 1) (argT : accArgs))
-                else if isUnaryResultPolymorphicMethod cls methodName
+            else if isUnaryResultPolymorphicMethod cls methodName
                     then do
                         -- Arity-1 methods like @Applicative.pure@ /
                         -- @Monad.return@ wrap a value into a monadic
@@ -3895,7 +3911,7 @@ classMethodDispatcher reg cls methodName = selfVal
                         -- now so the call resolves to a real instance
                         -- (e.g. @IO@ / @STM@) and the bind keeps
                         -- chaining proper actions.
-                        mResult <- resultPolymorphicMethod
+                        mResult <- resultPolymorphicMethodForArg (Just tag)
                         case mResult of
                             Just resultVal ->
                                 applyAll resultVal (reverse (argT : accArgs))
@@ -3961,7 +3977,13 @@ classMethodDispatcher reg cls methodName = selfVal
                                  <> "` for method `" <> BC.unpack methodName
                                  <> "` (after trying " <> show (length accArgs + 1) <> " arguments)" )
 
-    resultPolymorphicMethod = tryTags (resultPolymorphicDefaultTags cls methodName)
+    resultPolymorphicMethod = resultPolymorphicMethodForArg Nothing
+
+    resultPolymorphicMethodForArg mArgTag = do
+        let tags = resultPolymorphicDefaultTagsForArg mArgTag cls methodName
+        when (prefersSTResultCarrier mArgTag cls methodName) $
+            triggerCoreInstanceLoad legacyHooks cls
+        tryTags tags
       where
         tryTags [] = pure Nothing
         tryTags (tag:rest) = do
@@ -3971,6 +3993,17 @@ classMethodDispatcher reg cls methodName = selfVal
                 Just methodVal
                   | not (isMethodPlaceholder methodVal) -> pure (Just methodVal)
                 _ -> tryTags rest
+
+    resultPolymorphicDefaultTagsForArg mArgTag clsName method
+        | isPureLikeResult clsName method
+        , maybe False isSTResultCarrierTag mArgTag =
+            [BC.pack "ST", BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
+        | otherwise =
+            resultPolymorphicDefaultTags clsName method
+
+    prefersSTResultCarrier mArgTag clsName method =
+        isPureLikeResult clsName method
+        && maybe False isSTResultCarrierTag mArgTag
 
     resultPolymorphicDefaultTags clsName method
         | clsName == BC.pack "GetAddrInfo"
@@ -4062,11 +4095,17 @@ classMethodDispatcher reg cls methodName = selfVal
         = [BC.pack "ParsecT"]
         | otherwise = []
 
-    -- | Methods whose first (and only) value-arg drives 'pure'-like
-    -- semantics: when that arg is non-dispatchable, the dispatcher
-    -- must NOT walk past it (no further arg ever comes).  Fire
-    -- result-polymorphic immediately instead.  See the `else if`
-    -- branch in 'dispatch'.
+    isPureLikeResult clsName method =
+        (clsName == BC.pack "Applicative" && method == BC.pack "pure")
+     || (clsName == BC.pack "Monad"       && method == BC.pack "return")
+
+    isSTResultCarrierTag tag =
+        tag `elem` map BC.pack ["STArray", "STUArray"]
+
+    -- | Methods whose first (and only) value-arg does NOT identify the
+    -- class instance.  The result type chooses the Applicative/Monad; in
+    -- optimistic mode we approximate that context with
+    -- 'resultPolymorphicDefaultTags'.
     isUnaryResultPolymorphicMethod :: ByteString -> ByteString -> Bool
     isUnaryResultPolymorphicMethod c m =
         (c == BC.pack "Applicative" && m == BC.pack "pure")
@@ -4169,7 +4208,7 @@ classMethodDispatcher reg cls methodName = selfVal
                             case preferMethod mMethod0 mShared of
                                 Just methodVal
                                   | not (isMethodPlaceholder methodVal) ->
-                                        Just <$> applyAll methodVal (reverse (argT : accArgs))
+                                        Just <$> applyAllForTag ixTag methodVal (reverse (argT : accArgs))
                                 _ -> pure Nothing
         | otherwise = pure Nothing
 
@@ -4325,6 +4364,63 @@ classMethodDispatcher reg cls methodName = selfVal
     applyAll v (t:ts) = do
         v' <- apply legacyHooks v t
         applyAll v' ts
+
+    applyAllForTag :: ByteString -> Val -> [Thunk] -> IO Val
+    applyAllForTag tag v args
+        | shouldCoerceFloatArgs tag = do
+            args' <- mapM (coerceFloatArgThunk tag) args
+            applied <- applyAll v args'
+            pure (wrapFloatArgFunction tag applied)
+        | otherwise =
+            applyAll v args
+
+    -- Source-loaded primitive numeric instances pattern-match on F#/D# for
+    -- every homogeneous argument.  In optimistic mode an integer literal in
+    -- a Float/Double context still arrives as VInt/VInteger (for example
+    -- @x == 0@ with @x :: Double@), so normalize those arguments before the
+    -- source pattern fires.  This replaces the old structural Eq/Ord mixed
+    -- Int/Double fallback without reviving a host method shim.
+    shouldCoerceFloatArgs :: ByteString -> Bool
+    shouldCoerceFloatArgs tag =
+        tag `elem` map BC.pack ["Float", "Double"]
+        && case BC.unpack cls of
+            "Eq" ->
+                methodName `elem` map BC.pack ["==", "/="]
+            "Ord" ->
+                methodName `elem` map BC.pack ["compare", "<", "<=", ">", ">="]
+            "Num" ->
+                methodName `elem` map BC.pack ["+", "-", "*"]
+            "Fractional" ->
+                methodName == BC.pack "/"
+            "Floating" ->
+                methodName == BC.pack "**"
+            _ ->
+                False
+
+    coerceFloatArgThunk :: ByteString -> Thunk -> IO Thunk
+    coerceFloatArgThunk tag t = do
+        v <- force legacyHooks t
+        case v of
+            VInt n ->
+                newWHNFThunk (VFloat (fromIntegral n))
+            VInteger n ->
+                newWHNFThunk (VFloat (fromInteger n))
+            _ ->
+                newWHNFThunk v
+
+    wrapFloatArgFunction :: ByteString -> Val -> Val
+    wrapFloatArgFunction tag (VFun f) =
+        VFun $ \nextT -> do
+            nextT' <- coerceFloatArgThunk tag nextT
+            result <- f nextT'
+            pure (wrapFloatArgFunction tag result)
+    wrapFloatArgFunction tag (VFunIP ipm f) =
+        VFunIP ipm $ \callIpm nextT -> do
+            nextT' <- coerceFloatArgThunk tag nextT
+            result <- f callIpm nextT'
+            pure (wrapFloatArgFunction tag result)
+    wrapFloatArgFunction _ other =
+        other
 
     -- A tag like "<function>", "<IO>", "()" is not dispatchable: no
     -- type-class instance is registered under it.  Try later args.
