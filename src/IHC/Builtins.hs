@@ -61,10 +61,8 @@ import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Numeric.Natural (Natural)
 import Foreign.C.String (peekCAString, withCString)
 import Foreign.ForeignPtr
-    ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
-    , newForeignPtr_
-    , plusForeignPtr
-    )
+    ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, newForeignPtr_
+    , plusForeignPtr )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
@@ -779,19 +777,10 @@ builtins reg =
     -- Phase 2.8: ForeignPtr
     , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB)
     , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
-    , ("withForeignPtr",             withForeignPtrB)
-    , ("unsafeWithForeignPtr",       withForeignPtrB)
-    , ("Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.withForeignPtr", withForeignPtrB)
-    , ("GHC.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
+    -- withForeignPtr / unsafeWithForeignPtr / touchForeignPtr source-load
+    -- from GHC.Internal.ForeignPtr. They bottom out in keepAlive# and touch#.
     -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
     -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
-    , ("touchForeignPtr",            touchForeignPtrB)
     , ("newForeignPtr_",             newForeignPtr_B)
     , ("newForeignPtr",              newForeignPtrB)
     , ("addForeignPtrFinalizer",     addForeignPtrFinalizerB)
@@ -4198,24 +4187,6 @@ bsValToBS v = do
     (fp, len) <- bsValPayload v
     withForeignPtr fp $ \ptr ->
         BS.packCStringLen (castPtr ptr, len)
-
-withForeignPtrB :: IO Val
-withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    fpv <- force legacyHooks fpT; fv <- force legacyHooks fT
-    fp <- foreignPtrValToForeignPtr fpv
-    markForeignPtrWord8 fp
-    withForeignPtr fp $ \ptr -> do
-        markWord8Ptr (castPtr ptr)
-        pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-        rv <- apply legacyHooks fv pT
-        runIOVal legacyHooks rv
-
-touchForeignPtrB :: IO Val
-touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
-    fpv <- force legacyHooks fpT
-    fp <- foreignPtrValToForeignPtr fpv
-    touchForeignPtr fp
-    pure VUnit
 
 newForeignPtr_B :: IO Val
 newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
