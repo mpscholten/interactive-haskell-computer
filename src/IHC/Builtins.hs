@@ -1256,8 +1256,11 @@ builtins reg =
     -- forkIO and warp's defaultFork bottom out into this.
     , ("fork#",           forkHashB)
     , ("GHC.Prim.fork#",  forkHashB)
-    , ("killThread",      killThreadB)
-    , ("myThreadId",      myThreadIdB)
+    -- throwTo / killThread / myThreadId are deliberately omitted:
+    -- GHC.Internal.Conc.Sync has real source and lowers them to
+    -- killThread# / myThreadId# plus the source ThreadId constructor.
+    , ("killThread#",     killThreadHashB)
+    , ("GHC.Prim.killThread#", killThreadHashB)
     , ("myThreadId#",     myThreadIdHashB)
     , ("fromThreadId",    fromThreadIdB)
     , ("GHC.Conc.Sync.fromThreadId", fromThreadIdB)
@@ -1542,7 +1545,8 @@ builtins reg =
     -- removed shim (PR #166). Source-loaded from
     -- GHC.Internal.Control.Exception.Base — each bottoms out on the
     -- source-loaded `catch` / `mask` chain.
-    , ("throwTo",         throwToB)
+    -- throwTo source-loads from GHC.Internal.Conc.Sync and bottoms out
+    -- on the killThread# primop above.
     , ("displayException", displayExceptionB)
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
     , ("typeRep",        typeRepB)
@@ -6366,34 +6370,42 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
             f Map.empty stok
         _ -> runIOVal legacyHooks v
 
--- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
-killThreadB :: IO Val
-killThreadB = pure $ VFun $ \tidT -> pure $ VIO $ do
-    tidV <- force legacyHooks tidT
-    case tidV of
-        VPrimObj (PrimThreadId tid) -> do
-            killThread tid
-            pure VUnit
-        _ -> error ("killThread: not a ThreadId: " <> showValForDebug tidV)
-
--- | @myThreadId@ - return the current thread's id.
-myThreadIdB :: IO Val
-myThreadIdB = pure $ VIO $ do
-    tid <- myThreadId
-    pure (VPrimObj (PrimThreadId tid))
-
 fromThreadIdB :: IO Val
 fromThreadIdB = pure $ VFun $ \tidT -> do
     tidV <- force legacyHooks tidT
-    case tidV of
-        VPrimObj (PrimThreadId tid) ->
-            pure (VInt (fromIntegral (threadIdKey tid)))
-        other -> error ("fromThreadId: not a ThreadId: " <> showValForDebug other)
+    tid <- extractThreadId tidV
+    pure (VInt (fromIntegral (threadIdKey tid)))
   where
+    extractThreadId (VPrimObj (PrimThreadId tid)) = pure tid
+    extractThreadId (VCon "ThreadId" [innerT]) = do
+        inner <- force legacyHooks innerT
+        extractThreadId inner
+    extractThreadId other =
+        error ("fromThreadId: not a ThreadId: " <> showValForDebug other)
+
     threadIdKey tid =
         let s = show tid
             step h c = h * 16777619 + fromIntegral (ord c)
         in foldl step (2166136261 :: Word64) s
+
+-- | @killThread# :: ThreadId# -> a -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. Source-loaded @throwTo (ThreadId tid) ex@ bottoms out
+-- here after wrapping @ex@ with @toException@.
+killThreadHashB :: IO Val
+killThreadHashB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VFun $ \_stT -> do
+    tidV <- force legacyHooks tidT
+    excV <- force legacyHooks excT
+    tid <- extractThreadIdHash tidV
+    exc <- valToIhcException excV
+    throwTo tid exc
+    pure (VPrimObj PrimRealWorld)
+  where
+    extractThreadIdHash (VPrimObj (PrimThreadId tid)) = pure tid
+    extractThreadIdHash (VCon "ThreadId" [innerT]) = do
+        inner <- force legacyHooks innerT
+        extractThreadIdHash inner
+    extractThreadIdHash other =
+        error ("killThread#: not a ThreadId#: " <> showValForDebug other)
 
 myThreadIdHashB :: IO Val
 myThreadIdHashB = pure $ VFun $ \stT -> do
@@ -7305,17 +7317,6 @@ runStateTransformer stateFnT = do
     case res of
         VCon "(#,#)" [_stateT, resultT] -> force legacyHooks resultT
         _ -> pure res
-
-throwToB :: IO Val
-throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
-    tidV <- force legacyHooks tidT
-    excV <- force legacyHooks excT
-    case tidV of
-        VPrimObj (PrimThreadId tid) -> do
-            exc <- valToIhcException excV
-            throwTo tid exc
-            pure VUnit
-        _ -> error ("throwTo: not a ThreadId: " <> showValForDebug tidV)
 
 displayExceptionB :: IO Val
 displayExceptionB = pure $ VFun $ \eT -> do
