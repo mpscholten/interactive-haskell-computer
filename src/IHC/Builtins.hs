@@ -1265,12 +1265,11 @@ builtins reg =
     , ("fromThreadId",    fromThreadIdB)
     , ("GHC.Conc.Sync.fromThreadId", fromThreadIdB)
     , ("GHC.Internal.Conc.Sync.fromThreadId", fromThreadIdB)
-    , ("labelThread",     labelThreadB)
-    , ("GHC.Conc.Sync.labelThread", labelThreadB)
-    , ("GHC.Internal.Conc.Sync.labelThread", labelThreadB)
-    , ("labelThreadByteArray#", labelThreadByteArrayHashB)
-    , ("GHC.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
-    , ("GHC.Internal.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
+    -- labelThread / labelThreadByteArray# source-load from
+    -- GHC.Internal.Conc.Sync. They bottom out in the raw labelThread#
+    -- primop, which is eventlog/debug metadata only in IHC.
+    , ("labelThread#", labelThreadHashB)
+    , ("GHC.Prim.labelThread#", labelThreadHashB)
     , ("threadDelay",     threadDelayB)
     , ("getNumCapabilities", getNumCapabilitiesB)
     -- closeFdWith coordinates with GHC's RTS event manager. IHC does not
@@ -6413,13 +6412,12 @@ myThreadIdHashB = pure $ VFun $ \stT -> do
     tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
     pure (VCon "(#,#)" [stT, tidT])
 
-labelThreadB :: IO Val
-labelThreadB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
-    pure $ VIO $ pure VUnit
-
-labelThreadByteArrayHashB :: IO Val
-labelThreadByteArrayHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
-    pure $ VIO $ pure VUnit
+-- | @labelThread# :: ThreadId# -> ByteArray# -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. GHC uses it for eventlog/debug labels; IHC does not
+-- expose an eventlog, so preserve only the state-threading shape.
+labelThreadHashB :: IO Val
+labelThreadHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT -> pure $ VFun $ \sT ->
+    force legacyHooks sT
 
 -- | @threadDelay microseconds@ - sleep.
 threadDelayB :: IO Val
