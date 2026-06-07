@@ -558,23 +558,14 @@ loadProgramFromSource searchPath src0 = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
-                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
-                    , "catch", "handle", "try", "evaluate"
-                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
-                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
-                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
-                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "forkIO", "fromThreadId"
-                    , "create", "createAndTrim", "createFp", "createFpAndTrim"
+                    ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
+                    , "fromThreadId"
                     , "addForeignPtrFinalizer"
                     , "newUnique", "hashUnique"
                     , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
-                    , "labelThread", "labelThreadByteArray#"
-                    , "settingsHost", "settingsPort"
-                    , "putStrLn", "putStr", "print"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
@@ -1640,19 +1631,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
-                    [">>=", ">>", "return", "pure", "fmap", "<*>", "void"
-                    , "catch", "handle", "try", "evaluate"
-                    , "mask", "mask_", "uninterruptibleMask", "uninterruptibleMask_"
-                    , "block", "unblock", "unsafeUnmask", "allowInterrupt", "interruptible"
-                    , "bracket", "bracket_", "bracketOnError", "finally", "onException"
-                    , "unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
+                    ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
                     , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
-                    , "labelThread", "labelThreadByteArray#"
-                    , "settingsHost", "settingsPort"
-                    , "putStrLn", "putStr", "print"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
@@ -5036,7 +5019,7 @@ renderTypeForAnnotation = top
 -- Haskell source path.
 ffiBuiltinNames :: Set ByteString
 ffiBuiltinNames = Set.fromList
-    [ "hPutBuf", "hGetBuf", "hPutBufNonBlocking", "hGetBufNonBlocking"
+    [ "hPutBuf"
     , "withCString", "withCStringLen", "withCStringLen0"
     , "peekCString", "peekCAString", "newCString", "newCAString"
     , "addForeignPtrFinalizer"
@@ -5045,7 +5028,6 @@ ffiBuiltinNames = Set.fromList
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
     , "sizeOf", "alignment"
     , "peek", "poke", "peekByteOff", "pokeByteOff", "peekElemOff", "pokeElemOff"
-    , "memcpy", "copyBytes"
     , "socket"
     , "setSocketOption"
     , "listen"
@@ -5055,8 +5037,6 @@ ffiBuiltinNames = Set.fromList
     , "mallocBytes"
     , "free"
     , "newUnique", "hashUnique", "fromThreadId"
-    , "settingsHost", "settingsPort"
-    , "plusPtr", "minusPtr", "castPtr"
     -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
     -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
     -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
@@ -5080,17 +5060,12 @@ ffiBuiltinNames = Set.fromList
     , "hPutStrLn", "hPutStr", "hPutChar"
     -- Text-level handle input: same situation as the output-side names
     -- above, mirrored for stdin reads.  Source-loading
-    -- 'System.IO.getLine = hGetLine stdin' / 'System.IO.getContents =
-    -- hGetContents stdin' must resolve 'hGetLine' / 'hGetContents' /
-    -- 'hGetChar' to the host shim that takes 'VPrimObj (PrimHandle h)';
+    -- 'System.IO.getLine = hGetLine stdin' must resolve 'hGetLine'
+    -- to the host shim that takes 'VPrimObj (PrimHandle h)';
     -- otherwise the source bodies in 'GHC.IO.Handle.Text' fall back to
     -- the FileHandle/DuplexHandle pattern-match path, which assumes the
-    -- source-level Handle ADT layer we haven't implemented.  'hGetLine'
-    -- already has a host shim; 'hGetContents' / 'hGetChar' do not yet,
-    -- but listing them here is harmless (the FQN forwarder only fires
-    -- when a builtin is registered) and future-proofs the routing for
-    -- when those shims land.
-    , "hGetLine", "hGetContents", "hGetChar"
+    -- source-level Handle ADT layer we haven't implemented.
+    , "hGetLine"
     ]
 
 -- | Build a map from each locally-visible imported name to its
