@@ -447,15 +447,7 @@ builtins reg =
     -- everything in Data.ByteString.Internal.Type), and through the
     -- RTS-level primitives still host-backed below (mallocPlainForeignPtrBytes,
     -- minusAddr#, etc.) for actual allocation/pointer boundaries.
-    -- Unique generation is an RTS/global-state service. Vault uses these as
-    -- ordered map keys, so represent them as Unique Integer-style constructors
-    -- backed by a host counter.
-    [ ("newUnique", newUniqueB)
-    , ("hashUnique", hashUniqueB)
-    , ("Data.Unique.newUnique", newUniqueB)
-    , ("Data.Unique.hashUnique", hashUniqueB)
-    , ("Data.Unique.Really.newUnique", newUniqueB)
-    , ("Data.Unique.Really.hashUnique", hashUniqueB)
+    [
     -- Data.ByteString.Char8: graduated to pure source (empty/null/
     -- length/pack/unpack/head/index/singleton/replicate/concat/
     -- append/putStrLn).  'Char8.putStrLn' was the last hold-out —
@@ -539,7 +531,7 @@ builtins reg =
     -- GHC.IORef, GHC.Internal.IORef, and GHC.Internal.Data.IORef all
     -- have real source; they lower to the MutVar# and Weak# primops below.
     -- File IO
-    , ("openFile",    openFileB)
+      ("openFile",    openFileB)
     , ("hClose",      hCloseB)
     , ("hPutStr",     hPutStrB)
     , ("hPutChar",    hPutCharB)
@@ -4150,21 +4142,6 @@ bsValPayload v = case v of
 {-# NOINLINE uniqueCounterRef #-}
 uniqueCounterRef :: IORef Int64
 uniqueCounterRef = unsafePerformIO (newIORef 0)
-
-newUniqueB :: IO Val
-newUniqueB = pure $ VIO $ do
-    n <- atomicModifyIORef' uniqueCounterRef $ \x ->
-        let x' = x + 1 in (x', x')
-    nT <- newWHNFThunk (VInt n)
-    pure (VCon "Unique" [nT])
-
-hashUniqueB :: IO Val
-hashUniqueB = pure $ VFun $ \uT -> do
-    uv <- force legacyHooks uT
-    case uv of
-        VCon "Unique" [nT] -> force legacyHooks nT
-        VInt n             -> pure (VInt n)
-        other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
 
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString

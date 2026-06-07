@@ -561,7 +561,6 @@ loadProgramFromSource searchPath src0 = do
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
                     , "fromThreadId"
                     , "addForeignPtrFinalizer"
-                    , "newUnique", "hashUnique"
                     , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
@@ -5036,7 +5035,7 @@ ffiBuiltinNames = Set.fromList
     , "bind"
     , "mallocBytes"
     , "free"
-    , "newUnique", "hashUnique", "fromThreadId"
+    , "fromThreadId"
     -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
     -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
     -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
