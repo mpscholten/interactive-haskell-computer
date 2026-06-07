@@ -296,6 +296,7 @@ seedBuiltinClassMethodSigs = do
             , ("pure",       "Applicative")
             , ("<*>",        "Applicative")
             , ("return",     "Monad")
+            , (">>",         "Monad")
             -- Monoid / Semigroup
             , ("mempty",     "Monoid")
             , ("mappend",    "Monoid")

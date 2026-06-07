@@ -511,15 +511,12 @@ builtins reg =
     --     getContents  =  hGetContents stdin    -- System/IO.hs:316-317
     -- It was never shimmed in the first place; documented here for
     -- symmetry with 'getLine'.
-    -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
-    -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
-    -- implementation for VIO values.
+    -- Monad bind still bridges IO/ST directly.  '>>' is deliberately
+    -- omitted: it is a class method with real source in GHC.Internal.Base
+    -- and resolves through the seeded class-method dispatcher.
     , (">>=",      bindDispatch reg)
     , ("GHC.Internal.Base.>>=", bindDispatch reg)
     , ("Prelude.>>=", bindDispatch reg)
-    , (">>",       seqDispatch reg)
-    , ("GHC.Internal.Base.>>", seqDispatch reg)
-    , ("Prelude.>>", seqDispatch reg)
     -- 'pure' / 'return' deliberately omitted: both are class methods
     -- with real source in @GHC.Internal.Base@.  Bare references route
     -- through the seeded class-method dispatcher and its
@@ -2845,66 +2842,6 @@ bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
         vT <- newWHNFThunk v
         r  <- apply legacyHooks kv vT
         runIOVal legacyHooks r
-
--- | @m >> n@ = run m (discarding result), then run n.
-seqDispatch :: ClassRegistry -> IO Val
-seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
-    mv <- force legacyHooks ma
-    case mv of
-        VIO _         -> ioSeq mv mb
-        VCon "IO" [_] -> ioSeq mv mb
-        -- ST monad seq:
-        -- m >> n = m >>= \_ -> n  for ST
-        -- Note: primop state functions may return VIO actions; run them with runIOVal.
-        -- If n is VIO (from `return`/`pure`), we run it and wrap as (# s', a #).
-        VCon "ST" [mFuncT] -> do
-            mFuncV <- force legacyHooks mFuncT
-            stFunc <- newWHNFThunk $ VFun $ \sT -> do
-                resRaw <- apply legacyHooks mFuncV sT    -- apply :: Val -> Thunk -> IO Val
-                resV   <- runIOVal legacyHooks resRaw    -- run VIO if needed
-                case stResultComponents resV of
-                    Just (newST, _) -> do
-                        nbV <- force legacyHooks mb
-                        case nbV of
-                            VCon "ST" [k2FuncT] -> do
-                                k2FuncV  <- force legacyHooks k2FuncT
-                                resRaw2  <- apply legacyHooks k2FuncV newST
-                                runIOVal legacyHooks resRaw2
-                            -- VIO from `return`/`pure`: run and wrap as (# s, a #)
-                            VIO io -> do
-                                r  <- io
-                                rT <- newWHNFThunk r
-                                pure (VCon "(#,#)" [newST, rT])
-                            other -> do
-                                v <- runIOVal legacyHooks other
-                                case v of
-                                    VCon "ST" [k2FuncT] -> do
-                                        k2FuncV <- force legacyHooks k2FuncT
-                                        resRaw2 <- apply legacyHooks k2FuncV newST
-                                        runIOVal legacyHooks resRaw2
-                                    _ -> do
-                                        vT <- newWHNFThunk v
-                                        pure (VCon "(#,#)" [newST, vT])
-                    Nothing -> pure resV
-            pure (VCon "ST" [stFunc])
-        _ -> do
-            let tag = typeTagOf mv
-            mSeqMethod <- lookupInstanceMethod reg "Monad" tag ">>" >>= forceInstanceMethod
-            case mSeqMethod of
-                Just seqMethod -> do
-                    maT <- newWHNFThunk mv
-                    r1  <- apply legacyHooks seqMethod maT
-                    apply legacyHooks r1 mb
-                _ ->
-                    pure $ VIO $ do
-                        _ <- runIOVal legacyHooks mv
-                        nv <- force legacyHooks mb
-                        runIOVal legacyHooks nv
-  where
-    ioSeq mv mb = pure $ VIO $ do
-        _ <- runIOVal legacyHooks mv
-        nv <- force legacyHooks mb
-        runIOVal legacyHooks nv
 
 -- Strict ST state functions produce unboxed tuples in state-first order,
 -- while lazy ST produces boxed pairs in value-first order. Constructor names

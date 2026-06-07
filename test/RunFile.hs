@@ -1264,6 +1264,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "ap-io-effect\n7\n"
 
+    it "Monad >> IO: source-loaded method sequences effects" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_seq_io.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "seq-io-a\nseq-io-b\n"
+
+    it "Monad >> Maybe: source-loaded method keeps Maybe semantics" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_seq_maybe.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Just 2\nNothing\n"
+
+    it "Monad >> ST: source-loaded method sequences state actions" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_seq_st.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "5\n"
+
     it "runST STRef counter: source-loaded ST actions sequence correctly" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/sem_runst_basic.hs")
         n   `shouldBe` 0
