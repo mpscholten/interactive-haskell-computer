@@ -1559,8 +1559,10 @@ builtins reg =
     , ("GHC.Internal.Exception.toException", toExceptionB)
     -- fromException: pair of toException. Used by source-loaded catch:
     --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
-    -- With Val-level dynamic typing we cannot implement the type match;
-    -- we always return Just, so the user handler sees the raw exception Val.
+    -- With Val-level dynamic typing we return the wrapper in `Just`;
+    -- matchPat handles concrete constructor demands through the
+    -- SomeException wrapper and lets failed downcast guards fall through
+    -- to `Nothing`.
     , ("fromException",   fromExceptionB)
     , ("Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
@@ -1620,33 +1622,10 @@ builtins reg =
     -- =================================================================
     -- end VIO <-> State# bridge
     -- =================================================================
-    -- Phase 2.10a exception shim. `catch` HAS real source in
-    -- ghc-internal/src/GHC/Internal/IO.hs and bottoms out into
-    -- primops we already implement (`catch#`/`unIO`/`raiseIO#`), so
-    -- per "minimum surface only" it is a graduation candidate.
-    -- Graduation is BLOCKED on TWO interpreter gaps (both reproduced;
-    -- see test/Fixtures/Unsupported/io_catch_graduated.hs):
-    --   1. ECase eagerly runs a `VIO` scrutinee even when the case
-    --      destructures the `IO` newtype (`catch (IO io) h = …`), so
-    --      the action throws OUTSIDE `catch#`'s protection. Fixable in
-    --      IHC.Eval `go (ECase …)` — a core-evaluator change kept
-    --      separate from the shim removal to bound the blast radius.
-    --   2. Even past (1): source `catch`'s
-    --        handler' e = case fromException e of
-    --                       Just e' -> unIO (handler e') ; Nothing -> raiseIO# e
-    --      needs `fromException` to return `Just` for the @SomeException@
-    --      handler case (GHC: @instance Exception SomeException where
-    --      fromException = Just@). `fromExceptionB` deliberately returns
-    --      `Nothing` for downcast-safety (warp/wai `Just (Con _) <-
-    --      fromException e` guards — see its inline note); flipping it
-    --      regresses those, and matchPat has no `SomeException`
-    --      newtype-transparency for concrete-ctor patterns to compensate.
-    --      Needs runtime-type-directed `fromException`/`cast`.
-    , ("catch",           catchB)
-    , ("GHC.IO.catch",    catchB)
-    , ("GHC.Internal.IO.catch", catchB)
-    , ("Control.Exception.catch", catchB)
-    , ("GHC.Internal.Control.Exception.catch", catchB)
+    -- catch: source-loaded from GHC.Internal.IO:
+    --   catch (IO io) handler = IO $ catch# io handler'
+    -- The source bottoms out on the catch# primop plus the VIO/State#
+    -- bridge (`unIO`) and the Val-level `fromException` helper above.
     -- evaluate: removed shim. Source-loaded from GHC.Internal.IO:
     --   `evaluate a = IO $ \s -> seq# a s`
     -- bottoms out into the `seq#` GHC.Prim primop (registered below),
@@ -1660,7 +1639,7 @@ builtins reg =
     -- try / handle: removed shim (PR #171). Source-loaded from
     -- GHC.Internal.Control.Exception.Base: `try a = catch (Right <$> a)
     -- (pure . Left)` / `handle = flip catch`; bottoms out on the
-    -- source-loaded `catch` chain (catch# primop) once `catch` graduates.
+    -- source-loaded `catch` chain (catch# primop).
     -- bracket / bracket_ / bracketOnError / finally / onException:
     -- removed shim (PR #166). Source-loaded from
     -- GHC.Internal.Control.Exception.Base — each bottoms out on the
@@ -7315,17 +7294,18 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
     let runAction = do
             rRaw <- apply legacyHooks ioV sT
             runIOVal legacyHooks rRaw
-    rRes <- CE.try @IhcException (CE.try @SomeException runAction)
+    rRes <- CE.try @SomeException (CE.try @IhcException runAction)
     case rRes of
         Right (Right v) -> ensurePair v
-        Right (Left se) -> do
-            -- Non-IhcException host error — wrap & hand to handler.
-            let msg = BC.pack (show se)
-            excT <- newWHNFThunk (VStr msg)
-            invokeHandler hV excT
-        Left exc -> do
-            excVal <- ihcExceptionToVal exc
+        Right (Left exc) -> do
+            rawExcVal <- ihcExceptionToVal exc
+            excVal <- ensureSomeExceptionVal rawExcVal
             excT   <- newWHNFThunk excVal
+            invokeHandler hV excT
+        Left se -> do
+            -- Non-IhcException host error — wrap & hand to handler.
+            excVal <- hostExceptionToSomeExceptionVal se
+            excT <- newWHNFThunk excVal
             invokeHandler hV excT
   where
     -- Ensure the result is shaped as (# State#, a #). If the IO action
@@ -7349,6 +7329,31 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
             _ -> do
                 v <- runIOVal legacyHooks r1
                 ensurePair v
+
+-- | Convert a host-thrown 'SomeException' into the Val shape that
+-- source-loaded exception code expects from the @catch#@ primop.
+--
+-- This helper is part of the primop boundary, not a replacement for
+-- source-level @catch@: ordinary exception combinators still load from
+-- @GHC.Internal.IO@ / @Control.Exception@ and bottom out here.
+hostExceptionToSomeExceptionVal :: SomeException -> IO Val
+hostExceptionToSomeExceptionVal e = do
+    descT <- newWHNFThunk =<< stringToListValIO (show e)
+    handleT <- newWHNFThunk (VCon "Nothing" [])
+    typeT <- newWHNFThunk (VCon "OtherError" [])
+    locT <- newWHNFThunk =<< stringToListValIO ""
+    errnoT <- newWHNFThunk (VCon "Nothing" [])
+    fileT <- newWHNFThunk (VCon "Nothing" [])
+    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
+    ioErrT <- newWHNFThunk ioErrVal
+    pure (VCon "SomeException" [ioErrT])
+
+ensureSomeExceptionVal :: Val -> IO Val
+ensureSomeExceptionVal v = case v of
+    VCon "SomeException" _ -> pure v
+    _ -> do
+        innerT <- newWHNFThunk v
+        pure (VCon "SomeException" [innerT])
 
 -- | @newMVar# :: State# s -> (# State# s, MVar# s a #)@
 --
@@ -7551,12 +7556,10 @@ toExceptionB = pure $ VFun $ \eT -> do
             eT' <- newWHNFThunk ev
             pure (VCon "SomeException" [eT'])
 
--- | @fromException :: Exception e => SomeException -> Maybe e@ — inverse
--- of 'toException'. In real GHC the dispatch is type-directed; at the Val
--- level there is no type to check against, so we always unwrap and wrap in
--- 'Just'. Source-loaded @catch@ uses this to route handlers: returning
--- 'Just' keeps the exception value flowing to the user handler (which is
--- what we want), 'Nothing' would rethrow.
+-- | @fromException :: Exception e => SomeException -> Maybe e@.
+-- Real GHC is type-directed.  At the Val level we return @Just@ for
+-- 'SomeException' inputs; 'matchPat' supplies the limited downcast
+-- behavior we can infer from demanded constructor patterns.
 fromExceptionB :: IO Val
 fromExceptionB = pure $ VFun $ \eT -> do
     -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
@@ -7570,14 +7573,12 @@ fromExceptionB = pure $ VFun $ \eT -> do
     -- IOError (@Just (IOError ...)@ doesn't match @Just
     -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
     --
-    -- Defaulting to 'Nothing' is the safe answer for exception-type
-    -- DOWNCASTS — the common pattern in warp / wai / standard handler
-    -- code.  Code that genuinely wants the wrapped value can pattern
-    -- match @SomeException e <- ...@ directly (we wrap host
-    -- exceptions in 'VCon "SomeException" [innerT]', and the record-
-    -- accessor / matchPat legacyHooks paths already descend through the wrap).
-    _ <- force legacyHooks eT
-    pure (VCon "Nothing" [])
+    ev <- force legacyHooks eT
+    case ev of
+        VCon "SomeException" _ -> do
+            evT <- newWHNFThunk ev
+            pure (VCon "Just" [evT])
+        _ -> pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --
@@ -7619,53 +7620,6 @@ runStateTransformer stateFnT = do
     case res of
         VCon "(#,#)" [_stateT, resultT] -> force legacyHooks resultT
         _ -> pure res
-
-catchB :: IO Val
-catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    hv <- force legacyHooks hT
-    -- A single `try @SomeException` so the user handler runs exactly once.
-    -- Nesting two host `catch`es (one for IhcException, one for the
-    -- SomeException fallthrough) double-invoked the handler whenever the
-    -- handler itself rethrew: the rethrown IhcException escaped the inner
-    -- catch and was re-caught by the outer one, running `hv` a second
-    -- time. (This was masked while bracket/finally/onException were
-    -- host-shimmed; source-loading them exercises this path.)
-    r <- CE.try @SomeException (runIOVal legacyHooks av)
-    case r of
-        Right v -> pure v
-        Left e  -> do
-            excVal <- case CE.fromException e of
-                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
-                Nothing                       -> hostExceptionToVal e
-            excT <- newWHNFThunk excVal
-            rv   <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv
-
--- | Convert a host-thrown 'SomeException' into a Val that source-level
--- pattern matching on 'IOError' can introspect.  Most Haskell code in
--- the ecosystem reaches for 'ioe_errno', 'ioeGetErrorType', and
--- 'displayException', so we materialise a record that supplies these
--- fields with conservative defaults (no errno, OtherError type, the
--- exception's @show@ as description).
-hostExceptionToVal :: SomeException -> IO Val
-hostExceptionToVal e = do
-    descT <- newWHNFThunk =<< stringToListValIO (show e)
-    handleT <- newWHNFThunk (VCon "Nothing" [])
-    typeT <- newWHNFThunk (VCon "OtherError" [])
-    locT <- newWHNFThunk =<< stringToListValIO ""
-    errnoT <- newWHNFThunk (VCon "Nothing" [])
-    fileT <- newWHNFThunk (VCon "Nothing" [])
-    -- Wrap in 'SomeException' so handlers that pattern-match
-    -- @\(SomeException e) -> ...@ (e.g. warp's 'throughAsync',
-    -- 'settingsOnException') see the expected ctor.  Existing handlers
-    -- that match on the inner @IOError@ ctor still work via
-    -- newtype-transparent pattern matching: 'matchPat' on
-    -- @PCon "IOError"@ against a single-field @VCon "SomeException"@
-    -- projects the inner field and retries.
-    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
-    ioErrT <- newWHNFThunk ioErrVal
-    pure (VCon "SomeException" [ioErrT])
 
 throwToB :: IO Val
 throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do

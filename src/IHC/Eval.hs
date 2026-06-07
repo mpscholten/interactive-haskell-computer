@@ -1555,6 +1555,19 @@ matchPat hooks pat@(PCon "PS" _) v = do
 -- strict state-passing order.
 matchPat hooks (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
     matchFields hooks [(pState, stateT), (pVal, valT)] []
+matchPat hooks (PCon "Nothing" []) (VCon "Just" [excT]) = do
+    -- fromException is type-directed in GHC. IHC's Val-level helper
+    -- returns `Just (SomeException inner)`, so a failed `Just
+    -- (Concrete ...)` downcast must still be able to reach the following
+    -- `Nothing` alternative in guard-style code.
+    exc <- force hooks excT
+    case exc of
+        VCon "SomeException" _ -> pure (Just [])
+        _                      -> pure Nothing
+matchPat hooks pat@(PCon pname _) (VCon "SomeException" [innerT])
+    | pname /= BC.pack "SomeException" = do
+        inner <- force hooks innerT
+        matchPat hooks pat inner
 matchPat hooks (PCon name pats) v@(VCon vname vthunks)
     | name == vname && (length pats == length vthunks
                         || null pats) =

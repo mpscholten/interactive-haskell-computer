@@ -1,6 +1,7 @@
 -- Exercises source-loaded `try` and `handle` from
 -- GHC.Internal.Control.Exception(.Base) after their host shims were
--- removed (Builtins.hs: tryB/handleB deleted; only `catch` stays host).
+-- removed. `catch` is source-loaded too; the chain bottoms out in
+-- the `catch#` primop.
 --   handle = flip catch
 --   try a  = catch (a >>= \v -> return (Right v)) (\e -> return (Left e))
 -- A custom Exception type keeps the golden deterministic (no reliance
