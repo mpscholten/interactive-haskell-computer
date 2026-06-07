@@ -5037,7 +5037,6 @@ renderTypeForAnnotation = top
 ffiBuiltinNames :: Set ByteString
 ffiBuiltinNames = Set.fromList
     [ "hPutBuf", "hGetBuf", "hPutBufNonBlocking", "hGetBufNonBlocking"
-    , "with"
     , "withCString", "withCStringLen", "withCStringLen0"
     , "peekCString", "peekCAString", "newCString", "newCAString"
     , "addForeignPtrFinalizer"
