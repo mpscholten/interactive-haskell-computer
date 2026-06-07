@@ -4126,6 +4126,8 @@ tyConToFFI c _ = case c of
     "Double"   -> Just FFIDouble
     "Bool"     -> Just FFIInt
     "Char"     -> Just FFIChar
+    "Int#"     -> Just FFIInt64
+    "Word#"    -> Just FFIWord64
     "CString"  -> Just FFICString
     "CStringLen" -> Just (FFIPtr FFIVoid)  -- CStringLen = (CString, Int) — tuple, deferred
     "Ptr"      -> Just (FFIPtr FFIVoid)

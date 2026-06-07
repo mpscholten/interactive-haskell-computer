@@ -6522,9 +6522,8 @@ loadModule
     -> IO LoadedModule
 loadModule registry searchPath includeMap name = do
     -- Builtin-backed fast path: 'loadModule' is called millions of
-    -- times per warp request for the ~7 always-loaded compiler modules
-    -- ('GHC.Prim', 'GHC.CString', 'GHC.Tuple', 'GHC.Types', 'GHC.Magic',
-    -- 'GHC.Num.BigNat', 'GHC.Classes').  Each call read the per-call
+    -- times per warp request for the small compiler-backed module set
+    -- (e.g. 'GHC.Prim', 'GHC.Tuple', 'GHC.Types'). Each call read the per-call
     -- @registry@ first ('Map.lookup name reg' = O(log 464) compareBytes
     -- with a typical warp-loaded reg), even though for builtin-backed
     -- modules the ANSWER never changes once the global cache is
@@ -8543,14 +8542,13 @@ lookupIncludeDirs includeMap fileDir =
 
 -- | Phase 2.17: Minimal compiler-builtins-only whitelist.
 --
--- ONLY modules with NO .hs source file in base-4.19.0.0 stay here.
--- These are generated or wired-in by the GHC build system itself;
--- they cannot be source-loaded because they literally do not exist
--- as Haskell text on disk.
+-- Ordinary modules with interpretable source must not stay here.  Entries
+-- that remain are either compiler-generated/wired-in modules or explicitly
+-- documented compiler-intrinsic carve-outs such as Unsafe.Coerce.
 --
--- Verification: checked against ~/.cache/ihc/sources/base-4.19.0.0/
--- for each entry below.  Every module with a .hs file has been
--- REMOVED from this list and will be source-loaded instead.
+-- Verification includes both base and ghc-prim source bundles.  For example,
+-- GHC.CString has real ghc-prim source and is source-loaded; its primitive
+-- leaves live in IHC.Builtins instead.
 --
 -- The 17-clause original whitelist covered modules that DO have
 -- source (GHC.Base, GHC.IO, Prelude, System.IO, Foreign.*, etc.).
@@ -8585,8 +8583,8 @@ isBuiltinBackedModule n =
     -- GHC.Types: wired-in kinds, Constraint, RuntimeRep, Int#, etc.
     -- The compiler synthesises this module; base-4.19 has no GHC/Types.hs.
     || n == "GHC.Types"
-    -- GHC.CString: unpackCString# and friends — wired-in string literals.
-    || n == "GHC.CString"
+    -- GHC.CString has real ghc-prim source and is interpreted. Its
+    -- unpacking loops bottom out on indexCharOffAddr# and strlen.
     -- GHC.Classes is NOT here despite being wired-in in GHC: the source
     -- (ghc-prim-0.12.0/GHC/Classes.hs) is on disk and now interpretable
     -- given the Scan.hs paren-pat-infix and TkPrimId-LHS fixes. We

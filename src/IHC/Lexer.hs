@@ -634,9 +634,17 @@ nextToken s c0 =
                 Just b    -> decodeUtf8At s p0 b
                 Nothing   -> ('?', p0)
         in
-        -- skip closing '\''
+        -- Skip closing '\'' and an optional immediate trailing '#'.
+        -- Char# literals such as '\0'# are represented as TkChar too:
+        -- at the Val level boxed Char and unboxed Char# both use VChar,
+        -- and consuming the hash here keeps it from being parsed as a
+        -- stray operator after source-loaded GHC.CString primop tests.
         let endP' = case peekByte s endP of
-                Just 0x27 -> endP + 1
+                Just 0x27 ->
+                    let afterQuote = endP + 1
+                    in case peekByte s afterQuote of
+                        Just 0x23 -> afterQuote + 1
+                        _         -> afterQuote
                 _         -> endP
             end = Cursor endP' (cLine openCur)
                          (cCol openCur + (endP' - cPos openCur))
