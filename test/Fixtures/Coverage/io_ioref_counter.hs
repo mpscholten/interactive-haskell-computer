@@ -1,3 +1,5 @@
+import Data.IORef
+
 countUp r 0 = pure ()
 countUp r n = do
     v <- readIORef r

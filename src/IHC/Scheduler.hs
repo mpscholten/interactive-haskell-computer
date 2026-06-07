@@ -5042,9 +5042,7 @@ ffiBuiltinNames = Set.fromList
     , "peekCString", "peekCAString", "newCString", "newCAString"
     , "withForeignPtr", "unsafeWithForeignPtr", "newForeignPtr", "addForeignPtrFinalizer"
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
-    , "newIORef", "readIORef", "writeIORef", "modifyIORef", "modifyIORef'"
-    , "atomicModifyIORef'"
-    , "mkWeak#", "mkWeakNoFinalizer#"
+    , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
     , "sizeOf", "alignment"
     , "peek", "poke", "peekByteOff", "pokeByteOff", "peekElemOff", "pokeElemOff"
@@ -5063,7 +5061,8 @@ ffiBuiltinNames = Set.fromList
     -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
     -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
     -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
-    , "mkWeakIORef"  -- wraps mkWeak#, which has no Haskell implementation
+    -- mkWeakIORef is source-loaded from GHC.Internal.Data.IORef; only
+    -- the mkWeak# primitive underneath is host-backed.
     , "stdout", "stdin", "stderr"  -- RTS pre-built handles
     -- System.Posix.IO.setFdOption source-loads from unix; only the fcntl
     -- foreign imports underneath are OS boundaries.
