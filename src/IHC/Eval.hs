@@ -1500,6 +1500,12 @@ matchPat hooks (PCon "IORef" [PCon "STRef" [p]]) prim@(VPrimObj (PrimIORef _)) =
 matchPat hooks (PCon "STRef" [p]) prim@(VPrimObj (PrimIORef _)) = do
     t <- newWHNFThunk prim
     matchFields hooks [(p, t)] []
+-- MVar source wrappers around the same host-backed synchronisation object.
+-- Source-loaded handle/event code can pass a raw PrimMVar into
+-- GHC.Internal.MVar functions, whose clauses pattern-match on MVar mvar#.
+matchPat hooks (PCon "MVar" [p]) prim@(VPrimObj (PrimMVar _)) = do
+    t <- newWHNFThunk prim
+    matchFields hooks [(p, t)] []
 matchPat hooks (PCon "TVar" [p]) prim@(VPrimObj (PrimTVar _)) = do
     t <- newWHNFThunk prim
     matchFields hooks [(p, t)] []
