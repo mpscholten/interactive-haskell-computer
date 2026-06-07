@@ -115,7 +115,7 @@ mkForeignPtrVal fp = do
 foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
 foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
 
--- | Every interpreter-spawned thread ('forkIOB' / 'fork#').  An
+-- | Every interpreter-spawned thread (source-loaded 'forkIO' via 'fork#').  An
 -- interpreted program's @main@ can fork background threads (warp's
 -- accept loop, System.TimeManager, async workers, bare @forkIO@) that
 -- are still alive — running or blocked on an MVar\/STM\/threadDelay —
@@ -1249,14 +1249,9 @@ builtins reg =
     --   Double#/Float# power primops (@**##@ / @powerFloat#@) are
     --   GHC.Prim intrinsics — registered as carve-outs below near the
     --   Double# arithmetic primops (full chain documented there).
-    -- Phase 2.10a: concurrency primitives.  forkIO is backed by GHC's
-    -- RTS thread primitive (`fork#` in GHC.Internal.Conc.Sync), so the
-    -- module-qualified names forward to the same host operation as the bare
-    -- builtin instead of interpreting the low-level RTS wrapper source.
-    , ("forkIO",          forkIOB)
-    , ("Control.Concurrent.forkIO", forkIOB)
-    , ("GHC.Conc.Sync.forkIO", forkIOB)
-    , ("GHC.Internal.Conc.Sync.forkIO", forkIOB)
+    -- Phase 2.10a: concurrency primitives.  forkIO / forkIOWithUnmask
+    -- are deliberately omitted: GHC.Internal.Conc.Sync has real source and
+    -- lowers them to unIO plus the fork# primop below.
     -- Compiler-intrinsic 'fork#' primop. ghc-prim has no .hs source;
     -- forkIO and warp's defaultFork bottom out into this.
     , ("fork#",           forkHashB)
@@ -6327,16 +6322,6 @@ buildFieldEnv reg = do
 --------------------------------------------------------------------------------
 -- Phase 2.10a: concurrency - thread primitives
 --------------------------------------------------------------------------------
-
--- | @forkIO action@ - fork a new thread running the IO action.
-forkIOB :: IO Val
-forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tid <- forkIO $ do
-        _ <- runIOVal legacyHooks av
-        pure ()
-    registerSpawnedThread tid
-    pure (VPrimObj (PrimThreadId tid))
 
 -- | @fork# :: IO () -> State# RealWorld -> (# State# RealWorld, ThreadId# #)@
 -- — GHC primop used by source-loaded @forkIO@ and warp's @defaultFork@
