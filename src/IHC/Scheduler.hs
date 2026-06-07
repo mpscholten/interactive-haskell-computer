@@ -5613,9 +5613,15 @@ buildAliases
 buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     -- Index qualPairs so we can look up "Module.name" -> Thunk fast.
     let thunkByKey = Map.fromList (zip (map fst qualPairs) slots)
+    entryBodies <- readIORef (lmBodies entry)
+    let entryNeeded = Set.fromList
+            [ fv
+            | expr <- Map.elems entryBodies
+            , fv <- freeVars expr
+            ]
     -- Build aliases for the entry module's imports.
     let entryImports = mhImports (lmHeader entry)
-    entryPairs <- concat <$> mapM (aliasesForImport thunkByKey) entryImports
+    entryPairs <- concat <$> mapM (aliasesForImport entryNeeded True thunkByKey) entryImports
     -- Also build aliases for materialized non-entry modules' qualified imports.
     -- Without this, qualified references like `List.length` inside
     -- Data.ByteString.Internal.Type (which does `import qualified Data.List as List`)
@@ -5642,7 +5648,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     internalPairs <- concat <$> mapM (internalAliases thunkByKey) allModules
     pure (HashMap.fromList (internalPairs ++ entryPairs))
   where
-    aliasesForImport thunkByKey imp = do
+    aliasesForImport needed allowLazyImportAll thunkByKey imp = do
             -- We need to know which names the target module actually
             -- exports. We only have the loaded registry, so look it up.
             reg <- readIORef registry
@@ -5680,7 +5686,13 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                             | BC.null qualPrefix = []
                             | otherwise =
                                 [ (qualPrefix <> n, t) | (n, t) <- allPairs ]
-                    pure (lazyPairs ++ bareAliases ++ qualAliases)
+                        concreteAliases = bareAliases ++ qualAliases ++ lazyPairs
+                        concreteNames = Set.fromList (map fst concreteAliases)
+                    lazyNeededPairs <-
+                        if allowLazyImportAll
+                            then lazyAliasesForLoadedBroadImport needed concreteNames tm imp
+                            else pure []
+                    pure (lazyPairs ++ lazyNeededPairs ++ bareAliases ++ qualAliases)
                 _ -> lazyAliasesForImport imp
 
     lazyAliasesForLoadedImport tm imp =
@@ -5761,6 +5773,70 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                      <> BC.unpack targetKey)
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
 
+    lazyAliasesForLoadedBroadImport needed concreteNames tm imp =
+        case impSpec imp of
+            ImportOnly _ -> pure []
+            _ | impModule imp == BC.pack "Prelude" -> pure []
+              | otherwise -> do
+                    let candidates =
+                            [ bare
+                            | key <- Set.toList needed
+                            , Just bare <- [neededBareName key]
+                            , alias <- importedAliasesForName imp bare
+                            , not (Set.member alias concreteNames)
+                            ]
+                    concat <$> mapM lazyVisible candidates
+      where
+        neededBareName key
+            | not (impQualified imp)
+            , not (BC.elem '.' key)
+            , specAllows (impSpec imp) key
+            = Just key
+            | otherwise =
+                case (importQualPrefix imp, splitQualified key) of
+                    (Just p, Just (qual, bare))
+                        | p == qual <> BC.pack "."
+                        , specAllows (impSpec imp) bare
+                        -> Just bare
+                    _ -> Nothing
+
+        importQualPrefix imp' =
+            case impAlias imp' of
+                Just a  -> Just (a <> BC.pack ".")
+                Nothing
+                    | impQualified imp' -> Just (lmName tm <> BC.pack ".")
+                    | otherwise         -> Nothing
+
+        lazyVisible n = do
+            local <- localExported n
+            provider <- if local
+                then pure (Just (lmName tm))
+                else resolveImport registry _searchPath _includeMap tm n
+                        `catch` (\(_ :: SomeException) -> pure Nothing)
+            case provider of
+                Nothing -> pure []
+                Just targetModule -> do
+                    slot <- newLazyBuiltinThunk $ do
+                        mSlot <- resolveFallback Nothing
+                            (targetModule <> BC.pack "." <> n)
+                        case mSlot of
+                            Just targetSlot -> force legacyHooks targetSlot
+                            Nothing -> error
+                                ("import alias: unresolved target "
+                                 <> BC.unpack targetModule <> "."
+                                 <> BC.unpack n)
+                    pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
+
+        localExported n = do
+            bodies <- readIORef (lmBodies tm)
+            hasLhs <- isJust <$> findOrResolveLhs (lmSource tm) (lmKnown tm) n
+            let hasLocal =
+                    Map.member n bodies
+                    || hasLhs
+                    || Map.member n (lmFieldReg tm)
+                    || Map.member n (lmDataReg tm)
+            pure (hasLocal && exportsNameDirect tm n)
+
     knownDirectImportOwner n
         -- Warp's public/Internal modules export these record selectors
         -- through Settings(..), but the selector metadata lives in the
@@ -5821,7 +5897,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
                 -- ByteString binding.
                 , impModule imp /= BC.pack "Prelude"
                 ]
-        concat <$> mapM (aliasesForImport thunkByKey) imports
+        concat <$> mapM (aliasesForImport needed False thunkByKey) imports
 
     -- | Return @(bare-name, Thunk)@ pairs for names exported by a loaded
     -- module — including names re-exported via ExportName from its imports.
@@ -8525,6 +8601,8 @@ isAllowedTargetedGhc n =
     || n == BC.pack "GHC.Magic"
     || n == BC.pack "GHC.Magic.Dict"
     || n == BC.pack "GHC.MVar"
+    || n == BC.pack "GHC.Conc"
+    || n == BC.pack "GHC.Conc.Sync"
     || n == BC.pack "GHC.Exception"
     || n == BC.pack "GHC.Ix"
 

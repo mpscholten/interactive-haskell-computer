@@ -32,7 +32,7 @@ import Control.Concurrent.MVar
     , tryTakeMVar, tryPutMVar, isEmptyMVar
     )
 import Control.Concurrent.STM
-    ( TVar, atomically, retry, check
+    ( TVar, atomically
     , newTVarIO, readTVar, writeTVar, readTVarIO
     )
 import qualified Control.Exception as CE
@@ -1356,18 +1356,9 @@ builtins reg =
     -- MVar wrappers are deliberately omitted. Control.Concurrent.MVar,
     -- GHC.MVar, GHC.Internal.MVar, and GHC.Internal.Control.Concurrent.MVar
     -- have real source; they lower to the MVar# primops below.
-    -- Phase 2.10a: STM
-    , ("atomically",      atomicallyB)
-    , ("retry",           retryB)
-    , ("orElse",          orElseB)
-    , ("check",           checkB)
-    , ("newTVar",         newTVarB)
-    , ("newTVarIO",       newTVarIOB)
-    , ("readTVar",        readTVarB)
-    , ("writeTVar",       writeTVarB)
-    , ("modifyTVar'",     modifyTVar'B)
-    , ("modifyTVar",      modifyTVar'B)
-    , ("readTVarIO",      readTVarIOB)
+    -- STM/TVar wrappers are deliberately omitted. GHC.Internal.Conc.Sync
+    -- and the public Control.Concurrent.STM re-exports have real source;
+    -- they lower to the STM/TVar# primops below.
     -- Phase 2.10a: exceptions
     , ("throwIO",         throwIOB)
     , ("throw",           throwIOB)
@@ -6617,74 +6608,6 @@ getNumCapabilitiesB :: IO Val
 getNumCapabilitiesB = pure $ VIO $ pure (VInt 1)
 
 --------------------------------------------------------------------------------
--- Phase 2.10a: STM primitives
---------------------------------------------------------------------------------
-
-atomicallyB :: IO Val
-atomicallyB = pure $ VFun $ \stmT -> pure $ VIO $ do
-    stmV <- force legacyHooks stmT
-    runIOVal legacyHooks stmV
-
-retryB :: IO Val
-retryB = pure $ VIO $ atomically retry
-
-orElseB :: IO Val
-orElseB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    bv <- force legacyHooks bT
-    -- Approximate: try av first, fall back to bv on exception
-    CE.catch (runIOVal legacyHooks av) (\(_ :: CE.SomeException) -> runIOVal legacyHooks bv)
-
-checkB :: IO Val
-checkB = pure $ VFun $ \bT -> pure $ VIO $ do
-    bv <- force legacyHooks bT
-    atomically (check (isTruthy bv))
-    pure VUnit
-
-newTVarB :: IO Val
-newTVarB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tv <- newTVarIO av
-    pure (VPrimObj (PrimTVar tv))
-
-newTVarIOB :: IO Val
-newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tv <- newTVarIO av
-    pure (VPrimObj (PrimTVar tv))
-
-readTVarB :: IO Val
-readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    tv  <- requireTVarPrim "readTVar" tvv
-    atomically (readTVar tv)
-
-writeTVarB :: IO Val
-writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    av  <- force legacyHooks aT
-    tv  <- requireTVarPrim "writeTVar" tvv
-    atomically (writeTVar tv av)
-    pure VUnit
-
-modifyTVar'B :: IO Val
-modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    fv  <- force legacyHooks fT
-    tv  <- requireTVarPrim "modifyTVar'" tvv
-    cur  <- atomically (readTVar tv)
-    curT <- newWHNFThunk cur
-    new  <- apply legacyHooks fv curT
-    atomically (writeTVar tv new)
-    pure VUnit
-
-readTVarIOB :: IO Val
-readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    tv  <- requireTVarPrim "readTVarIO" tvv
-    readTVarIO tv
-
---------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
 --
 -- GHC.Prim STM primops, compiler-intrinsic — no Haskell source. The
@@ -6734,11 +6657,11 @@ atomicallyHashB = pure $ VFun $ \stmT -> pure $ VFun $ \sT -> do
 -- | @retry# :: State# RealWorld -> (# State# RealWorld, a #)@.
 --
 -- In a concurrent runtime this blocks until a watched TVar changes.
--- Since we're single-threaded, a retry can never succeed — treat it
--- as an exception (the host 'atomically' call would do the same on
--- the underlying 'BlockedIndefinitelyOnSTM').
+-- Since we're single-threaded, represent retry as a catchable
+-- exception instead of delegating to host @atomically retry@, which can
+-- block forever. Source-loaded @orElse@ catches this via @catchRetry#@.
 retryHashB :: IO Val
-retryHashB = pure $ VFun $ \_sT -> atomically retry
+retryHashB = pure $ VFun $ \_sT -> CE.throwIO (userError "STM retry")
 
 -- | @catchRetry# :: (State# RealWorld -> (# State# RealWorld, a #))
 --                -> (State# RealWorld -> (# State# RealWorld, a #))
