@@ -538,44 +538,9 @@ builtins reg =
     --   first  f (a, b) = (f a, b) -- Arrow (->) instance method
     --   second g (a, b) = (a, g b) -- ditto
     --   runIdentity (Identity x) = x  -- newtype field accessor
-    -- IORef
-    , ("newIORef",    newIORefB)
-    , ("GHC.IORef.newIORef", newIORefB)
-    , ("GHC.Internal.IORef.newIORef", newIORefB)
-    , ("GHC.Internal.Data.IORef.newIORef", newIORefB)
-    , ("Data.IORef.newIORef", newIORefB)
-    , ("readIORef",   readIORefB)
-    , ("GHC.IORef.readIORef", readIORefB)
-    , ("GHC.Internal.IORef.readIORef", readIORefB)
-    , ("GHC.Internal.Data.IORef.readIORef", readIORefB)
-    , ("Data.IORef.readIORef", readIORefB)
-    , ("writeIORef",  writeIORefB)
-    , ("GHC.IORef.writeIORef", writeIORefB)
-    , ("GHC.Internal.IORef.writeIORef", writeIORefB)
-    , ("GHC.Internal.Data.IORef.writeIORef", writeIORefB)
-    , ("Data.IORef.writeIORef", writeIORefB)
-    , ("modifyIORef", modifyIORefB)
-    , ("GHC.IORef.modifyIORef", modifyIORefB)
-    , ("GHC.Internal.IORef.modifyIORef", modifyIORefB)
-    , ("GHC.Internal.Data.IORef.modifyIORef", modifyIORefB)
-    , ("Data.IORef.modifyIORef", modifyIORefB)
-    , ("modifyIORef'",modifyIORefB)             -- same, no laziness diff here
-    , ("GHC.IORef.modifyIORef'", modifyIORefB)
-    , ("GHC.Internal.IORef.modifyIORef'", modifyIORefB)
-    , ("GHC.Internal.Data.IORef.modifyIORef'", modifyIORefB)
-    , ("Data.IORef.modifyIORef'", modifyIORefB)
-    , ("atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.Internal.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.Internal.Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    -- mkWeakIORef is source-defined only as a thin wrapper over mkWeak#,
-    -- so the observable operation is RTS-exclusive.  We keep the Weak inert:
-    -- network's mkSocket discards it after registering the close finalizer.
-    , ("mkWeakIORef", mkWeakIORefB)
-    , ("GHC.IORef.mkWeakIORef", mkWeakIORefB)
-    , ("GHC.Internal.Data.IORef.mkWeakIORef", mkWeakIORefB)
-    , ("Data.IORef.mkWeakIORef", mkWeakIORefB)
+    -- IORef wrappers are deliberately omitted.  Data.IORef,
+    -- GHC.IORef, GHC.Internal.IORef, and GHC.Internal.Data.IORef all
+    -- have real source; they lower to the MutVar# and Weak# primops below.
     -- File IO
     , ("openFile",    openFileB)
     , ("hClose",      hCloseB)
@@ -1692,6 +1657,9 @@ builtins reg =
     , ("atomicModifyMutVar_#",  atomicModifyMutVarUB)
     , ("atomicSwapMutVar#",     atomicSwapMutVarB)
     , ("casMutVar#",            casMutVarB)
+    -- GHC.Prim.reallyUnsafePtrEquality#: raw pointer-equality primop.
+    -- Source GHC.Prim.PtrEq defines sameMutVar# and friends in terms of it.
+    , ("reallyUnsafePtrEquality#", reallyUnsafePtrEqualityHashB)
     -- Weak# primops.  Weak pointers are RTS objects; source modules only
     -- wrap these operations in ordinary newtypes.
     , ("mkWeak#",               mkWeakHashB)
@@ -1779,13 +1747,6 @@ makeWord8CmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VInt x, VInt y) ->
             pure (primBoolVal (op (fromIntegral x) (fromIntegral y)))
         _ -> error (name <> ": bad args")
-
--- | Extract a host IORef from a 'VPrimObj' or fail with a
--- context-tagged error. Used by readIORef / writeIORef /
--- modifyIORef / atomicModifyIORef'.
-extractIORef :: String -> Val -> IO (IORef Thunk)
-extractIORef _   (VPrimObj (PrimIORef rf)) = pure rf
-extractIORef ctx v = error (ctx <> ": not an IORef: " <> showValForDebug v)
 
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
@@ -2777,68 +2738,6 @@ _fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
 -- be a separate copy here).  We import it from there.
 
 --------------------------------------------------------------------------------
--- IORef primops. Each returns 'VIO' — construction, read, and write
--- are all IO actions.
---------------------------------------------------------------------------------
-
-newIORefB :: IO Val
-newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    -- Store the THUNK directly so error-throwing initialisers
-    -- (e.g. warp's @newIORef $ error "keepAliveRef not filled"@) are
-    -- only evaluated on read.
-    rf <- newIORef a
-    pure (VPrimObj (PrimIORef rf))
-
-readIORefB :: IO Val
-readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "readIORef"
-    readIORef rf >>= force legacyHooks
-
-writeIORefB :: IO Val
-writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "writeIORef"
-    -- Install the thunk directly; readers force on demand.
-    writeIORef rf b
-    pure VUnit
-
--- | @modifyIORef ref f@. We force f then apply it to a thunk holding
--- the current ref contents. Works for both the lazy and strict forms
--- (Phase 2.4 does not differentiate beyond that).
-modifyIORefB :: IO Val
-modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "modifyIORef"
-    fv <- force legacyHooks f
-    curT <- readIORef rf
-    new <- apply legacyHooks fv curT
-    newT <- newWHNFThunk new
-    writeIORef rf newT
-    pure VUnit
-
--- | @atomicModifyIORef' ref f@ for ihc's host-backed IORef.  This mirrors
--- the existing IORef builtins and is atomic enough for ihc's single-threaded
--- evaluator: read the current value, apply @f@ to get @(new, result)@, store
--- @new@, and return @result@.
-atomicModifyIORefB :: IO Val
-atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "atomicModifyIORef'"
-    fv <- force legacyHooks f
-    curT <- readIORef rf
-    pair <- apply legacyHooks fv curT >>= runIOVal legacyHooks
-    case pair of
-        VCon _ [newT, resultT] -> do
-            result <- force legacyHooks resultT
-            writeIORef rf newT
-            pure result
-        _ -> error ("atomicModifyIORef': function did not return a pair: "
-                    <> showValForDebug pair)
-
-mkWeakIORefB :: IO Val
-mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $ do
-    refV <- force legacyHooks refT
-    weakPayload <- newWHNFThunk refV
-    pure (VCon "Weak" [weakPayload])
-
---------------------------------------------------------------------------------
 -- MutVar# primops (Phase 3.6).
 --
 -- GHC.Prim has no .hs source; MutVar# is wired-in by the GHC build system.
@@ -2975,6 +2874,52 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
             zT   <- newWHNFThunk (VInt 0)
             pure (VCon "(#,,#)" [stT, zT, newThunk])
         _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
+
+-- | @reallyUnsafePtrEquality# :: a -> b -> Int#@.
+-- GHC.Prim.PtrEq has source for its typed wrappers; this is the raw
+-- compiler primop they bottom out on.  Do not force arbitrary lifted
+-- values: callers commonly use this only as an optimisation guard.
+reallyUnsafePtrEqualityHashB :: IO Val
+reallyUnsafePtrEqualityHashB = pure $ VFun $ \lhsT -> pure $ VFun $ \rhsT -> do
+    same <- sameThunkObject lhsT rhsT
+    pure (primBoolVal same)
+  where
+    sameThunkObject lhsT rhsT
+        | lhsT == rhsT = pure True
+        | otherwise = do
+            lhs <- peekRuntimeObject 8 lhsT
+            rhs <- peekRuntimeObject 8 rhsT
+            case (lhs, rhs) of
+                (Just lhsV, Just rhsV) -> pure (sameRuntimeObject lhsV rhsV)
+                _ -> pure False
+
+    peekRuntimeObject :: Int -> Thunk -> IO (Maybe Val)
+    peekRuntimeObject 0 _ = pure Nothing
+    peekRuntimeObject depth t = do
+        state <- readIORef t
+        case state of
+            Evaluated v -> pure (Just v)
+            Unevaluated (Closure env _ expr)
+                | Just t' <- chaseExpr env expr
+                , t' /= t -> peekRuntimeObject (depth - 1) t'
+            _ -> pure Nothing
+
+    chaseExpr env (EVar name) = lookupEnv name env
+    chaseExpr env (ETyApp expr _) = chaseExpr env expr
+    chaseExpr _ _ = Nothing
+
+    sameRuntimeObject (VPrimObj (PrimIORef l)) (VPrimObj (PrimIORef r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimByteArray l)) (VPrimObj (PrimByteArray r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimArray l)) (VPrimObj (PrimArray r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimBoxedArray _ l)) (VPrimObj (PrimBoxedArray _ r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimMVar l)) (VPrimObj (PrimMVar r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimTVar l)) (VPrimObj (PrimTVar r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimThreadId l)) (VPrimObj (PrimThreadId r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimPtr l)) (VPrimObj (PrimPtr r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimForeignPtr l)) (VPrimObj (PrimForeignPtr r)) =
+        unsafeForeignPtrToPtr l == unsafeForeignPtrToPtr r
+    sameRuntimeObject (VPrimObj PrimRealWorld) (VPrimObj PrimRealWorld) = True
+    sameRuntimeObject _ _ = False
 
 mkWeakHashB :: IO Val
 mkWeakHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_finalizerT -> pure $ VFun $ \_stT -> do
