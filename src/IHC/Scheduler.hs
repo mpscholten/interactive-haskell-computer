@@ -5027,7 +5027,7 @@ ffiBuiltinNames = Set.fromList
     , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
     , "sizeOf", "alignment"
-    , "peek", "poke", "peekByteOff", "pokeByteOff", "peekElemOff", "pokeElemOff"
+    , "peek", "poke", "peekByteOff", "pokeByteOff"
     , "socket"
     , "setSocketOption"
     , "listen"
