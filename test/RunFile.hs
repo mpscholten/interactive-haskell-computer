@@ -1249,6 +1249,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "42\n"
 
+    it "Applicative <*> Maybe: Just function applies through source-loaded method" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_ap_maybe.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Just 42\n"
+
+    it "Applicative <*> Maybe: Nothing uses the Maybe instance, not a host retry" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_ap_maybe_nothing.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Nothing\n"
+
+    it "Applicative <*> IO: source-loaded IO instance sequences effects" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_ap_io.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "ap-io-effect\n7\n"
+
     it "runST STRef counter: source-loaded ST actions sequence correctly" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/sem_runst_basic.hs")
         n   `shouldBe` 0

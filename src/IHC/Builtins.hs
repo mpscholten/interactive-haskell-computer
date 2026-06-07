@@ -524,12 +524,10 @@ builtins reg =
     -- with real source in @GHC.Internal.Base@.  Bare references route
     -- through the seeded class-method dispatcher and its
     -- result-polymorphic fallback.
-    -- fmap: source-loaded from `instance Functor IO` in GHC.Internal.Base.
-    -- No host-backed dispatcher — per CLAUDE.md "No host-backed class
-    -- method dispatchers".  Resolved via classMethodDispatcher.
-    , ("<*>",      apDispatch reg)
-    , ("GHC.Internal.Base.<*>", apDispatch reg)
-    , ("Prelude.<*>", apDispatch reg)
+    -- fmap / <*>: source-loaded from the corresponding Functor /
+    -- Applicative instances in GHC.Internal.Base.  No host-backed
+    -- dispatchers -- per CLAUDE.md "No host-backed class method
+    -- dispatchers".  Resolved via classMethodDispatcher.
     -- 'Semigroup.(<>)' — argument-directed dispatch keyed on the LHS
     -- tag.  Source-loaded code (warp's HTTP response builders, blaze's
     -- html builder, etc.) and user code (e.g. instance defining
@@ -2924,9 +2922,9 @@ stResultComponents _                               = Nothing
 -- uses keep working, and a @fmap@ on a container type that truly has
 -- no registered instance still produces a runtime error from the IO
 -- path rather than silently misbehaving.
--- Legacy host-backed fmap dispatcher — awaiting full removal.
--- Kept as dead code to preserve the pattern for reference during
--- migration of other dispatchers (bindDispatch, apDispatch, etc.).
+-- Legacy host-backed fmap dispatcher -- kept out of the registry as a
+-- reference while completing the remaining class-method dispatcher
+-- removals.
 _fmapDispatch :: ClassRegistry -> IO Val
 _fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     mv <- force legacyHooks mt
@@ -2996,40 +2994,6 @@ sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
     consAppend other _ =
         error ("<>: unexpected list shape: " <> showValForDebug other)
 
-
--- | Dispatching @<*>@. Forces the first argument and looks up an
--- @(Applicative, typeTagOf fv)@ entry in the 'ClassRegistry'. If the
--- first argument's tag has no Applicative instance (e.g. @Nothing@'s
--- "Nothing" tag may not be registered while only "Just" is), we also try
--- the second argument's tag — for the same Applicative both sides share
--- the type but distinct constructors. Falls back to a VIO-only inline
--- implementation so existing IO uses keep working.
-apDispatch :: ClassRegistry -> IO Val
-apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
-    fv <- force legacyHooks ft
-    let tryTag tag = lookupInstanceMethod reg (BC.pack "Applicative") tag (BC.pack "<*>")
-                       >>= forceInstanceMethod
-    mApMethod <- tryTag (typeTagOf fv)
-    mApMethod2 <- case mApMethod of
-        Just _  -> pure mApMethod
-        Nothing -> do
-            mv <- force legacyHooks mt
-            tryTag (typeTagOf mv)
-    case mApMethod2 of
-        Just apMethod -> do
-            fT <- newWHNFThunk fv
-            r1 <- apply legacyHooks apMethod fT
-            apply legacyHooks r1 mt
-        Nothing -> case fv of
-            VIO _ -> pure $ VIO $ do
-                f1 <- runIOVal legacyHooks fv
-                mv <- force legacyHooks mt
-                v  <- runIOVal legacyHooks mv
-                vT <- newWHNFThunk v
-                apply legacyHooks f1 vT
-            _ -> error
-                ( "<*>: no Applicative instance registered for type `"
-                  <> BC.unpack (typeTagOf fv) <> "`" )
 
 -- | @join mm = do { m <- mm; m }@.
 -- 'joinB' was removed in slice 5b — 'join' is now interpreted from

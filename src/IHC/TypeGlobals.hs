@@ -290,9 +290,11 @@ seedBuiltinClassMethodSigs = do
             , ("setBit",     "Bits")
             -- Foldable
             , ("length",     "Foldable")
-            -- Applicative / Monad seeds (already in env via builtins, but
-            -- registering the class lets future env-fallbacks dispatch).
+            -- Applicative / Monad seeds. These are class methods with
+            -- source bodies, so bare references must synthesize
+            -- classMethodDispatcher instead of using host shims.
             , ("pure",       "Applicative")
+            , ("<*>",        "Applicative")
             , ("return",     "Monad")
             -- Monoid / Semigroup
             , ("mempty",     "Monoid")
