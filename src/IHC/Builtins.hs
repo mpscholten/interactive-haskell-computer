@@ -743,6 +743,7 @@ builtins reg =
     , ("plusAddr#",   plusAddrB)
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
+    , ("indexCharOffAddr#", indexCharOffAddrHashB)
     -- Addr# comparison primops — RTS-exclusive (Addr# is unboxed; no
     -- source 'Eq Addr#' instance).  Used by the derived
     -- @instance Eq (Ptr a)@ from @data Ptr a = Ptr Addr#@'s synthesis
@@ -1034,10 +1035,11 @@ builtins reg =
     , ("double2Int#",         double2IntHashB)
     , ("double2Float#",       double2FloatHashB)
     , ("float2Double#",       float2DoubleHashB)
+    -- GHC.CString now source-loads from ghc-prim. Its Haskell bodies
+    -- bottom out on the Addr#/Char# primops above plus the scanned
+    -- foreign import ccall "strlen" leaf, so the high-level
+    -- cstringLength#/unpackCString# shims do not belong here.
     -- Phase 2.8: misc
-    , ("cstringLength#",  cstringLengthB)
-    , ("unpackCString#",  unpackCStringB)
-    , ("unpackCStringUtf8#", unpackCStringB)
     -- Foreign.C.String shortcuts — source bodies reach for RTS locale
     -- state via getForeignEncoding; we bypass that and go straight to
     -- ASCII-byte marshalling (matches GHC's default for libc FFI).
@@ -3872,6 +3874,22 @@ addr2IntB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
 
+-- | @indexCharOffAddr# :: Addr# -> Int# -> Char#@.
+-- Genuine GHC.Prim leaf used by the source-loaded GHC.CString
+-- unpacking loops. It reads one byte from the raw address and returns
+-- the byte-valued Char# that GHC.CString then decodes as ASCII/UTF-8.
+indexCharOffAddrHashB :: IO Val
+indexCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    p <- valToHostPtr addrV
+    case idxV of
+        VInt i -> do
+            b <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
+            pure (VChar (chr (fromIntegral b)))
+        _ -> error ("indexCharOffAddr#: offset not an Int: "
+                    <> showValForDebug idxV)
+
 -- | @setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld@
 -- Memset primop used by source-loaded @fillBytes@.  The state value
 -- IS the side-effect carrier in our interpreter: the runIOVal IO
@@ -5765,32 +5783,6 @@ mulIntMayOfloB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     case (av, bv) of
         (VInt _, VInt _) -> pure (VInt 0)
         _ -> error "mulIntMayOflo#: bad args"
-
---------------------------------------------------------------------------------
--- Phase 2.8: misc primops
---------------------------------------------------------------------------------
-
-cstringLengthB :: IO Val
-cstringLengthB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            let go i = do
-                  w <- peek (plusPtr p i :: Ptr Word8)
-                  if w == 0 then pure (VInt (fromIntegral i)) else go (i + 1)
-            go (0 :: Int)
-        VStr s -> pure (VInt (fromIntegral (BC.length s)))
-        _ -> error ("cstringLength#: bad arg: " <> showValForDebug av)
-
-unpackCStringB :: IO Val
-unpackCStringB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            s <- peekCAString (castPtr p)
-            stringToListValIO s
-        VStr s -> stringToListValIO (BC.unpack s)
-        _ -> error ("unpackCString#: bad arg: " <> showValForDebug av)
 
 -- Foreign.C.String helpers.  The real @Foreign.C.String.withCString@ in
 -- base reaches for @getForeignEncoding@, which sits on RTS locale

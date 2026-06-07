@@ -206,16 +206,18 @@ eval hooks env ipm = go
     -- VStr representation.
     go (ELit (LStr s))   = stringLiteralToListVal s
     -- @\"...\"#@ Addr# literal: allocate a leaked malloc-backed
-    -- buffer of the bytes and return as 'VPrimObj (PrimPtr p)'.
+    -- NUL-terminated buffer of the bytes and return it as
+    -- 'VPrimObj (PrimPtr p)'.
     -- The literal lives for the program's lifetime — typical use
     -- is in a top-level @bytes = unsafePackLenLiteral N "..."#@
     -- whose result thunk caches the BS — so the leak is bounded
     -- by the number of distinct literals, not by call count.
     go (ELit (LAddrStr s)) = do
         let len = BS.length s
-        ptr <- mallocBytes len
+        ptr <- mallocBytes (len + 1)
         BS.useAsCStringLen s $ \(srcPtr, _) ->
             copyBytes (castPtr ptr) (castPtr srcPtr) len
+        FStorable.pokeByteOff (castPtr ptr :: Ptr Word8) len (0 :: Word8)
         pure (VPrimObj (PrimPtr (castPtr ptr)))
     go (ELit (LChar c))  = pure (VChar c)
     go (ELabel name)     = pure (VLabel name)  -- Phase 3.5: OverloadedLabels
