@@ -681,7 +681,6 @@ builtins reg =
     --   bigNatToWordMaybe# :: BigNat# -> (# (# #) | Word# #)
     --   bigNatToAddr* / bigNatFromAddr* / bigNatTo|FromByteArray* /
     --     bigNatFromWordArray*                         (IO + Addr#)
-    , ("bigNatToInt#",             bigNatToIntHashB)          -- BigNat# -> Int#
     , ("bigNatFromAbsInt#",        bigNatFromAbsIntHashB)     -- Int# -> BigNat#
     , ("bigNatFromWord64#",        bigNatFromWordB)           -- alias on 64-bit
     , ("bigNatEncodeDouble#",      bigNatEncodeDoubleHashB)   -- m * 2^e
@@ -822,6 +821,10 @@ builtins reg =
     -- representation; IHC also supports PrimBigNat here while that
     -- representation is Natural-backed.
     , ("indexWordArray#",           indexWordArrayHashB)
+    -- GHC.Prim primop, no .hs source.  ghc-bignum's BigNat# -> Int#
+    -- path indexes the low limb through this leaf; the host runtime
+    -- uses the same Natural-backed limb access here.
+    , ("indexIntArray#",            indexIntArrayHashB)
     , ("unsafeFreezeByteArray#",    unsafeFreezeByteArrayB)
     , ("byteArrayContents#",        byteArrayContentsB)
     , ("mutableByteArrayContents#", mutableByteArrayContentsB)
@@ -3257,15 +3260,6 @@ bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error
             ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
 
--- | Phase 2.D: @bigNatToInt# :: BigNat# -> Int#@ — like
--- 'bigNatToWord#' but reinterprets the low 64 bits as signed Int#.
--- Equivalent to @word2Int# (bigNatToWord# n)@ in ghc-bignum.
-bigNatToIntHashB :: IO Val
-bigNatToIntHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatToInt#" av
-    pure (VInt (fromIntegral (fromIntegral n :: Word)))
-
 -- | Phase 2.D: @bigNatFromAbsInt# :: Int# -> BigNat#@ — absolute
 -- value of an Int# as a BigNat.  ghc-bignum uses this for the
 -- @IS k@ → BigNat# transition in 'integerNegate' etc.  For
@@ -4447,6 +4441,20 @@ indexWordArrayHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             bs <- readIORef ref
             pure (VInt (word64ToInt64 (byteStringWord64At bs idx)))
         _ -> error ("indexWordArray#: not a WordArray#: " <> showValForDebug av)
+
+indexIntArrayHashB :: IO Val
+indexIntArrayHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    idx <- case bv of
+        VInt i | i >= 0 -> pure i
+        _ -> error ("indexIntArray#: not a non-negative Int#: " <> showValForDebug bv)
+    case av of
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (word64ToInt64 (bigNatWordLimbAt n idx)))
+        VPrimObj (PrimByteArray ref) -> do
+            bs <- readIORef ref
+            pure (VInt (word64ToInt64 (byteStringWord64At bs idx)))
+        _ -> error ("indexIntArray#: not a IntArray#: " <> showValForDebug av)
 
 bigNatWordLimbAt :: Natural -> Int64 -> Word64
 bigNatWordLimbAt n idx =
