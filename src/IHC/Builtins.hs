@@ -1306,28 +1306,18 @@ builtins reg =
     -- Code that branches on this probe (e.g. auto-update's mkAutoUpdate) then
     -- takes the event-manager backend, which routes through the equally
     -- host-backed timer manager (getSystemTimerManager / registerTimeout).
-    , ("getSystemEventManager", getSystemEventManagerB)
-    , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Internal.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Internal.Event.Thread.getSystemEventManager", getSystemEventManagerB)
     -- IHC also does not run GHC's RTS timer manager.  Warp/time-manager use
     -- these operations only to register idle timeout callbacks; expose a
     -- no-op timer manager so request handling can proceed without evaluating
     -- the RTS-only TimerManager implementation.
-    , ("getSystemTimerManager", getSystemTimerManagerB)
-    , ("GHC.Event.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
-    , ("registerTimeout", registerTimeoutB)
-    , ("GHC.Event.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB)
-    , ("unregisterTimeout", unregisterTimeoutB)
-    , ("GHC.Event.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
-    , ("updateTimeout", updateTimeoutB)
-    , ("GHC.Event.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.TimerManager.updateTimeout", updateTimeoutB)
     , ("withHandle", timeManagerWithHandleB)
