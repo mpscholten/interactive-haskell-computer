@@ -808,27 +808,13 @@ builtins reg =
     , ("GHC.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.Internal.Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
-    -- Phase 2.8: Storable ops on Ptr
+    -- Phase 2.8: Storable ops on Ptr.  Qualified module entries source-load
+    -- through the Storable class; keep only bare host fallbacks for raw
+    -- pointer operations where optimistic execution lacks enough type evidence.
     , ("peek",         peekB)
-    , ("Foreign.peek", peekB)
-    , ("Foreign.Storable.peek", peekB)
-    , ("GHC.Internal.Foreign.Storable.peek", peekB)
-    , ("Network.Socket.Imports.peek", peekB)
     , ("poke",         pokeB)
-    , ("Foreign.poke", pokeB)
-    , ("Foreign.Storable.poke", pokeB)
-    , ("GHC.Internal.Foreign.Storable.poke", pokeB)
-    , ("Network.Socket.Imports.poke", pokeB)
     , ("peekByteOff",  peekByteOffB)
-    , ("Foreign.peekByteOff", peekByteOffB)
-    , ("Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("GHC.Internal.Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("Network.Socket.Imports.peekByteOff", peekByteOffB)
     , ("pokeByteOff",  pokeByteOffB)
-    , ("Foreign.pokeByteOff", pokeByteOffB)
-    , ("Foreign.Storable.pokeByteOff", pokeByteOffB)
-    , ("GHC.Internal.Foreign.Storable.pokeByteOff", pokeByteOffB)
-    , ("Network.Socket.Imports.pokeByteOff", pokeByteOffB)
     -- Phase 2.8: MutableByteArray# family
     , ("newByteArray#",             newByteArrayB)
     , ("newPinnedByteArray#",       newPinnedByteArrayB)

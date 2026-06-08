@@ -947,6 +947,8 @@ eval hooks env ipm = go
 
     peekArgs :: Expr -> Maybe (Bool, Expr, Expr)
     peekArgs expr = case stripTyApps expr of
+        EApp fn ptrE
+            | isPeekHead fn -> Just (False, ptrE, ELit (LInt 0))
         EApp (EApp fn ptrE) offE
             | isPeekByteOffHead fn -> Just (False, ptrE, offE)
             | isPeekElemOffHead fn -> Just (True, ptrE, offE)
@@ -959,6 +961,12 @@ eval hooks env ipm = go
                     , isPeekElemOffHead fn -> Just (True, ptrE, offE)
                 _ -> Nothing
         _ -> Nothing
+
+    isPeekHead :: Expr -> Bool
+    isPeekHead (EVar n) =
+        lastNameComponent n == BC.pack "peek"
+    isPeekHead (ETyApp inner _) = isPeekHead inner
+    isPeekHead _ = False
 
     isPeekByteOffHead :: Expr -> Bool
     isPeekByteOffHead (EVar n) =

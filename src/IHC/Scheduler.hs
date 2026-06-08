@@ -5318,7 +5318,8 @@ ffiBuiltinNames = Set.fromList
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
     , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
-    , "peek", "poke", "peekByteOff", "pokeByteOff"
+    -- Storable peek/poke methods source-load through the class.  The bare
+    -- host fallbacks remain in the base env for optimistic raw-pointer cases.
     , "socket"
     , "setSocketOption"
     , "listen"
