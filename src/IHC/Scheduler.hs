@@ -2118,9 +2118,9 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                 -- the method-local FV set so qualified aliases in the
                 -- method body (e.g. @length = List.length@) can be
                 -- rewritten to their real source module before eval.
-                methodFvs <- bindingLhsFreeVars lm lhs
+                methodFvs <- bindingLhsFreeVars registry searchPath includeMap lm lhs
                 rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
-                r <- try (evalMethodWithLazy classReg env lm rw (Just (cls, typ, mn)) (mn, lhs))
+                r <- try (evalMethodWithLazy registry searchPath includeMap classReg env lm rw (Just (cls, typ, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
                     Right (VLazyMethod innerT) -> force legacyHooks innerT
@@ -2288,16 +2288,18 @@ findRuntimeCtorsForType registry searchPath includeMap seen lm ty
 -- 'registerOne' itself, or via later REPL-level discovery), so the
 -- thunk's captured env resolves successfully.
 evalMethodWithLazy
-    :: ClassRegistry
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> ClassRegistry
     -> Env
     -> LoadedModule
     -> Map ByteString ByteString
     -> Maybe (ByteString, ByteString, ByteString)
     -> (ByteString, BindingLhs)
     -> IO Val
-evalMethodWithLazy classReg env lm rewrites methodCtx (methodName, lhs) = do
-    expr0 <- Parser.parseBodyExprWithFixity
-                (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+evalMethodWithLazy registry searchPath includeMap classReg env lm rewrites methodCtx (methodName, lhs) = do
+    expr0 <- parseBodyExprInScope registry searchPath includeMap lm lhs
     let expr0' = lowerInstanceCoerceMethod methodCtx
                $ lowerHashDotCoerce methodName expr0
         expr1 = desugarRecordPats (lmFieldReg lm)
@@ -2347,15 +2349,26 @@ instanceTypedNullaryEnv classReg (Just (_cls, typ, _methodName)) = do
 -- instance.  Used to seed 'buildImportRewritesForNames' with the exact
 -- set of names we need to resolve; restricting to actually-referenced
 -- names keeps the rewrite walk bounded.
-_collectInstanceMethodFVs :: LoadedModule -> [(ByteString, BindingLhs)] -> IO (Set ByteString)
-_collectInstanceMethodFVs lm methods = do
-    fvs <- mapM (bindingLhsFreeVars lm . snd) methods
+_collectInstanceMethodFVs
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> [(ByteString, BindingLhs)]
+    -> IO (Set ByteString)
+_collectInstanceMethodFVs registry searchPath includeMap lm methods = do
+    fvs <- mapM (bindingLhsFreeVars registry searchPath includeMap lm . snd) methods
     pure (Set.unions fvs)
 
-bindingLhsFreeVars :: LoadedModule -> BindingLhs -> IO (Set ByteString)
-bindingLhsFreeVars lm lhs = do
-    r <- try (Parser.parseBodyExprWithFixity
-                (lmSource lm) (lmFixity lm) (lhsClauses lhs))
+bindingLhsFreeVars
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> BindingLhs
+    -> IO (Set ByteString)
+bindingLhsFreeVars registry searchPath includeMap lm lhs = do
+    r <- try (parseBodyExprInScope registry searchPath includeMap lm lhs)
             :: IO (Either SomeException Expr)
     case r of
         Right e -> pure (Set.fromList (freeVars e))
@@ -4723,7 +4736,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                         case Map.lookup methodName defaults of
                             Just lhs -> do
                                 t <- newLazyBuiltinThunk $ do
-                                    methodFvs0 <- bindingLhsFreeVars lm lhs
+                                    methodFvs0 <- bindingLhsFreeVars registry searchPath includeMap lm lhs
                                     -- Class-local methods are already in
                                     -- envForDefaults. Do not let import
                                     -- rewrites turn e.g. Foldable's
@@ -4738,7 +4751,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
                                             | otherwise = methodFvs0
                                     -- No eager discovery: env-fallback resolves on demand.
                                     rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
-                                    evalDefaultMethodWith envForDefaults lm rw lhs
+                                    evalDefaultMethodWith registry searchPath includeMap envForDefaults lm rw lhs
                                 pure (methodName, VLazyMethod t)
                             Nothing -> pure (methodName, placeholder cls methodName))
                     methodNames
@@ -4755,10 +4768,17 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
     -- missing class default.
     placeholder cls' methodName = identifyingPlaceholder cls' methodName
 
-evalDefaultMethodWith :: Env -> LoadedModule -> Map ByteString ByteString -> BindingLhs -> IO Val
-evalDefaultMethodWith env lm rewrites lhs = do
-    expr0 <- Parser.parseBodyExprWithFixity
-                (lmSource lm) (lmFixity lm) (lhsClauses lhs)
+evalDefaultMethodWith
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> Env
+    -> LoadedModule
+    -> Map ByteString ByteString
+    -> BindingLhs
+    -> IO Val
+evalDefaultMethodWith registry searchPath includeMap env lm rewrites lhs = do
+    expr0 <- parseBodyExprInScope registry searchPath includeMap lm lhs
     let expr1 = desugarRecordPats (lmFieldReg lm)
                  (desugarRecordCons (lmFieldReg lm) expr0)
         expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
@@ -8467,18 +8487,17 @@ resolveFallbackSource mOwner name = do
                 case mLhs of
                     Nothing -> pure Nothing
                     Just lhs -> do
-                        mExpr <- (Just <$> Parser.parseBodyExprWithFixity
-                                            (lmSource owner)
-                                            (lmFixity owner)
-                                            (lhsClauses lhs))
+                        searchPath <- readIORef globalSearchPathRef
+                        includeMap <- readIORef globalIncludeMapRef
+                        transientReg <- newIORef (Map.map Loaded mods)
+                        mExpr <- (Just <$> parseBodyExprInScope
+                                            transientReg searchPath includeMap
+                                            owner lhs)
                                     `catch` (\(_ :: SomeException) -> pure Nothing)
                         case mExpr of
                             Nothing -> pure Nothing
                             Just expr0 -> do
                                 let expr0' = lowerHashDotCoerce bareName expr0
-                                searchPath <- readIORef globalSearchPathRef
-                                includeMap <- readIORef globalIncludeMapRef
-                                transientReg <- newIORef (Map.map Loaded mods)
                                 visibleFields <-
                                     if needsRecordFields expr0'
                                         then visibleFieldRegistryFor transientReg searchPath includeMap owner
@@ -9638,10 +9657,8 @@ discoverImpl builtins registry searchPath includeMap lm name
                         -- are not yet supported.  Skip them and fall through to
                         -- import resolution so the evaluator can still find the
                         -- name via a re-export.
-                        eExpr <- try (Parser.parseBodyExprWithFixity
-                                            (lmSource lm)
-                                            (lmFixity lm)
-                                            (lhsClauses lhs))
+                        eExpr <- try (parseBodyExprInScope
+                                            registry searchPath includeMap lm lhs)
                                     :: IO (Either ParseError Expr)
                         case eExpr of
                             Left parseErr
@@ -10539,6 +10556,46 @@ findOrResolveLhs src known name = do
         Just (SpanOnly lhs) -> pure (Just lhs)
         Just (Compiled _)   -> pure Nothing
         Nothing             -> findBinding src known name
+
+parseBodyExprInScope
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> BindingLhs
+    -> IO Expr
+parseBodyExprInScope registry searchPath includeMap lm lhs = do
+    fx <- fixityInScope registry searchPath includeMap lm
+    Parser.parseBodyExprWithFixity (lmSource lm) fx (lhsClauses lhs)
+
+-- Haskell fixity declarations are imported with the names they describe.
+-- Body parsing therefore needs the owner's local declarations plus the
+-- fixities from imports that bring names into unqualified scope; otherwise
+-- source-loaded code such as ghc-bignum's @&&#@/@||#@ expressions falls back
+-- to the parser's default precedence and groups incorrectly.
+fixityInScope
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> IO FixityTable
+fixityInScope registry searchPath includeMap lm = do
+    imported <- fmap catMaybes $
+        forM (mhImports (lmHeader lm)) $ \imp ->
+            if impQualified imp
+                then pure Nothing
+                else do
+                    loaded <- try (loadModule registry searchPath includeMap (impModule imp))
+                                :: IO (Either SomeException LoadedModule)
+                    pure $ case loaded of
+                        Left _ ->
+                            Nothing
+                        Right target ->
+                            Just (filterImportedFixity imp (lmFixity target))
+    pure (foldl' Map.union (lmFixity lm) imported)
+  where
+    filterImportedFixity imp =
+        Map.filterWithKey (\op _ -> specAllows (impSpec imp) op)
 
 -- | All free variables of an expression — names referenced via 'EVar'
 -- that aren't shadowed by a lambda, let, or pattern binding inside.
