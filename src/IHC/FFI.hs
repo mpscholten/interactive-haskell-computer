@@ -53,6 +53,7 @@ import Data.IORef
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.Word (Word32)
 import Foreign.LibFFI
     ( Arg, callFFI
     , argCInt, argCUInt, argCLong, argCULong
@@ -69,6 +70,7 @@ import Foreign.LibFFI
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
+import qualified GHC.Conc.Sync as HostConc
 import System.Directory (doesDirectoryExist, listDirectory)
 import qualified System.Environment as Env
 import System.FilePath ((</>), takeExtension)
@@ -81,6 +83,9 @@ import IHC.Val
 
 foreign import ccall "&RtsFlags"
     hsRtsFlagsPtr :: Ptr ()
+
+foreign import ccall "&enabled_capabilities"
+    hsEnabledCapabilitiesPtr :: Ptr Word32
 
 --------------------------------------------------------------------------------
 -- Types
@@ -109,6 +114,7 @@ data FFIType
     | FFIWord64
     | FFIFloat
     | FFIDouble
+    | FFIThreadId           -- @ThreadId#@, only valid for RTS-special leaves
     | FFIPtr      !FFIType   -- @Ptr a@ — payload type is carried for clarity
     | FFIFunPtr   !FFIType   -- @FunPtr a@
     | FFICString             -- @CString@ == @Ptr CChar@, specialised to marshal ByteString
@@ -291,6 +297,7 @@ valToArg ty v = case ty of
     FFIWord64 -> pure (argWord64 (fromIntegral (asInt v)))
     FFIFloat  -> pure (argCFloat  (realToFrac (asFloat v)))
     FFIDouble -> pure (argCDouble (realToFrac (asFloat v)))
+    FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# requires an RTS-special foreign import")
     FFIVoid   -> throwIO (userError "IHC.FFI: void cannot appear as an argument")
     FFIPtr _      -> do p <- ptrFromVal v; pure (argPtr p)
     FFIFunPtr _   -> do p <- ptrFromVal v; pure (argPtr p)
@@ -400,6 +407,7 @@ dispatchRet ty fp args = case ty of
     FFIWord64  -> (VInt . fromIntegral) <$> callFFI fp retWord64  args
     FFIFloat   -> (VFloat . realToFrac)  <$> callFFI fp retCFloat  args
     FFIDouble  -> (VFloat . realToFrac)  <$> callFFI fp retCDouble args
+    FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# cannot be returned through generic libffi")
     FFIPtr _   -> do
         p <- callFFI fp (retPtr retCChar) args
         pure (VPrimObj (PrimPtr (castPtr p)))
@@ -435,17 +443,37 @@ bsToConsList bs = go (BS.unpack bs)
 -- | Call the foreign symbol once, given the fully-saturated argument list.
 -- Raises 'IhcException' (via 'throwIO') if the symbol cannot be resolved.
 callForeign :: ForeignDecl -> [Val] -> IO Val
-callForeign decl argVals = do
-    mFp <- resolveSymbol (fdSymbol decl)
-    case mFp of
-        Nothing -> do
-            msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found: " <> fdSymbol decl))
-            throwIO (IhcException
-                ("FFI: symbol '" <> fdSymbol decl <> "' not found in any loaded library")
-                msgT)
-        Just fp -> do
-            argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
-            dispatchRet (fdRetType decl) fp argsFfi
+callForeign decl argVals
+    | fdSymbol decl == BC.pack "rts_getThreadId"
+    , [tidV] <- argVals = do
+          tid <- extractThreadId tidV
+          pure (VInteger (toInteger (HostConc.fromThreadId tid)))
+    | fdSymbol decl == BC.pack "rtsSupportsBoundThreads"
+    , null argVals =
+          -- The host RTS symbol is not reliably visible through dlsym in the
+          -- in-process test runner. Reporting false makes source-loaded
+          -- threadDelay choose the delay# primop path, which is the actual
+          -- non-event-manager primitive boundary IHC implements.
+          pure (VInt 0)
+    | otherwise = do
+          mFp <- resolveSymbol (fdSymbol decl)
+          case mFp of
+              Nothing -> do
+                  msgT <- newWHNFThunk (VStr (BC.pack "FFI symbol not found: " <> fdSymbol decl))
+                  throwIO (IhcException
+                      ("FFI: symbol '" <> fdSymbol decl <> "' not found in any loaded library")
+                      msgT)
+              Just fp -> do
+                  argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
+                  dispatchRet (fdRetType decl) fp argsFfi
+
+extractThreadId :: Val -> IO HostConc.ThreadId
+extractThreadId (VPrimObj (PrimThreadId tid)) = pure tid
+extractThreadId (VCon "ThreadId" [innerT]) = do
+    inner <- force legacyHooks innerT
+    extractThreadId inner
+extractThreadId other =
+    error ("IHC.FFI: expected ThreadId#/ThreadId, got " <> showValForDebug other)
 
 -- | Turn a 'ForeignDecl' into a runtime 'Val' that behaves like a
 -- curried Haskell function of the declared arity.  Applying the final
@@ -469,6 +497,14 @@ makeForeignVal decl
           -- resolves through the generic FFI path, but in-process test
           -- runners do not expose this RTS data object through dlsym.
           pure (VPrimObj (PrimPtr (castPtr hsRtsFlagsPtr)))
+    | fdIsAddrOf decl
+    , fdSymbol decl == BC.pack "enabled_capabilities" =
+          -- RTS-exclusive data symbol used by source-loaded
+          -- GHC.Internal.Conc.Sync.getNumCapabilities.
+          let p = castPtr hsEnabledCapabilitiesPtr
+          in do
+              markTypedHostPtr p (BC.pack "Word32")
+              pure (VPrimObj (PrimPtr p))
     | fdIsAddrOf decl = do
           mFp <- resolveSymbol (fdSymbol decl)
           case mFp of

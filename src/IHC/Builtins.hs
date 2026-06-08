@@ -857,6 +857,10 @@ builtins reg =
     , ("word2Int#",         word2IntB)
     , ("word8ToWord#",      word8ToWordB)
     , ("wordToWord8#",      wordToWord8B)
+    , ("word32ToWord#",     word32ToWordB)
+    , ("GHC.Prim.word32ToWord#", word32ToWordB)
+    , ("wordToWord32#",     wordToWord32B)
+    , ("GHC.Prim.wordToWord32#", wordToWord32B)
     , ("setAddrRange#",     setAddrRangeB)
     , ("copyAddrToAddrNonOverlapping#", copyAddrToAddrNonOverlappingB)
     , ("copyAddrToAddr#",   copyAddrToAddrB)
@@ -1241,16 +1245,16 @@ builtins reg =
     , ("killThread#",     killThreadHashB)
     , ("GHC.Prim.killThread#", killThreadHashB)
     , ("myThreadId#",     myThreadIdHashB)
-    , ("fromThreadId",    fromThreadIdB)
-    , ("GHC.Conc.Sync.fromThreadId", fromThreadIdB)
-    , ("GHC.Internal.Conc.Sync.fromThreadId", fromThreadIdB)
     -- labelThread / labelThreadByteArray# source-load from
     -- GHC.Internal.Conc.Sync. They bottom out in the raw labelThread#
     -- primop, which is eventlog/debug metadata only in IHC.
     , ("labelThread#", labelThreadHashB)
     , ("GHC.Prim.labelThread#", labelThreadHashB)
-    , ("threadDelay",     threadDelayB)
-    , ("getNumCapabilities", getNumCapabilitiesB)
+    -- threadDelay source-loads from GHC.Internal.Conc.IO/POSIX and bottoms
+    -- out in the raw delay# primop when the source-side RTS event-manager path
+    -- is not selected.
+    , ("delay#", delayHashB)
+    , ("GHC.Prim.delay#", delayHashB)
     -- closeFdWith coordinates with GHC's RTS event manager. IHC does not
     -- run that manager, so the compatible behavior is to run the supplied
     -- low-level close action directly.
@@ -3970,6 +3974,19 @@ wordToWord8B = pure $ VFun $ \t -> do
         VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word8)))
         _      -> error ("wordToWord8#: bad arg: " <> showValForDebug v)
 
+-- | @word32ToWord# :: Word32# -> Word#@ — widening; no-op on our Val.
+-- Source-loaded @GHC.Internal.Word@ uses this for @Integral Word32@.
+word32ToWordB :: IO Val
+word32ToWordB = pure $ VFun $ \t -> force legacyHooks t
+
+-- | @wordToWord32# :: Word# -> Word32#@ — narrowing to the low 32 bits.
+wordToWord32B :: IO Val
+wordToWord32B = pure $ VFun $ \t -> do
+    v <- force legacyHooks t
+    case v of
+        VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word32)))
+        _      -> error ("wordToWord32#: bad arg: " <> showValForDebug v)
+
 -- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
 -- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
 -- All six produce @Int#@ in source semantics (1 / 0); we map to the
@@ -4189,25 +4206,35 @@ peekB :: IO Val
 peekB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force legacyHooks a
     p <- ptrValToPtr av
-    isWord8 <- isMarkedWord8Ptr p
-    if isWord8
-        then do
-            w <- peek (p :: Ptr Word8)
-            pure (VInt (fromIntegral w))
-        else do
-            flags <- peekByteOff (castPtr p :: Ptr Word32) 0
-            family <- peekByteOff (castPtr p :: Ptr Word32) 4
-            socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
-            protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
-            if looksLikeAddrInfo flags family socktype protocol
-                then peekAddrInfoVal p flags family socktype protocol
+    mTyped <- lookupTypedHostPtr p
+    case mTyped of
+        Just "Word32" -> peekTypedWord32Ptr p
+        _ -> do
+            isWord8 <- isMarkedWord8Ptr p
+            if isWord8
+                then do
+                    w <- peek (p :: Ptr Word8)
+                    pure (VInt (fromIntegral w))
                 else do
-                    ptrWord <- peek (castPtr p :: Ptr Word64)
-                    if ptrWord >= 4096
-                        then pure (VPrimObj (PrimPtr (wordPtrToPtr ptrWord)))
+                    flags <- peekByteOff (castPtr p :: Ptr Word32) 0
+                    family <- peekByteOff (castPtr p :: Ptr Word32) 4
+                    socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
+                    protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
+                    if looksLikeAddrInfo flags family socktype protocol
+                        then peekAddrInfoVal p flags family socktype protocol
                         else do
-                            w <- peek (p :: Ptr Word8)
-                            pure (VInt (fromIntegral w))
+                            ptrWord <- peek (castPtr p :: Ptr Word64)
+                            if ptrWord >= 4096
+                                then pure (VPrimObj (PrimPtr (wordPtrToPtr ptrWord)))
+                                else do
+                                    w <- peek (p :: Ptr Word8)
+                                    pure (VInt (fromIntegral w))
+
+peekTypedWord32Ptr :: Ptr Word8 -> IO Val
+peekTypedWord32Ptr p = do
+    w <- peek (castPtr p :: Ptr Word32)
+    t <- newWHNFThunk (VInt (fromIntegral w))
+    pure (VCon "W32#" [t])
 
 looksLikeAddrInfo :: Word32 -> Word32 -> Word32 -> Word32 -> Bool
 looksLikeAddrInfo flags family socktype protocol =
@@ -6274,24 +6301,6 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
             f Map.empty stok
         _ -> runIOVal legacyHooks v
 
-fromThreadIdB :: IO Val
-fromThreadIdB = pure $ VFun $ \tidT -> do
-    tidV <- force legacyHooks tidT
-    tid <- extractThreadId tidV
-    pure (VInt (fromIntegral (threadIdKey tid)))
-  where
-    extractThreadId (VPrimObj (PrimThreadId tid)) = pure tid
-    extractThreadId (VCon "ThreadId" [innerT]) = do
-        inner <- force legacyHooks innerT
-        extractThreadId inner
-    extractThreadId other =
-        error ("fromThreadId: not a ThreadId: " <> showValForDebug other)
-
-    threadIdKey tid =
-        let s = show tid
-            step h c = h * 16777619 + fromIntegral (ord c)
-        in foldl step (2166136261 :: Word64) s
-
 -- | @killThread# :: ThreadId# -> a -> State# RealWorld -> State# RealWorld@.
 -- GHC.Prim primop. Source-loaded @throwTo (ThreadId tid) ex@ bottoms out
 -- here after wrapping @ex@ with @toException@.
@@ -6324,13 +6333,17 @@ labelThreadHashB :: IO Val
 labelThreadHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT -> pure $ VFun $ \sT ->
     force legacyHooks sT
 
--- | @threadDelay microseconds@ - sleep.
-threadDelayB :: IO Val
-threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
+-- | @delay# :: Int# -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. Source-loaded @threadDelay@ wraps this in IO and adds
+-- the unit result; the primop itself only threads the state token.
+delayHashB :: IO Val
+delayHashB = pure $ VFun $ \nT -> pure $ VFun $ \sT -> do
     nv <- force legacyHooks nT
     case nv of
-        VInt n -> do { threadDelay (fromIntegral n); pure VUnit }
-        _ -> error ("threadDelay: not an Int: " <> showValForDebug nv)
+        VInt n -> do
+            threadDelay (fromIntegral n)
+            force legacyHooks sT
+        _ -> error ("delay#: not an Int#: " <> showValForDebug nv)
 
 closeFdWithB :: IO Val
 closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do
@@ -6503,10 +6516,6 @@ timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT 
         keyRefT <- newWHNFThunk VUnit
         stateT <- newWHNFThunk VUnit
         pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
-
--- | @getNumCapabilities@ - return 1 (simplified).
-getNumCapabilitiesB :: IO Val
-getNumCapabilitiesB = pure $ VIO $ pure (VInt 1)
 
 --------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
