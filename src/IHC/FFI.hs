@@ -46,6 +46,7 @@ module IHC.FFI
     ) where
 
 import Control.Exception (throwIO, catch, SomeException)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -455,7 +456,17 @@ callForeign decl argVals
           -- threadDelay choose the delay# primop path, which is the actual
           -- non-event-manager primitive boundary IHC implements.
           pure (VInt 0)
-    | otherwise = do
+    | fdSymbol decl == BC.pack "memset"
+    , [ptrV, byteV, lenV] <- argVals = do
+          result <- dispatchResolved
+          let len = fromIntegral (asInt lenV) :: Int
+          when (asInt byteV == 0) $ do
+              p <- ptrFromVal ptrV
+              markSockAddrBuffer p len
+          pure result
+    | otherwise = dispatchResolved
+  where
+    dispatchResolved = do
           mFp <- resolveSymbol (fdSymbol decl)
           case mFp of
               Nothing -> do
