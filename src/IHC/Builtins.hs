@@ -681,11 +681,9 @@ builtins reg =
     --   bigNatToWordMaybe# :: BigNat# -> (# (# #) | Word# #)
     --   bigNatToAddr* / bigNatFromAddr* / bigNatTo|FromByteArray* /
     --     bigNatFromWordArray*                         (IO + Addr#)
-    , ("bigNatToWord#",            bigNatToWordHashB)         -- BigNat# -> Word#
     , ("bigNatToInt#",             bigNatToIntHashB)          -- BigNat# -> Int#
     , ("bigNatFromAbsInt#",        bigNatFromAbsIntHashB)     -- Int# -> BigNat#
     , ("bigNatFromWord64#",        bigNatFromWordB)           -- alias on 64-bit
-    , ("bigNatToWord64#",          bigNatToWordHashB)         -- alias on 64-bit
     , ("bigNatEncodeDouble#",      bigNatEncodeDoubleHashB)   -- m * 2^e
     -- Integer <-> BigNat# bridges (from GHC.Num.Integer)
     , ("integerFromBigNat#",       integerFromBigNatHashB)
@@ -938,6 +936,12 @@ builtins reg =
     , ("int64ToInt#",       identityIntPrimop)
     , ("int64ToWord64#",    identityIntPrimop)
     , ("word64ToInt64#",    identityIntPrimop)
+    -- 64-bit word-size compatibility aliases from source-loaded
+    -- Data.Memory.Internal.CompatPrim64 / ghc-bignum. These are
+    -- representation no-ops on our target, so a builtin leaf keeps
+    -- the source-loaded path honest without reintroducing a BigNat shim.
+    , ("wordToWord64#",     identityIntPrimop)
+    , ("word64ToWord#",     identityIntPrimop)
     , ("timesInt2#",        timesInt2B)
     , ("timesWord2#",       timesWord2B)
     , ("ltChar#",           ltCharHashB)
@@ -3252,20 +3256,6 @@ bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
                     else na `andNotNat` fromIntegral (-i - 1))))
         _ -> error
             ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
-
--- | Phase 2.D: @bigNatToWord# :: BigNat# -> Word#@ — returns the
--- low 64 bits of the BigNat, reinterpreted as a Word#.  For a
--- BigNat that fits in one limb, this is just the limb value.  For
--- larger BigNats, the high limbs are dropped (matches
--- @wordArrayLast@-on-low-limb behaviour in ghc-bignum).
---
--- Same body powers 'bigNatToWord64#' since Word# == Word64# on
--- 64-bit (our target).
-bigNatToWordHashB :: IO Val
-bigNatToWordHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatToWord#" av
-    pure (VInt (fromIntegral (fromIntegral n :: Word)))
 
 -- | Phase 2.D: @bigNatToInt# :: BigNat# -> Int#@ — like
 -- 'bigNatToWord#' but reinterprets the low 64 bits as signed Int#.
