@@ -651,7 +651,8 @@ builtins reg =
     , ("bigNatRem",                makeBigNatBinOp "bigNatRem" rem)
     , ("bigNatGcd",                makeBigNatBinOp "bigNatGcd" gcd)
     , ("bigNatLcm",                makeBigNatBinOp "bigNatLcm" lcm)
-    , ("bigNatSqr",                bigNatSqrB)
+    -- bigNatSqr source-loads from ghc-bignum:
+    -- bigNatSqr a = bigNatMul a a.
     , ("bigNatQuotRem#",           bigNatQuotRemHashB)
     , ("bigNatAddWord#",           makeBigNatWordOp "bigNatAddWord#" (+))
     , ("bigNatMulWord#",           makeBigNatWordOp "bigNatMulWord#" (*))
@@ -3135,16 +3136,6 @@ coerceWordArg _   (VInteger n) =
     pure (fromInteger (n `mod` (1 `shiftL` 64)))
 coerceWordArg ctx v =
     error (ctx <> ": not a Word#: " <> showValForDebug v)
-
--- | @bigNatSqr :: BigNat# -> BigNat#@ — square of a BigNat#.
--- Equivalent to @bigNatMul a a@ but ghc-bignum keeps a dedicated
--- primop because GMP has a specialised path; over host 'Natural'
--- the speedup is negligible, so we just multiply.
-bigNatSqrB :: IO Val
-bigNatSqrB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatSqr" av
-    pure (VPrimObj (PrimBigNat (n * n)))
 
 -- | Build an unboxed-sum value @(# … | … #)@ — see the @(#|#)@
 -- constructor registration in 'builtinEnv'.  @tag@ is the 1-based

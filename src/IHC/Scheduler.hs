@@ -512,6 +512,7 @@ loadProgramFromSource searchPath src0 = do
     conEnv   <- buildConEnv  unionedData
     fieldEnv <- buildFieldAccessorEnv loadedModules publicFields unionedFields
     builtins <- builtinEnv classReg
+    writeIORef envRawBuiltinsForFallbackRef builtins
     -- Install a thunk per scanned @foreign import ccall@ declaration
     -- under a synthetic @__ffi.Module.name@ key. Module bodies reach
     -- these through sentinel @EVar@ entries inserted in 'buildLoadedModule'.
@@ -757,6 +758,7 @@ buildBaseEnv = do
     -- via RTLD_DEFAULT without any package-specific hardcoding.
     FFI.registerCbitsDylibs
     builtins <- builtinEnv classReg
+    writeIORef envRawBuiltinsForFallbackRef builtins
     conEnv   <- buildConEnv Map.empty
     let env0 = HashMap.union builtins conEnv
     -- Pre-discover GHC.Exception / GHC.Internal.Exception helpers.
@@ -7007,6 +7009,7 @@ data LegacySchedulerRunState = LegacySchedulerRunState
     , lsrsIncludeMap          :: !(IORef (Map FilePath [FilePath]))
     , lsrsEnvFallbackCache    :: !(IORef (Map ByteString Thunk))
     , lsrsEnvBaseForFallback  :: !(IORef Env)
+    , lsrsEnvRawBuiltins      :: !(IORef Env)
     , lsrsEnvFallbackNegCache :: !(IORef (Int, Set (Maybe ByteString, ByteString)))
     , lsrsEnvFallbackCacheGen :: !(IORef Int)
     , lsrsDiscoverNegCache    :: !(IORef (Set (ByteString, ByteString)))
@@ -7024,6 +7027,7 @@ legacySchedulerRunState = unsafePerformIO $ do
     includeMap   <- newIORef Map.empty
     fbCache      <- newIORef Map.empty
     fbBase       <- newIORef HashMap.empty
+    fbRawBuiltins <- newIORef HashMap.empty
     fbNeg        <- newIORef (0, Set.empty)
     fbGen        <- newIORef 0
     discoverNeg  <- newIORef Set.empty
@@ -7034,6 +7038,7 @@ legacySchedulerRunState = unsafePerformIO $ do
         , lsrsIncludeMap          = includeMap
         , lsrsEnvFallbackCache    = fbCache
         , lsrsEnvBaseForFallback  = fbBase
+        , lsrsEnvRawBuiltins      = fbRawBuiltins
         , lsrsEnvFallbackNegCache = fbNeg
         , lsrsEnvFallbackCacheGen = fbGen
         , lsrsDiscoverNegCache    = discoverNeg
@@ -7129,6 +7134,7 @@ resetPerRunGlobals = do
     writeIORef envFallbackNegCacheRef (0, Set.empty)
     writeIORef envFallbackCacheGenRef 0
     writeIORef envBaseForFallbackRef  HashMap.empty
+    writeIORef envRawBuiltinsForFallbackRef HashMap.empty
     writeIORef globalTypeSigsRef      Map.empty
     writeIORef globalAmbiguousSigsRef Set.empty
     writeIORef globalTypeSynonymsRef  Map.empty
@@ -7379,6 +7385,11 @@ envFallbackCache = lsrsEnvFallbackCache legacySchedulerRunState
 -- materialisation of bodies the user's expression never touches.
 envBaseForFallbackRef :: IORef Env
 envBaseForFallbackRef = lsrsEnvBaseForFallback legacySchedulerRunState
+
+-- | Raw 'IHC.Builtins' table for resolver branches that must distinguish
+-- host-backed primitives from import aliases in 'envBaseForFallbackRef'.
+envRawBuiltinsForFallbackRef :: IORef Env
+envRawBuiltinsForFallbackRef = lsrsEnvRawBuiltins legacySchedulerRunState
 
 -- | Negative-result memo for the env-fallback hook.  When 'resolveFallback'
 -- returns 'Nothing' for some @(owner, name)@ pair, that result is recorded
@@ -7654,8 +7665,8 @@ resolveFallbackSource mOwner name = do
                     -- host-shimmed (Natural-backed runtime, not source-loaded
                     -- ByteArray# limb arrays — see
                     -- @plans/full-ghc-bignum-source-load.md@).  Direct
-                    -- @import GHC.Num.BigNat (bigNatMulWord#)@ already resolves
-                    -- to the shim via the bare-name baseEnv, but a source-loaded
+                    -- @import GHC.Num.BigNat (bigNatMulWord#)@ resolves
+                    -- to the shim via the raw builtin table, but a source-loaded
                     -- sibling (e.g. @integerMul@'s @IP@ arm calling
                     -- @bigNatMulWord#@) gets its FV import-rewritten to the FQN
                     -- @GHC.Num.BigNat.bigNatMulWord#@, which is NOT a baseEnv key
@@ -7672,8 +7683,8 @@ resolveFallbackSource mOwner name = do
                     mShim <-
                         if modName `elem` hostShimmedBignumModules
                             then do
-                                baseEnv <- readIORef envBaseForFallbackRef
-                                pure (HashMap.lookup bareName baseEnv)
+                                rawBuiltins <- readIORef envRawBuiltinsForFallbackRef
+                                pure (HashMap.lookup bareName rawBuiltins)
                             else pure Nothing
                     case mShim of
                         Just t  -> pure (Just t)
