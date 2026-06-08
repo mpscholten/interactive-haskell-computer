@@ -1094,55 +1094,30 @@ builtins reg =
     -- Socket value shape used by the rest of the interpreted network package.
     , ("socket", socketCreateB)
     , ("Network.Socket.Syscall.socket", socketCreateB)
-    -- setsockopt is an OS syscall.  Keep the Haskell option constants and
-    -- Socket shape, but perform the fd-level call in the host.
-    , ("setSocketOption", socketSetOptionB)
-    , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
+    -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
+    -- lower setSockOpt foreign imports.
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
     , ("Network.Socket.Syscall.listen", socketListenB)
     -- accept(2) blocks for the next connection and returns a network Socket
     -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
     -- above it remains source-interpreted.
-    , ("accept", socketAcceptB)
-    , ("Network.Socket.SockAddr.accept", socketAcceptB)
     , ("Network.Socket.Syscall.accept", socketAcceptB)
     -- connect(2) — host-backed because the interpreted connectLoop
     -- triggers excessive lazy discovery (~5000 bindings) that hangs.
-    , ("connect", socketConnectB)
-    , ("Network.Socket.SockAddr.connect", socketConnectB)
     , ("Network.Socket.Syscall.connect", socketConnectB)
-    -- getsockname(2), used by Warp to populate connMySockAddr.
-    , ("getSocketName", socketGetNameB)
-    , ("Network.Socket.SockAddr.getSocketName", socketGetNameB)
+    -- Network.Socket.SockAddr.getSocketName source-loads and delegates to
+    -- Network.Socket.Name.getSocketName, the getsockname(2) boundary used by
+    -- Warp to populate connMySockAddr.
     , ("Network.Socket.Name.getSocketName", socketGetNameB)
-    , ("bind", socketBindB)
-    , ("Network.Socket.SockAddr.bind", socketBindB)
+    -- Network.Socket.SockAddr.bind source-loads; the fd-level bind(2) boundary
+    -- stays in Network.Socket.Syscall.
     , ("Network.Socket.Syscall.bind", socketBindB)
-    -- Network.Socket.bind is the actual OS bind(2) boundary for AF_INET/AF_INET6
-    -- sockets. We keep SockAddr data constructors source-interpreted, but perform
-    -- the sockaddr marshalling + bind syscall in the host.
-    -- Network.Socket.close / close' ultimately coordinate fd shutdown through
-    -- closeFdWith and the host RTS/OS socket object. We keep network's Socket
-    -- value shape source-compatible, but perform the actual invalidation +
-    -- close(2) in the host.
-    , ("close", socketCloseB False)
-    , ("close'", socketCloseB True)
-    , ("Network.Socket.Types.close", socketCloseB False)
-    , ("Network.Socket.Types.close'", socketCloseB True)
-    -- Network.Socket.withFdSocket reads the live fd out of the mutable Socket
-    -- cell and runs an IO callback. The Socket is host-backed already, so we
-    -- bridge this directly rather than re-entering the interpreted wrapper.
-    , ("withFdSocket", withFdSocketB)
-    , ("Network.Socket.Types.withFdSocket", withFdSocketB)
-    -- Network.Socket's Socket value is already represented by IHC as a
-    -- host-backed fd-bearing constructor. fdSocket/unsafeFdSocket expose that
-    -- fd as IO CInt in network >= 3, so this is an RTS/OS bridge over the
-    -- existing host socket object rather than a Hackage-library shim.
-    , ("fdSocket", socketFdB)
-    , ("unsafeFdSocket", socketFdB)
-    , ("Network.Socket.Types.fdSocket", socketFdB)
-    , ("Network.Socket.Types.unsafeFdSocket", socketFdB)
+    -- Network.Socket.Types.close / close' source-load; the actual close(2)
+    -- happens through lower foreign imports / closeFdWith.
+    -- Network.Socket.Types.withFdSocket source-loads over the Socket IORef.
+    -- Network.Socket.Types.fdSocket / unsafeFdSocket source-load over the
+    -- same Socket IORef representation.
     -- sendBuf/recvBuf are the fd-level OS send(2)/recv(2) boundaries used by
     -- Network.Socket.ByteString. Keep the ByteString API source-interpreted,
     -- but perform the actual socket syscall in the host.
@@ -4563,21 +4538,9 @@ socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $
         else do
             fdT <- newWHNFThunk (VInt (fromIntegral fd))
             ref <- newIORef fdT
-            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+            refV <- mkSourceIORefVal ref
+            refT <- newWHNFThunk refV
             pure (VCon "Socket" [refT, fdT])
-
-socketSetOptionB :: IO Val
-socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ \valueT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    (level, opt) <- socketOptionField optT
-    value <- intField "setSocketOption.value" valueT
-    allocaBytes (sizeOf (undefined :: CInt)) $ \p -> do
-        poke (castPtr p :: Ptr CInt) (fromIntegral value)
-        rc <- c_setsockopt_host (fromIntegral fd) (fromIntegral level) (fromIntegral opt) (castPtr p) (fromIntegral (sizeOf (undefined :: CInt)))
-        if rc == -1
-            then ioError (userError "Network.Socket.setSocketOption")
-            else pure VUnit
 
 -- | Host-backed @connect :: Socket -> SockAddr -> IO ()@.
 -- Handles non-blocking sockets: retries on EINTR, waits via
@@ -4647,7 +4610,8 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
             ioError (userError ("Network.Socket.accept: errno=" <> show e))
         fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
         ref <- newIORef fdValT
-        refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+        refV <- mkSourceIORefVal ref
+        refT <- newWHNFThunk refV
         sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdValT])
         addrV <- peekSockAddrVal (castPtr addrP)
         addrT <- newWHNFThunk addrV
@@ -4676,48 +4640,26 @@ socketFdFromVal v = do
 socketCurrentFdVal :: Val -> IO Val
 socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
     refV <- force legacyHooks refT
-    case refV of
-        VPrimObj (PrimIORef rf) -> readIORef rf >>= force legacyHooks
-        other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
+    rf <- primIORefFromVal refV
+    readIORef rf >>= force legacyHooks
 socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
 
-socketFdB :: IO Val
-socketFdB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    pure (VInt fd)
+mkSourceIORefVal :: IORef Thunk -> IO Val
+mkSourceIORefVal ref = do
+    primT <- newWHNFThunk (VPrimObj (PrimIORef ref))
+    stRefT <- newWHNFThunk (VCon "STRef" [primT])
+    pure (VCon "IORef" [stRefT])
 
-socketCloseB :: Bool -> (IO Val)
-socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    case sockV of
-        VCon "Socket" [refT, _fdT] -> do
-            refV <- force legacyHooks refT
-            case refV of
-                VPrimObj (PrimIORef rf) -> do
-                    sentinelT <- newWHNFThunk (VInt (-1))
-                    oldT <- atomicModifyIORef' rf $ \cur -> (sentinelT, cur)
-                    oldFdV <- force legacyHooks oldT
-                    case oldFdV of
-                        VInt oldFd
-                            | oldFd == -1 -> pure VUnit
-                            | otherwise -> do
-                                rc <- c_close_host (fromIntegral oldFd)
-                                if rc == -1 && throwOnError
-                                    then ioError (userError "Network.Socket.close'")
-                                    else pure VUnit
-                        other -> error ("Socket fd cell is not an Int: " <> showValForDebug other)
-                other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
-        other -> error ("close: not a Socket: " <> showValForDebug other)
-
-withFdSocketB :: IO Val
-withFdSocketB = pure $ VFun $ \sockT -> pure $ VFun $ \fnT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    fnV <- force legacyHooks fnT
-    fdT <- newWHNFThunk (VInt fd)
-    r <- apply legacyHooks fnV fdT
-    runIOVal legacyHooks r
+primIORefFromVal :: Val -> IO (IORef Thunk)
+primIORefFromVal (VPrimObj (PrimIORef rf)) = pure rf
+primIORefFromVal (VCon "IORef" [stRefT]) = do
+    stRefV <- force legacyHooks stRefT
+    primIORefFromVal stRefV
+primIORefFromVal (VCon "STRef" [primT]) = do
+    primV <- force legacyHooks primT
+    primIORefFromVal primV
+primIORefFromVal other =
+    error ("Socket ref is not an IORef: " <> showValForDebug other)
 
 socketSendBufB :: IO Val
 socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
@@ -4825,21 +4767,8 @@ socketTypeField t = do
         VInt n                  -> pure n
         other                   -> error ("socket.type: not a SocketType: " <> showValForDebug other)
 
-socketOptionField :: Thunk -> IO (Int64, Int64)
-socketOptionField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "SockOpt" [levelT, optT] -> do
-            level <- intField "socket.option.level" levelT
-            opt <- intField "socket.option.name" optT
-            pure (level, opt)
-        other -> error ("setSocketOption: not a SocketOption: " <> showValForDebug other)
-
 foreign import ccall unsafe "socket"
     c_socket_host :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall unsafe "setsockopt"
-    c_setsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> CInt -> IO CInt
 
 foreign import ccall unsafe "listen"
     c_listen_host :: CInt -> CInt -> IO CInt
@@ -4868,9 +4797,6 @@ foreign import ccall unsafe "connect"
 
 foreign import ccall unsafe "getsockopt"
     c_getsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
-
-foreign import ccall unsafe "close"
-    c_close_host :: CInt -> IO CInt
 
 foreign import ccall unsafe "send"
     c_send_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
