@@ -711,12 +711,13 @@ builtins reg =
     , ("bigNatSetBit#",            makeBigNatShiftOp "bigNatSetBit#"   (\n i -> setBit n i))
     , ("bigNatComplementBit#",     makeBigNatShiftOp "bigNatComplementBit#" (\n i -> complementBit n i))
     -- bigNatGtWord#, bigNatLeWord#, and bigNatEqWord# source-load from
-    -- ghc-bignum; their bodies compose retained lower leaves
-    -- (bigNatSize#, bigNatIndex#, bigNatIsZero#).
+    -- ghc-bignum; their bodies compose source-loaded BigNat readers over
+    -- the retained wordArraySize#/indexWordArray# leaves.
     -- bigNatCompareWord#, bigNatIsTwo#, and bigNatCheck# source-load
     -- from ghc-bignum over retained word-array reader leaves
     -- (wordArraySize#, indexWordArray#, sizeofByteArray#).
-    , ("bigNatIndex#",             bigNatIndexHashB)          -- BigNat# -> Int# -> Word# (i-th 64-bit limb)
+    -- bigNatIndex# source-loads directly from ghc-bignum:
+    -- bigNatIndex# x i = indexWordArray# x i.
     , ("bigNatZero#",              bigNatZeroHashB)           -- (# #) -> BigNat#
     , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
     -- bigNatCtz# and bigNatCtzWord# source-load from ghc-bignum;
@@ -3439,25 +3440,6 @@ naturalLogBase b n          = go 0 n
   where
     go !i k | k < b     = i
             | otherwise = go (i + 1) (k `div` b)
-
--- | @bigNatIndex# :: BigNat# -> Int# -> Word#@ — extract the i-th
--- 64-bit limb (little-endian).  Bounds-checking is the caller's
--- responsibility per ghc-bignum convention (out-of-range returns 0
--- in our backing since shifted-out bits are 0).
-bigNatIndexHashB :: IO Val
-bigNatIndexHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat "bigNatIndex#" av
-    case bv of
-        VInt i ->
-            -- Right-shift by 64*i, then mask off to the low 64 bits.
-            -- For i out of range (i >= limbCount na), the shift
-            -- produces 0; the .&. 0xFFFFFFFFFFFFFFFF is implicit in
-            -- the fromIntegral :: Natural -> Word truncation.
-            let shifted = na `shiftR` (64 * fromIntegral i)
-            in pure (VInt (fromIntegral (fromIntegral shifted :: Word)))
-        _ -> error
-            ("bigNatIndex#: not an Int#: " <> showValForDebug bv)
 
 -- | @bigNatZero# :: (# #) -> BigNat#@ — constant zero BigNat.  The
 -- @(# #)@ argument is the unit unboxed tuple ghc-bignum uses to
