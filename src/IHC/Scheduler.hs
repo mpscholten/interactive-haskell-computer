@@ -5786,20 +5786,38 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
     isSelfAliasIn _ _ _ = False
 
     -- | @(bare-name, fully-qualified-key)@ pairs from a re-exported
-    -- module (@module Foo@ in the export list).
+    -- module (@module Foo@ in the export list).  Re-export chains can
+    -- be more than one hop, e.g. ghc-bignum's
+    -- @GHC.Num.Backend -> Selected -> Native@ backend facade.
     rewritePairsFromReexport reg modName requestedNames =
-        case Map.lookup modName reg of
-            Just (Loaded reLm) -> directRewritePairs reg reLm requestedNames
-            _
-                | allowLoadImports -> do
-                    loaded <- try (loadModule registry searchPath includeMap modName)
-                                :: IO (Either SomeException LoadedModule)
-                    case loaded of
-                        Left _     -> pure []
-                        Right reLm -> do
-                            reg' <- readIORef registry
-                            directRewritePairs reg' reLm requestedNames
-                | otherwise -> pure []
+        go Set.empty reg modName
+      where
+        go visited regNow m
+            | Set.member m visited = pure []
+            | otherwise = do
+                mLoaded <- loadReexport regNow m
+                case mLoaded of
+                    Nothing -> pure []
+                    Just (regLoaded, reLm) -> do
+                        direct <- directRewritePairs regLoaded reLm requestedNames
+                        nested <- concat <$>
+                            mapM (go (Set.insert m visited) regLoaded)
+                                 (moduleReexports (lmHeader reLm))
+                        pure (direct ++ nested)
+
+        loadReexport regNow m =
+            case Map.lookup m regNow of
+                Just (Loaded reLm) -> pure (Just (regNow, reLm))
+                _
+                    | allowLoadImports -> do
+                        loaded <- try (loadModule registry searchPath includeMap m)
+                                    :: IO (Either SomeException LoadedModule)
+                        case loaded of
+                            Left _     -> pure Nothing
+                            Right reLm -> do
+                                reg' <- readIORef registry
+                                pure (Just (reg', reLm))
+                    | otherwise -> pure Nothing
 
 -- | Rewrite every free 'EVar' in @expr@ whose name appears in the
 -- rewrite table (and isn't shadowed by an inner binder) to its
@@ -8896,6 +8914,14 @@ isAllowedTargetedGhc n =
     || n == BC.pack "GHC.Conc.Sync"
     || n == BC.pack "GHC.Exception"
     || n == BC.pack "GHC.Ix"
+    -- ghc-bignum facade/re-export chain:
+    -- GHC.Num.BigNat imports GHC.Num.Backend, whose export list re-exports
+    -- Selected, which re-exports the actual backend module selected by CPP
+    -- (Native in IHC's source bundle). These modules are source-loaded so
+    -- ordinary helpers like bignat_compare don't need host shims.
+    || n == BC.pack "GHC.Num.Backend"
+    || n == BC.pack "GHC.Num.Backend.Selected"
+    || n == BC.pack "GHC.Num.Backend.Native"
 
 isBuiltinBackedModule :: ModuleName -> Bool
 isBuiltinBackedModule n =
@@ -10358,11 +10384,22 @@ nubBS = go []
         | otherwise      = x : go (x:seen) xs
 
 -- | Extract any @module Foo@ re-export module names from a module's
--- export list.  Used by 'resolveImport' to follow re-export chains.
+-- export list, resolving @Foo@ through import aliases when the export
+-- uses @module Alias@.  Used by 'resolveImport' to follow re-export
+-- chains.
 moduleReexports :: ModuleHeader -> [ModuleName]
 moduleReexports h = case mhExports h of
     ExportAll     -> []
-    ExportList xs -> [ m | ExportModule m <- xs ]
+    ExportList xs -> concatMap reexportTargets xs
+  where
+    reexportTargets (ExportModule m) =
+        let imported =
+                [ impModule imp
+                | imp <- mhImports h
+                , impModule imp == m || impAlias imp == Just m
+                ]
+        in if null imported then [m] else imported
+    reexportTargets _ = []
 
 -- | Returns True if @n@ is directly exported (by name or type entry)
 -- or if the module re-exports everything ('ExportAll').  Does NOT

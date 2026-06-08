@@ -99,6 +99,11 @@ defaultCppContext = Map.fromList
     , ("HS_cstringLength_AND_FinalPtr_AVAILABLE", MObj "1")
     , ("HS_unsafeWithForeignPtr_AVAILABLE",       MObj "1")
     , ("HS_timesInt2_PRIMOP_AVAILABLE",           MObj "1")
+    -- ghc-bignum backend selection.  The source bundle includes the
+    -- pure Haskell Native backend; selecting it keeps backend helpers
+    -- such as bignat_compare source-loadable instead of falling through
+    -- the CPP #error branch or requiring host shims.
+    , ("BIGNUM_NATIVE", MObj "1")
     -- ghc-bignum WordSize.h macros for 64-bit aarch64.
     -- Pre-defined here as a fallback for sources that
     -- @#include "WordSize.h"@ but where IHC's per-package
