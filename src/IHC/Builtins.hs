@@ -1254,10 +1254,9 @@ builtins reg =
     , ("GHC.Internal.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.TimerManager.updateTimeout", updateTimeoutB)
-    , ("withHandle", timeManagerWithHandleB)
-    , ("withHandleKillThread", timeManagerWithHandleB)
-    , ("System.TimeManager.withHandle", timeManagerWithHandleB)
-    , ("System.TimeManager.withHandleKillThread", timeManagerWithHandleB)
+    -- System.TimeManager.withHandle / withHandleKillThread source-load:
+    -- the package definitions are ordinary bracket/register wrappers. The
+    -- RTS-only boundary remains the timer manager operations above.
     -- System.TimeManager.initialize / stopManager source-load: upstream
     -- definitions are ordinary Haskell wrappers around the Manager newtype.
     -- System.Posix.IO.setFdOption source-loads from unix and bottoms out in
@@ -6058,22 +6057,6 @@ updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \
         case usecV of
             VInt _ -> pure VUnit
             _ -> error ("updateTimeout: timeout is not an Int: " <> showValForDebug usecV)
-
-timeManagerWithHandleB :: IO Val
-timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT -> pure $ VFun $ \actionT ->
-    pure $ VIO $ do
-        actionV <- force legacyHooks actionT
-        h <- emptyTimeManagerHandle
-        hT <- newWHNFThunk h
-        r <- apply legacyHooks actionV hT
-        runIOVal legacyHooks r
-  where
-    emptyTimeManagerHandle = do
-        timeoutT <- newWHNFThunk (VInt 0)
-        actionT <- newWHNFThunk (VIO (pure VUnit))
-        keyRefT <- newWHNFThunk VUnit
-        stateT <- newWHNFThunk VUnit
-        pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
 
 --------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)

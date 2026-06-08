@@ -563,7 +563,6 @@ loadProgramFromSource searchPath src0 = do
                     , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
-                    , "withHandle", "withHandleKillThread"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
@@ -1633,7 +1632,6 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
-                    , "withHandle", "withHandleKillThread"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
