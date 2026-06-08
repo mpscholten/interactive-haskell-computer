@@ -60,12 +60,12 @@ import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Numeric.Natural (Natural)
-import Foreign.C.String (peekCAString, withCString)
+import Foreign.C.String (peekCAString)
 import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, newForeignPtr_
     , plusForeignPtr )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes)
+import Foreign.Marshal.Alloc (allocaBytes, mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
@@ -1118,16 +1118,8 @@ builtins reg =
     -- registers all Settings fields in lmFieldReg, and tryFieldSlot
     -- synthesises the accessors automatically.  Helpers warpSettings*B
     -- and settingsFieldB went with them.
-    -- Network.Socket AddrInfo field accessors source-load from
-    -- Network.Socket.Info. The host getAddrInfo syscall below still builds the
-    -- source constructor shape, so the normal field registry can synthesize
-    -- addrFlags/addrFamily/etc.
-    -- Network.Socket.getAddrInfo: host @getaddrinfo(3)@.  warp's listen
-    -- pipeline calls it through streaming-commons' bindPortGenEx.  We
-    -- ignore hints (NULL) for now — the OS gives back a TCP-stream-
-    -- compatible list anyway, which is all warp examines.
-    , ("getAddrInfo",     getAddrInfoB)
-    , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
+    -- Network.Socket.Info.getAddrInfo source-loads; its getaddrinfo(3)
+    -- foreign imports dispatch through the generic FFI path.
     -- Phase 2.8: additional numeric ops needed by containers (graduated)
     --   * 'fromInteger' (Num class) → 'Num Int.fromInteger'
     --     at GHC/Internal/Num.hs:115 — body @fromInteger i = I# (integerToInt# i)@.
@@ -4206,162 +4198,75 @@ peekAddrInfoVal p flags family socktype protocol = do
     canonT <- newWHNFThunk =<< maybeCStringVal canonPtrWord
     pure (VCon "AddrInfo" [flagsT, familyT, socktypeT, protocolT, addrT, canonT])
 
--- | Read a single @struct addrinfo@ at @p@ and return a 'Val'.  Used by
--- 'getAddrInfoB' when walking the linked list returned by
--- @getaddrinfo(3)@.
-peekFullAddrInfoVal :: Ptr Word8 -> IO Val
-peekFullAddrInfoVal p = do
-    flags    <- peekByteOff (castPtr p :: Ptr Word32) 0
-    family   <- peekByteOff (castPtr p :: Ptr Word32) 4
-    socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
-    protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
-    peekAddrInfoVal p flags family socktype protocol
+pokeAddrInfoHintsVal :: Ptr Word8 -> Val -> IO ()
+pokeAddrInfoHintsVal p val = do
+    (flags, family, socktype, protocol) <- addrInfoHintFields val
+    fillBytes p 0 48
+    pokeByteOff (castPtr p :: Ptr Word32) 0  flags
+    pokeByteOff (castPtr p :: Ptr Word32) 4  family
+    pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
+    pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
 
--- | @getAddrInfo :: Maybe AddrInfo -> Maybe HostName -> Maybe ServiceName
--- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@.  Parses
--- the @hints@ argument and passes through the OS-relevant fields
--- (addrFlags, addrFamily, addrSocketType, addrProtocol).  Walks the
--- linked list via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64
--- layout) and materialises each entry as a 'VCon "AddrInfo"' before
--- @freeaddrinfo@-ing the chain.
---
--- Without parsing hints, warp's @bindPortGenEx@ would receive a
--- mixed UDP+TCP result list, and the first @setSocketOption sock
--- NoDelay 1@ on the UDP entry would throw EINVAL.  The exception
--- is caught by @tryAddrs@ and the next addr (TCP) used, but the
--- per-attempt churn is wasted work.
-getAddrInfoB :: IO Val
-getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
-    hintsV <- force legacyHooks hintsT
-    hostV <- force legacyHooks hostT
-    serviceV <- force legacyHooks serviceT
-    withMaybeCString hostV $ \hostP ->
-        withMaybeCString serviceV $ \serviceP ->
-            withHintsPtr hintsV $ \hintsP ->
-                alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
-                    rc <- c_getaddrinfo_host hostP serviceP hintsP resPP
-                    if rc /= 0
-                        then ioError (userError ("getaddrinfo: returned " ++ show rc))
-                        else do
-                            firstP <- peek resPP
-                            if firstP == nullPtr
-                                then pure (VCon "[]" [])
-                                else do
-                                    lst <- walkAddrInfo firstP
-                                    c_freeaddrinfo_host firstP
-                                    pure lst
+addrInfoHintFields :: Val -> IO (Word32, Word32, Word32, Word32)
+addrInfoHintFields val = case val of
+    VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
+        flagsV    <- force legacyHooks flagsT
+        familyV   <- force legacyHooks familyT
+        socktypeV <- force legacyHooks socktypeT
+        protocolV <- force legacyHooks protocolT
+        flags    <- addrInfoFlagBits flagsV
+        family   <- socketConInt familyV
+        socktype <- socketConInt socktypeV
+        protocol <- socketConInt protocolV
+        pure (flags, family, socktype, protocol)
+    _ -> pure (0, 0, 0, 0)
+
+addrInfoFlagBits :: Val -> IO Word32
+addrInfoFlagBits = go 0
   where
-    walkAddrInfo :: Ptr Word8 -> IO Val
-    walkAddrInfo p = do
-        v <- peekFullAddrInfoVal p
-        nextWord <- peekByteOff (castPtr p :: Ptr Word64) 40
-        let nextP = wordPtrToPtr nextWord
-        rest <- if nextP == nullPtr
-                    then pure (VCon "[]" [])
-                    else walkAddrInfo nextP
-        hd <- newWHNFThunk v
-        tl <- newWHNFThunk rest
-        pure (VCon ":" [hd, tl])
+    go !acc v = case v of
+        VCon "[]" []      -> pure acc
+        VCon ":" [hT, tT] -> do
+            hV <- force legacyHooks hT
+            tV <- force legacyHooks tT
+            go (acc .|. addrInfoFlagBit hV) tV
+        _ -> pure acc
 
-    withMaybeCString :: Val -> (Ptr Word8 -> IO a) -> IO a
-    withMaybeCString v action = case v of
-        VCon "Nothing" []   -> action nullPtr
-        VCon "Just" [innerT] -> do
-            inner <- force legacyHooks innerT
-            s <- valToString inner
-            withCString s (action . castPtr)
-        other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
+addrInfoFlagBit :: Val -> Word32
+addrInfoFlagBit (VCon "AI_ADDRCONFIG" _) = 1024
+addrInfoFlagBit (VCon "AI_ALL" _)        = 256
+addrInfoFlagBit (VCon "AI_CANONNAME" _)  = 2
+addrInfoFlagBit (VCon "AI_NUMERICHOST" _) = 4
+addrInfoFlagBit (VCon "AI_NUMERICSERV" _) = 4096
+addrInfoFlagBit (VCon "AI_PASSIVE" _)    = 1
+addrInfoFlagBit (VCon "AI_V4MAPPED" _)   = 2048
+addrInfoFlagBit _                        = 0
 
-    -- Build a host @struct addrinfo@ from a @Maybe AddrInfo@ Val and
-    -- pass its pointer to the action.  Without this, @c_getaddrinfo@
-    -- gets a NULL hints pointer and returns ALL socket types — warp
-    -- requests Stream-only, but we'd hand back UDP entries too, then
-    -- @setSocketOption sock TCP_NODELAY@ on the UDP socket fails with
-    -- EINVAL.  The first 4 fields (flags, family, socktype, protocol)
-    -- are 4-byte ints; the rest can be zero-filled because
-    -- getaddrinfo only reads the first four when given hints.
-    withHintsPtr :: Val -> (Ptr Word8 -> IO a) -> IO a
-    withHintsPtr v action = case v of
-        VCon "Nothing" [] -> action nullPtr
-        VCon "Just" [innerT] -> do
-            inner <- force legacyHooks innerT
-            (flags, family, socktype, protocol) <- extractHintsFields inner
-            allocaBytes 48 $ \p -> do
-                fillBytes p 0 48
-                pokeByteOff (castPtr p :: Ptr Word32) 0  flags
-                pokeByteOff (castPtr p :: Ptr Word32) 4  family
-                pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
-                pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
-                action p
-        _ -> action nullPtr
+socketConInt :: Val -> IO Word32
+socketConInt v = case v of
+    VCon _ [innerT] -> do
+        inner <- force legacyHooks innerT
+        case inner of
+            VInt n -> pure (fromIntegral n)
+            _      -> socketConByName v
+    VInt n -> pure (fromIntegral n)
+    _      -> socketConByName v
 
-    -- Extract (flags, family, socktype, protocol) from an AddrInfo
-    -- record value.  Pattern: VCon "AddrInfo" [flagsT, familyT,
-    -- socktypeT, protocolT, addressT, canonNameT].  The flags field is
-    -- a list of constructors like @[AI_PASSIVE]@ that we OR-fold; the
-    -- family / socktype / protocol fields are single-field VCons
-    -- wrapping @CInt@ codes.
-    extractHintsFields :: Val -> IO (Word32, Word32, Word32, Word32)
-    extractHintsFields val = case val of
-        VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
-            flagsV    <- force legacyHooks flagsT
-            familyV   <- force legacyHooks familyT
-            socktypeV <- force legacyHooks socktypeT
-            protocolV <- force legacyHooks protocolT
-            flags    <- foldFlagBits flagsV
-            family   <- conIntField "addrFamily" familyV
-            socktype <- conIntField "addrSocketType" socktypeV
-            protocol <- conIntField "addrProtocol" protocolV
-            pure (flags, family, socktype, protocol)
-        _ -> pure (0, 0, 0, 0)
-
-    -- @[AI_FOO, AI_BAR]@ → bitwise-or of named flag values.
-    foldFlagBits :: Val -> IO Word32
-    foldFlagBits = go 0
-      where
-        go !acc v = case v of
-            VCon "[]" []        -> pure acc
-            VCon ":" [hT, tT]   -> do
-                hV <- force legacyHooks hT
-                tV <- force legacyHooks tT
-                let bit = case hV of
-                        VCon "AI_ADDRCONFIG" _ -> 1024
-                        VCon "AI_ALL" _        -> 256
-                        VCon "AI_CANONNAME" _  -> 2
-                        VCon "AI_NUMERICHOST" _ -> 4
-                        VCon "AI_NUMERICSERV" _ -> 4096
-                        VCon "AI_PASSIVE" _    -> 1
-                        VCon "AI_V4MAPPED" _   -> 2048
-                        _                       -> 0
-                go (acc .|. bit) tV
-            _ -> pure acc
-
-    conIntField :: String -> Val -> IO Word32
-    conIntField _name v = case v of
-        VCon _ [innerT] -> do
-            inner <- force legacyHooks innerT
-            case inner of
-                VInt n -> pure (fromIntegral n)
-                _      -> conByName v
-        VInt n          -> pure (fromIntegral n)
-        _               -> conByName v
-
-    -- Source-loaded constructors: map name → C value
-    conByName :: Val -> IO Word32
-    conByName (VCon n _) = case Map.lookup n socketConMap of
+socketConByName :: Val -> IO Word32
+socketConByName (VCon n _) =
+    case Map.lookup n socketConMap of
         Just v  -> pure v
         Nothing -> error ("socket con: unknown constructor " <> BC.unpack n)
-    conByName v = error ("socket con: not a constructor: " <> showValForDebug v)
+socketConByName v =
+    error ("socket con: not a constructor: " <> showValForDebug v)
 
-    socketConMap :: Map.Map ByteString Word32
-    socketConMap = Map.fromList
-        -- SocketType
-        [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
-        , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
-        -- Family (common ones)
-        , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
-        , ("AF_INET6", if isDarwin then 30 else 10)
-        ]
+socketConMap :: Map.Map ByteString Word32
+socketConMap = Map.fromList
+    [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
+    , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
+    , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
+    , ("AF_INET6", if isDarwin then 30 else 10)
+    ]
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -4611,17 +4516,14 @@ foreign import ccall unsafe "connect"
 foreign import ccall unsafe "getsockopt"
     c_getsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
 
-foreign import ccall unsafe "getaddrinfo"
-    c_getaddrinfo_host :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Ptr (Ptr Word8) -> IO CInt
-
-foreign import ccall unsafe "freeaddrinfo"
-    c_freeaddrinfo_host :: Ptr Word8 -> IO ()
-
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force legacyHooks a; bv <- force legacyHooks b
     p <- ptrValToPtr av
     case bv of
+        VCon "AddrInfo" _ -> do
+            pokeAddrInfoHintsVal p bv
+            pure VUnit
         VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
         -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
         -- values reaching @poke@ via the Char8 path arrive as

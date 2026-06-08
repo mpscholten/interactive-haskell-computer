@@ -3896,6 +3896,14 @@ classMethodDispatcher reg cls methodName = selfVal
                                                                   -- 'fallback', which raises the no-instance
                                                                   -- error.
                                                                   pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isSaturatedFunctorFallback accArgs
+                    then do
+                        mResult <- resultPolymorphicMethod
+                        case mResult of
+                            Just resultVal ->
+                                applyAll resultVal (reverse (argT : accArgs))
+                            Nothing ->
+                                pure (dispatch (remaining - 1) (argT : accArgs))
             else if isUnaryResultPolymorphicMethod cls methodName
                     then do
                         -- Arity-1 methods like @Applicative.pure@ /
@@ -3987,12 +3995,38 @@ classMethodDispatcher reg cls methodName = selfVal
       where
         tryTags [] = pure Nothing
         tryTags (tag:rest) = do
-            m0 <- lookupInstanceMethodForced reg cls tag methodName
-            mShared <- lookupInSharedRegForced cls tag methodName
-            case preferMethod m0 mShared of
+            mConcrete <- lookupConcreteInstanceMethod cls tag methodName
+            case mConcrete of
                 Just methodVal
-                  | not (isMethodPlaceholder methodVal) -> pure (Just methodVal)
-                _ -> tryTags rest
+                  | not (isMethodPlaceholder methodVal) ->
+                    pure (Just methodVal)
+                Just _methodVal ->
+                    tryFallbackOrRest tag rest
+                _ ->
+                    tryFallbackOrRest tag rest
+
+        lookupConcreteInstanceMethod c tag m = do
+            m0 <- lookupInstanceMethodForced reg c tag m
+            mShared <- lookupInSharedRegForced c tag m
+            pure (preferMethod m0 mShared)
+
+        lookupConcreteFallback tag =
+            tryFallbacks (methodFallbacks cls methodName)
+          where
+            tryFallbacks [] = pure Nothing
+            tryFallbacks ((fallbackCls, fallbackMethod) : rest) = do
+                m <- lookupConcreteInstanceMethod fallbackCls tag fallbackMethod
+                case m of
+                    Just methodVal | not (isMethodPlaceholder methodVal) ->
+                        pure (Just methodVal)
+                    _ -> tryFallbacks rest
+
+        tryFallbackOrRest tag rest = do
+            mFallback <- lookupConcreteFallback tag
+            case mFallback of
+                Just methodVal ->
+                    pure (Just methodVal)
+                Nothing -> tryTags rest
 
     resultPolymorphicDefaultTagsForArg mArgTag clsName method
         | isPureLikeResult clsName method
@@ -4056,19 +4090,19 @@ classMethodDispatcher reg cls methodName = selfVal
             , "getParserState", "updateParserState", "mkParsec"
             ]
         = [BC.pack "ParsecT"]
-        -- Applicative / Functor / Monad methods on parser monads have
-        -- the same shape as MonadParsec methods: 'm' only appears in
-        -- the result type, so argument-directed dispatch can't find
-        -- the ParsecT instance from the args alone.  Class defaults
-        -- like 'a1 *> a2 = (id <$ a1) <*> a2' may also fail to
-        -- evaluate (parser hasn't yet learned every operator they
-        -- use), leaving placeholder slots in the registry.  When the
-        -- result-polymorphic fallback gets a chance to fire, route
-        -- to ParsecT — that instance defines '*>' / '<*' / '<*>' /
-        -- 'fmap' / '>>=' explicitly.
+        -- Applicative / Functor / Monad methods can have the same shape as
+        -- MonadParsec methods: the carrier @m@ only appears in the result
+        -- type, so argument-directed dispatch cannot always find the
+        -- instance from values alone.  Source-shaped IO actions are also
+        -- State# functions at runtime, so fully-applied @fmap f action@
+        -- may have only function-shaped args until the IO instance is
+        -- selected.  Try IO / ST / STM before ParsecT for @fmap@ and
+        -- pure-like methods so ordinary source IO keeps resolving to the
+        -- source-loaded boot-library instances.  Keep @>>=@ / @>>@ on the
+        -- older ParsecT-only fallback: ST code can expose state functions
+        -- during bind dispatch, and defaulting those to IO breaks runSTArray.
         --
-        -- IO / ST / STM are tried BEFORE ParsecT for @pure@ / @return@
-        -- specifically: warp's @waitForZero@ does
+        -- This order is important for warp's @waitForZero@, which does
         -- @atomically $ do { x <- readTVar v; when (x > 0) retry }@,
         -- context.  Our STM≈IO bridge means the IO instance produces a
         -- properly-shaped @VCon "IO" [_]@ that 'runIOVal' can unwrap;
@@ -4086,7 +4120,7 @@ classMethodDispatcher reg cls methodName = selfVal
         = [BC.pack "ParsecT"]
         | clsName == BC.pack "Functor"
         , method `elem` map BC.pack ["fmap", "<$"]
-        = [BC.pack "ParsecT"]
+        = [BC.pack "IO", BC.pack "ST", BC.pack "STM", BC.pack "ParsecT"]
         | clsName == BC.pack "Monad"
         , method `elem` map BC.pack ["return"]
         = [BC.pack "IO", BC.pack "ST", BC.pack "STM", BC.pack "ParsecT"]
@@ -4114,6 +4148,23 @@ classMethodDispatcher reg cls methodName = selfVal
     isFoldableElementArg =
         cls == BC.pack "Foldable"
         && methodName `elem` map BC.pack ["elem", "notElem"]
+
+    isSaturatedFunctorFallback accArgs =
+        cls == BC.pack "Functor"
+        && methodName `elem` map BC.pack ["fmap", "<$"]
+        && length accArgs == 1
+
+    -- Modern base keeps these as class defaults.  If an instance method
+    -- slot is a placeholder, use the law-equivalent superclass method
+    -- that has the concrete source body.
+    methodFallbacks c m
+        | c == BC.pack "Monad"
+        , m == BC.pack "return" =
+            [(BC.pack "Applicative", BC.pack "pure")]
+        | c == BC.pack "Monad"
+        , m == BC.pack ">>" =
+            [(BC.pack "Applicative", BC.pack "*>")]
+        | otherwise = []
 
     -- | Classes whose IO instance source-loads: when a container arg
     -- has the host 'VIO' tag "<IO>", normalise to "IO" so the
