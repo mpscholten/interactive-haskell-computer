@@ -1324,6 +1324,9 @@ bareConName n = case BC.elemIndexEnd '.' n of
     Just idx -> BC.drop (idx + 1) n
     Nothing  -> n
 
+sameConName :: Name -> Name -> Bool
+sameConName a b = a == b || bareConName a == bareConName b
+
 -- | Attempt to match a constructor pattern against a value via the
 -- pattern synonym registry: if @name@ is registered as a pattern
 -- synonym with parameters @ps@ and body @b@, substitute @ps -> args@
@@ -1684,8 +1687,8 @@ matchPat hooks pat@(PCon pname _) (VCon "SomeException" [innerT])
         inner <- force hooks innerT
         matchPat hooks pat inner
 matchPat hooks (PCon name pats) v@(VCon vname vthunks)
-    | name == vname && (length pats == length vthunks
-                        || null pats) =
+    | sameConName name vname && (length pats == length vthunks
+                                 || null pats) =
         -- null pats: desugared from Con {..} where field registry
         -- doesn't know the fields.  Match the constructor name,
         -- ignore field count.
