@@ -681,7 +681,6 @@ builtins reg =
     --   bigNatToWordMaybe# :: BigNat# -> (# (# #) | Word# #)
     --   bigNatToAddr* / bigNatFromAddr* / bigNatTo|FromByteArray* /
     --     bigNatFromWordArray*                         (IO + Addr#)
-    , ("bigNatFromAbsInt#",        bigNatFromAbsIntHashB)     -- Int# -> BigNat#
     , ("bigNatFromWord64#",        bigNatFromWordB)           -- alias on 64-bit
     , ("bigNatEncodeDouble#",      bigNatEncodeDoubleHashB)   -- m * 2^e
     -- Integer <-> BigNat# bridges (from GHC.Num.Integer)
@@ -690,8 +689,6 @@ builtins reg =
     , ("integerFromBigNatSign#",   integerFromBigNatSignHashB)
     , ("integerToBigNatClamp#",    integerToBigNatClampHashB)
     -- Logarithms
-    , ("bigNatLog2#",              bigNatLog2HashB)           -- BigNat# -> Word#
-    , ("bigNatLogBase#",           bigNatLogBaseHashB)        -- BigNat# -> BigNat# -> Word#
     -- bigNatLogBaseWord# source-loads from ghc-bignum:
     -- base <= 1 -> unexpectedValue_Word#; base == 2 -> bigNatLog2#;
     -- otherwise bigNatLogBase# (bigNatFromWord# base) a.
@@ -976,6 +973,7 @@ builtins reg =
     -- GHC.Prim primop, no .hs source.  Required by source-loaded
     -- ghc-bignum word/BigNat trailing-zero helpers.
     , ("ctz#",       ctzHashB)
+    , ("clz#",       clzHashB)
     , ("indexOfTheOnlyBit#", indexOfTheOnlyBitB)
     -- Phase 2.8: Int# arithmetic primops
     , ("negateInt#",   negateIntB)
@@ -3260,20 +3258,6 @@ bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error
             ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
 
--- | Phase 2.D: @bigNatFromAbsInt# :: Int# -> BigNat#@ — absolute
--- value of an Int# as a BigNat.  ghc-bignum uses this for the
--- @IS k@ → BigNat# transition in 'integerNegate' etc.  For
--- @minBound :: Int@, the magnitude exceeds maxBound, so we use
--- 'abs' over 'Integer' to avoid overflow.
-bigNatFromAbsIntHashB :: IO Val
-bigNatFromAbsIntHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt i ->
-            pure (VPrimObj (PrimBigNat (fromInteger (abs (toInteger i)))))
-        _ -> error
-            ("bigNatFromAbsInt#: not an Int#: " <> showValForDebug av)
-
 -- | Phase 2.D: @bigNatEncodeDouble# :: BigNat# -> Int# -> Double#@
 -- — returns @m * 2^e@ as a Double#.  Uses host 'encodeFloat'
 -- which is the canonical Haskell primitive for this conversion.
@@ -3384,46 +3368,6 @@ integerToBigNatClampHashB = pure $ VFun $ \a -> do
         VCon "IN" _ -> pure (VPrimObj (PrimBigNat 0))
         _ -> error
             ("integerToBigNatClamp#: not an Integer: " <> showValForDebug av)
-
--- | Phase 2.D: @bigNatLog2# :: BigNat# -> Word#@ — floor(log2 n).
--- ghc-bignum returns 0 for n = 0; we match that.
-bigNatLog2HashB :: IO Val
-bigNatLog2HashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatLog2#" av
-    pure (VInt (fromIntegral (naturalLog2 n)))
-
--- | Pure helper for floor(log2 n).  Returns 0 for n = 0
--- (matching ghc-bignum's @bigNatLog2# 0 == 0##@).
-naturalLog2 :: Natural -> Int
-naturalLog2 0 = 0
-naturalLog2 n = go 0 n
-  where
-    go !i 1 = i
-    go !i k = go (i + 1) (k `shiftR` 1)
-
--- | Phase 2.D: @bigNatLogBase# :: BigNat# -> BigNat# -> Word#@.
--- ghc-bignum raises 'unexpectedValue_Word#' for base ≤ 1; we
--- 'error' (matches the host shim convention for source-loaded
--- @raiseUnexpectedValue@).
-bigNatLogBaseHashB :: IO Val
-bigNatLogBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- extractBigNat "bigNatLogBase#" av
-    n    <- extractBigNat "bigNatLogBase#" bv
-    pure (VInt (fromIntegral (naturalLogBase base n)))
-
--- | Pure helper for floor(log_b n).  Errors if @b <= 1@ (matches
--- ghc-bignum's @unexpectedValue_Word#@).  Returns 0 for n = 0 as a
--- practical default; ghc-bignum's source is undefined here.
-naturalLogBase :: Natural -> Natural -> Int
-naturalLogBase b _ | b <= 1 = error "bigNatLogBase#: base must be > 1"
-naturalLogBase _ 0          = 0
-naturalLogBase 2 n          = naturalLog2 n
-naturalLogBase b n          = go 0 n
-  where
-    go !i k | k < b     = i
-            | otherwise = go (i + 1) (k `div` b)
 
 -- | @bigNatZero# :: (# #) -> BigNat#@ — constant zero BigNat.  The
 -- @(# #)@ argument is the unit unboxed tuple ghc-bignum uses to
@@ -4977,6 +4921,17 @@ ctzHashB = pure $ VFun $ \a -> do
                   | otherwise = countTrailingZeros w
             in pure (VInt (fromIntegral z))
         _ -> error ("ctz#: bad arg: " <> showValForDebug av)
+
+clzHashB :: IO Val
+clzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let w = fromIntegral n :: Word64
+                z | w == 0    = 64
+                  | otherwise = countLeadingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("clz#: bad arg: " <> showValForDebug av)
 
 indexOfTheOnlyBitB :: IO Val
 indexOfTheOnlyBitB = pure $ VFun $ \a -> do
