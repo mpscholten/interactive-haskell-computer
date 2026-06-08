@@ -42,8 +42,6 @@ import Control.Exception
     , throwTo
     , SomeException
     )
-import Foreign.C.Error (Errno(..), getErrno, eINTR, eINPROGRESS)
-import Foreign.C.Types (CInt(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
@@ -65,11 +63,11 @@ import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, newForeignPtr_
     , plusForeignPtr )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (allocaBytes, mallocBytes)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff)
 import qualified System.Info
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -1096,9 +1094,8 @@ builtins reg =
     -- import dispatches through the generic FFI path.
     -- Network.Socket.Syscall.accept source-loads; its accept(2) foreign
     -- import dispatches through the generic FFI path.
-    -- connect(2) — host-backed because the interpreted connectLoop
-    -- triggers excessive lazy discovery (~5000 bindings) that hangs.
-    , ("Network.Socket.Syscall.connect", socketConnectB)
+    -- Network.Socket.Syscall.connect source-loads; its connect(2) foreign
+    -- import dispatches through the generic FFI path.
     -- Network.Socket.Name.getSocketName source-loads; its getsockname(2)
     -- foreign import dispatches through the generic FFI path.
     -- Network.Socket.Syscall.bind source-loads; its bind(2) foreign import
@@ -4310,21 +4307,6 @@ peekSaFamily p = do
         then pure (fromIntegral raw16)         -- Linux: plain sa_family
         else peekByteOff p 1 :: IO Word8       -- macOS: sa_family after sa_len
 
--- | Write @sa_family@ to a @struct sockaddr@.  On macOS writes
--- sa_len + sa_family (offsets 0 + 1); on Linux writes sa_family
--- as a Word16 at offset 0.
-pokeSaFamily :: Ptr Word8 -> Word8 -> IO ()
-pokeSaFamily p fam
-    | isDarwin  = do
-        pokeByteOff p 0 (0 :: Word8)   -- sa_len (set by bind/connect)
-        pokeByteOff p 1 fam
-    | otherwise =
-        pokeByteOff p 0 (fromIntegral fam :: Word16)
-
--- | AF_INET6 value for the current platform.
-afInet6 :: Word8
-afInet6 = if isDarwin then 30 else 10
-
 -- | Detect macOS at runtime via System.Info.
 isDarwin :: Bool
 isDarwin = System.Info.os == "darwin"
@@ -4401,96 +4383,6 @@ htons16 = byteSwap16
 htonl32 :: Word32 -> Word32
 htonl32 = byteSwap32
 
--- | Host-backed @connect :: Socket -> SockAddr -> IO ()@.
--- Handles non-blocking sockets: retries on EINTR, waits via
--- threadWaitWrite on EINPROGRESS, then checks SO_ERROR.
-socketConnectB :: IO Val
-socketConnectB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    addrV <- force legacyHooks addrT
-    fd <- socketFdFromVal sockV
-    (sz, pokeAddr) <- sockAddrPoke addrV
-    allocaBytes sz $ \p -> do
-        fillBytes p 0 sz
-        pokeAddr (castPtr p)
-        let connectLoop = do
-                rc <- c_connect_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
-                if rc == 0
-                    then pure ()
-                    else do
-                        Errno e <- getErrno
-                        if Errno e == eINTR
-                            then connectLoop
-                            else if Errno e == eINPROGRESS
-                                then do
-                                    threadWaitWrite (fromIntegral fd)
-                                    -- Check SO_ERROR after connect completes
-                                    allocaBytes (sizeOf (undefined :: CInt)) $ \optP -> do
-                                        allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-                                            poke (castPtr lenP :: Ptr CInt) (fromIntegral (sizeOf (undefined :: CInt)))
-                                            _ <- c_getsockopt_host (fromIntegral fd) 1 4 (castPtr optP) (castPtr lenP)
-                                            soErr <- peek (castPtr optP :: Ptr CInt)
-                                            if soErr /= 0
-                                                then ioError (userError ("Network.Socket.connect: SO_ERROR=" <> show soErr))
-                                                else pure ()
-                                else ioError (userError ("Network.Socket.connect: errno=" <> show e))
-        connectLoop
-        pure VUnit
-
-socketFdFromVal :: Val -> IO Int64
-socketFdFromVal v = do
-    fdV <- socketCurrentFdVal v
-    case fdV of
-        VInt fd -> pure fd
-        other   -> error ("Socket fd is not an Int: " <> showValForDebug other)
-
-socketCurrentFdVal :: Val -> IO Val
-socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
-    refV <- force legacyHooks refT
-    rf <- primIORefFromVal refV
-    readIORef rf >>= force legacyHooks
-socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
-
-primIORefFromVal :: Val -> IO (IORef Thunk)
-primIORefFromVal (VPrimObj (PrimIORef rf)) = pure rf
-primIORefFromVal (VCon "IORef" [stRefT]) = do
-    stRefV <- force legacyHooks stRefT
-    primIORefFromVal stRefV
-primIORefFromVal (VCon "STRef" [primT]) = do
-    primV <- force legacyHooks primT
-    primIORefFromVal primV
-primIORefFromVal other =
-    error ("Socket ref is not an IORef: " <> showValForDebug other)
-
-sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
-sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
-    port <- intField "SockAddrInet.port" portT
-    addr <- intField "SockAddrInet.addr" addrT
-    -- HostAddress is a Word32 already in network byte order (its host-LE
-    -- bytes ARE the network bytes).  PortNumber is host order, so htons
-    -- is required for sin_port; sin_addr is poked raw.
-    pure (16, \p -> do
-        pokeSaFamily p 2
-        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
-        pokeByteOff p 4 (fromIntegral addr :: Word32))
-sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
-    port <- intField "SockAddrInet6.port" portT
-    flow <- intField "SockAddrInet6.flow" flowT
-    scope <- intField "SockAddrInet6.scope" scopeT
-    (a0, a1, a2, a3) <- hostAddress6Fields addrT
-    -- HostAddress6 = (Word32, Word32, Word32, Word32) in HOST byte order,
-    -- so each chunk needs htonl on poke.  ScopeID is raw (host concept).
-    pure (28, \p -> do
-        pokeSaFamily p afInet6
-        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
-        pokeByteOff p 4 (htonl32 (fromIntegral flow) :: Word32)
-        pokeByteOff p 8 (htonl32 (fromIntegral a0) :: Word32)
-        pokeByteOff p 12 (htonl32 (fromIntegral a1) :: Word32)
-        pokeByteOff p 16 (htonl32 (fromIntegral a2) :: Word32)
-        pokeByteOff p 20 (htonl32 (fromIntegral a3) :: Word32)
-        pokeByteOff p 24 (fromIntegral scope :: Word32))
-sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug other)
-
 hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)
 hostAddress6Fields addrT = do
     addrV <- force legacyHooks addrT
@@ -4509,12 +4401,6 @@ intField label t = do
     case v of
         VInt n -> pure n
         other  -> error (label <> " is not an Int: " <> showValForDebug other)
-
-foreign import ccall unsafe "connect"
-    c_connect_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
-
-foreign import ccall unsafe "getsockopt"
-    c_getsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
