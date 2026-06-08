@@ -617,9 +617,9 @@ builtins reg =
     , ("bigNatLe#",                makeBigNatCmpOp "bigNatLe#" (<=))
     , ("bigNatGt#",                makeBigNatCmpOp "bigNatGt#" (>))
     , ("bigNatGe#",                makeBigNatCmpOp "bigNatGe#" (>=))
-    , ("bigNatIsZero#",            makeBigNatUnaryBool "bigNatIsZero#" (== 0))
-    , ("bigNatIsOne#",             makeBigNatUnaryBool "bigNatIsOne#" (== 1))
-    , ("bigNatSize#",              bigNatSizeHashB)       -- BigNat# -> Int# (limb count)
+    -- bigNatSize#, bigNatIsZero#, and bigNatIsOne# source-load from
+    -- ghc-bignum; their bodies bottom on wordArraySize# and
+    -- indexWordArray#, which are retained lower leaves.
     -- Phase 2.B: arithmetic primops.  Thin wrappers over host
     -- 'Numeric.Natural' arithmetic.  Signatures from
     -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
@@ -3072,14 +3072,6 @@ makeBigNatCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     nb <- extractBigNat name bv
     pure (primBoolVal (op na nb))
 
--- | Phase 2.A: unary BigNat# predicate primop, returning @Bool#@.
--- Used for @bigNatIsZero#@ and @bigNatIsOne#@.
-makeBigNatUnaryBool :: String -> (Natural -> Bool) -> IO Val
-makeBigNatUnaryBool name p = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat name av
-    pure (primBoolVal (p n))
-
 -- | @bigNatCompare :: BigNat# -> BigNat# -> Ordering@ — note no
 -- @#@ suffix; ghc-bignum's source returns the lifted 'Ordering'
 -- type.  The unboxed-tuple-returning @bigNatCompare#@ name listed
@@ -3094,20 +3086,10 @@ bigNatCompareB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         EQ -> VCon "EQ" []
         GT -> VCon "GT" []
 
--- | @bigNatSize# :: BigNat# -> Int#@ — returns the number of
--- 64-bit Word# limbs needed to represent the BigNat in
--- ghc-bignum's canonical layout.  For our 'Natural'-backed
--- representation we compute it via repeated 64-bit shifts,
--- matching @wordArraySize#@'s O(limbs) cost.  By convention,
--- @bigNatSize# 0## == 0#@ (ghc-bignum BigNat.hs:81 + 111-112).
-bigNatSizeHashB :: IO Val
-bigNatSizeHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatSize#" av
-    pure (VInt (fromIntegral (bigNatLimbCount n)))
-
 -- | Count 64-bit limbs in a 'Natural'.  Zero is canonically
--- represented with size 0 in ghc-bignum.
+-- represented with size 0 in ghc-bignum.  Used by the retained
+-- sizeofByteArray# PrimBigNat leaf so source-loaded wordArraySize#
+-- observes the same limb count.
 bigNatLimbCount :: Natural -> Int
 bigNatLimbCount = go 0
   where
