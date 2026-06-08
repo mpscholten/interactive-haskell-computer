@@ -1762,17 +1762,32 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     discoverRequestedReexport builtinNames registry searchPath includeMap targetLm n
         | not (exportsMissingName targetLm n) = pure ()
         | otherwise = do
-            mProvider <- resolveImport registry searchPath includeMap targetLm n
-                            `catch` (\(_ :: SomeException) -> pure Nothing)
-            case mProvider of
-                Nothing -> pure ()
-                Just providerName -> do
-                    mProviderLm <- (Just <$> loadModule registry searchPath includeMap providerName)
-                                      `catch` (\(_ :: SomeException) -> pure Nothing)
-                    case mProviderLm of
+            case builtinReexportTarget builtinNames targetLm n of
+                Just target ->
+                    insertLmBody targetLm n (EVar target)
+                Nothing -> do
+                    mProvider <- resolveImport registry searchPath includeMap targetLm n
+                                    `catch` (\(_ :: SomeException) -> pure Nothing)
+                    case mProvider of
                         Nothing -> pure ()
-                        Just providerLm ->
-                            discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
+                        Just providerName -> do
+                            mProviderLm <- (Just <$> loadModule registry searchPath includeMap providerName)
+                                              `catch` (\(_ :: SomeException) -> pure Nothing)
+                            case mProviderLm of
+                                Nothing -> pure ()
+                                Just providerLm ->
+                                    discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
+
+    builtinReexportTarget builtinNames targetLm n =
+        case [ fqn
+             | imp' <- mhImports (lmHeader targetLm)
+             , not (impQualified imp')
+             , specAllows (impSpec imp') n
+             , let fqn = impModule imp' <> BC.pack "." <> n
+             , Set.member fqn builtinNames
+             ] of
+            target : _ -> Just target
+            []         -> Nothing
 
     discoverFastPathProviders builtinNames registry searchPath includeMap targetLm bodies requested = do
         providerPairs <- fmap (Set.toList . Set.fromList . concat) $
