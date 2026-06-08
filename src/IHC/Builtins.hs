@@ -1088,12 +1088,8 @@ builtins reg =
     , ("Foreign.Storable.alignment", alignmentB)
     , ("GHC.Internal.Foreign.Storable.alignment", alignmentB)
     , ("Network.Socket.Imports.alignment", alignmentB)
-    -- Network.Socket.socket creates an OS file descriptor and wraps it in
-    -- network's Socket constructor.  The fd allocation is inherently an
-    -- OS/RTS boundary, so IHC hosts this syscall while preserving the source
-    -- Socket value shape used by the rest of the interpreted network package.
-    , ("socket", socketCreateB)
-    , ("Network.Socket.Syscall.socket", socketCreateB)
+    -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
+    -- import dispatches through the generic FFI path.
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
     -- lower setSockOpt foreign imports.
     -- Network.Socket.Syscall.listen source-loads; its listen(2) foreign
@@ -4500,21 +4496,6 @@ htons16 = byteSwap16
 htonl32 :: Word32 -> Word32
 htonl32 = byteSwap32
 
-socketCreateB :: IO Val
-socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $ \protocolT -> pure $ VIO $ do
-    family <- familyField familyT
-    stype <- socketTypeField stypeT
-    protocol <- intField "socket.protocol" protocolT
-    fd <- c_socket_host (fromIntegral family) (fromIntegral stype) (fromIntegral protocol)
-    if fd == -1
-        then ioError (userError "Network.Socket.socket")
-        else do
-            fdT <- newWHNFThunk (VInt (fromIntegral fd))
-            ref <- newIORef fdT
-            refV <- mkSourceIORefVal ref
-            refT <- newWHNFThunk refV
-            pure (VCon "Socket" [refT, fdT])
-
 -- | Host-backed @connect :: Socket -> SockAddr -> IO ()@.
 -- Handles non-blocking sockets: retries on EINTR, waits via
 -- threadWaitWrite on EINPROGRESS, then checks SO_ERROR.
@@ -4564,12 +4545,6 @@ socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
     rf <- primIORefFromVal refV
     readIORef rf >>= force legacyHooks
 socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
-
-mkSourceIORefVal :: IORef Thunk -> IO Val
-mkSourceIORefVal ref = do
-    primT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-    stRefT <- newWHNFThunk (VCon "STRef" [primT])
-    pure (VCon "IORef" [stRefT])
 
 primIORefFromVal :: Val -> IO (IORef Thunk)
 primIORefFromVal (VPrimObj (PrimIORef rf)) = pure rf
@@ -4629,37 +4604,6 @@ intField label t = do
     case v of
         VInt n -> pure n
         other  -> error (label <> " is not an Int: " <> showValForDebug other)
-
-familyField :: Thunk -> IO Int64
-familyField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "Family" [nT] -> intField "socket.family" nT
-        -- Source-loaded Family constructors
-        VCon "AF_UNSPEC" [] -> pure 0
-        VCon "AF_UNIX"   [] -> pure 1
-        VCon "AF_INET"   [] -> pure 2
-        VCon "AF_INET6"  [] -> pure (if isDarwin then 30 else 10)
-        VInt n              -> pure n
-        other               -> error ("socket.family: not a Family: " <> showValForDebug other)
-
-socketTypeField :: Thunk -> IO Int64
-socketTypeField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "SocketType" [nT] -> intField "socket.type" nT
-        -- Source-loaded SocketType constructors from Network.Socket.Types
-        VCon "NoSocketType"  [] -> pure 0
-        VCon "Stream"        [] -> pure 1
-        VCon "Datagram"      [] -> pure 2
-        VCon "Raw"           [] -> pure 3
-        VCon "RDM"           [] -> pure 4
-        VCon "SeqPacket"     [] -> pure 5
-        VInt n                  -> pure n
-        other                   -> error ("socket.type: not a SocketType: " <> showValForDebug other)
-
-foreign import ccall unsafe "socket"
-    c_socket_host :: CInt -> CInt -> CInt -> IO CInt
 
 foreign import ccall unsafe "connect"
     c_connect_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
