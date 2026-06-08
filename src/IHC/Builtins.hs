@@ -1107,9 +1107,8 @@ builtins reg =
     , ("Network.Socket.Syscall.connect", socketConnectB)
     -- Network.Socket.Name.getSocketName source-loads; its getsockname(2)
     -- foreign import dispatches through the generic FFI path.
-    -- Network.Socket.SockAddr.bind source-loads; the fd-level bind(2) boundary
-    -- stays in Network.Socket.Syscall.
-    , ("Network.Socket.Syscall.bind", socketBindB)
+    -- Network.Socket.Syscall.bind source-loads; its bind(2) foreign import
+    -- dispatches through the generic FFI path.
     -- Network.Socket.Types.close / close' source-load; the actual close(2)
     -- happens through lower foreign imports / closeFdWith.
     -- Network.Socket.Types.withFdSocket source-loads over the Socket IORef.
@@ -4503,22 +4502,6 @@ htons16 = byteSwap16
 htonl32 :: Word32 -> Word32
 htonl32 = byteSwap32
 
-socketBindB :: IO Val
-socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    addrV <- force legacyHooks addrT
-    fd <- socketFdFromVal sockV
-    (sz, pokeAddr) <- sockAddrPoke addrV
-    allocaBytes sz $ \p -> do
-        fillBytes p 0 sz
-        pokeAddr (castPtr p)
-        rc <- c_bind_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
-        if rc == -1
-            then do
-                Errno e <- getErrno
-                ioError (userError ("Network.Socket.bind: errno=" <> show e))
-            else pure VUnit
-
 socketCreateB :: IO Val
 socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $ \protocolT -> pure $ VIO $ do
     family <- familyField familyT
@@ -4721,9 +4704,6 @@ c_setBlocking fd = do
 
 foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
 
-foreign import ccall unsafe "bind"
-    c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
-
 foreign import ccall unsafe "connect"
     c_connect_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
 
@@ -4788,18 +4768,88 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
     av <- force legacyHooks a; bv <- force legacyHooks b; cv <- force legacyHooks c
     p <- ptrValToPtr av
     case bv of
-        VInt off ->
-            case cv of
-                VInt n -> do
-                    pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
-                    pure VUnit
-                _ | off == 24 || off == 32 || off == 40 -> do
-                    ptr <- ptrValToPtr cv
-                    pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)
-                        (fromIntegral (ptrToIntPtr (castPtr ptr)) :: Word64)
-                    pure VUnit
-                _ -> error ("pokeByteOff: value not an Int: " <> showValForDebug cv)
+        VInt off -> do
+            handled <- pokeSockAddrByteOff p (fromIntegral off) cv
+            if handled
+                then pure VUnit
+                else case cv of
+                    VInt n -> do
+                        pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
+                        pure VUnit
+                    _ | off == 24 || off == 32 || off == 40 -> do
+                        ptr <- ptrValToPtr cv
+                        pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)
+                            (fromIntegral (ptrToIntPtr (castPtr ptr)) :: Word64)
+                        pure VUnit
+                    _ -> error ("pokeByteOff: value not an Int: " <> showValForDebug cv)
         _ -> error ("pokeByteOff: bad args: " <> showValForDebug av)
+
+pokeSockAddrByteOff :: Ptr Word8 -> Int -> Val -> IO Bool
+pokeSockAddrByteOff p off v = do
+    mLen <- lookupSockAddrBuffer p
+    case (mLen, off) of
+        (Just 16, 0) -> pokeWord16Raw p off v
+        (Just 16, 2) -> pokePortNumber p off v
+        (Just 16, 4) -> pokeWord32Raw p off v
+        (Just 28, 0) -> pokeWord16Raw p off v
+        (Just 28, 2) -> pokePortNumber p off v
+        (Just 28, 4) -> pokeWord32Raw p off v
+        (Just 28, 8) -> pokeIn6Addr p off v
+        (Just 28, 24) -> pokeWord32Raw p off v
+        _ -> pure False
+  where
+    pokeWord16Raw ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr Word16" val
+        pokeByteOff (castPtr ptr :: Ptr Word16) byteOff (fromIntegral n :: Word16)
+        pure True
+    pokePortNumber ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr PortNumber" val
+        pokeByteOff (castPtr ptr :: Ptr Word16) byteOff (htons16 (fromIntegral n) :: Word16)
+        pure True
+    pokeWord32Raw ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr Word32" val
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (fromIntegral n :: Word32)
+        pure True
+    pokeIn6Addr ptr byteOff (VCon "In6Addr" [addrT]) = do
+        (a0, a1, a2, a3) <- hostAddress6Fields addrT
+        pokeNetwork32 ptr byteOff      a0
+        pokeNetwork32 ptr (byteOff + 4)  a1
+        pokeNetwork32 ptr (byteOff + 8)  a2
+        pokeNetwork32 ptr (byteOff + 12) a3
+        pure True
+    pokeIn6Addr ptr byteOff other = do
+        n <- intVal "pokeByteOff sockaddr In6Addr" other
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (fromIntegral n :: Word32)
+        pure True
+    pokeNetwork32 ptr byteOff n =
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (htonl32 (fromIntegral n) :: Word32)
+
+intVal :: String -> Val -> IO Int64
+intVal _ (VInt n) = pure n
+intVal _ (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = pure (fromInteger n)
+intVal label (VCon con [t])
+    | bareRuntimeCon con `elem` numericRuntimeNewtypes =
+        force legacyHooks t >>= intVal label
+intVal label other =
+    error (label <> ": expected numeric value, got " <> showValForDebug other)
+
+bareRuntimeCon :: ByteString -> ByteString
+bareRuntimeCon n = case BC.elemIndexEnd '.' n of
+    Just idx -> BC.drop (idx + 1) n
+    Nothing  -> n
+
+numericRuntimeNewtypes :: [ByteString]
+numericRuntimeNewtypes =
+    map BC.pack
+        [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
+        , "CShort", "CUShort", "CLLong", "CULLong"
+        , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
+        , "Int8", "Int16", "Int32", "Int64"
+        , "Word", "Word8", "Word16", "Word32", "Word64"
+        , "PortNum", "Family"
+        ]
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: MutableByteArray# family (backed by IORef ByteString)

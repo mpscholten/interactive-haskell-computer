@@ -21,6 +21,8 @@ module IHC.Val
       -- * Host pointer metadata
     , markTypedHostPtr
     , lookupTypedHostPtr
+    , markSockAddrBuffer
+    , lookupSockAddrBuffer
       -- * Environments
     , Env
     , emptyEnv
@@ -259,6 +261,20 @@ markTypedHostPtr p ty =
 lookupTypedHostPtr :: Ptr a -> IO (Maybe ByteString)
 lookupTypedHostPtr p =
     Map.lookup (ptrToIntPtr p) <$> readIORef typedHostPtrsRef
+
+{-# NOINLINE sockAddrBuffersRef #-}
+sockAddrBuffersRef :: IORef (Map.Map IntPtr Int)
+sockAddrBuffersRef = unsafePerformIO (newIORef Map.empty)
+
+markSockAddrBuffer :: Ptr a -> Int -> IO ()
+markSockAddrBuffer p len
+    | len == 16 || len == 28 =
+        modifyIORef' sockAddrBuffersRef (Map.insert (ptrToIntPtr p) len)
+    | otherwise = pure ()
+
+lookupSockAddrBuffer :: Ptr a -> IO (Maybe Int)
+lookupSockAddrBuffer p =
+    Map.lookup (ptrToIntPtr p) <$> readIORef sockAddrBuffersRef
 
 --------------------------------------------------------------------------------
 -- Environments
