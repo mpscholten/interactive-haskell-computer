@@ -1106,10 +1106,8 @@ builtins reg =
     -- connect(2) — host-backed because the interpreted connectLoop
     -- triggers excessive lazy discovery (~5000 bindings) that hangs.
     , ("Network.Socket.Syscall.connect", socketConnectB)
-    -- Network.Socket.SockAddr.getSocketName source-loads and delegates to
-    -- Network.Socket.Name.getSocketName, the getsockname(2) boundary used by
-    -- Warp to populate connMySockAddr.
-    , ("Network.Socket.Name.getSocketName", socketGetNameB)
+    -- Network.Socket.Name.getSocketName source-loads; its getsockname(2)
+    -- foreign import dispatches through the generic FFI path.
     -- Network.Socket.SockAddr.bind source-loads; the fd-level bind(2) boundary
     -- stays in Network.Socket.Syscall.
     , ("Network.Socket.Syscall.bind", socketBindB)
@@ -4612,19 +4610,6 @@ socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
         addrT <- newWHNFThunk addrV
         pure (VCon "(,)" [sockOutT, addrT])
 
-socketGetNameB :: IO Val
-socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    allocaBytes 128 $ \addrP ->
-      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        fillBytes addrP 0 128
-        poke (castPtr lenP :: Ptr CInt) 128
-        rc <- c_getsockname_host (fromIntegral fd) (castPtr addrP) (castPtr lenP)
-        if rc == -1
-            then ioError (userError "Network.Socket.getSocketName")
-            else peekSockAddrVal (castPtr addrP)
-
 socketFdFromVal :: Val -> IO Int64
 socketFdFromVal v = do
     fdV <- socketCurrentFdVal v
@@ -4750,9 +4735,6 @@ c_setBlocking fd = do
     pure ()
 
 foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall unsafe "getsockname"
-    c_getsockname_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
 
 foreign import ccall unsafe "bind"
     c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
