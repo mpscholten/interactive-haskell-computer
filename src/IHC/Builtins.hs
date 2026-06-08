@@ -1093,37 +1093,30 @@ builtins reg =
     -- OS/RTS boundary, so IHC hosts this syscall while preserving the source
     -- Socket value shape used by the rest of the interpreted network package.
     , ("socket", socketCreateB)
-    , ("Network.Socket.socket", socketCreateB)
     , ("Network.Socket.Syscall.socket", socketCreateB)
     -- setsockopt is an OS syscall.  Keep the Haskell option constants and
     -- Socket shape, but perform the fd-level call in the host.
     , ("setSocketOption", socketSetOptionB)
-    , ("Network.Socket.setSocketOption", socketSetOptionB)
     , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
     -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
     , ("listen", socketListenB)
-    , ("Network.Socket.listen", socketListenB)
     , ("Network.Socket.Syscall.listen", socketListenB)
     -- accept(2) blocks for the next connection and returns a network Socket
     -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
     -- above it remains source-interpreted.
     , ("accept", socketAcceptB)
-    , ("Network.Socket.accept", socketAcceptB)
     , ("Network.Socket.SockAddr.accept", socketAcceptB)
     , ("Network.Socket.Syscall.accept", socketAcceptB)
     -- connect(2) — host-backed because the interpreted connectLoop
     -- triggers excessive lazy discovery (~5000 bindings) that hangs.
     , ("connect", socketConnectB)
-    , ("Network.Socket.connect", socketConnectB)
     , ("Network.Socket.SockAddr.connect", socketConnectB)
     , ("Network.Socket.Syscall.connect", socketConnectB)
     -- getsockname(2), used by Warp to populate connMySockAddr.
     , ("getSocketName", socketGetNameB)
-    , ("Network.Socket.getSocketName", socketGetNameB)
     , ("Network.Socket.SockAddr.getSocketName", socketGetNameB)
     , ("Network.Socket.Name.getSocketName", socketGetNameB)
     , ("bind", socketBindB)
-    , ("Network.Socket.bind", socketBindB)
     , ("Network.Socket.SockAddr.bind", socketBindB)
     , ("Network.Socket.Syscall.bind", socketBindB)
     -- Network.Socket.bind is the actual OS bind(2) boundary for AF_INET/AF_INET6
@@ -1135,15 +1128,12 @@ builtins reg =
     -- close(2) in the host.
     , ("close", socketCloseB False)
     , ("close'", socketCloseB True)
-    , ("Network.Socket.close", socketCloseB False)
-    , ("Network.Socket.close'", socketCloseB True)
     , ("Network.Socket.Types.close", socketCloseB False)
     , ("Network.Socket.Types.close'", socketCloseB True)
     -- Network.Socket.withFdSocket reads the live fd out of the mutable Socket
     -- cell and runs an IO callback. The Socket is host-backed already, so we
     -- bridge this directly rather than re-entering the interpreted wrapper.
     , ("withFdSocket", withFdSocketB)
-    , ("Network.Socket.withFdSocket", withFdSocketB)
     , ("Network.Socket.Types.withFdSocket", withFdSocketB)
     -- Network.Socket's Socket value is already represented by IHC as a
     -- host-backed fd-bearing constructor. fdSocket/unsafeFdSocket expose that
@@ -1151,8 +1141,6 @@ builtins reg =
     -- existing host socket object rather than a Hackage-library shim.
     , ("fdSocket", socketFdB)
     , ("unsafeFdSocket", socketFdB)
-    , ("Network.Socket.fdSocket", socketFdB)
-    , ("Network.Socket.unsafeFdSocket", socketFdB)
     , ("Network.Socket.Types.fdSocket", socketFdB)
     , ("Network.Socket.Types.unsafeFdSocket", socketFdB)
     -- sendBuf/recvBuf are the fd-level OS send(2)/recv(2) boundaries used by
@@ -1162,8 +1150,6 @@ builtins reg =
     , ("recvBuf", socketRecvBufB)
     , ("Network.Socket.Buffer.sendBuf", socketSendBufB)
     , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
-    , ("Network.Socket.sendBuf", socketSendBufB)
-    , ("Network.Socket.recvBuf", socketRecvBufB)
     -- Phase C.3 (builtins-removal): the @Settings@ field accessors
     -- (settingsPort/Host/Timeout/FdCacheDuration/FileInfoCacheDuration)
     -- used to live here as positional shims that indexed into a host-
@@ -1181,7 +1167,6 @@ builtins reg =
     -- ignore hints (NULL) for now — the OS gives back a TCP-stream-
     -- compatible list anyway, which is all warp examines.
     , ("getAddrInfo",     getAddrInfoB)
-    , ("Network.Socket.getAddrInfo", getAddrInfoB)
     , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
     -- Phase 2.8: additional numeric ops needed by containers (graduated)
     --   * 'fromInteger' (Num class) → 'Num Int.fromInteger'
