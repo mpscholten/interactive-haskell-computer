@@ -704,7 +704,9 @@ builtins reg =
     -- Logarithms
     , ("bigNatLog2#",              bigNatLog2HashB)           -- BigNat# -> Word#
     , ("bigNatLogBase#",           bigNatLogBaseHashB)        -- BigNat# -> BigNat# -> Word#
-    , ("bigNatLogBaseWord#",       bigNatLogBaseWordHashB)    -- Word# -> BigNat# -> Word#
+    -- bigNatLogBaseWord# source-loads from ghc-bignum:
+    -- base <= 1 -> unexpectedValue_Word#; base == 2 -> bigNatLog2#;
+    -- otherwise bigNatLogBase# (bigNatFromWord# base) a.
     -- Phase 2.E: completion tranche.  The Phase 2 plan listed
     -- 'bigNatShow' / 'bigNatRead' / 'bigNatToHexString' as the show/read
     -- tranche, but none of those primops exist in ghc-bignum source —
@@ -728,7 +730,9 @@ builtins reg =
     , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
     , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
     , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
-    , ("bigNatSizeInBase#",        bigNatSizeInBaseHashB)     -- Word# -> BigNat# -> Word#
+    -- bigNatSizeInBase# source-loads from ghc-bignum:
+    -- base <= 1 -> unexpectedValue_Word#; zero -> 0##;
+    -- otherwise bigNatLogBaseWord# base a + 1##.
     -- Phase 4: ghc-bignum 'integerMul (IS x) (IS y)' overflow path
     -- constructs BigNats from a high/low Word# pair.  Without this
     -- shim, in-Int64 × in-Int64 → out-of-Int64 multiplications
@@ -3467,14 +3471,6 @@ bigNatLogBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     n    <- extractBigNat "bigNatLogBase#" bv
     pure (VInt (fromIntegral (naturalLogBase base n)))
 
--- | Phase 2.D: @bigNatLogBaseWord# :: Word# -> BigNat# -> Word#@.
-bigNatLogBaseWordHashB :: IO Val
-bigNatLogBaseWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- coerceWordArg "bigNatLogBaseWord#" av
-    n    <- extractBigNat "bigNatLogBaseWord#" bv
-    pure (VInt (fromIntegral (naturalLogBase base n)))
-
 -- | Pure helper for floor(log_b n).  Errors if @b <= 1@ (matches
 -- ghc-bignum's @unexpectedValue_Word#@).  Returns 0 for n = 0 as a
 -- practical default; ghc-bignum's source is undefined here.
@@ -3586,22 +3582,6 @@ naturalCtz n = go 0 n
     go !i k
       | k .&. 1 == 1 = i
       | otherwise    = go (i + 1) (k `shiftR` 1)
-
--- | @bigNatSizeInBase# :: Word# -> BigNat# -> Word#@ — number of
--- digits to represent @n@ in @base@.  ghc-bignum errors for
--- @base <= 1@; we match.  For n = 0 returns 0 (ghc-bignum
--- convention).  Otherwise returns @floor(logBase base n) + 1@.
-bigNatSizeInBaseHashB :: IO Val
-bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- coerceWordArg "bigNatSizeInBase#" av
-    n    <- extractBigNat "bigNatSizeInBase#" bv
-    pure (VInt
-        (if base <= 1
-            then error "bigNatSizeInBase#: base must be > 1"
-            else if n == 0
-                then 0
-                else fromIntegral (naturalLogBase base n) + 1))
 
 -- | Phase 4: @bigNatFromWord2# :: Word# -> Word# -> BigNat#@ —
 -- construct a BigNat from a high/low Word# pair.  Used by
