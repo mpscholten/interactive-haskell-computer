@@ -1104,8 +1104,6 @@ builtins reg =
     , ("listen", socketListenB)
     , ("Network.Socket.listen", socketListenB)
     , ("Network.Socket.Syscall.listen", socketListenB)
-    , ("Network.Socket.listen", socketListenB)
-    , ("Network.Socket.Syscall.listen", socketListenB)
     -- accept(2) blocks for the next connection and returns a network Socket
     -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
     -- above it remains source-interpreted.
@@ -1126,7 +1124,6 @@ builtins reg =
     , ("Network.Socket.Name.getSocketName", socketGetNameB)
     , ("bind", socketBindB)
     , ("Network.Socket.bind", socketBindB)
-    , ("Network.Socket.Types.bind", socketBindB)
     , ("Network.Socket.SockAddr.bind", socketBindB)
     , ("Network.Socket.Syscall.bind", socketBindB)
     -- Network.Socket.bind is the actual OS bind(2) boundary for AF_INET/AF_INET6
