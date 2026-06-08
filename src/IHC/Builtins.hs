@@ -1078,14 +1078,12 @@ builtins reg =
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
     , ("newCString",      newCStringB)
+    -- Foreign.Storable.sizeOf / alignment source-load for qualified module
+    -- entries.  Keep only the bare optimistic fallback for polymorphic
+    -- library code like alloca's sizeOf (undefined :: a), where IHC has no
+    -- typechecker dictionary to recover a concrete Storable instance.
     , ("sizeOf",       sizeOfB)
-    , ("Foreign.Storable.sizeOf", sizeOfB)
-    , ("GHC.Internal.Foreign.Storable.sizeOf", sizeOfB)
-    , ("Network.Socket.Imports.sizeOf", sizeOfB)
     , ("alignment",    alignmentB)
-    , ("Foreign.Storable.alignment", alignmentB)
-    , ("GHC.Internal.Foreign.Storable.alignment", alignmentB)
-    , ("Network.Socket.Imports.alignment", alignmentB)
     -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
     -- import dispatches through the generic FFI path.
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on

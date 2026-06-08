@@ -3627,6 +3627,17 @@ classMethodDispatcher reg cls methodName = selfVal
                   | not (isMethodPlaceholder methodVal) ->
                       applyAll methodVal [argT]
                 _ -> argDirectedDispatch argT
+        (firstTag:_)
+          | isDispatchableTag firstTag
+          , cls == BC.pack "Storable"
+          , methodName `elem` map BC.pack ["sizeOf", "alignment"] -> do
+            mM <- lookupInstanceMethodForced reg cls firstTag methodName
+            mShared <- lookupInSharedRegForced cls firstTag methodName
+            case preferMethod mM mShared of
+                Just methodVal
+                  | not (isMethodPlaceholder methodVal) ->
+                      applyAll methodVal [argT]
+                _ -> argDirectedDispatch argT
         -- Type-tag-driven path: matchPat synthesised a tag from a PCon
         -- pattern.  Look up the instance method for that type and
         -- return it WITHOUT applying — the argT we were given is a
@@ -5307,7 +5318,6 @@ ffiBuiltinNames = Set.fromList
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
     , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
-    , "sizeOf", "alignment"
     , "peek", "poke", "peekByteOff", "pokeByteOff"
     , "socket"
     , "setSocketOption"
