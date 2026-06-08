@@ -64,7 +64,7 @@ import Foreign.ForeignPtr
     ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, newForeignPtr_
     , plusForeignPtr )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
+import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
@@ -1101,13 +1101,6 @@ builtins reg =
     , ("Network.Socket.getSocketName", socketGetNameB)
     , ("Network.Socket.SockAddr.getSocketName", socketGetNameB)
     , ("Network.Socket.Name.getSocketName", socketGetNameB)
-    -- Raw heap buffer allocation used by Warp's response buffers.
-    , ("mallocBytes", mallocBytesB)
-    , ("Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
-    , ("GHC.Internal.Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
-    , ("free", freeB)
-    , ("Foreign.Marshal.Alloc.free", freeB)
-    , ("GHC.Internal.Foreign.Marshal.Alloc.free", freeB)
     , ("bind", socketBindB)
     , ("Network.Socket.bind", socketBindB)
     , ("Network.Socket.Types.bind", socketBindB)
@@ -4768,19 +4761,6 @@ socketRecvBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \l
                 then ioError (userError "Network.Socket.recvBuf")
                 else pure (VInt (fromIntegral r))
         _ -> error ("recvBuf: not a positive Int: " <> showValForDebug lenV)
-
-mallocBytesB :: IO Val
-mallocBytesB = pure $ VFun $ \nT -> pure $ VIO $ do
-    n <- intField "mallocBytes.size" nT
-    p <- mallocBytes (max 1 (fromIntegral n))
-    pure (VPrimObj (PrimPtr (castPtr p)))
-
-freeB :: IO Val
-freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
-    ptrV <- force legacyHooks ptrT
-    p <- ptrValToPtr ptrV
-    free p
-    pure VUnit
 
 sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
 sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do

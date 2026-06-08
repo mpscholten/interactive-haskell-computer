@@ -560,7 +560,7 @@ loadProgramFromSource searchPath src0 = do
                 (Set.fromList
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
                     , "addForeignPtrFinalizer"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
@@ -1630,7 +1630,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             Set.union ffiBuiltinNames
                 (Set.fromList
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "mallocBytes", "free", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "withHandle", "withHandleKillThread"
@@ -5032,8 +5032,6 @@ ffiBuiltinNames = Set.fromList
     , "accept"
     , "getSocketName"
     , "bind"
-    , "mallocBytes"
-    , "free"
     -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
     -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
     -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
