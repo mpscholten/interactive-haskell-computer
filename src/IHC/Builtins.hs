@@ -1290,7 +1290,6 @@ builtins reg =
     -- -> threadWait) reduces to.  The source body registers on the RTS event
     -- manager IHC never runs; host-back it to the host RTS IO manager directly.
     , ("threadWait", threadWaitB)
-    , ("GHC.Event.Thread.threadWait", threadWaitB)
     , ("GHC.Internal.Event.Thread.threadWait", threadWaitB)
     -- GHC.Internal.Event.Manager.registerFd / unregisterFd_ — the event-manager
     -- registration both threadWait (IO) and threadWaitSTM (the cancellable STM
@@ -1298,10 +1297,8 @@ builtins reg =
     -- IHC does not run the RTS event manager; emulate a OneShot registration on
     -- the host RTS IO manager (see 'registerFdB').
     , ("registerFd", registerFdB)
-    , ("GHC.Event.Manager.registerFd", registerFdB)
     , ("GHC.Internal.Event.Manager.registerFd", registerFdB)
     , ("unregisterFd_", unregisterFd_B)
-    , ("GHC.Event.Manager.unregisterFd_", unregisterFd_B)
     , ("GHC.Internal.Event.Manager.unregisterFd_", unregisterFd_B)
     -- IHC does not run GHC's RTS event manager.  We return a stub 'Just mgr'
     -- (see 'getSystemEventManagerB') so the threaded socket-wait path
@@ -1311,7 +1308,6 @@ builtins reg =
     -- host-backed timer manager (getSystemTimerManager / registerTimeout).
     , ("getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
-    , ("GHC.Event.Thread.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Internal.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Internal.Event.Thread.getSystemEventManager", getSystemEventManagerB)
     -- IHC also does not run GHC's RTS timer manager.  Warp/time-manager use
@@ -1320,22 +1316,18 @@ builtins reg =
     -- the RTS-only TimerManager implementation.
     , ("getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Event.getSystemTimerManager", getSystemTimerManagerB)
-    , ("GHC.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
     , ("registerTimeout", registerTimeoutB)
     , ("GHC.Event.registerTimeout", registerTimeoutB)
-    , ("GHC.Event.TimerManager.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB)
     , ("unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Event.unregisterTimeout", unregisterTimeoutB)
-    , ("GHC.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
     , ("updateTimeout", updateTimeoutB)
     , ("GHC.Event.updateTimeout", updateTimeoutB)
-    , ("GHC.Event.TimerManager.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.TimerManager.updateTimeout", updateTimeoutB)
     , ("withHandle", timeManagerWithHandleB)
