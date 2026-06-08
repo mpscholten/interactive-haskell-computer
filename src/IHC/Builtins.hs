@@ -43,7 +43,7 @@ import Control.Exception
     , SomeException
     )
 import Foreign.C.Error (Errno(..), getErrno, eINTR, eINPROGRESS)
-import Foreign.C.Types (CInt(..), CSize(..))
+import Foreign.C.Types (CInt(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
     , popCount, countLeadingZeros, finiteBitSize
@@ -1118,13 +1118,8 @@ builtins reg =
     -- Network.Socket.Types.withFdSocket source-loads over the Socket IORef.
     -- Network.Socket.Types.fdSocket / unsafeFdSocket source-load over the
     -- same Socket IORef representation.
-    -- sendBuf/recvBuf are the fd-level OS send(2)/recv(2) boundaries used by
-    -- Network.Socket.ByteString. Keep the ByteString API source-interpreted,
-    -- but perform the actual socket syscall in the host.
-    , ("sendBuf", socketSendBufB)
-    , ("recvBuf", socketRecvBufB)
-    , ("Network.Socket.Buffer.sendBuf", socketSendBufB)
-    , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
+    -- Network.Socket.Buffer.sendBuf / recvBuf source-load; their foreign
+    -- imports dispatch through the generic FFI path.
     -- Phase C.3 (builtins-removal): the @Settings@ field accessors
     -- (settingsPort/Host/Timeout/FdCacheDuration/FileInfoCacheDuration)
     -- used to live here as positional shims that indexed into a host-
@@ -4661,36 +4656,6 @@ primIORefFromVal (VCon "STRef" [primT]) = do
 primIORefFromVal other =
     error ("Socket ref is not an IORef: " <> showValForDebug other)
 
-socketSendBufB :: IO Val
-socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    ptrV <- force legacyHooks ptrT
-    lenV <- force legacyHooks lenT
-    fd <- socketFdFromVal sockV
-    ptr <- ptrValToPtr ptrV
-    case lenV of
-        VInt n | n >= 0 -> do
-            r <- c_send_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
-            if r < 0
-                then ioError (userError "Network.Socket.sendBuf")
-                else pure (VInt (fromIntegral r))
-        _ -> error ("sendBuf: not a non-negative Int: " <> showValForDebug lenV)
-
-socketRecvBufB :: IO Val
-socketRecvBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    ptrV <- force legacyHooks ptrT
-    lenV <- force legacyHooks lenT
-    fd <- socketFdFromVal sockV
-    ptr <- ptrValToPtr ptrV
-    case lenV of
-        VInt n | n > 0 -> do
-            r <- c_recv_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
-            if r < 0
-                then ioError (userError "Network.Socket.recvBuf")
-                else pure (VInt (fromIntegral r))
-        _ -> error ("recvBuf: not a positive Int: " <> showValForDebug lenV)
-
 sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
 sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
     port <- intField "SockAddrInet.port" portT
@@ -4797,12 +4762,6 @@ foreign import ccall unsafe "connect"
 
 foreign import ccall unsafe "getsockopt"
     c_getsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
-
-foreign import ccall unsafe "send"
-    c_send_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
-
-foreign import ccall unsafe "recv"
-    c_recv_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
 
 foreign import ccall unsafe "getaddrinfo"
     c_getaddrinfo_host :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Ptr (Ptr Word8) -> IO CInt
