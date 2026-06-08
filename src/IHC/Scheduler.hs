@@ -79,7 +79,7 @@ import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
-    , isHostWord8PtrVal, pokeHostWord8ByteOff
+    , isHostWord8PtrVal, peekHostWord8ByteOff, pokeHostWord8ByteOff
     , ordCmp
     , reapSpawnedThreads
     )
@@ -3724,12 +3724,16 @@ classMethodDispatcher reg cls methodName = selfVal
                             pure (dispatch (remaining - 1) (argT : accArgs))
             else if isStorableResultReadyArg accArgs
                 then do
-                    mResult <- resultPolymorphicMethod
-                    case mResult of
-                        Just resultVal ->
-                            applyAll resultVal (reverse (argT : accArgs))
-                        Nothing ->
-                            pure (dispatch (remaining - 1) (argT : accArgs))
+                    mBytePeek <- tryStorableBytePeek av accArgs
+                    case mBytePeek of
+                        Just bytePeek -> pure bytePeek
+                        Nothing -> do
+                            mResult <- resultPolymorphicMethod
+                            case mResult of
+                                Just resultVal ->
+                                    applyAll resultVal (reverse (argT : accArgs))
+                                Nothing ->
+                                    pure (dispatch (remaining - 1) (argT : accArgs))
             else if isStorablePreResultArg accArgs
                 then do
                     -- Storable.peekElemOff/peekByteOff have shape
@@ -4148,7 +4152,7 @@ classMethodDispatcher reg cls methodName = selfVal
                     Just flushed -> pure flushed
                     Nothing -> error "BufferedIO.flushWriteBuffer: unsupported host handle buffer"))
         | cls == BC.pack "Storable"
-        , methodName == BC.pack "pokeByteOff"
+        , methodName `elem` map BC.pack ["pokeElemOff", "pokeByteOff"]
         , length accArgs == 2
         = case reverse accArgs of
             [ptrT, offT] -> do
@@ -4268,6 +4272,18 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Storable"
         && methodName `elem` map BC.pack ["peekElemOff", "peekByteOff"]
         && length accArgs == 1
+
+    tryStorableBytePeek offV accArgs =
+        case reverse accArgs of
+            [ptrT] -> do
+                ptrV <- force legacyHooks ptrT
+                isWord8 <- isHostWord8PtrVal ptrV
+                    `catch` (\(_ :: SomeException) -> pure False)
+                pure $
+                    if isWord8
+                        then Just (VIO (peekHostWord8ByteOff ptrV offV))
+                        else Nothing
+            _ -> pure Nothing
 
     isNumFromIntegerArg accArgs =
         cls == BC.pack "Num"
@@ -4853,7 +4869,7 @@ wrapNullaryResultSig lm n e =
             ELet bs body -> ELet [(bn, go rhs) | (bn, rhs) <- bs] (go body)
             ECase s as   -> ECase (go s) [Alt p (go rhs) | Alt p rhs <- as]
             EIf c t f    -> EIf (go c) (go t) (go f)
-            EDo stmts    -> EDo (map goStmt stmts)
+            EDo stmts    -> EDo (goDoStmts stmts)
             ENeg inner   -> ENeg (go inner)
             ETuple xs    -> ETuple (map go xs)
             ERecordCon c fs -> ERecordCon c [(fn, go rhs) | (fn, rhs) <- fs]
@@ -4869,18 +4885,50 @@ wrapNullaryResultSig lm n e =
             SLet bs           -> SLet [(bn, go rhs) | (bn, rhs) <- bs]
             SImplicitLet bs   -> SImplicitLet [(bn, go rhs) | (bn, rhs) <- bs]
 
+        goDoStmts [] = []
+        goDoStmts (stmt:rest) =
+            case stmt of
+                SBind bn rhs
+                    | actionHasTypedPeekShape rhs
+                    , Just argTy <- firstUseAsArgType bn (EDo rest)
+                    , Just tyBytes <- renderTypeForAnnotation
+                        (TyApp (TyCon (BC.pack "IO")) argTy)
+                    -> SBind bn (annotateAction tyBytes rhs) : goDoStmts rest
+                    | Just elemTy <- firstPtrElemType bn (EDo rest)
+                    , Just tyBytes <- renderTypeForAnnotation
+                        (TyApp (TyCon (BC.pack "IO"))
+                            (TyApp (TyCon (BC.pack "Ptr")) elemTy))
+                    -> SBind bn (annotateAction tyBytes rhs) : goDoStmts rest
+                    | otherwise ->
+                        SBind bn (go rhs) : goDoStmts rest
+                SBangBind bn rhs
+                    | actionHasTypedPeekShape rhs
+                    , Just argTy <- firstUseAsArgType bn (EDo rest)
+                    , Just tyBytes <- renderTypeForAnnotation
+                        (TyApp (TyCon (BC.pack "IO")) argTy)
+                    -> SBangBind bn (annotateAction tyBytes rhs) : goDoStmts rest
+                    | Just elemTy <- firstPtrElemType bn (EDo rest)
+                    , Just tyBytes <- renderTypeForAnnotation
+                        (TyApp (TyCon (BC.pack "IO"))
+                            (TyApp (TyCon (BC.pack "Ptr")) elemTy))
+                    -> SBangBind bn (annotateAction tyBytes rhs) : goDoStmts rest
+                    | otherwise ->
+                        SBangBind bn (go rhs) : goDoStmts rest
+                other ->
+                    goStmt other : goDoStmts rest
+
         annotateAction _ action@ETyApp{} = go action
         annotateAction tyBytes action    = ETyApp (go action) tyBytes
 
     actionHasTypedPeekShape :: Expr -> Bool
     actionHasTypedPeekShape expr = case stripTyApps expr of
         EApp (EApp fn _) _
-            | isPeekByteOffHead fn -> True
+            | isTypedPeekHead fn -> True
         EApp (ELam n body) _ ->
             case stripTyApps body of
                 EApp (EApp fn (EVar v)) _
                     | v == n
-                    , isPeekByteOffHead fn -> True
+                    , isTypedPeekHead fn -> True
                 _ -> False
         _ -> False
 
@@ -4892,11 +4940,176 @@ wrapNullaryResultSig lm n e =
                 (argTy : _, _) -> Just argTy
                 _              -> Nothing
         ETyApp inner _ -> firstArgType inner
+        ELam n body    -> firstUseAsArgType n body
         _ -> Nothing
+
+    firstUseAsArgType :: ByteString -> Expr -> Maybe Type
+    firstUseAsArgType n expr = case expr of
+        EApp fn (EVar v)
+            | v == n -> firstArgType fn
+        EApp f x ->
+            firstUseAsArgType n f <|> firstUseAsArgType n x
+        ELam n' body
+            | n' == n   -> Nothing
+            | otherwise -> firstUseAsArgType n body
+        ELet bs body ->
+            firstInBinds bs <|> if shadows bs then Nothing else firstUseAsArgType n body
+        ECase s as ->
+            firstUseAsArgType n s <|> firstInAlts as
+        EIf c t f ->
+            firstUseAsArgType n c <|> firstUseAsArgType n t <|> firstUseAsArgType n f
+        EDo stmts ->
+            firstInStmts stmts
+        ENeg inner ->
+            firstUseAsArgType n inner
+        ETuple xs ->
+            firstInExprs xs
+        ERecordCon _ fs ->
+            firstInExprs (map snd fs)
+        ERecordUpdate base fs ->
+            firstUseAsArgType n base <|> firstInExprs (map snd fs)
+        ESplice inner ->
+            firstUseAsArgType n inner
+        EQuote inner ->
+            firstUseAsArgType n inner
+        ETyApp inner _ ->
+            firstUseAsArgType n inner
+        EImplicitLet bs body ->
+            firstInBinds bs <|> if shadows bs then Nothing else firstUseAsArgType n body
+        _ -> Nothing
+      where
+        shadows bs = any ((== n) . fst) bs
+        firstInExprs = foldr ((<|>) . firstUseAsArgType n) Nothing
+        firstInBinds = firstInExprs . map snd . filter ((/= n) . fst)
+        firstInAlts = foldr ((<|>) . firstAlt) Nothing
+        firstAlt (Alt pat rhs)
+            | n `elem` patVars pat = Nothing
+            | otherwise                = firstUseAsArgType n rhs
+        patVars (PVar x)         = [x]
+        patVars PWild            = []
+        patVars (PLit _)         = []
+        patVars (PCon _ ps)      = concatMap patVars ps
+        patVars (PAs x p)        = x : patVars p
+        patVars (PBang p)        = patVars p
+        patVars (PIrref p)       = patVars p
+        patVars (PTuple ps)      = concatMap patVars ps
+        patVars (PRecord _ fps)  = concatMap (patVars . snd) fps
+        patVars (PRecordWild _)  = []
+        patVars (PView _ p)      = patVars p
+        firstInStmts [] = Nothing
+        firstInStmts (stmt:rest) =
+            case stmt of
+                SExpr rhs ->
+                    firstUseAsArgType n rhs <|> firstInStmts rest
+                SBind n' rhs ->
+                    firstUseAsArgType n rhs <|>
+                        if n' == n then Nothing else firstInStmts rest
+                SBangBind n' rhs ->
+                    firstUseAsArgType n rhs <|>
+                        if n' == n then Nothing else firstInStmts rest
+                SLet bs ->
+                    firstInBinds bs <|>
+                        if shadows bs then Nothing else firstInStmts rest
+                SImplicitLet bs ->
+                    firstInBinds bs <|>
+                        if shadows bs then Nothing else firstInStmts rest
 
     lookupSig fn =
         Map.lookup fn (lmTypeSigs lm)
         <|> Map.lookup (lastNameComponent fn) (lmTypeSigs lm)
+
+    firstPtrElemType :: ByteString -> Expr -> Maybe Type
+    firstPtrElemType n expr = case expr of
+        EApp (EApp (EApp fn (EVar v)) _) valE
+            | v == n
+            , isPokeElemOffHead fn -> exprResultType valE
+        EApp f x ->
+            firstPtrElemType n f <|> firstPtrElemType n x
+        ELam n' body
+            | n' == n   -> Nothing
+            | otherwise -> firstPtrElemType n body
+        ELet bs body ->
+            firstPtrInBinds bs <|> if shadows bs then Nothing else firstPtrElemType n body
+        ECase s as ->
+            firstPtrElemType n s <|> foldr ((<|>) . firstAlt) Nothing as
+        EIf c t f ->
+            firstPtrElemType n c <|> firstPtrElemType n t <|> firstPtrElemType n f
+        EDo stmts ->
+            firstPtrInStmts stmts
+        ENeg inner ->
+            firstPtrElemType n inner
+        ETuple xs ->
+            firstPtrInExprs xs
+        ERecordCon _ fs ->
+            firstPtrInExprs (map snd fs)
+        ERecordUpdate base fs ->
+            firstPtrElemType n base <|> firstPtrInExprs (map snd fs)
+        ESplice inner ->
+            firstPtrElemType n inner
+        EQuote inner ->
+            firstPtrElemType n inner
+        ETyApp inner _ ->
+            firstPtrElemType n inner
+        EImplicitLet bs body ->
+            firstPtrInBinds bs <|> if shadows bs then Nothing else firstPtrElemType n body
+        _ -> Nothing
+      where
+        shadows bs = any ((== n) . fst) bs
+        firstPtrInExprs = foldr ((<|>) . firstPtrElemType n) Nothing
+        firstPtrInBinds = firstPtrInExprs . map snd . filter ((/= n) . fst)
+        firstAlt (Alt pat rhs)
+            | n `elem` patVars pat = Nothing
+            | otherwise            = firstPtrElemType n rhs
+        firstPtrInStmts [] = Nothing
+        firstPtrInStmts (stmt:rest) =
+            case stmt of
+                SExpr rhs ->
+                    firstPtrElemType n rhs <|> firstPtrInStmts rest
+                SBind n' rhs ->
+                    firstPtrElemType n rhs <|>
+                        if n' == n then Nothing else firstPtrInStmts rest
+                SBangBind n' rhs ->
+                    firstPtrElemType n rhs <|>
+                        if n' == n then Nothing else firstPtrInStmts rest
+                SLet bs ->
+                    firstPtrInBinds bs <|>
+                        if shadows bs then Nothing else firstPtrInStmts rest
+                SImplicitLet bs ->
+                    firstPtrInBinds bs <|>
+                        if shadows bs then Nothing else firstPtrInStmts rest
+
+    patVars (PVar x)         = [x]
+    patVars PWild            = []
+    patVars (PLit _)         = []
+    patVars (PCon _ ps)      = concatMap patVars ps
+    patVars (PAs x p)        = x : patVars p
+    patVars (PBang p)        = patVars p
+    patVars (PIrref p)       = patVars p
+    patVars (PTuple ps)      = concatMap patVars ps
+    patVars (PRecord _ fps)  = concatMap (patVars . snd) fps
+    patVars (PRecordWild _)  = []
+    patVars (PView _ p)      = patVars p
+
+    exprResultType :: Expr -> Maybe Type
+    exprResultType expr = case stripTyApps expr of
+        EVar fn -> sigResultType fn
+        EApp fn _ -> sigResultAfterArgs 1 fn
+        _ -> Nothing
+
+    sigResultType fn = do
+        Scheme _ _ body <- lookupSig fn
+        pure (snd (tyArrowArgs body))
+
+    sigResultAfterArgs consumed fn = do
+        Scheme _ _ body <- lookupSigExpr fn
+        let (args, resultTy) = tyArrowArgs body
+        if length args >= consumed
+            then pure (foldr TyArrow resultTy (drop consumed args))
+            else Nothing
+
+    lookupSigExpr expr = case stripTyApps expr of
+        EVar fn -> lookupSig fn
+        _       -> Nothing
 
     isBindFromRight op =
         case op of
@@ -4910,10 +5123,16 @@ wrapNullaryResultSig lm n e =
             ETyApp inner _ -> isBind inner
             _ -> False
 
-    isPeekByteOffHead op =
+    isTypedPeekHead op =
         case op of
-            EVar name -> lastNameComponent name == BC.pack "peekByteOff"
-            ETyApp inner _ -> isPeekByteOffHead inner
+            EVar name -> lastNameComponent name `elem` map BC.pack ["peekByteOff", "peekElemOff"]
+            ETyApp inner _ -> isTypedPeekHead inner
+            _ -> False
+
+    isPokeElemOffHead op =
+        case op of
+            EVar name -> lastNameComponent name == BC.pack "pokeElemOff"
+            ETyApp inner _ -> isPokeElemOffHead inner
             _ -> False
 
     stripTyApps expr =
@@ -5019,7 +5238,7 @@ ffiBuiltinNames :: Set ByteString
 ffiBuiltinNames = Set.fromList
     [ "hPutBuf"
     , "withCString", "withCStringLen", "withCStringLen0"
-    , "peekCString", "peekCAString", "newCString", "newCAString"
+    , "peekCString", "newCString"
     , "addForeignPtrFinalizer"
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
     , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"

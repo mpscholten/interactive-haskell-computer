@@ -19,6 +19,7 @@ module IHC.Builtins
     , flushHostHandleBuffer
     , isHostWord8PtrVal
     , ordCmp
+    , peekHostWord8ByteOff
     , pokeHostWord8ByteOff
     , reapSpawnedThreads
     ) where
@@ -53,7 +54,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr, ord, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
-import Data.Int (Int64)
+import Data.Int (Int8, Int64)
 import Data.List (intercalate)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
@@ -154,17 +155,20 @@ isMarkedWord8Ptr p =
 isHostWord8PtrVal :: Val -> IO Bool
 isHostWord8PtrVal v = do
     p <- ptrValToPtr v
-    isMarkedWord8Ptr p
+    marked <- isMarkedWord8Ptr p
+    if marked
+        then pure True
+        else do
+            mTyped <- lookupTypedHostPtr p
+            pure (mTyped `elem` map Just [BC.pack "Word8", BC.pack "CChar", BC.pack "CSChar", BC.pack "CUChar"])
 
 pokeHostWord8ByteOff :: Val -> Val -> Val -> IO Val
 pokeHostWord8ByteOff ptrV offV valV = do
     p <- ptrValToPtr ptrV
-    case offV of
-        VInt off -> do
-            byte <- word8FromVal valV
-            pokeByteOff (p :: Ptr Word8) (fromIntegral off) byte
-            pure VUnit
-        _ -> error ("pokeHostWord8ByteOff: bad offset: " <> showValForDebug offV)
+    off <- byteOffsetFromVal "pokeHostWord8ByteOff" offV
+    byte <- word8FromVal valV
+    pokeByteOff (p :: Ptr Word8) off byte
+    pure VUnit
   where
     word8FromVal (VInt n) =
         pure (fromIntegral n :: Word8)
@@ -174,6 +178,27 @@ pokeHostWord8ByteOff ptrV offV valV = do
         pure (fromIntegral (ord c) :: Word8)
     word8FromVal other =
         error ("pokeHostWord8ByteOff: bad byte: " <> showValForDebug other)
+
+peekHostWord8ByteOff :: Val -> Val -> IO Val
+peekHostWord8ByteOff ptrV offV = do
+    p <- ptrValToPtr ptrV
+    off <- byteOffsetFromVal "peekHostWord8ByteOff" offV
+    mTyped <- lookupTypedHostPtr p
+    case mTyped of
+        Just ty | ty `elem` map BC.pack ["CChar", "CSChar"] -> do
+            byte <- peekByteOff (castPtr p :: Ptr Int8) off :: IO Int8
+            pure (VInt (fromIntegral byte))
+        _ -> do
+            byte <- peekByteOff (p :: Ptr Word8) off :: IO Word8
+            pure (VInt (fromIntegral byte))
+
+byteOffsetFromVal :: String -> Val -> IO Int
+byteOffsetFromVal who (VInt off) =
+    pure (fromIntegral off)
+byteOffsetFromVal who (VInteger off) =
+    pure (fromInteger off)
+byteOffsetFromVal who other =
+    error (who <> ": bad offset: " <> showValForDebug other)
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
@@ -1044,9 +1069,9 @@ builtins reg =
     -- foreign import ccall "strlen" leaf, so the high-level
     -- cstringLength#/unpackCString# shims do not belong here.
     -- Phase 2.8: misc
-    -- Foreign.C.String shortcuts — source bodies reach for RTS locale
-    -- state via getForeignEncoding; we bypass that and go straight to
-    -- ASCII-byte marshalling (matches GHC's default for libc FFI).
+    -- Foreign.C.String shortcuts — the locale-aware source bodies reach
+    -- for RTS locale state via getForeignEncoding; keep only those host
+    -- shims.  The CAString variants are byte-wise Haskell and source-load.
     , ("withCString",     withCStringB)
     , ("withCStringLen",  withCStringLenB)
     , ("withCStringLen0", withCStringLenB)
@@ -1054,9 +1079,7 @@ builtins reg =
     -- GHC.Internal.Foreign.Marshal.Utils:
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
-    , ("peekCAString",    peekCStringB)
     , ("newCString",      newCStringB)
-    , ("newCAString",     newCStringB)
     , ("sizeOf",       sizeOfB)
     , ("Foreign.Storable.sizeOf", sizeOfB)
     , ("GHC.Internal.Foreign.Storable.sizeOf", sizeOfB)
