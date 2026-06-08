@@ -1096,9 +1096,8 @@ builtins reg =
     , ("Network.Socket.Syscall.socket", socketCreateB)
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
     -- lower setSockOpt foreign imports.
-    -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
-    , ("listen", socketListenB)
-    , ("Network.Socket.Syscall.listen", socketListenB)
+    -- Network.Socket.Syscall.listen source-loads; its listen(2) foreign
+    -- import dispatches through the generic FFI path.
     -- accept(2) blocks for the next connection and returns a network Socket
     -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
     -- above it remains source-interpreted.
@@ -4571,17 +4570,6 @@ socketConnectB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
         connectLoop
         pure VUnit
 
-socketListenB :: IO Val
-socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    backlog <- intField "listen.backlog" backlogT
-    rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
-    System.IO.hFlush System.IO.stderr
-    if rc == -1
-        then ioError (userError "Network.Socket.listen")
-        else pure VUnit
-
 socketAcceptB :: IO Val
 socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
     sockV <- force legacyHooks sockT
@@ -4719,9 +4707,6 @@ socketTypeField t = do
 
 foreign import ccall unsafe "socket"
     c_socket_host :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall unsafe "listen"
-    c_listen_host :: CInt -> CInt -> IO CInt
 
 foreign import ccall safe "accept"
     c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
