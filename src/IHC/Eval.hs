@@ -435,7 +435,7 @@ eval hooks env ipm = go
         let ty = case TR.reduceTypeExpr reg ty0 of
                      Just reduced -> reduced
                      Nothing      -> ty0
-        mTypedPeek <- tryTypedPeekByteOff e ty
+        mTypedPeek <- tryTypedPeek e ty
         case mTypedPeek of
             Just v -> pure v
             Nothing -> do
@@ -654,33 +654,76 @@ eval hooks env ipm = go
                             Nothing -> pure v
                 VIO action
                     | Just resultTy <- ioResultAnnotation ty ->
-                        pure (VIO (applyNumericTyAnnotation resultTy <$> action))
+                        pure (VIO (action >>= applyIOResultAnnotation resultTy))
                 _               -> pure (applyNumericTyAnnotation ty v)
 
-    tryTypedPeekByteOff :: Expr -> ByteString -> IO (Maybe Val)
-    tryTypedPeekByteOff e ty =
-        case (ioResultAnnotation ty, peekByteOffArgs e) of
-            (Just resultTy, Just (ptrE, offE)) ->
-                pure (Just (VIO (typedPeekByteOff resultTy ptrE offE)))
+    tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
+    tryTypedPeek e ty =
+        case (ioResultAnnotation ty, peekArgs e) of
+            (Just resultTy, Just (isElemOff, ptrE, offE)) ->
+                pure (Just (VIO (typedPeek isElemOff resultTy ptrE offE)))
             _ -> pure Nothing
 
-    typedPeekByteOff :: ByteString -> Expr -> Expr -> IO Val
-    typedPeekByteOff resultTy ptrE offE = do
+    typedPeek :: Bool -> ByteString -> Expr -> Expr -> IO Val
+    typedPeek isElemOff resultTy ptrE offE = do
         ptrV <- go ptrE
         offV <- go offE
         p <- valToHostPtr ptrV
         off <- case offV of
             VInt n     -> pure (fromIntegral n)
             VInteger n -> pure (fromInteger n)
-            _ -> error ("peekByteOff: offset is not an Int: "
+            _ -> error ("typed peek: offset is not an Int: "
                         <> showValForDebug offV)
-        readTypedPeek resultTy p off
+        let byteOff
+                | isElemOff = off * typedPeekElemSize resultTy
+                | otherwise = off
+        readTypedPeek resultTy p byteOff
+
+    typedPeekElemSize :: ByteString -> Int
+    typedPeekElemSize ty =
+        case tyAnnotationHead ty of
+            "Ptr"      -> ptrSize
+            "FunPtr"   -> ptrSize
+            "Char"     -> FStorable.sizeOf (undefined :: Char)
+            "Double"   -> FStorable.sizeOf (undefined :: Double)
+            "Float"    -> FStorable.sizeOf (undefined :: Float)
+            "Word8"    -> FStorable.sizeOf (undefined :: Word8)
+            "Word16"   -> FStorable.sizeOf (undefined :: Word16)
+            "Word32"   -> FStorable.sizeOf (undefined :: Word32)
+            "Word64"   -> FStorable.sizeOf (undefined :: Word64)
+            "Word"     -> FStorable.sizeOf (undefined :: Word)
+            "Int8"     -> FStorable.sizeOf (undefined :: Int8)
+            "Int16"    -> FStorable.sizeOf (undefined :: Int16)
+            "Int32"    -> FStorable.sizeOf (undefined :: Int32)
+            "Int64"    -> FStorable.sizeOf (undefined :: Int64)
+            "Int"      -> FStorable.sizeOf (undefined :: Int)
+            "CChar"    -> FStorable.sizeOf (undefined :: Int8)
+            "CUChar"   -> FStorable.sizeOf (undefined :: Word8)
+            "CBool"    -> FStorable.sizeOf (undefined :: Word8)
+            "CShort"   -> FStorable.sizeOf (undefined :: Int16)
+            "CUShort"  -> FStorable.sizeOf (undefined :: Word16)
+            "CInt"     -> FStorable.sizeOf (undefined :: Int32)
+            "CUInt"    -> FStorable.sizeOf (undefined :: Word32)
+            "CLong"    -> FStorable.sizeOf (undefined :: Int64)
+            "CULong"   -> FStorable.sizeOf (undefined :: Word64)
+            "CLLong"   -> FStorable.sizeOf (undefined :: Int64)
+            "CULLong"  -> FStorable.sizeOf (undefined :: Word64)
+            "CSize"    -> FStorable.sizeOf (undefined :: Word)
+            "CSsize"   -> FStorable.sizeOf (undefined :: Int64)
+            "CSSize"   -> FStorable.sizeOf (undefined :: Int64)
+            "CIntPtr"  -> FStorable.sizeOf (undefined :: Int64)
+            "CUIntPtr" -> FStorable.sizeOf (undefined :: Word64)
+            "CPtrdiff" -> FStorable.sizeOf (undefined :: Int64)
+            _          -> FStorable.sizeOf (undefined :: Word8)
+      where
+        ptrSize = FStorable.sizeOf (undefined :: Ptr Word8)
 
     readTypedPeek :: ByteString -> Ptr Word8 -> Int -> IO Val
     readTypedPeek ty p off =
         case tyAnnotationHead ty of
             "Ptr"      -> readPtr
             "FunPtr"   -> readPtr
+            "Char"     -> readChar
             "Double"   -> VFloat <$> (FStorable.peekByteOff (castPtr p :: Ptr Double) off :: IO Double)
             "Float"    -> do
                 x <- FStorable.peekByteOff (castPtr p :: Ptr Float) off :: IO Float
@@ -717,6 +760,9 @@ eval hooks env ipm = go
         readPtr = do
             raw <- FStorable.peekByteOff (castPtr p :: Ptr Word64) off :: IO Word64
             pure (VPrimObj (PrimPtr (castPtr (intPtrToPtr (fromIntegral raw)))))
+        readChar = do
+            c <- FStorable.peekByteOff (castPtr p :: Ptr Char) off :: IO Char
+            pure (VChar c)
         readWord8 = do
             x <- FStorable.peekByteOff (castPtr p :: Ptr Word8) off :: IO Word8
             pure (VInt (fromIntegral x))
@@ -755,17 +801,47 @@ eval hooks env ipm = go
     valToHostPtr (VInteger n) = pure (intPtrToPtr (fromInteger n))
     valToHostPtr VUnit = pure nullPtr
     valToHostPtr other =
-        error ("peekByteOff: expected Ptr, got " <> showValForDebug other)
+        error ("typed peek: expected Ptr, got " <> showValForDebug other)
 
-    peekByteOffArgs :: Expr -> Maybe (Expr, Expr)
-    peekByteOffArgs expr = case stripTyApps expr of
+    applyIOResultAnnotation :: ByteString -> Val -> IO Val
+    applyIOResultAnnotation resultTy v = do
+        case ptrPointeeHead resultTy of
+            Just elemTy
+                | elemTy `elem` map BC.pack ["CChar", "CSChar", "CUChar", "Word8"] ->
+                    markTypedPtrVal elemTy v
+            _ -> pure ()
+        pure (applyNumericTyAnnotation resultTy v)
+
+    markTypedPtrVal :: ByteString -> Val -> IO ()
+    markTypedPtrVal elemTy (VPrimObj (PrimPtr p)) =
+        markTypedHostPtr p elemTy
+    markTypedPtrVal elemTy (VCon "Ptr" [pT]) =
+        force hooks pT >>= markTypedPtrVal elemTy
+    markTypedPtrVal _ _ =
+        pure ()
+
+    ptrPointeeHead :: ByteString -> Maybe ByteString
+    ptrPointeeHead ty = do
+        parsed <- Elab.parseRawTypeExpr ty
+        let (headTy, args) = TA.tyApps parsed
+        case (headTy, args) of
+            (TA.TyCon h, [arg])
+                | lastNameComponent (normalizeTyTag h) == BC.pack "Ptr" ->
+                    lastNameComponent . normalizeTyTag <$> TA.tyHead arg
+            _ -> Nothing
+
+    peekArgs :: Expr -> Maybe (Bool, Expr, Expr)
+    peekArgs expr = case stripTyApps expr of
         EApp (EApp fn ptrE) offE
-            | isPeekByteOffHead fn -> Just (ptrE, offE)
+            | isPeekByteOffHead fn -> Just (False, ptrE, offE)
+            | isPeekElemOffHead fn -> Just (True, ptrE, offE)
         EApp (ELam n body) ptrE ->
             case stripTyApps body of
                 EApp (EApp fn (EVar v)) offE
                     | v == n
-                    , isPeekByteOffHead fn -> Just (ptrE, offE)
+                    , isPeekByteOffHead fn -> Just (False, ptrE, offE)
+                    | v == n
+                    , isPeekElemOffHead fn -> Just (True, ptrE, offE)
                 _ -> Nothing
         _ -> Nothing
 
@@ -774,6 +850,12 @@ eval hooks env ipm = go
         lastNameComponent n == BC.pack "peekByteOff"
     isPeekByteOffHead (ETyApp inner _) = isPeekByteOffHead inner
     isPeekByteOffHead _ = False
+
+    isPeekElemOffHead :: Expr -> Bool
+    isPeekElemOffHead (EVar n) =
+        lastNameComponent n == BC.pack "peekElemOff"
+    isPeekElemOffHead (ETyApp inner _) = isPeekElemOffHead inner
+    isPeekElemOffHead _ = False
 
     stripTyApps :: Expr -> Expr
     stripTyApps (ETyApp inner _) = stripTyApps inner
@@ -816,10 +898,35 @@ eval hooks env ipm = go
         case (headTy, args) of
             (TA.TyCon h, [arg])
                 | lastNameComponent (normalizeTyTag h) == BC.pack "IO" ->
-                    case TA.tyHead arg of
-                        Just argHead -> Just argHead
-                        Nothing      -> Nothing
+                    renderTypeAnnotation arg
             _ -> Nothing
+
+    renderTypeAnnotation :: TA.Type -> Maybe ByteString
+    renderTypeAnnotation = top
+      where
+        top t = case t of
+            TA.TyVar v   -> Just (bareTypeName v)
+            TA.TyCon c   -> Just (bareTypeName c)
+            TA.TyApp _ _ -> let (h, args) = TA.tyApps t in renderApp h args
+            _            -> Nothing
+
+        renderApp h args = do
+            hb <- atom h
+            parts <- mapM atom args
+            pure (BC.intercalate (BC.singleton ' ') (hb : parts))
+
+        atom t = case t of
+            TA.TyVar v   -> Just (bareTypeName v)
+            TA.TyCon c   -> Just (bareTypeName c)
+            TA.TyApp _ _ -> do
+                inner <- top t
+                Just (BC.concat [BC.singleton '(', inner, BC.singleton ')'])
+            _            -> Nothing
+
+        bareTypeName c =
+            case BC.elemIndexEnd (toEnum (fromEnum '.')) c of
+                Just idx | idx + 1 < BC.length c -> BC.drop (idx + 1) c
+                _ -> c
 
     tyAnnotationHead :: ByteString -> ByteString
     tyAnnotationHead ty =
