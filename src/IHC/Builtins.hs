@@ -719,9 +719,9 @@ builtins reg =
     , ("bigNatClearBit#",          makeBigNatShiftOp "bigNatClearBit#" (\n i -> clearBit n i))
     , ("bigNatSetBit#",            makeBigNatShiftOp "bigNatSetBit#"   (\n i -> setBit n i))
     , ("bigNatComplementBit#",     makeBigNatShiftOp "bigNatComplementBit#" (\n i -> complementBit n i))
-    , ("bigNatGtWord#",            makeBigNatWordCmpOp "bigNatGtWord#" (>))
-    , ("bigNatLeWord#",            makeBigNatWordCmpOp "bigNatLeWord#" (<=))
-    , ("bigNatEqWord#",            makeBigNatWordCmpOp "bigNatEqWord#" (==))
+    -- bigNatGtWord#, bigNatLeWord#, and bigNatEqWord# source-load from
+    -- ghc-bignum; their bodies compose retained lower leaves
+    -- (bigNatSize#, bigNatIndex#, bigNatIsZero#).
     , ("bigNatCompareWord#",       bigNatCompareWordHashB)    -- BigNat# -> Word# -> Ordering
     , ("bigNatIsTwo#",             makeBigNatUnaryBool "bigNatIsTwo#" (== 2))
     , ("bigNatCheck#",             bigNatCheckHashB)          -- BigNat# -> Bool# (always 1 for our backing)
@@ -3482,24 +3482,6 @@ naturalLogBase b n          = go 0 n
   where
     go !i k | k < b     = i
             | otherwise = go (i + 1) (k `div` b)
-
--- | Phase 2.E: @BigNat# -> Word# -> Bool#@ comparison primop.
--- Both args extracted via the standard Natural reinterpretation
--- chain; result is VInt 1/0 per 'primBoolVal'.  Mirrors
--- 'makeBigNatCmpOp' from Phase 2.A.
-makeBigNatWordCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
-makeBigNatWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat name av
-    -- 'coerceWordArg' (not a bare @VInt@ match): Word# literals such
-    -- as @ABS_INT_MINBOUND## = 0x8000000000000000@ exceed
-    -- @maxBound :: Int64@ so the parser stores them as 'VInteger',
-    -- not 'VInt'.  ghc-bignum's 'integerNegate' (@IP b@ arm) calls
-    -- @bigNatEqWord# b ABS_INT_MINBOUND##@, which would otherwise
-    -- fail "not a Word#".  Mirrors the Phase 3 'makeBigNatWordOp'
-    -- fix.
-    nb <- coerceWordArg name bv
-    pure (primBoolVal (op na nb))
 
 -- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
 bigNatCompareWordHashB :: IO Val

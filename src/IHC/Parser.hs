@@ -195,10 +195,8 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
                     , peCol  = tkCol precTok
                     , peMsg  = "fixity precedence must be in 0..9, got "
                                <> show n })
-                | otherwise -> consumeOps assoc (fromInteger n) acc (advance cur1)
+                | otherwise -> consumeOps assoc (fromInteger n) acc cur1
             _ -> go acc cur
-
-    advance cur = snd (nextToken src cur)
 
     -- After `infixl N`, collect a comma-separated list of op names
     -- until we leave the line (any column-1 token or EOF).
