@@ -44,7 +44,7 @@ import Control.Exception
     )
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
-    , popCount, countLeadingZeros, finiteBitSize
+    , popCount, countLeadingZeros, countTrailingZeros, finiteBitSize
     , bit, testBit, clearBit, setBit, complementBit
     )
 import Data.ByteString (ByteString)
@@ -722,14 +722,14 @@ builtins reg =
     -- bigNatGtWord#, bigNatLeWord#, and bigNatEqWord# source-load from
     -- ghc-bignum; their bodies compose retained lower leaves
     -- (bigNatSize#, bigNatIndex#, bigNatIsZero#).
-    , ("bigNatCompareWord#",       bigNatCompareWordHashB)    -- BigNat# -> Word# -> Ordering
-    , ("bigNatIsTwo#",             makeBigNatUnaryBool "bigNatIsTwo#" (== 2))
-    , ("bigNatCheck#",             bigNatCheckHashB)          -- BigNat# -> Bool# (always 1 for our backing)
+    -- bigNatCompareWord#, bigNatIsTwo#, and bigNatCheck# source-load
+    -- from ghc-bignum over retained word-array reader leaves
+    -- (wordArraySize#, indexWordArray#, sizeofByteArray#).
     , ("bigNatIndex#",             bigNatIndexHashB)          -- BigNat# -> Int# -> Word# (i-th 64-bit limb)
     , ("bigNatZero#",              bigNatZeroHashB)           -- (# #) -> BigNat#
     , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
-    , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
-    , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
+    -- bigNatCtz# and bigNatCtzWord# source-load from ghc-bignum;
+    -- their loops use indexWordArray# and the GHC.Prim ctz# leaf.
     -- bigNatSizeInBase# source-loads from ghc-bignum:
     -- base <= 1 -> unexpectedValue_Word#; zero -> 0##;
     -- otherwise bigNatLogBaseWord# base a + 1##.
@@ -827,6 +827,11 @@ builtins reg =
     , ("writeWord8Array#",          writeWord8ArrayB)
     , ("readWord8Array#",           readWord8ArrayB)
     , ("indexWord8Array#",          indexWord8ArrayB)
+    -- GHC.Prim primop, no .hs source.  ghc-bignum's WordArray#
+    -- source uses it to read 64-bit limbs from the BigNat# ByteArray#
+    -- representation; IHC also supports PrimBigNat here while that
+    -- representation is Natural-backed.
+    , ("indexWordArray#",           indexWordArrayHashB)
     , ("unsafeFreezeByteArray#",    unsafeFreezeByteArrayB)
     , ("byteArrayContents#",        byteArrayContentsB)
     , ("mutableByteArrayContents#", mutableByteArrayContentsB)
@@ -969,6 +974,9 @@ builtins reg =
     , ("quotWord#",  quotWordB)
     , ("remWord#",   remWordB)
     , ("popCnt#",    popCntB)
+    -- GHC.Prim primop, no .hs source.  Required by source-loaded
+    -- ghc-bignum word/BigNat trailing-zero helpers.
+    , ("ctz#",       ctzHashB)
     , ("indexOfTheOnlyBit#", indexOfTheOnlyBitB)
     -- Phase 2.8: Int# arithmetic primops
     , ("negateInt#",   negateIntB)
@@ -3483,26 +3491,6 @@ naturalLogBase b n          = go 0 n
     go !i k | k < b     = i
             | otherwise = go (i + 1) (k `div` b)
 
--- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
-bigNatCompareWordHashB :: IO Val
-bigNatCompareWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat "bigNatCompareWord#" av
-    nb <- coerceWordArg "bigNatCompareWord#" bv
-    pure $ case compare na nb of
-        LT -> VCon "LT" []
-        EQ -> VCon "EQ" []
-        GT -> VCon "GT" []
-
--- | @bigNatCheck# :: BigNat# -> Bool#@ — ghc-bignum's canonical-form
--- sanity check (high limb non-zero, etc.).  Our 'Natural'-backed
--- representation is always canonical by construction, so this is
--- a constant True.
-bigNatCheckHashB :: IO Val
-bigNatCheckHashB = pure $ VFun $ \a -> do
-    _ <- force legacyHooks a
-    pure (primBoolVal True)
-
 -- | @bigNatIndex# :: BigNat# -> Int# -> Word#@ — extract the i-th
 -- 64-bit limb (little-endian).  Bounds-checking is the caller's
 -- responsibility per ghc-bignum convention (out-of-range returns 0
@@ -3537,23 +3525,6 @@ bigNatOneHashB :: IO Val
 bigNatOneHashB = pure $ VFun $ \a -> do
     _ <- force legacyHooks a
     pure (VPrimObj (PrimBigNat 1))
-
--- | @bigNatCtz# :: BigNat# -> Word#@ — count trailing zero bits.
--- Returns 0 for n = 0 (ghc-bignum convention, BigNat.hs:1213).
-bigNatCtzHashB :: IO Val
-bigNatCtzHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatCtz#" av
-    pure (VInt (fromIntegral (naturalCtz n)))
-
--- | @bigNatCtzWord# :: BigNat# -> Word#@ — count trailing zero
--- 64-bit limbs.  Returns 0 for n = 0.  Equivalent to
--- @bigNatCtz# n `div` 64@.
-bigNatCtzWordHashB :: IO Val
-bigNatCtzWordHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatCtzWord#" av
-    pure (VInt (fromIntegral (naturalCtz n `div` 64)))
 
 -- | Pure helper: count trailing zero bits of a 'Natural'.  Returns 0
 -- for n = 0 (matches ghc-bignum's @bigNatCtz# 0 == 0##@).
@@ -4542,6 +4513,40 @@ indexWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
                 _ -> error "indexWord8Array#: bad index"
         _ -> error ("indexWord8Array#: not a MutableByteArray: " <> showValForDebug av)
 
+indexWordArrayHashB :: IO Val
+indexWordArrayHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    idx <- case bv of
+        VInt i | i >= 0 -> pure i
+        _ -> error ("indexWordArray#: not a non-negative Int#: " <> showValForDebug bv)
+    case av of
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (word64ToInt64 (bigNatWordLimbAt n idx)))
+        VPrimObj (PrimByteArray ref) -> do
+            bs <- readIORef ref
+            pure (VInt (word64ToInt64 (byteStringWord64At bs idx)))
+        _ -> error ("indexWordArray#: not a WordArray#: " <> showValForDebug av)
+
+bigNatWordLimbAt :: Natural -> Int64 -> Word64
+bigNatWordLimbAt n idx =
+    fromIntegral (n `shiftR` (64 * fromIntegral idx))
+
+byteStringWord64At :: ByteString -> Int64 -> Word64
+byteStringWord64At bs idx
+    | off < 0 || off + 8 > BS.length bs =
+        error "indexWordArray#: index out of bounds"
+    | otherwise =
+        foldl
+            (\acc (shiftBy, byte) ->
+                acc .|. (fromIntegral byte `shiftL` shiftBy))
+            0
+            (zip [0,8..56] (BS.unpack (BS.take 8 (BS.drop off bs))))
+  where
+    off = fromIntegral idx * 8
+
+word64ToInt64 :: Word64 -> Int64
+word64ToInt64 = fromIntegral
+
 unsafeFreezeByteArrayB :: IO Val
 unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
     av <- force legacyHooks a; stv <- force legacyHooks stT
@@ -4678,6 +4683,8 @@ sizeofByteArrayB = pure $ VFun $ \a -> do
         VPrimObj (PrimByteArray ref) -> do
             bs <- readIORef ref
             pure (VInt (fromIntegral (BS.length bs)))
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (fromIntegral (8 * bigNatLimbCount n)))
         _ -> error ("sizeofByteArray#: not a ByteArray: " <> showValForDebug av)
 
 resizeMutableByteArrayB :: IO Val
@@ -5030,6 +5037,17 @@ popCntB = pure $ VFun $ \a -> do
     case av of
         VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
         _      -> error ("popCnt#: bad arg: " <> showValForDebug av)
+
+ctzHashB :: IO Val
+ctzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let w = fromIntegral n :: Word64
+                z | w == 0    = 64
+                  | otherwise = countTrailingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("ctz#: bad arg: " <> showValForDebug av)
 
 indexOfTheOnlyBitB :: IO Val
 indexOfTheOnlyBitB = pure $ VFun $ \a -> do
