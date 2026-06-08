@@ -22,9 +22,9 @@
 -- silently discarded, since ihc resolves modules by name across its
 -- source cache.
 --
--- Not yet supported: @module Foo (module Bar) where@ re-exports. These
--- degrade gracefully — the scanner stops at the unrecognised form and
--- the rest of the file is still reachable.
+-- @module Foo (module Bar) where@ re-exports are parsed; the scheduler
+-- follows the re-export chain and resolves import aliases such as
+-- @module Backend@ from @import Foo as Backend@.
 -- Operator imports like @import Foo ((<>))@ are now parsed correctly
 -- (the operator name is skipped/ignored, but subsequent names in the
 -- list are preserved and the import is not aborted).
