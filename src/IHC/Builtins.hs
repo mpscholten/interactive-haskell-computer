@@ -1098,10 +1098,8 @@ builtins reg =
     -- lower setSockOpt foreign imports.
     -- Network.Socket.Syscall.listen source-loads; its listen(2) foreign
     -- import dispatches through the generic FFI path.
-    -- accept(2) blocks for the next connection and returns a network Socket
-    -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
-    -- above it remains source-interpreted.
-    , ("Network.Socket.Syscall.accept", socketAcceptB)
+    -- Network.Socket.Syscall.accept source-loads; its accept(2) foreign
+    -- import dispatches through the generic FFI path.
     -- connect(2) — host-backed because the interpreted connectLoop
     -- triggers excessive lazy discovery (~5000 bindings) that hangs.
     , ("Network.Socket.Syscall.connect", socketConnectB)
@@ -4553,34 +4551,6 @@ socketConnectB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
         connectLoop
         pure VUnit
 
-socketAcceptB :: IO Val
-socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    -- Set socket to blocking mode for accept.  The network library
-    -- creates sockets in non-blocking mode for GHC's IO manager,
-    -- but IHC's single-threaded accept loop needs a blocking accept.
-    c_setBlocking (fromIntegral fd)
-    allocaBytes 128 $ \addrP ->
-      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        fillBytes addrP 0 128
-        poke (castPtr lenP :: Ptr CInt) 128
-        -- safe FFI: blocks OS thread, releases GHC capability
-        newFd <- c_accept_host (fromIntegral fd)
-                               (castPtr addrP)
-                               (castPtr lenP)
-        when (newFd == -1) $ do
-            Errno e <- getErrno
-            ioError (userError ("Network.Socket.accept: errno=" <> show e))
-        fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
-        ref <- newIORef fdValT
-        refV <- mkSourceIORefVal ref
-        refT <- newWHNFThunk refV
-        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdValT])
-        addrV <- peekSockAddrVal (castPtr addrP)
-        addrT <- newWHNFThunk addrV
-        pure (VCon "(,)" [sockOutT, addrT])
-
 socketFdFromVal :: Val -> IO Int64
 socketFdFromVal v = do
     fdV <- socketCurrentFdVal v
@@ -4690,19 +4660,6 @@ socketTypeField t = do
 
 foreign import ccall unsafe "socket"
     c_socket_host :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall safe "accept"
-    c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
-
--- | Set a socket fd to blocking mode (clear O_NONBLOCK).
-c_setBlocking :: CInt -> IO ()
-c_setBlocking fd = do
-    flags <- c_fcntl fd 3 0  -- F_GETFL = 3
-    let newFlags = flags .&. complement 0x800  -- O_NONBLOCK = 0x800 on Linux
-    _ <- c_fcntl fd 4 newFlags  -- F_SETFL = 4
-    pure ()
-
-foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
 
 foreign import ccall unsafe "connect"
     c_connect_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
