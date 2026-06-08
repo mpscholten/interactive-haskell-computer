@@ -18,6 +18,9 @@ module IHC.Val
     , newWHNFThunk
     , newLazyIOThunk
     , newLazyBuiltinThunk
+      -- * Host pointer metadata
+    , markTypedHostPtr
+    , lookupTypedHostPtr
       -- * Environments
     , Env
     , emptyEnv
@@ -49,9 +52,10 @@ import Data.Map.Strict (Map)
 import Data.Int (Int64)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (IntPtr, Ptr, ptrToIntPtr)
 import Numeric.Natural (Natural)
 import System.IO (Handle)
+import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr, Name)
 
@@ -239,6 +243,22 @@ newLazyIOThunk mkV = newIORef (LazyBuiltin mkV)
 -- | Builtin-facing name for 'newLazyIOThunk'.
 newLazyBuiltinThunk :: IO Val -> IO Thunk
 newLazyBuiltinThunk = newLazyIOThunk
+
+--------------------------------------------------------------------------------
+-- Host pointer metadata
+--------------------------------------------------------------------------------
+
+{-# NOINLINE typedHostPtrsRef #-}
+typedHostPtrsRef :: IORef (Map.Map IntPtr ByteString)
+typedHostPtrsRef = unsafePerformIO (newIORef Map.empty)
+
+markTypedHostPtr :: Ptr a -> ByteString -> IO ()
+markTypedHostPtr p ty =
+    modifyIORef' typedHostPtrsRef (Map.insert (ptrToIntPtr p) ty)
+
+lookupTypedHostPtr :: Ptr a -> IO (Maybe ByteString)
+lookupTypedHostPtr p =
+    Map.lookup (ptrToIntPtr p) <$> readIORef typedHostPtrsRef
 
 --------------------------------------------------------------------------------
 -- Environments
