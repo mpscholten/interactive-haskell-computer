@@ -2869,12 +2869,24 @@ scanInstanceDeclsRaw src
                 -- and applied forms like @instance Functor ((->) r)@.
                 [TkArrow] -> Just (BC.pack "(->)")
                 (TkLParen : TkArrow : TkRParen : _) -> Just (BC.pack "(->)")
-                (TkConId n : rest) -> Just (normalizeTyTag (qualifiedConHeadTokens n rest))
+                (TkConId n : rest)
+                    | n `elem` map BC.pack ["ShareInput", "NoShareInput"]
+                    , Just arg <- simpleAppliedTypeArg rest ->
+                        Just (normalizeTyTag (n <> BC.pack " " <> arg))
+                    | otherwise ->
+                        Just (normalizeTyTag (qualifiedConHeadTokens n rest))
                 (TkIdent n : _)    -> Just (normalizeTyTag n)
                 _                  -> Nothing
       where
         spanCommas :: [TokenKind] -> ([TokenKind], [TokenKind])
         spanCommas = span (\case TkComma -> True; _ -> False)
+
+        simpleAppliedTypeArg :: [TokenKind] -> Maybe ByteString
+        simpleAppliedTypeArg toks =
+            case dropNoise toks of
+                (TkConId n : rest) -> Just (qualifiedConHeadTokens n rest)
+                (TkIdent n : _)    -> Just n
+                _                  -> Nothing
 
     qualifiedConHead :: ByteString -> Cursor -> (ByteString, Cursor)
     qualifiedConHead first cur =
