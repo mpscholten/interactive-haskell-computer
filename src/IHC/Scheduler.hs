@@ -528,7 +528,8 @@ loadProgramFromSource searchPath src0 = do
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
-    let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
+    let qualEnv0 = extendEnvMany (zip (map fst qualPairs) slots) base
+        qualEnv = HashMap.union classMethodEnv qualEnv0
 
     -- For FQN keys whose bare name (last dot-component) matches a builtin,
     -- point the FQN slot directly at the builtin thunk.  This ensures that
@@ -884,28 +885,32 @@ installCoreInstanceLoadHook classReg baseEnv = do
 -- automatically follows whatever the installed @base@ (and other
 -- packages) declare.
 --
--- The 'GHC.Internal.*' filter mirrors the scope decision in
--- 'loadProgramFromSource' — keeps the hook bounded to boot-library
--- reach so an unrelated user package's 'instance Show ...' doesn't
--- trigger a surprise cross-package fan-out at the prompt.
--- User-imported packages are loaded through the ordinary import path,
--- not this hook.
+-- For boot-library classes, keep the hook bounded to @GHC.Internal.*@
+-- providers so an ordinary @Show@ miss does not fan out across every
+-- package in the source cache.  For package-defined classes that have
+-- no boot-library providers (e.g. @Text.Megaparsec.Stream.Stream@),
+-- load that class's source providers on first miss; those classes often
+-- enter via class-default or internal method calls rather than the
+-- entry module's free-variable preload path.
 --
--- Empty providers (user-defined classes, classes outside
--- 'GHC.Internal.*', or empty source cache) → no-op.  The caller
+-- Empty providers (user-defined classes not found in the source-cache
+-- manifest, or empty source cache) → no-op.  The caller
 -- ('resolveTypedMethod') falls through to the value-directed
 -- 'lookupClassMethodFallback'.
 loadCoreInstanceModules :: ClassRegistry -> Env -> ByteString -> IO ()
 loadCoreInstanceModules classReg baseEnv cls = do
     let idx               = Manifest.manifestIndex
         ghcInternalPrefix = BC.pack "GHC.Internal."
-        providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`)
-                               (Manifest.providersForClass idx cls)
+        allProviders = Manifest.providersForClass idx cls
+        coreProviders = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
+        providers
+            | Set.null coreProviders = allProviders
+            | otherwise              = coreProviders
         headTypeMods = Set.fromList
             [ definingMod
             | tyName       <- Map.findWithDefault [] cls (Manifest.miClassHeads idx)
             , Just definingMod <- [Map.lookup tyName (Manifest.miTypeProviders idx)]
-            , ghcInternalPrefix `BC.isPrefixOf` definingMod
+            , Set.null coreProviders || ghcInternalPrefix `BC.isPrefixOf` definingMod
             ]
         toLoad = Set.toList (providers `Set.union` headTypeMods)
     case toLoad of
@@ -1133,7 +1138,8 @@ loadFileIntoEnv searchPath path existingEnv = do
         qualPairs = filter (isEntryVisibleKey . fst) qualPairs0
     -- Tie the knot.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
-    let qualEnv = extendEnvMany (zip (map fst qualPairs) slots) base
+    let qualEnv0 = extendEnvMany (zip (map fst qualPairs) slots) base
+        qualEnv = HashMap.union classMethodEnv qualEnv0
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let innerEnv = HashMap.union aliases qualEnv
@@ -1620,7 +1626,8 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         [ n | (n, Nothing) <- zip requested requestedStandard ]
     let requestedPairs =
             mapMaybe id requestedStandard ++ mapMaybe id requestedFromBuiltins
-    let qualEnv    = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
+    let qualEnv0   = extendEnvMany (zip (map fst qualPairs) slots) baseForImport
+        qualEnv    = HashMap.union classMethodEnv qualEnv0
         thunkByKey = HashMap.fromList (zip (map fst qualPairs) slots)
         modPrefix  = lmName targetLm <> BC.pack "."
         builtinBareName k =
@@ -2175,7 +2182,18 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     mapM_ (\ctor -> registerInstance classReg cls ctor methodVals) ctors
   where
 
-    instanceRuntimeCtors ty =
+    instanceRuntimeCtors ty
+        | Just inner <- wrappedStreamInputArg (BC.pack "ShareInput") ty =
+            map (BC.pack "ShareInput " <>) <$> runtimeCtorsForType inner
+        | Just inner <- wrappedStreamInputArg (BC.pack "NoShareInput") ty =
+            map (BC.pack "NoShareInput " <>) <$> runtimeCtorsForType inner
+        | otherwise =
+            runtimeCtorsForType ty
+
+    wrappedStreamInputArg wrapper ty =
+        BC.stripPrefix (wrapper <> BC.pack " ") ty
+
+    runtimeCtorsForType ty =
         case splitQualified ty of
             Just (qual, bareTy) -> do
                 mTarget <- resolveQualified registry searchPath includeMap lm qual
@@ -2239,6 +2257,7 @@ findRuntimeCtorsForType registry searchPath includeMap seen lm ty
 
     loadCandidates [] = pure []
     loadCandidates (imp:rest)
+        | impQualified imp = loadCandidates rest
         | not (specAllows (impSpec imp) ty) = loadCandidates rest
         | otherwise = do
             loaded <- try (loadModule registry searchPath includeMap (impModule imp))
@@ -3709,13 +3728,7 @@ classMethodDispatcher reg cls methodName = selfVal
             -- list keeps the "[]" tag and the existing
             -- result-polymorphic / default chain handles it
             -- (@mconcat [] = mempty@).
-            rawTag <- if rawTag0 == BC.pack "[]"
-                        && cls == BC.pack "Monoid"
-                        && methodName == BC.pack "mconcat"
-                      then case av of
-                              VCon ":" (hT : _) -> typeTagOf <$> force legacyHooks hT
-                              _                 -> pure rawTag0
-                      else pure rawTag0
+            rawTag <- classifyClassArg rawTag0 av
             -- Then 'dispatchTagForValue' applies a second normalisation:
             -- for arrow-style classes (Category, Arrow, ArrowChoice,
             -- ArrowLoop) a function value dispatches as @(->)@.
@@ -3789,6 +3802,15 @@ classMethodDispatcher reg cls methodName = selfVal
                     -- not the Foldable container.  Carry it forward and
                     -- let the next argument drive the instance lookup.
                     pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isStreamPreDispatchArg tag accArgs
+                then
+                    -- Stream-style methods often carry a leading Proxy
+                    -- argument (or, for takeN_, an Int count) before the
+                    -- actual stream/chunk value that corresponds to the
+                    -- instance head.  Dispatching on Proxy would look for
+                    -- @Stream Proxy@; carry it forward and let the next
+                    -- value drive lookup.
+                    pure (dispatch (remaining - 1) (argT : accArgs))
             else if isFoldablePreContainerArg accArgs
                 then
                     -- Foldable.foldr/foldl/foldl' have shape
@@ -3814,112 +3836,117 @@ classMethodDispatcher reg cls methodName = selfVal
                     mSpecial <- specialClassApplication tag av argT accArgs
                     case mSpecial of
                         Just specialVal -> pure specialVal
-                        Nothing
-                          | isIxIndexMethod
-                          , isPairVal av ->
-                              -- For Ix methods with a separate index argument,
-                              -- the first argument is bounds.  Its runtime
-                              -- constructor is always `(,)`, regardless of the
-                              -- actual index type, so a failed bounds-specific
-                              -- classification must not fall through to the
-                              -- generic `(,)` instance.  Carry the bounds arg
-                              -- forward and let the real index argument drive
-                              -- dispatch.
-                              pure (dispatch (remaining - 1) (argT : accArgs))
                         Nothing -> do
-                          -- First lookup against the dispatcher's own classReg.
-                          mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
-                          -- Also check the shared classReg (per Haskell 2010
-                          -- §4.3.2, instances from the user's transitive import
-                          -- closure should be visible — they may have been
-                          -- registered by a later import via the shared ref).
-                          mMethodShared <- lookupInSharedRegForced cls tag methodName
-                          let mMethod = preferMethod mMethod0 mMethodShared
-                          case mMethod of
-                            Just methodVal
-                              | not (isMethodPlaceholder methodVal) ->
-                                    applyAllForTag tag methodVal (reverse (argT : accArgs))
+                          mWrappedStream <- tryStreamWrappedChunkMethod tag argT accArgs
+                          case mWrappedStream of
+                            Just streamVal
+                              | not (isMethodPlaceholder streamVal) -> pure streamVal
                             _ -> do
-                              mHost <- hostShowFallback reg cls tag methodName av
-                              case mHost of
-                                Just hostVal -> pure hostVal
-                                Nothing -> do
-                                  -- First-miss path: when the user's program
-                                  -- (or REPL) hasn't imported the module that
-                                  -- provides this class's instances yet, the
-                                  -- registry is empty.  Trigger the core-
-                                  -- instance load hook which force-loads the
-                                  -- providers from the manifest (e.g. Num →
-                                  -- GHC.Internal.Num).  Idempotent per class
-                                  -- per session.  Mirrors the same hook
-                                  -- 'IHC.Eval.resolveTypedMethod' calls.
-                                  triggerCoreInstanceLoad legacyHooks cls
-                                  -- Re-lookup after the core-load hook may
-                                  -- have populated the registry.  If still
-                                  -- nothing, fall through to lazyInstanceRetry
-                                  -- for in-scope module re-scans.
-                                  postLoad <- do
-                                      a <- lookupInstanceMethodForced reg cls tag methodName
-                                      b <- lookupInSharedRegForced cls tag methodName
-                                      pure (preferMethod a b)
-                                  didScan <- if isJust postLoad
-                                      then pure False
-                                      else lazyInstanceRetry cls tag
-                                  mMethod2 <- if isJust postLoad
-                                      then pure postLoad
-                                      else if didScan
-                                          then do
+                              if isIxIndexMethod && isPairVal av
+                                then
+                                  -- For Ix methods with a separate index argument,
+                                  -- the first argument is bounds.  Its runtime
+                                  -- constructor is always `(,)`, regardless of the
+                                  -- actual index type, so a failed bounds-specific
+                                  -- classification must not fall through to the
+                                  -- generic `(,)` instance.  Carry the bounds arg
+                                  -- forward and let the real index argument drive
+                                  -- dispatch.
+                                  pure (dispatch (remaining - 1) (argT : accArgs))
+                                else do
+                                  -- First lookup against the dispatcher's own classReg.
+                                  mMethod0 <- lookupInstanceMethodForced reg cls tag methodName
+                                  -- Also check the shared classReg (per Haskell 2010
+                                  -- §4.3.2, instances from the user's transitive import
+                                  -- closure should be visible — they may have been
+                                  -- registered by a later import via the shared ref).
+                                  mMethodShared <- lookupInSharedRegForced cls tag methodName
+                                  let mMethod = preferMethod mMethod0 mMethodShared
+                                  case mMethod of
+                                    Just methodVal
+                                      | not (isMethodPlaceholder methodVal) ->
+                                            applyAllForTag tag methodVal (reverse (argT : accArgs))
+                                    _ -> do
+                                      mHost <- hostShowFallback reg cls tag methodName av
+                                      case mHost of
+                                        Just hostVal -> pure hostVal
+                                        Nothing -> do
+                                          -- First-miss path: when the user's program
+                                          -- (or REPL) hasn't imported the module that
+                                          -- provides this class's instances yet, the
+                                          -- registry is empty.  Trigger the core-
+                                          -- instance load hook which force-loads the
+                                          -- providers from the manifest (e.g. Num →
+                                          -- GHC.Internal.Num).  Idempotent per class
+                                          -- per session.  Mirrors the same hook
+                                          -- 'IHC.Eval.resolveTypedMethod' calls.
+                                          triggerCoreInstanceLoad legacyHooks cls
+                                          -- Re-lookup after the core-load hook may
+                                          -- have populated the registry.  If still
+                                          -- nothing, fall through to lazyInstanceRetry
+                                          -- for in-scope module re-scans.
+                                          postLoad <- do
                                               a <- lookupInstanceMethodForced reg cls tag methodName
                                               b <- lookupInSharedRegForced cls tag methodName
                                               pure (preferMethod a b)
-                                          else pure mMethod
-                                  case mMethod2 of
-                                      Just methodVal
-                                        | not (isMethodPlaceholder methodVal) ->
-                                              applyAllForTag tag methodVal (reverse (argT : accArgs))
-                                      _ -> do
-                                          mResult <- resultPolymorphicMethod
-                                          case mResult of
-                                              Just resultVal ->
-                                                  applyAll resultVal (reverse (argT : accArgs))
-                                              Nothing -> do
-                                                  -- Dispatchable arg but no matching instance.
-                                                  -- Fall back to the class's default body.
-                                                  mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                                  mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                                  let mDef = preferMethod mDef0 mDefShared
-                                                  case mDef of
-                                                      Just defVal ->
-                                                          applyAll defVal (reverse (argT : accArgs))
-                                                      -- Category (->): (.) and id are GHC.Internal.Base
-                                                      -- primitives whose source body self-references
-                                                      -- through the class re-export.  Provide the
-                                                      -- canonical implementation directly.
-                                                      _ | cls == BC.pack "Category"
-                                                        , tag == functionArrowTag
-                                                        , methodName == BC.pack "." || methodName == BC.pack "id" -> do
-                                                          let baseDot = VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
-                                                                  gV <- force legacyHooks gT
-                                                                  gxV <- apply legacyHooks gV xT
-                                                                  gxT <- newWHNFThunk gxV
-                                                                  fV <- force legacyHooks fT
-                                                                  apply legacyHooks fV gxT
-                                                              baseId = VFun $ \a -> force legacyHooks a
-                                                              impl = if methodName == BC.pack "." then baseDot else baseId
-                                                          applyAll impl (reverse (argT : accArgs))
-                                                      _ -> do
-                                                          mOrdFallback <- tryOrdRelationFallback (reverse (argT : accArgs))
-                                                          case mOrdFallback of
-                                                              Just ordVal -> pure ordVal
-                                                              Nothing ->
-                                                                  -- No instance and no default — try the
-                                                                  -- next argument position (the class
-                                                                  -- variable may not be in the first
-                                                                  -- dispatchable slot, e.g. SocketAddress).
-                                                                  -- Exhausting all positions terminates at
-                                                                  -- 'fallback', which raises the no-instance
-                                                                  -- error.
-                                                                  pure (dispatch (remaining - 1) (argT : accArgs))
+                                          didScan <- if isJust postLoad
+                                              then pure False
+                                              else lazyInstanceRetry cls tag
+                                          mMethod2 <- if isJust postLoad
+                                              then pure postLoad
+                                              else if didScan
+                                                  then do
+                                                      a <- lookupInstanceMethodForced reg cls tag methodName
+                                                      b <- lookupInSharedRegForced cls tag methodName
+                                                      pure (preferMethod a b)
+                                                  else pure mMethod
+                                          case mMethod2 of
+                                              Just methodVal
+                                                | not (isMethodPlaceholder methodVal) ->
+                                                      applyAllForTag tag methodVal (reverse (argT : accArgs))
+                                              _ -> do
+                                                  mResult <- resultPolymorphicMethod
+                                                  case mResult of
+                                                      Just resultVal ->
+                                                          applyAll resultVal (reverse (argT : accArgs))
+                                                      Nothing -> do
+                                                          -- Dispatchable arg but no matching instance.
+                                                          -- Fall back to the class's default body.
+                                                          mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                                          mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                                          let mDef = preferMethod mDef0 mDefShared
+                                                          case mDef of
+                                                              Just defVal ->
+                                                                  applyAll defVal (reverse (argT : accArgs))
+                                                              -- Category (->): (.) and id are GHC.Internal.Base
+                                                              -- primitives whose source body self-references
+                                                              -- through the class re-export.  Provide the
+                                                              -- canonical implementation directly.
+                                                              _ | cls == BC.pack "Category"
+                                                                , tag == functionArrowTag
+                                                                , methodName == BC.pack "." || methodName == BC.pack "id" -> do
+                                                                  let baseDot = VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
+                                                                          gV <- force legacyHooks gT
+                                                                          gxV <- apply legacyHooks gV xT
+                                                                          gxT <- newWHNFThunk gxV
+                                                                          fV <- force legacyHooks fT
+                                                                          apply legacyHooks fV gxT
+                                                                      baseId = VFun $ \a -> force legacyHooks a
+                                                                      impl = if methodName == BC.pack "." then baseDot else baseId
+                                                                  applyAll impl (reverse (argT : accArgs))
+                                                              _ -> do
+                                                                  mOrdFallback <- tryOrdRelationFallback (reverse (argT : accArgs))
+                                                                  case mOrdFallback of
+                                                                      Just ordVal -> pure ordVal
+                                                                      Nothing ->
+                                                                          -- No instance and no default — try the
+                                                                          -- next argument position (the class
+                                                                          -- variable may not be in the first
+                                                                          -- dispatchable slot, e.g. SocketAddress).
+                                                                          -- Exhausting all positions terminates at
+                                                                          -- 'fallback', which raises the no-instance
+                                                                          -- error.
+                                                                          pure (dispatch (remaining - 1) (argT : accArgs))
             else if isSaturatedFunctorFallback accArgs
                     then do
                         mResult <- resultPolymorphicMethod
@@ -3957,6 +3984,34 @@ classMethodDispatcher reg cls methodName = selfVal
                                         ( "class-method dispatch: arity-1 `"
                                          <> BC.unpack cls <> "." <> BC.unpack methodName
                                          <> "` got non-dispatchable arg of tag `"
+                                         <> BC.unpack tag
+                                         <> "` and no result-polymorphic / default instance" )
+                    else if isContainerFirstResultPolymorphicMethod cls methodName
+                         && null accArgs
+                    then do
+                        -- Methods like @Applicative.*>@ and @Monad.>>@
+                        -- have their class variable in the first value
+                        -- argument.  If that argument is represented as a
+                        -- host closure (notably parser/Q newtypes whose
+                        -- runtime wrapper has already been unwrapped), do
+                        -- not walk forward and accidentally dispatch on a
+                        -- later argument such as an @IO@ action.  Use the
+                        -- result-polymorphic defaults for parser-shaped
+                        -- calls instead.
+                        mResult <- resultPolymorphicMethod
+                        case mResult of
+                            Just resultVal ->
+                                applyAll resultVal [argT]
+                            Nothing -> do
+                                mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                case preferMethod mDef0 mDefShared of
+                                    Just defVal | not (isMethodPlaceholder defVal) ->
+                                        applyAll defVal [argT]
+                                    _ -> error
+                                        ( "class-method dispatch: container-first `"
+                                         <> BC.unpack cls <> "." <> BC.unpack methodName
+                                         <> "` got non-dispatchable first arg of tag `"
                                          <> BC.unpack tag
                                          <> "` and no result-polymorphic / default instance" )
                     else do
@@ -4169,6 +4224,11 @@ classMethodDispatcher reg cls methodName = selfVal
         (c == BC.pack "Applicative" && m == BC.pack "pure")
      || (c == BC.pack "Monad"       && m == BC.pack "return")
 
+    isContainerFirstResultPolymorphicMethod :: ByteString -> ByteString -> Bool
+    isContainerFirstResultPolymorphicMethod c m =
+        (c == BC.pack "Applicative" && m `elem` map BC.pack ["*>", "<*", "<*>"])
+     || (c == BC.pack "Monad"       && m `elem` map BC.pack [">>=", ">>"])
+
     isFoldableElementArg =
         cls == BC.pack "Foldable"
         && methodName `elem` map BC.pack ["elem", "notElem"]
@@ -4204,6 +4264,31 @@ classMethodDispatcher reg cls methodName = selfVal
         , "Alternative", "MonadPlus"
         , "Semigroup", "Monoid"  -- (a -> IO ()) Monoid via IO instance
         ]
+
+    classifyClassArg rawTag0 av
+        | rawTag0 == BC.pack "[]"
+        , cls `elem` map BC.pack ["ToMarkup", "ToValue"] =
+            case av of
+                VCon ":" (hT : _) -> do
+                    hv <- force legacyHooks hT
+                    pure $ case hv of
+                        VChar _ -> BC.pack "String"
+                        _       -> rawTag0
+                _ -> pure rawTag0
+        | rawTag0 == BC.pack "[]"
+        , cls == BC.pack "Monoid"
+        , methodName == BC.pack "mconcat" =
+            case av of
+                VCon ":" (hT : _) -> typeTagOf <$> force legacyHooks hT
+                _                 -> pure rawTag0
+        | rawTag0 `elem` map BC.pack ["ShareInput", "NoShareInput"]
+        , cls `elem` map BC.pack ["Stream", "VisualStream", "TraversableStream"] =
+            case av of
+                VCon wrapper [innerT] -> do
+                    inner <- force legacyHooks innerT
+                    pure (wrapper <> BC.pack " " <> typeTagOf inner)
+                _ -> pure rawTag0
+        | otherwise = pure rawTag0
 
     specialClassApplication tag av argT accArgs
         | isOrdRelationMethod
@@ -4385,6 +4470,31 @@ classMethodDispatcher reg cls methodName = selfVal
         && methodName == BC.pack "flushWriteBuffer"
         && tag == BC.pack "<Handle>"
         && null accArgs
+
+    isStreamPreDispatchArg tag accArgs =
+        (cls `elem` map BC.pack ["Stream", "VisualStream", "TraversableStream"]
+         && tag == BC.pack "Proxy"
+         && null accArgs)
+        || (cls == BC.pack "Stream"
+            && methodName == BC.pack "takeN_"
+            && tag == BC.pack "Int"
+            && null accArgs)
+
+    tryStreamWrappedChunkMethod tag argT accArgs
+        | cls == BC.pack "Stream"
+        , methodName `elem` map BC.pack ["chunkLength", "chunkEmpty", "chunkToTokens"]
+        , length accArgs == 1
+        , not (BC.pack "ShareInput " `BC.isPrefixOf` tag)
+        , not (BC.pack "NoShareInput " `BC.isPrefixOf` tag) = do
+            let wrappedTag = BC.pack "ShareInput " <> tag
+            m0 <- lookupInstanceMethodForced reg cls wrappedTag methodName
+            mShared <- lookupInSharedRegForced cls wrappedTag methodName
+            case preferMethod m0 mShared of
+                Just methodVal
+                  | not (isMethodPlaceholder methodVal) ->
+                      Just <$> applyAll methodVal (reverse (argT : accArgs))
+                _ -> pure Nothing
+        | otherwise = pure Nothing
 
     isPairVal (VCon "(,)" _) = True
     isPairVal _              = False
@@ -4644,7 +4754,10 @@ buildClassMethodEnv
     -> [LoadedModule]
     -> IO Env
 buildClassMethodEnv classReg existing loadedModules = do
-    decls <- concat <$> mapM (\lm -> scanClassDecls (lmSource lm)) loadedModules
+    moduleDecls <- forM loadedModules $ \lm -> do
+        decls <- scanClassDecls (lmSource lm)
+        pure (lm, decls)
+    let decls = concatMap snd moduleDecls
     -- Publish every declared method name so the elaborator's
     -- 'classMethodHint' can distinguish real class methods from
     -- top-level bindings that merely happen to have a single-pred
@@ -4663,16 +4776,26 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- Build each method as (name, thunk). Later entries overwrite earlier
     -- so a later class with the same method name "wins", but this only
     -- happens in pathological source; typical modules don't clash.
-    pairs <- concat <$> mapM buildOne decls
-    let filtered = [ p | p@(n, _) <- pairs, not (HashMap.member n existing) ]
+    pairs <- concat <$> mapM (uncurry buildModule) moduleDecls
+    let filtered =
+            [ (n, t)
+            | (forceShadow, n, t) <- pairs
+            , forceShadow || not (HashMap.member n existing)
+            ]
     pure (HashMap.fromList filtered)
   where
-    buildOne (ClassDecl cls methodNames _defaults _supers) =
-        mapM (mkMethodEntry cls) methodNames
-    mkMethodEntry cls methodName = do
+    buildModule lm decls =
+        concat <$> mapM (buildOne (lmName lm)) decls
+    buildOne ownerName (ClassDecl cls methodNames _defaults _supers) =
+        concat <$> mapM (mkMethodEntries ownerName cls) methodNames
+    mkMethodEntries ownerName cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
         t <- newWHNFThunk v
-        pure (methodName, t)
+        let qualifiedName = ownerName <> BC.pack "." <> methodName
+        pure
+            [ (False, methodName, t)
+            , (True,  qualifiedName, t)
+            ]
 
 -- | Stage 3 of the lazy-registration plan: defer class-default
 -- materialisation the same way Stage 2 deferred per-instance
@@ -8358,8 +8481,11 @@ resolveFallbackSource mOwner name = do
     buildSlotFromOwner mods owner bareName = do
         registerSharedDerivedEnumBounded (Map.elems mods)
         bodies <- readIORef (lmBodies owner)
-        case Map.lookup bareName bodies of
-            Just expr | not (isSelfAlias owner bareName expr) -> do
+        mClassMethodEarly <- tryClassMethodSlot owner bareName
+        case mClassMethodEarly of
+            Just slot -> pure (Just slot)
+            Nothing -> case Map.lookup bareName bodies of
+              Just expr | not (isSelfAlias owner bareName expr) -> do
                 -- Synthesize a transient registry from the global
                 -- catalogue so 'buildImportRewrites' can walk the
                 -- owner's imports to resolve bare references inside
@@ -8453,39 +8579,35 @@ resolveFallbackSource mOwner name = do
                 modifyIORef' envFallbackCache
                     (Map.insert name slot . Map.insert selfKey slot)
                 pure (Just slot)
-            _ -> do
-                mClassMethod <- tryClassMethodSlot owner bareName
-                case mClassMethod of
-                    Just slot -> pure (Just slot)
+              _ -> do
+                mLocal <- refreshLocalBindingFromSource mods owner bareName
+                case mLocal of
+                    Just slot -> do
+                        modifyIORef' envFallbackCache (Map.insert name slot)
+                        pure (Just slot)
                     Nothing -> do
-                        mLocal <- refreshLocalBindingFromSource mods owner bareName
-                        case mLocal of
+                        mImport <- tryImportAliasSlot mods owner bareName
+                        case mImport of
                             Just slot -> do
                                 modifyIORef' envFallbackCache (Map.insert name slot)
                                 pure (Just slot)
                             Nothing -> do
-                                mImport <- tryImportAliasSlot mods owner bareName
-                                case mImport of
+                                mBase <- tryBaseBareSlot bareName
+                                case mBase of
                                     Just slot -> do
                                         modifyIORef' envFallbackCache (Map.insert name slot)
                                         pure (Just slot)
                                     Nothing -> do
-                                        mBase <- tryBaseBareSlot bareName
-                                        case mBase of
+                                        mCon <- tryConstructorSlot mods owner bareName
+                                        case mCon of
                                             Just slot -> do
                                                 modifyIORef' envFallbackCache (Map.insert name slot)
                                                 pure (Just slot)
                                             Nothing -> do
-                                                mCon <- tryConstructorSlot mods owner bareName
-                                                case mCon of
-                                                    Just slot -> do
-                                                        modifyIORef' envFallbackCache (Map.insert name slot)
-                                                        pure (Just slot)
-                                                    Nothing -> do
-                                                        mField <- tryFieldSlot mods owner bareName
-                                                        case mField of
-                                                            Just slot -> pure (Just slot)
-                                                            Nothing   -> tryKnownDirectOwnerSlot mods owner bareName
+                                                mField <- tryFieldSlot mods owner bareName
+                                                case mField of
+                                                    Just slot -> pure (Just slot)
+                                                    Nothing   -> tryKnownDirectOwnerSlot mods owner bareName
 
     isSelfAlias owner bareName (EVar n) =
         n == bareName || n == lmName owner <> BC.pack "." <> bareName

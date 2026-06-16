@@ -265,7 +265,9 @@ eval hooks env ipm = go
             VPrimObj _ -> do
                 a <- force hooks xt
                 error ("IHC.Eval.go(EApp): VPrimObj in function position: "
-                       <> showValForDebug fv <> " applied to " <> showValForDebug a)
+                       <> showValForDebug fv <> " applied to " <> showValForDebug a
+                       <> " while evaluating `"
+                       <> show f <> "` applied to `" <> show x <> "`")
             VCon _ (_:_:_) -> do
                 a <- force hooks xt
                 error ("IHC.Eval.go(EApp): not a function while evaluating `"
@@ -2129,6 +2131,14 @@ applyIP _     _         (VCon n [])                arg
 applyIP hooks ipm       (VCon _ [innerT])          arg = do
     inner <- force hooks innerT
     applyIP hooks ipm inner arg
+-- VIO applied to a state token: same bridge as 'apply', but on the
+-- implicit-param-aware application path used by user closures and
+-- quasiquote expansion.
+applyIP hooks _         (VIO io)                   _arg = do
+    result <- io
+    stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    resT <- newWHNFThunk result
+    pure (VCon "(#,#)" [stT, resT])
 applyIP hooks _         v                          arg  = do
     a <- force hooks arg
     error ("IHC.Eval.applyIP: not a function: "
