@@ -353,13 +353,7 @@ parseOneImport src cur0 = do
     (qualified, curQ) <- case tkKind t1 of
         TkQualified -> pure (True, cur1)
         _           -> pure (False, cur0)
-    -- PackageImports: an optional "pkg" string between `qualified` (if
-    -- present) and the module name. We accept it unconditionally and
-    -- discard the contents — module resolution is by name only.
-    let (tPkg, curAfterPkg) = nextSigTok src curQ
-    let curName = case tkKind tPkg of
-            TkStr _ -> curAfterPkg
-            _       -> curQ
+    let curName = skipPackageImportQualifier src curQ
     (mModName, cur2) <- parseDottedName src curName
     case mModName of
         Nothing   -> pure Nothing
@@ -394,6 +388,17 @@ parseOneImport src cur0 = do
                     , impSpec      = spec
                     }
             pure (Just (decl, curF))
+
+-- | PackageImports: an optional @"pkg"@ string may appear between
+-- @qualified@ (if present) and the module name.  IHC currently resolves
+-- imports by module name across its source cache, so the package qualifier is
+-- accepted and discarded instead of becoming part of 'ImportDecl'.
+skipPackageImportQualifier :: Source -> Cursor -> Cursor
+skipPackageImportQualifier src cur =
+    let (tok, cur') = nextSigTok src cur
+    in case tkKind tok of
+        TkStr _ -> cur'
+        _       -> cur
 
 -- | Called just after the opening @(@. Returns the list of imported
 -- names and the cursor past the closing @)@.
