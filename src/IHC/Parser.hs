@@ -186,7 +186,7 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
             _ -> go acc cur'
 
     grab assoc acc cur = do
-        let (precTok, cur1) = skipNewlines cur
+        let (precTok, curBeforePrec, curAfterPrec) = skipNewlinesWithStart cur
         case tkKind precTok of
             TkInt n
                 | n < 0 || n > 9 -> throwIO (ParseError
@@ -195,8 +195,11 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
                     , peCol  = tkCol precTok
                     , peMsg  = "fixity precedence must be in 0..9, got "
                                <> show n })
-                | otherwise -> consumeOps assoc (fromInteger n) acc cur1
-            _ -> go acc cur
+                | otherwise -> consumeOps assoc (fromInteger n) acc curAfterPrec
+            TkEof -> pure acc
+            _
+                | tkCol precTok == 1 -> go acc curBeforePrec
+                | otherwise          -> consumeOps assoc 9 acc curBeforePrec
 
     -- After `infixl N`, collect a comma-separated list of op names
     -- until we leave the line (any column-1 token or EOF).
@@ -213,27 +216,32 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
             TkComma    -> consumeOps assoc prec acc cur1
             TkBacktick ->
                 let (idTok, cur2) = nextToken src cur1
-                    (_closeTok, cur3) = nextToken src cur2
-                in case tkKind idTok of
-                    TkIdent n ->
+                    (closeTok, cur3) = nextToken src cur2
+                in case (backtickOpName (tkKind idTok), tkKind closeTok) of
+                    (Just n, TkBacktick) ->
                         let key = BC.pack "`" <> n <> BC.pack "`"
                         in consumeOps assoc prec (Map.insert key (assoc, prec) acc) cur3
                     _ -> consumeOps assoc prec acc cur2
-            TkSymOp n  -> consumeOps assoc prec (Map.insert n (assoc, prec) acc) cur1
-            TkPlus     -> consumeOps assoc prec (Map.insert "+" (assoc, prec) acc) cur1
-            TkMinus    -> consumeOps assoc prec (Map.insert "-" (assoc, prec) acc) cur1
-            TkStar     -> consumeOps assoc prec (Map.insert "*" (assoc, prec) acc) cur1
-            TkPlusPlus -> consumeOps assoc prec (Map.insert "++" (assoc, prec) acc) cur1
-            TkColon    -> consumeOps assoc prec (Map.insert ":" (assoc, prec) acc) cur1
-            TkDollar   -> consumeOps assoc prec (Map.insert "$" (assoc, prec) acc) cur1
-            TkDot      -> consumeOps assoc prec (Map.insert "." (assoc, prec) acc) cur1
-            _          -> go acc cur1
+            _ | Just name <- tokenOpName (tkKind tok) ->
+                consumeOps assoc prec (Map.insert name (assoc, prec) acc) cur1
+            _ -> go acc cur1
 
     skipNewlines cur =
         let (t, c) = nextToken src cur in
         case tkKind t of
             TkNewline -> skipNewlines c
             _         -> (t, c)
+
+    skipNewlinesWithStart cur =
+        let (t, c) = nextToken src cur in
+        case tkKind t of
+            TkNewline -> skipNewlinesWithStart c
+            _         -> (t, cur, c)
+
+    backtickOpName = \case
+        TkIdent n -> Just n
+        TkConId n -> Just n
+        _         -> Nothing
 
 --------------------------------------------------------------------------------
 -- Parser context
