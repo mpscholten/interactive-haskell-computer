@@ -1423,13 +1423,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                            `isInfixOf` m)
 
     --------------------------------------------------------------------
-    -- HSX + Blaze hello-world smoke fixtures (expected-fail).
+    -- HSX + Blaze hello-world smoke fixtures.
     --
-    -- These record the target for the HSX rendering milestone. Both
-    -- examples throw today; the tests assert the current error
-    -- messages so the suite stays green and the errors changing
-    -- signals real progress. Graduate to positive expectations once
-    -- rendering works end-to-end.
+    -- HSX quasi-quoting is still pending; the direct Blaze path now
+    -- renders through source-loaded blaze-html and serves as the
+    -- positive baseline for the rendering half of the milestone.
     --------------------------------------------------------------------
     it "examples/hsx_hello: [hsx|...|] QuasiQuoter is not expanded (expected-fail)" do
         -- Pins "HSX quasi-quoting still doesn't work" without
