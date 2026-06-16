@@ -108,6 +108,8 @@ spec = describe "Hs2010 — Expression control flow" $ do
             shouldParse "case x of { A -> 1; B -> 2 }"
         it "5.6.3 case alt with guards `_ | g -> e`" $
             shouldParse "case x of _ | g -> e"
+        it "5.6.3b braced case alt with boolean guard and fallback" $
+            shouldParse "case x of { p | cond -> e; _ -> z }"
         it "5.6.4 case alt with where clause" $
             shouldParse "case x of _ -> e where y = 1"
         it "5.6.5 empty case alternative list" $
