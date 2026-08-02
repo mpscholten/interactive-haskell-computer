@@ -13,15 +13,13 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: socket setup, source-shaped Handle__,\
-                    \ Data.Text fusion Step.Done, Foldable NonEmpty defaults,\
-                    \ source list folds, infix conop let/where, Natural NS/NB\
-                    \ bridges, and class-default placeholder apply all work;\
-                    \ request path still dies after accept on\
-                    \ integerToInt#/fromInteger with IS|IP|IN patterns applied\
-                    \ to a *function* (args=<function>) — likely fromInteger\
-                    \ receiving an unapplied toInteger/class-method, not an\
-                    \ Integer value."
+        pendingWith "Pending: after accept, request path still dies on\
+                    \ Int I# binary op with args=<function> 48 (ASCII '0');\
+                    \ likely _0+fromIntegral in header/digit parse after\
+                    \ fromIntegral left a function. Fixed along the way:\
+                    \ class-method single-tag apply, Natural NS/NB,\
+                    \ Category (->) baseDot, fromInteger∘toInteger recovery.\
+                    \ parseHeaderLines works on S.pack ByteStrings."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle

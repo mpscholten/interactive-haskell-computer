@@ -3678,20 +3678,31 @@ classMethodDispatcher reg cls methodName = selfVal
                   | not (isMethodPlaceholder methodVal) ->
                       applyAll methodVal [argT]
                 _ -> argDirectedDispatch argT
-        -- Type-tag-driven path: matchPat synthesised a tag from a PCon
-        -- pattern.  Look up the instance method for that type and
-        -- return it WITHOUT applying — the argT we were given is a
-        -- matchPat sentinel (VUnit), not a real class-method arg.
-        -- Nullary methods (mempty, maxBound) return a concrete value
-        -- that matchPat can re-match directly.  Unary+ methods return
-        -- a VFun; matchPat treats that as "no match" and the dispatch
-        -- fails cleanly.
+        -- Type-tag-driven path: either matchPat synthesised a tag from a
+        -- PCon pattern (argT is the VUnit sentinel), or ETyApp / type
+        -- ascription attached a tag and the *next* apply is a real value
+        -- argument (toInteger \@Word8 w, fromInteger \@Int n, …).
+        --
+        -- matchPat only: return the method WITHOUT applying — nullary
+        -- methods (mempty, maxBound) are concrete values matchPat re-matches;
+        -- unary+ methods are VFun and matchPat treats that as "no match".
+        --
+        -- Real apply: MUST applyAll.  Pre-fix we always returned the
+        -- bare method, so @toInteger \@Word8 w@ evaluated to the
+        -- Integral Word8 method *function*, and @fromInteger (toInteger w)@
+        -- (fromIntegral) then ran integerToInt# on that function —
+        -- Non-exhaustive IS|IP|IN with args=<function>.  That was the
+        -- warp request-path crash after accept.
         (firstTag:_) | isDispatchableTag firstTag -> do
             mM <- lookupInstanceMethodForced reg cls firstTag methodName
             mShared <- lookupInSharedRegForced cls firstTag methodName
             case preferMethod mM mShared of
                 Just methodVal
-                  | not (isMethodPlaceholder methodVal) -> pure methodVal
+                  | not (isMethodPlaceholder methodVal) -> do
+                      argV <- force legacyHooks argT
+                      case argV of
+                          VUnit -> pure methodVal
+                          _     -> applyAll methodVal [argT]
                 _ -> pure selfVal   -- no instance; tell caller "no match"
         _ -> argDirectedDispatch argT
     argDirectedDispatch argT0 = do
@@ -3744,7 +3755,25 @@ classMethodDispatcher reg cls methodName = selfVal
                     | otherwise
                         = rawTag
                 tag = dispatchTagForValue normTag
-            if isUnaryResultPolymorphicMethod cls methodName && null accArgs
+            if isCategoryArrowMethod tag && null accArgs
+                then do
+                    -- Always use Base (.) / id for Category (->).  The
+                    -- source instance is @(. ) = (GHC.Internal.Base..)@;
+                    -- under heavy warp loads that RHS has been observed
+                    -- to mis-reduce so @fromInteger . toInteger@ becomes
+                    -- application (@fromInteger toInteger@), feeding a
+                    -- function into Num.fromInteger.  baseDot is the
+                    -- known-correct @\f g x -> f (g x)@.
+                    let baseDot = VFun $ \fT -> pure $ VFun $ \gT -> pure $ VFun $ \xT -> do
+                            gV <- force legacyHooks gT
+                            gxV <- apply legacyHooks gV xT
+                            gxT <- newWHNFThunk gxV
+                            fV <- force legacyHooks fT
+                            apply legacyHooks fV gxT
+                        baseId = VFun $ \a -> force legacyHooks a
+                        impl = if methodName == BC.pack "." then baseDot else baseId
+                    applyAll impl [argT]
+            else if isUnaryResultPolymorphicMethod cls methodName && null accArgs
                 then do
                     -- @pure :: a -> f a@ and @return :: a -> m a@
                     -- are result-polymorphic: the lone value argument is
@@ -3774,12 +3803,39 @@ classMethodDispatcher reg cls methodName = selfVal
                     -- the Integer argument is not the Num instance type.
                     -- Without a typechecker, use the normal defaulting path
                     -- instead of dispatching to Num Integer.
-                    mResult <- resultPolymorphicMethod
-                    case mResult of
-                        Just resultVal ->
-                            applyAll resultVal [argT]
-                        Nothing ->
-                            pure (dispatch (remaining - 1) (argT : accArgs))
+                    --
+                    -- Recovery: if the arg is a *function* / class method
+                    -- (typically unapplied 'toInteger'), treat this as the
+                    -- mis-reduced form of @fromInteger . toInteger@ —
+                    -- i.e. @fromInteger toInteger@ instead of
+                    -- @\x -> fromInteger (toInteger x)@.  Return the
+                    -- composed fromIntegral-shaped function.  Observed on
+                    -- the warp request path as integerToInt# args=<function>.
+                    avFi <- force legacyHooks argT
+                    case avFi of
+                        VFun{} -> pure $ VFun $ \xT -> do
+                            intermediate <- apply legacyHooks avFi xT
+                            iT <- newWHNFThunk intermediate
+                            mResult <- resultPolymorphicMethod
+                            case mResult of
+                                Just resultVal -> applyAll resultVal [iT]
+                                Nothing -> error
+                                    "Num.fromInteger: composition recovery failed (no Num default)"
+                        VClassMethod{} -> pure $ VFun $ \xT -> do
+                            intermediate <- apply legacyHooks avFi xT
+                            iT <- newWHNFThunk intermediate
+                            mResult <- resultPolymorphicMethod
+                            case mResult of
+                                Just resultVal -> applyAll resultVal [iT]
+                                Nothing -> error
+                                    "Num.fromInteger: composition recovery failed (no Num default)"
+                        _ -> do
+                            mResult <- resultPolymorphicMethod
+                            case mResult of
+                                Just resultVal ->
+                                    applyAll resultVal [argT]
+                                Nothing ->
+                                    pure (dispatch (remaining - 1) (argT : accArgs))
             else if isStorableResultReadyArg accArgs
                 then do
                     mBytePeek <- tryStorableBytePeek av accArgs
@@ -4480,6 +4536,12 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Num"
         && methodName == BC.pack "fromInteger"
         && null accArgs
+
+    -- Category (.) / id on the function arrow — see early dispatch branch.
+    isCategoryArrowMethod tag =
+        cls == BC.pack "Category"
+        && tag == functionArrowTag
+        && (methodName == BC.pack "." || methodName == BC.pack "id")
 
     isBufferedIOHostHandleArg tag accArgs =
         cls == BC.pack "BufferedIO"
