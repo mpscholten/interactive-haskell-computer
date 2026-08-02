@@ -358,6 +358,12 @@ loadProgramFromSource searchPath src0 = do
     -- at an instance we haven't loaded (e.g. @return 42 :: ST s Int@).
     setClassMethodFallback legacyHooks (\cls method ->
         pure (Just (classMethodDispatcher classReg cls method)))
+    -- Install the TH Exp → Expr decoder so QuasiQuoter dispatch
+    -- ('EQuasiQuote' in 'IHC.Eval') can convert the Val produced by
+    -- @quoteExp@ into an 'Expr' and evaluate it.  'resetPerRunGlobals'
+    -- clears this hook to its error stub; reinstall every run.  Same
+    -- install as 'buildBaseEnv' (REPL path).
+    setThExpToExpr legacyHooks thExpToExpr
     -- Seed the type-sig registry with canonical class method sigs
     -- (pure, return, mempty, minBound, maxBound).
     seedBuiltinClassMethodSigs

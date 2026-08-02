@@ -509,6 +509,53 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
               , startsPat (tkKind tok)  -> go cur' depth True
             _                           -> go cur' depth sawPat
 
+-- | Look ahead for a top-level (paren-depth 0) /constructor/ operator
+-- before @=@ / @|@.  Constructor operators are @:@ and any 'TkSymOp'
+-- whose spelling starts with @:@ (Haskell 2010 §2.4 / §4.3.2 @conop@).
+--
+-- Used to distinguish unparenthesised pattern bindings
+--
+-- @
+--   a :| as = rhs     -- pattern bind (conop)
+--   x : xs  = rhs     -- pattern bind (list cons)
+-- @
+--
+-- from ordinary function bindings and variable-operator equations
+--
+-- @
+--   f x     = rhs     -- function
+--   x + y   = rhs     -- varop funlhs for (+)
+-- @
+--
+-- Without this, @let a :| as = x@ is mis-parsed as a function named
+-- @a@, then fails with "expected `=` or `|`; saw TkSymOp \":|\"",
+-- which is the root of the Data.List.NonEmpty lazy @:|@ pattern miss
+-- (base's @instance Monad NonEmpty@ uses @where b :| bs = f a@).
+hasTopLevelConOpBeforeEq :: Ctx -> Cursor -> Bool
+hasTopLevelConOpBeforeEq ctx0 cur0 = go cur0 (0 :: Int)
+  where
+    go cur !depth =
+        let (tok, cur') = nextSig ctx0 cur in
+        case tkKind tok of
+            TkEof                    -> False
+            TkEq     | depth == 0    -> False
+            TkBar    | depth == 0    -> False
+            TkColon  | depth == 0    -> True
+            TkSymOp op
+                | depth == 0
+                , isConOpSpelling op -> True
+            TkLParen                 -> go cur' (depth + 1)
+            TkLBracket               -> go cur' (depth + 1)
+            TkLBrace                 -> go cur' (depth + 1)
+            TkRParen                 -> go cur' (max 0 (depth - 1))
+            TkRBracket               -> go cur' (max 0 (depth - 1))
+            TkRBrace                 -> go cur' (max 0 (depth - 1))
+            _                        -> go cur' depth
+
+    isConOpSpelling op = case BC.uncons op of
+        Just (':', _) -> True
+        _             -> False
+
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do
     let ctx  = Ctx src end 1 fx
@@ -862,14 +909,15 @@ parseBindingsIn src fx (start, end) = do
     -- Returns (tmpBind, perVarBinds, curAfter).
     -- e.g. (a, b) = rhs  =>
     --   $wh0 = rhs
-    --   a    = case $wh0 of { (a, _) -> a }
-    --   b    = case $wh0 of { (_, b) -> b }
+    --   a    = case $wh0 of { ~(a, _) -> a }
+    --   b    = case $wh0 of { ~(_, b) -> b }
+    -- Report §3.12: where/let pattern matches are irrefutable.
     parseWherePatBind ctx accLen cur = do
         -- Use 'parseTopPat' so constructor-application LHS patterns
         -- like @BS _ m = bs@ (i.e. PCon with arguments) and infix
-        -- @x : xs = ys@ are accepted.  'parseSubPat' only consumes
-        -- a single atomic pattern token — for @BS _ m = bs@ it
-        -- consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
+        -- @x : xs = ys@ / @a :| as = ne@ are accepted.  'parseSubPat'
+        -- only consumes a single atomic pattern token — for @BS _ m = bs@
+        -- it consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
         -- with @expected `=`; saw TkUnderscore@.  This had been
         -- silently failing inside 'discoverInModule' (the error was
         -- caught and turned into 'unbound variable Data.ByteString.
@@ -885,13 +933,13 @@ parseBindingsIn src fx (start, end) = do
                     tmpBind  = (tmpName, rhsE)
                     vars     = patVars pat
                     -- For each bound variable v, produce:
-                    --   v = case $tmp of { pat -> v }
-                    -- where pat is the original pattern (variables other than v
-                    -- are still bound by the same match; we just project v out).
+                    --   v = case $tmp of { ~pat -> v }
+                    -- Irrefutable so that @where b :| bs = f a@ matches
+                    -- Report §3.12 lazy pattern-binding semantics.
                     perVarBind v =
                         ( v
                         , ECase (EVar tmpName)
-                            [ Alt pat (EVar v)
+                            [ Alt (PIrref pat) (EVar v)
                             , Alt PWild (EApp (EVar "error")
                                           (stringToConsList
                                             "Non-exhaustive pattern in where"))
@@ -943,7 +991,7 @@ parseBindingsIn src fx (start, end) = do
                                 perVarBind v =
                                     ( v
                                     , ECase (EVar n)
-                                        [ Alt subPat (EVar v)
+                                        [ Alt (PIrref subPat) (EVar v)
                                         , Alt PWild (EApp (EVar "error")
                                                       (stringToConsList
                                                         "Non-exhaustive as-pattern in where"))
@@ -954,6 +1002,14 @@ parseBindingsIn src fx (start, end) = do
                         _ -> parseErr ctx
                                 "expected `=` after as-pattern in where-binding"
                                 eqTok
+            -- Unparenthesised infix conop pattern binding in where:
+            --   where b :| bs = f a
+            -- (base's Monad NonEmpty).  Route to parseWherePatBind before
+            -- the function-binding path swallows the leading ident.
+            TkIdent _
+                | hasTopLevelConOpBeforeEq ctx cur -> do
+                    (newBinds, cur') <- parseWherePatBind ctx accLen cur
+                    pure (newBinds, cur')
             TkIdent _ -> do
                 -- Normal named binding (identifier starts the binding).
                 (name, params0, rhs0, cur1) <- parseClauseRaw ctx cur
@@ -1871,10 +1927,14 @@ parseDoLet ctx cur0 = do
         let tmpName = BC.pack ("$doPat" ++ show n)
             strictName = BC.pack ("$doPatStrict" ++ show n)
             vars    = doLetPatVars pat
+            -- Report §3.12: let patterns are irrefutable unless bang-strict.
+            matchPat'
+                | isStrictDoLetPat pat = pat
+                | otherwise            = PIrref pat
             perVar v =
                 ( v
                 , ECase (EVar tmpName)
-                    [ Alt pat (EVar v)
+                    [ Alt matchPat' (EVar v)
                     , Alt PWild (EApp (EVar "error")
                                   (stringToConsList
                                     "Non-exhaustive pattern in let"))
@@ -2002,7 +2062,17 @@ parseDoLet ctx cur0 = do
             Nothing -> do
                 let (nameTok, cur1) = nextSig ctx cur
                 case tkKind nameTok of
-                    TkIdent n -> do
+                    TkIdent n
+                        | hasTopLevelConOpBeforeEq ctx cur -> do
+                            -- Unparenthesised infix conop pattern in do-let:
+                            --   let a :| as = ne
+                            (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                            let (peek, _) = nextSig ctx cur4
+                                acc' = reverse patBinds ++ acc
+                            if tkCol peek == bindCol && tkKind peek /= TkEof
+                                then layoutBinds bindCol cur4 acc'
+                                else pure (reverse acc', cur4)
+                        | otherwise -> do
                         let _ = cur1
                         (_, params0, rhs0, cur4a) <- parseDoLetClauseRaw bindCol cur
                         (moreClauses, cur4) <- collectMoreDoLetClauses bindCol n cur4a []
@@ -2054,27 +2124,39 @@ parseDoLet ctx cur0 = do
 
     bracedIdentBind cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
-        name <- case tkKind nameTok of
-            TkIdent n -> pure n
-            _         -> parseErr ctx "expected identifier in let-binding" nameTok
-        (params, cur2) <- collectLetParams ctx cur1 []
-        let (sepTok, cur3) = nextSig ctx cur2
-        (e, cur4) <- case tkKind sepTok of
-            TkEq -> do
-                (rhs, cur4') <- parseExpr ctx cur3
-                pure (wrapParams params rhs, cur4')
-            TkBar -> do
-                (branches, cur4') <- parseDoLetGuardBranches ctx cur3 []
-                let rhs = desugarClauses
-                            [(params, RhsGuards branches)]
-                            (length params)
-                pure (rhs, cur4')
-            _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
-        let (sep, curN) = nextSig ctx cur4
-        case tkKind sep of
-            TkSemi   -> bracedBinds curN ((name, e) : acc)
-            TkRBrace -> pure (reverse ((name, e) : acc), curN)
-            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+        -- Unparenthesised infix conop pattern: `{ a :| as = ne; … }`
+        case tkKind nameTok of
+            TkIdent _
+                | hasTopLevelConOpBeforeEq ctx cur -> do
+                    (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                    let (sep, curN) = nextSig ctx cur4
+                        acc' = reverse patBinds ++ acc
+                    case tkKind sep of
+                        TkSemi   -> bracedBinds curN acc'
+                        TkRBrace -> pure (reverse acc', curN)
+                        _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+            _ -> do
+                name <- case tkKind nameTok of
+                    TkIdent n -> pure n
+                    _         -> parseErr ctx "expected identifier in let-binding" nameTok
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (sepTok, cur3) = nextSig ctx cur2
+                (e, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (rhs, cur4') <- parseExpr ctx cur3
+                        pure (wrapParams params rhs, cur4')
+                    TkBar -> do
+                        (branches, cur4') <- parseDoLetGuardBranches ctx cur3 []
+                        let rhs = desugarClauses
+                                    [(params, RhsGuards branches)]
+                                    (length params)
+                        pure (rhs, cur4')
+                    _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+                let (sep, curN) = nextSig ctx cur4
+                case tkKind sep of
+                    TkSemi   -> bracedBinds curN ((name, e) : acc)
+                    TkRBrace -> pure (reverse ((name, e) : acc), curN)
+                    _        -> parseErr ctx "expected `;` or `}` in let-block" sep
 
     parseDoLetGuardBranches ctx cur acc = do
         (gs, cur1) <- parseGuardList ctx cur
@@ -2173,8 +2255,12 @@ parseLet ctx cur0 = do
             -- let (a, b) = rhs
             -- desugars to:
             --   let $patN = rhs
-            --       a = case $patN of { (a, _) -> a; _ -> error }
-            --       b = case $patN of { (_, b) -> b; _ -> error }
+            --       a = case $patN of { ~(a, _) -> a }
+            --       b = case $patN of { ~(_, b) -> b }
+            -- Haskell Report §3.12: pattern matches in let/where are always
+            -- irrefutable (lazy).  Wrap non-bang patterns in 'PIrref' so
+            -- the match is deferred until a bound variable is forced —
+            -- matching base's @where b :| bs = f a@ in Monad NonEmpty.
             -- For a strict pattern binding (`let !pat = rhs`), also wrap
             -- the body in a case on the shared temporary.  The projection
             -- bindings stay in the recursive let group so sibling RHSs can
@@ -2182,10 +2268,13 @@ parseLet ctx cur0 = do
             -- strictness edge that source IO/state loops rely on.
             let tmpName = BC.pack ("$pat" ++ show (length normalAcc))
                 vars = letPatVars pat
+                matchPat'
+                    | isStrictLetPat pat = pat
+                    | otherwise          = PIrref pat
                 perVarBind v =
                     ( v
                     , ECase (EVar tmpName)
-                        [ Alt pat (EVar v)
+                        [ Alt matchPat' (EVar v)
                         , Alt PWild (EApp (EVar "error")
                                       (stringToConsList
                                         "Non-exhaustive pattern in let"))
@@ -2242,11 +2331,24 @@ parseLet ctx cur0 = do
     --   name params = expr
     --   name params | guard = expr | guard = expr
     --   (pat, ...) = expr            (pattern binding, returned as Right)
+    --   a :| as = expr / x:xs = expr  (infix conop pattern binding)
     parseOneLetItem bindCol cur = do
         let rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
         let (nameTok, cur1) = nextSig ctx cur
         case tkKind nameTok of
-            TkIdent n -> do
+            TkIdent n
+                -- Unparenthesised infix conop pattern: `a :| as = rhs`.
+                -- Must win over the function-binding path, else we treat
+                -- `a` as the function name and choke on the `:|`.
+                | hasTopLevelConOpBeforeEq ctx cur -> do
+                    (pat, cur2) <- parseTopPat ctx cur
+                    let (eqTok, cur3) = nextSig ctx cur2
+                    case tkKind eqTok of
+                        TkEq -> do
+                            (e, cur4) <- parseExpr rhsCtx cur3
+                            pure (Right (pat, e), cur4)
+                        _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
+                | otherwise -> do
                 (params, cur2) <- collectLetParams ctx cur1 []
                 let (sepTok, cur3) = nextSig ctx cur2
                 case tkKind sepTok of
@@ -2598,7 +2700,29 @@ parseAltWhereBinds ctx cur0 = do
     -- @curAfter@ points past the first token (used when the first token
     -- is an identifier and we want to start collecting params/args).
     parseOneAltWhereBind innerCtx curBefore curAfter nameTok = case tkKind nameTok of
-        TkIdent name -> do
+        TkIdent name
+            | hasTopLevelConOpBeforeEq innerCtx curBefore -> do
+                -- Unparenthesised infix conop pattern: `a :| as = ne`
+                (pat, curPat) <- parseTopPat innerCtx curBefore
+                let (sepTok, curSep) = nextSig innerCtx curPat
+                case tkKind sepTok of
+                    TkEq -> do
+                        (rhsE, curE) <- parseExpr innerCtx curSep
+                        let tmpName = BC.pack "$altwh0"
+                            tmpBind = (tmpName, rhsE)
+                            vars = patVarsAlt pat
+                            perVarBind v =
+                                ( v
+                                , ECase (EVar tmpName)
+                                    [ Alt (PIrref pat) (EVar v)
+                                    , Alt PWild (EApp (EVar "error")
+                                                  (stringToConsList
+                                                    "Non-exhaustive pattern in alt-where"))
+                                    ]
+                                )
+                        pure (tmpBind : map perVarBind vars, curE)
+                    _ -> pure ([], curPat)
+            | otherwise -> do
             -- Simple variable binding: collect params then parse body.
             (params, curP) <- collectLetParams innerCtx curAfter []
             let (sepTok, curSep) = nextSig innerCtx curP
@@ -2621,7 +2745,7 @@ parseAltWhereBinds ctx cur0 = do
                         perVarBind v =
                             ( v
                             , ECase (EVar tmpName)
-                                [ Alt pat (EVar v)
+                                [ Alt (PIrref pat) (EVar v)
                                 , Alt PWild (EApp (EVar "error")
                                               (stringToConsList
                                                 "Non-exhaustive pattern in alt-where"))

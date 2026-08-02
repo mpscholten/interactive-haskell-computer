@@ -39,6 +39,7 @@ entry in its `DEFAULT_PKGS` list. The script is idempotent — re-running prints
 | `string-conversions` | `cs` conversions used in HSX attribute handling                |
 | `parser-combinators` | megaparsec's applicative-combinator companion (transitive dep) |
 | `case-insensitive`   | transitive dep; already cached, included defensively           |
+| `template-haskell`   | `Language.Haskell.TH.Quote` (`QuasiQuoter` record). Prefer **2.22.x** — self-contained `data QuasiQuoter`. 2.24+ re-exports from `GHC.Boot.TH.Quote` (not cached). |
 
 ## Pre-existing cache state (before this change)
 
