@@ -119,6 +119,14 @@ prettyExpr = \case
         "(" <> prettyExpr e <> " { "
           <> bsIntercalate ", " (map prettyFieldExpr fields)
           <> " })"
+    -- @[qqName|body|]@ — QuasiQuoter.  Body is raw source bytes (HTML,
+    -- SQL, …); re-emit them inside the brackets.  Opaque to re-parse of
+    -- the body (same contract as the lexer: QQ body is not Haskell).
+    EQuasiQuote n body ->
+        "[" <> n <> "|" <> body <> "|]"
+    -- TH quote / splice: keep the phase-2.11/2.12 surface round-trippable.
+    EQuote e  -> "[| " <> prettyExpr e <> " |]"
+    ESplice e -> "$(" <> prettyExpr e <> ")"
     e              -> error
         ( "IHC.Pretty.prettyExpr: unsupported Expr constructor.\n"
           <> "  Phase 2 generators are bounded to constructors that\n"

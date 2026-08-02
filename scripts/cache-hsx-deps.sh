@@ -33,6 +33,12 @@ mkdir -p "$SOURCES_DIR"
 #   string-conversions  — `cs` conversions used in HSX attribute handling
 #   parser-combinators  — megaparsec's applicative-combinator companion
 #   case-insensitive    — transitive dep; already cached, included defensively
+#   template-haskell    — Language.Haskell.TH.Quote (QuasiQuoter record).
+#                         Prefer a 2.22.x tarball: 2.24+ re-exports the
+#                         data type from GHC.Boot.TH.Quote (not in cache).
+#                         The self-contained 2.22 Quote.hs defines
+#                         `data QuasiQuoter = QuasiQuoter { quoteExp, … }`
+#                         which source-loads cleanly under IHC.
 DEFAULT_PKGS=(
     ihp-hsx
     blaze-html
@@ -42,6 +48,7 @@ DEFAULT_PKGS=(
     string-conversions
     parser-combinators
     case-insensitive
+    template-haskell
 )
 
 PKGS=("${DEFAULT_PKGS[@]}" "$@")
