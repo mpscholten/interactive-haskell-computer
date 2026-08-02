@@ -15,10 +15,13 @@ spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
         pendingWith "Pending: socket setup, source-shaped Handle__,\
                     \ Data.Text fusion Step.Done, Foldable NonEmpty defaults,\
-                    \ source list folds, and unparenthesised let/where infix\
-                    \ conop patterns (`a :| as = …`, Monad NonEmpty) now work;\
-                    \ the request path accepts TCP then dies on\
-                    \ Integral/toInteger method placeholder before serving."
+                    \ source list folds, infix conop let/where, Natural NS/NB\
+                    \ bridges, and class-default placeholder apply all work;\
+                    \ request path still dies after accept on\
+                    \ integerToInt#/fromInteger with IS|IP|IN patterns applied\
+                    \ to a *function* (args=<function>) — likely fromInteger\
+                    \ receiving an unapplied toInteger/class-method, not an\
+                    \ Integer value."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle

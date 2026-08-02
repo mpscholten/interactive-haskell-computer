@@ -1720,6 +1720,34 @@ matchPat hooks (PCon "IP" [p]) v@(VPrimObj (PrimBigNat _)) = do
 matchPat hooks (PCon "IN" [p]) v@(VPrimObj (PrimBigNat _)) = do
     t <- newWHNFThunk v
     matchFields hooks [(p, t)] []
+-- ghc-bignum's @Natural@ data constructors (mirror of Integer IS/IP/IN):
+--
+--     data Natural = NS !Word# | NB !BigNat#
+--
+-- Literals like @(5 :: Natural)@ and @fromInteger@ land as 'VInt' /
+-- 'VInteger' (same optimistic path as 'Integer').  Source that
+-- pattern-matches @NS w@ / @NB bn@ needs the transparent-constructor
+-- bridge so @integerFromNatural@, @naturalToWord#@, etc. resolve.
+-- Without this, @integerFromNatural (5 :: Natural)@ fails with
+-- @Non-exhaustive patterns … NS … NB@ and warp's request path dies
+-- when Natural/Integer conversions run after @recv@.
+matchPat hooks (PCon "NS" [p]) (VInt n) = do
+    t <- newWHNFThunk (VInt n)
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "NS" [p]) (VInteger n)
+    | n >= 0
+    , n <= toInteger (maxBound :: Word64) = do
+        t <- newWHNFThunk (VInt (fromIntegral n))
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "NS" [p]) (VCon "W#" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "NB" [p]) (VInteger n)
+    | n > toInteger (maxBound :: Word64) = do
+        t <- newWHNFThunk (VPrimObj (PrimBigNat (fromInteger n)))
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "NB" [p]) v@(VPrimObj (PrimBigNat _)) = do
+    t <- newWHNFThunk v
+    matchFields hooks [(p, t)] []
 -- Lazy ST's lifted state token is `data State s = S# (State# s)`.
 -- The interpreter represents all erased State# tokens as PrimRealWorld, so
 -- expose that raw token through the source constructor when lazy ST code

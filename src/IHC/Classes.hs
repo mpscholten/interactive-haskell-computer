@@ -364,6 +364,9 @@ typeTagOf (VCon "Right"   _) = BC.pack "Either"
 typeTagOf (VCon "IS" _) = BC.pack "Integer"
 typeTagOf (VCon "IP" _) = BC.pack "Integer"
 typeTagOf (VCon "IN" _) = BC.pack "Integer"
+-- ghc-bignum Natural constructors (NS !Word# | NB !BigNat#).
+typeTagOf (VCon "NS" _) = BC.pack "Natural"
+typeTagOf (VCon "NB" _) = BC.pack "Natural"
 typeTagOf (VCon n _) =
     -- For source-loaded ADTs we now key dispatch on the constructor
     -- name directly. 'IHC.Scheduler.registerOne' (line ~1779) registers

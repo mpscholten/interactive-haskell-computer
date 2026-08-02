@@ -634,10 +634,22 @@ desugarClauses [(pats, RhsPlain body)] _
         in foldr ELam body' names
 desugarClauses clauses arity =
     let argNames = [BC.pack ("$a" ++ show i) | i <- [0 .. arity - 1]]
+        -- Include the failing argument values in the error so warp-style
+        -- "Non-exhaustive patterns in function: [[IS…],[IP…],[IN…]]"
+        -- failures name the runtime shape (VInt / NS / W# / …).
+        failMsg = stringToConsList
+                    ("Non-exhaustive patterns in function: "
+                      <> show (map fst clauses)
+                      <> " args=")
+        showArgs = foldr
+            (\a acc -> EApp (EApp (EVar "++")
+                                   (EApp (EVar "show") (EVar a)))
+                             (EApp (EApp (EVar "++") (stringToConsList " "))
+                                   acc))
+            (stringToConsList "")
+            argNames
         ultimateFail = EApp (EVar "error")
-                            (stringToConsList
-                                ("Non-exhaustive patterns in function: "
-                                  <> show (map fst clauses)))
+                            (EApp (EApp (EVar "++") failMsg) showArgs)
         bodyExpr = buildClauses argNames clauses ultimateFail
     in foldr ELam bodyExpr argNames
 

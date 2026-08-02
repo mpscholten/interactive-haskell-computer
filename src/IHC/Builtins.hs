@@ -5487,6 +5487,27 @@ tryIntegerCollapse "IN" [t] = do
                     then pure (VInt (fromInteger (negate (toInteger n))))
                     else pure (VInteger (negate (toInteger n)))
         _ -> pure (VCon "IN" [t])
+-- Natural = NS !Word# | NB !BigNat# — collapse like Integer so
+-- @(5 :: Natural)@ and @NS w@ share the same VInt/VInteger runtime
+-- as Word/Integer paths; matchPat bridges re-expose NS/NB.
+tryIntegerCollapse "NS" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VInt _ -> pure v
+        VInteger n
+            | n >= 0
+            , n <= toInteger (maxBound :: Word64)
+            -> pure (VInt (fromIntegral n))
+        VCon "W#" [inner] -> force legacyHooks inner
+        _ -> pure (VCon "NS" [t])
+tryIntegerCollapse "NB" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n) ->
+            if n <= fromIntegral (maxBound :: Word64)
+                then pure (VInt (fromIntegral n))
+                else pure (VInteger (fromIntegral n))
+        _ -> pure (VCon "NB" [t])
 tryIntegerCollapse name thunks = pure (VCon name thunks)
 
 -- | Build an environment binding each record-field name to an accessor

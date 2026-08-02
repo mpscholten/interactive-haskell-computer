@@ -3918,11 +3918,17 @@ classMethodDispatcher reg cls methodName = selfVal
                                                       Nothing -> do
                                                           -- Dispatchable arg but no matching instance.
                                                           -- Fall back to the class's default body.
+                                                          -- Never apply a method-placeholder default: that
+                                                          -- used to surface as
+                                                          --   apply: not a function: <<ihc-method-placeholder>:Integral/toInteger…>
+                                                          -- (warp request path) instead of naming the tag
+                                                          -- that had no Integral instance.
                                                           mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
                                                           mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
                                                           let mDef = preferMethod mDef0 mDefShared
                                                           case mDef of
-                                                              Just defVal ->
+                                                              Just defVal
+                                                                | not (isMethodPlaceholder defVal) ->
                                                                   applyAll defVal (reverse (argT : accArgs))
                                                               -- Category (->): (.) and id are GHC.Internal.Base
                                                               -- primitives whose source body self-references
@@ -3945,13 +3951,13 @@ classMethodDispatcher reg cls methodName = selfVal
                                                                   case mOrdFallback of
                                                                       Just ordVal -> pure ordVal
                                                                       Nothing ->
-                                                                          -- No instance and no default — try the
-                                                                          -- next argument position (the class
-                                                                          -- variable may not be in the first
+                                                                          -- No instance and no usable default —
+                                                                          -- try the next argument position (the
+                                                                          -- class variable may not be in the first
                                                                           -- dispatchable slot, e.g. SocketAddress).
                                                                           -- Exhausting all positions terminates at
                                                                           -- 'fallback', which raises the no-instance
-                                                                          -- error.
+                                                                          -- error with the last tag context.
                                                                           pure (dispatch (remaining - 1) (argT : accArgs))
             else if isSaturatedFunctorFallback accArgs
                     then do
@@ -4051,6 +4057,8 @@ classMethodDispatcher reg cls methodName = selfVal
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
     fallback accArgs = VFun $ \finalArgT -> do
+        finalAv <- force legacyHooks finalArgT
+        let finalTag = typeTagOf finalAv
         mDef <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
         case mDef of
             Just defVal | not (isMethodPlaceholder defVal) ->
@@ -4068,7 +4076,9 @@ classMethodDispatcher reg cls methodName = selfVal
                                 ( "class-method dispatch: no dispatchable instance of `"
                                  <> BC.unpack cls
                                  <> "` for method `" <> BC.unpack methodName
-                                 <> "` (after trying " <> show (length accArgs + 1) <> " arguments)" )
+                                 <> "` (after trying " <> show (length accArgs + 1)
+                                 <> " arguments; last arg tag `"
+                                 <> BC.unpack finalTag <> "`)" )
 
     resultPolymorphicMethod = resultPolymorphicMethodForArg Nothing
 
