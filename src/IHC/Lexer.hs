@@ -542,14 +542,31 @@ nextToken s c0 =
     -- | Longest-match symbolic operator. Scans the contiguous run of operator
     -- characters, then decides which token kind to emit. Known shapes map to
     -- dedicated tokens; everything else becomes @TkSymOp bs@.
+    --
+    -- Qualified-operator split: @P.>*<@ must lex as @P@ + @.@ + @>*<@, not as
+    -- @P@ + @.>*<@.  Maximal-munch would glue the qualifier dot onto the
+    -- operator.  When a run starts with @.@ and is longer than a known
+    -- dot-operator (@.@, @..@, @.&@, @.|@, @.$@, …), emit only @TkDot@ for
+    -- the first character so the next @nextToken@ call restarts on the
+    -- true operator.  Required by bsb-http-chunked's
+    -- @P.char8 P.>*< P.char8@ (warp chunked response path).
     lexSymOp start = go (cPos start)
       where
         go p = case peekByte s p of
             Just b | isOpChar (Just b) -> go (p + 1)
             _ -> let bs  = sliceBytes s (cPos start, p)
-                     k   = classifySymOp bs
-                     end = Cursor p (cLine start) (cCol start + (p - cPos start))
-                 in (mkTok k start end, end)
+                 in case () of
+                      _ | BC.head bs == '.'
+                        , BC.length bs > 1
+                        , not (isKnownDotOperator bs) ->
+                            -- Split: emit TkDot for the qualifier separator only.
+                            let end = step start
+                            in (mkTok TkDot start end, end)
+                        | otherwise ->
+                            let k   = classifySymOp bs
+                                end = Cursor p (cLine start)
+                                              (cCol start + (p - cPos start))
+                            in (mkTok k start end, end)
 
     -- Starts at the opening quote. Consume up to the matching @"@, handling
     -- backslash escapes (both simple \\n/\\t and numeric \\x41, \\123, \\o77,
@@ -832,6 +849,22 @@ classifySymOp bs = case bs of
     "!"  -> TkBang
     "$"  -> TkDollar
     _    -> TkSymOp bs
+
+-- | Operators that legitimately start with @.@ and must NOT be split into
+-- @TkDot@ + remainder by 'lexSymOp'.  Keep this list minimal: every extra
+-- entry is one more case where @M.op@ with @op@ starting the same way would
+-- mis-lex.  Bitwise @.&.@/@.|.@ and enum @..@ are the common ones.
+isKnownDotOperator :: ByteString -> Bool
+isKnownDotOperator bs =
+    bs == BC.pack "."
+    || bs == BC.pack ".."
+    || bs == BC.pack ".&."
+    || bs == BC.pack ".|."
+    || bs == BC.pack ".$."
+    || bs == BC.pack ".+."
+    || bs == BC.pack ".-."
+    || bs == BC.pack ".*."
+    || bs == BC.pack "./."
 
 -- | Haskell operator characters (except the structural @(@/@)@ etc). Used to
 -- delimit longest-match symbolic-operator tokens. Backtick and backslash are

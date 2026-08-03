@@ -21,6 +21,9 @@ module IHC.Val
       -- * Host pointer metadata
     , markTypedHostPtr
     , lookupTypedHostPtr
+    , markWord8PtrRange
+    , isMarkedWord8Ptr
+    , clearWord8PtrRanges
     , markSockAddrBuffer
     , lookupSockAddrBuffer
       -- * Environments
@@ -54,7 +57,7 @@ import Data.Map.Strict (Map)
 import Data.Int (Int64)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
-import Foreign.Ptr (IntPtr, Ptr, ptrToIntPtr)
+import Foreign.Ptr (IntPtr, Ptr, castPtr, ptrToIntPtr)
 import Numeric.Natural (Natural)
 import System.IO (Handle)
 import System.IO.Unsafe (unsafePerformIO)
@@ -261,6 +264,28 @@ markTypedHostPtr p ty =
 lookupTypedHostPtr :: Ptr a -> IO (Maybe ByteString)
 lookupTypedHostPtr p =
     Map.lookup (ptrToIntPtr p) <$> readIORef typedHostPtrsRef
+
+-- | Byte-buffer address ranges for Storable Word8 host peeks/pokes.
+-- plusForeignPtr advances the base; exact-address marks would miss
+-- interior peeks used by ByteString.any / fold.
+{-# NOINLINE word8PtrRangesRef #-}
+word8PtrRangesRef :: IORef [(IntPtr, IntPtr)]
+word8PtrRangesRef = unsafePerformIO (newIORef [])
+
+markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
+markWord8PtrRange p len =
+    let start = ptrToIntPtr (castPtr p)
+        end   = start + fromIntegral (max 1 len)
+    in modifyIORef' word8PtrRangesRef ((start, end) :)
+
+isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
+isMarkedWord8Ptr p =
+    let addr = ptrToIntPtr (castPtr p)
+    in any (\(start, end) -> addr >= start && addr < end)
+        <$> readIORef word8PtrRangesRef
+
+clearWord8PtrRanges :: IO ()
+clearWord8PtrRanges = writeIORef word8PtrRangesRef []
 
 {-# NOINLINE sockAddrBuffersRef #-}
 sockAddrBuffersRef :: IORef (Map.Map IntPtr Int)

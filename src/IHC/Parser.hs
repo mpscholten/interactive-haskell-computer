@@ -3373,11 +3373,47 @@ peekOp ctx cur =
                             (a, p) = lookupFixity (ctxFixity ctx) name
                         in Just (name, a, p, cur'')
                     _ -> Nothing
+            -- Qualified symbolic operator: @P.>*<@ / @M.N.op@.  After the
+            -- lexer split of qualifier-dot + operator, tokens are
+            -- @ConId/Ident@ + adjacent @TkDot@ + adjacent op.  Without this
+            -- branch Pratt treats the module id as a juxta-arg and fails
+            -- with "not a function" on @char8@ applied to @>*<@.
+            -- Required by bsb-http-chunked @P.char8 P.>*< P.char8@.
+            TkConId mod0 -> peekQualifiedOp ctx mod0 tok cur'
+            TkIdent mod0 -> peekQualifiedOp ctx mod0 tok cur'
             _ -> case tokenOpName (tkKind tok) of
                 Nothing   -> Nothing
                 Just name ->
                     let (a, p) = lookupFixity (ctxFixity ctx) name
                     in Just (name, a, p, cur')
+
+-- | After consuming a module segment, try to read @.op@ (and further
+-- @.Seg.op@ chains) as a single qualified operator name for Pratt.
+peekQualifiedOp :: Ctx -> Name -> Token -> Cursor -> Maybe (Name, Assoc, Int, Cursor)
+peekQualifiedOp ctx firstSeg firstTok cur0 =
+    go firstSeg firstTok cur0
+  where
+    src = ctxSrc ctx
+    go acc lastTok cur =
+        let (dotTok, curAfterDot) = nextToken src cur
+        in case tkKind dotTok of
+            TkDot | tkStart dotTok == tkEnd lastTok ->
+                let (segTok, curAfterSeg) = nextToken src curAfterDot
+                in case tkKind segTok of
+                    TkConId n | tkStart segTok == tkEnd dotTok ->
+                        go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    TkIdent n | tkStart segTok == tkEnd dotTok ->
+                        -- @M.foo@ is a qualified var, not an infix op
+                        Nothing
+                    _ | Just opName <- tokenOpName (tkKind segTok)
+                      , tkStart segTok == tkEnd dotTok ->
+                        let name   = acc <> BC.pack "." <> opName
+                            -- Fixity is keyed on the bare operator
+                            -- (fixity decls don't use the module prefix).
+                            (a, p) = lookupFixity (ctxFixity ctx) opName
+                        in Just (name, a, p, curAfterSeg)
+                    _ -> Nothing
+            _ -> Nothing
 
 -- | Parse an identifier-like name inside backticks, allowing qualified
 -- segments such as @B.snoc@ or @Data.List.elem@.
@@ -3506,7 +3542,23 @@ parseApp ctx cur0 = do
             _ | isBlockArgStart (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseBlockArg ctx cur
                     loop (EApp fn arg) curA
-            _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
+            -- Qualified infix op (@P.>*<@): ConId/Ident that begins a
+            -- @M.op@ sequence is NOT a juxta-arg — leave it for Pratt
+            -- ('peekOp' / 'peekQualifiedOp').  Without this, juxta
+            -- steals @P@ and the op becomes a broken application.
+            _ | startsAtom (tkKind tok)
+              , tkCol tok > ctxMinCol ctx
+              , case tkKind tok of
+                    TkConId n ->
+                        case peekQualifiedOp ctx n tok cur' of
+                            Just _  -> False   -- infix op; stop app
+                            Nothing -> True
+                    TkIdent n ->
+                        case peekQualifiedOp ctx n tok cur' of
+                            Just _  -> False
+                            Nothing -> True
+                    _ -> True
+              -> do
                     (arg, curA) <- parseAtomPostfix ctx cur
                     loop (EApp fn arg) curA
             -- NegativeLiterals (always-on): @TkMinus@ /immediately/

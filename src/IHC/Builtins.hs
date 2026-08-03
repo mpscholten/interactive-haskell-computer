@@ -19,6 +19,7 @@ module IHC.Builtins
     , flushHostHandleBuffer
     , isHostWord8PtrVal
     , ordCmp
+    , eqByteStringHost
     , peekHostWord8ByteOff
     , pokeHostWord8ByteOff
     , reapSpawnedThreads
@@ -108,9 +109,9 @@ mkForeignPtrVal fp = do
     gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     pure (VCon "ForeignPtr" [addrT, gutsT])
 
-{-# NOINLINE foreignPtrWord8RangesRef #-}
-foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
-foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
+-- word8PtrRangesRef / markWord8PtrRange / isMarkedWord8Ptr live in
+-- IHC.Val so Eval.byteStringConFromBS can mark OverloadedStrings
+-- buffers the same way mallocForeignPtrBytesB does.
 
 -- | Every interpreter-spawned thread (source-loaded 'forkIO' via 'fork#').  An
 -- interpreted program's @main@ can fork background threads (warp's
@@ -134,21 +135,9 @@ registerSpawnedThread tid = modifyIORef' spawnedThreadsRef (tid :)
 markWord8Ptr :: Ptr Word8 -> IO ()
 markWord8Ptr p = markWord8PtrRange p 1
 
-markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
-markWord8PtrRange p len =
-    let start = ptrToIntPtr (castPtr p)
-        end   = start + fromIntegral (max 1 len)
-    in modifyIORef' foreignPtrWord8RangesRef ((start, end) :)
-
 markForeignPtrWord8 :: ForeignPtr Word8 -> IO ()
 markForeignPtrWord8 fp =
     markWord8Ptr (castPtr (unsafeForeignPtrToPtr fp))
-
-isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
-isMarkedWord8Ptr p =
-    let addr = ptrToIntPtr (castPtr p)
-    in any (\(start, end) -> addr >= start && addr < end)
-        <$> readIORef foreignPtrWord8RangesRef
 
 isHostWord8PtrVal :: Val -> IO Bool
 isHostWord8PtrVal v = do
@@ -1759,10 +1748,30 @@ eqVals reg av bv = case (av, bv) of
     -- equality.  Keep that representation bridge here rather than reviving
     -- any Data.ByteString API shim: default VCon field-by-field equality
     -- would compare ForeignPtr identity and fail for equal fresh buffers.
+    --
+    -- Also coerce [Char]/VStr on either side: OverloadedStrings leaves
+    -- @"server"@ as a char list until a BS consumer packs it.  Without
+    -- this, @bs == "server"@ in warp's responseKeyIndex (first arg real
+    -- BS, second still [Char]) falls through to structural VCon compare
+    -- and always yields False → idx = -1 → empty IndexedHeader.
     (VCon "BS" _, VCon "BS" _) -> do
         ba <- bsValToBS av
         bb <- bsValToBS bv
         pure (boolVal (ba == bb))
+    (VCon "BS" _, _) -> do
+        mBb <- charListBytes bv
+        case mBb of
+            Just bb -> do
+                ba <- bsValToBS av
+                pure (boolVal (ba == bb))
+            Nothing -> fallbackNoBuiltinEq
+    (_, VCon "BS" _) -> do
+        mBa <- charListBytes av
+        case mBa of
+            Just ba -> do
+                bb <- bsValToBS bv
+                pure (boolVal (ba == bb))
+            Nothing -> fallbackNoBuiltinEq
     (VCon n1 ts1, VCon n2 ts2) -> do
         -- A user-defined @instance Eq T@ may override the default
         -- structural equality (e.g. comparing only one field of a
@@ -1965,7 +1974,7 @@ clearCtorIndex = writeIORef ctorIndexRegistry Map.empty
 -- may have reused for other purposes by the time of the next
 -- 'isMarkedWord8Ptr' check.
 clearForeignPtrWord8Ranges :: IO ()
-clearForeignPtrWord8Ranges = writeIORef foreignPtrWord8RangesRef []
+clearForeignPtrWord8Ranges = clearWord8PtrRanges
 
 -- | Kill every interpreter-spawned thread from the prior
 -- 'loadProgramFromSource' run and clear the registry.  Called by
@@ -3983,6 +3992,25 @@ bsValToBS v = do
     withForeignPtr fp $ \ptr ->
         BS.packCStringLen (castPtr ptr, len)
 
+-- | Host content-equality for ByteString values, coercing [Char]/VStr
+-- on either side (OverloadedStrings second arg of @bs == "server"@).
+-- Used by class-method Eq dispatch for tag @BS@ so warp's
+-- responseKeyIndex works without a prior warm-up of Eq ByteString.
+eqByteStringHost :: Val -> Val -> IO Bool
+eqByteStringHost a b = do
+    ma <- asHostBS a
+    mb <- asHostBS b
+    pure (case (ma, mb) of
+            (Just x, Just y) -> x == y
+            _                -> False)
+  where
+    asHostBS v@(VCon "BS" _) = Just <$> bsValToBS v
+    asHostBS v = do
+        isChars <- isCharList v
+        if isChars
+            then Just . BC.pack <$> valToString v
+            else pure Nothing
+
 newForeignPtr_B :: IO Val
 newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
     pv <- force legacyHooks pT
@@ -5756,14 +5784,38 @@ buildFieldEnv reg = do
         | any ((BC.pack "StaticString" ==) . fst) clauses
         , fieldName == BC.pack "getString"
         = Just (pure (charListAppender listVal))
+        -- CI ByteString / HeaderName (http-types, warp).  Pre-fix
+        -- foldedCase returned a host VStr; original returned the raw
+        -- [Char] list.  BS.== / BS.length then either hung (Eq on VStr
+        -- vs real BS via class dispatch) or missed, so
+        -- indexResponseHeader [("Server",…)] never matched / hung.
+        -- Pack real @BS ForeignPtr Int@ payloads (ASCII foldCase).
         | any ((BC.pack "CI" ==) . fst) clauses
         , fieldName == BC.pack "original"
-        = Just (pure listVal)
+        = Just (stringToByteStringVal listVal id)
         | any ((BC.pack "CI" ==) . fst) clauses
         , fieldName == BC.pack "foldedCase"
-        = Just (VStr . BC.pack . map toLower <$> valToString listVal)
+        = Just (stringToByteStringVal listVal (map toLower))
         | otherwise = Nothing
 
+    -- Pack a [Char]/VStr as a source-shaped ByteString, optionally
+    -- mapping the characters first (ASCII case fold for foldedCase).
+    stringToByteStringVal listVal mapChars = do
+        s <- valToString listVal
+        let bs = BC.pack (mapChars s)
+            len = BS.length bs
+        fp <- mallocForeignPtrBytes (max 1 len)
+        withForeignPtr fp $ \dst ->
+            when (len > 0) $
+                BS.useAsCStringLen bs $ \(src, n) ->
+                    copyBytes (castPtr dst) (castPtr src) n
+        markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (max 1 len)
+        markTypedHostPtr (castPtr (unsafeForeignPtrToPtr fp) :: Ptr Word8)
+            (BC.pack "Word8")
+        fpV <- mkForeignPtrVal fp
+        fpT <- newWHNFThunk fpV
+        lenT <- newWHNFThunk (VInt (fromIntegral len))
+        pure (VCon "BS" [fpT, lenT])
     -- @(listVal ++)@: a 'VFun' that, given another list, returns
     -- @listVal ++ that@.  Built by walking 'listVal' once and chaining
     -- cons cells.  Mirrors the runtime shape of 'StaticString's

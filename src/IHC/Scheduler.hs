@@ -81,6 +81,7 @@ import IHC.Builtins
     , foreignPtrValToForeignPtr
     , isHostWord8PtrVal, peekHostWord8ByteOff, pokeHostWord8ByteOff
     , ordCmp
+    , eqByteStringHost
     , reapSpawnedThreads
     )
 import IHC.CabalProject
@@ -4418,6 +4419,25 @@ classMethodDispatcher reg cls methodName = selfVal
         , tag == BC.pack "<ForeignPtr>" || tag == BC.pack "ForeignPtr"
         , null accArgs
         = Just <$> foreignPtrEqMethod methodName av
+        -- ByteString content equality.  Source Eq ByteString is `eq`
+        -- which pattern-matches both sides as @BS@; OverloadedStrings
+        -- leaves @"server"@ as [Char], so the source instance never
+        -- matches and responseKeyIndex always returns -1 unless the
+        -- entry program has already warm-loaded Eq ByteString.  Host
+        -- path coerces char lists / VStr (same bridge as 'eqVals').
+        | cls == BC.pack "Eq"
+        , methodName `elem` map BC.pack ["==", "/="]
+        , tag == BC.pack "BS"
+        , null accArgs
+        = Just <$> byteStringEqMethod methodName av
+        -- Monad ST (>>): mapM_ = foldr ((>>) . f) (return ()).
+        -- Host (>>) when left is ST; right may be IO-shaped return ().
+        -- Do NOT steal IO (>>) — that breaks network Socket withFdSocket.
+        | cls == BC.pack "Monad"
+        , methodName == BC.pack ">>"
+        , tag == BC.pack "ST"
+        , null accArgs
+        = Just <$> stSeqMethod av
         | cls == BC.pack "IsString"
         , methodName == BC.pack "fromString"
         , tag == BC.pack "[]"
@@ -4475,6 +4495,22 @@ classMethodDispatcher reg cls methodName = selfVal
                     then pure (Just (VIO (pokeHostWord8ByteOff ptrV (VInt 0) av)))
                     else pure Nothing
             _ -> pure Nothing
+        -- Storable.peek :: Ptr a -> IO a.  Arg-directed dispatch sees
+        -- typeTagOf (Ptr …) as "Ptr" / "<Ptr>" and can pick
+        -- instance Storable (Ptr b) — which reinterprets the pointee as
+        -- another pointer.  For host Word8 buffers (ByteString payloads
+        -- marked via markTypedHostPtr / markForeignPtrWord8), always
+        -- read a byte.  Without this, S.any / peekFp on OverloadedStrings
+        -- ByteStrings fail as I# args=<Ptr> 13 when Eq Word8 sees a Ptr.
+        | cls == BC.pack "Storable"
+        , methodName == BC.pack "peek"
+        , null accArgs
+        = do
+            isWord8 <- isHostWord8PtrVal av
+                `catch` (\(_ :: SomeException) -> pure False)
+            if isWord8
+                then pure (Just (VIO (peekHostWord8ByteOff av (VInt 0))))
+                else pure Nothing
         | cls == BC.pack "Ix"
         , methodName `elem` map BC.pack ["range", "index", "unsafeIndex", "inRange", "rangeSize", "unsafeRangeSize"]
         = do
@@ -4509,6 +4545,55 @@ classMethodDispatcher reg cls methodName = selfVal
                     | method == BC.pack "/=" = not same
                     | otherwise              = same
             pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
+
+    byteStringEqMethod method left =
+        pure $ VFun $ \rightT -> do
+            right <- force legacyHooks rightT
+            same <- eqByteStringHost left right
+            let result
+                    | method == BC.pack "/=" = not same
+                    | otherwise              = same
+            pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
+
+    -- ST (>>) that accepts IO-shaped or bare state functions on the
+    -- right (return () defaulting to IO).  Preserves left ST effects.
+    stSeqMethod left =
+        pure $ VFun $ \rightT -> do
+            right <- force legacyHooks rightT
+            leftFnT <- stStateFnThunk left
+            rightFnT <- stStateFnThunk right
+            let seqFn = VFun $ \sT -> do
+                    leftFn <- force legacyHooks leftFnT
+                    step <- apply legacyHooks leftFn sT
+                    case step of
+                        -- Prefer state-first unboxed (# s, a #); boxed
+                        -- (a, s) is handled by matchPat bridges already
+                        -- when source ST produces it.
+                        VCon _ [s'T, _] -> do
+                            rightFn <- force legacyHooks rightFnT
+                            apply legacyHooks rightFn s'T
+                        other -> pure other
+            seqFnT <- newWHNFThunk seqFn
+            pure (VCon (BC.pack "ST") [seqFnT])
+
+    stStateFnThunk :: Val -> IO Thunk
+    stStateFnThunk (VCon name [fnT])
+        | name == BC.pack "ST" || name == BC.pack "IO" = pure fnT
+    stStateFnThunk (VIO io) = do
+        -- Lift a host VIO into a state-passing function.
+        let fn = VFun $ \sT -> do
+                _ <- force legacyHooks sT
+                v <- io
+                vT <- newWHNFThunk v
+                pure (VCon (BC.pack "(#,#)") [sT, vT])
+        newWHNFThunk fn
+    stStateFnThunk v@(VFun _) = newWHNFThunk v
+    stStateFnThunk other = do
+        -- Constant action: ignore state, return other.
+        t <- newWHNFThunk other
+        let fn = VFun $ \sT ->
+                pure (VCon (BC.pack "(#,#)") [sT, t])
+        newWHNFThunk fn
 
     isOrdRelationMethod =
         cls == BC.pack "Ord"

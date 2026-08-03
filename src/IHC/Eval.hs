@@ -32,7 +32,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Bits ((.&.))
-import Data.Char (ord)
+import Data.Char (ord, toLower)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
 import Data.Word (Word8, Word16, Word32, Word64)
@@ -1010,6 +1010,14 @@ eval hooks env ipm = go
             -- source-shaped ForeignPtr (packChars path), not a char list.
             "ByteString" -> toByteString v
             "StrictByteString" -> toByteString v
+            -- @"…" :: CI ByteString@ (http-types HeaderName, warp headers).
+            -- Without this the literal stays a [Char] list; CI field
+            -- accessors then synthesise a VStr for foldedCase and
+            -- BS.== / responseKeyIndex hang or miss.  Build a real
+            -- @CI original foldedCase@ of packed ByteStrings.
+            "CI"
+                | BC.pack "ByteString" `BC.isInfixOf` ty -> toCIByteString v
+                | otherwise -> pure v
             h | h `elem` integralAnnotationHeads -> pure (toIntegral v)
             _        -> pure v
       where
@@ -1027,6 +1035,36 @@ eval hooks env ipm = go
                 Just bsV -> pure bsV
                 Nothing  -> pure v0
 
+        -- IsString (CI ByteString) ≅ mk . fromString: pack the chars,
+        -- then foldCase via ASCII lower (FoldCase ByteString = B.map
+        -- toLower8).  Already-a-CI values pass through.
+        toCIByteString v0@(VCon "CI" _) = pure v0
+        toCIByteString v0 = do
+            charsM <- extractCharList v0
+            case charsM of
+                Nothing -> pure v0
+                Just chars -> do
+                    -- Independent BS buffers for strict CI fields.
+                    origV <- byteStringConFromBS (BC.pack chars)
+                    foldedV <- byteStringConFromBS
+                        (BC.pack (map toLower chars))
+                    origT <- newWHNFThunk origV
+                    foldedT <- newWHNFThunk foldedV
+                    pure (VCon "CI" [origT, foldedT])
+
+        extractCharList :: Val -> IO (Maybe String)
+        extractCharList = go []
+          where
+            go acc (VCon "[]" []) = pure (Just (reverse acc))
+            go acc (VCon ":" [hT, tT]) = do
+                hv <- force hooks hT
+                case hv of
+                    VChar c -> do
+                        tv <- force hooks tT
+                        go (c : acc) tv
+                    _ -> pure Nothing
+            go acc (VStr bs) = pure (Just (reverse acc ++ BC.unpack bs))
+            go _ _ = pure Nothing
         boxWordCtor :: ByteString -> Int64 -> Val -> IO Val
         boxWordCtor ctor mask v0 = case asWordBits v0 of
             Just n -> do
@@ -1546,10 +1584,23 @@ matchPat hooks (PAs n p)    v          = do
 matchPat hooks (PTuple ps) v = do
     let arity = length ps
         tupleName = BC.pack ("(" <> replicate (arity - 1) ',' <> ")")
+        -- Unboxed 2-tuple constructor name as used elsewhere in IHC.
+        unboxed2 = BC.pack "(#,#)"
     case v of
         VCon cn vthunks
             | cn == tupleName && length vthunks == arity ->
                 matchPat hooks (PCon tupleName ps) v
+            -- Lazy ST (Control.Monad.ST.Lazy) binds results as boxed
+            -- pairs @(r, new_s)@ via irrefutable patterns, while
+            -- strict ST / runSTArray produce unboxed
+            -- @(# State# s, a #)@.  Bridge both orders:
+            --   boxed (val, state)  ←→  unboxed (# state, val #)
+            | arity == 2
+            , cn == unboxed2
+            , length vthunks == 2
+            , [pVal, pState] <- ps
+            , [stateT, valT] <- vthunks ->
+                matchFields hooks [(pVal, valT), (pState, stateT)] []
         _ -> pure Nothing
 matchPat hooks (PLit (LInt n)) (VInt m)
     | n == m    = pure (Just [])
@@ -1879,6 +1930,11 @@ matchPat hooks pat@(PCon "PS" _) v = do
 -- strict state-passing order.
 matchPat hooks (PCon "(#,#)" [pState, pVal]) (VCon "(,)" [valT, stateT]) =
     matchFields hooks [(pState, stateT), (pVal, valT)] []
+-- Reverse direction: lazy ST's @(r, new_s) = res@ where @res@ came from
+-- a strict ST action returning @(# s, r #)@.  runSTArray / warp header
+-- indexing hit this (Irrefutable pattern failed for PTuple r,new_s).
+matchPat hooks (PCon "(,)" [pVal, pState]) (VCon "(#,#)" [stateT, valT]) =
+    matchFields hooks [(pVal, valT), (pState, stateT)] []
 matchPat hooks (PCon "Nothing" []) (VCon "Just" [excT]) = do
     -- fromException is type-directed in GHC. IHC's Val-level helper
     -- returns `Just (SomeException inner)`, so a failed `Just
@@ -2149,8 +2205,9 @@ byteStringConFromBS bs = do
         BS.useAsCStringLen bs $ \(src, n) ->
             copyBytes (castPtr dst) (castPtr src) n
     let rawPtr = castPtr (unsafeForeignPtrToPtr fp) :: Ptr Word8
-    -- So isHostWord8PtrVal / Storable Word8 host peeks treat this as
-    -- a Word8 buffer (same as mkForeignPtrVal's markForeignPtrWord8).
+    -- Full buffer range so plusForeignPtr peeks inside S.any still hit
+    -- isHostWord8PtrVal (same as mallocForeignPtrBytesB).
+    markWord8PtrRange rawPtr len
     markTypedHostPtr rawPtr (BC.pack "Word8")
     -- Match source-shaped ForeignPtr: VCon "ForeignPtr" [addr, guts],
     -- not a bare PrimForeignPtr.  Bare PrimForeignPtr as the BS field
