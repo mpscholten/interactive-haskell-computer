@@ -1233,6 +1233,27 @@ builtins reg =
     , ("GHC.Conc.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Conc.IO.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Internal.Conc.IO.threadWaitWrite", threadWaitWriteB)
+    -- threadWaitReadSTM / threadWaitWriteSTM: warp makeGracefulRecv waits
+    -- via @atomically (checkShutdown <|> sockWait)@.  Source path bottoms
+    -- out in Event.registerFd with a nested Fd/CInt that IHC often leaves
+    -- as a VFun shell ("Fd payload not VInt: <function>").  Host-back the
+    -- STM wait pair directly so cancellable recv works.
+    , ("threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Conc.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Conc.IO.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Internal.Conc.IO.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Internal.Event.Thread.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Conc.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Internal.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Internal.Event.Thread.threadWaitWriteSTM", threadWaitWriteSTMB)
+    -- Higher-level: waitReadSocketSTM :: Socket -> IO (STM ())
+    -- Avoids broken Fd/CInt newtype unwrapping on the source path.
+    , ("waitReadSocketSTM", waitReadSocketSTMB)
+    , ("Network.Socket.STM.waitReadSocketSTM", waitReadSocketSTMB)
+    , ("waitWriteSocketSTM", waitWriteSocketSTMB)
+    , ("Network.Socket.STM.waitWriteSocketSTM", waitWriteSocketSTMB)
     -- GHC.Internal.Event.Thread.threadWait evt fd — the single choke point the
     -- threaded socket-wait path (threadWaitRead/Write -> Event.threadWaitRead
     -- -> threadWait) reduces to.  The source body registers on the RTS event
@@ -5885,10 +5906,17 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
     runActionVal v = case v of
         VFun f -> do
             stok <- newWHNFThunk (VPrimObj PrimRealWorld)
-            f stok
+            r <- f stok
+            -- State# transformer may return VIO, unboxed (# s, a #), or
+            -- already a WHNF result. Always drive through runIOVal so
+            -- nested IO (makeGracefulRecv, http1, the app) actually runs
+            -- when the body is a deferred VIO rather than an already-
+            -- forced unboxed pair.
+            runIOVal legacyHooks r
         VFunIP _ f -> do
             stok <- newWHNFThunk (VPrimObj PrimRealWorld)
-            f Map.empty stok
+            r <- f Map.empty stok
+            runIOVal legacyHooks r
         _ -> runIOVal legacyHooks v
 
 -- | @killThread# :: ThreadId# -> a -> State# RealWorld -> State# RealWorld@.
@@ -5959,6 +5987,135 @@ threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
     threadWaitWrite (fromIntegral n)
     pure VUnit
 
+-- | @threadWaitReadSTM :: Fd -> IO (STM (), IO ())@.
+threadWaitReadSTMB :: IO Val
+threadWaitReadSTMB = pure $ VFun $ \fdT -> pure $ VIO $
+    threadWaitSTMimpl fdT
+        (\i -> threadWaitRead (fromIntegral i))
+        "threadWaitReadSTM"
+
+threadWaitWriteSTMB :: IO Val
+threadWaitWriteSTMB = pure $ VFun $ \fdT -> pure $ VIO $
+    threadWaitSTMimpl fdT
+        (\i -> threadWaitWrite (fromIntegral i))
+        "threadWaitWriteSTM"
+
+-- | @waitReadSocketSTM :: Socket -> IO (STM ())@
+waitReadSocketSTMB :: IO Val
+waitReadSocketSTMB = pure $ VFun $ \sockT -> pure $ VIO $ do
+    n <- socketValToFdInt sockT "waitReadSocketSTM"
+    pair <- threadWaitSTMimplInt n
+        (\i -> threadWaitRead (fromIntegral i))
+    -- Return only the STM () half (fst of the pair).
+    case pair of
+        VCon "(,)" [stmT, _] -> force legacyHooks stmT
+        _ -> pure pair
+
+waitWriteSocketSTMB :: IO Val
+waitWriteSocketSTMB = pure $ VFun $ \sockT -> pure $ VIO $ do
+    n <- socketValToFdInt sockT "waitWriteSocketSTM"
+    pair <- threadWaitSTMimplInt n
+        (\i -> threadWaitWrite (fromIntegral i))
+    case pair of
+        VCon "(,)" [stmT, _] -> force legacyHooks stmT
+        _ -> pure pair
+
+-- | Extract CInt fd from @Socket (IORef CInt) CInt@.
+socketValToFdInt :: Thunk -> String -> IO Int64
+socketValToFdInt t primName = do
+    v <- force legacyHooks t
+    case v of
+        VCon "Socket" [refT, ofdT] -> do
+            -- Prefer live IORef contents (ofd can lag / be a Char-leaked
+            -- copy of the same ordinal). Fall back to ofd if ref is closed.
+            refN <- peelSocketRef refT primName
+            if refN >= 0
+                then pure refN
+                else do
+                    ofd <- force legacyHooks ofdT
+                    peelIntegral ofd
+        -- Tolerate extra fields / alternate ctor layouts.
+        VCon "Socket" (refT : ofdT : _) -> do
+            refN <- peelSocketRef refT primName
+            if refN >= 0
+                then pure refN
+                else force legacyHooks ofdT >>= peelIntegral
+        _ -> error (primName <> ": not a Socket: " <> showValForDebug v)
+
+-- | Read the CInt fd from a Socket's IORef field.
+-- Source shape is @IORef (STRef (MutVar# s a))@ → peel wrappers until
+-- 'PrimIORef'. Host-created sockets may store a bare 'PrimIORef'.
+peelSocketRef :: Thunk -> String -> IO Int64
+peelSocketRef refT primName = do
+    refV <- force legacyHooks refT
+    peelIORefVal refV primName >>= \contentT ->
+        force legacyHooks contentT >>= peelIntegral
+
+-- | Walk @IORef@ / @STRef@ / bare 'PrimIORef' to the underlying thunk content.
+peelIORefVal :: Val -> String -> IO Thunk
+peelIORefVal v primName = go 0 v
+  where
+    go d val
+        | d > 8 = error (primName <> ": IORef nest too deep: "
+                         <> showValForDebug val)
+        | otherwise = case val of
+            VPrimObj (PrimIORef ref) -> readIORef ref
+            VCon "IORef" [inner] -> force legacyHooks inner >>= go (d + 1)
+            VCon "STRef" [inner] -> force legacyHooks inner >>= go (d + 1)
+            -- MutVar# sometimes surfaces as a named con wrapping PrimIORef.
+            VCon "MutVar#" [inner] -> force legacyHooks inner >>= go (d + 1)
+            VCon n _ ->
+                error (primName <> ": IORef shape: " <> showValForDebug val
+                       <> " (ctor " <> BC.unpack n <> ")")
+            _ -> error (primName <> ": IORef shape: " <> showValForDebug val)
+
+peelIntegral :: Val -> IO Int64
+peelIntegral = go (0 :: Int)
+  where
+    go :: Int -> Val -> IO Int64
+    go d v
+        | d > 8 = error ("peelIntegral: too deep: " <> showValForDebug v)
+        | otherwise = case v of
+            VInt n -> pure n
+            VInteger n -> pure (fromIntegral n)
+            -- CInt/Fd sometimes land as VChar when small ordinals leak through
+            -- the Char#/Int# shared representation (fd 36 → '$').
+            VChar c -> pure (fromIntegral (fromEnum c))
+            VCon _ [inner] -> force legacyHooks inner >>= go (d + 1)
+            _ -> error ("peelIntegral: not integral: " <> showValForDebug v)
+
+-- | Build @(STM (), IO ())@ for a host-backed fd wait.
+threadWaitSTMimpl
+    :: Thunk
+    -> (Int -> IO ())
+    -> String
+    -> IO Val
+threadWaitSTMimpl fdT waitIO primName = do
+    n <- fdArgToInt fdT primName
+    threadWaitSTMimplInt n waitIO
+
+threadWaitSTMimplInt :: Int64 -> (Int -> IO ()) -> IO Val
+threadWaitSTMimplInt n waitIO = do
+    ready <- newTVarIO False
+    _ <- forkIO $ do
+        waitIO (fromIntegral n)
+        atomically (writeTVar ready True)
+    let waitStm = VFun $ \_sT -> pure $ VIO $ do
+            go
+            unitT <- newWHNFThunk VUnit
+            sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+            pure (VCon "(#,#)" [sT', unitT])
+          where
+            go = do
+                ok <- readTVarIO ready
+                if ok then pure ()
+                else threadDelay 1000 >> go
+    let cancel = VIO (pure VUnit)
+    waitStmT <- newWHNFThunk waitStm
+    stmT <- newWHNFThunk (VCon "STM" [waitStmT])
+    cancelT <- newWHNFThunk cancel
+    pure (VCon "(,)" [stmT, cancelT])
+
 -- | @threadWait :: Event -> Fd -> IO ()@ (GHC.Internal.Event.Thread).
 -- The source body dispatches to the RTS event manager (registerFd + an MVar
 -- handshake), which IHC does not run.  Delegate straight to the host RTS IO
@@ -6025,20 +6182,35 @@ unregisterFd_B :: IO Val
 unregisterFd_B = pure $ VFun $ \_mgrT -> pure $ VFun $ \_regT -> pure $ VIO $
     pure (boolVal True)
 
--- | Unwrap a @Fd@-like argument to its underlying @Int@.  Accepts the
--- common shapes the source @System.Posix.Types.Fd@ newtype can take
--- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
+-- | Unwrap a @Fd@/@CInt@-like argument to its underlying @Int@.
+-- Source newtypes nest: @Fd (CInt n)@, @CInt (I32# n)@, bare 'VInt',
+-- or a single-field 'VCon'.  Walk constructors until we hit 'VInt'.
+-- (Bug: @threadWaitReadSTM . Fd@ with nested CInt used to fail as
+-- "Fd payload not VInt: <function>" when the newtype ctor was still a
+-- VFun shell, hanging warp's makeGracefulRecv forever.)
 fdArgToInt :: Thunk -> String -> IO Int64
-fdArgToInt t primName = do
-    v <- force legacyHooks t
-    case v of
-        VInt n          -> pure n
-        VCon _ [inner] -> do
-            iv <- force legacyHooks inner
-            case iv of
-                VInt n -> pure n
-                _ -> error (primName <> ": Fd payload not VInt: " <> showValForDebug iv)
-        _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
+fdArgToInt t primName = force legacyHooks t >>= go 0
+  where
+    go :: Int -> Val -> IO Int64
+    go depth v
+        | depth > 8 = error (primName <> ": Fd nest too deep: " <> showValForDebug v)
+        | otherwise = case v of
+            VInt n -> pure n
+            VInteger n -> pure (fromIntegral n)
+            -- Same Char#/Int# leakage as peelIntegral (fd 36 → '$').
+            VChar c -> pure (fromIntegral (fromEnum c))
+            -- Newtype / data wrappers: peel one field.
+            VCon _ [inner] -> force legacyHooks inner >>= go (depth + 1)
+            -- Nullary / multi-field: not an Fd.
+            VCon n _ ->
+                error (primName <> ": unexpected Fd ctor " <> BC.unpack n
+                       <> ": " <> showValForDebug v)
+            -- Newtype constructor still a function (unapplied shell) —
+            -- should not reach here if applied; report clearly.
+            VFun{} ->
+                error (primName <> ": Fd still a function (unapplied newtype?): "
+                       <> showValForDebug v)
+            _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
 
 -- | @getSystemEventManager :: IO (Maybe EventManager)@.  Returns a stub
 -- manager so the threaded socket-wait path (threadWait / threadWaitSTM via
@@ -6129,23 +6301,54 @@ ensureStatePair v = case v of
 --                 -> (# State# RealWorld, a #)@
 --
 -- Source-loaded: @atomically (STM m) = IO (\\s -> (atomically# m) s)@.
--- Since ihc is single-threaded at the eval level, an STM action IS an
--- IO action in our world — we just apply the state-transformer.
+-- Single-threaded STM-as-IO: apply the state transformer, but on
+-- 'retry#' re-execute after a short delay so concurrent writers
+-- (e.g. 'registerFd' callback writing a TVar for
+-- 'threadWaitReadSTM') can make progress.  Without the re-exec loop,
+-- warp's 'makeGracefulRecv' hangs forever on
+-- @atomically (checkShutdown \<|> sockWait)@ because the first
+-- 'retry' would surface and the second branch would also retry out.
 atomicallyHashB :: IO Val
 atomicallyHashB = pure $ VFun $ \stmT -> pure $ VFun $ \sT -> do
-    stmV <- force legacyHooks stmT
-    rRaw <- apply legacyHooks stmV sT
-    v    <- runIOVal legacyHooks rRaw
-    ensureStatePair v
+    let loop = do
+            stmV <- force legacyHooks stmT
+            r <- CE.try @CE.SomeException $ do
+                rRaw <- apply legacyHooks stmV sT
+                runIOVal legacyHooks rRaw
+            case r of
+                Right v -> ensureStatePair v
+                Left e
+                    | isStmRetryException e -> do
+                        -- Yield to forked waiters (registerFd) and re-run.
+                        threadDelay 1000  -- 1 ms
+                        loop
+                    | otherwise -> CE.throwIO e
+    loop
 
 -- | @retry# :: State# RealWorld -> (# State# RealWorld, a #)@.
 --
--- In a concurrent runtime this blocks until a watched TVar changes.
--- Since we're single-threaded, represent retry as a catchable
--- exception instead of delegating to host @atomically retry@, which can
--- block forever. Source-loaded @orElse@ catches this via @catchRetry#@.
+-- Signals the enclosing 'atomically#' to re-execute (and
+-- source-loaded 'orElse' via 'catchRetry#').  Must not be a bare
+-- forever-block: IHC is single-threaded at the eval level, so
+-- concurrent TVar writers only run between atomically iterations.
 retryHashB :: IO Val
-retryHashB = pure $ VFun $ \_sT -> CE.throwIO (userError "STM retry")
+retryHashB = pure $ VFun $ \_sT -> CE.throwIO StmRetryException
+
+-- | Marker for STM 'retry#'.  Distinct from arbitrary IOErrors so
+-- 'atomically#' / 'catchRetry#' do not treat every failure as retry.
+data StmRetryException = StmRetryException
+    deriving (Show)
+instance CE.Exception StmRetryException
+
+isStmRetryException :: CE.SomeException -> Bool
+isStmRetryException e =
+    case CE.fromException e of
+        Just StmRetryException -> True
+        Nothing ->
+            -- Legacy: older retry# used userError "STM retry"
+            case CE.fromException e of
+                Just (CE.ErrorCall msg) -> msg == "STM retry"
+                Nothing -> False
 
 -- | @catchRetry# :: (State# RealWorld -> (# State# RealWorld, a #))
 --                -> (State# RealWorld -> (# State# RealWorld, a #))
@@ -6153,8 +6356,10 @@ retryHashB = pure $ VFun $ \_sT -> CE.throwIO (userError "STM retry")
 --                -> (# State# RealWorld, a #)@
 --
 -- Source-loaded: @orElse (STM m) e = STM $ \\s -> catchRetry# m (unSTM e) s@.
--- Try the first action; if it raises a retry-like exception, fall
--- back to the second.
+-- Try the first action; if it raises a *retry* exception, fall back to
+-- the second.  Non-retry exceptions propagate.  If the second also
+-- retries, re-raise 'StmRetryException' so the enclosing 'atomically#'
+-- re-executes the whole transaction (both arms get another chance).
 catchRetryHashB :: IO Val
 catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT -> do
     aV <- force legacyHooks aT
@@ -6165,9 +6370,15 @@ catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT ->
     r <- CE.try @CE.SomeException (runAction aV)
     case r of
         Right v -> ensureStatePair v
-        Left _  -> do
-            v <- runAction bV
-            ensureStatePair v
+        Left e
+            | isStmRetryException e -> do
+                r2 <- CE.try @CE.SomeException (runAction bV)
+                case r2 of
+                    Right v -> ensureStatePair v
+                    Left e2
+                        | isStmRetryException e2 -> CE.throwIO StmRetryException
+                        | otherwise -> CE.throwIO e2
+            | otherwise -> CE.throwIO e
 
 -- | @catchSTM# :: (State# RealWorld -> (# State# RealWorld, a #))
 --              -> (b -> State# RealWorld -> (# State# RealWorld, a #))
