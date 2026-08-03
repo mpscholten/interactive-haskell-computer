@@ -8074,12 +8074,8 @@ resolveFallback _mOwner name
     | BC.pack "Conc." `BC.isPrefixOf` name =
         resolveFallback _mOwner (BC.pack "Control.Concurrent." `BC.append` BC.drop 5 name)
     -- @import qualified Data.Vault.Lazy as Vault@ — used by warp's
-    -- HTTP1.hs / HTTP2/Request.hs and Settings.hs for vault keys.
-    -- NOTE: @Vault.newKey@ (used by pauseTimeoutKey CAF) still does not
-    -- materialise reliably via FQN discovery; tracked as the next
-    -- warp-hello blocker after Bits/Foreign.  Keep the original FQN
-    -- rewrite so empty/insert/lookup can still resolve when their
-    -- bodies are present.
+    -- HTTP1.hs / HTTP2/Request.hs and Settings.hs for vault keys
+    -- (pauseTimeoutKey CAF, request vault insert/lookup).
     | BC.pack "Vault." `BC.isPrefixOf` name
     , not (BC.pack "Data.Vault." `BC.isPrefixOf` name) =
         resolveFallback _mOwner

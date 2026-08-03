@@ -433,12 +433,17 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
             -- are substituted into the body of the included file.
             --
             -- Exception: C header files (.h, .hpp, .H) may contain C-style
-            -- comments (/* ... */) and other non-Haskell content.  Emitting
-            -- these verbatim into the output would confuse the Haskell lexer
-            -- (e.g. bytestring-cpp-macros.h has /* ... */ comments between
-            -- #define directives that appear before the module declaration
-            -- of the including .hs file).  We blank those regular lines out
-            -- so only CPP-directive-driven content affects the output.
+            -- comments (/* ... */) that would confuse the Haskell lexer if
+            -- emitted verbatim (e.g. bytestring-cpp-macros.h).  However many
+            -- Hackage packages (vault, hashable, …) ship *Haskell* source as
+            -- .h templates included via #include "IO.h" / "ST.h" after a
+            -- #define LAZINESS Lazy.  Blanking every regular .h line killed
+            -- those modules (Data.Vault.Lazy ended up as ~empty source, so
+            -- Vault.newKey never materialised).
+            --
+            -- Policy: still expand macros in .h bodies, but strip C block
+            -- comments.  Pure-comment residual lines become blank; real
+            -- Haskell (module / import / binding) is kept.
             let isCHeader = ".h"   `isSuffixOf` filePath
                          || ".hpp" `isSuffixOf` filePath
                          || ".H"   `isSuffixOf` filePath
@@ -446,9 +451,10 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
                     | active && not isCHeader =
                         joinFunctionMacroInvocation ctx ln rest'
                     | otherwise = (ln, 0, rest')
-            let emit | not active  = BS.empty
-                     | isCHeader   = BS.empty   -- C comments / non-Haskell content
-                     | otherwise   = expandMacrosInLine ctx regularLn
+            let emit | not active = BS.empty
+                     | isCHeader  =
+                         expandMacrosInLine ctx (stripCBlockComments regularLn)
+                     | otherwise  = expandMacrosInLine ctx regularLn
             (xs, c) <- processIO includeDirs ctx active regularRest stack filePath depth
             pure (emit : replicate regularContCount BS.empty ++ xs, c)
 
@@ -867,6 +873,22 @@ parseIntMaybe bs = case BC.unpack bs of
 --------------------------------------------------------------------------------
 -- Macro expansion in regular source lines
 --------------------------------------------------------------------------------
+
+-- | Strip C block comments (@/* ... */@) from a single source line.
+-- Used when emitting regular lines from @.h@ includes so pure-C comment
+-- residue (bytestring-cpp-macros.h) becomes blank while real Haskell
+-- template lines (vault's IO.h / ST.h) survive.  Unclosed @/*@ blanks
+-- the remainder of the line (conservative; multi-line C comments are rare
+-- in the Hackage .h templates we care about and harmless when blanked).
+stripCBlockComments :: ByteString -> ByteString
+stripCBlockComments = BC.pack . go . BC.unpack
+  where
+    go [] = []
+    go ('/':'*':rest) = go (dropComment rest)
+    go (c:rest)       = c : go rest
+    dropComment [] = []
+    dropComment ('*':'/':rest) = rest
+    dropComment (_:rest)       = dropComment rest
 
 -- | Expand object-like and function-like macros in a regular (non-directive)
 -- source line.  This implements the core C-preprocessor substitution rule:
