@@ -1004,6 +1004,12 @@ eval hooks env ipm = go
             "Word32" -> boxWordCtor "W32#" 0xffffffff v
             "Word64" -> boxWordCtor "W64#" maxBound v
             "Word"   -> boxWordCtor "W#" maxBound v
+            -- Optimistic OverloadedStrings: @"…" :: ByteString@ still
+            -- evaluates the literal as a [Char] list (or VStr).  Pack it
+            -- into a real BS so S.any / sanitizeHeaders / peekFp see a
+            -- source-shaped ForeignPtr (packChars path), not a char list.
+            "ByteString" -> toByteString v
+            "StrictByteString" -> toByteString v
             h | h `elem` integralAnnotationHeads -> pure (toIntegral v)
             _        -> pure v
       where
@@ -1014,6 +1020,12 @@ eval hooks env ipm = go
         toIntegral (VPrimObj (PrimPtr p)) =
             VInt (fromIntegral (ptrToIntPtr p))
         toIntegral other = other
+
+        toByteString v0 = do
+            mBs <- charListToByteStringVal hooks v0
+            case mBs of
+                Just bsV -> pure bsV
+                Nothing  -> pure v0
 
         boxWordCtor :: ByteString -> Int64 -> Val -> IO Val
         boxWordCtor ctor mask v0 = case asWordBits v0 of
@@ -2136,7 +2148,16 @@ byteStringConFromBS bs = do
     withForeignPtr fp $ \dst ->
         BS.useAsCStringLen bs $ \(src, n) ->
             copyBytes (castPtr dst) (castPtr src) n
-    fpT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
+    let rawPtr = castPtr (unsafeForeignPtrToPtr fp) :: Ptr Word8
+    -- So isHostWord8PtrVal / Storable Word8 host peeks treat this as
+    -- a Word8 buffer (same as mkForeignPtrVal's markForeignPtrWord8).
+    markTypedHostPtr rawPtr (BC.pack "Word8")
+    -- Match source-shaped ForeignPtr: VCon "ForeignPtr" [addr, guts],
+    -- not a bare PrimForeignPtr.  Bare PrimForeignPtr as the BS field
+    -- broke peekFp / S.any on OverloadedStrings ByteStrings.
+    addrT <- newWHNFThunk (VPrimObj (PrimPtr rawPtr))
+    gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
+    fpT  <- newWHNFThunk (VCon "ForeignPtr" [addrT, gutsT])
     lenT <- newWHNFThunk (VInt (fromIntegral len))
     pure (VCon "BS" [fpT, lenT])
 

@@ -4340,6 +4340,18 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
                     VInt n -> do
                         pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
                         pure VUnit
+                    -- Num Word8 boxes as VCon "W8#" after W8# carrier work.
+                    VCon c [t]
+                        | c == BC.pack "W8#" || c == BC.pack "W#"
+                          || c == BC.pack "IS" -> do
+                            inner <- force legacyHooks t
+                            case inner of
+                                VInt n -> do
+                                    pokeByteOff (p :: Ptr Word8) (fromIntegral off)
+                                        (fromIntegral n :: Word8)
+                                    pure VUnit
+                                _ -> error ("pokeByteOff: W8#/IS inner not Int: "
+                                            <> showValForDebug inner)
                     _ | off == 24 || off == 32 || off == 40 -> do
                         ptr <- ptrValToPtr cv
                         pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)

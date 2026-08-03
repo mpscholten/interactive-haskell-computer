@@ -3076,6 +3076,19 @@ synthStructuralOrd classReg tyName ctors =
     orderingVal GT = VCon (BC.pack "GT") []
 
     compareVals VUnit VUnit = pure EQ
+    -- Cross-representation @Ptr@ (mirrors 'synthStructuralEq'): one
+    -- operand may be @VCon "Ptr" [addr]@ while the other is a bare
+    -- @VPrimObj (PrimPtr p)@.  Source Ord for Ptr bottoms out on
+    -- @ltAddr#@/@eqAddr#@ — compare host 'Ptr's after unwrapping.
+    -- Without this, chunked HTTP encoding's @when (op >= op0)@ in
+    -- @writeWord32Hex'@ crashes ("field compare returned non-Ordering").
+    compareVals a b
+        | tyName == BC.pack "Ptr" =
+            case (asPtr a, asPtr b) of
+                (Just p1, Just p2) -> pure (compare p1 p2)
+                _ -> error
+                    ( "derived Ord for Ptr: not a pointer-shaped value: "
+                      <> shortShow a <> " vs " <> shortShow b )
     compareVals (VCon n1 fs1) (VCon n2 fs2)
         | n1 == n2 && length fs1 == length fs2 =
             compareFields fs1 fs2
@@ -3087,6 +3100,17 @@ synthStructuralOrd classReg tyName ctors =
         ( "derived Ord for " <> BC.unpack tyName
           <> ": expected constructor values, got "
           <> shortShow other1 <> " and " <> shortShow other2 )
+
+    asPtr (VPrimObj (PrimPtr p)) = Just p
+    asPtr (VCon "Ptr" [t]) = unsafePerformIO $ do
+        v <- force legacyHooks t
+        case v of
+            VPrimObj (PrimPtr p) -> pure (Just p)
+            VInt n     -> pure (Just (FP.intPtrToPtr (fromIntegral n)))
+            VInteger n -> pure (Just (FP.intPtrToPtr (fromIntegral n)))
+            VUnit      -> pure (Just nullPtr)
+            _          -> pure Nothing
+    asPtr _ = Nothing
 
     compareCtor n1 n2 =
         case (Map.lookup n1 ctorIndex, Map.lookup n2 ctorIndex) of
@@ -3809,6 +3833,17 @@ classMethodDispatcher reg cls methodName = selfVal
                     -- the pointer or offset.  In optimistic mode there is
                     -- no typechecker to recover @a@ from @Ptr a@.
                     pure (dispatch (remaining - 1) (argT : accArgs))
+            else if isIsStringFromStringArg accArgs
+                then do
+                    -- IsString.fromString :: String -> a — result-polymorphic.
+                    -- Prefer ETyApp / result-context instance (ByteString,
+                    -- Text, HostPreference) over arg tag [] (IsString [Char]).
+                    mResult <- resultPolymorphicMethod
+                    case mResult of
+                        Just resultVal ->
+                            applyAll resultVal [argT]
+                        Nothing ->
+                            pure (dispatch (remaining - 1) (argT : accArgs))
             else if isNumFromIntegerArg accArgs
                 then do
                     -- Num.fromInteger :: Integer -> a is result-polymorphic:
@@ -4387,7 +4422,11 @@ classMethodDispatcher reg cls methodName = selfVal
         , methodName == BC.pack "fromString"
         , tag == BC.pack "[]"
         , null accArgs
-        = Just <$> hostPreferenceFromString av argT
+        -- Only the HostPreference special cases (* / *4 / …).  A
+        -- catch-all `Host s` stole every arg-directed fromString —
+        -- including IsString ByteString / Text — so OverloadedStrings
+        -- ByteStrings became Host "…" and S.any/sanitizeHeaders died.
+        = hostPreferenceFromString av argT
         | cls == BC.pack "Foldable"
         , methodName == BC.pack "sum"
         , tag == BC.pack "[]"
@@ -4549,6 +4588,13 @@ classMethodDispatcher reg cls methodName = selfVal
         && methodName == BC.pack "fromInteger"
         && null accArgs
 
+    -- IsString.fromString :: String -> a is result-polymorphic like
+    -- fromInteger: the String argument is never the instance type.
+    isIsStringFromStringArg accArgs =
+        cls == BC.pack "IsString"
+        && methodName == BC.pack "fromString"
+        && null accArgs
+
     isFloatingNumericClass c =
         c `elem` map BC.pack
             [ "Floating", "Fractional", "RealFrac", "RealFloat" ]
@@ -4633,12 +4679,14 @@ classMethodDispatcher reg cls methodName = selfVal
     hostPreferenceFromString av argT = do
         ms <- charListString av
         case ms of
-            Just "*"  -> pure (VCon (BC.pack "HostAny") [])
-            Just "*4" -> pure (VCon (BC.pack "HostIPv4") [])
-            Just "!4" -> pure (VCon (BC.pack "HostIPv4Only") [])
-            Just "*6" -> pure (VCon (BC.pack "HostIPv6") [])
-            Just "!6" -> pure (VCon (BC.pack "HostIPv6Only") [])
-            _         -> pure (VCon (BC.pack "Host") [argT])
+            Just "*"  -> pure (Just (VCon (BC.pack "HostAny") []))
+            Just "*4" -> pure (Just (VCon (BC.pack "HostIPv4") []))
+            Just "!4" -> pure (Just (VCon (BC.pack "HostIPv4Only") []))
+            Just "*6" -> pure (Just (VCon (BC.pack "HostIPv6") []))
+            Just "!6" -> pure (Just (VCon (BC.pack "HostIPv6Only") []))
+            -- Non-special strings: fall through so IsString ByteString
+            -- (packChars) / IsString Text / source HostPreference can run.
+            _         -> pure Nothing
 
     charListString (VCon "[]" _) = pure (Just "")
     charListString (VCon ":" [hT, tT]) = do

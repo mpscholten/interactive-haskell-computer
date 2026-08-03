@@ -980,6 +980,14 @@ parseBindingsIn src fx (start, end) = do
     -- (e.g. `f _ [] = ...; f x (y:_) = ...`) are properly desugared.
     -- Returns a list of Bind because a pattern binding expands to multiple binds.
     parseOne ctx bindCol accLen cur = do
+        -- RHS expressions must stop at sibling bindings at @bindCol@.
+        -- Without this, a pattern/as-pattern binding whose RHS is a
+        -- constructor application (e.g. @brInner@(BufferRange opInner _)
+        -- = BufferRange (op+2) (ope-1)@) greedily eats the next binding
+        -- (@doneH …@) as extra arguments — leaving @doneH@ unbound.
+        -- That shape is the HTTP chunked-encoder's inner where-block in
+        -- @bsb-http-chunked@ / @Data.ByteString.Builder.HTTP.Chunked@.
+        let rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
         let (peekTok, cur1Peek) = nextSig ctx cur
         case tkKind peekTok of
             -- As-pattern binding: @name @ pat = rhs@ (e.g.
@@ -992,11 +1000,12 @@ parseBindingsIn src fx (start, end) = do
                 | (atTok, _) <- nextSig ctx cur1Peek
                 , tkKind atTok == TkAt -> do
                     let (_, cur2Peek)   = nextSig ctx cur1Peek    -- consume @
-                    (subPat, cur3Peek)  <- parseSubPat ctx cur2Peek
+                    -- parseTopPat so @name@(Con a b)@ keeps constructor args.
+                    (subPat, cur3Peek)  <- parseTopPat ctx cur2Peek
                     let (eqTok, cur4Peek) = nextSig ctx cur3Peek
                     case tkKind eqTok of
                         TkEq -> do
-                            (rhsE, cur5Peek) <- parseExpr ctx cur4Peek
+                            (rhsE, cur5Peek) <- parseExpr rhsCtx cur4Peek
                             -- Project the bound vars of subPat out of name.
                             let nameBind = (n, rhsE)
                                 vars     = patVars subPat
@@ -1020,7 +1029,7 @@ parseBindingsIn src fx (start, end) = do
             -- the function-binding path swallows the leading ident.
             TkIdent _
                 | hasTopLevelConOpBeforeEq ctx cur -> do
-                    (newBinds, cur') <- parseWherePatBind ctx accLen cur
+                    (newBinds, cur') <- parseWherePatBind rhsCtx accLen cur
                     pure (newBinds, cur')
             TkIdent _ -> do
                 -- Normal named binding (identifier starts the binding).
@@ -1048,11 +1057,12 @@ parseBindingsIn src fx (start, end) = do
                 case tkKind eqTok of
                     TkEq -> pure ()
                     _    -> parseErr ctx "expected `=` after ?ip in where-binding" eqTok
-                (_, cur3) <- parseExpr ctx cur2
+                (_, cur3) <- parseExpr rhsCtx cur2
                 pure ([], cur3)
             _ | startsPat (tkKind peekTok) -> do
-                -- Pattern binding: (a, b) = rhs, Con x = rhs, etc.
-                (newBinds, cur') <- parseWherePatBind ctx accLen cur
+                -- Pattern binding: (a, b) = rhs, Con x = rhs, !x = rhs,
+                -- !brInner@(BufferRange op _) = …, etc.
+                (newBinds, cur') <- parseWherePatBind rhsCtx accLen cur
                 pure (newBinds, cur')
               | otherwise ->
                 parseErr ctx "expected identifier or pattern in where-binding" peekTok
@@ -2361,17 +2371,31 @@ parseLet ctx cur0 = do
                             pure (Right (pat, e), cur4)
                         _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
                 | otherwise -> do
-                (params, cur2) <- collectLetParams ctx cur1 []
+                -- Multi-clause let functions, e.g. bytestring's
+                -- packUptoLenChars:
+                --   let go !p []     = ...
+                --       go !p (c:cs) = ...
+                --   in go p0 cs0
+                -- Without collecting same-name clauses, the last equation
+                -- shadows the rest and wrapParams turns @(c:cs)@ into a
+                -- single-pattern lambda that fails on @[]@ with
+                -- "Non-exhaustive patterns in let: PCon \":\" …".  That
+                -- blocked Lazy.Char8.pack / responseLBS string bodies.
+                (params0, cur2) <- collectLetParams ctx cur1 []
                 let (sepTok, cur3) = nextSig ctx cur2
-                case tkKind sepTok of
+                (rhs0, cur4) <- case tkKind sepTok of
                     TkEq -> do
-                        (e, cur4) <- parseExpr rhsCtx cur3
-                        pure (Left (n, wrapParams params e), cur4)
+                        (e, c) <- parseExpr rhsCtx cur3
+                        pure (RhsPlain e, c)
                     TkBar -> do
-                        (branches, cur4) <- parseLetGuardBranches rhsCtx cur3 []
-                        let e = desugarClauses [(params, RhsGuards branches)] (length params)
-                        pure (Left (n, e), cur4)
+                        (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
+                        pure (RhsGuards branches, c)
                     _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+                (moreClauses, curFinal) <-
+                    collectMoreLetClauses bindCol n cur4 []
+                let allClauses = (params0, rhs0) : moreClauses
+                    e = desugarClauses allClauses (length params0)
+                pure (Left (n, e), curFinal)
             _ | startsPat (tkKind nameTok) -> do
                 -- Pattern binding: (a, b) = expr, Con x = expr, !x = expr, etc.
                 -- Use parseTopPat so applied constructors (e.g. `Foo a b`) are
@@ -2399,6 +2423,30 @@ parseLet ctx cur0 = do
         case tkKind sep of
             TkBar -> parseLetGuardBranches ctx cur4 acc'
             _     -> pure (acc', cur3)
+
+    -- Collect additional same-name equations for a multi-clause let
+    -- binding (mirrors 'collectMoreWhereClauses' / 'collectMoreDoLetClauses').
+    collectMoreLetClauses bindCol name cur acc = do
+        let (peek, _) = nextSig ctx cur
+            rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
+        case tkKind peek of
+            TkIdent n | n == name && tkCol peek == bindCol -> do
+                let (_, cur1) = nextSig ctx cur   -- consume name
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (sepTok, cur3) = nextSig ctx cur2
+                (rhs, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (e, c) <- parseExpr rhsCtx cur3
+                        pure (RhsPlain e, c)
+                    TkBar -> do
+                        (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
+                        pure (RhsGuards branches, c)
+                    _ -> parseErr ctx
+                            "expected `=` or `|` in multi-clause let-binding"
+                            sepTok
+                collectMoreLetClauses bindCol name cur4
+                    (acc ++ [(params, rhs)])
+            _ -> pure (acc, cur)
 
     -- Collect layout-mode let items (bindings and pattern bindings).
     -- All items must be at `bindCol`.
