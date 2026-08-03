@@ -102,6 +102,7 @@ import IHC.Classes
     , setCoreInstanceLoadHook, triggerCoreInstanceLoad
     , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
+    , lookupClassMethodFallback
     , setThExpToExpr
     , registerSuperclasses
       -- Lazy instance catalogue (Stage 2)
@@ -1299,12 +1300,16 @@ typeLikeRuntimeNames lm ty subs = do
                 (methods:_) -> methods
                 []          -> []
     pure $ case subs of
+        -- @T(..)@: expand to local ctors / fields / methods.
         [] -> nubBS (ctorsOfTy ++ fieldsOfTy ++ classMethods)
-        _  -> nubBS
-                [ n
-                | n <- subs
-                , n `elem` ctorsOfTy || n `elem` fieldsOfTy || n `elem` classMethods
-                ]
+        -- @T(a,b,c)@ / @Class(meth1, meth2)@: the export list is
+        -- authoritative.  Do NOT require the names to appear in this
+        -- module's local class/data decls — re-export facades like
+        -- @Data.Bits@ (which only @import GHC.Internal.Data.Bits@ and
+        -- re-lists @Bits((.&.), …, unsafeShiftR, …)@) otherwise drop
+        -- every method, so @import qualified Foreign as F@ never sees
+        -- @F.unsafeShiftR@ / @F.countLeadingZeros@ (warp chunked path).
+        _  -> nubBS subs
 
 -- | Load a single import declaration into an existing 'Env', as if the
 -- REPL user typed @import Foo@ at the prompt.
@@ -6436,9 +6441,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
             mSlot <- resolveFallback Nothing targetKey
             case mSlot of
                 Just targetSlot -> force legacyHooks targetSlot
-                Nothing -> error
-                    ("import alias: unresolved target "
-                     <> BC.unpack targetKey)
+                Nothing -> resolveClassMethodOrDie n targetKey
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
       where
         targetModule = fromMaybe (impModule imp) (knownDirectImportOwner n)
@@ -6455,10 +6458,38 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
             mSlot <- resolveFallback Nothing targetKey
             case mSlot of
                 Just targetSlot -> force legacyHooks targetSlot
-                Nothing -> error
-                    ("import alias: unresolved target "
-                     <> BC.unpack targetKey)
+                Nothing -> resolveClassMethodOrDie n targetKey
         pure [ (alias, slot) | alias <- importedAliasesForName imp n ]
+
+    -- Class methods re-exported through facade modules (@Foreign@ →
+    -- @Data.Bits@ → @GHC.Internal.Data.Bits@) have no
+    -- module-qualified top-level body.  Synthesise the ambient
+    -- class-method dispatcher directly (do NOT look the bare name up
+    -- in the program env — that re-enters this same lazy-builtin slot
+    -- and throws 'LoopException').  Without this,
+    -- @import qualified Foreign as F@ / @F.unsafeShiftR@ dies and
+    -- warp's chunked encoder never runs.
+    resolveClassMethodOrDie bare targetKey = go classMethodClasses
+      where
+        go [] = error
+            ("import alias: unresolved target "
+             <> BC.unpack targetKey)
+        go (cls:rest) = do
+            m <- lookupClassMethodFallback legacyHooks (BC.pack cls) bare
+            case m of
+                Just v  -> pure v
+                Nothing -> go rest
+        -- Classes whose methods commonly arrive only via facade
+        -- re-exports (@module Data.Bits@ from Foreign, etc.).
+        classMethodClasses =
+            [ "Bits", "FiniteBits"
+            , "Num", "Integral", "Real", "Fractional", "Floating"
+            , "RealFrac", "RealFloat"
+            , "Eq", "Ord", "Show", "Read", "Enum", "Bounded", "Ix"
+            , "Functor", "Applicative", "Monad", "Alternative", "MonadPlus"
+            , "Foldable", "Traversable", "Monoid", "Semigroup"
+            , "Storable", "IsString", "IsList"
+            ]
 
     lazyAliasesForLoadedBroadImport needed concreteNames tm imp =
         case impSpec imp of
@@ -7921,6 +7952,20 @@ resolveFallback _mOwner name
         resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.Fd")
     | BC.pack ".F.Refresh" `isSuffixOf` name =
         resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.FdCache.Refresh")
+    -- @import qualified Foreign as F@ (bsb-http-chunked etc.): Bits /
+    -- FiniteBits methods re-exported via @module Data.Bits@.  Specific
+    -- FdCache @F.*@ symbols above take priority; remaining @F.<bare>@
+    -- fall through to the bare class-method dispatcher (or other bare
+    -- resolution).  Without this, @F.unsafeShiftR@ / @F.countLeadingZeros@
+    -- stay unbound and warp's chunked response path spins forever.
+    | BC.pack "F." `BC.isPrefixOf` name =
+        resolveFallback _mOwner (BC.drop 2 name)
+    | BC.pack ".F." `BS.isInfixOf` name =
+        -- owner-qualified @...F.unsafeShiftR@ → bare method
+        case BC.breakSubstring (BC.pack ".F.") name of
+            (_, rest) | not (BC.null rest) ->
+                resolveFallback _mOwner (BC.drop 3 rest)
+            _ -> resolveFallbackSource _mOwner name
     -- @import qualified Network.Wai.Handler.Warp.Date as D@
     | BC.pack ".D.withDateCache" `isSuffixOf` name =
         resolveFallback _mOwner (BC.pack "Network.Wai.Handler.Warp.Date.withDateCache")

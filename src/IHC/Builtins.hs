@@ -974,6 +974,35 @@ builtins reg =
     -- ghc-bignum word/BigNat trailing-zero helpers.
     , ("ctz#",       ctzHashB)
     , ("clz#",       clzHashB)
+    -- Sized WordN# bit-count primops (GHC.Prim, no .hs source).
+    -- Word32 FiniteBits / Bits bottom out on these via
+    -- @countLeadingZeros (W32# x) = clz32# (word32ToWord# x)@ etc.
+    -- Without them warp's chunked encoder (F.countLeadingZeros /
+    -- F.unsafeShiftR on Word32 chunk lengths) dies mid-response.
+    , ("popCnt8#",   popCntWidthB 8)
+    , ("popCnt16#",  popCntWidthB 16)
+    , ("popCnt32#",  popCntWidthB 32)
+    , ("popCnt64#",  popCntWidthB 64)
+    , ("clz8#",      clzWidthB 8)
+    , ("clz16#",     clzWidthB 16)
+    , ("clz32#",     clzWidthB 32)
+    , ("clz64#",     clzWidthB 64)
+    , ("ctz8#",      ctzWidthB 8)
+    , ("ctz16#",     ctzWidthB 16)
+    , ("ctz32#",     ctzWidthB 32)
+    , ("ctz64#",     ctzWidthB 64)
+    , ("GHC.Prim.popCnt8#",  popCntWidthB 8)
+    , ("GHC.Prim.popCnt16#", popCntWidthB 16)
+    , ("GHC.Prim.popCnt32#", popCntWidthB 32)
+    , ("GHC.Prim.popCnt64#", popCntWidthB 64)
+    , ("GHC.Prim.clz8#",     clzWidthB 8)
+    , ("GHC.Prim.clz16#",    clzWidthB 16)
+    , ("GHC.Prim.clz32#",    clzWidthB 32)
+    , ("GHC.Prim.clz64#",    clzWidthB 64)
+    , ("GHC.Prim.ctz8#",     ctzWidthB 8)
+    , ("GHC.Prim.ctz16#",    ctzWidthB 16)
+    , ("GHC.Prim.ctz32#",    ctzWidthB 32)
+    , ("GHC.Prim.ctz64#",    ctzWidthB 64)
     , ("indexOfTheOnlyBit#", indexOfTheOnlyBitB)
     -- Phase 2.8: Int# arithmetic primops
     , ("negateInt#",   negateIntB)
@@ -5102,6 +5131,44 @@ clzHashB = pure $ VFun $ \a -> do
                   | otherwise = countLeadingZeros w
             in pure (VInt (fromIntegral z))
         _ -> error ("clz#: bad arg: " <> showValForDebug av)
+
+-- | Sized @popCntN# :: Word# -> Word#@ — popcount of the low N bits.
+popCntWidthB :: Int -> IO Val
+popCntWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+            in pure (VInt (fromIntegral (popCount w)))
+        _ -> error ("popCnt" <> show width <> "#: bad arg: " <> showValForDebug av)
+
+-- | Sized @clzN# :: Word# -> Word#@ — leading zeros among the low N bits.
+-- For @w == 0@ the result is @N@ (matches GHC).
+clzWidthB :: Int -> IO Val
+clzWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+                z | w == 0    = width
+                  | otherwise = countLeadingZeros w - (64 - width)
+            in pure (VInt (fromIntegral z))
+        _ -> error ("clz" <> show width <> "#: bad arg: " <> showValForDebug av)
+
+-- | Sized @ctzN# :: Word# -> Word#@ — trailing zeros among the low N bits.
+ctzWidthB :: Int -> IO Val
+ctzWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+                z | w == 0    = width
+                  | otherwise = countTrailingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("ctz" <> show width <> "#: bad arg: " <> showValForDebug av)
 
 indexOfTheOnlyBitB :: IO Val
 indexOfTheOnlyBitB = pure $ VFun $ \a -> do
