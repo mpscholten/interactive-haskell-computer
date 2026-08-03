@@ -8063,6 +8063,24 @@ resolveFallback _mOwner name
     -- enumerate each one, rewrite any @NS.<bareName>@ → the canonical
     -- @Network.Socket.<bareName>@ qualified form, which is registered in
     -- 'IHC.Builtins' (or interpreted from Network.Socket source).
+    -- network's Network.Socket re-exports withSocketsDo from
+    -- Network.Socket.Internal (non-Windows body is identity).  Warp's
+    -- Run path forces the FQN before any socket syscall; resolve the
+    -- defining module so demand discovery does not stop at the facade.
+    | name == BC.pack "Network.Socket.withSocketsDo"
+    || name == BC.pack "withSocketsDo" =
+        resolveFallback _mOwner (BC.pack "Network.Socket.Internal.withSocketsDo")
+    -- getAddrInfo is a class method on GetAddrInfo in Network.Socket.Info.
+    -- Routing to the bare method self-loops (lazy alias ↔ class dispatcher).
+    -- Warp's bind path wants the [] instance body; jump straight to the
+    -- concrete implementation (getAddrInfoList) that Info defines.
+    | name == BC.pack "Network.Socket.getAddrInfo"
+    || name == BC.pack "Network.Socket.Info.getAddrInfo" =
+        resolveFallback _mOwner (BC.pack "Network.Socket.Info.getAddrInfoList")
+    -- network Info uses @import qualified Data.List.NonEmpty as NE@.
+    | BC.pack "NE." `BC.isPrefixOf` name =
+        resolveFallback _mOwner
+            (BC.pack "Data.List.NonEmpty." `BC.append` BC.drop 3 name)
     | BC.pack "NS." `BC.isPrefixOf` name =
         resolveFallback _mOwner (BC.pack "Network.Socket." `BC.append` BC.drop 3 name)
     -- @import qualified Network.Socket.ByteString as Sock@ in warp's
@@ -10312,6 +10330,12 @@ specialSelfAliasTarget lm n expr
     , lmName lm == BC.pack "Network.Socket.Info"
     , n == BC.pack "getAddrInfo"
     = Just (BC.pack "getAddrInfo")
+    -- Network.Socket re-exports getAddrInfo from Info; self-alias would
+    -- loop.  Point at the concrete []-instance body.
+    | isSelfAliasIn lm n expr
+    , lmName lm == BC.pack "Network.Socket"
+    , n == BC.pack "getAddrInfo"
+    = Just (BC.pack "Network.Socket.Info.getAddrInfoList")
     | isSelfAliasIn lm n expr
     , lmName lm == BC.pack "Network.Socket.BufferPool"
     , n `elem` map BC.pack ["newBufferPool", "withBufferPool", "mallocBS", "copy"]
