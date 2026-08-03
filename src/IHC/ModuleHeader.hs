@@ -94,12 +94,20 @@ data ExportItem
 -- read bindings.
 parseModuleHeader :: Source -> Cursor -> IO (Maybe ModuleHeader, Cursor)
 parseModuleHeader src cur0 = do
-    let (tok, _) = skipNewlines src cur0
+    -- Use 'nextSigTok' (not 'skipNewlines'/'nextToken'): leading
+    -- @{-# LANGUAGE … #-}@ pragmas and block comments are treated as
+    -- whitespace by the sig-level lexer.  'skipNewlines' only drops
+    -- 'TkNewline', so a file that starts with a language pragma
+    -- (network's Network.Socket, almost every modern module) was
+    -- previously classified as headerless — 'emptyHeader' with
+    -- 'ExportAll' and zero imports.  That made re-exported record
+    -- fields (AddrInfo via Socket → Info) invisible to record-update
+    -- desugaring (streaming-commons @NS.defaultHints { NS.addrFlags = … }@).
+    let (tok, cur1) = nextSigTok src cur0
     case tkKind tok of
         TkModule -> do
-            -- Advance past the `module` keyword.
-            let (_, curAfterMod) = nextSigTok src cur0
-            (name, exports, cur2) <- parseModuleLine src curAfterMod
+            -- cur1 is already past the `module` keyword.
+            (name, exports, cur2) <- parseModuleLine src cur1
             (imports, cur3) <- parseImports src cur2
             pure (Just (ModuleHeader (Just name) exports imports), cur3)
         TkImport -> do

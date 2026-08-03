@@ -6920,42 +6920,38 @@ visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
             ]
     pure (unionFieldRegistries (lmFieldReg lm : imported ++ loadedFields))
   where
-    importFields imp
-        -- Qualified imports: we don't walk their full export chain,
-        -- but we do ensure the target is loaded so its lmFieldReg
-        -- enters the loadedFields union (read from the registry
-        -- after all importFields calls complete).  This makes
-        -- record updates on types from qualified imports work
-        -- (e.g. NS.defaultHints { NS.addrFlags = ... }).
-        | impQualified imp = case mWanted of
-            Just _ -> do
-                _ <- try (loadModule registry searchPath includeMap (impModule imp))
-                        :: IO (Either SomeException LoadedModule)
-                pure Map.empty
-            Nothing -> pure Map.empty
-        | otherwise = do
-            r <- try (loadModule registry searchPath includeMap (impModule imp))
-                    :: IO (Either SomeException LoadedModule)
-            case r of
-                Left _ -> pure Map.empty
-                Right importedLm -> do
-                    case mWanted of
-                        Just wanted -> do
-                            visibleWanted <- filterM
-                                (specAllowsLoaded importedLm (impSpec imp))
-                                wanted
-                            -- If specAllowsLoaded rejected all wanted names,
-                            -- they might be sub-names of a re-exported type
-                            -- (e.g. field names from T(..) where T is defined
-                            -- in a transitive import).  Try the original list
-                            -- so exportedFieldRegistryForNames can walk the
-                            -- re-export chain.
-                            let effective = if null visibleWanted
-                                              then wanted
-                                              else visibleWanted
-                            exportedFieldRegistryForNames registry searchPath includeMap
-                                importedLm [lmName lm] effective
-                        Nothing -> do
+    importFields imp = do
+        -- Qualified and unqualified imports both need re-export-aware
+        -- field metadata: Network.Socket re-exports AddrInfo(..) from
+        -- Network.Socket.Info, and streaming-commons writes
+        -- @NS.defaultHints { NS.addrFlags = …, NS.addrSocketType = … }@.
+        -- Loading the facade alone leaves lmFieldReg empty for those
+        -- fields (they're defined on Info), so we must walk export lists
+        -- via exportedFieldRegistryForNames regardless of impQualified.
+        r <- try (loadModule registry searchPath includeMap (impModule imp))
+                :: IO (Either SomeException LoadedModule)
+        case r of
+            Left _ -> pure Map.empty
+            Right importedLm -> do
+                case mWanted of
+                    Just wanted -> do
+                        visibleWanted <- filterM
+                            (specAllowsLoaded importedLm (impSpec imp))
+                            wanted
+                        -- If specAllowsLoaded rejected all wanted names,
+                        -- they might be sub-names of a re-exported type
+                        -- (e.g. field names from T(..) where T is defined
+                        -- in a transitive import).  Try the original list
+                        -- so exportedFieldRegistryForNames can walk the
+                        -- re-export chain.
+                        let effective = if null visibleWanted
+                                          then wanted
+                                          else visibleWanted
+                        exportedFieldRegistryForNames registry searchPath includeMap
+                            importedLm [lmName lm] effective
+                    Nothing
+                        | impQualified imp -> pure Map.empty
+                        | otherwise -> do
                             exported <- exportedFieldRegistry registry searchPath includeMap
                                             importedLm [lmName lm]
                             filterImportedFieldRegistry importedLm (impSpec imp) exported

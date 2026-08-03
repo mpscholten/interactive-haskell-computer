@@ -432,18 +432,18 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
             -- (defined via #define in a template-include wrapper like Posix.hs)
             -- are substituted into the body of the included file.
             --
-            -- Exception: C header files (.h, .hpp, .H) may contain C-style
-            -- comments (/* ... */) that would confuse the Haskell lexer if
-            -- emitted verbatim (e.g. bytestring-cpp-macros.h).  However many
-            -- Hackage packages (vault, hashable, …) ship *Haskell* source as
-            -- .h templates included via #include "IO.h" / "ST.h" after a
-            -- #define LAZINESS Lazy.  Blanking every regular .h line killed
-            -- those modules (Data.Vault.Lazy ended up as ~empty source, so
-            -- Vault.newKey never materialised).
-            --
-            -- Policy: still expand macros in .h bodies, but strip C block
-            -- comments.  Pure-comment residual lines become blank; real
-            -- Haskell (module / import / binding) is kept.
+            -- .h includes come in two flavours:
+            --   1. Pure-C macro headers (network HsNetDef.h, bytestring
+            --      cpp-macros) — regular lines must NOT be emitted; they
+            --      contain multi-line /* … */ comments whose residue
+            --      (@don't. */@) confuses the Haskell lexer/header parser.
+            --   2. Haskell-as-.h templates (vault IO.h / ST.h) after a
+            --      wrapper @#define LAZINESS Lazy@ — these are real
+            --      Haskell and MUST be emitted (with LAZINESS expanded).
+            -- Heuristic: emit a .h regular line only when, after stripping
+            -- C comments and expanding macros, it still looks like a
+            -- Haskell source line (starts with a letter/underscore or a
+            -- common Haskell token, and carries no C-comment residue).
             let isCHeader = ".h"   `isSuffixOf` filePath
                          || ".hpp" `isSuffixOf` filePath
                          || ".H"   `isSuffixOf` filePath
@@ -453,7 +453,11 @@ processIO includeDirs ctx active (ln : rest) stack filePath depth =
                     | otherwise = (ln, 0, rest')
             let emit | not active = BS.empty
                      | isCHeader  =
-                         expandMacrosInLine ctx (stripCBlockComments regularLn)
+                         let cleaned  = stripCBlockComments regularLn
+                             expanded = expandMacrosInLine ctx cleaned
+                         in if looksLikeHaskellHeaderLine expanded
+                                then expanded
+                                else BS.empty
                      | otherwise  = expandMacrosInLine ctx regularLn
             (xs, c) <- processIO includeDirs ctx active regularRest stack filePath depth
             pure (emit : replicate regularContCount BS.empty ++ xs, c)
@@ -889,6 +893,61 @@ stripCBlockComments = BC.pack . go . BC.unpack
     dropComment [] = []
     dropComment ('*':'/':rest) = rest
     dropComment (_:rest)       = dropComment rest
+
+-- | True when a post-clean .h line still looks like Haskell rather than
+-- C-comment residue.  Pure-C headers (network HsNetDef.h) have multi-line
+-- @/* … */@ comments whose middle lines start with ordinary English words
+-- (@systems@, @required@, …); accepting any alphabetic start leaked those
+-- into the host .hs file and broke @parseModuleHeader@.
+--
+-- Accept:
+--   * keyword-led lines (@module@ / @import@ / @data@ / …)
+--   * line comments (@--@)
+--   * top-level bindings / signatures (@newKey = …@, @empty :: Vault@)
+--   * export-list fragments (@Vault, Key,@ / @empty, newKey,@)
+-- Reject free English prose (C comment residue).
+looksLikeHaskellHeaderLine :: ByteString -> Bool
+looksLikeHaskellHeaderLine bs0 =
+    let bs = BC.dropWhile isHSpace bs0
+    in not (BS.null bs)
+       && not (BC.isInfixOf (BC.pack "*/") bs)
+       && not (BC.isPrefixOf (BC.pack "/*") bs)
+       && ( any (`BC.isPrefixOf` bs) haskellKw
+         || BC.isPrefixOf (BC.pack "--") bs
+         || isBindingOrSig bs
+         || isExportListFragment bs )
+  where
+    haskellKw =
+        [ BC.pack "module ", BC.pack "module\t"
+        , BC.pack "import ", BC.pack "import\t"
+        , BC.pack "type ", BC.pack "data ", BC.pack "newtype "
+        , BC.pack "class ", BC.pack "instance "
+        , BC.pack "infix", BC.pack "infixr", BC.pack "infixl"
+        , BC.pack "default ", BC.pack "foreign "
+        , BC.pack "deriving ", BC.pack "where"
+        , BC.pack "(", BC.pack ")"
+        ]
+    isIdentStart c =
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+    isBindingOrSig bs =
+        case BC.uncons bs of
+            Just (c, _)
+                | c >= 'a' && c <= 'z' || c == '_' ->
+                    BC.elem '=' bs || BC.isInfixOf (BC.pack "::") bs
+                | otherwise -> False
+            Nothing -> False
+    -- @empty, newKey, lookup,@ or @Vault, Key,@ — only idents, commas,
+    -- spaces, and a trailing comma/paren.  Rejects English prose because
+    -- those lines have spaces between ordinary words without commas.
+    isExportListFragment bs =
+        case BC.uncons bs of
+            Just (c, _) | isIdentStart c ->
+                let ok ch = isIdentStart ch || ch == ',' || ch == ' '
+                         || ch == '\t' || ch == ')' || ch == '('
+                         || (ch >= '0' && ch <= '9') || ch == '\''
+                         || ch == '#'
+                in BC.all ok bs && BC.elem ',' bs
+            _ -> False
 
 -- | Expand object-like and function-like macros in a regular (non-directive)
 -- source line.  This implements the core C-preprocessor substitution rule:
