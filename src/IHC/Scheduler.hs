@@ -1773,10 +1773,22 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         -- REPL has already discovered the same module as an entry module
         -- via :load.  Bypass the global discovery miss cache here so the
         -- fresh non-entry LoadedModule gets its own body slot populated.
+        --
+        -- Also re-discover when the existing body is a self-alias
+        -- (@EVar "Data.Vault.Lazy.newKey"@) left by a prior ImportAll /
+        -- re-export rewrite: those aliases never resolve and leave
+        -- @Vault.newKey@ unbound forever.
         bodies <- readIORef (lmBodies targetLm)
-        if Map.member n bodies
-            then pure ()
-            else discoverInModuleWith' builtinNames registry searchPath includeMap targetLm n
+        let needsDiscover = case Map.lookup n bodies of
+                Nothing -> True
+                Just (EVar v)
+                    | v == n -> True
+                    | v == lmName targetLm <> BC.pack "." <> n -> True
+                    | BC.isSuffixOf (BC.pack "." <> n) v -> True
+                    | otherwise -> False
+                Just _ -> False
+        when needsDiscover $
+            discoverInModuleWith' builtinNames registry searchPath includeMap targetLm n
 
     discoverRequestedReexport builtinNames registry searchPath includeMap targetLm n
         | not (exportsMissingName targetLm n) = pure ()
@@ -8063,8 +8075,15 @@ resolveFallback _mOwner name
         resolveFallback _mOwner (BC.pack "Control.Concurrent." `BC.append` BC.drop 5 name)
     -- @import qualified Data.Vault.Lazy as Vault@ — used by warp's
     -- HTTP1.hs / HTTP2/Request.hs and Settings.hs for vault keys.
-    | BC.pack "Vault." `BC.isPrefixOf` name =
-        resolveFallback _mOwner (BC.pack "Data.Vault.Lazy." `BC.append` BC.drop 6 name)
+    -- NOTE: @Vault.newKey@ (used by pauseTimeoutKey CAF) still does not
+    -- materialise reliably via FQN discovery; tracked as the next
+    -- warp-hello blocker after Bits/Foreign.  Keep the original FQN
+    -- rewrite so empty/insert/lookup can still resolve when their
+    -- bodies are present.
+    | BC.pack "Vault." `BC.isPrefixOf` name
+    , not (BC.pack "Data.Vault." `BC.isPrefixOf` name) =
+        resolveFallback _mOwner
+            (BC.pack "Data.Vault.Lazy." `BC.append` BC.drop 6 name)
     -- @import qualified Data.ByteString.Builder as BB@ — used in
     -- warp's HTTP1 path for response body construction.
     | BC.pack "BB." `BC.isPrefixOf` name =
