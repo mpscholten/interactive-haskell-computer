@@ -3752,6 +3752,18 @@ classMethodDispatcher reg cls methodName = selfVal
             let normTag
                     | rawTag == BC.pack "<IO>" && isMonadicClass cls
                         = BC.pack "IO"
+                    -- Optimistic numeric defaulting: unannotated Int
+                    -- literals (VInt) used with Floating/Fractional
+                    -- methods (log, logBase, /, **) should pick the
+                    -- Double instance.  Without this, @logBase 10 y@
+                    -- dispatches Floating on tag Int (no instance),
+                    -- returns an unapplied method VFun, and
+                    -- @log y / log 10@ dies on D# patterns with
+                    -- args=<number> <function>.  Blocks warp
+                    -- packIntegral (ceiling $ logBase 10 n').
+                    | isFloatingNumericClass cls
+                    , rawTag == BC.pack "Int" || rawTag == BC.pack "Integer"
+                        = BC.pack "Double"
                     | otherwise
                         = rawTag
                 tag = dispatchTagForValue normTag
@@ -4536,6 +4548,10 @@ classMethodDispatcher reg cls methodName = selfVal
         cls == BC.pack "Num"
         && methodName == BC.pack "fromInteger"
         && null accArgs
+
+    isFloatingNumericClass c =
+        c `elem` map BC.pack
+            [ "Floating", "Fractional", "RealFrac", "RealFloat" ]
 
     -- Category (.) / id on the function arrow — see early dispatch branch.
     isCategoryArrowMethod tag =
@@ -5539,7 +5555,8 @@ ffiBuiltinNames = Set.fromList
     , "peekCString", "newCString"
     , "addForeignPtrFinalizer"
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
-    , "mkWeak#", "mkWeakNoFinalizer#", "reallyUnsafePtrEquality#"
+    , "mkWeak#", "mkWeakNoFinalizer#", "deRefWeak#", "finalizeWeak#"
+    , "reallyUnsafePtrEquality#"
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
     -- Storable peek/poke methods source-load through the class.  The bare
     -- host fallbacks remain in the base env for optimistic raw-pointer cases.

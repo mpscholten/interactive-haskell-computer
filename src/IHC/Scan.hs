@@ -2461,12 +2461,23 @@ scanFunctorDerivingsRaw src
                             loop acc cAfterArr
                         else do
                             -- Peek: '{' → record syntax; else positional.
-                            let (peek, _) = nextToken src c'
-                            (roles, cEnd) <- case tkKind peek of
-                                TkLBrace -> do
-                                    let (_, cBrace) = nextToken src c'
-                                    collectRecordRoles tvN cBrace
-                                _ -> collectPositionalRoles tvN c'
+                            -- Skip intervening newlines so multi-line record
+                            -- decls are recognized (common style in Hackage):
+                            --   data T = MkT
+                            --     { field :: Int
+                            --     }
+                            --     deriving (Eq)
+                            -- Without this, '{' on the next line is missed,
+                            -- derived Eq is never registered, and Eq.== falls
+                            -- through to the class default (==) = not (/=)
+                            -- which mutually recurses with (/=) = not (==)
+                            -- → infinite spin (warp composeHeader /
+                            -- HttpVersion equality).
+                            (roles, cEnd) <- do
+                                mRec <- peekRecordBrace c'
+                                case mRec of
+                                    Just cBrace -> collectRecordRoles tvN cBrace
+                                    Nothing     -> collectPositionalRoles tvN c'
                             let ctor = FunctorCtor name roles
                             -- After fields, see if another ctor follows.
                             let (sep, cSep) = nextToken src cEnd
@@ -2474,6 +2485,16 @@ scanFunctorDerivingsRaw src
                                 TkBar     -> loop (ctor : acc) cSep
                                 _         -> pure (reverse (ctor : acc), cEnd)
                 _ -> loop acc c'
+
+    -- Skip newlines and return Just (cursor after '{') if a record brace
+    -- follows; Nothing if the next non-newline token is not '{'.
+    peekRecordBrace :: Cursor -> IO (Maybe Cursor)
+    peekRecordBrace cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkNewline -> peekRecordBrace cur'
+            TkLBrace  -> pure (Just cur')
+            _         -> pure Nothing
 
     -- Positional field parser. Each field is a type-atom (single token or
     -- a parenthesised/bracketed group) optionally preceded by '!' or '~'.

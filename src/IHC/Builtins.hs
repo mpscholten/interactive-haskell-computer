@@ -172,6 +172,12 @@ pokeHostWord8ByteOff ptrV offV valV = do
         pure (fromIntegral n :: Word8)
     word8FromVal (VInteger n) =
         pure (fromInteger n :: Word8)
+    word8FromVal (VCon "W8#" [t]) = do
+        inner <- force legacyHooks t
+        case inner of
+            VInt n -> pure (fromIntegral n :: Word8)
+            _ -> error ("pokeHostWord8ByteOff: W8# inner not Int: "
+                        <> showValForDebug inner)
     word8FromVal (VChar c) =
         pure (fromIntegral (ord c) :: Word8)
     word8FromVal other =
@@ -964,6 +970,11 @@ builtins reg =
     , ("gtWord8#",  gtWord8B)
     , ("geWord8#",  geWord8B)
     , ("neWord8#",  neWord8B)
+    -- Word8# arithmetic (Num Word8 bottoms). Results stay boxed as
+    -- VCon "W8#" so typeTagOf → Word8.
+    , ("plusWord8#",  plusWord8B)
+    , ("subWord8#",   subWord8B)
+    , ("timesWord8#", timesWord8B)
     , ("minusWord#", minusWordB)
     , ("plusWord#",  plusWordB)
     , ("timesWord#", timesWordB)
@@ -1042,6 +1053,26 @@ builtins reg =
     -- @sqrtDouble (D# x) = D# (sqrtDouble# x)@) now that the bare-name
     -- @sqrt@ shim is gone.  Reuses the shared 'unaryOpFloat' helper.
     , ("sqrtDouble#",  unaryOpFloat sqrt)
+    -- Floating Double bottoms (Float.hs:1574–1591) — all GHC.Prim
+    -- intrinsics with no .hs source.  packIntegral / logBase need
+    -- logDouble#; register the full Floating Double unary suite so
+    -- the next missing primop does not re-block warp response packing.
+    , ("expDouble#",   unaryOpFloat exp)
+    , ("expm1Double#", unaryOpFloat (\x -> exp x - 1))
+    , ("logDouble#",   unaryOpFloat log)
+    , ("log1pDouble#", unaryOpFloat (\x -> log (1 + x)))
+    , ("sinDouble#",   unaryOpFloat sin)
+    , ("cosDouble#",   unaryOpFloat cos)
+    , ("tanDouble#",   unaryOpFloat tan)
+    , ("asinDouble#",  unaryOpFloat asin)
+    , ("acosDouble#",  unaryOpFloat acos)
+    , ("atanDouble#",  unaryOpFloat atan)
+    , ("sinhDouble#",  unaryOpFloat sinh)
+    , ("coshDouble#",  unaryOpFloat cosh)
+    , ("tanhDouble#",  unaryOpFloat tanh)
+    , ("asinhDouble#", unaryOpFloat asinh)
+    , ("acoshDouble#", unaryOpFloat acosh)
+    , ("atanhDouble#", unaryOpFloat atanh)
     -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
     -- Bottom-of-stack primop for 'decodeFloat' on Double:
     -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
@@ -1505,6 +1536,8 @@ builtins reg =
     -- wrap these operations in ordinary newtypes.
     , ("mkWeak#",               mkWeakHashB)
     , ("mkWeakNoFinalizer#",    mkWeakNoFinalizerHashB)
+    , ("deRefWeak#",            deRefWeakHashB)
+    , ("finalizeWeak#",         finalizeWeakHashB)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
@@ -1579,15 +1612,50 @@ makeWordArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VInt (fromIntegral (op (fromIntegral x) (fromIntegral y))))
         _ -> error (name <> ": bad args")
 
--- | Binary Word8# comparison primop. IHC stores unboxed Word8# as
--- 'VInt', so truncate to 'Word8' before comparing.
+-- | Unwrap Word8# payload: bare VInt or boxed VCon "W8#".
+asWord8Val :: Val -> Maybe Word8
+asWord8Val (VInt n) = Just (fromIntegral n)
+asWord8Val (VInteger n)
+    | n >= 0, n <= 255 = Just (fromInteger n)
+asWord8Val _ = Nothing
+
+forceWord8Payload :: Thunk -> IO (Maybe Word8)
+forceWord8Payload t = do
+    v <- force legacyHooks t
+    case v of
+        VCon "W8#" [inner] -> force legacyHooks inner >>= pure . asWord8Val
+        other -> pure (asWord8Val other)
+
+-- | Binary Word8# comparison primop. Accepts bare VInt or boxed W8#.
 makeWord8CmpOp :: String -> (Word8 -> Word8 -> Bool) -> IO Val
 makeWord8CmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    case (av, bv) of
-        (VInt x, VInt y) ->
-            pure (primBoolVal (op (fromIntegral x) (fromIntegral y)))
-        _ -> error (name <> ": bad args")
+    ma <- forceWord8Payload a
+    mb <- forceWord8Payload b
+    case (ma, mb) of
+        (Just x, Just y) -> pure (primBoolVal (op x y))
+        _ -> do
+            av <- force legacyHooks a; bv <- force legacyHooks b
+            error (name <> ": bad args: " <> showValForDebug av
+                   <> " " <> showValForDebug bv)
+
+-- | Binary Word8# arithmetic; result boxed as VCon "W8#" for Num Word8.
+makeWord8ArithOp :: String -> (Word8 -> Word8 -> Word8) -> IO Val
+makeWord8ArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    ma <- forceWord8Payload a
+    mb <- forceWord8Payload b
+    case (ma, mb) of
+        (Just x, Just y) -> do
+            t <- newWHNFThunk (VInt (fromIntegral (op x y)))
+            pure (VCon "W8#" [t])
+        _ -> do
+            av <- force legacyHooks a; bv <- force legacyHooks b
+            error (name <> ": bad args: " <> showValForDebug av
+                   <> " " <> showValForDebug bv)
+
+plusWord8B, subWord8B, timesWord8B :: IO Val
+plusWord8B  = makeWord8ArithOp "plusWord8#"  (+)
+subWord8B   = makeWord8ArithOp "subWord8#"   (-)
+timesWord8B = makeWord8ArithOp "timesWord8#" (*)
 
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
@@ -2755,6 +2823,8 @@ mkWeakHashB :: IO Val
 mkWeakHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_finalizerT -> pure $ VFun $ \_stT -> do
     valV <- force legacyHooks valT
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    -- Strong ref under interpretation: GC never drops keys, so the
+    -- "weak" object is just the value itself.  deRefWeak# always succeeds.
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
 
@@ -2764,6 +2834,30 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
+
+-- | @deRefWeak# :: Weak# v -> State# s -> (# State# s, Int#, v #)@.
+-- Flag 0# = dead, non-zero = alive (see GHC.Internal.Weak.deRefWeak).
+-- Our mkWeak* always keep the value alive, so flag is always 1#.
+deRefWeakHashB :: IO Val
+deRefWeakHashB = pure $ VFun $ \weakT -> pure $ VFun $ \_stT -> do
+    valV <- force legacyHooks weakT
+    stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    flagT <- newWHNFThunk (VInt 1)
+    valOut <- newWHNFThunk valV
+    pure (VCon "(#,,#)" [stT, flagT, valOut])
+
+-- | @finalizeWeak# :: Weak# v -> State# s
+--                 -> (# State# s, Int#, State# s -> (# State# s, () #) #)@.
+-- Flag 0# = already dead / no finalizer.  We never store finalizers on
+-- the strong-ref Weak# representation, so always return 0#.
+finalizeWeakHashB :: IO Val
+finalizeWeakHashB = pure $ VFun $ \_weakT -> pure $ VFun $ \_stT -> do
+    stT   <- newWHNFThunk (VPrimObj PrimRealWorld)
+    flagT <- newWHNFThunk (VInt 0)
+    -- Dummy finalizer thunk (unused when flag is 0#).
+    unitT <- newWHNFThunk VUnit
+    dummy <- newWHNFThunk (VFun $ \sT -> pure (VCon "(#,#)" [sT, unitT]))
+    pure (VCon "(#,,#)" [stT, flagT, dummy])
 
 --------------------------------------------------------------------------------
 -- File IO primops.
@@ -3484,12 +3578,21 @@ iHashB = pure $ VFun $ \a -> force legacyHooks a
 wHashB :: IO Val
 wHashB = pure $ VFun $ \a -> force legacyHooks a
 
+-- Box Word8 as VCon "W8#" so typeTagOf can map to "Word8" and Num
+-- Word8 dispatch does not collapse to Num Int (bare VInt).  Without
+-- this, @(5::Word8) - 48@ evaluates as Int (-43) instead of modular
+-- Word8 213, and Word8 digit math on the warp request path is wrong.
 w8HashB :: IO Val
 w8HashB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
     case av of
-        VInt n -> pure (VInt (n .&. 0xff))
-        _      -> force legacyHooks a
+        VInt n -> do
+            t <- newWHNFThunk (VInt (n .&. 0xff))
+            pure (VCon "W8#" [t])
+        VCon "W8#" _ -> pure av
+        _ -> do
+            t <- newWHNFThunk av
+            pure (VCon "W8#" [t])
 
 cHashB :: IO Val
 cHashB = pure $ VFun $ \a -> force legacyHooks a
@@ -4177,6 +4280,12 @@ pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
             pokeAddrInfoHintsVal p bv
             pure VUnit
         VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        -- Boxed Word8 (after W8# carrier for Num Word8 dispatch).
+        VCon "W8#" [t] -> do
+            inner <- force legacyHooks t
+            case inner of
+                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+                _      -> error ("poke: W8# inner not an Int: " <> showValForDebug inner)
         -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
         -- values reaching @poke@ via the Char8 path arrive as
         -- 'VCon "IS" [VInt n]' rather than the bare 'VInt' the

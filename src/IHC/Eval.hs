@@ -31,6 +31,7 @@ import Control.Concurrent (myThreadId, yield)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
+import Data.Bits ((.&.))
 import Data.Char (ord)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
@@ -666,7 +667,7 @@ eval hooks env ipm = go
                 VIO action
                     | Just resultTy <- ioResultAnnotation ty ->
                         pure (VIO (action >>= applyIOResultAnnotation resultTy))
-                _               -> pure (applyNumericTyAnnotation ty v)
+                _               -> applyNumericTyAnnotation ty v
 
     tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
     tryTypedPeek e ty =
@@ -927,7 +928,7 @@ eval hooks env ipm = go
                 | elemTy `elem` map BC.pack ["CChar", "CSChar", "CUChar", "Word8"] ->
                     markTypedPtrVal elemTy v
             _ -> pure ()
-        pure (applyNumericTyAnnotation resultTy v)
+        applyNumericTyAnnotation resultTy v
 
     markTypedPtrVal :: ByteString -> Val -> IO ()
     markTypedPtrVal elemTy (VPrimObj (PrimPtr p)) =
@@ -991,13 +992,20 @@ eval hooks env ipm = go
     -- representation.  This lets code such as
     -- @sqrt (fromIntegral n :: Double)@ dispatch on the annotated result type
     -- instead of the intermediate @Int@ runtime tag.
-    applyNumericTyAnnotation :: ByteString -> Val -> Val
+    applyNumericTyAnnotation :: ByteString -> Val -> IO Val
     applyNumericTyAnnotation ty v =
         case tyAnnotationHead ty of
-            "Double" -> toFloat v
-            "Float"  -> toFloat v
-            h | h `elem` integralAnnotationHeads -> toIntegral v
-            _        -> v
+            "Double" -> pure (toFloat v)
+            "Float"  -> pure (toFloat v)
+            -- Fixed-width words need a carrier so Num dispatch hits
+            -- Word8/Word/… instances, not bare Int (VInt).
+            "Word8"  -> boxWordCtor "W8#" 0xff v
+            "Word16" -> boxWordCtor "W16#" 0xffff v
+            "Word32" -> boxWordCtor "W32#" 0xffffffff v
+            "Word64" -> boxWordCtor "W64#" maxBound v
+            "Word"   -> boxWordCtor "W#" maxBound v
+            h | h `elem` integralAnnotationHeads -> pure (toIntegral v)
+            _        -> pure v
       where
         toFloat (VInt n)     = VFloat (fromIntegral n)
         toFloat (VInteger n) = VFloat (fromInteger n)
@@ -1006,6 +1014,20 @@ eval hooks env ipm = go
         toIntegral (VPrimObj (PrimPtr p)) =
             VInt (fromIntegral (ptrToIntPtr p))
         toIntegral other = other
+
+        boxWordCtor :: ByteString -> Int64 -> Val -> IO Val
+        boxWordCtor ctor mask v0 = case asWordBits v0 of
+            Just n -> do
+                t <- newWHNFThunk (VInt (n .&. mask))
+                pure (VCon ctor [t])
+            Nothing -> pure v0
+
+        asWordBits (VInt n) = Just n
+        asWordBits (VInteger n)
+            | n >= 0
+            , n <= toInteger (maxBound :: Word64) = Just (fromIntegral n)
+        asWordBits (VCon "W8#" _)  = Nothing  -- already boxed; leave alone below
+        asWordBits _ = Nothing
 
         integralAnnotationHeads =
             [ "Int", "Word", "Word8", "Word16", "Word32", "Word64"
@@ -1665,6 +1687,25 @@ matchPat hooks (PCon "F#" [p]) (VFloat n) = do
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "D#" [p]) (VFloat n) = do
     t <- newWHNFThunk (VFloat n)
+    matchFields hooks [(p, t)] []
+-- Optimistic numeric defaulting: unannotated integer literals stay
+-- VInt, but Floating/Fractional Double methods (log, /, logBase, …)
+-- pattern-match on D#/F#.  Without these bridges,
+-- @logBase 10 (201 :: Double)@ evaluates @log 10@ through the Double
+-- instance with a VInt argument, D# fails, and @/@ then sees
+-- args=<number> <function> (unapplied method fallout).  That blocked
+-- warp's packIntegral (len = ceiling $ logBase 10 n').
+matchPat hooks (PCon "D#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VFloat (fromIntegral n))
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "F#" [p]) (VInt n) = do
+    t <- newWHNFThunk (VFloat (fromIntegral n))
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "D#" [p]) (VInteger n) = do
+    t <- newWHNFThunk (VFloat (fromInteger n))
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "F#" [p]) (VInteger n) = do
+    t <- newWHNFThunk (VFloat (fromInteger n))
     matchFields hooks [(p, t)] []
 -- ghc-bignum's @Integer@ data constructors:
 --

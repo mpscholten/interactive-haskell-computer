@@ -367,6 +367,12 @@ typeTagOf (VCon "IN" _) = BC.pack "Integer"
 -- ghc-bignum Natural constructors (NS !Word# | NB !BigNat#).
 typeTagOf (VCon "NS" _) = BC.pack "Natural"
 typeTagOf (VCon "NB" _) = BC.pack "Natural"
+-- Fixed-width word boxing constructors — must not dispatch as Int.
+typeTagOf (VCon "W8#" _)  = BC.pack "Word8"
+typeTagOf (VCon "W16#" _) = BC.pack "Word16"
+typeTagOf (VCon "W32#" _) = BC.pack "Word32"
+typeTagOf (VCon "W64#" _) = BC.pack "Word64"
+typeTagOf (VCon "W#" _)   = BC.pack "Word"
 typeTagOf (VCon n _) =
     -- For source-loaded ADTs we now key dispatch on the constructor
     -- name directly. 'IHC.Scheduler.registerOne' (line ~1779) registers
