@@ -4555,26 +4555,59 @@ classMethodDispatcher reg cls methodName = selfVal
                     | otherwise              = same
             pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
 
-    -- ST (>>) that accepts IO-shaped or bare state functions on the
-    -- right (return () defaulting to IO).  Preserves left ST effects.
+    -- ST (>>) that accepts IO-shaped right (return () defaulting to IO).
+    -- When *both* sides are already VCon "ST", fall through to source
+    -- Monad ST — host rewrapping of two writeArrays corrupts the S#
+    -- state token (Non-exhaustive PCon "S#").
     stSeqMethod left =
         pure $ VFun $ \rightT -> do
             right <- force legacyHooks rightT
-            leftFnT <- stStateFnThunk left
-            rightFnT <- stStateFnThunk right
-            let seqFn = VFun $ \sT -> do
-                    leftFn <- force legacyHooks leftFnT
-                    step <- apply legacyHooks leftFn sT
-                    case step of
-                        -- Prefer state-first unboxed (# s, a #); boxed
-                        -- (a, s) is handled by matchPat bridges already
-                        -- when source ST produces it.
-                        VCon _ [s'T, _] -> do
-                            rightFn <- force legacyHooks rightFnT
-                            apply legacyHooks rightFn s'T
-                        other -> pure other
-            seqFnT <- newWHNFThunk seqFn
-            pure (VCon (BC.pack "ST") [seqFnT])
+            case (left, right) of
+                (VCon n1 _, VCon n2 _)
+                    | n1 == BC.pack "ST", n2 == BC.pack "ST" ->
+                        -- Source instance: both sides real ST.
+                        sourceStSeq left rightT
+                _ -> do
+                    leftFnT <- stStateFnThunk left
+                    rightFnT <- stStateFnThunk right
+                    let seqFn = VFun $ \sT -> do
+                            leftFn <- force legacyHooks leftFnT
+                            step <- apply legacyHooks leftFn sT
+                            case step of
+                                VCon _ [s'T, _] -> do
+                                    rightFn <- force legacyHooks rightFnT
+                                    apply legacyHooks rightFn s'T
+                                other -> pure other
+                    seqFnT <- newWHNFThunk seqFn
+                    pure (VCon (BC.pack "ST") [seqFnT])
+
+    -- Apply source-loaded Monad ST (>>) so S# state threading is preserved.
+    -- Important: look up the *instance method body*, not classMethodDispatcher
+    -- (which would re-enter stSeqMethod).
+    sourceStSeq left rightT = do
+        triggerCoreInstanceLoad legacyHooks (BC.pack "Monad")
+        mMethod <- lookupInstanceMethodForced reg (BC.pack "Monad") (BC.pack "ST") (BC.pack ">>")
+        mShared <- lookupInSharedRegForced (BC.pack "Monad") (BC.pack "ST") (BC.pack ">>")
+        case preferMethod mMethod mShared of
+            Just methodVal | not (isMethodPlaceholder methodVal) -> do
+                leftT <- newWHNFThunk left
+                step1 <- apply legacyHooks methodVal leftT
+                apply legacyHooks step1 rightT
+            _ -> do
+                -- Last resort: host rewrap. Preferable to hard-error;
+                -- may still fail on multi-writeArray if S# is required.
+                leftFnT <- stStateFnThunk left
+                rightFnT <- stStateFnThunk =<< force legacyHooks rightT
+                let seqFn = VFun $ \sT -> do
+                        leftFn <- force legacyHooks leftFnT
+                        step <- apply legacyHooks leftFn sT
+                        case step of
+                            VCon _ [s'T, _] -> do
+                                rightFn <- force legacyHooks rightFnT
+                                apply legacyHooks rightFn s'T
+                            other -> pure other
+                seqFnT <- newWHNFThunk seqFn
+                pure (VCon (BC.pack "ST") [seqFnT])
 
     stStateFnThunk :: Val -> IO Thunk
     stStateFnThunk (VCon name [fnT])
