@@ -283,20 +283,33 @@ parseExportList src cur0 = go [] cur0
                             go acc curSkip
             _        -> pure (ExportList (reverse acc), cur)
 
-    parseExportSubs s c0 = loop [] c0
+    parseExportSubs s c0 = do
+        (subs, sawDotDot, cEnd) <- loop [] False c0
+        -- @T(.., pattern P)@ / @ErrorCall(.., ErrorCall)@: a `..`
+        -- wildcard bundled with extra (pattern-synonym) names.  IHC's
+        -- @Just []@ wildcard already over-approximates every constructor,
+        -- field selector and pattern synonym of @T@, so once a `..`
+        -- appears we collapse the group to that wildcard.  Crucially we
+        -- keep consuming tokens up to the matching @)@ first: the previous
+        -- code returned early at the @..@ when it was not immediately
+        -- followed by @)@, leaving the cursor mid-group.  The group's own
+        -- @)@ was then mistaken for the export-list terminator, so
+        -- @) where@ and EVERY import below were silently dropped — e.g.
+        -- @GHC.Internal.Exception@'s @ErrorCall(..,ErrorCall)@ zeroed its
+        -- import list, making re-exported values like @divZeroException@
+        -- (from @GHC.Internal.Exception.Type@) unresolvable and turning
+        -- @div 1 0@ into an @unbound variable@ crash instead of a proper
+        -- @divide by zero@ 'ArithException'.
+        pure (if sawDotDot then [] else subs, cEnd)
       where
-        loop subs c = do
+        loop subs dd c = do
             let (tok, c1) = nextSigTok s c
             case tkKind tok of
-                TkRParen  -> pure (reverse subs, c1)
-                TkDotDot  -> do
-                    let (close, c2) = nextSigTok s c1
-                    case tkKind close of
-                        TkRParen -> pure ([], c2)      -- Tree(..)
-                        _        -> pure (reverse subs, c1)
-                TkComma   -> loop subs c1
-                TkIdent n -> loop (n : subs) c1
-                TkConId n -> loop (n : subs) c1
+                TkRParen  -> pure (reverse subs, dd, c1)
+                TkDotDot  -> loop subs True c1
+                TkComma   -> loop subs dd c1
+                TkIdent n -> loop (n : subs) dd c1
+                TkConId n -> loop (n : subs) dd c1
                 -- Operator in parens inside subs: Class((>>=), (>>), return).
                 -- Keep the operator name so class-method exports like
                 -- Bits((.&.), (.|.)) can be resolved through facade modules.
@@ -308,7 +321,7 @@ parseExportList src cur0 = go [] cur0
                             let c' = case tkKind close of
                                     TkRParen -> c3
                                     _        -> c2
-                            loop (op : subs) c'
+                            loop (op : subs) dd c'
                         Nothing -> case tkKind inner of
                             TkAt -> do
                                 let (rest, c3) = nextSigTok s c2
@@ -319,18 +332,18 @@ parseExportList src cur0 = go [] cur0
                                 let c' = case tkKind close of
                                         TkRParen -> c4
                                         _        -> cAfterOp
-                                loop (fullOp : subs) c'
+                                loop (fullOp : subs) dd c'
                             _ -> do
                                 cAfterOp <- skipToCloseParen s c1 1
-                                loop subs cAfterOp
+                                loop subs dd cAfterOp
                 -- Bare operator (symbolic or backtick-wrapped): skip it.
-                TkSymOp _ -> loop subs c1
+                TkSymOp _ -> loop subs dd c1
                 TkBacktick -> do
                     -- Skip `op`
                     let (_op, c2) = nextSigTok s c1
                     let (_bt, c3) = nextSigTok s c2
-                    loop subs c3
-                _         -> pure (reverse subs, c)
+                    loop subs dd c3
+                _         -> pure (reverse subs, dd, c)
 
 --------------------------------------------------------------------------------
 -- import block
