@@ -74,11 +74,20 @@ data TokenKind
                               --   pin a static blob to a 'ByteString'.
                               --   Field is lazy like 'TkStr'.
     | TkChar  !Char           -- ^ @\'c\'@ character literal
+    | TkNameQuote !ByteString -- ^ TemplateHaskellQuotes name quote:
+                              --   @\'varid@ / @\'Conid@ / @\'(symop)@.
+                              --   Emitted when a leading @\'@ is NOT a
+                              --   char literal and NOT a DataKinds
+                              --   promoted-list/tuple tick.  The payload
+                              --   is the quoted name (bare or operator).
     | TkTick                  -- ^ promoted-list/tuple tick — the bare @\'@
                               --   when followed by @[@, @(@, or @{@. The
                               --   lexer disambiguates on lookahead so
                               --   @\'[a,b]@ parses as a promoted-list
                               --   literal, not a char literal of @[@.
+                              --   Exception: @\'(op)@ where @op@ is a
+                              --   symbolic operator is a name quote
+                              --   ('TkNameQuote'), not a promoted tuple.
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
     | TkPlusPlus              -- ^ @++@ (string / list concat)
@@ -283,6 +292,16 @@ nextToken s c0 =
             | b == 0x2C        -> (mkTok TkComma    c (step c), step c)  -- ','
             | b == 0x3B        -> (mkTok TkSemi     c (step c), step c)  -- ';'
             | b == 0x60        -> (mkTok TkBacktick c (step c), step c)  -- '`'
+            -- Backslash: single '\' is lambda (TkBackslash).  Two
+            -- backslashes '\\' are the symbolic operator used by
+            -- Data.Set difference (Set.\\) and similar — emit TkSymOp
+            -- "\\", matching the '||' / '|' split above.  '\' is not in
+            -- isOpChar (it has a dedicated single-char token), so we
+            -- special-case the double form here rather than via lexSymOp.
+            | b == 0x5C
+            , Just 0x5C <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c)
+                                  in (mkTok (TkSymOp (BC.pack "\\")) c c', c')
             | b == 0x5C        -> (mkTok TkBackslash c (step c), step c) -- '\\'
             -- '@' is an operator-ish char in Haskell reports, but in practice
             -- it's used for as-patterns and type applications; treat as its
@@ -669,23 +688,103 @@ nextToken s c0 =
 
     -- | Entry point for the byte @0x27@ (@\'@). Disambiguates between:
     --
-    --   * @\'[...]@ / @\'(...)@ / @\'{...}@ promoted-list/tuple/record
-    --     literals (DataKinds) — emit 'TkTick', advance by one byte, let
-    --     the next call lex the bracket/paren/brace on its own.
-    --   * Everything else — delegate to 'lexChar' (true char literal or
-    --     promoted constructor like @\'True@ consumed as @TkChar \'T\'@
-    --     + ident, handled downstream in 'captureTypeArg').
+    --   * @\'(op)@ where @op@ is a run of operator characters — TH
+    --     name quote of a parenthesized symbolic operator
+    --     (@\'(.)@, @\'(\<*>)@, @\'(:)@).  Emit 'TkNameQuote'.
+    --   * @\'[...]@ / @\'(...@ (non-operator interior) / @\'{...}@ —
+    --     DataKinds promoted-list/tuple/record: emit 'TkTick', advance
+    --     by one byte, let the next call lex the bracket/paren/brace.
+    --   * @\'varid@ / @\'Conid@ — TH name quote of an identifier
+    --     (@\'pure@, @\'Left@, @\'fmap@).  Distinguished from a char
+    --     literal by the absence of a closing @\'@ after a single
+    --     character (or by a multi-character identifier).
+    --   * Everything else — delegate to 'lexChar' (true char literal
+    --     including escapes like @\'\\n\'@).
     lexQuote openCur =
         let p1 = cPos openCur + 1 in
         case peekByte s p1 of
-            Just b | b == 0x5B || b == 0x28 || b == 0x7B
-                -- '[' (0x5B), '(' (0x28), '{' (0x7B) — always TkTick
-                -- since the corresponding char-literal form would need a
-                -- closing '\'' three bytes later, which is rare in source
-                -- and even then ambiguous. DataKinds wins.
+            -- '(' — either TH name-quote of a parenthesized operator
+            -- ('(.), '(<*>), '(:)) or a DataKinds promoted-tuple tick.
+            Just 0x28 ->
+                case tryThParenNameQuote openCur p1 of
+                    Just result -> result
+                    Nothing ->
+                        let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
+                        in (mkTok TkTick openCur end, end)
+            -- '[' / '{' — always DataKinds promoted-list / record tick.
+            -- The corresponding char-literal form would need a closing
+            -- '\'' three bytes later, which is rare and even then
+            -- ambiguous. DataKinds wins.
+            Just b | b == 0x5B || b == 0x7B
                 -> let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
                    in (mkTok TkTick openCur end, end)
+            -- Identifier start: disambiguate char lit ('x') from TH
+            -- name quote ('pure, 'Left, 'fmap).
+            Just b | isLowerStart b || isUpperStart b ->
+                case tryThNameQuoteIdent openCur p1 of
+                    Just result -> result
+                    Nothing     -> lexChar openCur
             _   -> lexChar openCur
+
+    -- | @\'(op)@ TH name quote of a parenthesized symbolic operator.
+    -- After the opening @\'(@, scan a non-empty run of operator
+    -- characters (isOpChar) followed immediately by @)@.  Returns
+    -- 'Nothing' when the interior is not a bare operator (e.g.
+    -- @\'(Int, Bool)@, @\'()@, @\'(a)@) so the caller emits 'TkTick'.
+    tryThParenNameQuote openCur pOpenParen =
+        let pOpStart = pOpenParen + 1   -- byte after '('
+            pOpEnd   = scanOpChars pOpStart
+        in if pOpEnd > pOpStart
+              then case peekByte s pOpEnd of
+                  Just 0x29 ->   -- closing ')'
+                      let name = sliceBytes s (pOpStart, pOpEnd)
+                          endP = pOpEnd + 1
+                          end  = Cursor endP (cLine openCur)
+                                       (cCol openCur + (endP - cPos openCur))
+                      in Just (mkTok (TkNameQuote name) openCur end, end)
+                  _ -> Nothing
+              else Nothing
+      where
+        scanOpChars p = case peekByte s p of
+            Just b | isOpChar (Just b) -> scanOpChars (p + 1)
+            _                          -> p
+
+    -- | @\'ident@ TH name quote.  After @\'@, read a full identifier.
+    -- Character literals take priority: if the first character (possibly
+    -- multi-byte UTF-8) is immediately followed by a closing @\'@, or the
+    -- payload starts with an escape @\\@, return 'Nothing' so the caller
+    -- falls through to 'lexChar'.  Note: @isIdentCont@ includes @\'@
+    -- (primed binders like @x'@), so a naïve longest-ident scan would
+    -- swallow the closing quote of @\'a\'@ and emit @TkNameQuote "a'"@.
+    tryThNameQuoteIdent openCur pIdentStart =
+        case peekByte s pIdentStart of
+            -- Escape → always a char-literal form ('\n', '\x41', …).
+            Just 0x5C -> Nothing
+            Just b | isLowerStart b || isUpperStart b ->
+                -- Decode one character (handles multi-byte UTF-8 like α).
+                let (_ch, afterChar) = decodeUtf8At s pIdentStart b
+                in case peekByte s afterChar of
+                    -- Single char + closing quote → char literal.
+                    Just 0x27 -> Nothing
+                    _ ->
+                        -- True name quote: scan the full identifier.
+                        -- Include primes so 'foo' (name of foo') works
+                        -- when there is no intervening closing-quote
+                        -- ambiguity (we already ruled out char lit).
+                        let pIdentEnd = scanIdent pIdentStart
+                            name      = sliceBytes s (pIdentStart, pIdentEnd)
+                        in if BS.null name
+                              then Nothing
+                              else
+                                let end = Cursor pIdentEnd (cLine openCur)
+                                                 (cCol openCur
+                                                    + (pIdentEnd - cPos openCur))
+                                in Just (mkTok (TkNameQuote name) openCur end, end)
+            _ -> Nothing
+      where
+        scanIdent p = case peekByte s p of
+            Just b | isIdentCont b -> scanIdent (p + 1)
+            _                      -> p
 
     -- | Lex an OverloadedLabels label: '#' followed by a run of
     -- identifier-continuation chars. The '#' is consumed as part of the

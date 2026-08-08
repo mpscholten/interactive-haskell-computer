@@ -429,3 +429,118 @@ methodArrayParserSpec =
         it "parses 'a ||| b' as the operator application (|||) a b" $ do
             e <- parseExprOnly (mkSrc "a ||| b") defaultFixityTable
             topOp e `shouldBe` Just "|||"
+
+    -- TemplateHaskellQuotes name quotes used by lens Internal/TH.hs:
+    --   pureValName = 'pure
+    --   apValName   = '(<*>)
+    --   leftDataName = 'Left
+    --   composeValName = '(.)
+    -- Previously: '(' after tick always became TkTick (DataKinds), so
+    -- '(.) / '(<*>) failed with "unexpected token; saw TkTick".  And
+    -- 'pure was lexed as TkChar 'p' + residual "ure".
+    describe "TH name quotes ('pure, 'Left, '(.), '(<*>))" $ do
+        it "lexes 'pure as TkNameQuote \"pure\"" $ do
+            r <- lexOne "'pure"
+            case r of
+                Right (TkNameQuote n) -> n `shouldBe` "pure"
+                Right other -> expectationFailure
+                    ("expected TkNameQuote \"pure\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "lexes 'Left as TkNameQuote \"Left\"" $ do
+            r <- lexOne "'Left"
+            case r of
+                Right (TkNameQuote n) -> n `shouldBe` "Left"
+                Right other -> expectationFailure
+                    ("expected TkNameQuote \"Left\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "lexes '(.) as TkNameQuote \".\"" $ do
+            r <- lexOne "'(.)"
+            case r of
+                Right (TkNameQuote n) -> n `shouldBe` "."
+                Right other -> expectationFailure
+                    ("expected TkNameQuote \".\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "lexes '(<*>) as TkNameQuote \"<*>\"" $ do
+            r <- lexOne "'(<*>)"
+            case r of
+                Right (TkNameQuote n) -> n `shouldBe` "<*>"
+                Right other -> expectationFailure
+                    ("expected TkNameQuote \"<*>\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "still lexes 'a' as TkChar 'a' (char literal)" $ do
+            r <- lexOne "'a'"
+            case r of
+                Right (TkChar 'a') -> pure ()
+                Right other -> expectationFailure
+                    ("expected TkChar 'a', got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "still lexes '( as TkTick for DataKinds promoted tuple" $ do
+            -- bare '( without a closing operator+) is a promoted-tuple tick
+            r <- lexOne "'(Int"
+            case r of
+                Right TkTick -> pure ()
+                Right other -> expectationFailure
+                    ("expected TkTick, got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "parses 'pure as EVar \"pure\"" $ do
+            e <- parseExprOnly (mkSrc "'pure") defaultFixityTable
+            e `shouldBe` EVar "pure"
+        it "parses '(.) as EVar \".\"" $ do
+            e <- parseExprOnly (mkSrc "'(.)") defaultFixityTable
+            e `shouldBe` EVar "."
+        it "parses '(<*>) as EVar \"<*>\"" $ do
+            e <- parseExprOnly (mkSrc "'(<*>)") defaultFixityTable
+            e `shouldBe` EVar "<*>"
+
+    -- Data.Set difference operator '\\' (two backslashes).  Single '\'
+    -- remains lambda (TkBackslash).  lens FieldTH/PrismTH use Set.\\ .
+    describe "backslash operator \\\\ (Set.\\\\)" $ do
+        it "lexes \\\\ as TkSymOp \"\\\\\"" $ do
+            r <- lexOne "\\\\"
+            case r of
+                Right (TkSymOp op) -> op `shouldBe` "\\"
+                Right other -> expectationFailure
+                    ("expected TkSymOp \"\\\\\", got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "still lexes single \\ as TkBackslash" $ do
+            r <- lexOne "\\"
+            case r of
+                Right TkBackslash -> pure ()
+                Right other -> expectationFailure
+                    ("expected TkBackslash, got " <> show other)
+                Left e -> expectationFailure ("lexer crashed: " <> show e)
+        it "parses a \\\\ b as operator application" $ do
+            e <- parseExprOnly (mkSrc "a \\\\ b") defaultFixityTable
+            topOp e `shouldBe` Just "\\"
+        it "parses Set.\\\\ as qualified operator" $ do
+            e <- parseExprOnly (mkSrc "a Set.\\\\ b") defaultFixityTable
+            topOp e `shouldBe` Just "Set.\\"
+        it "still parses lambda \\x -> x" $ do
+            e <- parseExprOnly (mkSrc "\\x -> x") defaultFixityTable
+            case e of
+                ELam "x" (EVar "x") -> pure ()
+                other -> expectationFailure
+                    ("expected ELam x (EVar x), got " <> show other)
+
+    -- Lens FieldTH: ts ^@.. folded  — '@' is not isOpChar so the lexer
+    -- splits ^@.. into TkSymOp "^" + TkAt + TkDotDot.  peekOp must
+    -- recombine them so the third tuple element of
+    --   (n, length ts, f <$> ts ^@.. folded)
+    -- does not stop at `ts` and then fail with
+    -- "expected `,` or `)` in tuple section; saw TkSymOp \"^\"".
+    describe "mid-@ symbolic ops (^@.., ^@.)" $ do
+        it "parses a ^@.. b as a single operator" $ do
+            e <- parseExprOnly (mkSrc "a ^@.. b") defaultFixityTable
+            topOp e `shouldBe` Just "^@.."
+        it "parses a ^@. b as a single operator" $ do
+            e <- parseExprOnly (mkSrc "a ^@. b") defaultFixityTable
+            topOp e `shouldBe` Just "^@."
+        it "parses list-of-tuple with ^@.. in the third element" $ do
+            e <- parseExprOnly
+                    (mkSrc "[ (n, length ts, f <$> ts ^@.. folded) | x <- xs ]")
+                    defaultFixityTable
+            -- Just needs to parse; shape is a list-comp desugar.
+            case e of
+                EApp _ _ -> pure ()
+                EVar _   -> pure ()  -- unexpected but not a parse fail
+                _        -> pure ()  -- any Expr is fine; no exception = success
