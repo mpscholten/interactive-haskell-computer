@@ -113,7 +113,7 @@ spec = describe "Hs2010 — Expression control flow" $ do
         it "5.6.4 case alt with where clause" $
             shouldParse "case x of _ -> e where y = 1"
         it "5.6.5 empty case alternative list" $
-            pendingWith "known gap: empty case alternative list"
+            shouldParse "case x of {}"
         it "5.6.6 pattern guard inside case alt" $
             shouldParse "case m of { _ | Just x <- m -> x; _ -> z }"
         it "5.6.7 local-decl guard inside case alt" $
@@ -127,7 +127,7 @@ spec = describe "Hs2010 — Expression control flow" $ do
         it "5.7.3 let statement `do let x = 1 ; e`" $
             shouldParse "do { let x = 1 ; e }"
         it "5.7.4 empty statement `do ; e`" $
-            pendingWith "known gap: empty `;` statement at start of do block"
+            shouldParse "do { ; e }"
         it "5.7.5 final must be expression — invalid `do x <- m`" $
             pendingWith "known gap: parser doesn't enforce do-block final-expression rule"
 

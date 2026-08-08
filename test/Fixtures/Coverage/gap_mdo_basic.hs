@@ -1,5 +1,5 @@
--- Gap (closed for keyword only): RecursiveDo `mdo` is accepted and parsed like
--- `do`. Full recursive-do desugaring / `rec` blocks are still incomplete.
+-- RecursiveDo `mdo` is accepted and parsed like `do` (non-recursive desugar).
+-- Nested `rec` blocks: see gap_rec_block.hs. Full mfix knot-tying is incomplete.
 -- Ref: HsExtMisc.hs.
 {-# LANGUAGE RecursiveDo #-}
 main = do

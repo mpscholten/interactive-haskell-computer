@@ -114,6 +114,7 @@ data TokenKind
     | TkWhere                 -- ^ keyword @where@
     | TkDo                    -- ^ keyword @do@
     | TkMDo                   -- ^ keyword @mdo@ (RecursiveDo)
+    | TkRec                   -- ^ keyword @rec@ (RecursiveDo nested block)
     | TkData                  -- ^ keyword @data@
     | TkModule                -- ^ keyword @module@
     | TkImport                -- ^ keyword @import@
@@ -993,6 +994,7 @@ nextToken s c0 =
         "else"      -> TkElse
         "do"        -> TkDo
         "mdo"       -> TkMDo
+        "rec"       -> TkRec
         "let"       -> TkLet
         "in"        -> TkIn
         "where"     -> TkWhere
@@ -1077,14 +1079,14 @@ isKnownDotOperator bs =
         (n == 1 && BC.head bs == '.')
         -- Any two-char .op (.=, .|, .#, .$, .~, .&, .^, .., …).
      || (n == 2 && BC.head bs == '.' && isOpChar (Just (BS.index bs 1)))
-        -- Known 3-char bitwise / numeric package forms.
-     || bs == BC.pack ".&."
-     || bs == BC.pack ".|."
-     || bs == BC.pack ".$."
-     || bs == BC.pack ".+."
-     || bs == BC.pack ".-."
-     || bs == BC.pack ".*."
-     || bs == BC.pack "./."
+        -- Any three-char .xy form (all op chars). Covers bitwise package
+        -- ops (.&., .|., .$., .+., …) and library ops like servant-server's
+        -- (.++) that otherwise split into TkDot + remainder and break
+        -- infix/sections. Longer runs still split so qualified
+        -- @P.>*<@ → TkDot + @>*<@.
+     || (n == 3 && BC.head bs == '.'
+                && isOpChar (Just (BS.index bs 1))
+                && isOpChar (Just (BS.index bs 2)))
 
 -- | Haskell operator characters (except the structural @(@/@)@ etc). Used to
 -- delimit longest-match symbolic-operator tokens. Backtick and backslash are
