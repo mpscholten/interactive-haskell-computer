@@ -557,6 +557,16 @@ builtins reg =
     , ("hGetLine",    hGetLineB)
     , ("hFlush",      hFlushB)
     , ("hSetBuffering", hSetBufferingB)
+    -- High-level file IO kept host-backed: source bodies in
+    -- GHC.Internal.System.IO are ordinary wrappers
+    --   readFile name = openFile name ReadMode >>= hGetContents
+    --   writeFile f txt = withFile f WriteMode (\hdl -> hPutStr hdl txt)
+    --   appendFile f txt = withFile f AppendMode (\hdl -> hPutStr hdl txt)
+    -- but withFile / openFile / hGetContents pull the full source-level
+    -- Handle ADT + getFileSystemEncoding locale state that IHC does not
+    -- yet model (same carve-out as hPutStrLn in ffiBuiltinNames).  Host
+    -- shortcuts operate on PrimHandle / host path strings until that
+    -- layer lands.
     , ("readFile",    readFileB)
     , ("writeFile",   writeFileB)
     , ("appendFile",  appendFileB)
@@ -801,7 +811,14 @@ builtins reg =
     -- from GHC.Internal.ForeignPtr. They bottom out in keepAlive# and touch#.
     -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
     -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
-    , ("newForeignPtr_",             newForeignPtr_B)
+    -- 'newForeignPtr_' graduated to source-loaded from
+    -- GHC.Internal.ForeignPtr:
+    --   newForeignPtr_ (Ptr obj) = do
+    --     r <- newIORef NoFinalizers
+    --     return (ForeignPtr obj (PlainForeignPtr r))
+    -- Bottoms on newIORef + ForeignPtr/PlainForeignPtr constructors;
+    -- foreignPtrValToForeignPtr / withForeignPtr already accept the
+    -- VCon "ForeignPtr" shape.
     -- newForeignPtr source-loads from ForeignPtr.Imp:
     -- newForeignPtr finalizer p = newForeignPtr_ p >>= \fp ->
     -- addForeignPtrFinalizer finalizer fp >> pure fp.
@@ -1133,9 +1150,12 @@ builtins reg =
     -- Foreign.C.String shortcuts — the locale-aware source bodies reach
     -- for RTS locale state via getForeignEncoding; keep only those host
     -- shims.  The CAString variants are byte-wise Haskell and source-load.
+    -- withCStringLen0 is NOT registered: real source is
+    --   withCStringLen0 :: TextEncoding -> String -> (CStringLen -> IO a) -> IO a
+    -- (Encoding.hs) — a 3-arg encoding-first API.  A 2-arg host alias
+    -- to withCStringLen would shadow the correct source arity.
     , ("withCString",     withCStringB)
     , ("withCStringLen",  withCStringLenB)
-    , ("withCStringLen0", withCStringLenB)
     -- Foreign.Marshal.Utils.with source-loads from
     -- GHC.Internal.Foreign.Marshal.Utils:
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
@@ -4072,13 +4092,6 @@ eqByteStringHost a b = do
             then Just . BC.pack <$> valToString v
             else pure Nothing
 
-newForeignPtr_B :: IO Val
-newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force legacyHooks pT
-    p <- ptrValToPtr pv
-    fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
-
 addForeignPtrFinalizerB :: IO Val
 addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pure $ VIO $ do
     fpv <- force legacyHooks fpT
@@ -5595,6 +5608,7 @@ powerFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 
 --------------------------------------------------------------------------------
 -- Simple file IO: readFile, writeFile, appendFile
+-- Host-backed until Handle ADT + encoding layer exists (see registration).
 --------------------------------------------------------------------------------
 
 -- | @readFile path@ — read the entire file as a String ([Char]).
@@ -5602,7 +5616,7 @@ readFileB :: IO Val
 readFileB = pure $ VFun $ \a -> pure $ VIO $ do
     pv   <- force legacyHooks a
     path <- valToString pv
-    contents <- readFile path
+    contents <- Prelude.readFile path
     stringToListValIO contents
 
 -- | @writeFile path contents@ — write a String to the file (truncating).
@@ -5612,7 +5626,7 @@ writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     path <- valToString pv
     cv   <- force legacyHooks b
     s    <- valToString cv
-    writeFile path s
+    Prelude.writeFile path s
     pure VUnit
 
 -- | @appendFile path contents@ — append a String to the file.
@@ -5622,7 +5636,7 @@ appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     path <- valToString pv
     cv   <- force legacyHooks b
     s    <- valToString cv
-    appendFile path s
+    Prelude.appendFile path s
     pure VUnit
 
 --------------------------------------------------------------------------------
