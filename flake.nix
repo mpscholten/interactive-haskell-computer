@@ -238,9 +238,28 @@
         # enumerate $out the same way it enumerates ~/.cache/ihc/sources/.
         ihcSourceRoot = pkgs.runCommand "ihc-hackage-sources" { } ''
           mkdir -p $out
-          ${pkgs.lib.concatMapStringsSep "\n" (p:
-            "${pkgs.gnutar}/bin/tar -xf ${p.src} -C $out"
-          ) ihcHackageSources}
+          # Each package's .src is usually a .tar.gz, but some nixpkgs
+          # entries (e.g. bsb-http-chunked) are already unpacked source
+          # directories from fetchFromGitHub.  Handle both.
+          ${pkgs.lib.concatMapStringsSep "\n" (p: ''
+            src="${p.src}"
+            if [ -d "$src" ]; then
+              # Directory source: copy under <name>-<version> so the
+              # loader's package enumerator finds a .cabal file.
+              cabal=$(find "$src" -maxdepth 2 -name '*.cabal' -type f | head -1)
+              if [ -n "$cabal" ]; then
+                pname=$(basename "$cabal" .cabal)
+                version=$(grep -im1 '^version:' "$cabal" | awk '{print $2}' | tr -d '\r')
+                target="$out/$pname-$version"
+                cp -r "$src" "$target"
+              else
+                echo "WARNING: no .cabal in directory source $src" >&2
+                cp -r "$src" "$out/$(basename "$src")"
+              fi
+            else
+              ${pkgs.gnutar}/bin/tar -xf "$src" -C $out
+            fi
+          '') ihcHackageSources}
           # GHC boot libs — plain directories, not tarballs
           cp -r ${ghcBootSourceRoot}/* $out/ 2>/dev/null || true
           chmod -R u+w $out
