@@ -299,6 +299,7 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                             Nothing -> go acc cur'
             -- Prefix operator binding: @(|>) x f = ...@.
             -- Or paren-wrapped pattern + backtick infix: @(I# x) \`eqInt\` (I# y) = ...@.
+            -- Or paren-pattern + symbolic infix: @(x:xs) .++ ys = ...@.
             -- Or pattern binding: @(a, b) = e@ / @(a, b) | g = e@.
             TkLParen | tkCol tok == 1 -> do
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
@@ -313,21 +314,42 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                                 curSkipped <- skipThroughPrefixOpBinding src opName curAfterBackticks
                                 let acc' = if opName `elem` acc then acc else opName : acc
                                 go acc' curSkipped
-                            Nothing -> do
-                                mPat <- tryScanTopLevelPatBind src startCur
-                                case mPat of
-                                    Just (vars, _, curAfter) ->
-                                        go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
-                                           curAfter
-                                    Nothing -> go acc cur'
+                            Nothing ->
+                                case peekPatSymbolicInfixBinding src startCur of
+                                    Just (opName, curAfterClose) -> do
+                                        curSkipped <- skipThroughPrefixOpBinding src opName curAfterClose
+                                        let acc' = if opName `elem` acc then acc else opName : acc
+                                        go acc' curSkipped
+                                    Nothing -> do
+                                        mPat <- tryScanTopLevelPatBind src startCur
+                                        case mPat of
+                                            Just (vars, _, curAfter) ->
+                                                go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
+                                                   curAfter
+                                            Nothing -> go acc cur'
             -- List-pattern binding at col 1: @[x, y] = xs@.
+            -- Or list-pattern + symbolic infix: @[] .++ ys = ys@.
             TkLBracket | tkCol tok == 1 -> do
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
-                mPat <- tryScanTopLevelPatBind src startCur
-                case mPat of
-                    Just (vars, _, curAfter) ->
-                        go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
-                           curAfter
+                case peekPatSymbolicInfixBinding src startCur of
+                    Just (opName, curAfterClose) -> do
+                        curSkipped <- skipThroughPrefixOpBinding src opName curAfterClose
+                        let acc' = if opName `elem` acc then acc else opName : acc
+                        go acc' curSkipped
+                    Nothing -> do
+                        mPat <- tryScanTopLevelPatBind src startCur
+                        case mPat of
+                            Just (vars, _, curAfter) ->
+                                go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
+                                   curAfter
+                            Nothing -> go acc cur'
+            -- Wildcard as left arg of infix: @_ .++ ys = ys@.
+            TkUnderscore | tkCol tok == 1 ->
+                case peekInfixOp src cur' of
+                    Just opName -> do
+                        curSkipped <- skipThroughPrefixOpBinding src opName cur'
+                        let acc' = if opName `elem` acc then acc else opName : acc
+                        go acc' curSkipped
                     Nothing -> go acc cur'
             TkLUnbox | tkCol tok == 1 -> do
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
@@ -429,6 +451,7 @@ skipThroughPrefixOpBinding src opName curAfterClose = do
         case tkKind peek of
             -- Next clause in prefix form: `(op) ... = ...`
             -- Or paren-pat infix continuation: `(pat) `op` ... = ...`
+            -- Or paren-pat symbolic infix: `(x:xs) .++ ys = ...`
             TkLParen | tkCol peek == 1 ->
                 let startCur = Cursor (tkStart peek) (tkLine peek) (tkCol peek)
                 in case peekPrefixOpBinding src startCur of
@@ -444,7 +467,33 @@ skipThroughPrefixOpBinding src opName curAfterClose = do
                                 case mClause' of
                                     Nothing -> pure cur
                                     Just (_, curAfter') -> loopClauses curAfter'
-                            _ -> pure cur
+                            _ ->
+                                case peekPatSymbolicInfixBinding src startCur of
+                                    Just (op', curAfterClose') | op' == opName -> do
+                                        mClause' <- scanOneClauseAfterName src curAfterClose'
+                                        case mClause' of
+                                            Nothing -> pure cur
+                                            Just (_, curAfter') -> loopClauses curAfter'
+                                    _ -> pure cur
+            -- List-pat symbolic infix continuation: `[] .++ ys = ...`
+            TkLBracket | tkCol peek == 1 ->
+                let startCur = Cursor (tkStart peek) (tkLine peek) (tkCol peek)
+                in case peekPatSymbolicInfixBinding src startCur of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterClose'
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
+            -- Wildcard infix continuation: `_ .++ ys = ...`
+            TkUnderscore | tkCol peek == 1 ->
+                case peekInfixOp src curAfterPeek of
+                    Just op' | op' == opName -> do
+                        mClause' <- scanOneClauseAfterName src curAfterPeek
+                        case mClause' of
+                            Nothing -> pure cur
+                            Just (_, curAfter') -> loopClauses curAfter'
+                    _ -> pure cur
             TkLUnbox | tkCol peek == 1 ->
                 let startCur = Cursor (tkStart peek) (tkLine peek) (tkCol peek)
                 in case peekPrefixOpBinding src startCur of
@@ -696,6 +745,47 @@ skipBalancedParens src cur0 =
             TkEof    -> Nothing
             _        -> loop n c'
 
+-- | Skip a balanced bracketed expression. Cursor must be positioned at the
+-- @[@ token start. Returns the cursor just after the matching @]@, or
+-- @Nothing@ if brackets are unbalanced (EOF before close).
+--
+-- Used to recognise list-pattern left-args of infix operator bindings:
+-- @[] .++ ys = ys@, @[x] .++ ys = ...@.
+skipBalancedBrackets :: Source -> Cursor -> Maybe Cursor
+skipBalancedBrackets src cur0 =
+    let (t1, c1) = nextToken src cur0       -- consume '['
+    in case tkKind t1 of
+        TkLBracket -> loop (1 :: Int) c1
+        _          -> Nothing
+  where
+    loop 0 c = Just c
+    loop n c =
+        let (tok, c') = nextToken src c
+        in case tkKind tok of
+            TkLBracket -> loop (n + 1) c'
+            TkRBracket -> loop (n - 1) c'
+            TkEof      -> Nothing
+            _          -> loop n c'
+
+-- | After a balanced paren/bracket pattern, check for a symbolic or
+-- backtick infix-operator binding: @[] .++ ys = ys@, @(x:xs) .++ ys = ...@.
+-- Cursor must be at the opening @(@ or @[@. Returns
+-- @Just (opName, curAfterClose)@ with the cursor just after the matching
+-- close, ready for 'scanOneClauseAfterName' (same position as after a
+-- ConId left-arg — see 'handleConIdInfixLhs').
+peekPatSymbolicInfixBinding :: Source -> Cursor -> Maybe (ByteString, Cursor)
+peekPatSymbolicInfixBinding src cur0 =
+    let mAfter = case tkKind (fst (nextToken src cur0)) of
+            TkLParen   -> skipBalancedParens src cur0
+            TkLBracket -> skipBalancedBrackets src cur0
+            _          -> Nothing
+    in case mAfter of
+        Nothing -> Nothing
+        Just curAfterClose ->
+            case peekInfixOp src curAfterClose of
+                Just opName -> Just (opName, curAfterClose)
+                Nothing     -> Nothing
+
 -- | Detect an infix-form binding whose first argument is a paren-wrapped
 -- pattern: @(pat) \`op\` ...@ at column 1.  The cursor must be positioned
 -- at the @(@. Returns @Just (opName, cursorAfterClosingBacktick)@ — the
@@ -710,6 +800,8 @@ skipBalancedParens src cur0 =
 --
 -- The prefix-op shape @(op) ...@ is handled by 'peekPrefixOpBinding'; this
 -- helper is the fall-through for paren-wrapped *patterns*.
+-- Symbolic infix after a paren-pat (@(x:xs) .++ ys = ...@) is handled by
+-- 'peekPatSymbolicInfixBinding'.
 peekParenPatBacktickInfixBinding :: Source -> Cursor -> Maybe (ByteString, Cursor)
 peekParenPatBacktickInfixBinding src cur0 =
     case skipBalancedParens src cur0 of
@@ -770,6 +862,7 @@ findBinding src ref target = do
                     Nothing     -> handleTopPatBind acc tok cur'
             -- Prefix-form operator binding: @(|>) x f = ...@
             -- Or paren-wrapped-pattern infix binding: @(I# x) \`eqInt\` (I# y) = ...@
+            -- Or paren-pattern + symbolic infix: @(x:xs) .++ ys = ...@
             -- Or pattern binding: @(a, b) = e@ / @(a, b) | g = e@.
             TkLParen | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
@@ -780,10 +873,27 @@ findBinding src ref target = do
                         case peekParenPatBacktickInfixBinding src startCur of
                             Just (opName, curAfterBackticks) ->
                                 handleParenPatInfix acc opName tok curAfterBackticks
-                            Nothing -> handleTopPatBind acc tok cur'
+                            Nothing ->
+                                case peekPatSymbolicInfixBinding src startCur of
+                                    Just (opName, curAfterClose) ->
+                                        -- Same registration path as ConId-led
+                                        -- infix: cur after left pat, extend
+                                        -- clausePats leftward to the '('.
+                                        handleConIdInfixLhs acc opName tok curAfterClose
+                                    Nothing -> handleTopPatBind acc tok cur'
             -- List-pattern binding at col 1: @[x, y] = xs@.
+            -- Or list-pattern + symbolic infix: @[] .++ ys = ys@.
             TkLBracket | tkCol tok == 1 ->
-                handleTopPatBind acc tok cur'
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                in case peekPatSymbolicInfixBinding src startCur of
+                    Just (opName, curAfterClose) ->
+                        handleConIdInfixLhs acc opName tok curAfterClose
+                    Nothing -> handleTopPatBind acc tok cur'
+            -- Wildcard as left arg of infix: @_ .++ ys = ys@.
+            TkUnderscore | tkCol tok == 1 ->
+                case peekInfixOp src cur' of
+                    Just opName -> handleConIdInfixLhs acc opName tok cur'
+                    Nothing     -> go acc cur'
             TkLUnbox | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 in case peekPrefixOpBinding src startCur of
@@ -900,6 +1010,7 @@ findBinding src ref target = do
         case tkKind tok of
             -- Another prefix clause `(op) ... = ...`
             -- Or paren-pat infix continuation `(pat) `op` ... = ...`
+            -- Or paren-pat symbolic infix `(x:xs) .++ ys = ...`
             TkLParen | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 in case peekPrefixOpBinding src startCur of
@@ -919,7 +1030,42 @@ findBinding src ref target = do
                                         let cl' = cl { clausePats =
                                                 (tkStart tok, snd (clausePats cl)) }
                                         in collectMoreOpClauses opName (cl' : acc) curNext
-                            _ -> pure (acc, cur)
+                            _ ->
+                                case peekPatSymbolicInfixBinding src startCur of
+                                    Just (op', curAfterClose') | op' == opName -> do
+                                        mClause <- scanOneClauseAfterName src curAfterClose'
+                                        case mClause of
+                                            Nothing -> pure (acc, cur)
+                                            Just (cl, curNext) ->
+                                                let cl' = cl { clausePats =
+                                                        (tkStart tok, snd (clausePats cl)) }
+                                                in collectMoreOpClauses opName (cl' : acc) curNext
+                                    _ -> pure (acc, cur)
+            -- List-pat symbolic infix continuation: `[] .++ ys = ...`
+            TkLBracket | tkCol tok == 1 ->
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                in case peekPatSymbolicInfixBinding src startCur of
+                    Just (op', curAfterClose') | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterClose'
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                let cl' = cl { clausePats =
+                                        (tkStart tok, snd (clausePats cl)) }
+                                in collectMoreOpClauses opName (cl' : acc) curNext
+                    _ -> pure (acc, cur)
+            -- Wildcard infix continuation: `_ .++ ys = ...`
+            TkUnderscore | tkCol tok == 1 ->
+                case peekInfixOp src curAfterTok of
+                    Just op' | op' == opName -> do
+                        mClause <- scanOneClauseAfterName src curAfterTok
+                        case mClause of
+                            Nothing -> pure (acc, cur)
+                            Just (cl, curNext) ->
+                                let cl' = cl { clausePats =
+                                        (tkStart tok, snd (clausePats cl)) }
+                                in collectMoreOpClauses opName (cl' : acc) curNext
+                    _ -> pure (acc, cur)
             TkLUnbox | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 in case peekPrefixOpBinding src startCur of
