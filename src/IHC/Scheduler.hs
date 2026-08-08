@@ -1825,8 +1825,13 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                                               `catch` (\(_ :: SomeException) -> pure Nothing)
                             case mProviderLm of
                                 Nothing -> pure ()
-                                Just providerLm ->
+                                Just providerLm -> do
                                     discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
+                                    -- Foreign-alias sentinel so exportBodies /
+                                    -- resolveRequestedPair / FQN env-fallback
+                                    -- see @targetLm.n@ → @provider.n@.
+                                    insertLmBody targetLm n
+                                        (EVar (providerName <> BC.pack "." <> n))
 
     builtinReexportTarget builtinNames targetLm n =
         case [ fqn
@@ -10270,13 +10275,24 @@ discoverImpl builtins registry searchPath includeMap lm name
                         -- only use builtin names (the common case).
                         | Set.member name builtins ->
                             recordDiscoveryMiss lm name
-                        | not (lmIsEntry lm) ->
-                            -- Non-entry: skip resolveImport.  The eval-time
-                            -- env-fallback resolves imported names on demand.
+                        -- Non-entry modules that do NOT list @name@ as an
+                        -- export skip resolveImport: free vars inside their
+                        -- bodies are resolved on demand by the eval-time
+                        -- env-fallback (tryImportAliasSlot).  BUT when the
+                        -- export list names a binding that has no local body
+                        -- (named re-export, e.g. GHC.Exts.lazy → GHC.Magic),
+                        -- we must chase imports here and install a foreign-
+                        -- alias sentinel.  Otherwise FQN resolution of the
+                        -- re-export (and @import GHC.Exts (lazy)@ aliases)
+                        -- bottoms as unbound / wrong slot.
+                        | not (lmIsEntry lm)
+                        , not (exportsMissingName lm name) ->
                             recordDiscoveryMiss lm name
                         | otherwise -> do
-                            -- Runtime / class-default discovery: resolve
-                            -- through imports so #. etc. can be found.
+                            -- Entry module, OR non-entry with @name@ in its
+                            -- export list but no local body: chase imports
+                            -- so re-export FQNs materialise as
+                            -- @EVar "DefiningModule.name"@ sentinels.
                             mForeign <- resolveImport registry searchPath includeMap lm name
                             case mForeign of
                                 Just srcMod ->
