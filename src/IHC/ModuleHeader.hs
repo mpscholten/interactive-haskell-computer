@@ -372,8 +372,9 @@ parseOneImport :: Source -> Cursor -> IO (Maybe (ImportDecl, Cursor))
 parseOneImport src cur0 = do
     let (t1, cur1) = nextSigTok src cur0
     (qualified, curQ) <- case tkKind t1 of
-        TkQualified -> pure (True, cur1)
-        _           -> pure (False, cur0)
+        -- 'qualified' is a soft keyword (TkIdent "qualified"); match by string.
+        TkIdent "qualified" -> pure (True, cur1)
+        _                   -> pure (False, cur0)
     let curName = skipPackageImportQualifier src curQ
     (mModName, cur2) <- parseDottedName src curName
     case mModName of
@@ -391,7 +392,8 @@ parseOneImport src cur0 = do
             -- Optional: hiding (...) or (...)
             let (t3, cur5) = nextSigTok src cur4
             (spec, curF) <- case tkKind t3 of
-                TkHiding -> do
+                -- 'hiding' is a soft keyword; match by string like 'as'.
+                TkIdent "hiding" -> do
                     let (lp, curLp) = nextSigTok src cur5
                     case tkKind lp of
                         TkLParen -> do

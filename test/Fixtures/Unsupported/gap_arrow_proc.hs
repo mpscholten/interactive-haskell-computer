@@ -1,4 +1,4 @@
--- Gap: Arrow notation `proc` / `-<` not parsed. Ref: HsExtMisc.hs.
+-- Gap: Arrow notation proc / -< not implemented. Ref: HsExtMisc.hs
 {-# LANGUAGE Arrows #-}
 import Control.Arrow (arr, returnA)
 

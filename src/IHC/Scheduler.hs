@@ -11066,7 +11066,7 @@ parseBodyExprInScope
     -> IO Expr
 parseBodyExprInScope registry searchPath includeMap lm lhs = do
     fx <- fixityInScope registry searchPath includeMap lm
-    Parser.parseBodyExprWithFixity (lmSource lm) fx (lhsClauses lhs)
+    Parser.parseBodyExprWithFixity (lmSource lm) fx lhs
 
 -- Haskell fixity declarations are imported with the names they describe.
 -- Body parsing therefore needs the owner's local declarations plus the

@@ -94,7 +94,7 @@ probeBinding src fx parseErrs otherErrs okCount name = do
     case mLhs of
         Nothing  -> pure ()
         Just lhs -> do
-            eResult <- try (evaluate =<< parseBodyExprWithFixity src fx (lhsClauses lhs))
+            eResult <- try (evaluate =<< parseBodyExprWithFixity src fx lhs)
                           :: IO (Either SomeException Expr)
             case eResult of
                 Right _ -> modifyIORef' okCount (+1)
