@@ -4317,12 +4317,18 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "IArray"
         , method `elem` map BC.pack ["unsafeArray", "array", "listArray", "accumArray", "genArray"] =
             [BC.pack "Arr.Array", BC.pack "Array"]
+        -- peekElemOff without a surviving result type: prefer Int (http-date
+        -- month/day tables, array peeks) before Char/Word8.  Pre-fix Char
+        -- was first, so unannotated @peekElemOff (p :: Ptr Int) i@ returned
+        -- VChar bytes; formatHTTPDate then died on @fromIntegral n + 48@
+        -- (I#/W8# args=<function> 48).  Marked Word8 buffers still take
+        -- tryStorableBytePeek before this fallback.
         | clsName == BC.pack "Storable"
         , method == BC.pack "peekElemOff" =
-            [BC.pack "Char"]
+            [BC.pack "Int", BC.pack "Word8", BC.pack "Char"]
         | clsName == BC.pack "Storable"
         , method == BC.pack "peekByteOff" =
-            [BC.pack "Word8"]
+            [BC.pack "Word8", BC.pack "Int", BC.pack "Char"]
         | clsName == BC.pack "Num"
         , method == BC.pack "fromInteger" =
             [BC.pack "Int", BC.pack "Integer"]

@@ -2570,6 +2570,7 @@ parseLet ctx cur0 = do
     -- Consume a trailing @where@ on a let-binding's RHS so that
     -- expression-level @let f x = body where helper = … in …@ parses.
     -- Mirrors 'attachDoLetWhere' (do-block lets already had this path).
+    -- Also covers bytestring foldl'/foldr' nested-where loops.
     attachLetWhere rhs cur = do
         let (peekWhere, curAfterWhere) = nextSig ctx cur
         case tkKind peekWhere of
