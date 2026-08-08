@@ -44,7 +44,6 @@ import IHC.Scan
     ( KnownSymbols
     , emptyKnownSymbols
     , findBinding
-    , lhsClauses
     , scanAllTopLevelNames
     )
 import IHC.Source (Source, readSourceFile)
