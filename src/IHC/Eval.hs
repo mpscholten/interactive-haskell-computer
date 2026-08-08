@@ -52,6 +52,7 @@ import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
+import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -69,6 +70,49 @@ import IHC.Val
 forceMethodVal :: IHCHooks -> Val -> IO Val
 forceMethodVal hooks (VLazyMethod t) = force hooks t
 forceMethodVal _     v               = pure v
+
+-- | If @x@ is a bare nullary 'Bounded' method (@maxBound@ / @minBound@) and
+-- @f@ is a variable whose registered type signature begins with a
+-- concrete type constructor (@Int -> …@), rewrite @x@ to @x :: T@ so
+-- the existing 'ETyApp' nullary path can resolve the instance.
+--
+-- Mirrors GHC specialising @measureOff maxBound@ from
+-- @measureOff :: Int -> Text -> Int@.  Does not invent a default type
+-- when the callee signature is missing or polymorphic — that would
+-- re-break non-Int uses like @listArray (minBound, maxBound)@ for enums.
+annotateNullaryBoundedArg :: Expr -> Expr -> IO Expr
+annotateNullaryBoundedArg f x = case x of
+    EVar m
+      | isNullaryBoundedName m -> case f of
+            EVar fname -> do
+                sigs <- readIORef globalTypeSigsRef
+                let bareF = lastDottedComponent fname
+                pure $ case Map.lookup bareF sigs `orElse` Map.lookup fname sigs of
+                    Just (Scheme _ _ body) ->
+                        case tyArrowArgs body of
+                            (argTy : _, _)
+                              | Just con <- tyHead argTy
+                              , isMonoCon argTy ->
+                                    ETyApp x con
+                            _ -> x
+                    Nothing -> x
+            _ -> pure x
+      | otherwise -> pure x
+    _ -> pure x
+  where
+    isNullaryBoundedName n =
+        let bare = lastDottedComponent n
+        in bare == BC.pack "maxBound" || bare == BC.pack "minBound"
+    lastDottedComponent n =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
+    -- Only specialise when the domain is a bare type constructor
+    -- (Int, Char, …), not a type application or variable.
+    isMonoCon (TA.TyCon _) = True
+    isMonoCon _            = False
+    orElse (Just a) _ = Just a
+    orElse Nothing  b = b
 
 -- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
 -- method in the class registry; if the instance registered a
@@ -289,10 +333,23 @@ eval hooks env ipm = go
                         pure (storableSizeAlignFallback method)
                     | otherwise ->
                         go (EApp (ETyApp f ty) x)
+    -- Signature-directed specialisation of bare nullary Bounded methods.
+    -- GHC specialises @measureOff maxBound@ to @maxBound :: Int@ from
+    -- @measureOff :: Int -> Text -> Int@.  Without that, @Data.Text.length
+    -- = negate . measureOff maxBound@ leaves @maxBound@ as an untagged
+    -- 'VClassMethod' and FFI / @I#@ patterns see @\<function\>@.  When the
+    -- callee has a known monomorphic first-arg type constructor, rewrite
+    -- @f maxBound@ → @f (maxBound :: T)@ so 'tryTypedNullaryClassMethod' can
+    -- resolve it.  Does NOT default unbound uses to Int (that poisoned
+    -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
-        fv  <- go f                            -- function to WHNF
-        xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
-        case fv of
+        x' <- annotateNullaryBoundedArg f x
+        goApp f x'
+      where
+        goApp f' x'' = do
+          fv  <- go f'                           -- function to WHNF
+          xt  <- newThunkIP env ipm x''          -- argument stays a thunk (lazy)
+          case fv of
             VPrimObj _ -> do
                 a <- force hooks xt
                 error ("IHC.Eval.go(EApp): VPrimObj in function position: "
