@@ -128,13 +128,41 @@
         # "Version:" spellings.
         #
         # base / ghc-internal in GHC 9.10 only ship as <pkg>.cabal.in (the
-        # autoconf template).  Inspection shows there are no @VAR@ template
-        # placeholders in those files — they're essentially valid cabal
-        # files with the version baked in — so we accept the .in form as a
-        # fallback and rename it to <pkg>.cabal in the output tree so the
-        # IHC.CabalProject loader (which only looks for *.cabal) finds it.
+        # autoconf template).  Unlike earlier inspection assumed, these
+        # templates DO contain @ProjectVersionForLib@ placeholders:
+        #   ghc-internal.cabal.in:  version: @ProjectVersionForLib@.0
+        #   base.cabal:             ghc-internal == @ProjectVersionForLib@.*
+        # Leaving them unsubstituted produces a store path literally named
+        # ghc-internal-@ProjectVersionForLib@.0 and breaks package identity
+        # + cbits dylib naming.  Substitute from the installed GHC package
+        # tree (e.g. ghc-internal-9.1003.0-XXXX → token 9.1003).
+        #
+        # ghc-internal version convention (from the .cabal.in comment):
+        #   ghc 9.10.3 → ghc-internal 9.1003.0  (@ProjectVersionForLib@ = 9.1003)
         ghcBootSourceRoot = pkgs.runCommand "ihc-ghc-boot-libs" { } ''
           mkdir -p $out
+
+          # Resolve @ProjectVersionForLib@ from the installed package dir
+          # name: ghc-internal-9.1003.0-<hash> → 9.1003
+          project_version_for_lib=""
+          for d in ${ghc}/lib/ghc-*/lib/*-ghc-*/ghc-internal-*; do
+            if [ -d "$d" ]; then
+              base=$(basename "$d")
+              # ghc-internal-9.1003.0-33ec → 9.1003.0
+              ver_full=''${base#ghc-internal-}
+              ver_full=''${ver_full%%-*}
+              # 9.1003.0 → 9.1003  (strip the ghc-internal patch .0)
+              project_version_for_lib=''${ver_full%.0}
+              break
+            fi
+          done
+          if [ -z "$project_version_for_lib" ]; then
+            # Fallback matching GHC 9.10.3 / ghc-internal-9.1003.0
+            project_version_for_lib="9.1003"
+            echo "WARNING: could not detect ghc-internal version from GHC install; using $project_version_for_lib" >&2
+          fi
+          echo "ProjectVersionForLib=$project_version_for_lib" >&2
+
           ${pkgs.lib.concatMapStringsSep "\n" (pkg: ''
             if [ -d "${ghcSrc}/libraries/${pkg}" ]; then
               cabal_file=$(find "${ghcSrc}/libraries/${pkg}" -maxdepth 3 -name "${pkg}.cabal" -type f | head -1)
@@ -145,6 +173,9 @@
               fi
               if [ -n "$cabal_file" ]; then
                 version=$(grep -im1 '^version:' "$cabal_file" | awk '{print $2}' | tr -d '\r')
+                # Expand autoconf-style @ProjectVersionForLib@ in the version
+                # field (ghc-internal.cabal.in ships version: @ProjectVersionForLib@.0).
+                version=$(printf '%s' "$version" | sed "s/@ProjectVersionForLib@/$project_version_for_lib/g")
                 src_dir=$(dirname "$cabal_file")
                 target="$out/${pkg}-$version"
                 cp -r "$src_dir" "$target"
@@ -154,6 +185,15 @@
                 if [ -n "$cabal_in_file" ]; then
                   cp "$target/${pkg}.cabal.in" "$target/${pkg}.cabal"
                 fi
+                # Substitute remaining @ProjectVersionForLib@ in cabal files
+                # (e.g. base's ghc-internal == @ProjectVersionForLib@.*).
+                # Portable in-place edit (no GNU/BSD sed -i differences).
+                for f in "$target"/*.cabal "$target"/*.cabal.in; do
+                  [ -f "$f" ] || continue
+                  tmp="$f.tmp"
+                  sed "s/@ProjectVersionForLib@/$project_version_for_lib/g" "$f" > "$tmp"
+                  mv "$tmp" "$f"
+                done
               fi
             fi
           '') ghcBootLibs}
