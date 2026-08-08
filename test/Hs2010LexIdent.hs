@@ -164,6 +164,22 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
             shouldLexAs "!" TkBang
         it "1.3.5 `!=` is a regular symbolic operator (not bang + equals)" $
             shouldLexAs "!=" (TkSymOp "!=")
+        -- Dot-led multi-char ops must not be split into TkDot + remainder
+        -- (aeson/lens .=, conduit .|, lens .#, Data.Bits .&.).
+        it "1.3.6 dot-op `.=` lexes as TkSymOp (aeson/lens)" $
+            shouldLexAs ".=" (TkSymOp ".=")
+        it "1.3.6 dot-op `.|` lexes as TkSymOp (conduit)" $
+            shouldLexAs ".|" (TkSymOp ".|")
+        it "1.3.6 dot-op `.#` lexes as TkSymOp (lens)" $
+            shouldLexAs ".#" (TkSymOp ".#")
+        it "1.3.6 dot-op `.$` lexes as TkSymOp" $
+            shouldLexAs ".$" (TkSymOp ".$")
+        it "1.3.6 dot-op `.~` lexes as TkSymOp" $
+            shouldLexAs ".~" (TkSymOp ".~")
+        it "1.3.6 bitwise `.&.` lexes as one TkSymOp" $
+            shouldLexAs ".&." (TkSymOp ".&.")
+        it "1.3.6 bitwise `.|.` lexes as one TkSymOp" $
+            shouldLexAs ".|." (TkSymOp ".|.")
 
     describe "§1.4 Qualified names" $ do
         it "1.4.1 qvarid `Foo.bar` parses as a qualified expression" $

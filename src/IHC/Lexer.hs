@@ -546,10 +546,12 @@ nextToken s c0 =
     -- Qualified-operator split: @P.>*<@ must lex as @P@ + @.@ + @>*<@, not as
     -- @P@ + @.>*<@.  Maximal-munch would glue the qualifier dot onto the
     -- operator.  When a run starts with @.@ and is longer than a known
-    -- dot-operator (@.@, @..@, @.&@, @.|@, @.$@, …), emit only @TkDot@ for
-    -- the first character so the next @nextToken@ call restarts on the
-    -- true operator.  Required by bsb-http-chunked's
-    -- @P.char8 P.>*< P.char8@ (warp chunked response path).
+    -- dot-operator (any 2-char @.<opchar>@ plus 3-char bitwise/numeric forms
+    -- like @.&.@ / @.|.@ / @.$.@), emit only @TkDot@ for the first character
+    -- so the next @nextToken@ call restarts on the true operator.  Required
+    -- by bsb-http-chunked's @P.char8 P.>*< P.char8@ (warp chunked response
+    -- path).  Qualified ops whose post-dot part is length>2 and not on the
+    -- 3-char allowlist still split (e.g. @P.>*<@ → @TkDot@ + @>*<@).
     lexSymOp start = go (cPos start)
       where
         go p = case peekByte s p of
@@ -851,20 +853,38 @@ classifySymOp bs = case bs of
     _    -> TkSymOp bs
 
 -- | Operators that legitimately start with @.@ and must NOT be split into
--- @TkDot@ + remainder by 'lexSymOp'.  Keep this list minimal: every extra
--- entry is one more case where @M.op@ with @op@ starting the same way would
--- mis-lex.  Bitwise @.&.@/@.|.@ and enum @..@ are the common ones.
+-- @TkDot@ + remainder by 'lexSymOp'.
+--
+-- Policy (maintainable default):
+--
+--   * Any 2-character operator @.<opchar>@ is known — covers library ops
+--     such as @.=@ (aeson/lens), @.|@ (conduit), @.#@ (lens), @.$@ / @.~@
+--     / @.&@ / @.^@ / @.%@ / @.*@ / @.+@ / @.-@ / @./@ / @.<@ / @.>@, as
+--     well as @..@ (enumFromTo / export-all).
+--   * Plus a short allowlist of 3-char bitwise / numeric forms
+--     (@.&.@, @.|.@, @.$.@, @.+.@, @.-.@, @.*.@, @./.@).
+--
+-- Longer runs that start with @.@ and are not on the 3-char allowlist still
+-- split (e.g. qualified @P.>*<@ → @TkDot@ + @>*<@).  Trade-off: a 2-char
+-- qualified form like @P.=@ would not split; that shape is vanishingly rare
+-- next to real @.=@ uses in aeson/lens, so we favour maximal munch for
+-- length-2.
 isKnownDotOperator :: ByteString -> Bool
 isKnownDotOperator bs =
-    bs == BC.pack "."
-    || bs == BC.pack ".."
-    || bs == BC.pack ".&."
-    || bs == BC.pack ".|."
-    || bs == BC.pack ".$."
-    || bs == BC.pack ".+."
-    || bs == BC.pack ".-."
-    || bs == BC.pack ".*."
-    || bs == BC.pack "./."
+    let n = BC.length bs
+    in  -- Bare composition / qualifier separator (never consulted when n==1
+        -- by the call site, but kept for completeness).
+        (n == 1 && BC.head bs == '.')
+        -- Any two-char .op (.=, .|, .#, .$, .~, .&, .^, .., …).
+     || (n == 2 && BC.head bs == '.' && isOpChar (Just (BS.index bs 1)))
+        -- Known 3-char bitwise / numeric package forms.
+     || bs == BC.pack ".&."
+     || bs == BC.pack ".|."
+     || bs == BC.pack ".$."
+     || bs == BC.pack ".+."
+     || bs == BC.pack ".-."
+     || bs == BC.pack ".*."
+     || bs == BC.pack "./."
 
 -- | Haskell operator characters (except the structural @(@/@)@ etc). Used to
 -- delimit longest-match symbolic-operator tokens. Backtick and backslash are
