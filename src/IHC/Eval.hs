@@ -2432,10 +2432,16 @@ evalDo hooks env ipm (SExpr e : rest) =
                 pure mv
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT Nothing rest
-            _ -> pure $ VIO $ do
-                _  <- runIOVal hooks mv                   -- run and discard
+            -- IO fast path: keep VIO sequencing (no class-dispatch hop).
+            VIO _ -> pure $ VIO $ do
+                _  <- runIOVal hooks mv
                 restV <- evalDo hooks env ipm rest
                 runIOVal hooks restV
+            -- Other monads (ParsecT, ReaderT, …): sequence via source
+            -- @>>@ so multi-statement do works for non-IO carriers.
+            -- HSX/megaparsec hits this; the previous catch-all forced
+            -- @runIOVal@ and produced @<(#,#)> applied to <function>@.
+            _ -> doMonadicSequence hooks env ipm mv Nothing rest
 evalDo hooks env ipm (SBind name e : rest) =
     do
         mv <- eval hooks env ipm e
@@ -2446,12 +2452,13 @@ evalDo hooks env ipm (SBind name e : rest) =
                 pure mv
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT (Just (name, False)) rest
-            _ -> pure $ VIO $ do
+            VIO _ -> pure $ VIO $ do
                 v  <- runIOVal hooks mv
                 vT <- newWHNFThunk v
                 let env' = extendEnv name vT env
                 restV <- evalDo hooks env' ipm rest
                 runIOVal hooks restV
+            _ -> doMonadicSequence hooks env ipm mv (Just (name, False)) rest
 evalDo hooks env ipm [SBangBind _ e] =
     -- Defensive: a do-block ending in a (bang-)bind is ill-formed; mirror SBind.
     eval hooks env ipm e
@@ -2466,13 +2473,14 @@ evalDo hooks env ipm (SBangBind name e : rest) =
         case mv of
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT (Just (name, True)) rest
-            _ -> pure $ VIO $ do
+            VIO _ -> pure $ VIO $ do
                 v  <- runIOVal hooks mv
                 vT <- newWHNFThunk v
                 _  <- force hooks vT  -- bang: force to WHNF before continuing
                 let env' = extendEnv name vT env
                 restV <- evalDo hooks env' ipm rest
                 runIOVal hooks restV
+            _ -> doMonadicSequence hooks env ipm mv (Just (name, True)) rest
 evalDo hooks env ipm (SLet bs : rest) = do
     -- Same tying-the-knot pattern as 'ELet', but we're inside a
     -- do-block so the scope is the rest of the stmts (not a body expr).
@@ -2494,6 +2502,36 @@ evalDo hooks env ipm (SImplicitLet bs : rest) = do
                writeIORef slot (Unevaluated (Closure env ipm rhs)))
           (zip bs slots)
     evalDo hooks env ipm' rest
+
+-- | Sequence a non-IO monadic action with the rest of a do-block using
+-- source-loaded @>>=@ / @>>@ (class dispatch). @mBind@:
+--
+--   * @Nothing@            — @m >> do { rest }@  (SExpr)
+--   * @Just (n, False)@    — @m >>= \\n -> do { rest }@
+--   * @Just (n, True)@     — bang-bind: force @n@ with @seq@ after bind
+doMonadicSequence
+    :: IHCHooks
+    -> Env
+    -> ImplicitParamMap
+    -> Val
+    -> Maybe (Name, Bool)
+    -> [Stmt]
+    -> IO Val
+doMonadicSequence hooks env ipm mv mBind rest = do
+    actT <- newWHNFThunk mv
+    let actName = BC.pack "$doAct"
+        envAct  = extendEnv actName actT env
+        restE   = EDo rest
+        bodyE   = case mBind of
+            Nothing ->
+                EApp (EApp (EVar ">>") (EVar actName)) restE
+            Just (n, False) ->
+                EApp (EApp (EVar ">>=") (EVar actName))
+                     (ELam n restE)
+            Just (n, True) ->
+                EApp (EApp (EVar ">>=") (EVar actName))
+                     (ELam n (EApp (EApp (EVar "seq") (EVar n)) restE))
+    eval hooks envAct ipm bodyE
 
 doSTSequence
     :: IHCHooks
