@@ -54,6 +54,34 @@
           # Network.Socket.*.  The cbits/HsNet.c + cbits/cmsg.c side
           # is handled by the separate libhsnetDylib derivation below.
           network
+          # Coverage fixtures (warp / megaparsec / CI / vault path).
+          # Pure `nix flake check` has no ~/.cache/ihc/sources; without
+          # these tarballs the fixtures fail as "module not found" even
+          # when the interpreter is fine.  Transitive deps must be listed
+          # explicitly — this is a source bundle, not a cabal install.
+          megaparsec
+          parser-combinators
+          case-insensitive
+          auto-update
+          http-types
+          word8
+          vault
+          streaming-commons
+          wai
+          warp
+          http-date
+          simple-sendfile
+          unix-compat
+          resourcet
+          time-manager
+          bsb-http-chunked
+          unliftio
+          unliftio-core
+          recv
+          iproute
+          byteorder
+          old-locale
+          semigroups
         ];
 
         # Keep only packages that actually have a derivation and are not
@@ -96,6 +124,10 @@
           "transformers"
           "text"
           "bytestring"
+          # QuasiQuoter / TH Quote path (qq_toy_string Coverage fixture).
+          "template-haskell"
+          "ghc-boot-th"
+          "pretty"
         ];
 
         # A single flat directory containing every .h file shipped with the
