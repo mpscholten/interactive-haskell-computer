@@ -119,7 +119,7 @@ spec = describe "Hs2010 — Bindings & guards" $ do
             assertParses "module M where\n(a, b) = p where p = (1, 2)\n"
 
         it "4.3.6 pattern binding with guards `(x, y) | c = p`" $
-            pendingWith "known gap: guards on pattern bindings"
+            assertParses "module M where\n(x, y) | True = (1, 2)\n"
 
     --------------------------------------------------------------------
     -- 4.4 Guard forms (also used in case alts and list comprehensions)
@@ -131,10 +131,10 @@ spec = describe "Hs2010 — Bindings & guards" $ do
                 EApp (EApp (EVar ">") (EVar "x")) (ELit (LInt 0))
 
         it "4.4.2 pattern guard `| Just x <- m`" $
-            pendingWith "known gap: pattern guards (| Just x <- m)"
+            assertParses "module M where\nf m | Just x <- m = x\n"
 
         it "4.4.3 local-decl guard `| let y = x`" $
-            pendingWith "known gap: local-decl guards (| let y = x)"
+            assertParses "module M where\nf x | let y = x * 2, y > 0 = y\n"
 
         it "4.4.4 comma-separated guard sequence `| a, b, c`" $
             assertParses "module M where\nf x | x > 0, x < 10 = x\n"

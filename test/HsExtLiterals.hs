@@ -70,15 +70,16 @@ spec = describe "HsExt — Literal extensions" $ do
             r <- lexOne "0b1010"
             case r of
                 Right (TkInt 10) -> pure ()
-                Right _other     -> pendingWith "needs LANGUAGE BinaryLiterals support"
+                Right other      -> expectationFailure
+                    ("expected TkInt 10, got " <> show other)
                 Left e           -> expectationFailure
                     ("lexer crashed: " <> show e)
         it "BinaryLiterals + NumericUnderscores: 0B1111_0000 lexes as a single int" $ do
             r <- lexOne "0B1111_0000"
             case r of
                 Right (TkInt 0xF0) -> pure ()
-                Right _other       -> pendingWith
-                    "needs LANGUAGE BinaryLiterals + NumericUnderscores support"
+                Right other        -> expectationFailure
+                    ("expected TkInt 0xF0, got " <> show other)
                 Left e             -> expectationFailure
                     ("lexer crashed: " <> show e)
 
@@ -87,24 +88,24 @@ spec = describe "HsExt — Literal extensions" $ do
             r <- lexOne "0x1p+8"
             case r of
                 Right (TkFloat _) -> pure ()
-                Right _other      -> pendingWith
-                    "needs LANGUAGE HexFloatLiterals support"
+                Right other       -> expectationFailure
+                    ("expected TkFloat, got " <> show other)
                 Left e            -> expectationFailure
                     ("lexer crashed: " <> show e)
         it "HexFloatLiterals: 0x1.8p+8 lexes as a float" $ do
             r <- lexOne "0x1.8p+8"
             case r of
                 Right (TkFloat _) -> pure ()
-                Right _other      -> pendingWith
-                    "needs LANGUAGE HexFloatLiterals support"
+                Right other       -> expectationFailure
+                    ("expected TkFloat, got " <> show other)
                 Left e            -> expectationFailure
                     ("lexer crashed: " <> show e)
         it "HexFloatLiterals: 0x.8p+8 lexes as a float" $ do
             r <- lexOne "0x.8p+8"
             case r of
                 Right (TkFloat _) -> pure ()
-                Right _other      -> pendingWith
-                    "needs LANGUAGE HexFloatLiterals support"
+                Right other       -> expectationFailure
+                    ("expected TkFloat, got " <> show other)
                 Left e            -> expectationFailure
                     ("lexer crashed: " <> show e)
 

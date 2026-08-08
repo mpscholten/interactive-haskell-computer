@@ -238,7 +238,7 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
     describe "RecursiveDo" $ do
         it "RecursiveDo: mdo { x <- foo; pure x }" $ do
             r <- parseExprStrict "mdo { x <- foo; pure x }"
-            assertParsesOrPending "known gap: `mdo` keyword not recognised" r
+            assertParses r
 
         it "RecursiveDo: do { rec { x <- foo }; pure x }" $ do
             r <- parseExprStrict "do { rec { x <- foo }; pure x }"

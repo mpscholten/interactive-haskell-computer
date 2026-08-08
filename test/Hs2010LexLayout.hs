@@ -55,8 +55,10 @@ spec = describe "Hs2010 — Lexical layout" $ do
                     [ Alt (PLit (LInt 1)) (ELit (LInt 1))
                     , Alt (PLit (LInt 2)) (ELit (LInt 2))
                     ]
+        it "explicit semicolon between let bindings" $
+            shouldParse "let x = 1; y = 2 in x + y"
         it "implicit semicolon between let bindings (layout)" $
-            pendingWith "known gap: multi-binding layout in `let` (no implicit semicolon)"
+            shouldParse "let\n  x = 1\n  y = 2\nin x"
 
     describe "1.8.3 implicit `}` on dedent" $ do
         it "do block closes on dedent" $

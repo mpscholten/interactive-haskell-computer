@@ -50,9 +50,9 @@ spec = describe "Hs2010 — Expression control flow" $ do
         it "5.1.6 unit constructor `()`" $ shouldParse "()"
         it "5.1.7 nil-list constructor `[]`" $ shouldParse "[]"
         it "5.1.8a tuple constructor `(,)`" $
-            pendingWith "known gap: tuple constructors (,) as values"
+            shouldParse "(,)"
         it "5.1.8b tuple constructor `(,,)`" $
-            pendingWith "known gap: tuple constructors (,,) as values"
+            shouldParse "(,,)"
         it "5.1.9 integer literal `1`" $
             "1" `shouldParseTo` ELit (LInt 1)
         it "5.1.10 float literal `1.5`" $
@@ -89,10 +89,10 @@ spec = describe "Hs2010 — Expression control flow" $ do
                 ELet [("x", ELit (LInt 1))] (EVar "x")
         it "5.4.2a let with multi-binding (explicit braces)" $
             shouldParse "let { x = 1; y = 2 } in x"
-        it "5.4.2b let with multi-binding (true layout — same line)" $
-            pendingWith "known gap: multi-binding layout in let (no implicit semicolon)"
+        it "5.4.2b let with multi-binding (semicolon separators, same line)" $
+            shouldParse "let x = 1; y = 2 in x"
         it "5.4.3 let with type signature" $
-            pendingWith "known gap: type signatures inside layout `let`"
+            shouldParse "let x :: Int\n    x = 1\n in x"
 
     describe "5.5 conditional" $ do
         it "5.5.1 `if c then a else b`" $
@@ -115,9 +115,9 @@ spec = describe "Hs2010 — Expression control flow" $ do
         it "5.6.5 empty case alternative list" $
             pendingWith "known gap: empty case alternative list"
         it "5.6.6 pattern guard inside case alt" $
-            pendingWith "known gap: pattern guards in case alts"
+            shouldParse "case m of { _ | Just x <- m -> x; _ -> z }"
         it "5.6.7 local-decl guard inside case alt" $
-            pendingWith "known gap: local-decl guards in case alts"
+            shouldParse "case x of { _ | let y = x -> y }"
 
     describe "5.7 do expressions" $ do
         it "5.7.1 sequenced `do e1 ; e2`" $
