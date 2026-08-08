@@ -537,7 +537,13 @@ loadProgramFromSource searchPath src0 = do
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     let qualEnv0 = extendEnvMany (zip (map fst qualPairs) slots) base
-        qualEnv = HashMap.union classMethodEnv qualEnv0
+        -- Re-apply class methods so they win over accidental bare-name
+        -- collisions — but NEVER over entry-module top-level bindings
+        -- (exportBodies keys those bare, no '.').  Without this carve-out,
+        -- a user @empty = Tip@ loses to Alternative.empty and case
+        -- scrutinees become class-method dispatchers
+        -- (data_strict_fields_then_tip).
+        qualEnv = preferClassMethodsExceptEntryBare classMethodEnv qualPairs qualEnv0
 
     -- For FQN keys whose bare name (last dot-component) matches a builtin,
     -- point the FQN slot directly at the builtin thunk.  This ensures that
@@ -1158,7 +1164,7 @@ loadFileIntoEnv searchPath path existingEnv = do
     -- Tie the knot.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
     let qualEnv0 = extendEnvMany (zip (map fst qualPairs) slots) base
-        qualEnv = HashMap.union classMethodEnv qualEnv0
+        qualEnv = preferClassMethodsExceptEntryBare classMethodEnv qualPairs qualEnv0
     -- Aliases: imported libs get bare+qualified aliases in the entry scope.
     aliases <- buildAliases registry fullSearchPath includeMap entry slots qualPairs
     let innerEnv = HashMap.union aliases qualEnv
@@ -5324,6 +5330,26 @@ newtypeBoolSemigroupExpr ctor accessor boolOp =
         combined = EApp (EApp (EVar boolOp) xBool) yBool
     in ELam x (ELam y (EApp (EVar ctor) combined))
 
+-- | Re-apply class-method dispatchers over an env that already includes
+-- exported bodies, without letting them shadow entry-module bare
+-- bindings.  'exportBodies' keys entry bindings without a @\'.\'@; class
+-- methods are bare names too.  Historically @HashMap.union classMethodEnv
+-- qualEnv0@ forced class methods to win (so an accidental same-named
+-- non-entry collision could not hide @empty@ / @pure@ / …).  That also
+-- erased the entry module's own top-level @empty = …@, which must win
+-- under Haskell 2010 §5.5 (local definition shadows everything else).
+preferClassMethodsExceptEntryBare
+    :: Env
+    -> [(ByteString, a)]
+    -> Env
+    -> Env
+preferClassMethodsExceptEntryBare classMethodEnv qualPairs qualEnv0 =
+    let entryBare = Set.fromList
+            [ k | (k, _) <- qualPairs, not (BC.elem '.' k) ]
+        classSansEntry = HashMap.filterWithKey
+            (\k _ -> k `Set.notMember` entryBare) classMethodEnv
+    in HashMap.union classSansEntry qualEnv0
+
 -- | For each loaded module, read its collected bodies out of the
 -- IORef and key them by either the unqualified local name (entry
 -- module) or the fully-qualified @\"Module.name\"@ form (imported
@@ -8366,43 +8392,67 @@ resolveFallbackSource mOwner name = do
                                    case mAny of
                                     Just slot -> pure (Just slot)
                                     Nothing -> do
-                                     mDirect <- case mOwner >>= (`Map.lookup` mods) of
-                                         Just owner -> tryKnownDirectOwnerSlot mods owner bareName
-                                         Nothing    -> pure Nothing
-                                     case mDirect of
+                                     -- Owner-module top-level bindings MUST shadow
+                                     -- class methods of the same bare name.  Without
+                                     -- this, a user binding @empty = Tip@ loses to
+                                     -- 'Alternative.empty' (or similar) once the
+                                     -- class method is registered — the case
+                                     -- scrutinee becomes a class-method dispatcher
+                                     -- and pattern-matches as "unexpected" /
+                                     -- non-exhaustive.  'tryImportScopedBareSlot'
+                                     -- only walks imports + implicit Prelude, so
+                                     -- same-module bindings were never candidates
+                                     -- before class-method preference below.
+                                     -- 'hasScannedTopLevel' is a cheap source scan;
+                                     -- 'buildSlotFromOwner' materialises the body
+                                     -- if needed via 'refreshLocalBindingFromSource'.
+                                     mLocalOwner <- case mOwner >>= (`Map.lookup` mods) of
+                                         Just owner -> do
+                                             hasLocal <- hasScannedTopLevel owner bareName
+                                             if hasLocal
+                                                 then buildSlotFromOwner mods owner bareName
+                                                 else pure Nothing
+                                         Nothing -> pure Nothing
+                                     case mLocalOwner of
                                       Just slot -> pure (Just slot)
                                       Nothing -> do
-                                        -- A bare name the owner-scoped lookup couldn't
-                                        -- resolve to an in-scope top-level binding, but
-                                        -- which IS a registered class method, must
-                                        -- dispatch AS a class method — it must NOT be
-                                        -- scavenged from an unrelated module's same-named
-                                        -- top-level binding by the UNSCOPED global scans
-                                        -- below.  Concretely: GHC.Internal.Ix's default
-                                        -- @index@/@rangeSize@ call @unsafeIndex@/@index@
-                                        -- (both Ix methods); once Data.ByteString is
-                                        -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
-                                        -- otherwise win 'tryGlobalImportScan' and
-                                        -- pattern-fail on the Ix bounds tuple
-                                        -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
-                                        -- such collision) already resolved correctly via
-                                        -- the class-method tail below; this lifts the same
-                                        -- dispatch ahead of the scope-blind scan for the
-                                        -- colliding names.  Cheap (one IORef read on miss,
-                                        -- no module loads) so it respects the per-name
-                                        -- fallback hot-path rule.
-                                        -- Try ALL loaded modules' imports — the owner
-                                        -- might be wrong (e.g. class default method
-                                        -- evaluated in a different module's context).
-                                        mGlobal <- do
-                                            mClassFirst <- tryKnownClassMethodSlot bareName
-                                            case mClassFirst of
-                                                Just s  -> pure (Just s)
-                                                Nothing -> tryGlobalImportScan mods bareName
-                                        case mGlobal of
-                                         Just slot -> pure (Just slot)
-                                         Nothing -> do
-                                          tryClassMethodOrPreludeSlot bareName mods
+                                       mDirect <- case mOwner >>= (`Map.lookup` mods) of
+                                           Just owner -> tryKnownDirectOwnerSlot mods owner bareName
+                                           Nothing    -> pure Nothing
+                                       case mDirect of
+                                        Just slot -> pure (Just slot)
+                                        Nothing -> do
+                                          -- A bare name the owner-scoped lookup couldn't
+                                          -- resolve to an in-scope top-level binding, but
+                                          -- which IS a registered class method, must
+                                          -- dispatch AS a class method — it must NOT be
+                                          -- scavenged from an unrelated module's same-named
+                                          -- top-level binding by the UNSCOPED global scans
+                                          -- below.  Concretely: GHC.Internal.Ix's default
+                                          -- @index@/@rangeSize@ call @unsafeIndex@/@index@
+                                          -- (both Ix methods); once Data.ByteString is
+                                          -- loaded its @unsafeIndex@/@index@ FUNCTIONS would
+                                          -- otherwise win 'tryGlobalImportScan' and
+                                          -- pattern-fail on the Ix bounds tuple
+                                          -- ("Non-exhaustive [[PCon BS …]]").  'inRange' (no
+                                          -- such collision) already resolved correctly via
+                                          -- the class-method tail below; this lifts the same
+                                          -- dispatch ahead of the scope-blind scan for the
+                                          -- colliding names.  Cheap (one IORef read on miss,
+                                          -- no module loads) so it respects the per-name
+                                          -- fallback hot-path rule.
+                                          -- Try ALL loaded modules' imports — the owner
+                                          -- might be wrong (e.g. class default method
+                                          -- evaluated in a different module's context).
+                                          mGlobal <- do
+                                              mClassFirst <- tryKnownClassMethodSlot bareName
+                                              case mClassFirst of
+                                                  Just s  -> pure (Just s)
+                                                  Nothing -> tryGlobalImportScan mods bareName
+                                          case mGlobal of
+                                           Just slot -> pure (Just slot)
+                                           Nothing -> do
+                                            tryClassMethodOrPreludeSlot bareName mods
 
     tryClassMethodOrPreludeSlot bareName mods = do
         mMethod <- tryClassMethodFromRegistry bareName

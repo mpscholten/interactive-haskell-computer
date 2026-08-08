@@ -54,6 +54,34 @@
           # Network.Socket.*.  The cbits/HsNet.c + cbits/cmsg.c side
           # is handled by the separate libhsnetDylib derivation below.
           network
+          # Coverage fixtures (warp / megaparsec / CI / vault path).
+          # Pure `nix flake check` has no ~/.cache/ihc/sources; without
+          # these tarballs the fixtures fail as "module not found" even
+          # when the interpreter is fine.  Transitive deps must be listed
+          # explicitly — this is a source bundle, not a cabal install.
+          megaparsec
+          parser-combinators
+          case-insensitive
+          auto-update
+          http-types
+          word8
+          vault
+          streaming-commons
+          wai
+          warp
+          http-date
+          simple-sendfile
+          unix-compat
+          resourcet
+          time-manager
+          bsb-http-chunked
+          unliftio
+          unliftio-core
+          recv
+          iproute
+          byteorder
+          old-locale
+          semigroups
         ];
 
         # Keep only packages that actually have a derivation and are not
@@ -96,6 +124,10 @@
           "transformers"
           "text"
           "bytestring"
+          # QuasiQuoter / TH Quote path (qq_toy_string Coverage fixture).
+          "template-haskell"
+          "ghc-boot-th"
+          "pretty"
         ];
 
         # A single flat directory containing every .h file shipped with the
@@ -128,13 +160,41 @@
         # "Version:" spellings.
         #
         # base / ghc-internal in GHC 9.10 only ship as <pkg>.cabal.in (the
-        # autoconf template).  Inspection shows there are no @VAR@ template
-        # placeholders in those files — they're essentially valid cabal
-        # files with the version baked in — so we accept the .in form as a
-        # fallback and rename it to <pkg>.cabal in the output tree so the
-        # IHC.CabalProject loader (which only looks for *.cabal) finds it.
+        # autoconf template).  Unlike earlier inspection assumed, these
+        # templates DO contain @ProjectVersionForLib@ placeholders:
+        #   ghc-internal.cabal.in:  version: @ProjectVersionForLib@.0
+        #   base.cabal:             ghc-internal == @ProjectVersionForLib@.*
+        # Leaving them unsubstituted produces a store path literally named
+        # ghc-internal-@ProjectVersionForLib@.0 and breaks package identity
+        # + cbits dylib naming.  Substitute from the installed GHC package
+        # tree (e.g. ghc-internal-9.1003.0-XXXX → token 9.1003).
+        #
+        # ghc-internal version convention (from the .cabal.in comment):
+        #   ghc 9.10.3 → ghc-internal 9.1003.0  (@ProjectVersionForLib@ = 9.1003)
         ghcBootSourceRoot = pkgs.runCommand "ihc-ghc-boot-libs" { } ''
           mkdir -p $out
+
+          # Resolve @ProjectVersionForLib@ from the installed package dir
+          # name: ghc-internal-9.1003.0-<hash> → 9.1003
+          project_version_for_lib=""
+          for d in ${ghc}/lib/ghc-*/lib/*-ghc-*/ghc-internal-*; do
+            if [ -d "$d" ]; then
+              base=$(basename "$d")
+              # ghc-internal-9.1003.0-33ec → 9.1003.0
+              ver_full=''${base#ghc-internal-}
+              ver_full=''${ver_full%%-*}
+              # 9.1003.0 → 9.1003  (strip the ghc-internal patch .0)
+              project_version_for_lib=''${ver_full%.0}
+              break
+            fi
+          done
+          if [ -z "$project_version_for_lib" ]; then
+            # Fallback matching GHC 9.10.3 / ghc-internal-9.1003.0
+            project_version_for_lib="9.1003"
+            echo "WARNING: could not detect ghc-internal version from GHC install; using $project_version_for_lib" >&2
+          fi
+          echo "ProjectVersionForLib=$project_version_for_lib" >&2
+
           ${pkgs.lib.concatMapStringsSep "\n" (pkg: ''
             if [ -d "${ghcSrc}/libraries/${pkg}" ]; then
               cabal_file=$(find "${ghcSrc}/libraries/${pkg}" -maxdepth 3 -name "${pkg}.cabal" -type f | head -1)
@@ -145,6 +205,9 @@
               fi
               if [ -n "$cabal_file" ]; then
                 version=$(grep -im1 '^version:' "$cabal_file" | awk '{print $2}' | tr -d '\r')
+                # Expand autoconf-style @ProjectVersionForLib@ in the version
+                # field (ghc-internal.cabal.in ships version: @ProjectVersionForLib@.0).
+                version=$(printf '%s' "$version" | sed "s/@ProjectVersionForLib@/$project_version_for_lib/g")
                 src_dir=$(dirname "$cabal_file")
                 target="$out/${pkg}-$version"
                 cp -r "$src_dir" "$target"
@@ -154,6 +217,15 @@
                 if [ -n "$cabal_in_file" ]; then
                   cp "$target/${pkg}.cabal.in" "$target/${pkg}.cabal"
                 fi
+                # Substitute remaining @ProjectVersionForLib@ in cabal files
+                # (e.g. base's ghc-internal == @ProjectVersionForLib@.*).
+                # Portable in-place edit (no GNU/BSD sed -i differences).
+                for f in "$target"/*.cabal "$target"/*.cabal.in; do
+                  [ -f "$f" ] || continue
+                  tmp="$f.tmp"
+                  sed "s/@ProjectVersionForLib@/$project_version_for_lib/g" "$f" > "$tmp"
+                  mv "$tmp" "$f"
+                done
               fi
             fi
           '') ghcBootLibs}
@@ -166,9 +238,28 @@
         # enumerate $out the same way it enumerates ~/.cache/ihc/sources/.
         ihcSourceRoot = pkgs.runCommand "ihc-hackage-sources" { } ''
           mkdir -p $out
-          ${pkgs.lib.concatMapStringsSep "\n" (p:
-            "${pkgs.gnutar}/bin/tar -xf ${p.src} -C $out"
-          ) ihcHackageSources}
+          # Each package's .src is usually a .tar.gz, but some nixpkgs
+          # entries (e.g. bsb-http-chunked) are already unpacked source
+          # directories from fetchFromGitHub.  Handle both.
+          ${pkgs.lib.concatMapStringsSep "\n" (p: ''
+            src="${p.src}"
+            if [ -d "$src" ]; then
+              # Directory source: copy under <name>-<version> so the
+              # loader's package enumerator finds a .cabal file.
+              cabal=$(find "$src" -maxdepth 2 -name '*.cabal' -type f | head -1)
+              if [ -n "$cabal" ]; then
+                pname=$(basename "$cabal" .cabal)
+                version=$(grep -im1 '^version:' "$cabal" | awk '{print $2}' | tr -d '\r')
+                target="$out/$pname-$version"
+                cp -r "$src" "$target"
+              else
+                echo "WARNING: no .cabal in directory source $src" >&2
+                cp -r "$src" "$out/$(basename "$src")"
+              fi
+            else
+              ${pkgs.gnutar}/bin/tar -xf "$src" -C $out
+            fi
+          '') ihcHackageSources}
           # GHC boot libs — plain directories, not tarballs
           cp -r ${ghcBootSourceRoot}/* $out/ 2>/dev/null || true
           chmod -R u+w $out
