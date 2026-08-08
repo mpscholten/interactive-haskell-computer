@@ -568,11 +568,19 @@ loadProgramFromSource searchPath src0 = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
+                    -- VIO ↔ State# bridges (RTS-exclusive).
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
                     , "addForeignPtrFinalizer"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    -- closeFdWith: host-backed because IHC does not run
+                    -- GHC's RTS event manager (see Builtins registration).
+                    , "closeFdWith"
+                    -- Event/timer manager probes + timeout ops: host stubs
+                    -- for the RTS managers IHC does not run.
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
+                    -- Handle-text I/O + standard handles: host-backed until
+                    -- the source-level Handle ADT layer exists (see
+                    -- ffiBuiltinNames comment).
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
@@ -1649,8 +1657,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
+                    -- Keep in sync with loadProgramFromSource's set:
+                    -- only names that still have host builtin registrations.
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "addForeignPtrFinalizer"
+                    , "closeFdWith"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
@@ -5734,7 +5745,7 @@ renderTypeForAnnotation = top
 ffiBuiltinNames :: Set ByteString
 ffiBuiltinNames = Set.fromList
     [ "hPutBuf"
-    , "withCString", "withCStringLen", "withCStringLen0"
+    , "withCString", "withCStringLen"
     , "peekCString", "newCString"
     , "addForeignPtrFinalizer"
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"
