@@ -671,6 +671,9 @@ nextToken s c0 =
 
     -- | Entry point for the byte @0x27@ (@\'@). Disambiguates between:
     --
+    --   * Char literals @\'[\'@ / @\'(\'@ / @\'{\'@ (and MagicHash forms
+    --     like @\'[\'#@) — look one byte past the bracket; if it is @\'@,
+    --     delegate to 'lexChar'.
     --   * @\'[...]@ / @\'(...)@ / @\'{...}@ promoted-list/tuple/record
     --     literals (DataKinds) — emit 'TkTick', advance by one byte, let
     --     the next call lex the bracket/paren/brace on its own.
@@ -681,12 +684,17 @@ nextToken s c0 =
         let p1 = cPos openCur + 1 in
         case peekByte s p1 of
             Just b | b == 0x5B || b == 0x28 || b == 0x7B
-                -- '[' (0x5B), '(' (0x28), '{' (0x7B) — always TkTick
-                -- since the corresponding char-literal form would need a
-                -- closing '\'' three bytes later, which is rare in source
-                -- and even then ambiguous. DataKinds wins.
-                -> let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
-                   in (mkTok TkTick openCur end, end)
+                -- '[' (0x5B), '(' (0x28), '{' (0x7B): distinguish the
+                -- common char literals @\'[\'@ / @\'(\'@ / @\'{\'@ from
+                -- DataKinds promoted forms @\'[...@ / @\'(...@ / @\'{...@.
+                -- One-byte lookahead past the bracket: closing @\'@ means
+                -- char literal (lexChar also accepts an optional trailing
+                -- @#@ for Char#); anything else keeps TkTick.
+                -> case peekByte s (p1 + 1) of
+                    Just 0x27 -> lexChar openCur
+                    _ ->
+                        let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
+                        in (mkTok TkTick openCur end, end)
             _   -> lexChar openCur
 
     -- | Lex an OverloadedLabels label: '#' followed by a run of
