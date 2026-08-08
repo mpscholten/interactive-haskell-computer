@@ -242,7 +242,7 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
 
         it "RecursiveDo: do { rec { x <- foo }; pure x }" $ do
             r <- parseExprStrict "do { rec { x <- foo }; pure x }"
-            assertParsesOrPending "known gap: `rec` block inside do not recognised" r
+            assertParses r
 
     describe "ParallelListComp" $ do
         it "ParallelListComp: [x + y | x <- xs | y <- ys] parses" $ do

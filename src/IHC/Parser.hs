@@ -1793,16 +1793,32 @@ parseDo ctx cur0 = do
             case stmts of
                 (ss, cur') -> pure (desugarDo ss, cur')
   where
+    -- Empty statement slots (`do { ; e }`, `do { e1; ; e2 }`) are
+    -- legal: skip consecutive `TkSemi` and allow an immediate `}` so
+    -- `do {}` also parses as an empty statement list.
     bracedStmts cur acc = do
-        (ss, cur') <- parseStmt ctx cur
-        let acc' = reverse ss ++ acc
-        let (sep, curN) = nextSig ctx cur'
-        case tkKind sep of
-            TkSemi   -> bracedStmts curN acc'
-            TkRBrace -> pure (reverse acc', curN)
-            _        -> parseErr ctx "expected `;` or `}` in do-block" sep
+        let (tok, curPeek) = nextSig ctx cur
+        case tkKind tok of
+            TkRBrace -> pure (reverse acc, curPeek)
+            TkSemi   -> bracedStmts curPeek acc
+            _        -> do
+                (ss, cur') <- parseStmt ctx cur
+                let acc' = reverse ss ++ acc
+                let (sep, curN) = nextSig ctx cur'
+                case tkKind sep of
+                    TkSemi   -> bracedStmts curN acc'
+                    TkRBrace -> pure (reverse acc', curN)
+                    _        -> parseErr ctx "expected `;` or `}` in do-block" sep
 
     layoutStmts stmtCol cur acc = do
+        -- Skip empty `;` slots in layout do-blocks too
+        -- (`do e1; ; e2`).
+        let (leadTok, curAfterLead) = nextSig ctx cur
+        case tkKind leadTok of
+            TkSemi -> layoutStmts stmtCol curAfterLead acc
+            _      -> layoutStmts1 stmtCol cur acc
+
+    layoutStmts1 stmtCol cur acc = do
         let stmtCtx = ctx { ctxMinCol = stmtCol }
         (ss, cur') <- parseStmt stmtCtx cur
         let acc' = reverse ss ++ acc
@@ -2011,6 +2027,10 @@ parseStmt ctx cur0 = do
     let (tok, cur1) = nextSig ctx cur0
     case tkKind tok of
         TkLet -> parseDoLet ctx cur1
+        -- RecursiveDo: @rec { stmts }@ / layout @rec@ block. Minimal
+        -- desugar splices the nested statements into the enclosing do
+        -- (non-recursive; full mfix knot-tying is future work).
+        TkRec -> parseRecBlock ctx cur1
         TkIdent name -> do
             let (peek, cur2) = nextSig ctx cur1
             case tkKind peek of
@@ -2059,6 +2079,7 @@ parseStmt ctx cur0 = do
                 TkLArrow | par == 0 && br == 0 && brace == 0 -> True
                 TkDo | par == 0 && br == 0 && brace == 0 -> False
                 TkMDo | par == 0 && br == 0 && brace == 0 -> False
+                TkRec | par == 0 && br == 0 && brace == 0 -> False
                 TkIf | par == 0 && br == 0 && brace == 0 -> False
                 TkLet | par == 0 && br == 0 && brace == 0 -> False
                 TkCase | par == 0 && br == 0 && brace == 0 -> False
@@ -2113,6 +2134,46 @@ parseStmt ctx cur0 = do
         go seen (x:xs)
             | x `elem` seen = go seen xs
             | otherwise     = x : go (x : seen) xs
+
+-- | Parse a RecursiveDo @rec@ block body (braced or layout) and return its
+-- statements.  Non-recursive desugar: the body is spliced into the enclosing
+-- do as ordinary statements.  Sufficient for parse tests and non-knotting
+-- rec bodies; mutual recursion via mfix is future work.
+parseRecBlock :: Ctx -> Cursor -> IO ([Stmt], Cursor)
+parseRecBlock ctx cur0 = do
+    let (firstTok, curAfter) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkLBrace -> bracedStmts curAfter []
+        TkEof    -> pure ([], cur0)
+        _        -> layoutStmts (tkCol firstTok) cur0 []
+  where
+    -- Same layout/brace rules as 'parseDo''s statement collectors so a
+    -- nested @rec@ block ends at the same column boundaries as a do-block.
+    bracedStmts cur acc = do
+        (ss, cur') <- parseStmt ctx cur
+        let acc' = reverse ss ++ acc
+        let (sep, curN) = nextSig ctx cur'
+        case tkKind sep of
+            TkSemi   -> bracedStmts curN acc'
+            TkRBrace -> pure (reverse acc', curN)
+            _        -> parseErr ctx "expected `;` or `}` in rec-block" sep
+
+    layoutStmts stmtCol cur acc = do
+        let stmtCtx = ctx { ctxMinCol = stmtCol }
+        (ss, cur') <- parseStmt stmtCtx cur
+        let acc' = reverse ss ++ acc
+        let (nextTok, curAfterSep) = nextSig ctx cur'
+        case tkKind nextTok of
+            TkEof -> pure (reverse acc', cur')
+            TkSemi -> layoutStmts stmtCol curAfterSep acc'
+            TkWhere | tkCol nextTok == stmtCol -> pure (reverse acc', cur')
+            TkIn    | tkCol nextTok == stmtCol -> pure (reverse acc', cur')
+            TkRParen   -> pure (reverse acc', cur')
+            TkRBracket -> pure (reverse acc', cur')
+            TkRBrace   -> pure (reverse acc', cur')
+            TkComma    -> pure (reverse acc', cur')
+            _ | tkCol nextTok == stmtCol -> layoutStmts stmtCol cur' acc'
+              | otherwise                -> pure (reverse acc', cur')
 
 parseDoLet :: Ctx -> Cursor -> IO ([Stmt], Cursor)
 parseDoLet ctx cur0 = do
@@ -3014,14 +3075,24 @@ buildCaseExpr scrut alts
     isPlain (AltBodyExpr _) = True
     isPlain _               = False
 
+-- | Braced case alternatives.  EmptyCase (GHC extension) allows an
+-- empty alt list @case e of {}@ — that desugars to a match that always
+-- fails at runtime (eval already throws PatternMatchFail on @ECase _ []@).
+-- Leading / consecutive empty slots after @;@ are also skipped so
+-- @case e of { ; p -> x }@ and trailing @;@ before @}@ parse cleanly.
 bracedAlts :: Ctx -> Cursor -> [(Pat, AltBody)] -> IO ([(Pat, AltBody)], Cursor)
 bracedAlts ctx cur acc = do
-    (alt, cur') <- parseAlt ctx ctx cur
-    let (sep, curN) = nextSig ctx cur'
-    case tkKind sep of
-        TkSemi   -> bracedAlts ctx curN (alt : acc)
-        TkRBrace -> pure (reverse (alt : acc), curN)
-        _        -> parseErr ctx "expected `;` or `}` in case alts" sep
+    let (tok, curPeek) = nextSig ctx cur
+    case tkKind tok of
+        TkRBrace -> pure (reverse acc, curPeek)
+        TkSemi   -> bracedAlts ctx curPeek acc
+        _        -> do
+            (alt, cur') <- parseAlt ctx ctx cur
+            let (sep, curN) = nextSig ctx cur'
+            case tkKind sep of
+                TkSemi   -> bracedAlts ctx curN (alt : acc)
+                TkRBrace -> pure (reverse (alt : acc), curN)
+                _        -> parseErr ctx "expected `;` or `}` in case alts" sep
 
 layoutAlts :: Ctx -> Int -> Cursor -> [(Pat, AltBody)] -> IO ([(Pat, AltBody)], Cursor)
 layoutAlts ctx altCol cur acc = do
