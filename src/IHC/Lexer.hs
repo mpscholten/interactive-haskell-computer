@@ -74,11 +74,20 @@ data TokenKind
                               --   pin a static blob to a 'ByteString'.
                               --   Field is lazy like 'TkStr'.
     | TkChar  !Char           -- ^ @\'c\'@ character literal
+    | TkNameQuote !ByteString -- ^ TemplateHaskellQuotes name quote:
+                              --   @\'varid@ / @\'Conid@ / @\'(symop)@.
+                              --   Emitted when a leading @\'@ is NOT a
+                              --   char literal and NOT a DataKinds
+                              --   promoted-list/tuple tick.  The payload
+                              --   is the quoted name (bare or operator).
     | TkTick                  -- ^ promoted-list/tuple tick — the bare @\'@
                               --   when followed by @[@, @(@, or @{@. The
                               --   lexer disambiguates on lookahead so
                               --   @\'[a,b]@ parses as a promoted-list
                               --   literal, not a char literal of @[@.
+                              --   Exception: @\'(op)@ where @op@ is a
+                              --   symbolic operator is a name quote
+                              --   ('TkNameQuote'), not a promoted tuple.
     | TkEq                    -- ^ @=@
     | TkPlus                  -- ^ @+@
     | TkPlusPlus              -- ^ @++@ (string / list concat)
@@ -283,6 +292,16 @@ nextToken s c0 =
             | b == 0x2C        -> (mkTok TkComma    c (step c), step c)  -- ','
             | b == 0x3B        -> (mkTok TkSemi     c (step c), step c)  -- ';'
             | b == 0x60        -> (mkTok TkBacktick c (step c), step c)  -- '`'
+            -- Backslash: single '\' is lambda (TkBackslash).  Two
+            -- backslashes '\\' are the symbolic operator used by
+            -- Data.Set difference (Set.\\) and similar — emit TkSymOp
+            -- "\\", matching the '||' / '|' split above.  '\' is not in
+            -- isOpChar (it has a dedicated single-char token), so we
+            -- special-case the double form here rather than via lexSymOp.
+            | b == 0x5C
+            , Just 0x5C <- peekByte s (cPos c + 1)
+                               -> let c' = step (step c)
+                                  in (mkTok (TkSymOp (BC.pack "\\")) c c', c')
             | b == 0x5C        -> (mkTok TkBackslash c (step c), step c) -- '\\'
             -- '@' is an operator-ish char in Haskell reports, but in practice
             -- it's used for as-patterns and type applications; treat as its
@@ -651,10 +670,12 @@ nextToken s c0 =
     -- Qualified-operator split: @P.>*<@ must lex as @P@ + @.@ + @>*<@, not as
     -- @P@ + @.>*<@.  Maximal-munch would glue the qualifier dot onto the
     -- operator.  When a run starts with @.@ and is longer than a known
-    -- dot-operator (@.@, @..@, @.&@, @.|@, @.$@, …), emit only @TkDot@ for
-    -- the first character so the next @nextToken@ call restarts on the
-    -- true operator.  Required by bsb-http-chunked's
-    -- @P.char8 P.>*< P.char8@ (warp chunked response path).
+    -- dot-operator (any 2-char @.<opchar>@ plus 3-char bitwise/numeric forms
+    -- like @.&.@ / @.|.@ / @.$.@), emit only @TkDot@ for the first character
+    -- so the next @nextToken@ call restarts on the true operator.  Required
+    -- by bsb-http-chunked's @P.char8 P.>*< P.char8@ (warp chunked response
+    -- path).  Qualified ops whose post-dot part is length>2 and not on the
+    -- 3-char allowlist still split (e.g. @P.>*<@ → @TkDot@ + @>*<@).
     lexSymOp start = go (cPos start)
       where
         go p = case peekByte s p of
@@ -774,23 +795,102 @@ nextToken s c0 =
 
     -- | Entry point for the byte @0x27@ (@\'@). Disambiguates between:
     --
-    --   * @\'[...]@ / @\'(...)@ / @\'{...}@ promoted-list/tuple/record
-    --     literals (DataKinds) — emit 'TkTick', advance by one byte, let
-    --     the next call lex the bracket/paren/brace on its own.
-    --   * Everything else — delegate to 'lexChar' (true char literal or
-    --     promoted constructor like @\'True@ consumed as @TkChar \'T\'@
-    --     + ident, handled downstream in 'captureTypeArg').
+    --   * Char literals @\'[\'@ / @\'(\'@ / @\'{\'@ (and MagicHash forms)
+    --     — look one byte past the bracket; if it is @\'@, use 'lexChar'.
+    --   * @\'(op)@ — TH name quote of a parenthesized symbolic operator
+    --     (@\'(.)@, @\'(\<*>)@, @\'(:)@).  Emit 'TkNameQuote'.
+    --   * @\'[...]@ / @\'(...@ / @\'{...}@ — DataKinds promoted forms:
+    --     emit 'TkTick', advance by one byte.
+    --   * @\'varid@ / @\'Conid@ — TH name quote of an identifier
+    --     (@\'pure@, @\'Left@).  Distinguished from a char literal by the
+    --     absence of a closing @\'@ after a single character.
+    --   * Everything else — 'lexChar' (true char literal / escapes).
     lexQuote openCur =
         let p1 = cPos openCur + 1 in
         case peekByte s p1 of
-            Just b | b == 0x5B || b == 0x28 || b == 0x7B
-                -- '[' (0x5B), '(' (0x28), '{' (0x7B) — always TkTick
-                -- since the corresponding char-literal form would need a
-                -- closing '\'' three bytes later, which is rare in source
-                -- and even then ambiguous. DataKinds wins.
-                -> let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
-                   in (mkTok TkTick openCur end, end)
+            -- '(' — priority: char lit '('  ; TH '(op)  ; DataKinds tick
+            Just 0x28 ->
+                case peekByte s (p1 + 1) of
+                    Just 0x27 -> lexChar openCur
+                    _ ->
+                        case tryThParenNameQuote openCur p1 of
+                            Just result -> result
+                            Nothing ->
+                                let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
+                                in (mkTok TkTick openCur end, end)
+            -- '[' / '{' — char lit if closing quote follows, else DataKinds
+            Just b | b == 0x5B || b == 0x7B
+                -> case peekByte s (p1 + 1) of
+                    Just 0x27 -> lexChar openCur
+                    _ ->
+                        let end = Cursor p1 (cLine openCur) (cCol openCur + 1)
+                        in (mkTok TkTick openCur end, end)
+            -- Identifier start: TH name quote vs char lit
+            Just b | isLowerStart b || isUpperStart b ->
+                case tryThNameQuoteIdent openCur p1 of
+                    Just result -> result
+                    Nothing     -> lexChar openCur
             _   -> lexChar openCur
+
+    -- | @\'(op)@ TH name quote of a parenthesized symbolic operator.
+    -- After the opening @\'(@, scan a non-empty run of operator
+    -- characters (isOpChar) followed immediately by @)@.  Returns
+    -- 'Nothing' when the interior is not a bare operator (e.g.
+    -- @\'(Int, Bool)@, @\'()@, @\'(a)@) so the caller emits 'TkTick'.
+    tryThParenNameQuote openCur pOpenParen =
+        let pOpStart = pOpenParen + 1   -- byte after '('
+            pOpEnd   = scanOpChars pOpStart
+        in if pOpEnd > pOpStart
+              then case peekByte s pOpEnd of
+                  Just 0x29 ->   -- closing ')'
+                      let name = sliceBytes s (pOpStart, pOpEnd)
+                          endP = pOpEnd + 1
+                          end  = Cursor endP (cLine openCur)
+                                       (cCol openCur + (endP - cPos openCur))
+                      in Just (mkTok (TkNameQuote name) openCur end, end)
+                  _ -> Nothing
+              else Nothing
+      where
+        scanOpChars p = case peekByte s p of
+            Just b | isOpChar (Just b) -> scanOpChars (p + 1)
+            _                          -> p
+
+    -- | @\'ident@ TH name quote.  After @\'@, read a full identifier.
+    -- Character literals take priority: if the first character (possibly
+    -- multi-byte UTF-8) is immediately followed by a closing @\'@, or the
+    -- payload starts with an escape @\\@, return 'Nothing' so the caller
+    -- falls through to 'lexChar'.  Note: @isIdentCont@ includes @\'@
+    -- (primed binders like @x'@), so a naïve longest-ident scan would
+    -- swallow the closing quote of @\'a\'@ and emit @TkNameQuote "a'"@.
+    tryThNameQuoteIdent openCur pIdentStart =
+        case peekByte s pIdentStart of
+            -- Escape → always a char-literal form ('\n', '\x41', …).
+            Just 0x5C -> Nothing
+            Just b | isLowerStart b || isUpperStart b ->
+                -- Decode one character (handles multi-byte UTF-8 like α).
+                let (_ch, afterChar) = decodeUtf8At s pIdentStart b
+                in case peekByte s afterChar of
+                    -- Single char + closing quote → char literal.
+                    Just 0x27 -> Nothing
+                    _ ->
+                        -- True name quote: scan the full identifier.
+                        -- Include primes so 'foo' (name of foo') works
+                        -- when there is no intervening closing-quote
+                        -- ambiguity (we already ruled out char lit).
+                        let pIdentEnd = scanIdent pIdentStart
+                            name      = sliceBytes s (pIdentStart, pIdentEnd)
+                        in if BS.null name
+                              then Nothing
+                              else
+                                let end = Cursor pIdentEnd (cLine openCur)
+                                                 (cCol openCur
+                                                    + (pIdentEnd - cPos openCur))
+                                in Just (mkTok (TkNameQuote name) openCur end, end)
+            _ -> Nothing
+      where
+        scanIdent p = case peekByte s p of
+            Just b | isIdentCont b -> scanIdent (p + 1)
+            _                      -> p
 
     -- | Lex an OverloadedLabels label: '#' followed by a run of
     -- identifier-continuation chars. The '#' is consumed as part of the
@@ -953,20 +1053,38 @@ classifySymOp bs = case bs of
     _    -> TkSymOp bs
 
 -- | Operators that legitimately start with @.@ and must NOT be split into
--- @TkDot@ + remainder by 'lexSymOp'.  Keep this list minimal: every extra
--- entry is one more case where @M.op@ with @op@ starting the same way would
--- mis-lex.  Bitwise @.&.@/@.|.@ and enum @..@ are the common ones.
+-- @TkDot@ + remainder by 'lexSymOp'.
+--
+-- Policy (maintainable default):
+--
+--   * Any 2-character operator @.<opchar>@ is known — covers library ops
+--     such as @.=@ (aeson/lens), @.|@ (conduit), @.#@ (lens), @.$@ / @.~@
+--     / @.&@ / @.^@ / @.%@ / @.*@ / @.+@ / @.-@ / @./@ / @.<@ / @.>@, as
+--     well as @..@ (enumFromTo / export-all).
+--   * Plus a short allowlist of 3-char bitwise / numeric forms
+--     (@.&.@, @.|.@, @.$.@, @.+.@, @.-.@, @.*.@, @./.@).
+--
+-- Longer runs that start with @.@ and are not on the 3-char allowlist still
+-- split (e.g. qualified @P.>*<@ → @TkDot@ + @>*<@).  Trade-off: a 2-char
+-- qualified form like @P.=@ would not split; that shape is vanishingly rare
+-- next to real @.=@ uses in aeson/lens, so we favour maximal munch for
+-- length-2.
 isKnownDotOperator :: ByteString -> Bool
 isKnownDotOperator bs =
-    bs == BC.pack "."
-    || bs == BC.pack ".."
-    || bs == BC.pack ".&."
-    || bs == BC.pack ".|."
-    || bs == BC.pack ".$."
-    || bs == BC.pack ".+."
-    || bs == BC.pack ".-."
-    || bs == BC.pack ".*."
-    || bs == BC.pack "./."
+    let n = BC.length bs
+    in  -- Bare composition / qualifier separator (never consulted when n==1
+        -- by the call site, but kept for completeness).
+        (n == 1 && BC.head bs == '.')
+        -- Any two-char .op (.=, .|, .#, .$, .~, .&, .^, .., …).
+     || (n == 2 && BC.head bs == '.' && isOpChar (Just (BS.index bs 1)))
+        -- Known 3-char bitwise / numeric package forms.
+     || bs == BC.pack ".&."
+     || bs == BC.pack ".|."
+     || bs == BC.pack ".$."
+     || bs == BC.pack ".+."
+     || bs == BC.pack ".-."
+     || bs == BC.pack ".*."
+     || bs == BC.pack "./."
 
 -- | Haskell operator characters (except the structural @(@/@)@ etc). Used to
 -- delimit longest-match symbolic-operator tokens. Backtick and backslash are

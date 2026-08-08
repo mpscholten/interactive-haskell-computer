@@ -13,13 +13,14 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: after accept, request path still dies on\
-                    \ Int I# binary op with args=<function> 48 (ASCII '0');\
-                    \ likely _0+fromIntegral in header/digit parse after\
-                    \ fromIntegral left a function. Fixed along the way:\
+        pendingWith "Pending: post-accept hang (~100% CPU) with no HTTP body.\
+                    \ Fixed along the way: nested where on let (S.foldl'/\
+                    \ readInt64), Storable.peekElemOff default Int (http-date\
+                    \ month tables; was Char → fromIntegral+48 I# crash),\
                     \ class-method single-tag apply, Natural NS/NB,\
                     \ Category (->) baseDot, fromInteger∘toInteger recovery.\
-                    \ parseHeaderLines works on S.pack ByteStrings."
+                    \ parseHeaderLines/composeHeader/packStatus green;\
+                    \ remaining spin likely date auto-update or response path."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle

@@ -48,9 +48,11 @@ import Control.Exception (try, SomeException)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
+import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -68,6 +70,49 @@ import IHC.Val
 forceMethodVal :: IHCHooks -> Val -> IO Val
 forceMethodVal hooks (VLazyMethod t) = force hooks t
 forceMethodVal _     v               = pure v
+
+-- | If @x@ is a bare nullary 'Bounded' method (@maxBound@ / @minBound@) and
+-- @f@ is a variable whose registered type signature begins with a
+-- concrete type constructor (@Int -> …@), rewrite @x@ to @x :: T@ so
+-- the existing 'ETyApp' nullary path can resolve the instance.
+--
+-- Mirrors GHC specialising @measureOff maxBound@ from
+-- @measureOff :: Int -> Text -> Int@.  Does not invent a default type
+-- when the callee signature is missing or polymorphic — that would
+-- re-break non-Int uses like @listArray (minBound, maxBound)@ for enums.
+annotateNullaryBoundedArg :: Expr -> Expr -> IO Expr
+annotateNullaryBoundedArg f x = case x of
+    EVar m
+      | isNullaryBoundedName m -> case f of
+            EVar fname -> do
+                sigs <- readIORef globalTypeSigsRef
+                let bareF = lastDottedComponent fname
+                pure $ case Map.lookup bareF sigs `orElse` Map.lookup fname sigs of
+                    Just (Scheme _ _ body) ->
+                        case tyArrowArgs body of
+                            (argTy : _, _)
+                              | Just con <- tyHead argTy
+                              , isMonoCon argTy ->
+                                    ETyApp x con
+                            _ -> x
+                    Nothing -> x
+            _ -> pure x
+      | otherwise -> pure x
+    _ -> pure x
+  where
+    isNullaryBoundedName n =
+        let bare = lastDottedComponent n
+        in bare == BC.pack "maxBound" || bare == BC.pack "minBound"
+    lastDottedComponent n =
+        case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing  -> n
+    -- Only specialise when the domain is a bare type constructor
+    -- (Int, Char, …), not a type application or variable.
+    isMonoCon (TA.TyCon _) = True
+    isMonoCon _            = False
+    orElse (Just a) _ = Just a
+    orElse Nothing  b = b
 
 -- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
 -- method in the class registry; if the instance registered a
@@ -159,7 +204,12 @@ force :: IHCHooks -> Thunk -> IO Val
 force hooks t = do
     st <- readIORef t
     case st of
-        Evaluated v -> pure v
+        Evaluated v -> do
+            -- Already-memoised path: still count so tight loops over
+            -- forced method thunks (e.g. default Eq mutual recursion)
+            -- show up under IHC_EVAL_STATS.
+            noteForceKind "whnf" (valKindTag v)
+            pure v
         BlackHole owner msg -> do
             self <- myThreadId
             case owner of
@@ -169,12 +219,16 @@ force hooks t = do
                 -- 'Settings'/etc. thunks). This is NOT a loop — GHC's RTS
                 -- blocks on a foreign black-hole. Yield and retry until the
                 -- owner publishes the 'Evaluated' result.
-                Just o | o /= self -> yield >> force hooks t
+                Just o | o /= self -> do
+                    noteBlackHoleWait
+                    yield
+                    force hooks t
                 -- Same thread re-entered (a genuine `<<loop>>`), or an
                 -- owner-less knot-tying placeholder was demanded before it
                 -- was filled: that IS a real loop.
                 _ -> throwIO (LoopException msg)
         Unevaluated (Closure env ipm expr) -> do
+            noteForceEval (show expr)
             self <- myThreadId
             writeIORef t (BlackHole (Just self) (take 500 (show expr)))
             v <- eval hooks env ipm expr
@@ -185,11 +239,31 @@ force hooks t = do
         -- protocol) so a concurrent forcer waits (foreign owner) or sees a
         -- loop (same thread). See 'IHC.Val.newLazyBuiltinThunk'.
         LazyBuiltin mkV -> do
+            noteForceKind "lazy" "<lazy-builtin>"
             self <- myThreadId
             writeIORef t (BlackHole (Just self) "<lazy-builtin>")
             v <- mkV
             writeIORef t (Evaluated v)
             pure v
+
+-- | Cheap tag for WHNF force samples (no deep show).
+valKindTag :: Val -> String
+valKindTag = \case
+    VInt _            -> "VInt"
+    VInteger _        -> "VInteger"
+    VFloat _          -> "VFloat"
+    VChar _           -> "VChar"
+    VStr _            -> "VStr"
+    VUnit             -> "VUnit"
+    VFun _            -> "VFun"
+    VFunIP _ _        -> "VFunIP"
+    VCon n _          -> "VCon:" <> BC.unpack n
+    VIO _             -> "VIO"
+    VPrimObj _        -> "VPrimObj"
+    VLabel _          -> "VLabel"
+    VClassMethod n _ ts _ ->
+        "VClassMethod:" <> BC.unpack n <> "@" <> show (length ts)
+    VLazyMethod _     -> "VLazyMethod"
 
 --------------------------------------------------------------------------------
 -- eval
@@ -259,10 +333,23 @@ eval hooks env ipm = go
                         pure (storableSizeAlignFallback method)
                     | otherwise ->
                         go (EApp (ETyApp f ty) x)
+    -- Signature-directed specialisation of bare nullary Bounded methods.
+    -- GHC specialises @measureOff maxBound@ to @maxBound :: Int@ from
+    -- @measureOff :: Int -> Text -> Int@.  Without that, @Data.Text.length
+    -- = negate . measureOff maxBound@ leaves @maxBound@ as an untagged
+    -- 'VClassMethod' and FFI / @I#@ patterns see @\<function\>@.  When the
+    -- callee has a known monomorphic first-arg type constructor, rewrite
+    -- @f maxBound@ → @f (maxBound :: T)@ so 'tryTypedNullaryClassMethod' can
+    -- resolve it.  Does NOT default unbound uses to Int (that poisoned
+    -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
-        fv  <- go f                            -- function to WHNF
-        xt  <- newThunkIP env ipm x            -- argument stays a thunk (lazy)
-        case fv of
+        x' <- annotateNullaryBoundedArg f x
+        goApp f x'
+      where
+        goApp f' x'' = do
+          fv  <- go f'                           -- function to WHNF
+          xt  <- newThunkIP env ipm x''          -- argument stays a thunk (lazy)
+          case fv of
             VPrimObj _ -> do
                 a <- force hooks xt
                 error ("IHC.Eval.go(EApp): VPrimObj in function position: "
@@ -1701,6 +1788,18 @@ matchPat hooks pat@(PCon "I#" [_]) (VCon c [t])
 matchPat hooks (PCon "I#" [p]) (VCon c [t])
     | bareConName c `elem` intSizedPrimCons =
         matchFields hooks [(p, t)] []
+-- Cross-rep: Word#/Word8# carriers often appear as the second operand of
+-- @fromIntegral n + (48 :: Word8)@ (http-date @i2w8@, PackInt @_0 + …@)
+-- while the left stays a bare 'VInt' after optimistic fromIntegral. Num
+-- Int's @(I# x) + (I# y)@ must accept the W8#/W# payload so the digit
+-- packing path does not PatternMatchFail with args=<int> W8# 48.
+matchPat hooks (PCon "I#" [p]) (VCon c [t])
+    | bareConName c `elem` wordSizedPrimCons =
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VCon "W#" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VCon "W8#" [t]) =
+    matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =

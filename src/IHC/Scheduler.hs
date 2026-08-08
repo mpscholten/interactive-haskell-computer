@@ -568,11 +568,19 @@ loadProgramFromSource searchPath src0 = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
+                    -- VIO ↔ State# bridges (RTS-exclusive).
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
                     , "addForeignPtrFinalizer"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "sendBuf", "recvBuf", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    -- closeFdWith: host-backed because IHC does not run
+                    -- GHC's RTS event manager (see Builtins registration).
+                    , "closeFdWith"
+                    -- Event/timer manager probes + timeout ops: host stubs
+                    -- for the RTS managers IHC does not run.
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
+                    -- Handle-text I/O + standard handles: host-backed until
+                    -- the source-level Handle ADT layer exists (see
+                    -- ffiBuiltinNames comment).
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
                     , "stdout", "stderr", "stdin"
                     ])
@@ -1649,8 +1657,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         alwaysBuiltinNames =
             Set.union ffiBuiltinNames
                 (Set.fromList
+                    -- Keep in sync with loadProgramFromSource's set:
+                    -- only names that still have host builtin registrations.
                     ["unIO", "ioToST", "unsafeIOToST", "stToIO", "unsafeSTToIO"
-                    , "socket", "setSocketOption", "listen", "accept", "getSocketName", "bind", "close", "close'", "withFdSocket", "closeFdWith", "fdSocket", "unsafeFdSocket"
+                    , "addForeignPtrFinalizer"
+                    , "closeFdWith"
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
@@ -2182,11 +2193,24 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                     v <- lazyMethodVal mn (Just lhs)
                     pure (mn, v))
                 methods
-    -- Register under the head type name (used by Bool/Int/Char/String
-    -- dispatch via 'typeTagOf' specializations).  Qualified instance heads
-    -- like @FoldCase B.ByteString@ intentionally keep their qualified key so
-    -- strict and lazy modules with the same abstract type name do not collide.
-    registerInstance classReg cls typ methodVals
+    -- Runtime constructors first: 'typeTagOf (VCon n _) = n' dispatches
+    -- on these.  Compute them before the type-name registration so we can
+    -- decide whether the bare type-name key is safe.
+    ctors <- instanceRuntimeCtors typ
+    -- Register under the head type name when needed for 'typeTagOf'
+    -- specializations (Bool/Maybe/…) or when the type name is itself a
+    -- runtime constructor (strict @Text@'s @Text@ ctor).  Skip when the
+    -- runtime ctors are a disjoint set — e.g. lazy @Text@ is
+    -- @Empty | Chunk@, so registering lazy @Eq Text@ under the bare
+    -- @"Text"@ key would overwrite the strict @Eq Text@ that
+    -- @VCon "Text" [arr,off,len]@ needs.  Same collision class as the
+    -- historical strict/lazy @ByteString@ bug (resolved there by the
+    -- @"BS"@ ctor key).  Qualified heads like @FoldCase B.ByteString@
+    -- keep their qualified key and still register (not in @ctors@ of
+    -- the bare name, but @typ@ is qualified so it won't collide with
+    -- bare @"Text"@ / @"ByteString"@).
+    when (shouldRegisterTypeNameKey typ ctors) $
+        registerInstance classReg cls typ methodVals
     -- Multi-parameter classes (e.g. @IsLabel "email" Wrap@,
     -- @SetField "name" User String@) need an additional registration
     -- under the full @[tag1, tag2, …]@ key so that callers like
@@ -2202,9 +2226,29 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- that 'typeTagOf (VCon n _) = n' lookups succeed.  For qualified type
     -- heads, resolve the qualifier through the owning module's imports and
     -- chase type re-exports to the module that defines the constructors.
-    ctors <- instanceRuntimeCtors typ
     mapM_ (\ctor -> registerInstance classReg cls ctor methodVals) ctors
   where
+
+    -- True when the bare/qualified type-name key must be published.
+    -- See the call-site comment: avoid lazy-Text-style poison of a
+    -- shared abstract name when runtime ctors already cover dispatch.
+    shouldRegisterTypeNameKey ty cs
+        | null cs = True
+        | ty `elem` cs = True
+        | ty `elem` typeTagSpecialNames = True
+        | otherwise = False
+
+    -- Type names that 'typeTagOf' normalises *to* from a different
+    -- constructor (True/False → Bool, Just/Nothing → Maybe, …).  Those
+    -- instances are only reachable via the type-name key.
+    typeTagSpecialNames =
+        map BC.pack
+            [ "Bool", "Ordering", "Maybe", "Either"
+            , "Integer", "Natural"
+            , "Word8", "Word16", "Word32", "Word64", "Word"
+            , "[]", "()", "(,)", "(,,)"
+            , "String", "Int", "Char", "Double"
+            ]
 
     instanceRuntimeCtors ty
         | Just inner <- wrappedStreamInputArg (BC.pack "ShareInput") ty =
@@ -4273,12 +4317,18 @@ classMethodDispatcher reg cls methodName = selfVal
         | clsName == BC.pack "IArray"
         , method `elem` map BC.pack ["unsafeArray", "array", "listArray", "accumArray", "genArray"] =
             [BC.pack "Arr.Array", BC.pack "Array"]
+        -- peekElemOff without a surviving result type: prefer Int (http-date
+        -- month/day tables, array peeks) before Char/Word8.  Pre-fix Char
+        -- was first, so unannotated @peekElemOff (p :: Ptr Int) i@ returned
+        -- VChar bytes; formatHTTPDate then died on @fromIntegral n + 48@
+        -- (I#/W8# args=<function> 48).  Marked Word8 buffers still take
+        -- tryStorableBytePeek before this fallback.
         | clsName == BC.pack "Storable"
         , method == BC.pack "peekElemOff" =
-            [BC.pack "Char"]
+            [BC.pack "Int", BC.pack "Word8", BC.pack "Char"]
         | clsName == BC.pack "Storable"
         , method == BC.pack "peekByteOff" =
-            [BC.pack "Word8"]
+            [BC.pack "Word8", BC.pack "Int", BC.pack "Char"]
         | clsName == BC.pack "Num"
         , method == BC.pack "fromInteger" =
             [BC.pack "Int", BC.pack "Integer"]
@@ -5734,7 +5784,7 @@ renderTypeForAnnotation = top
 ffiBuiltinNames :: Set ByteString
 ffiBuiltinNames = Set.fromList
     [ "hPutBuf"
-    , "withCString", "withCStringLen", "withCStringLen0"
+    , "withCString", "withCStringLen"
     , "peekCString", "newCString"
     , "addForeignPtrFinalizer"
     , "mallocPlainForeignPtrBytes", "mallocForeignPtrBytes"

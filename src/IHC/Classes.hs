@@ -315,7 +315,8 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
 --   * @42@       (a @Nat@ literal)   → @42@
 --   * @\'x\'@    (a @Char@ literal)   → @x@
 normalizeTyTag :: ByteString -> ByteString
-normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
+normalizeTyTag bs0 =
+    rewriteHeadSyn (stripQuotes (trimAscii (stripParens bs0)))
   where
     stripParens s
         | BC.length s >= 2
@@ -331,6 +332,25 @@ normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
         , BC.head s == '\''
         , BC.last s == '\''   = BC.init (BC.tail s)
         | otherwise           = s
+
+    -- Collapse type-application / synonym spellings so result-polymorphic
+    -- methods (@pure \@Parser@, @pure \@(Parsec Void Text)@, …) hit the
+    -- same instance key the source instance was registered under.
+    --   * take the head constructor of a multi-token type app
+    --   * @Parsec@ is @type Parsec e s = ParsecT e s Identity@
+    -- Preserve @ShareInput T@ / @NoShareInput T@ compound tags used by
+    -- megaparsec Stream dispatch (see 'tryStreamWrappedChunkMethod').
+    rewriteHeadSyn s
+        | BC.pack "ShareInput " `BC.isPrefixOf` s = s
+        | BC.pack "NoShareInput " `BC.isPrefixOf` s = s
+        | otherwise =
+            let headCon =
+                    case BC.break (\c -> c == ' ' || c == '\t') s of
+                        (h, _) | not (BC.null h) -> h
+                        _                        -> s
+            in case headCon of
+                h | h == BC.pack "Parsec" -> BC.pack "ParsecT"
+                h                         -> h
 
 -- | Return a stable string tag for the runtime type of a value.
 -- Used by dispatch builtins to find the right class instance.
