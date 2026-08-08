@@ -81,7 +81,6 @@ spec = describe "HsExt — Pattern extensions" $ do
 
     describe "PatternSynonyms" $ do
         it "PatternSynonyms: bidirectional pattern P x = Just x" $ do
-            pendingWith "needs LANGUAGE PatternSynonyms support"
             r <- parseModule
                 "{-# LANGUAGE PatternSynonyms #-}\n\
                 \module M where\n\
@@ -90,7 +89,6 @@ spec = describe "HsExt — Pattern extensions" $ do
             shouldParse r
 
         it "PatternSynonyms: uni-directional pattern Q x <- Just x" $ do
-            pendingWith "needs LANGUAGE PatternSynonyms support"
             r <- parseModule
                 "{-# LANGUAGE PatternSynonyms #-}\n\
                 \module M where\n\
@@ -99,7 +97,6 @@ spec = describe "HsExt — Pattern extensions" $ do
             shouldParse r
 
         it "PatternSynonyms: record pattern R {y} = T y" $ do
-            pendingWith "needs LANGUAGE PatternSynonyms support"
             r <- parseModule
                 "{-# LANGUAGE PatternSynonyms #-}\n\
                 \module M where\n\

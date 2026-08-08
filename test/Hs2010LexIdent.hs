@@ -113,18 +113,10 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
             shouldLexAs "as" (TkIdent "as")
         it "1.2.8 soft keyword `forall` is lexed as a plain identifier (ParserBugs Bug 3)" $
             shouldLexAs "forall" (TkIdent "forall")
-        it "1.2.8 soft keyword `qualified` usable as varid" $ do
-            r <- lexOne "qualified"
-            case r of
-                Right (TkIdent "qualified") -> pure ()
-                _ -> pendingWith
-                    "known gap: `qualified` is a hard keyword; cannot bind as varid"
-        it "1.2.8 soft keyword `hiding` usable as varid" $ do
-            r <- lexOne "hiding"
-            case r of
-                Right (TkIdent "hiding") -> pure ()
-                _ -> pendingWith
-                    "known gap: `hiding` is a hard keyword; cannot bind as varid"
+        it "1.2.8 soft keyword `qualified` usable as varid" $
+            shouldLexAs "qualified" (TkIdent "qualified")
+        it "1.2.8 soft keyword `hiding` usable as varid" $
+            shouldLexAs "hiding" (TkIdent "hiding")
         it "1.2.9 maximal munch: `cases` is one identifier" $
             shouldLexAs "cases" (TkIdent "cases")
         it "1.2.9 maximal munch: `lett` is one identifier (not let + t)" $
