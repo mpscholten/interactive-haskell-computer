@@ -419,8 +419,7 @@ mkDefault env src decl methodName =
     case Map.lookup methodName (classDefaults decl) of
         Just lhs -> do
             r <- try (do
-                        expr <- parseBodyExprWithFixity src defaultFixityTable
-                                    (lhsClauses lhs)
+                        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
                         t <- newThunk env expr
                         force legacyHooks t)
                     :: IO (Either SomeException Val)
@@ -484,7 +483,7 @@ evalInstanceMethods src env methods =
     HashMap.fromList <$> mapM evalOne methods
   where
     evalOne (methodName, lhs) = do
-        expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
         t    <- newThunk env expr
         v    <- force legacyHooks t
         pure (methodName, v)
@@ -663,7 +662,7 @@ parseLetBinding src name = do
     case mLhs of
         Nothing  -> throwIO (userError ("let: cannot parse binding for `"
                                          <> BC.unpack name <> "`"))
-        Just lhs -> parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        Just lhs -> parseBodyExprWithFixity src defaultFixityTable lhs
 
 tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> ClassRegistry -> String -> IO (Either String ())
 tryEvalExpr loadedRef importsRef fldReg env classReg input = do

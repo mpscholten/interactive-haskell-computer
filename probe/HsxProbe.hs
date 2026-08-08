@@ -174,7 +174,7 @@ reportBinding src fx ks name = do
     case mLhs of
         Nothing  -> pure ()
         Just lhs -> do
-            eExpr <- try (parseBodyExprWithFixity src fx (lhsClauses lhs))
+            eExpr <- try (parseBodyExprWithFixity src fx lhs)
                         :: IO (Either SomeException Expr)
             case eExpr of
                 Left ex -> hPutStrLn stderr $

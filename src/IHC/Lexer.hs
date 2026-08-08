@@ -113,12 +113,12 @@ data TokenKind
     | TkIn                    -- ^ keyword @in@
     | TkWhere                 -- ^ keyword @where@
     | TkDo                    -- ^ keyword @do@
+    | TkMDo                   -- ^ keyword @mdo@ (RecursiveDo)
     | TkData                  -- ^ keyword @data@
     | TkModule                -- ^ keyword @module@
     | TkImport                -- ^ keyword @import@
-    | TkQualified             -- ^ keyword @qualified@
-    -- No TkAs: 'as' is a soft keyword, see @keywordOr@ below.
-    | TkHiding                -- ^ keyword @hiding@
+    -- No TkQualified / TkAs / TkHiding: 'qualified', 'as', and 'hiding' are
+    -- soft keywords (see @keywordOr@); import parsing matches them by string.
     | TkNewtype               -- ^ keyword @newtype@
     | TkTypeKw                -- ^ keyword @type@
     | TkClass                 -- ^ keyword @class@
@@ -382,7 +382,8 @@ nextToken s c0 =
             _         -> (mkTok TkNewline start c, c)
 
     -- | Integer literal. Recognises decimal, hex (@0x@/@0X@), octal
-    -- (@0o@/@0O@). No exponent/float support yet.
+    -- (@0o@/@0O@), and binary (@0b@/@0B@, BinaryLiterals). Hex may continue
+    -- into a HexFloatLiterals form (@0x1.8p3@) — see 'lexHex'.
     lexInt start = case peekByte s (cPos start) of
         Just 0x30                                 -- leading '0'?
             | Just p <- peekByte s (cPos start + 1)
@@ -391,6 +392,9 @@ nextToken s c0 =
             | Just p <- peekByte s (cPos start + 1)
             , p == 0x6F || p == 0x4F              -- 'o' or 'O'
                 -> lexOct start
+            | Just p <- peekByte s (cPos start + 1)
+            , p == 0x62 || p == 0x42              -- 'b' or 'B'
+                -> lexBin start
         _ -> lexDec start
 
     lexDec start = go (cPos start)
@@ -490,6 +494,11 @@ nextToken s c0 =
     -- '_' between digits is a separator. @skipUnder@ consumes at most one
     -- underscore followed by a hex digit; we re-enter the digit loop
     -- whenever we see one.
+    --
+    -- HexFloatLiterals: after the integer hex digits (possibly none, for
+    -- @0x.8p3@), a @.@+hexdigit fraction and/or a binary exponent @p@/@P@
+    -- produces a 'TkFloat'. Value = mantissa * 2^exponent, where mantissa
+    -- is the hex integer+fraction interpreted as a real.
     lexHex start = go (cPos start + 2) 0
       where
         go p !acc = case peekByte s p of
@@ -498,9 +507,103 @@ nextToken s c0 =
                 | Just b2 <- peekByte s (p + 1)
                 , isHexDigit b2
                 -> go (p + 1) acc
+            _ -> finishHex p acc
+
+        finishHex p acc =
+            let hasFrac = case peekByte s p of
+                    Just 0x2E
+                        | Just b2 <- peekByte s (p + 1)
+                        , isHexDigit b2
+                        -> True
+                    _ -> False
+                hasPow = case peekByte s p of
+                    Just e | e == 0x70 || e == 0x50  -- 'p' or 'P'
+                           , validExponentAt (p + 1)
+                        -> True
+                    _ -> False
+            in if hasFrac || hasPow
+                then lexHexFloat start acc p
+                else if p == cPos start + 2
+                    then
+                        -- '0x' with no digits: fall back to decimal 0, leave 'x...'
+                        -- to the next call. Should not happen in practice.
+                        let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
+                        in (mkTok (TkInt 0) start end, end)
+                    else
+                        let p'  = skipHashes p
+                            end = Cursor p' (cLine start) (cCol start + (p' - cPos start))
+                        in (mkTok (TkInt acc) start end, end)
+
+        skipHashes p = case peekByte s p of
+            Just 0x23 -> skipHashes (p + 1)   -- '#'
+            _         -> p
+
+    -- | Hex float: mantissa is @intPart@ (hex integer already consumed) plus
+    -- optional @.hexfrac@ starting at @p0@, then required binary exponent
+    -- @p@/@P@ with optional sign and decimal digits.
+    lexHexFloat start intPart p0 =
+        let (p1, frac) = case peekByte s p0 of
+                Just 0x2E
+                    | Just b2 <- peekByte s (p0 + 1)
+                    , isHexDigit b2
+                    -> goFrac (p0 + 1) 0 0
+                _ -> (p0, 0.0)
+            mantissa = fromIntegral intPart + frac :: Double
+            (line, col) = lineCol s p1
+        in case peekByte s p1 of
+            Just e | (e == 0x70 || e == 0x50)    -- 'p' or 'P'
+                   , validExponentAt (p1 + 1)
+                -> let (sign, p2) = case peekByte s (p1 + 1) of
+                                        Just 0x2B -> (1,  p1 + 2)   -- '+'
+                                        Just 0x2D -> (-1, p1 + 2)   -- '-'
+                                        _         -> (1,  p1 + 1)
+                       (p3, expAcc) = goDecExp p2 0
+                       exponent = sign * expAcc
+                       d = scaleByPow2 mantissa exponent
+                       end = Cursor p3 (cLine start) (cCol start + (p3 - cPos start))
+                   in (mkTok (TkFloat d) start end, end)
+            _ -> throw (LexError (srcName s) line col
+                        "hex float literal requires binary exponent (p/P)")
+      where
+        -- Consume hex fraction digits; return (endPos, fractional value in [0,1)).
+        goFrac p !acc !places = case peekByte s p of
+            Just b | isHexDigit b ->
+                goFrac (p + 1) (acc * 16 + fromIntegral (hexVal b)) (places + 1)
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , isHexDigit b2
+                -> goFrac (p + 1) acc places
+            _ ->
+                let frac = if places == 0
+                              then 0.0
+                              else fromIntegral acc / (16.0 ^ places)
+                in (p, frac)
+        -- Decimal digits of the binary exponent (NumericUnderscores ok).
+        goDecExp p !acc = case peekByte s p of
+            Just b | isDigit b ->
+                goDecExp (p + 1) (acc * 10 + fromIntegral (b - 0x30))
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , isDigit b2
+                -> goDecExp (p + 1) acc
+            _ -> (p, acc)
+
+    -- | @mantissa * 2^exponent@ for hex-float evaluation.
+    scaleByPow2 :: Double -> Integer -> Double
+    scaleByPow2 m e
+        | e >= 0    = m * fromIntegral ((2 :: Integer) ^ e)
+        | otherwise = m / fromIntegral ((2 :: Integer) ^ negate e)
+
+    lexOct start = go (cPos start + 2) 0
+      where
+        go p !acc = case peekByte s p of
+            Just b | b >= 0x30 && b <= 0x37 ->
+                go (p + 1) (acc * 8 + fromIntegral (b - 0x30))
+            Just 0x5F
+                | Just b2 <- peekByte s (p + 1)
+                , b2 >= 0x30 && b2 <= 0x37
+                -> go (p + 1) acc
             _ | p == cPos start + 2 ->
-                    -- '0x' with no digits: fall back to decimal 0, leave 'x...'
-                    -- to the next call. Should not happen in practice.
                     let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
                     in (mkTok (TkInt 0) start end, end)
               | otherwise ->
@@ -511,14 +614,16 @@ nextToken s c0 =
             Just 0x23 -> skipHashes (p + 1)   -- '#'
             _         -> p
 
-    lexOct start = go (cPos start + 2) 0
+    -- | BinaryLiterals: @0b@/@0B@ followed by binary digits (and optional
+    -- NumericUnderscores separators).
+    lexBin start = go (cPos start + 2) 0
       where
         go p !acc = case peekByte s p of
-            Just b | b >= 0x30 && b <= 0x37 ->
-                go (p + 1) (acc * 8 + fromIntegral (b - 0x30))
+            Just b | b == 0x30 || b == 0x31 ->
+                go (p + 1) (acc * 2 + fromIntegral (b - 0x30))
             Just 0x5F
                 | Just b2 <- peekByte s (p + 1)
-                , b2 >= 0x30 && b2 <= 0x37
+                , b2 == 0x30 || b2 == 0x31
                 -> go (p + 1) acc
             _ | p == cPos start + 2 ->
                     let end = Cursor (cPos start + 1) (cLine start) (cCol start + 1)
@@ -887,6 +992,7 @@ nextToken s c0 =
         "then"      -> TkThen
         "else"      -> TkElse
         "do"        -> TkDo
+        "mdo"       -> TkMDo
         "let"       -> TkLet
         "in"        -> TkIn
         "where"     -> TkWhere
@@ -895,14 +1001,15 @@ nextToken s c0 =
         "data"      -> TkData
         "module"    -> TkModule
         "import"    -> TkImport
-        "qualified" -> TkQualified
-        -- 'as' is a soft keyword: it is only meaningful in `import Foo as Bar`
-        -- context. Everywhere else (e.g. `let as = 42` in lens) it is a
-        -- plain identifier. We emit TkIdent so expression/binding parsers
-        -- never trip over it. The module-header parser explicitly checks for
-        -- the *string* "as" when it needs the keyword semantics.
+        -- Soft keywords: only meaningful in a specific syntactic context
+        -- (import headers for qualified/as/hiding; type signatures for
+        -- forall). Everywhere else they are plain identifiers so user
+        -- code can bind them (e.g. `let hiding = 1`). We emit TkIdent
+        -- and let the relevant parsers match the *string* when they
+        -- need the keyword semantics.
+        "qualified" -> TkIdent "qualified"
         "as"        -> TkIdent "as"
-        "hiding"    -> TkHiding
+        "hiding"    -> TkIdent "hiding"
         "newtype"   -> TkNewtype
         "type"      -> TkTypeKw
         "class"     -> TkClass
@@ -911,11 +1018,6 @@ nextToken s c0 =
         "infixl"    -> TkInfixL
         "infixr"    -> TkInfixR
         "infix"     -> TkInfix
-        -- 'forall' is a soft keyword: only meaningful in type-signature
-        -- contexts (RankNTypes, ExistentialQuantification). User code
-        -- is allowed to bind it as a value identifier. We emit TkIdent
-        -- and let the type-level scanners explicitly match the *string*
-        -- "forall" when they need the quantifier semantics.
         "forall"    -> TkIdent "forall"
         "_"         -> TkUnderscore
         _           -> TkIdent bs

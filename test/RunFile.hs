@@ -16,7 +16,7 @@ import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
 import IHC.Eval (force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
-import IHC.Scan (BindingLhs(..), emptyKnownSymbols, findBinding)
+import IHC.Scan (emptyKnownSymbols, findBinding)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (readSourceFile)
 import IHC.Val (Val(..))
@@ -640,7 +640,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         src <- readSourceFile "test/Fixtures/Phase26/bang_infix_do_let.hs"
         known <- emptyKnownSymbols
         Just lhs <- findBinding src known "main"
-        expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
         let rendered = show expr
         rendered `shouldSatisfy` isInfixOf "EVar \"!\""
         rendered `shouldSatisfy` isInfixOf "handle100Continue"

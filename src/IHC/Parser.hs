@@ -49,7 +49,7 @@ import Data.Map.Strict (Map)
 
 import IHC.AST
 import IHC.Lexer
-import IHC.Scan (Clause(..))
+import IHC.Scan (BindingLhs(..), Clause(..))
 import IHC.Source
 import IHC.StringUtils (isAsciiSpace)
 
@@ -257,13 +257,30 @@ data Ctx = Ctx
 -- | Parse all clauses with the default fixity table. Kept so existing
 -- scheduler call sites keep working without passing a table.
 parseBodyExpr :: Source -> [Clause] -> IO Expr
-parseBodyExpr src = parseBodyExprWithFixity src defaultFixityTable
+parseBodyExpr src clauses = parseBodyExprWithFixity src defaultFixityTable (funLhs clauses)
+  where
+    -- Local reimplementation so callers that only have clauses still work
+    -- without importing Scan.funLhs (kept private to Scan).
+    funLhs cs = BindingLhs cs Nothing
 
-parseBodyExprWithFixity :: Source -> FixityTable -> [Clause] -> IO Expr
-parseBodyExprWithFixity src _ [] = throwIO (ParseError
+-- | Parse a binding body from its scanned 'BindingLhs'.  Ordinary function
+-- bindings desugar via multi-clause matching; pattern-binding projections
+-- (@lhsPatVar = Just v@) desugar to @case rhs of { ~pat -> v }@.
+parseBodyExprWithFixity :: Source -> FixityTable -> BindingLhs -> IO Expr
+parseBodyExprWithFixity src fx (BindingLhs _clauses (Just var)) =
+    case _clauses of
+        [cl] -> parsePatBindProjection src fx var cl
+        _    -> throwIO (ParseError
+            { peFile = srcName src, peLine = 0, peCol = 0
+            , peMsg  = "pattern-binding projection expects exactly one clause" })
+parseBodyExprWithFixity src fx (BindingLhs clauses Nothing) =
+    parseClausesBody src fx clauses
+
+parseClausesBody :: Source -> FixityTable -> [Clause] -> IO Expr
+parseClausesBody src _ [] = throwIO (ParseError
     { peFile = srcName src, peLine = 0, peCol = 0
     , peMsg  = "empty clause list" })
-parseBodyExprWithFixity src fx clauses = liftLex $ do
+parseClausesBody src fx clauses = liftLex $ do
     parsed <- mapM (parseClause src fx) clauses
     let arity = case parsed of
             ((ps, _) : _) -> length ps
@@ -276,6 +293,30 @@ parseBodyExprWithFixity src fx clauses = liftLex $ do
                         , peMsg  = "clauses have differing arities" }))
           parsed
     pure (desugarClauses parsed arity)
+
+-- | Desugar a top-level pattern binding projection for @var@.
+-- @(a, b) | True = (1, 2)@ looking up @a@ becomes
+-- @case <guarded-rhs> of { ~(a, b) -> a }@ (Report §3.12 irrefutable).
+parsePatBindProjection :: Source -> FixityTable -> Name -> Clause -> IO Expr
+parsePatBindProjection src fx var (Clause patsSpan rhsSpan) = liftLex $ do
+    let (coreSpan, mWhere) = splitOnWhere src rhsSpan
+    whereBinds <- case mWhere of
+        Nothing -> pure []
+        Just ws -> parseBindingsIn src fx ws
+    pat <- parsePatIn src fx patsSpan
+    rhs <- parseRhsIn src fx coreSpan
+    let failExpr = EApp (EVar "error")
+                        (stringToConsList "Non-exhaustive pattern in pattern binding")
+        body0 = case rhs of
+            RhsPlain e     -> e
+            RhsGuards brs  -> guardChain brs failExpr
+        body = case whereBinds of
+            [] -> body0
+            bs -> ELet bs body0
+    pure $ ECase body
+        [ Alt (PIrref pat) (EVar var)
+        , Alt PWild failExpr
+        ]
 
 -- | Parse a single expression from raw bytes — intended for REPL input.
 -- The entire source is treated as one expression (no binding LHS, no `=`).
@@ -318,6 +359,9 @@ data Rhs
 data Guard
     = GuardExpr !Expr
     | GuardPat !Pat !Expr
+    -- | Local-declaration guard @| let decls@ (Haskell 2010 §3.13 / §4.4.3).
+    -- Desugars to @let decls in <rest of guard chain / body>@.
+    | GuardLet ![Bind]
 
 parseClause :: Source -> FixityTable -> Clause -> IO ParsedClause
 parseClause src fx (Clause patsSpan rhsSpan) = do
@@ -334,6 +378,7 @@ parseClause src fx (Clause patsSpan rhsSpan) = do
         wrapGuard = \case
             GuardExpr g   -> GuardExpr (wrapWhere g)
             GuardPat p ge -> GuardPat p (wrapWhere ge)
+            GuardLet bs   -> GuardLet [ (n, wrapWhere e) | (n, e) <- bs ]
     let rhs' = case rhs of
             RhsPlain e    -> RhsPlain  (wrapWhere e)
             RhsGuards ges -> RhsGuards [(map wrapGuard gs, wrapWhere b) | (gs, b) <- ges]
@@ -648,6 +693,7 @@ wrapRhsWhereBinds bs r = case r of
   where
     wrapG (GuardExpr g)   = GuardExpr (ELet bs g)
     wrapG (GuardPat p ge) = GuardPat p (ELet bs ge)
+    wrapG (GuardLet gs)   = GuardLet (gs ++ bs)
 
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do
@@ -691,17 +737,26 @@ parseGuardList :: Ctx -> Cursor -> IO ([Guard], Cursor)
 parseGuardList ctx cur0 = go cur0 []
   where
     go cur acc = do
-        patAttempt <- try (parseTopPat ctx cur) :: IO (Either ParseError (Pat, Cursor))
-        case patAttempt of
-            Right (pat, curPat) ->
-                let (tok, curAfterTok) = nextSig ctx curPat in
-                case tkKind tok of
-                    TkLArrow -> do
-                        (rhs, curRhs) <- parseExpr ctx curAfterTok
-                        continue curRhs (GuardPat pat rhs : acc)
-                    _ -> parseBoolGuard cur acc
-            Left _ ->
-                parseBoolGuard cur acc
+        -- Local-decl guard: @| let decls@ (no @in@).  Must win over the
+        -- expression path, which would otherwise parse @let@ as a full
+        -- @let … in …@ expression and fail with "expected `in`".
+        let (peekTok, peekCur) = nextSig ctx cur
+        case tkKind peekTok of
+            TkLet -> do
+                (binds, curBinds) <- parseGuardLetBinds ctx peekCur
+                continue curBinds (GuardLet binds : acc)
+            _ -> do
+                patAttempt <- try (parseTopPat ctx cur) :: IO (Either ParseError (Pat, Cursor))
+                case patAttempt of
+                    Right (pat, curPat) ->
+                        let (tok, curAfterTok) = nextSig ctx curPat in
+                        case tkKind tok of
+                            TkLArrow -> do
+                                (rhs, curRhs) <- parseExpr ctx curAfterTok
+                                continue curRhs (GuardPat pat rhs : acc)
+                            _ -> parseBoolGuard cur acc
+                    Left _ ->
+                        parseBoolGuard cur acc
 
     -- Boolean guards must also accept a trailing comma so that
     -- @| cond1, cond2 = …@ and @| cond, p <- e = …@ parse.  Previously
@@ -717,6 +772,123 @@ parseGuardList ctx cur0 = go cur0 []
         case tkKind tok of
             TkComma -> go curNext acc
             _       -> pure (reverse acc, cur)
+
+-- | Parse the declaration list of a local-decl guard after consuming @let@.
+-- Bindings only — no @in@.  Layout or braced.  Stops before the next
+-- guard separator (@,@) or the guard-list terminator (@=@ / @->@ / @|@).
+parseGuardLetBinds :: Ctx -> Cursor -> IO ([Bind], Cursor)
+parseGuardLetBinds ctx cur0 = do
+    let (firstTok, _) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkLBrace -> bracedGuardLet ctx cur0
+        TkEof    -> pure ([], cur0)
+        _        -> do
+            let bindCol = tkCol firstTok
+            layoutGuardLet ctx bindCol cur0 []
+  where
+    bracedGuardLet c cur = do
+        let (tok, cur1) = nextSig c cur
+        case tkKind tok of
+            TkLBrace -> bracedItems c cur1 []
+            _        -> parseErr c "expected `{` after `let` in guard" tok
+
+    bracedItems c cur acc
+        | cPos cur >= ctxEnd c = pure (reverse acc, cur)
+        | otherwise = do
+            let (tok, _) = nextSig c cur
+            case tkKind tok of
+                TkRBrace -> do
+                    let (_, cur') = nextSig c cur
+                    pure (reverse acc, cur')
+                TkEof -> pure (reverse acc, cur)
+                _ -> do
+                    (bs, cur1) <- parseOneGuardLetBind c (tkCol tok) cur
+                    let (sep, cur2) = nextSig c cur1
+                    case tkKind sep of
+                        TkSemi   -> bracedItems c cur2 (reverse bs ++ acc)
+                        TkRBrace -> pure (reverse (reverse bs ++ acc), cur2)
+                        _        -> bracedItems c cur1 (reverse bs ++ acc)
+
+    layoutGuardLet c bindCol cur acc = do
+        let (peek, _) = nextSig c cur
+        case tkKind peek of
+            TkEof   -> pure (reverse acc, cur)
+            -- Guard-list separators / terminators end the let decls.
+            TkComma -> pure (reverse acc, cur)
+            TkBar   -> pure (reverse acc, cur)
+            TkEq    -> pure (reverse acc, cur)
+            TkArrow -> pure (reverse acc, cur)
+            _ | tkCol peek > 0 && tkCol peek < bindCol ->
+                  pure (reverse acc, cur)
+              | tkCol peek == bindCol || null acc -> do
+                  (bs, cur1) <- parseOneGuardLetBind c bindCol cur
+                  layoutGuardLet c bindCol cur1 (reverse bs ++ acc)
+              | otherwise ->
+                  pure (reverse acc, cur)
+
+    -- One @name [pats] = expr@ (or guarded) binding inside a guard-let.
+    parseOneGuardLetBind c bindCol cur = do
+        let rhsCtx = c { ctxMinCol = max (ctxMinCol c) bindCol }
+            (nameTok, cur1) = nextSig c cur
+        case tkKind nameTok of
+            TkIdent n -> do
+                (params, cur2) <- collectLetParams c cur1 []
+                let (sepTok, cur3) = nextSig c cur2
+                (rhs, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (e, curE) <- parseExpr rhsCtx cur3
+                        pure (RhsPlain e, curE)
+                    TkBar -> do
+                        (branches, curE) <- parseLetGuardBranchesInGuard c rhsCtx cur3 []
+                        pure (RhsGuards branches, curE)
+                    _ -> parseErr c "expected `=` or `|` in guard-let binding" sepTok
+                pure ([(n, desugarClauses [(params, rhs)] (length params))], cur4)
+            _ | startsPat (tkKind nameTok) -> do
+                (pat, cur2) <- parseTopPat c cur
+                let (eqTok, cur3) = nextSig c cur2
+                case tkKind eqTok of
+                    TkEq -> do
+                        (e, cur4) <- parseExpr rhsCtx cur3
+                        let tmpName = BC.pack ("$glet" ++ show bindCol)
+                            vars = guardLetPatVars pat
+                            perVar v =
+                                ( v
+                                , ECase (EVar tmpName)
+                                    [ Alt (PIrref pat) (EVar v)
+                                    , Alt PWild (EApp (EVar "error")
+                                                  (stringToConsList
+                                                    "Non-exhaustive pattern in guard let"))
+                                    ]
+                                )
+                        pure ((tmpName, e) : map perVar vars, cur4)
+                    _ -> parseErr c "expected `=` in guard-let pattern binding" eqTok
+              | otherwise ->
+                parseErr c "expected identifier or pattern after `let` in guard" nameTok
+
+    parseLetGuardBranchesInGuard c rhsCtx cur acc = do
+        (gs, cur1) <- parseGuardList c cur
+        let (eqTok, cur2) = nextSig c cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr c "expected `=` after guard in guard-let" eqTok
+        (b, cur3) <- parseExpr rhsCtx cur2
+        let acc' = acc ++ [(gs, b)]
+            (sep, cur4) = nextSig c cur3
+        case tkKind sep of
+            TkBar -> parseLetGuardBranchesInGuard c rhsCtx cur4 acc'
+            _     -> pure (acc', cur3)
+
+    guardLetPatVars (PVar n)        = [n]
+    guardLetPatVars (PAs n p)       = n : guardLetPatVars p
+    guardLetPatVars (PBang p)       = guardLetPatVars p
+    guardLetPatVars (PIrref p)      = guardLetPatVars p
+    guardLetPatVars (PTuple ps)     = concatMap guardLetPatVars ps
+    guardLetPatVars (PCon _ ps)     = concatMap guardLetPatVars ps
+    guardLetPatVars (PRecord _ fps) = concatMap (guardLetPatVars . snd) fps
+    guardLetPatVars (PRecordWild _) = []
+    guardLetPatVars (PView _ p)     = guardLetPatVars p
+    guardLetPatVars PWild           = []
+    guardLetPatVars (PLit _)        = []
 
 --------------------------------------------------------------------------------
 -- Clause desugaring
@@ -791,6 +963,12 @@ guardStep (GuardPat p scrut : rest) body fb =
         [ Alt p (guardStep rest body fb)
         , Alt PWild fb
         ]
+-- Local-decl guard: introduce the binds around the remainder of the
+-- guard chain and body (Haskell 2010 §3.13).
+guardStep (GuardLet binds : rest) body fb =
+    case binds of
+        [] -> guardStep rest body fb
+        bs -> ELet bs (guardStep rest body fb)
 
 matchPatterns :: [(Pat, Name)] -> Expr -> Expr -> Expr
 matchPatterns [] body _ = body
@@ -1000,6 +1178,7 @@ parseBindingsIn src fx (start, end) = do
                     wrapGuard = \case
                         GuardExpr g   -> GuardExpr (wrap g)
                         GuardPat p ge -> GuardPat p (wrap ge)
+                        GuardLet bs   -> GuardLet [ (n, wrap e) | (n, e) <- bs ]
                     rhs' = case rhs of
                         RhsPlain e    -> RhsPlain (wrap e)
                         RhsGuards ges -> RhsGuards [(map wrapGuard gs, wrap b) | (gs, b) <- ges]
@@ -1348,6 +1527,10 @@ parseExprNoSig ctx cur0 = do
     case tkKind tok of
         TkIf        -> parseIf ctx cur1
         TkDo        -> parseDo ctx cur1
+        -- RecursiveDo: non-recursive mdo desugars like do (sufficient for
+        -- the common case with no cross-bind recursion). Full mfix
+        -- desugaring is future work.
+        TkMDo       -> parseDo ctx cur1
         TkLet       -> parseLet ctx cur1
         TkCase      -> parseCase ctx cur1
         TkBackslash -> parseLambda ctx cur1
@@ -1875,6 +2058,7 @@ parseStmt ctx cur0 = do
                   , tkCol t <= ctxMinCol ctx -> False
                 TkLArrow | par == 0 && br == 0 && brace == 0 -> True
                 TkDo | par == 0 && br == 0 && brace == 0 -> False
+                TkMDo | par == 0 && br == 0 && brace == 0 -> False
                 TkIf | par == 0 && br == 0 && brace == 0 -> False
                 TkLet | par == 0 && br == 0 && brace == 0 -> False
                 TkCase | par == 0 && br == 0 && brace == 0 -> False
@@ -3499,6 +3683,7 @@ parseBinOp ctx minBp cur0 = do
             TkBackslash  -> True
             TkIf         -> True
             TkDo         -> True
+            TkMDo        -> True
             TkLet        -> True
             TkCase       -> True
             k            -> startsAtom k
@@ -3762,6 +3947,7 @@ parseUnary ctx cur0 = do
             pure (ENeg e, cur2)
         TkIf         -> parseIf         ctx cur1
         TkDo         -> parseDo         ctx cur1
+        TkMDo        -> parseDo         ctx cur1  -- RecursiveDo: same as do for non-recursive case
         TkLet        -> parseLet        ctx cur1
         TkCase       -> parseCase       ctx cur1
         TkBackslash  -> parseLambda     ctx cur1
@@ -3850,6 +4036,7 @@ parseApp ctx cur0 = do
 
     isBlockArgStart k = case k of
         TkDo        -> True
+        TkMDo       -> True
         TkCase      -> True
         TkIf        -> True
         TkLet       -> True
@@ -3860,6 +4047,7 @@ parseApp ctx cur0 = do
         let (tok, cur1) = nextSig c cur
         case tkKind tok of
             TkDo        -> parseDo     c cur1
+            TkMDo       -> parseDo     c cur1  -- RecursiveDo: same as do for non-recursive case
             TkCase      -> parseCase   c cur1
             TkIf        -> parseIf     c cur1
             TkLet       -> parseLet    c cur1
