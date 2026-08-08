@@ -583,6 +583,17 @@ parseRhsIn src fx (start, end) = do
             TkBar -> parseGuards ctx cur4 ((gs, b) : acc)
             _     -> pure (reverse ((gs, b) : acc))
 
+-- | Parse a comma-separated list of guards after @|@ (Haskell Report
+-- §3.13 / §4.4.3.1).  Each element is either a boolean guard (@expr@)
+-- or a pattern guard (@pat <- expr@).  Mixed lists are allowed, e.g.
+--
+-- > | lf > 3*lr + 1, i <- div (lf + lr) 2, (f',f'') <- splitAt i f = …
+-- > | i + grain < j, k <- i + shiftR (j - i) 1 = …
+-- > | isStaticTree node, isNonTrivialStaticNode node = …
+--
+-- Used by function-equation RHS guards, let/where guards, and case-alt
+-- guards.  Stops (without consuming) at the token that terminates the
+-- list — typically @=@ for equations or @->@ for case alts.
 parseGuardList :: Ctx -> Cursor -> IO ([Guard], Cursor)
 parseGuardList ctx cur0 = go cur0 []
   where
@@ -599,9 +610,14 @@ parseGuardList ctx cur0 = go cur0 []
             Left _ ->
                 parseBoolGuard cur acc
 
+    -- Boolean guards must also accept a trailing comma so that
+    -- @| cond1, cond2 = …@ and @| cond, p <- e = …@ parse.  Previously
+    -- only pattern guards continued on @,@ — boolean guards returned
+    -- immediately, so the next token was @,@ and the caller reported
+    -- "expected `=` after guard; saw TkComma".
     parseBoolGuard cur acc = do
         (g, cur1) <- parseExpr ctx cur
-        pure (reverse (GuardExpr g : acc), cur1)
+        continue cur1 (GuardExpr g : acc)
 
     continue cur acc = do
         let (tok, curNext) = nextSig ctx cur
