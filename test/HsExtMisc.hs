@@ -103,6 +103,28 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
             r <- parseExprStrict "$$(foo)"
             assertParsesOrPending "known gap: typed splice $$(...) not yet supported" r
 
+        -- Name quotes (TemplateHaskellQuotes): 'varid, 'Conid, '(op).
+        -- lens Control.Lens.Internal.TH uses these for pureValName etc.
+        it "TH: 'pure name quote parses" $ do
+            r <- parseExprStrict "'pure"
+            assertParses r
+
+        it "TH: 'Left name quote parses" $ do
+            r <- parseExprStrict "'Left"
+            assertParses r
+
+        it "TH: '(.) parenthesized operator name quote parses" $ do
+            r <- parseExprStrict "'(.)"
+            assertParses r
+
+        it "TH: '(<*>) parenthesized operator name quote parses" $ do
+            r <- parseExprStrict "'(<*>)"
+            assertParses r
+
+        it "TH: 'fmap name quote yields EVar" $ do
+            e <- parseExprAtEof (mkSource "<test>" "'fmap") defaultFixityTable
+            e `shouldBe` EVar "fmap"
+
     describe "QuasiQuotes" $ do
         it "QQ: [hsx| <h1>hi</h1> |] parses" $ do
             r <- parseExprStrict "[hsx| <h1>hi</h1> |]"
