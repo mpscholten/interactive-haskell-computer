@@ -11883,7 +11883,9 @@ desugarRecordPats fldReg = goExpr
         -- Con {..} binds each field to a variable with the same name.
         let allFields = conFields fldReg conName
             subPats   = [PVar fname | (fname, _) <- allFields]
-        in PCon conName subPats
+        in if null allFields
+            then PRecordWild conName  -- field registry empty; matchPat handles
+            else PCon conName subPats
     goPat (PView fn p)     = PView (goExpr fn) (goPat p)  -- nested view (unusual)
     goPat (PCon n ps)      = PCon n (map goPat ps)
     goPat (PAs n p)        = PAs n (goPat p)

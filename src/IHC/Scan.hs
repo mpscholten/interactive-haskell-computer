@@ -1977,7 +1977,22 @@ scanDataDecls src
             -- 'forall' is a soft keyword (now lexed as TkIdent), so match by name.
             TkIdent "forall" -> do
                 curAfterDot <- skipForallBinders cur'
-                collectCtors tyName cIdx (dReg, fReg) curAfterDot
+                -- After forall, check for constraint context (C a, ...) =>
+                -- and skip it if present.  Handle__'s existential form is:
+                --   forall dev ... . (RawIO dev, ...) => Handle__ { ... }
+                let (peekTok, _) = nextToken src curAfterDot
+                curAfterConstraint <- case tkKind peekTok of
+                    TkLParen -> do
+                        isC <- checkIfConstraint curAfterDot
+                        if isC
+                            then skipConstraintContext curAfterDot
+                            else pure curAfterDot
+                    _ -> do
+                        isC <- checkIfConstraint curAfterDot
+                        if isC
+                            then skipConstraintContext curAfterDot
+                            else pure curAfterDot
+                collectCtors tyName cIdx (dReg, fReg) curAfterConstraint
             TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             -- A '(' at constructor-start is usually an infix constructor,
             -- but it can also begin a tuple constraint context of an
