@@ -2391,9 +2391,20 @@ parseLet ctx cur0 = do
                         (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
                         pure (RhsGuards branches, c)
                     _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+                -- Nested where on a let binding (bytestring foldl'/foldr'):
+                --   let g ptr = go v ptr
+                --         where
+                --           end = ptr `plusForeignPtr` len
+                --           go !z !p | p == end = return z
+                --                    | otherwise = ...
+                --   in accursedUnutterablePerformIO (g fp)
+                -- Without this, the let parser expects `in` after the RHS
+                -- and dies with "expected `in` in let-binding; saw TkWhere",
+                -- leaving S.foldl' unresolved → warp request-path hang.
+                (rhs1, cur5) <- attachLetWhere rhs0 cur4
                 (moreClauses, curFinal) <-
-                    collectMoreLetClauses bindCol n cur4 []
-                let allClauses = (params0, rhs0) : moreClauses
+                    collectMoreLetClauses bindCol n cur5 []
+                let allClauses = (params0, rhs1) : moreClauses
                     e = desugarClauses allClauses (length params0)
                 pure (Left (n, e), curFinal)
             _ | startsPat (tkKind nameTok) -> do
@@ -2434,7 +2445,7 @@ parseLet ctx cur0 = do
                 let (_, cur1) = nextSig ctx cur   -- consume name
                 (params, cur2) <- collectLetParams ctx cur1 []
                 let (sepTok, cur3) = nextSig ctx cur2
-                (rhs, cur4) <- case tkKind sepTok of
+                (rhs0, cur4) <- case tkKind sepTok of
                     TkEq -> do
                         (e, c) <- parseExpr rhsCtx cur3
                         pure (RhsPlain e, c)
@@ -2444,9 +2455,54 @@ parseLet ctx cur0 = do
                     _ -> parseErr ctx
                             "expected `=` or `|` in multi-clause let-binding"
                             sepTok
-                collectMoreLetClauses bindCol name cur4
+                (rhs, cur5) <- attachLetWhere rhs0 cur4
+                collectMoreLetClauses bindCol name cur5
                     (acc ++ [(params, rhs)])
             _ -> pure (acc, cur)
+
+    -- | Consume a trailing @where@ attached to a single let-binding equation
+    -- and wrap the RHS with those local binds (as nested 'ELet').  Mirrors
+    -- 'attachDoLetWhere' for expression-level @let … in …@.  Required for
+    -- bytestring's @foldl'@ / @foldr'@ / @any@-style nested-where loops.
+    attachLetWhere rhs cur = do
+        let (peekWhere, curAfterWhere) = nextSig ctx cur
+        case tkKind peekWhere of
+            TkWhere -> do
+                let whereTokCol = tkCol peekWhere
+                    (whereEndPos, curEnd) = findLetWhereBlockEnd whereTokCol curAfterWhere
+                if cPos curAfterWhere >= whereEndPos
+                    then pure (rhs, cur)
+                    else do
+                        binds <- parseBindingsIn (ctxSrc ctx) (ctxFixity ctx)
+                                                 (cPos curAfterWhere, whereEndPos)
+                        pure (wrapLetWhereBinds binds rhs, curEnd)
+            _ -> pure (rhs, cur)
+
+    findLetWhereBlockEnd whereTokCol startCur = go startCur
+      where
+        go c
+            | cPos c >= ctxEnd ctx = (ctxEnd ctx, c)
+            | otherwise =
+                let (t, c') = nextToken (ctxSrc ctx) c in
+                case tkKind t of
+                    TkEof     -> (cPos c, c)
+                    TkNewline -> go c'
+                    _ | tkCol t <= whereTokCol ->
+                          (tkStart t, Cursor (tkStart t) (tkLine t) (tkCol t))
+                      | otherwise -> go c'
+
+    wrapLetWhereBinds [] r = r
+    wrapLetWhereBinds bs r = case r of
+        RhsPlain e    -> RhsPlain (ELet bs e)
+        RhsGuards ges -> RhsGuards
+            [ ( map (wrapLetWhereGuard bs) gs
+              , ELet bs b
+              )
+            | (gs, b) <- ges
+            ]
+
+    wrapLetWhereGuard bs (GuardExpr g)   = GuardExpr (ELet bs g)
+    wrapLetWhereGuard bs (GuardPat p ge) = GuardPat p (ELet bs ge)
 
     -- Collect layout-mode let items (bindings and pattern bindings).
     -- All items must be at `bindCol`.
