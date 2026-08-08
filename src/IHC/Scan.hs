@@ -471,24 +471,34 @@ peekInfixOp src cur =
                 TkPrimId op | primIdIsValueLevel op -> closedByBacktick op
                 _ -> Nothing
         -- Immediately followed by '@'-prefixed op: `arg @?= ...`
+        -- Also recombine mid-@ continuations (@?=.. etc. are rare but
+        -- @-prefix ops can themselves be extended).
         TkAt ->
-            let (t2, _) = peekSigTokFrom src c1
+            let (t2, c2) = peekSigTokFrom src c1
             in case tkKind t2 of
-                TkSymOp suf -> Just (BC.pack "@" <> suf)
-                _           -> Nothing
+                TkSymOp suf ->
+                    let (full, _) = extendOpNameThroughAt src (BC.pack "@" <> suf) t2 c2
+                    in Just full
+                _ | Just more <- tokenOpNameBS (tkKind t2) ->
+                    let (full, _) = extendOpNameThroughAt src (BC.pack "@" <> more) t2 c2
+                    in Just full
+                _ -> Nothing
         -- Immediately followed by a symbolic operator: `arg1 |> arg2 = ...`.
         -- The op must be followed by something that could be a second argument
         -- (ident, paren-wrapped pattern, literal, etc.) — otherwise this is
         -- not an infix-op binding LHS.
-        _ | Just opName <- tokenOpNameBS (tkKind t1)
-          , opName /= "~"    -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
-          , opName /= "!"    -- bang-pattern/strict marker in `f !x = ...`,
+        -- Mid-@ lens ops (^@.., ^@.) recombine via 'extendOpNameThroughAt'
+        -- so `xs ^@.. f = ...` registers under "^@.." not "^".
+        _ | Just opName0 <- tokenOpNameBS (tkKind t1)
+          , opName0 /= "~"   -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
+          , opName0 /= "!"   -- bang-pattern/strict marker in `f !x = ...`,
                              -- and also `arr ! i` array-index at expression
                              -- position (the RHS of a do-stmt, let, etc.).
                              -- Misclassifying either `f !x = ...` or
                              -- `main = do ... arr ! i ...` as an infix-LHS
                              -- drops the real binding's clause.
-          -> let (t2, _) = peekSigTokFrom src c1
+          -> let (opName, cAfterOp) = extendOpNameThroughAt src opName0 t1 c1
+                 (t2, _) = peekSigTokFrom src cAfterOp
              in case tkKind t2 of
                  -- For `-` specifically: only treat as infix-op binding
                  -- when the second arg is an identifier or paren-pattern.
@@ -502,11 +512,14 @@ peekInfixOp src cur =
                  TkIdent _    -> Just opName
                  TkConId _    -> Just opName
                  TkLParen     -> Just opName
-                 TkLBracket   | opName /= "-" -> Just opName
-                 TkUnderscore | opName /= "-" -> Just opName
-                 TkInt   _    | opName /= "-" -> Just opName
-                 TkStr   _    | opName /= "-" -> Just opName
-                 TkChar  _    | opName /= "-" -> Just opName
+                 TkLBracket   | opName0 /= "-" -> Just opName
+                 TkUnderscore | opName0 /= "-" -> Just opName
+                 TkInt   _    | opName0 /= "-" -> Just opName
+                 TkStr   _    | opName0 /= "-" -> Just opName
+                 TkChar  _    | opName0 /= "-" -> Just opName
+                 -- Mid-@ glue without a following arg token is still an
+                 -- op name (the next token was consumed into the name).
+                 TkAt         -> Just opName
                  _            -> Nothing
         _ -> Nothing
 
@@ -534,6 +547,37 @@ tokenOpNameBS = \case
     TkSymOp n  -> Just n
     _          -> Nothing
 
+-- | Operator segment after a mid-@ glue point.  Includes 'TkDotDot' so
+-- lens @^@..@ recombines; kept out of 'tokenOpNameBS' so enum ranges
+-- are unaffected.
+opSegmentNameBS :: TokenKind -> Maybe ByteString
+opSegmentNameBS TkDotDot = Just (BC.pack "..")
+opSegmentNameBS k        = tokenOpNameBS k
+
+-- | After an operator token, recombine a following adjacent @'@'@ plus
+-- more operator characters into a single name (lens @^@..@ / @^@.@).
+-- Returns the extended name and the cursor after the full operator.
+-- When there is no adjacent @'@'@, returns the original name and cursor.
+extendOpNameThroughAt
+    :: Source -> ByteString -> Token -> Cursor -> (ByteString, Cursor)
+extendOpNameThroughAt src name0 lastTok cur0 =
+    go name0 lastTok cur0
+  where
+    go acc lastTok' cur =
+        let (atTok, curAfterAt) = nextToken src cur
+        in case tkKind atTok of
+            TkAt | tkStart atTok == tkEnd lastTok' ->
+                let (segTok, curAfterSeg) = nextToken src curAfterAt
+                in if tkStart segTok == tkEnd atTok
+                      then case opSegmentNameBS (tkKind segTok) of
+                          Just more ->
+                              go (acc <> BC.pack "@" <> more) segTok curAfterSeg
+                          Nothing ->
+                              (acc <> BC.pack "@", curAfterAt)
+                      else
+                          (acc <> BC.pack "@", curAfterAt)
+            _ -> (acc, cur)
+
 -- | True iff a 'TkPrimId' name is a value-level identifier ending in @#@
 -- (e.g. @compareInt#@, @divInt#@), as opposed to a type/constructor-level
 -- one like @Int#@ or @State#@.  Lowercase-start ⇒ value level.
@@ -555,8 +599,10 @@ peekPrefixOpBinding src cur0 =
         TkLParen ->
             let (t2, c2) = peekSigTokFrom src c1
             in case tokenOpNameBS (tkKind t2) of
-                Just opName ->
-                    let (t3, c3) = peekSigTokFrom src c2
+                Just opName0 ->
+                    -- Mid-@ recombination: @(^@..)@ / @(^@.)@
+                    let (opName, cAfterOp) = extendOpNameThroughAt src opName0 t2 c2
+                        (t3, c3) = peekSigTokFrom src cAfterOp
                     in case tkKind t3 of
                         TkRParen -> Just (opName, c3)
                         _        -> Nothing
@@ -569,9 +615,10 @@ peekPrefixOpBinding src cur0 =
             in case tkKind t2 of
                 TkRParen -> Just (BC.pack "#", c2)
                 _ | Just suffix <- tokenOpNameBS (tkKind t2) ->
-                    let (t3, c3) = peekSigTokFrom src c2
+                    let (full, cAfter) = extendOpNameThroughAt src (BC.pack "#" <> suffix) t2 c2
+                        (t3, c3) = peekSigTokFrom src cAfter
                     in case tkKind t3 of
-                        TkRParen -> Just (BC.pack "#" <> suffix, c3)
+                        TkRParen -> Just (full, c3)
                         _        -> Nothing
                 _ -> Nothing
         _ -> Nothing
@@ -3000,11 +3047,14 @@ scanInstanceDeclsRaw src
                                         scanMethods acc' curFinal
             -- Phase 3.6: operator methods like @(>>=)@, @(>>)@, @(<>)@, @(+)@.
             -- Pattern: @TkLParen TkSymOp name TkRParen ...@
+            -- Mid-@ lens ops: @(^@..)@ recombines via extendOpNameThroughAt.
             TkLParen | tkCol tok > 1 -> do
                 let (opTok, cur'') = nextToken src cur'
                 case tokenOpNameBS (tkKind opTok) of
-                    Just opName -> do
-                        let (closeTok, cur''') = nextToken src cur''
+                    Just opName0 -> do
+                        let (opName, curAfterOp) =
+                                extendOpNameThroughAt src opName0 opTok cur''
+                            (closeTok, cur''') = nextToken src curAfterOp
                         case tkKind closeTok of
                             TkRParen -> do
                                 -- InstanceSigs: @(<>) :: ...@ inside an
@@ -3242,7 +3292,10 @@ scanInstanceDeclsRaw src
                 -- method named @~@ instead of the prefix-form @bimap@,
                 -- and the real method body is lost.
                 TkSymOp op | depth == 0
-                           , op /= BC.pack "~" -> pure (Just op)
+                           , op /= BC.pack "~" ->
+                    -- Recombine mid-@ lens ops: ^@.. not just ^.
+                    let (full, _) = extendOpNameThroughAt s op tok cur'
+                    in pure (Just full)
                 -- Backtick infix: @a `name` b@ at depth 0 names @name@
                 -- as the method.  Used by source bodies like
                 --   !a `mod` b | ... = …
@@ -3308,7 +3361,9 @@ scanInstanceDeclsRaw src
                 TkSemi    | depth == 0   -> pure Nothing
                 TkRBrace  | depth == 0   -> pure Nothing
                 TkSymOp op | depth == 0
-                           , op /= BC.pack "~" -> pure (Just op)
+                           , op /= BC.pack "~" ->
+                    let (full, _) = extendOpNameThroughAt s op tok cur'
+                    in pure (Just full)
                 TkBacktick | depth == 0 ->
                     let (nameTok, curN) = nextToken s cur'
                     in case tkKind nameTok of
@@ -4551,13 +4606,15 @@ collectMoreSigNames src acc cur = do
         _ -> pure (reverse acc, cur)
 
 -- | Match @(op) :: ...@ — operator-name type sig.
+-- Recombines mid-@ lens ops so @(^@..) :: ...@ registers as "^@..".
 peekOperatorSig :: Source -> Cursor -> Maybe (ByteString, Cursor)
 peekOperatorSig src cur =
     let (tok, cur') = nextToken src cur in
     case tokenOpNameBS (tkKind tok) of
-        Just op ->
-            let (tok2, cur2) = nextToken src cur' in
-            case tkKind tok2 of
+        Just op0 ->
+            let (op, curAfterOp) = extendOpNameThroughAt src op0 tok cur'
+                (tok2, cur2) = nextToken src curAfterOp
+            in case tkKind tok2 of
                 TkRParen -> Just (op, cur2)
                 _        -> Nothing
         Nothing -> Nothing

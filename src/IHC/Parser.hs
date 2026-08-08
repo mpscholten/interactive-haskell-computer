@@ -3563,13 +3563,29 @@ peekOp ctx cur =
             -- '@'-prefixed operator: @?=, @=?, etc.
             -- '@' (0x40) is not in isOpChar so it produces TkAt; the suffix is
             -- a separate TkSymOp.  Combine them into a single operator name.
+            -- Also recombine mid-@ lens ops when the suffix continues after
+            -- further '@' splits (rare for pure prefix forms).
             TkAt ->
                 let (nextTok, cur'') = nextSig ctx cur'
                 in case tkKind nextTok of
                     TkSymOp suf ->
-                        let name   = BC.pack "@" <> suf
-                            (a, p) = lookupFixity (ctxFixity ctx) name
-                        in Just (name, a, p, cur'')
+                        let name0 = BC.pack "@" <> suf
+                        in case extendOpThroughAt ctx name0 nextTok cur'' of
+                            Just (name, curEnd) ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name
+                                in Just (name, a, p, curEnd)
+                            Nothing ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name0
+                                in Just (name0, a, p, cur'')
+                    _ | Just more <- tokenOpName (tkKind nextTok) ->
+                        let name0 = BC.pack "@" <> more
+                        in case extendOpThroughAt ctx name0 nextTok cur'' of
+                            Just (name, curEnd) ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name
+                                in Just (name, a, p, curEnd)
+                            Nothing ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name0
+                                in Just (name0, a, p, cur'')
                     _ -> Nothing
             -- Qualified symbolic operator: @P.>*<@ / @M.N.op@.  After the
             -- lexer split of qualifier-dot + operator, tokens are
@@ -3582,8 +3598,56 @@ peekOp ctx cur =
             _ -> case tokenOpName (tkKind tok) of
                 Nothing   -> Nothing
                 Just name ->
-                    let (a, p) = lookupFixity (ctxFixity ctx) name
-                    in Just (name, a, p, cur')
+                    -- Lens (and similar) operators embed '@' which the lexer
+                    -- emits as a separate TkAt — e.g. @^@..@ → TkSymOp "^"
+                    -- + TkAt + TkDotDot.  Recombine adjacent @-pieces into
+                    -- one operator name so Pratt can treat them as a single
+                    -- infix (FieldTH @ts ^@.. folded@).
+                    case extendOpThroughAt ctx name tok cur' of
+                        Just (fullName, curEnd) ->
+                            let (a, p) = lookupFixity (ctxFixity ctx) fullName
+                            in Just (fullName, a, p, curEnd)
+                        Nothing ->
+                            let (a, p) = lookupFixity (ctxFixity ctx) name
+                            in Just (name, a, p, cur')
+
+-- | After an operator token, try to recombine a following adjacent @'@'@
+-- plus more operator characters into a single name.  The lexer treats
+-- @'@'@ as 'TkAt' (not 'isOpChar'), so operators like lens @^@..@,
+-- @^@.@, @%@~@ arrive as multiple tokens and must be glued here.
+-- Returns 'Nothing' when there is no adjacent @'@'@ extension.
+extendOpThroughAt
+    :: Ctx -> Name -> Token -> Cursor
+    -> Maybe (Name, Cursor)
+extendOpThroughAt ctx name0 lastTok cur0 =
+    go name0 lastTok cur0 False
+  where
+    src = ctxSrc ctx
+    go acc lastTok' cur extended =
+        let (atTok, curAfterAt) = nextToken src cur
+        in case tkKind atTok of
+            TkAt | tkStart atTok == tkEnd lastTok' ->
+                let (segTok, curAfterSeg) = nextToken src curAfterAt
+                in if tkStart segTok == tkEnd atTok
+                      then case opSegmentName (tkKind segTok) of
+                          Just more ->
+                              go (acc <> BC.pack "@" <> more)
+                                 segTok curAfterSeg True
+                          Nothing ->
+                              -- Trailing bare '@' (e.g. @^@@ alone).
+                              Just (acc <> BC.pack "@", curAfterAt)
+                      else
+                          -- '@' not glued to a following op — still part
+                          -- of the operator (e.g. @foo^@@ bar@).
+                          Just (acc <> BC.pack "@", curAfterAt)
+            _ | extended -> Just (acc, cur)
+              | otherwise -> Nothing
+
+    -- Operator-segment names, including 'TkDotDot' which is NOT in
+    -- general 'tokenOpName' (so enum @..@ in list ranges is unaffected).
+    opSegmentName k = case k of
+        TkDotDot -> Just (BC.pack "..")
+        _        -> tokenOpName k
 
 -- | After consuming a module segment, try to read @.op@ (and further
 -- @.Seg.op@ chains) as a single qualified operator name for Pratt.
@@ -3920,6 +3984,10 @@ captureTypeArg ctx cur0 =
                 TkConId{} -> pure (slice (tkEnd tok2), cur2)
                 TkIdent{} -> pure (slice (tkEnd tok2), cur2)
                 _         -> pure (slice (tkEnd tok), cur1)
+        -- TH name quote / promoted constructor: lexer now emits
+        -- TkNameQuote for `'Just` / `'pure` forms.  Capture the whole
+        -- source span (leading tick through the name) as the type arg.
+        TkNameQuote _ -> pure (slice (tkEnd tok), cur1)
         -- Legacy fallback: older lexings where `'X` was still TkChar 'X'.
         -- Kept for safety while the lexer migration settles.
         TkChar _   ->
@@ -3953,6 +4021,7 @@ startsAtom TkFloat{}       = True
 startsAtom TkStr{}         = True
 startsAtom TkAddrStr{}     = True   -- Phase 2.x: "..."# Addr# literal
 startsAtom TkChar{}        = True
+startsAtom TkNameQuote{}   = True  -- TH name quote 'pure / '(.)
 startsAtom TkLabel{}       = True  -- Phase 3.5: #name is a valid argument
 startsAtom TkLParen        = True
 startsAtom TkLBracket      = True
@@ -3995,6 +4064,11 @@ parseAtom ctx cur0 = do
         -- 'unsafePackLenLiteral' / 'allBytes' rely on this shape.
         TkAddrStr s -> pure (ELit (LAddrStr s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
+        -- TemplateHaskellQuotes name quote: 'pure, 'Left, '(.), '(<*>).
+        -- Lower to EVar of the quoted name so expression parse succeeds
+        -- (probe / parseBodyExpr bar).  Runtime Name resolution is a
+        -- separate TH concern; parse success is the goal here.
+        TkNameQuote n -> pure (EVar n, cur1)
         TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference
         -- Also support postfix dot-chain: ?ctx.field -> field ?ctx
@@ -4119,20 +4193,28 @@ parseParenExpr ctx _openTok cur0 = do
                                     in pure (ELam n body, curC)
                                 _ -> parseErr ctx "expected `)` in composition section" closeTok
         -- Operator-as-value, optionally followed by right-operand (section).
-        _ | Just opName <- tokenOpName (tkKind peek)
+        -- Also recombine mid-@ lens ops so @(^@..)@ / @(^@.)@ are single names
+        -- (lexer splits on TkAt because '@' is not isOpChar).
+        _ | Just opName0 <- tokenOpName (tkKind peek)
           , tkKind peek /= TkMinus        -- `(-1)` is NEG 1, not a section
           -> do
-            let (afterOp, curAfterOp) = nextSig ctx curP
+            let (opName, curAfterOp0) =
+                    case extendOpThroughAt ctx opName0 peek curP of
+                        Just (full, c) -> (full, c)
+                        Nothing        -> (opName0, curP)
+                (afterOp, curAfterOp) = nextSig ctx curAfterOp0
             case tkKind afterOp of
                 TkRParen -> pure (EVar opName, curAfterOp)
                 _ -> do
                     -- Right section: (op rhs) = \$x -> $x op rhs
+                    -- Restart from curP (not curAfterOp0) so a non-extended
+                    -- multi-token RHS like @(+ 1)@ still sees the op token.
                     (rhs, curR) <- parseExpr ctx curP
                     let (closeTok, curC) = nextSig ctx curR
                     case tkKind closeTok of
                         TkRParen ->
                             let n = "$s"
-                                body = EApp (EApp (EVar opName) (EVar n)) rhs
+                                body = EApp (EApp (EVar opName0) (EVar n)) rhs
                             in pure (ELam n body, curC)
                         _ -> parseErr ctx "expected `)` in section" closeTok
           | tkKind peek == TkBacktick -> do
