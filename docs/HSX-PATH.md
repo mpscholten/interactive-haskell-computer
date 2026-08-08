@@ -1,12 +1,14 @@
 # HSX hello-world: architecture & path to rendered HTML
 
-Status: **foundation phase**. End-to-end route from `[hsx|<h1>Hello
-world</h1>|]` source text to a rendered HTML `String` under IHC. Map
-for follow-up sessions.
+Status: **megaparsec Text path partially unblocked** (2026-08-08).
+Foundation (QQ plumbing, blaze render baseline) is green. First real
+HSX run now dies later in the stack: megaparsec multi-statement
+do-blocks need unannotated `pure` to resolve to `ParsecT`, but
+result-poly `pure` defaults to IO (ParsecT-first breaks warp IO).
 
 Sibling slices this batch: Unit 1 = cache-priming script, Unit 2 =
 smoke fixture, Unit 3 = parser `EQuasiQuote` wiring, Units 5/6/7 =
-evaluator / renderer / class-dispatch follow-ups. This is Unit 4.
+evaluator / renderer / class-dispatch follow-ups.
 
 ## 1. Goal
 
@@ -162,35 +164,48 @@ Key files:
   Prefer 2.22 over 2.24+: 2.24 re-exports from `GHC.Boot.TH.Quote`,
   which is not in the IHC source cache.
 
+### Landed (2026-08-08 session)
+
+- **`Data.Text.length` / `measureOff maxBound`.** Bare nullary `maxBound`
+  in `length = negate . measureOff maxBound` stayed a `VClassMethod` and
+  was fed to FFI as `<function>`. Fix: signature-directed rewrite in
+  `Eval` — when applying `f maxBound` and `f`'s type sig starts with a
+  concrete ctor (`Int -> …`), rewrite to `maxBound :: Int`. Fixtures:
+  `text_length`, `text_maxbound_measureoff`.
+- **Strict vs lazy `Eq Text` collision.** Both modules registered under
+  bare tag `"Text"`; last-write (lazy `Empty`/`Chunk`) won, so
+  `string`/`(==)` on strict Text pattern-matched lazy ctors. Fix:
+  skip type-name registration when runtime ctors are a disjoint set
+  (lazy Text → only `Empty`/`Chunk`). Same class of bug as historical
+  strict/lazy `ByteString`. Fixture: `megaparsec_string_text`.
+- **`normalizeTyTag` head-ctor + `Parsec`→`ParsecT`.** Lets
+  `pure @(Parsec Void Text)` hit `Applicative ParsecT`. Preserves
+  `ShareInput T` compound tags.
+- **Megaparsec green subset on Text:** `char`, `string`/`chunk`,
+  `takeWhileP`/`takeWhile1P`, Applicative `(,) <$> c1 <*> c2`.
+  Fixtures: `megaparsec_char_text`, `megaparsec_string_text`.
+- **Blaze render baseline still green:** `examples/blaze_hello`.
+- **QQ foundation still green:** `qq_toy_string`.
+
 ### Still open for full `[hsx|…]`
 
+- **Unannotated `pure` / `return` in ParsecT do-blocks (current tip).**
+  Result-poly defaults pure to IO-first (required for warp). HSX's
+  `parseHsx` ends with `pure node` unannotated → IO-shaped value →
+  `unParser` sees `(#,#)`. Type-annotated `pure @(Parsec …)` works;
+  reordering defaults to ParsecT-first when the instance is loaded
+  breaks `pure` in IO after megaparsec is in the process. Need
+  expected-type elaboration of pure from the enclosing `Parser`/
+  `ParsecT` binding or do-block, without a global default flip.
 - **TH surface used by HSX `quoteHsxExpression`.** `location` /
   `extsEnabled` stubs exist; nested brackets + `$(pure expr)` antiquotes,
-  `Lift Text`, and full megaparsec HSX parse under the interpreter remain
-  the main risk surface. See `docs/HSX-TH-NEEDS.md`.
-- **TH `reify`.** Not needed for hello-world; flagged for larger
-  templates that inspect types via splices.
-- **Class dispatch: `ToHtml` / `ToMarkup` / `ToValue`.** HSX attribute
-  conversion goes through these. `ClassRegistry` needs entries on
-  `String`, `Text`, `Int`, `Html`. Unit 6 territory.
-- **Renderer primops.** `blaze-html`'s renderer is pure Haskell — no
-  new primop *should* be needed. Unverified; a tight inner loop might
-  hit a `ByteArray#`/`MutableByteArray#` primop we haven't implemented.
-  If so: implement the primop, don't shim.
-- **megaparsec under the interpreter.** `IHP.HSX.Parser` sits on
-  megaparsec. Mostly pure Haskell; the concern is
-  `unsafeDupablePerformIO` internals. Partial progress (Stream dispatch);
-  `examples/hsx_hello` still expected-fail / nonterminates.
-- **Data.Text builtins.** Text is cached and partially exercised. Add
-  missing UTF-8 primops rather than shim.
-- **`PackageImports`.** `IHP.HSX.QQ` imports `"template-haskell"
-  Language.Haskell.TH`. Needs to round-trip through the loader.
-- **GHC API in `IHP.HSX.HaskellParser`.** Antiquotations that parse
-  embedded Haskell via the real GHC parser cannot run under IHC — see
-  gap 29 in `docs/HSX-TH-NEEDS.md`. Hello-world with no `{…}` embeds
-  may avoid this.
-- **IHP parser gaps.** `ihp-parser-gaps.md` lists open parser issues.
-  Fresh probe of `ihp-hsx` needed once its source hits the loader.
+  `Lift Text` remain. See `docs/HSX-TH-NEEDS.md`.
+- **TH `reify`.** Not needed for hello-world.
+- **Class dispatch: `ToHtml` / `ToMarkup` / `ToValue`.** Unit 6.
+- **Renderer primops.** blaze-html pure Haskell; unverified under full HSX.
+- **`PackageImports`.** `IHP.HSX.QQ` imports `"template-haskell" …`.
+- **GHC API in `IHP.HSX.HaskellParser`.** Hello-world with no `{…}`
+  embeds may avoid this (gap 29 in `docs/HSX-TH-NEEDS.md`).
 
 ---
 
@@ -209,12 +224,14 @@ Ordered, one-PR-per-step:
    on the run-file path. Proven by `test/Fixtures/Coverage/qq_toy_string.hs`.
 5. **(done for toy)** `QuasiQuoter` record construction/destruction via
    source-loaded `Language.Haskell.TH.Quote` (2.22).
-6. Enough of `Q` for full HSX `quoteHsxExpression` (megaparsec parse,
-   nested brackets, antiquotes) — still open.
-7. `ToHtml` / `ToMarkup` / `ToValue` registry entries for `String`,
+6. **(partial)** Megaparsec on Text: char/string/takeWhile + Applicative
+   green; monadic do + unannotated `pure` still open (see §6).
+7. Enough of `Q` for full HSX `quoteHsxExpression` (nested brackets,
+   antiquotes) — still open.
+8. `ToHtml` / `ToMarkup` / `ToValue` registry entries for `String`,
    `Text`, `Int`, `Html`.
-8. Interpret `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end;
-   fix any missing primop / class dispatch encountered.
-9. Green the Unit 2 / `hsx_hello` fixture (flip the expected-failure marker).
-10. Document surprises under §6 and open follow-ups for splices with
+9. Interpret `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end;
+   blaze_hello baseline already green without HSX.
+10. Green the Unit 2 / `hsx_hello` fixture (flip the expected-failure marker).
+11. Document surprises under §6 and open follow-ups for splices with
     interpolation, runtime-`Text` attribute conversion, etc.
