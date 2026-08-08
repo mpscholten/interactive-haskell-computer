@@ -206,45 +206,44 @@ parseExportList src cur0 = go [] cur0
                     Nothing   -> pure (ExportList (reverse acc), cur1)
             TkConId n -> do
                 -- Check for Tree(..) or Tree(a,b), but also handle
-                -- qualified export names like B.fromStrict or B.ByteString.
+                -- qualified export names like B.fromStrict, B.ByteString,
+                -- and multi-segment forms such as
+                -- GHC.Internal.Data.Coerce.coerce (seen in GHC.Internal.Exts).
                 -- A ConId immediately followed by '.' (no space) means this
-                -- is a qualified export — advance past 'ConId.bare' and
-                -- record the bare name.
+                -- is a qualified export — walk every segment and record the
+                -- final bare name.  Stopping after one hop left the next
+                -- go-iteration staring at a mid-name TkDot, which hit the
+                -- catch-all and aborted the export list early — dropping
+                -- @) where@ and EVERY subsequent import (Internal.Exts
+                -- ended up with mhImports = [], so re-exports like @lazy@
+                -- could not be chased to GHC.Magic).
                 let (peek, curP) = nextSigTok src cur1
                 case tkKind peek of
                     TkLParen -> do
                         (subs, cur2) <- parseExportSubs src curP
                         go (ExportType n (Just subs) : acc) cur2
                     TkDot -> do
-                        -- Qualified export: <ConId>.<bare> or <ConId>.<ConId>.
                         -- The dot is a qualifier separator only when it abuts
                         -- the ConId (no whitespace) — Haskell 2010 §5.2 / §2.4.
                         -- GHC rejects @module M (B . bar) where@ as a parse
                         -- error, so we must NOT silently rewrite that form
                         -- to the qualified export of @bar@.
-                        let (dotTok, curAfterDot) = nextToken src cur1
-                            (conTok, _)            = nextSigTok src cur
+                        let (dotTok, _) = nextToken src cur1
+                            (conTok, _) = nextSigTok src cur
                             abuts = tkStart dotTok == tkEnd conTok
-                        case tkKind dotTok of
-                            TkDot
-                                | abuts -> do
-                                    let (bareTok, curAfterBare) = nextToken src curAfterDot
-                                    case tkKind bareTok of
-                                        TkIdent bare -> do
-                                            -- qualified lower-case export (e.g. B.fromStrict)
-                                            go (ExportName bare : acc) curAfterBare
-                                        TkConId bare -> do
-                                            -- qualified upper-case export (e.g. B.ByteString)
-                                            let (peek2, curP2) = nextSigTok src curAfterBare
-                                            case tkKind peek2 of
-                                                TkLParen -> do
-                                                    (subs, cur3) <- parseExportSubs src curP2
-                                                    go (ExportType bare (Just subs) : acc) cur3
-                                                _ -> go (ExportType bare Nothing : acc) curAfterBare
-                                        _ ->
-                                            -- Unrecognized qualified form: emit bare ConId
-                                            go (ExportType n Nothing : acc) cur1
-                            _ -> go (ExportType n Nothing : acc) cur1
+                        if not abuts
+                            then go (ExportType n Nothing : acc) cur1
+                            else do
+                                (bare, mSubs, curAfter) <-
+                                    consumeQualifiedExportTail src cur1
+                                case mSubs of
+                                    Just subs ->
+                                        go (ExportType bare (Just subs) : acc) curAfter
+                                    Nothing
+                                        | isConLike bare ->
+                                            go (ExportType bare Nothing : acc) curAfter
+                                        | otherwise ->
+                                            go (ExportName bare : acc) curAfter
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
             -- Parenthesised operator export: @(++)@, @(!)@, @(@?=@), etc.
@@ -344,6 +343,68 @@ parseExportList src cur0 = go [] cur0
                     let (_bt, c3) = nextSigTok s c2
                     loop subs dd c3
                 _         -> pure (reverse subs, dd, c)
+
+-- | Walk @.Seg1.Seg2...final@ after the first ConId of a qualified export
+-- name.  Returns the final segment (lower- or upper-case), optional
+-- @T(..)@/sub-export list, and the cursor past the whole name.
+--
+-- Multi-segment forms (e.g. @GHC.Internal.Data.Coerce.coerce@) must be
+-- fully consumed; leaving a mid-name @TkDot@ for the next export-list
+-- iteration aborts the list and drops every import below @where@.
+consumeQualifiedExportTail
+    :: Source
+    -> Cursor
+    -> IO (ByteString, Maybe [ByteString], Cursor)
+consumeQualifiedExportTail src cur0 = go cur0
+  where
+    go cur = do
+        let (dotTok, curAfterDot) = nextToken src cur
+        case tkKind dotTok of
+            TkDot -> do
+                let (segTok, curAfterSeg) = nextToken src curAfterDot
+                case tkKind segTok of
+                    TkIdent bare ->
+                        pure (bare, Nothing, curAfterSeg)
+                    TkConId bare -> do
+                        let (peek, curP) = nextSigTok src curAfterSeg
+                        case tkKind peek of
+                            TkLParen -> do
+                                (subs, curEnd) <- parseExportSubs src curP
+                                pure (bare, Just subs, curEnd)
+                            TkDot ->
+                                -- Another qualifier segment (e.g. Internal.Data)
+                                go curAfterSeg
+                            _ ->
+                                pure (bare, Nothing, curAfterSeg)
+                    TkPrimId bare ->
+                        pure (bare, Nothing, curAfterSeg)
+                    _ ->
+                        -- Malformed qualifier; surface empty bare and stop
+                        pure (BC.empty, Nothing, cur)
+            _ -> pure (BC.empty, Nothing, cur)
+
+    parseExportSubs s c0 = do
+        (subs, sawDotDot, cEnd) <- loop [] False c0
+        pure (if sawDotDot then [] else subs, cEnd)
+      where
+        loop subs dd c = do
+            let (tok, c1) = nextSigTok s c
+            case tkKind tok of
+                TkRParen  -> pure (reverse subs, dd, c1)
+                TkDotDot  -> loop subs True c1
+                TkComma   -> loop subs dd c1
+                TkIdent n -> loop (n : subs) dd c1
+                TkConId n -> loop (n : subs) dd c1
+                TkPrimId n -> loop (n : subs) dd c1
+                _         -> pure (reverse subs, dd, c)
+
+-- | True when a bare export segment looks like a type/constructor name
+-- (uppercase or @:@-operator constructor), so it is recorded as
+-- 'ExportType' rather than 'ExportName'.
+isConLike :: ByteString -> Bool
+isConLike name = case BC.uncons name of
+    Just (c, _) -> (c >= 'A' && c <= 'Z') || c == ':'
+    Nothing     -> False
 
 --------------------------------------------------------------------------------
 -- import block

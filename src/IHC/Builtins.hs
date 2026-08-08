@@ -740,24 +740,14 @@ builtins reg =
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
-    -- 'lazy' is GHC.Magic identity with compiler-rewritten strictness
-    -- (Magic.hs: @lazy x = x@; CoreToStg rewrites the strictness
-    -- annotation).  At Val level it is identity.  Host-backed under
-    -- bare + FQN keys because demand-driven re-export resolution of
-    -- @GHC.Exts.lazy@ (a re-export of @GHC.Magic.lazy@) does not yet
-    -- materialise a slot when source-loaded unsafePerformIO bottoms
-    -- on it — tracked as a re-export discovery follow-up, not a
-    -- permanent "minimum surface" exception.  FQNs keep both
-    -- @import GHC.Exts (lazy)@ rewrites and bare @lazy@ references
-    -- working without short-circuiting the Magic module itself.
-    , ("lazy",                     lazyB)
-    , ("GHC.Magic.lazy",           lazyB)
-    , ("GHC.Exts.lazy",            lazyB)
+    -- 'lazy' / 'GHC.Magic.lazy' / 'GHC.Exts.lazy' resolve from source
+    -- (ghc-prim GHC.Magic: @lazy x = x@; re-exported via Base / Exts).
+    -- Demand-driven re-export discovery materialises the identity body.
     -- 'unsafePerformIO' / 'unsafeDupablePerformIO' graduated to
     -- source-loaded from GHC.Internal.IO.Unsafe:
     --   unsafePerformIO m = unsafeDupablePerformIO (noDuplicate >> m)
     --   unsafeDupablePerformIO (IO m) = case runRW# m of (# _, a #) -> lazy a
-    -- Bottoms on runRW# / noDuplicate# / lazy (all above or source).
+    -- Bottoms on runRW# / noDuplicate# / source lazy.
     -- matchPat on VIO already reconstructs the State# function so the
     -- @(IO m)@ pattern match works (Eval.hs).
     -- 'accursedUnutterablePerformIO' graduated to source-loaded from
@@ -3653,10 +3643,6 @@ runRWB = pure $ VFun $ \ft -> do
     -- If the result is a VIO action (ST-VIO bridge), execute it so that
     -- the caller sees the concrete value / unboxed tuple.
     runIOVal legacyHooks resRaw
-
--- | @lazy :: a -> a@ — identity at Val level (see registration note).
-lazyB :: IO Val
-lazyB = pure $ VFun $ \a -> force legacyHooks a
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: boxing/unboxing constructors
