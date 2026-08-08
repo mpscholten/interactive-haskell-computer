@@ -580,8 +580,11 @@ loadProgramFromSource searchPath src0 = do
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     -- Handle-text I/O + standard handles: host-backed until
                     -- the source-level Handle ADT layer exists (see
-                    -- ffiBuiltinNames comment).
+                    -- ffiBuiltinNames comment).  openFile/hClose/withFile/
+                    -- hGetContents pinned so source FD cannot steal them
+                    -- from graduated readFile/writeFile/appendFile.
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
+                    , "openFile", "hClose", "withFile", "hGetContents"
                     , "stdout", "stderr", "stdin"
                     ])
         builtinOverrides =
@@ -1665,6 +1668,11 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     , "getSystemEventManager", "getSystemTimerManager"
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
+                    -- Handle open/close/contents: host-backed until the
+                    -- source-level Handle ADT layer exists (mirrors
+                    -- hPutStrLn). Needed so source FD cannot steal them
+                    -- from graduated readFile/writeFile/appendFile.
+                    , "openFile", "hClose", "withFile", "hGetContents"
                     , "stdout", "stderr", "stdin"
                     ])
         qualPrefix = case impAlias imp of
@@ -5828,6 +5836,12 @@ ffiBuiltinNames = Set.fromList
     -- the FileHandle/DuplexHandle pattern-match path, which assumes the
     -- source-level Handle ADT layer we haven't implemented.
     , "hGetLine"
+    -- File open/close + contents: host-backed for the same Handle-device
+    -- reason as hPutStrLn/hGetLine.  Source-loaded
+    -- 'readFile'/'writeFile'/'appendFile' (and 'getContents') bottom out
+    -- on these; without pinning, FD / GHC.IO.Handle source rewrites can
+    -- steal the names and break the PrimHandle path.
+    , "openFile", "hClose", "withFile", "hGetContents"
     ]
 
 -- | Build a map from each locally-visible imported name to its
@@ -9317,6 +9331,10 @@ resolveFallbackSource mOwner name = do
         transientReg <- newIORef (Map.map Loaded mods)
         mProvider <- resolveImport transientReg searchPath includeMap owner bareName
                         `catch` (\(_ :: SomeException) -> pure Nothing)
+        when (bareName == BC.pack "lazy") $
+            System.IO.hPutStrLn System.IO.stderr
+                ("[debug tryImportAliasSlot] owner=" <> BC.unpack (lmName owner)
+                 <> " provider=" <> show (BC.unpack <$> mProvider))
         case mProvider of
             Nothing -> pure Nothing
             Just providerMod -> do
@@ -9326,6 +9344,10 @@ resolveFallbackSource mOwner name = do
                 mergeGlobalLoadedModules newMods
                 let providerName = providerMod <> BC.pack "." <> bareName
                 mSlot <- resolveFallback (Just (lmName owner)) providerName
+                when (bareName == BC.pack "lazy") $
+                    System.IO.hPutStrLn System.IO.stderr
+                        ("[debug tryImportAliasSlot] -> " <> BC.unpack providerName
+                         <> " slot=" <> show (isJust mSlot))
                 case mSlot of
                     Just slot -> do
                         modifyIORef' envFallbackCache (Map.insert name slot)

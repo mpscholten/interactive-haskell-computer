@@ -77,6 +77,7 @@ import System.IO
     , IOMode(..)
     , hClose
     , hFlush
+    , hGetContents
     , hGetLine
     , hPutBuf
     , hPutChar
@@ -516,8 +517,20 @@ builtins reg =
     --
     -- 'getContents' is similarly source-loaded from
     --     getContents  =  hGetContents stdin    -- System/IO.hs:316-317
-    -- It was never shimmed in the first place; documented here for
-    -- symmetry with 'getLine'.
+    -- It was never shimmed in the first place; bottoms out on host
+    -- 'hGetContents' (pinned below) once that name is demanded.
+    --
+    -- Slice: 'readFile' / 'writeFile' / 'appendFile' graduate to source.
+    -- Source bodies (GHC.Internal.System.IO / System.IO) are ordinary
+    -- wrappers:
+    --   readFile name = openFile name ReadMode >>= hGetContents
+    --   writeFile f txt = withFile f WriteMode (\hdl -> hPutStr hdl txt)
+    --   appendFile f txt = withFile f AppendMode (\hdl -> hPutStr hdl txt)
+    -- They bottom out on host 'openFile' / 'withFile' / 'hGetContents' /
+    -- 'hClose' / 'hPutStr' — temporary Handle-device carve-outs (same
+    -- family as hPutStrLn / hGetLine): source Handle ADT + locale
+    -- encoding is not modelled yet, so these names are pinned via
+    -- 'ffiBuiltinNames' and must resolve to PrimHandle host shims.
     -- Monad bind and sequence are deliberately omitted: they are class
     -- methods with real source in GHC.Internal.Base and resolve through
     -- the seeded class-method dispatcher.
@@ -548,28 +561,18 @@ builtins reg =
     -- IORef wrappers are deliberately omitted.  Data.IORef,
     -- GHC.IORef, GHC.Internal.IORef, and GHC.Internal.Data.IORef all
     -- have real source; they lower to the MutVar# and Weak# primops below.
-    -- File IO
+    -- File IO (Handle-device boundary; high-level readFile/writeFile/
+    -- appendFile are source-loaded — see slice comment above).
       ("openFile",    openFileB)
     , ("hClose",      hCloseB)
+    , ("withFile",    withFileB)
+    , ("hGetContents", hGetContentsB)
     , ("hPutStr",     hPutStrB)
     , ("hPutChar",    hPutCharB)
     , ("hPutStrLn",   hPutStrLnB)
     , ("hGetLine",    hGetLineB)
     , ("hFlush",      hFlushB)
     , ("hSetBuffering", hSetBufferingB)
-    -- High-level file IO kept host-backed: source bodies in
-    -- GHC.Internal.System.IO are ordinary wrappers
-    --   readFile name = openFile name ReadMode >>= hGetContents
-    --   writeFile f txt = withFile f WriteMode (\hdl -> hPutStr hdl txt)
-    --   appendFile f txt = withFile f AppendMode (\hdl -> hPutStr hdl txt)
-    -- but withFile / openFile / hGetContents pull the full source-level
-    -- Handle ADT + getFileSystemEncoding locale state that IHC does not
-    -- yet model (same carve-out as hPutStrLn in ffiBuiltinNames).  Host
-    -- shortcuts operate on PrimHandle / host path strings until that
-    -- layer lands.
-    , ("readFile",    readFileB)
-    , ("writeFile",   writeFileB)
-    , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
     -- error / undefined source-load from GHC.Internal.Err and bottom out
@@ -3175,6 +3178,39 @@ hSetBufferingB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     hSetBuffering h (bufferModeFromVal mv)
     pure VUnit
 
+-- | @withFile path mode action@ — open, run @action@ with the host
+-- 'Handle', close on success or exception.  Host-backed (Handle-device
+-- carve-out): source @withFile@ is @bracket (openFile …) hClose@, but
+-- the full source Handle/encoding layer is not modelled yet.  Lets
+-- source-loaded 'writeFile' / 'appendFile' (and direct 'withFile'
+-- users) bottom out here instead of a whole-file host shim.
+withFileB :: IO Val
+withFileB = pure $ VFun $ \pathT -> pure $ VFun $ \modeT -> pure $ VFun $ \kT -> pure $ VIO $ do
+    pv   <- force legacyHooks pathT
+    path <- valToString pv
+    mv   <- force legacyHooks modeT
+    let mode = ioModeFromVal mv
+    kv   <- force legacyHooks kT
+    CE.bracket
+        (do
+            h    <- openFile path mode
+            hVal <- mkFileHandleVal path h mode
+            pure (h, hVal))
+        (\(h, _) -> hClose h)
+        (\(_, hVal) -> do
+            hT <- newWHNFThunk hVal
+            r  <- apply legacyHooks kv hT
+            runIOVal legacyHooks r)
+
+-- | @hGetContents h@ — read the remainder of the handle as a String
+-- ([Char]).  Host-backed (same Handle-device carve-out as 'hGetLine');
+-- source-loaded 'readFile' / 'getContents' bottom out here.
+hGetContentsB :: IO Val
+hGetContentsB = pure $ VFun $ \a -> pure $ VIO $ do
+    h <- force legacyHooks a >>= requireHandle "hGetContents"
+    s <- hGetContents h
+    stringToListValIO s
+
 --------------------------------------------------------------------------------
 -- Control flow.
 --------------------------------------------------------------------------------
@@ -5606,38 +5642,6 @@ powerFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VFloat x, VFloat y) -> pure (VFloat (x ** y))
         _ -> error ("powerFloat#: bad args: " <> showValForDebug av)
 
---------------------------------------------------------------------------------
--- Simple file IO: readFile, writeFile, appendFile
--- Host-backed until Handle ADT + encoding layer exists (see registration).
---------------------------------------------------------------------------------
-
--- | @readFile path@ — read the entire file as a String ([Char]).
-readFileB :: IO Val
-readFileB = pure $ VFun $ \a -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    contents <- Prelude.readFile path
-    stringToListValIO contents
-
--- | @writeFile path contents@ — write a String to the file (truncating).
-writeFileB :: IO Val
-writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    cv   <- force legacyHooks b
-    s    <- valToString cv
-    Prelude.writeFile path s
-    pure VUnit
-
--- | @appendFile path contents@ — append a String to the file.
-appendFileB :: IO Val
-appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    cv   <- force legacyHooks b
-    s    <- valToString cv
-    Prelude.appendFile path s
-    pure VUnit
 
 --------------------------------------------------------------------------------
 -- User-defined constructors
