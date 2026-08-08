@@ -25,7 +25,6 @@ import IHC.Scan
     ( emptyKnownSymbols
     , scanAllTopLevelNames
     , findBinding
-    , lhsClauses
     )
 import IHC.Source (Source(..), mkSource)
 
