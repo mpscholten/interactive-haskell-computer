@@ -93,11 +93,13 @@ spec = describe "HsExt — Syntax sugar" $ do
     describe "BlockArguments" $ do
         it "BlockArguments: f do action" $
             "when c do action" `shouldParseTo`
-                EApp (EApp (EVar "when") (EVar "c")) (EVar "action")
+                EApp (EApp (EVar "when") (EVar "c"))
+                    (EDo [SExpr (EVar "action")])
 
         it "BlockArguments: f do { action }" $
             "when c do { action }" `shouldParseTo`
-                EApp (EApp (EVar "when") (EVar "c")) (EVar "action")
+                EApp (EApp (EVar "when") (EVar "c"))
+                    (EDo [SExpr (EVar "action")])
 
         it "BlockArguments: f \\x -> x" $
             "f \\x -> x" `shouldParseTo`

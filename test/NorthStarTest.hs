@@ -30,6 +30,7 @@
 module NorthStarTest (spec) where
 
 import Data.List (isInfixOf)
+import IhcTestBinary (ihcBin)
 import System.Directory (doesFileExist, getHomeDirectory)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
@@ -37,10 +38,6 @@ import System.Process (readProcessWithExitCode)
 import System.Timeout (timeout)
 import Test.Hspec
 import Text.Read (readMaybe)
-
--- | Path to the built ihc binary — matches ReplTest.ihcBin.
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
 
 -- | Default 30-second timeout.  Dial up with @IHC_NORTHSTAR_TIMEOUT=N@.
 defaultTimeoutSeconds :: Int
@@ -84,8 +81,9 @@ spec = describe "NorthStar (Phase 2.13)" do
                  <> " — run scripts/cache-test-deps.sh")
             else do
                 timeoutS <- resolveTimeoutSeconds
+                bin <- ihcBin
                 result   <- timeout (timeoutS * 1000000)
-                             (readProcessWithExitCode ihcBin ["run", mainHs] "")
+                             (readProcessWithExitCode bin ["run", mainHs] "")
                 case result of
                     Nothing ->
                         -- No captured output available when timeout fires

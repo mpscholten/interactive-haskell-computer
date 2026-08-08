@@ -16,7 +16,16 @@ module IHC.Val
     , newThunk
     , newThunkIP
     , newWHNFThunk
+    , newLazyIOThunk
     , newLazyBuiltinThunk
+      -- * Host pointer metadata
+    , markTypedHostPtr
+    , lookupTypedHostPtr
+    , markWord8PtrRange
+    , isMarkedWord8Ptr
+    , clearWord8PtrRanges
+    , markSockAddrBuffer
+    , lookupSockAddrBuffer
       -- * Environments
     , Env
     , emptyEnv
@@ -48,9 +57,10 @@ import Data.Map.Strict (Map)
 import Data.Int (Int64)
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
-import Foreign.Ptr (Ptr)
+import Foreign.Ptr (IntPtr, Ptr, castPtr, ptrToIntPtr)
 import Numeric.Natural (Natural)
 import System.IO (Handle)
+import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr, Name)
 
@@ -188,14 +198,17 @@ type Thunk = IORef ThunkState
 data ThunkState
     = Unevaluated !Closure
     | Evaluated   !Val
-    | BlackHole  !String                -- entered, not yet returned
-    -- | Lazy-init for builtins: a host @IO Val@ action that produces the
-    -- builtin's value on first force. Used by 'IHC.Builtins.builtinEnv'
-    -- so startup doesn't pay the cost of materialising every primop,
-    -- dispatch wrapper, and Typeable dict up-front. Semantics match
-    -- 'Unevaluated' — the value is produced once and memoised — but we
-    -- avoid building a Closure+Env+Expr around a host function that
-    -- doesn't come from source.
+    -- entered, not yet returned. The 'Maybe ThreadId' is the thread that
+    -- entered (set the black-hole) during evaluation; 'Nothing' for
+    -- knot-tying placeholder slots that have no evaluating owner. A thread
+    -- that hits a black-hole owned by ANOTHER thread must wait for that
+    -- thread to finish (concurrent evaluation of a shared thunk), not raise
+    -- a spurious loop — see 'IHC.Eval.force'.
+    | BlackHole  !(Maybe ThreadId) !String
+    -- | Lazy-init for host @IO Val@ actions that should run once and memoise.
+    -- Used by 'IHC.Builtins.builtinEnv' for primops/RTS boundaries, and by a
+    -- few scheduler paths for deferred source-name resolution where there is no
+    -- local 'Expr' to close over.
     | LazyBuiltin !(IO Val)
 
 -- | Map of implicit-parameter names (@?x@) to thunks, threaded through
@@ -226,12 +239,67 @@ newThunkIP env ipm expr = newIORef (Unevaluated (Closure env ipm expr))
 newWHNFThunk :: Val -> IO Thunk
 newWHNFThunk v = newIORef (Evaluated v)
 
--- | Make a thunk whose evaluation runs a host @IO Val@ action. Used by
--- 'IHC.Builtins.builtinEnv' to defer materialisation of primop values
--- until they're actually referenced. The action runs at most once —
--- 'IHC.Eval.force' writes the produced 'Val' back with 'Evaluated'.
+-- | Make a thunk whose evaluation runs a host @IO Val@ action. The action
+-- runs at most once; 'IHC.Eval.force' writes the produced 'Val' back with
+-- 'Evaluated'.
+newLazyIOThunk :: IO Val -> IO Thunk
+newLazyIOThunk mkV = newIORef (LazyBuiltin mkV)
+
+-- | Builtin-facing name for 'newLazyIOThunk'.
 newLazyBuiltinThunk :: IO Val -> IO Thunk
-newLazyBuiltinThunk mkV = newIORef (LazyBuiltin mkV)
+newLazyBuiltinThunk = newLazyIOThunk
+
+--------------------------------------------------------------------------------
+-- Host pointer metadata
+--------------------------------------------------------------------------------
+
+{-# NOINLINE typedHostPtrsRef #-}
+typedHostPtrsRef :: IORef (Map.Map IntPtr ByteString)
+typedHostPtrsRef = unsafePerformIO (newIORef Map.empty)
+
+markTypedHostPtr :: Ptr a -> ByteString -> IO ()
+markTypedHostPtr p ty =
+    modifyIORef' typedHostPtrsRef (Map.insert (ptrToIntPtr p) ty)
+
+lookupTypedHostPtr :: Ptr a -> IO (Maybe ByteString)
+lookupTypedHostPtr p =
+    Map.lookup (ptrToIntPtr p) <$> readIORef typedHostPtrsRef
+
+-- | Byte-buffer address ranges for Storable Word8 host peeks/pokes.
+-- plusForeignPtr advances the base; exact-address marks would miss
+-- interior peeks used by ByteString.any / fold.
+{-# NOINLINE word8PtrRangesRef #-}
+word8PtrRangesRef :: IORef [(IntPtr, IntPtr)]
+word8PtrRangesRef = unsafePerformIO (newIORef [])
+
+markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
+markWord8PtrRange p len =
+    let start = ptrToIntPtr (castPtr p)
+        end   = start + fromIntegral (max 1 len)
+    in modifyIORef' word8PtrRangesRef ((start, end) :)
+
+isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
+isMarkedWord8Ptr p =
+    let addr = ptrToIntPtr (castPtr p)
+    in any (\(start, end) -> addr >= start && addr < end)
+        <$> readIORef word8PtrRangesRef
+
+clearWord8PtrRanges :: IO ()
+clearWord8PtrRanges = writeIORef word8PtrRangesRef []
+
+{-# NOINLINE sockAddrBuffersRef #-}
+sockAddrBuffersRef :: IORef (Map.Map IntPtr Int)
+sockAddrBuffersRef = unsafePerformIO (newIORef Map.empty)
+
+markSockAddrBuffer :: Ptr a -> Int -> IO ()
+markSockAddrBuffer p len
+    | len == 16 || len == 28 =
+        modifyIORef' sockAddrBuffersRef (Map.insert (ptrToIntPtr p) len)
+    | otherwise = pure ()
+
+lookupSockAddrBuffer :: Ptr a -> IO (Maybe Int)
+lookupSockAddrBuffer p =
+    Map.lookup (ptrToIntPtr p) <$> readIORef sockAddrBuffersRef
 
 --------------------------------------------------------------------------------
 -- Environments

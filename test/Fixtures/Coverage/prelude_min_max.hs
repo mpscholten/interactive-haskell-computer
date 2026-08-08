@@ -11,17 +11,17 @@
 -- The class-method dispatcher binds @min@ / @max@ on demand via the
 -- env-fallback's @tryClassMethodFromRegistry@ (same path as the
 -- 93eee1a @compare@ removal). Both default bodies bottom out in the
--- still-builtin @<=@ dispatcher (slot 1 of @ordDispatch@), which has
--- primitive Int / Char / Double / String fast paths plus user
--- @Ord@-instance lookup plus structural VCon fallback.
+-- source-loaded @<=@ class method, whose dispatcher reaches the real
+-- @Ord@ instance method first; derived ADTs get compiler-synthesized
+-- Ord dictionaries.
 --
 -- Lock down the cases the source path covers:
 --
---   * primitive Int / Char / Double compares (fast paths in @ordCmp@),
+--   * primitive Int / Char / Double compares (source @Ord@ instances),
 --   * @[Char]@ string compare (recurses into Char element compare via
 --     the @Ord [a]@ source instance @compare (x:xs) (y:ys) = ...@),
 --   * @deriving Ord@ on a sum type (declaration-index ordering via
---     @ordDispatch@'s structural fallback driven through @<=@),
+--     @registerDerivedOrdInstances@),
 --   * @deriving Ord@ on a product type (lexicographic field compare),
 --   * a user @instance Ord@ providing @<=@ explicitly — the source
 --     @min@ / @max@ default body must dispatch through that user

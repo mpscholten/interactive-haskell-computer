@@ -7,20 +7,13 @@
 --    '1' after the float→Int graduation, going through source-loaded
 --    Integer arithmetic the whole way."
 --
--- Today (post-Phase 4), this works correctly through a hybrid path:
---   * floor / ceiling / round / truncate are still host shims in
---     'IHC.Builtins' (carve-out documented at the 'floatToIntB'
---     definition: the source-loaded RealFrac chain hits a Num Integer
---     dispatcher placeholder, blocked on a separate workstream).
---   * The shims compute @round@ / @floor@ etc. natively over Double,
---     bypassing the Integer chain — but produce the same result as
---     the source-loaded chain would for in-Int64 outputs.
+-- Today this works through the source-loaded RealFrac / RealFloat Double
+-- path, bottoming out on the Double#/Integer primops in 'IHC.Builtins'
+-- rather than ordinary Haskell API shims.
 --
 -- This fixture pins the visible behaviour: any regression in the
 -- float→Int path (positive, negative, exact, boundary) is caught
--- regardless of which side of the implementation lands the answer.
--- When the dispatcher workstream lifts the carve-out, we expect this
--- fixture to stay green throughout the transition.
+-- through the source-loaded float-to-Int path.
 --
 -- See plans/full-ghc-bignum-source-load.md (Phase 5).
 module Main where

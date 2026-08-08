@@ -10,9 +10,10 @@ module Hs2010Fixity (spec) where
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Data.List (sort)
+import qualified Data.Map.Strict as Map
 import Test.Hspec
 
-import IHC.Parser (FixityTable, ParseError, defaultFixityTable, scanFixityDecls)
+import IHC.Parser (Assoc(..), FixityTable, ParseError, defaultFixityTable, scanFixityDecls)
 import IHC.Scan (scanTypeSigs)
 import IHC.Source (Source, mkSource)
 
@@ -35,6 +36,17 @@ scanFixTo tbl bs expected = do
         Left (e :: SomeException) -> expectationFailure
             ("expected scan to succeed, got " <> show e)
 
+scanFixSucceeds :: FixityTable -> ByteString -> Expectation
+scanFixSucceeds tbl bs = do
+    r <- try (scanFixityDecls (mkSrc bs) tbl)
+    case r of
+        Right (_ :: FixityTable) -> pure ()
+        Left (e :: SomeException) -> expectationFailure
+            ("expected scan to succeed, got " <> show e)
+
+fixities :: [(ByteString, (Assoc, Int))] -> FixityTable
+fixities = Map.fromList
+
 -- | Run scanFixityDecls and assert that it throws a ParseError (used
 -- for the out-of-range precedence rejection cases).
 scanFixRejects :: ByteString -> Expectation
@@ -53,37 +65,43 @@ spec = describe "Hs2010 — Fixity & type signatures" $ do
     describe "3.8 fixity declarations" $ do
 
         it "3.8.1 `infixl` with default precedence (9) — `infixl `f``" $
-            pendingWith "known gap: scanFixityDecls requires explicit precedence digit; default-precedence form skipped"
+            scanFixTo mempty "infixl `f`\n"
+                (fixities [("`f`", (AssocL, 9))])
 
         it "3.8.2 `infixr 5 ++` parses without error" $
-            scanFixTo mempty "infixr 5 ++\n" mempty
+            scanFixSucceeds mempty "infixr 5 ++\n"
 
         it "3.8.2 `infixr 5 ++` registers `++` at precedence 5" $
-            pendingWith "known gap: scanFixityDecls.advance consumes the first operator after the precedence digit; only the SECOND op in the list is registered"
+            scanFixTo mempty "infixr 5 ++\n"
+                (fixities [("++", (AssocR, 5))])
 
         it "3.8.3 `infix 4 ==` parses without error" $
-            scanFixTo defaultFixityTable "infix 4 ==\n" defaultFixityTable
+            scanFixSucceeds defaultFixityTable "infix 4 ==\n"
 
         it "3.8.3 `infix 4 ==` registers `==` in the table" $
-            pendingWith "known gap: scanFixityDecls's consumeOps lacks TkEqEq case; `==` is silently skipped"
+            scanFixTo mempty "infix 4 ==\n"
+                (fixities [("==", (AssocN, 4))])
 
         it "3.8.4 multiple ops `infix 4 ==,/=` parses without error" $
-            scanFixTo defaultFixityTable "infix 4 ==,/=\n" defaultFixityTable
+            scanFixSucceeds defaultFixityTable "infix 4 ==,/=\n"
 
         it "3.8.4 multiple ops `infix 4 ==,/=` registers both ops" $
-            pendingWith "known gap: scanFixityDecls's consumeOps lacks TkEqEq/TkNeq cases"
+            scanFixTo mempty "infix 4 ==,/=\n"
+                (fixities [("==", (AssocN, 4)), ("/=", (AssocN, 4))])
 
         it "3.8.5 backtick `infixl 7 `div`` parses without error" $
-            scanFixTo mempty "infixl 7 `div`\n" mempty
+            scanFixSucceeds mempty "infixl 7 `div`\n"
 
         it "3.8.5 backtick `infixl 7 `div`` registers ``div``" $
-            pendingWith "known gap: same advance bug as 3.8.2; backtick op is consumed before consumeOps sees it"
+            scanFixTo mempty "infixl 7 `div`\n"
+                (fixities [("`div`", (AssocL, 7))])
 
         it "3.8.6 ctor-op fixity `infixr 5 :` parses without error" $
-            scanFixTo mempty "infixr 5 :\n" mempty
+            scanFixSucceeds mempty "infixr 5 :\n"
 
         it "3.8.6 ctor-op fixity `infixr 5 :` registers `:`" $
-            pendingWith "known gap: same advance bug as 3.8.2; the `:` after the precedence digit is consumed silently"
+            scanFixTo mempty "infixr 5 :\n"
+                (fixities [(":", (AssocR, 5))])
 
         it "3.8 rejection: `infixl 15 <>` raises ParseError (out of [0..9])" $
             scanFixRejects "infixl 15 <>\n"

@@ -1,12 +1,14 @@
 # HSX hello-world: architecture & path to rendered HTML
 
-Status: **foundation phase**. End-to-end route from `[hsx|<h1>Hello
-world</h1>|]` source text to a rendered HTML `String` under IHC. Map
-for follow-up sessions.
+Status: **megaparsec Text path partially unblocked** (2026-08-08).
+Foundation (QQ plumbing, blaze render baseline) is green. First real
+HSX run now dies later in the stack: megaparsec multi-statement
+do-blocks need unannotated `pure` to resolve to `ParsecT`, but
+result-poly `pure` defaults to IO (ParsecT-first breaks warp IO).
 
 Sibling slices this batch: Unit 1 = cache-priming script, Unit 2 =
 smoke fixture, Unit 3 = parser `EQuasiQuote` wiring, Units 5/6/7 =
-evaluator / renderer / class-dispatch follow-ups. This is Unit 4.
+evaluator / renderer / class-dispatch follow-ups.
 
 ## 1. Goal
 
@@ -91,24 +93,19 @@ short-forms `[e|` / `[d|` / `[t|` / `[p|` / `[e||` emit `TkOQuote*`;
 anything else (`[hsx|`, `[i|`, `[sql|`, …) emits `TkQQOpen <name>`. The
 body is not scanned — left as opaque bytes up to `|]`.
 
-Parser currently emits a placeholder for `TkQQOpen`
-(`src/IHC/Parser.hs:2867-2880`):
+Parser emits a real `EQuasiQuote` for `TkQQOpen`
+(`src/IHC/Parser.hs`, `TkQQOpen` branch):
 
 ```haskell
--- [name| ... |] — QuasiQuoter.  Without real TH QQ expansion we
--- scan the body as opaque bytes … and emit a placeholder
--- @error "unexpanded QQ: name"@.
+-- [name| ... |] — QuasiQuoter. Capture body bytes, emit EQuasiQuote.
 TkQQOpen qqName -> do
     curEnd <- skipQQBody ctx cur1
-    let placeholder =
-            EApp (EVar "error")
-                 (stringToConsList
-                     ("unexpanded QuasiQuoter [" ++ BC.unpack qqName ++ "|…|]"))
-    pure (placeholder, curEnd)
+    let body = sliceBytes (ctxSrc ctx) (cPos cur1, cPos curEnd - 2)
+    pure (EQuasiQuote qqName body, curEnd)
 ```
 
-**Unit 3 replaces the placeholder with a real `EQuasiQuote qqName
-bodyBytes` AST node** that carries the body to the evaluator.
+**Unit 3 done.** Body bytes are delivered to the evaluator, which
+projects `quoteExp` and expands the quote at run time.
 
 ---
 
@@ -118,24 +115,21 @@ End-to-end for one `[hsx|<h1>Hello world</h1>|]`:
 
 1. **Lex** — `src/IHC/Lexer.hs:606-637` emits `TkQQOpen "hsx"`, then
    raw body bytes up to `|]`.
-2. **Parse** — `src/IHC/Parser.hs:2874-2880` produces
-   `EQuasiQuote name body` once Unit 3 lands (today: `error "unexpanded
-   QuasiQuoter …"` placeholder). `name = "hsx"`, `body =
-   "<h1>Hello world</h1>"`.
+2. **Parse** — produces `EQuasiQuote name body` (`name = "hsx"`,
+   `body = "<h1>Hello world</h1>"`).
 3. **Resolve QQ** — evaluator looks up `IHP.HSX.QQ.hsx :: QuasiQuoter`.
    That's a record with `quoteExp, quotePat, quoteDec, quoteType`;
-   expression position picks `quoteExp` and applies it to the body
-   `String`.
-4. **Run `quoteExp`** — `IHP.HSX.QQ.quoteHsxExpression` runs in `Q`:
-   calls `IHP.HSX.Parser.parseHsx` (megaparsec) on the body, walks the
-   HSX AST, emits a TH `Exp` that constructs a
+   expression position picks `quoteExp` via `$fldProj$quoteExp` and
+   applies it to the body `String`.
+4. **Run `quoteExp`** — `IHP.HSX.QQ.quoteHsxExpression` runs in `Q`
+   (represented as `VIO`): calls `IHP.HSX.Parser.parseHsx` (megaparsec)
+   on the body, walks the HSX AST, emits a TH `Exp` that constructs a
    `Text.Blaze.Internal.MarkupM`.
-5. **TH Exp → IHC Expr** — `IHC.TH.thExpToExpr` (see `src/IHC/TH.hs`
-   header comment at lines 14-18) converts `VCon "LitE" …`, `VCon
+5. **TH Exp → IHC Expr** — `IHC.TH.thExpToExpr` (hook installed every
+   `loadProgramFromSource` run) converts `VCon "LitE" …`, `VCon
    "AppE" …`, etc. back into `IHC.AST.Expr`.
-6. **Evaluate** — normal `eval` / `force` loop; the splice bridge lives
-   alongside the `EQuote` / `ESplice` cases at
-   `src/IHC/Eval.hs:286-295`.
+6. **Evaluate** — normal `eval` / `force` loop; QQ dispatch is the
+   `EQuasiQuote` case in `src/IHC/Eval.hs`.
 7. **Render** — interpreted `Text.Blaze.Html.Renderer.String.renderHtml`
    walks the `MarkupM` tree to a `String`.
 8. **Print** — `putStrLn`.
@@ -156,34 +150,62 @@ Key files:
 
 ## 6. Known blockers
 
-- **Parser `EQuasiQuote` node.** Placeholder today; Unit 3.
-- **QuasiQuoter record resolution.** Evaluator must look up
-  `IHP.HSX.QQ.hsx`, project `quoteExp`, apply to the body. No
-  infrastructure yet — Units 5/7.
-- **TH `Q` monad.** `quoteHsxExpression` runs inside `Q`. `IHC.TH`
-  currently only supports Lift-splices (Phase 2.11) — no `Q IO`, no
-  `reify`. For the smoke test `Q` actions are trivial; the existing
-  `resetNewNameCounter` / `exprToVal` surface may suffice. TBD.
-- **TH `reify`.** Not needed for hello-world; flagged for larger
-  templates that inspect types via splices.
-- **Class dispatch: `ToHtml` / `ToMarkup` / `ToValue`.** HSX attribute
-  conversion goes through these. `ClassRegistry` needs entries on
-  `String`, `Text`, `Int`, `Html`. Unit 6 territory.
-- **Renderer primops.** `blaze-html`'s renderer is pure Haskell — no
-  new primop *should* be needed. Unverified; a tight inner loop might
-  hit a `ByteArray#`/`MutableByteArray#` primop we haven't implemented.
-  If so: implement the primop, don't shim.
-- **megaparsec under the interpreter.** `IHP.HSX.Parser` sits on
-  megaparsec. Mostly pure Haskell; the concern is
-  `unsafeDupablePerformIO` internals. Likely fine. TBD.
-- **Data.Text builtins.** Text is cached (2.1.1 + 2.1.4) and partially
-  exercised. Add missing UTF-8 primops rather than shim.
-- **`PackageImports`.** `IHP.HSX.QQ` imports `"template-haskell"
-  Language.Haskell.TH`. Needs to round-trip through the loader.
-- **IHP parser gaps.** `ihp-parser-gaps.md` lists 13 open parser
-  issues. HSX sub-tree uses record-update postfix and qualified
-  constructor patterns — both listed. Fresh probe of `ihp-hsx` needed
-  once its source hits the loader.
+### Landed (Unit 3 / QQ foundation)
+
+- **Parser `EQuasiQuote` node.** Done — `TkQQOpen` → `EQuasiQuote name bodyBytes`.
+- **Eval QQ dispatch.** Done — look up quoter, `$fldProj$quoteExp`, apply
+  body `String`, `runIOVal`, `thExpToExpr`, re-eval. Fixture:
+  `test/Fixtures/Coverage/qq_toy_string.hs`.
+- **`thExpToExpr` hook on run-file path.** Done — installed in
+  `loadProgramFromSource` (was only wired for the REPL via `buildBaseEnv`).
+- **`QuasiQuoter` from source.** Done for template-haskell **2.22.x**
+  (`Language.Haskell.TH.Quote` self-contained `data QuasiQuoter`).
+  Cache via `scripts/cache-hsx-deps.sh` (now lists `template-haskell`).
+  Prefer 2.22 over 2.24+: 2.24 re-exports from `GHC.Boot.TH.Quote`,
+  which is not in the IHC source cache.
+
+### Landed (2026-08-08 session)
+
+- **`Data.Text.length` / `measureOff maxBound`.** Bare nullary `maxBound`
+  in `length = negate . measureOff maxBound` stayed a `VClassMethod` and
+  was fed to FFI as `<function>`. Fix: signature-directed rewrite in
+  `Eval` — when applying `f maxBound` and `f`'s type sig starts with a
+  concrete ctor (`Int -> …`), rewrite to `maxBound :: Int`. Fixtures:
+  `text_length`, `text_maxbound_measureoff`.
+- **Strict vs lazy `Eq Text` collision.** Both modules registered under
+  bare tag `"Text"`; last-write (lazy `Empty`/`Chunk`) won, so
+  `string`/`(==)` on strict Text pattern-matched lazy ctors. Fix:
+  skip type-name registration when runtime ctors are a disjoint set
+  (lazy Text → only `Empty`/`Chunk`). Same class of bug as historical
+  strict/lazy `ByteString`. Fixture: `megaparsec_string_text`.
+- **`normalizeTyTag` head-ctor + `Parsec`→`ParsecT`.** Lets
+  `pure @(Parsec Void Text)` hit `Applicative ParsecT`. Preserves
+  `ShareInput T` compound tags.
+- **Megaparsec green subset on Text:** `char`, `string`/`chunk`,
+  `takeWhileP`/`takeWhile1P`, Applicative `(,) <$> c1 <*> c2`.
+  Fixtures: `megaparsec_char_text`, `megaparsec_string_text`.
+- **Blaze render baseline still green:** `examples/blaze_hello`.
+- **QQ foundation still green:** `qq_toy_string`.
+
+### Still open for full `[hsx|…]`
+
+- **Unannotated `pure` / `return` in ParsecT do-blocks (current tip).**
+  Result-poly defaults pure to IO-first (required for warp). HSX's
+  `parseHsx` ends with `pure node` unannotated → IO-shaped value →
+  `unParser` sees `(#,#)`. Type-annotated `pure @(Parsec …)` works;
+  reordering defaults to ParsecT-first when the instance is loaded
+  breaks `pure` in IO after megaparsec is in the process. Need
+  expected-type elaboration of pure from the enclosing `Parser`/
+  `ParsecT` binding or do-block, without a global default flip.
+- **TH surface used by HSX `quoteHsxExpression`.** `location` /
+  `extsEnabled` stubs exist; nested brackets + `$(pure expr)` antiquotes,
+  `Lift Text` remain. See `docs/HSX-TH-NEEDS.md`.
+- **TH `reify`.** Not needed for hello-world.
+- **Class dispatch: `ToHtml` / `ToMarkup` / `ToValue`.** Unit 6.
+- **Renderer primops.** blaze-html pure Haskell; unverified under full HSX.
+- **`PackageImports`.** `IHP.HSX.QQ` imports `"template-haskell" …`.
+- **GHC API in `IHP.HSX.HaskellParser`.** Hello-world with no `{…}`
+  embeds may avoid this (gap 29 in `docs/HSX-TH-NEEDS.md`).
 
 ---
 
@@ -191,28 +213,25 @@ Key files:
 
 Ordered, one-PR-per-step:
 
-1. **(Unit 1, in flight)** Cache-priming script for `ihp-hsx` + blaze +
-   megaparsec + string-conversions; idempotent, extends
-   `scripts/cache-test-deps.sh`.
-2. **(Unit 2, in flight)** Smoke fixture under `test/Fixtures/`
-   importing `IHP.HSX.QQ` and printing
-   `[hsx|<h1>Hello world</h1>|]` via `renderHtml`.
-   Expected-failure until pipeline greens.
-3. **(Unit 3, in flight)** Parser emits `EQuasiQuote name body` AST
-   node instead of the `error` placeholder; add `AST.Expr` ctor, wire
-   `Scan` / `Parser` / `Eval` to carry the body.
-4. `EQuasiQuote` dispatch in `IHC.Eval`: resolve
-   `<module>.<name> :: QuasiQuoter`, project `quoteExp`, apply to the
-   body string. Shared between Units 5 and 7.
-5. `QuasiQuoter` record construction/destruction — record-selector
-   eval for `Q`-typed fields (`template-haskell` source in cache).
-6. Enough of `Language.Haskell.TH.Quote`'s `Q` monad for `quoteExp` to
-   run: `Q IO`-level bind/return, `newName`/counter plumbing as used by
-   `quoteHsxExpression`.
-7. `ToHtml` / `ToMarkup` / `ToValue` registry entries for `String`,
+1. **(Unit 1, done)** Cache-priming script `scripts/cache-hsx-deps.sh`
+   for `ihp-hsx` + blaze + megaparsec + string-conversions +
+   `template-haskell` (2.22 preferred).
+2. **(Unit 2, done — expected-fail)** Smoke fixtures:
+   `examples/hsx_hello/`, blaze hello baseline.
+3. **(Unit 3, done)** Parser emits `EQuasiQuote name body`; AST /
+   Pretty / free-var / rewrite paths carry the node.
+4. **(done)** `EQuasiQuote` dispatch in `IHC.Eval` + `thExpToExpr` hook
+   on the run-file path. Proven by `test/Fixtures/Coverage/qq_toy_string.hs`.
+5. **(done for toy)** `QuasiQuoter` record construction/destruction via
+   source-loaded `Language.Haskell.TH.Quote` (2.22).
+6. **(partial)** Megaparsec on Text: char/string/takeWhile + Applicative
+   green; monadic do + unannotated `pure` still open (see §6).
+7. Enough of `Q` for full HSX `quoteHsxExpression` (nested brackets,
+   antiquotes) — still open.
+8. `ToHtml` / `ToMarkup` / `ToValue` registry entries for `String`,
    `Text`, `Int`, `Html`.
-8. Interpret `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end;
-   fix any missing primop / class dispatch encountered.
-9. Green the Unit 2 fixture (flip the expected-failure marker).
-10. Document surprises under §6 and open follow-ups for splices with
+9. Interpret `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end;
+   blaze_hello baseline already green without HSX.
+10. Green the Unit 2 / `hsx_hello` fixture (flip the expected-failure marker).
+11. Document surprises under §6 and open follow-ups for splices with
     interpolation, runtime-`Text` attribute conversion, etc.

@@ -11,6 +11,7 @@ module IHC.TypeGlobals
     , globalTypeSynonymsRef
     , globalClassMethodNamesRef
     , globalMethodClassRef
+    , globalAmbiguousSigsRef
       -- * Bundle that backs the four legacy registries
     , LegacyTypeState(..)
     , legacyTypeState
@@ -43,9 +44,10 @@ data LegacyTypeState = LegacyTypeState
     , ltsTypeSynonyms       :: !(IORef (Map ByteString (Int, Type)))
     , ltsClassMethodNames   :: !(IORef (Set ByteString))
     , ltsMethodClass        :: !(IORef (Map ByteString [ByteString]))
+    , ltsAmbiguousSigs      :: !(IORef (Set ByteString))
     }
 
--- | One-shot allocation of the four type-registry IORefs.
+-- | One-shot allocation of the type-registry IORefs.
 {-# NOINLINE legacyTypeState #-}
 legacyTypeState :: LegacyTypeState
 legacyTypeState = unsafePerformIO $ do
@@ -53,11 +55,13 @@ legacyTypeState = unsafePerformIO $ do
     synonyms    <- newIORef Map.empty
     classNames  <- newIORef Set.empty
     methodClass <- newIORef Map.empty
+    ambiguous   <- newIORef Set.empty
     pure LegacyTypeState
         { ltsTypeSigs         = sigs
         , ltsTypeSynonyms     = synonyms
         , ltsClassMethodNames = classNames
         , ltsMethodClass      = methodClass
+        , ltsAmbiguousSigs    = ambiguous
         }
 
 -- | Flat union of every loaded module's top-level type signatures.
@@ -98,6 +102,18 @@ globalClassMethodNamesRef = ltsClassMethodNames legacyTypeState
 -- dispatcher resolves.
 globalMethodClassRef :: IORef (Map ByteString [ByteString])
 globalMethodClassRef = ltsMethodClass legacyTypeState
+
+-- | Bare names whose top-level signatures CONFLICT across the loaded modules
+-- (e.g. @Prelude.map :: (a->b)->[a]->[b]@ vs @Data.List.NonEmpty.map ::
+-- (a->b)->NonEmpty a->NonEmpty b@).  'globalTypeSigsRef' is a flat bare-keyed
+-- union with last-writer-wins, so a colliding name silently resolves to
+-- whichever module loaded last — and once a library pulls in @NonEmpty@,
+-- elaborating @map f [xs]@ unifies @NonEmpty a@ against @[]@ and the whole
+-- signature-directed rewrite is discarded.  'IHC.Elaborate.elaborateVar'
+-- consults this set and treats an ambiguous bare name as opaque (no sig)
+-- rather than guess the wrong one — strictly safer than the last-writer guess.
+globalAmbiguousSigsRef :: IORef (Set ByteString)
+globalAmbiguousSigsRef = ltsAmbiguousSigs legacyTypeState
 
 -- | Seed the sig registry with a small table of canonical class
 -- method signatures.  Our top-level sig scanner ('scanTypeSigs') only
@@ -241,6 +257,21 @@ seedBuiltinClassMethodSigs = do
             , ("round",      "RealFrac")
             , ("ceiling",    "RealFrac")
             , ("floor",      "RealFrac")
+            -- RealFloat
+            , ("floatRadix",     "RealFloat")
+            , ("floatDigits",    "RealFloat")
+            , ("floatRange",     "RealFloat")
+            , ("decodeFloat",    "RealFloat")
+            , ("encodeFloat",    "RealFloat")
+            , ("exponent",       "RealFloat")
+            , ("significand",    "RealFloat")
+            , ("scaleFloat",     "RealFloat")
+            , ("isNaN",          "RealFloat")
+            , ("isInfinite",     "RealFloat")
+            , ("isDenormalized", "RealFloat")
+            , ("isNegativeZero", "RealFloat")
+            , ("isIEEE",         "RealFloat")
+            , ("atan2",          "RealFloat")
             -- Bits
             --
             -- Builtins-removal companion: the @popCount@ / @bit@ /
@@ -259,25 +290,36 @@ seedBuiltinClassMethodSigs = do
             , ("setBit",     "Bits")
             -- Foldable
             , ("length",     "Foldable")
-            -- Applicative / Monad seeds (already in env via builtins, but
-            -- registering the class lets future env-fallbacks dispatch).
+            -- Applicative / Monad seeds. These are class methods with
+            -- source bodies, so bare references must synthesize
+            -- classMethodDispatcher instead of using host shims.
             , ("pure",       "Applicative")
+            , ("<*>",        "Applicative")
             , ("return",     "Monad")
+            , (">>=",        "Monad")
+            , (">>",         "Monad")
             -- Monoid / Semigroup
             , ("mempty",     "Monoid")
             , ("mappend",    "Monoid")
             , ("mconcat",    "Monoid")
             , ("<>",         "Semigroup")
-            -- Pre-seed the @Eq@ method→class mapping for the
-            -- (currently still-builtin-shimmed) @==@ / @/=@ so that
-            -- the eventual builtin removal won't need a separate
-            -- TypeGlobals patch.  Today these names resolve via the
-            -- @eqDispatch@ / @neqDispatch@ builtins in
-            -- 'IHC.Builtins'; the seed is harmless until that shim is
-            -- dropped, at which point 'tryClassMethodFromRegistry'
-            -- starts using it.
+            -- Eq.  These source-load from @GHC.Classes@; pre-seeding
+            -- the method→class mapping lets the env-fallback synthesize
+            -- an @Eq@ dispatcher on the first bare @==@ / @/=@ lookup,
+            -- without relying on a host-backed class-method shim.
             , ("==",         "Eq")
             , ("/=",         "Eq")
+            -- Ord.  These source-load from @GHC.Classes@; pre-seeding
+            -- the method→class mapping lets the env-fallback synthesize
+            -- an @Ord@ dispatcher on the first bare relation / @compare@
+            -- lookup, now that the relation-operator builtins are gone.
+            , ("compare",    "Ord")
+            , ("<",          "Ord")
+            , ("<=",         "Ord")
+            , (">",          "Ord")
+            , (">=",         "Ord")
+            , ("min",        "Ord")
+            , ("max",        "Ord")
             -- Show
             --
             -- Lets the env-fallback's 'tryClassMethodFromRegistry'

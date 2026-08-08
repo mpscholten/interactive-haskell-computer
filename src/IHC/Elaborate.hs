@@ -28,13 +28,12 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
-import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry)
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
-import IHC.TypeGlobals (globalClassMethodNamesRef)
+import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import IHC.TypeUnify
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
@@ -66,6 +65,8 @@ data InferEnv = InferEnv
     , ieSynonyms :: !(Map ByteString (Int, Type))
     , ieClassReg :: !ClassRegistry
     , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
+    , ieClassMethodNames :: !(Set.Set ByteString)
+    , ieAmbiguousSigs    :: !(Set.Set ByteString)
     }
 
 -- | Top-level entry point.  Elaborate a sub-expression under an
@@ -83,12 +84,16 @@ elaborate
     -> IO (Expr, Type)
 elaborate classReg sigs synonyms expected e = do
     fresh <- newFreshSource
+    classMethodNames <- readIORef globalClassMethodNamesRef
+    ambiguousSigs    <- readIORef globalAmbiguousSigsRef
     let ienv = InferEnv
             { ieFresh    = fresh
             , ieSigs     = sigs
             , ieSynonyms = synonyms
             , ieClassReg = classReg
             , ieLocals   = Map.empty
+            , ieClassMethodNames = classMethodNames
+            , ieAmbiguousSigs    = ambiguousSigs
             }
     (e', t, _preds, sub) <- elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
@@ -231,37 +236,74 @@ elaborateVar ienv name =
         Just sch -> do
             (preds, ty) <- instantiate (ieFresh ienv) sch
             pure (EVar name, ty, preds, emptySubst)
-        Nothing -> case Map.lookup name (ieSigs ienv) of
-            Just sch -> do
-                (preds, ty) <- instantiate (ieFresh ienv) sch
-                case classMethodHint name preds ty of
-                    Just (cls, paramVar) ->
-                        -- Emit ETypedMethod with placeholder tag.
-                        -- The tag is the fresh tyvar's name;
-                        -- 'applyMethodSubst' resolves it later.
-                        pure ( ETypedMethod cls name paramVar
-                             , ty
-                             , preds
-                             , emptySubst
-                             )
-                    Nothing ->
-                        pure (EVar name, ty, preds, emptySubst)
-            Nothing ->
-                -- No signature available.  Return a fresh tyvar — the
-                -- enclosing context may still succeed if this var
-                -- doesn't participate in class dispatch.
-                do fresh <- TyVar <$> freshVar (ieFresh ienv)
-                   pure (EVar name, fresh, [], emptySubst)
+        Nothing -> do
+            mSig <- lookupSig
+            case mSig of
+                Just sch -> do
+                    (preds, ty) <- instantiate (ieFresh ienv) sch
+                    -- Use the BARE (unqualified) name for class-method detection
+                    -- and the emitted node.  In a non-entry module the binding's
+                    -- RHS has had its free vars import-rewritten to FQNs (e.g.
+                    -- @GHC.Enum.minBound@, @Data.Array.Base.listArray@), but the
+                    -- sig table and 'globalClassMethodNamesRef' are bare-keyed, and
+                    -- an 'ETypedMethod's method is looked up by bare name at eval
+                    -- time.  Without this, signature-directed elaboration fired
+                    -- only for the entry module (where names stay bare) — e.g.
+                    -- http-types' @methodArray@ resolved its @(minBound,maxBound)@
+                    -- bounds in a single-file repro but defaulted to Int when
+                    -- imported (the warp request path), surfacing as
+                    -- @Ix Int.index: non-Int index@.
+                    let bare = bareName name
+                    case classMethodHint ienv bare preds ty of
+                        Just (cls, paramVar) ->
+                            -- Emit ETypedMethod with placeholder tag (bare method
+                            -- name).  The tag is the fresh tyvar's name;
+                            -- 'applyMethodSubst' resolves it later.
+                            pure ( ETypedMethod cls bare paramVar
+                                 , ty
+                                 , preds
+                                 , emptySubst
+                                 )
+                        Nothing ->
+                            pure (EVar name, ty, preds, emptySubst)
+                Nothing ->
+                    -- No signature available.  Return a fresh tyvar — the
+                    -- enclosing context may still succeed if this var
+                    -- doesn't participate in class dispatch.
+                    do fresh <- TyVar <$> freshVar (ieFresh ienv)
+                       pure (EVar name, fresh, [], emptySubst)
+  where
+    -- Try the name as written, then its bare last component, so FQNs from a
+    -- non-entry module's import-rewritten RHS still find the bare-keyed sig.
+    -- BUT decline if the bare name is AMBIGUOUS (conflicting sigs across
+    -- loaded modules, e.g. @map@ once @Data.List.NonEmpty@ is in scope): the
+    -- flat table holds only the last-writer's scheme, so using it would unify
+    -- against the wrong shape (@NonEmpty a@ vs @[]@) and abort the whole
+    -- rewrite.  Treating it as opaque (Nothing → fresh tyvar) is safe — a
+    -- non-class-method like @map@ doesn't need a sig for the surrounding
+    -- signature-directed resolution to succeed.
+    lookupSig = do
+        if isAmbiguousSig ienv (bareName name)
+            then pure Nothing
+            else pure $ case Map.lookup name (ieSigs ienv) of
+                Just s  -> Just s
+                Nothing -> Map.lookup (bareName name) (ieSigs ienv)
+
+-- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
+bareName :: Name -> Name
+bareName n = case BC.elemIndexEnd '.' n of
+    Just i | i + 1 < BC.length n -> BC.drop (i + 1) n
+    _ -> n
 
 -- | If the signature has a single-parameter class constraint whose
 -- argument is a plain type variable that also appears in the body
 -- type, return @(className, tyVarName)@ — the info needed to emit
 -- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
-classMethodHint :: Name -> [Pred] -> Type -> Maybe (Name, Name)
-classMethodHint methodName preds body = case preds of
+classMethodHint :: InferEnv -> Name -> [Pred] -> Type -> Maybe (Name, Name)
+classMethodHint ienv methodName preds body = case preds of
     [Pred cls (TyVar v)]
       | Set.member v (freeTyVars body)
-      , isActualClassMethod methodName ->
+      , isActualClassMethod ienv methodName ->
             Just (cls, v)
     _ -> Nothing
 
@@ -271,12 +313,16 @@ classMethodHint methodName preds body = case preds of
 -- tyvar appears in the body" shape (@array :: Ix i => (i, i) -> [(i,
 -- e)] -> Array i e@) through the class dispatcher.
 --
--- 'unsafePerformIO' is safe because the referenced 'IORef' is
--- write-once-mostly (populated by the scheduler at program start) and
--- reads are commutative.
-isActualClassMethod :: Name -> Bool
-isActualClassMethod name =
-    name `Set.member` unsafePerformIO (readIORef globalClassMethodNamesRef)
+isActualClassMethod :: InferEnv -> Name -> Bool
+isActualClassMethod ienv name =
+    Set.member name (ieClassMethodNames ienv)
+
+-- | Does this bare name have CONFLICTING signatures across the loaded modules
+-- (so the flat 'globalTypeSigsRef' entry is whichever module loaded last)?
+-- See 'IHC.Scheduler.mirrorTypeSigsGlobal' / 'globalAmbiguousSigsRef'.  Same
+isAmbiguousSig :: InferEnv -> Name -> Bool
+isAmbiguousSig ienv name =
+    Set.member name (ieAmbiguousSigs ienv)
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)
@@ -392,16 +438,37 @@ elaborateDo ienv stmts = do
 applyMethodSubst :: Subst -> Expr -> Expr
 applyMethodSubst sub = go
   where
-    resolveTag :: Name -> Name
+    -- Resolve a placeholder tag to its concrete head constructor.  Returns
+    -- 'Nothing' when the class parameter is still ambiguous after inference
+    -- (the tag is a type variable, not a real type head) — the caller then
+    -- reverts the node to a bare 'EVar' (see 'go').
+    resolveTag :: Name -> Maybe Name
     resolveTag tag = case Map.lookup tag sub of
-        Just ty -> case tyHead (applySubst sub ty) of
-            Just h  -> h
-            Nothing -> tag   -- still a tyvar or arrow; eval will error
-        Nothing -> tag        -- tag is already a concrete head (direct rewrite)
+        Just ty -> tyHead (applySubst sub ty)   -- Just head, or Nothing if still a tyvar/arrow
+        Nothing
+          | isHeadName tag -> Just tag           -- already a concrete head (direct rewrite)
+          | otherwise      -> Nothing            -- unresolved placeholder type variable
+
+    -- A resolved type head is a constructor: an uppercase name, or the list /
+    -- tuple constructors.  Type-variable placeholders (lowercase, or the
+    -- fresh-var @$t…@ names) are not heads.
+    isHeadName t = case BC.uncons t of
+        Just (c, _) -> (c >= 'A' && c <= 'Z') || c == '[' || c == '('
+        Nothing     -> False
 
     go e = case e of
         ETypedMethod cls method tag ->
-            ETypedMethod cls method (resolveTag tag)
+            case resolveTag tag of
+                Just h  -> ETypedMethod cls method h
+                -- Tag stayed ambiguous (a type variable).  Revert to the bare
+                -- name rather than emitting a broken 'ETypedMethod' whose tag
+                -- has no instance: that node would (a) make the eval-site's
+                -- 'allTypedMethodsResolvable' reject the WHOLE rewrite — losing
+                -- the siblings that DID resolve (e.g. listArray's
+                -- @(minBound,maxBound)@ bounds while an element-list @maxBound@
+                -- stayed ambiguous) — and (b) error at eval.  A bare 'EVar'
+                -- falls to runtime value-directed dispatch / defaults instead.
+                Nothing -> EVar method
         EApp f x     -> EApp (go f) (go x)
         ELam n body  -> ELam n (go body)
         ELet bs body -> ELet [(n, go b) | (n, b) <- bs] (go body)
@@ -592,4 +659,3 @@ tokenize bs
                      || c == '.'
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
-

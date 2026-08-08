@@ -1,10 +1,10 @@
--- REGRESSION CANARY for the @==@/@/=@-builtin discovery cascade.
+-- REGRESSION CANARY for source-loaded @==@/@/=@ discovery.
 --
--- This is the exact reproducer from IHC.Builtins's "drop ==//=" TODO:
+-- This is the exact reproducer from IHC.Builtins's former "drop ==//=" TODO:
 -- composing a source-loaded @compare@ result with @==@ on @Ordering@.
--- Before the cascade fix, removing the @==@/@/=@ builtins made the
--- per-FV chase from @registerInstancesFrom@ / @registerClassDefaults@
--- recurse through @GHC.Classes@'s Eq/Ord surface + the
+-- Before the cascade fix, source-loading @==@/@/=@ made the per-FV
+-- chase from @registerInstancesFrom@ / @registerClassDefaults@ recurse
+-- through @GHC.Classes@'s Eq/Ord surface + the
 -- @GHC.Internal.*@ web until the 4 GB heap exhausted (discovery total
 -- ~1000 on master → >2400 → OOM).
 --

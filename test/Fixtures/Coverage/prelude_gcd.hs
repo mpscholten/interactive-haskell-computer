@@ -1,7 +1,7 @@
 -- Builtins-removal: gcd must resolve via the source-loaded
 -- Prelude re-export (GHC.Internal.Real), not the historical
 -- @binOpInt gcd@ shim.  The recursive body uses 'abs' (graduated
--- in Phase E) and 'rem' (still shimmed) plus first-order pattern
+-- in Phase E) and source-loaded 'rem' plus first-order pattern
 -- matching on 0.
 module Main where
 

@@ -6,6 +6,7 @@
 -- have the binary on PATH.
 module ReplTest (spec) where
 
+import IhcTestBinary (ihcBin)
 import System.IO (hPutStr, hFlush, hClose, openTempFile)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Process (readProcessWithExitCode)
@@ -13,17 +14,17 @@ import System.Exit (ExitCode(..))
 import System.Timeout (timeout)
 import Test.Hspec
 
--- | Locate the ihc binary built by cabal.
-ihcBin :: FilePath
-ihcBin = "dist-newstyle/build/aarch64-osx/ghc-9.10.3/ihc-0.1.0.0/x/ihc/build/ihc/ihc"
-
 runRepl :: String -> IO (ExitCode, String, String)
-runRepl input = do
-    result <- timeout (20 * 1000000) (readProcessWithExitCode ihcBin ["repl"] input)
+runRepl = runReplWithin 20
+
+runReplWithin :: Int -> String -> IO (ExitCode, String, String)
+runReplWithin seconds input = do
+    bin <- ihcBin
+    result <- timeout (seconds * 1000000) (readProcessWithExitCode bin ["repl"] input)
     case result of
         Just triple -> pure triple
         Nothing -> do
-            expectationFailure "REPL timed out"
+            expectationFailure ("REPL timed out after " <> show seconds <> "s")
             pure (ExitFailure 124, "", "")
 
 spec :: Spec
@@ -114,15 +115,25 @@ spec = describe "REPL smoke tests" do
         code `shouldBe` ExitSuccess
         out `shouldContain` "imported Data.ByteString (deferred)"
 
+    it "import qualified Data.ByteString as BS: BS.length materializes promptly" do
+        -- Regression guard for the targeted ImportOnly alias path.  A request
+        -- for just `length` previously walked broad Prelude/Data.List
+        -- re-export aliases and hung until the outer REPL timeout fired.
+        (code, out, _err) <- runReplWithin 8
+            ( "import qualified Data.ByteString as BS\n"
+           <> "BS.length\n"
+           <> ":q\n" )
+        code `shouldBe` ExitSuccess
+        out `shouldContain` "<function>"
+
     it "import qualified Data.ByteString as BS: BS.length (BS.pack [97,98,99]) = 3" do
         -- REPL imports route this through source-loaded
-        -- 'Data.ByteString.pack' (the 'bsPackB' shim only fires on
-        -- the file-mode entry-source path).  Source path goes
+        -- 'Data.ByteString.pack'.  Source path goes
         -- 'pack' → 'unsafePackLenBytes' → 'pokeFp p w8' for each
-        -- element.  Was gated on IHC_REPL_SLOW=1 when source-load
-        -- couldn't keep up with the 20s REPL timeout; current
-        -- measurement is ~1.7s wall, so ungated.
-        (code, out, _err) <- runRepl
+        -- element.  This is still the source-loaded pack path, not a
+        -- ByteString shim, and can sit close to the default 20s REPL
+        -- smoke-test timeout on a cold process.
+        (code, out, _err) <- runReplWithin 35
             ( "import qualified Data.ByteString as BS\n"
            <> "BS.length (BS.pack [97,98,99])\n"
            <> ":q\n" )
@@ -140,10 +151,8 @@ spec = describe "REPL smoke tests" do
         -- matching the explicit @c2w@ coercion used by
         -- 'Data.ByteString.Char8.pack' for the strict-typed Char
         -- path.  Source-loaded 'Data.ByteString.pack' now handles
-        -- both inputs without the 'bsPackB' shim being preferred (the
-        -- shim still exists, but is a separate clean-up — CLAUDE.md
-        -- rule 4 wants no Hackage shims at all).
-        (code, out, _err) <- runRepl
+        -- both inputs without any ByteString API shim being preferred.
+        (code, out, _err) <- runReplWithin 35
             ( "import qualified Data.ByteString as BS\n"
            <> "BS.length (BS.pack \"test\")\n"
            <> ":q\n" )

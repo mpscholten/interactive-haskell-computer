@@ -15,6 +15,13 @@ module IHC.Builtins
     , stringToListValIO
     , clearCtorIndex
     , clearForeignPtrWord8Ranges
+    , foreignPtrValToForeignPtr
+    , flushHostHandleBuffer
+    , isHostWord8PtrVal
+    , ordCmp
+    , eqByteStringHost
+    , peekHostWord8ByteOff
+    , pokeHostWord8ByteOff
     , reapSpawnedThreads
     ) where
 
@@ -24,11 +31,10 @@ import Control.Concurrent
     )
 import Control.Concurrent.MVar
     ( MVar, newMVar, newEmptyMVar, takeMVar, putMVar, readMVar
-    , modifyMVar_, modifyMVar, tryTakeMVar, tryPutMVar, isEmptyMVar
-    , withMVar, swapMVar
+    , tryTakeMVar, tryPutMVar, isEmptyMVar
     )
 import Control.Concurrent.STM
-    ( TVar, atomically, retry, check
+    ( TVar, atomically
     , newTVarIO, readTVar, writeTVar, readTVarIO
     )
 import qualified Control.Exception as CE
@@ -37,36 +43,32 @@ import Control.Exception
     , throwTo
     , SomeException
     )
-import Foreign.C.Error (Errno(..), getErrno)
-import Foreign.C.Types (CInt(..), CSize(..))
 import Data.Bits
     ( (.&.), (.|.), xor, complement, shiftL, shiftR
-    , popCount, countLeadingZeros, finiteBitSize
+    , popCount, countLeadingZeros, countTrailingZeros, finiteBitSize
     , bit, testBit, clearBit, setBit, complementBit
     )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Char (chr, ord)
+import Data.Char (chr, ord, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
-import Data.Int (Int64)
+import Data.Int (Int8, Int64)
 import Data.List (intercalate)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
 import Numeric.Natural (Natural)
-import Foreign.C.String (peekCAString, withCString)
+import Foreign.C.String (peekCAString)
 import Foreign.ForeignPtr
-    ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, touchForeignPtr
-    , newForeignPtr_
-    , plusForeignPtr
-    )
+    ( ForeignPtr, mallocForeignPtrBytes, withForeignPtr, newForeignPtr_
+    , plusForeignPtr )
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Marshal.Alloc (alloca, allocaBytes, mallocBytes, free)
+import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff)
 import qualified System.Info
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -75,6 +77,7 @@ import System.IO
     , IOMode(..)
     , hClose
     , hFlush
+    , hGetContents
     , hGetLine
     , hPutBuf
     , hPutChar
@@ -86,9 +89,6 @@ import System.IO
     , stdin
     , stdout
     )
-import qualified System.Posix.IO as PosixIO
-import System.Posix.Types (Fd)
-
 import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
@@ -110,11 +110,11 @@ mkForeignPtrVal fp = do
     gutsT <- newWHNFThunk (VPrimObj (PrimForeignPtr fp))
     pure (VCon "ForeignPtr" [addrT, gutsT])
 
-{-# NOINLINE foreignPtrWord8RangesRef #-}
-foreignPtrWord8RangesRef :: IORef [(IntPtr, IntPtr)]
-foreignPtrWord8RangesRef = unsafePerformIO (newIORef [])
+-- word8PtrRangesRef / markWord8PtrRange / isMarkedWord8Ptr live in
+-- IHC.Val so Eval.byteStringConFromBS can mark OverloadedStrings
+-- buffers the same way mallocForeignPtrBytesB does.
 
--- | Every interpreter-spawned thread ('forkIOB' / 'fork#').  An
+-- | Every interpreter-spawned thread (source-loaded 'forkIO' via 'fork#').  An
 -- interpreted program's @main@ can fork background threads (warp's
 -- accept loop, System.TimeManager, async workers, bare @forkIO@) that
 -- are still alive — running or blocked on an MVar\/STM\/threadDelay —
@@ -136,21 +136,63 @@ registerSpawnedThread tid = modifyIORef' spawnedThreadsRef (tid :)
 markWord8Ptr :: Ptr Word8 -> IO ()
 markWord8Ptr p = markWord8PtrRange p 1
 
-markWord8PtrRange :: Ptr Word8 -> Int -> IO ()
-markWord8PtrRange p len =
-    let start = ptrToIntPtr (castPtr p)
-        end   = start + fromIntegral (max 1 len)
-    in modifyIORef' foreignPtrWord8RangesRef ((start, end) :)
-
 markForeignPtrWord8 :: ForeignPtr Word8 -> IO ()
 markForeignPtrWord8 fp =
     markWord8Ptr (castPtr (unsafeForeignPtrToPtr fp))
 
-isMarkedWord8Ptr :: Ptr Word8 -> IO Bool
-isMarkedWord8Ptr p =
-    let addr = ptrToIntPtr (castPtr p)
-    in any (\(start, end) -> addr >= start && addr < end)
-        <$> readIORef foreignPtrWord8RangesRef
+isHostWord8PtrVal :: Val -> IO Bool
+isHostWord8PtrVal v = do
+    p <- ptrValToPtr v
+    marked <- isMarkedWord8Ptr p
+    if marked
+        then pure True
+        else do
+            mTyped <- lookupTypedHostPtr p
+            pure (mTyped `elem` map Just [BC.pack "Word8", BC.pack "CChar", BC.pack "CSChar", BC.pack "CUChar"])
+
+pokeHostWord8ByteOff :: Val -> Val -> Val -> IO Val
+pokeHostWord8ByteOff ptrV offV valV = do
+    p <- ptrValToPtr ptrV
+    off <- byteOffsetFromVal "pokeHostWord8ByteOff" offV
+    byte <- word8FromVal valV
+    pokeByteOff (p :: Ptr Word8) off byte
+    pure VUnit
+  where
+    word8FromVal (VInt n) =
+        pure (fromIntegral n :: Word8)
+    word8FromVal (VInteger n) =
+        pure (fromInteger n :: Word8)
+    word8FromVal (VCon "W8#" [t]) = do
+        inner <- force legacyHooks t
+        case inner of
+            VInt n -> pure (fromIntegral n :: Word8)
+            _ -> error ("pokeHostWord8ByteOff: W8# inner not Int: "
+                        <> showValForDebug inner)
+    word8FromVal (VChar c) =
+        pure (fromIntegral (ord c) :: Word8)
+    word8FromVal other =
+        error ("pokeHostWord8ByteOff: bad byte: " <> showValForDebug other)
+
+peekHostWord8ByteOff :: Val -> Val -> IO Val
+peekHostWord8ByteOff ptrV offV = do
+    p <- ptrValToPtr ptrV
+    off <- byteOffsetFromVal "peekHostWord8ByteOff" offV
+    mTyped <- lookupTypedHostPtr p
+    case mTyped of
+        Just ty | ty `elem` map BC.pack ["CChar", "CSChar"] -> do
+            byte <- peekByteOff (castPtr p :: Ptr Int8) off :: IO Int8
+            pure (VInt (fromIntegral byte))
+        _ -> do
+            byte <- peekByteOff (p :: Ptr Word8) off :: IO Word8
+            pure (VInt (fromIntegral byte))
+
+byteOffsetFromVal :: String -> Val -> IO Int
+byteOffsetFromVal who (VInt off) =
+    pure (fromIntegral off)
+byteOffsetFromVal who (VInteger off) =
+    pure (fromInteger off)
+byteOffsetFromVal who other =
+    error (who <> ": bad offset: " <> showValForDebug other)
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
@@ -227,9 +269,9 @@ builtinEnv reg = do
         , "NoBuffering", "LineBuffering", "BlockBuffering"
         ]
     -- Standard handles — source-loaded FileHandle constructors.
-    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin
-    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout
-    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr
+    stdinT  <- newWHNFThunk =<< mkFileHandleVal "<stdin>"  stdin  ReadMode
+    stdoutT <- newWHNFThunk =<< mkFileHandleVal "<stdout>" stdout WriteMode
+    stderrT <- newWHNFThunk =<< mkFileHandleVal "<stderr>" stderr WriteMode
     let handles = [("stdin", stdinT), ("stdout", stdoutT), ("stderr", stderrT)]
     -- Ordering constructors.
     ltT <- newWHNFThunk (VCon "LT" [])
@@ -332,9 +374,8 @@ builtins reg =
     -- @GHC.Classes@'s @class Ord@ defaults
     --   max x y = if x <= y then y else x
     --   min x y = if x <= y then x else y
-    -- and resolve through the @<=@ builtin (registered below as slot 1
-    -- of 'ordDispatch') plus the source-loaded class-method dispatcher
-    -- via the env-fallback's 'tryClassMethodFromRegistry'.
+    -- and resolve through the source-loaded @<=@ class method via the
+    -- env-fallback's 'tryClassMethodFromRegistry'.
     --
     -- 'gcd' graduated to source-loaded.  Body lives at
     --   ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Real.hs:928-930
@@ -373,47 +414,23 @@ builtins reg =
     --   ==##, /=##, <##, <=##, >##, >=##  — Double# comparisons
     --   fabsDouble#, negateFloat#  — Double# unary
     --
-    -- Plus host shims for 'encodeFloat' / 'decodeFloat' that
-    -- short-circuit the class-method dispatcher (separate workstream:
-    -- @RealFloat Double.encodeFloat@ instance method registration
-    -- isn't surfacing through dispatch; the host shim bypasses).
-    [ ("fromIntegral", fromIntegralB)
-    , ("maxBound",     maxBoundB)
-    , ("minBound",     minBoundB)
-    -- Phase 5: 'encodeFloat' / 'decodeFloat' host shims.  Kept:
-    -- graduation is blocked on the @RealFloat Double@ *instance-method
-    -- registration* gap (a distinct root cause from the integerMul
-    -- parse/qualified-resolution gap fixed in this PR — verified:
-    -- @integerEncodeDouble#@ source-loads and runs fine, but the
-    -- @RealFloat Double.encodeFloat@ instance method still dispatches
-    -- to a @<<ihc-method-placeholder>:RealFloat/encodeFloat>@).
-    -- Registering the shims in the builtin env makes the env-fallback
-    -- short-circuit the dispatcher.  Tracked for the instance-
-    -- registration workstream.
-    , ("encodeFloat",  encodeFloatB)
-    , ("decodeFloat",  decodeFloatB)
-    -- Comparisons: Phase 2.3 dispatch via ClassRegistry.
-    -- Builtin instances for Int, Char, Bool, [] are handled inline;
-    -- user-defined instances are looked up from the registry.
+    -- 'encodeFloat' / 'decodeFloat' source-load via RealFloat now.
+    -- 'fromIntegral' also source-loads from GHC.Internal.Real:
+    --   fromIntegral = fromInteger . toInteger
+    -- The source path relies on class dispatch for Integral.toInteger
+    -- and Num.fromInteger; ghc-bignum's IS/IP/IN constructors normalize
+    -- to the Integer type tag in 'IHC.Classes.typeTagOf'.
     --
-    -- TODO (slice-2 follow-up): drop @==@ / @/=@ — they have real
-    -- source in @GHC.Classes@ and the doctrine says interpret it.
-    -- The discovery-cascade blocker is FIXED: the per-FV chase from
-    -- @registerInstancesFrom@ / @registerClassDefaults@ now goes
-    -- through @IHC.Scheduler.discoverInModuleForChase@ (curated
-    -- 'perFVChaseShortCircuit'), so a source-loaded @GHC.Classes@ no
-    -- longer fans the chase out across @base@ + @ghc-internal@ until
-    -- the 4 GB heap exhausts.  Reproducer: @main = print (compare 1 2
-    -- == LT)@ (was: discovery >2400 → OOM; now ~master's ~1000).
-    -- Remaining before removal: route the @eqVals@ representation
-    -- bridges (cross-numeric, VStr, ByteString/ForeignPtr, null-ptr)
-    -- through source — there is no host Eq fallback in the dispatcher.
-    , ("==",       eqDispatch reg)
-    , ("/=",       neqDispatch reg)
-    , ("<",        ordDispatch reg 0)
-    , ("<=",       ordDispatch reg 1)
-    , (">",        ordDispatch reg 2)
-    , (">=",       ordDispatch reg 3)
+    -- 'maxBound' / 'minBound' source-load via Bounded in
+    -- GHC.Internal.Enum.  Nullary dispatch is type-directed through
+    -- ETyApp / wrapNullaryResultSig instead of a host Int default.
+    -- Comparisons: @==@, @/=@, @<@, @<=@, @>@, and @>=@ are
+    -- deliberately omitted.  They have real source in @GHC.Classes@'s
+    -- @class Eq@ / @class Ord@ methods and route through the
+    -- source-loaded class-method dispatcher seeded in
+    -- 'IHC.TypeGlobals.seedBuiltinClassMethodSigs'.  The discovery
+    -- cascade that previously blocked this removal is covered by
+    -- @test/Fixtures/Coverage/discovery_compare_eq_ordering.hs@.
     --
     -- @compare@ is deliberately omitted: source body lives in
     -- @GHC.Classes@'s @class Ord@ default
@@ -447,17 +464,9 @@ builtins reg =
     -- (show, length via Foldable), through source-loaded module bodies
     -- for plain Haskell functions (concatMap from GHC.Internal.List,
     -- everything in Data.ByteString.Internal.Type), and through the
-    -- RTS-level primitives still shimmed below (mallocPlainForeignPtrBytes,
+    -- RTS-level primitives still host-backed below (mallocPlainForeignPtrBytes,
     -- minusAddr#, etc.) for actual allocation/pointer boundaries.
-    -- Unique generation is an RTS/global-state service. Vault uses these as
-    -- ordered map keys, so represent them as Unique Integer-style constructors
-    -- backed by a host counter.
-    , ("newUnique", newUniqueB)
-    , ("hashUnique", hashUniqueB)
-    , ("Data.Unique.newUnique", newUniqueB)
-    , ("Data.Unique.hashUnique", hashUniqueB)
-    , ("Data.Unique.Really.newUnique", newUniqueB)
-    , ("Data.Unique.Really.hashUnique", hashUniqueB)
+    [
     -- Data.ByteString.Char8: graduated to pure source (empty/null/
     -- length/pack/unpack/head/index/singleton/replicate/concat/
     -- append/putStrLn).  'Char8.putStrLn' was the last hold-out —
@@ -508,48 +517,40 @@ builtins reg =
     --
     -- 'getContents' is similarly source-loaded from
     --     getContents  =  hGetContents stdin    -- System/IO.hs:316-317
-    -- It was never shimmed in the first place; documented here for
-    -- symmetry with 'getLine'.
-    -- Monad core: >>=  and >>  dispatch via class registry for non-IO monads
-    -- (e.g. ST s a, State s, Maybe, etc.) while falling back to the plain IO
-    -- implementation for VIO values.
-    , (">>=",      bindDispatch reg)
-    , ("GHC.Internal.Base.>>=", bindDispatch reg)
-    , ("Prelude.>>=", bindDispatch reg)
-    , (">>",       seqDispatch reg)
-    , ("GHC.Internal.Base.>>", seqDispatch reg)
-    , ("Prelude.>>", seqDispatch reg)
-    , ("return",   returnB)
-    , ("GHC.Internal.Base.return", returnB)
-    , ("Prelude.return", returnB)
-    , ("pure",     returnB)
-    , ("GHC.Internal.Base.pure", returnB)
-    , ("Prelude.pure", returnB)
-    -- fmap: source-loaded from `instance Functor IO` in GHC.Internal.Base.
-    -- No host-backed dispatcher — per CLAUDE.md "No host-backed class
-    -- method dispatchers".  Resolved via classMethodDispatcher.
-    , ("<*>",      apDispatch reg)
-    , ("GHC.Internal.Base.<*>", apDispatch reg)
-    , ("Prelude.<*>", apDispatch reg)
-    -- 'Semigroup.(<>)' — argument-directed dispatch keyed on the LHS
-    -- tag.  Source-loaded code (warp's HTTP response builders, blaze's
-    -- html builder, etc.) and user code (e.g. instance defining
-    -- '(<>)' in prefix form) reach for it as a bare 'EVar', so the
-    -- env must bind it directly rather than relying on whole-program
-    -- elaboration.
-    , ("<>",       sappendDispatch reg)
-    , ("GHC.Internal.Base.<>", sappendDispatch reg)
-    , ("Prelude.<>", sappendDispatch reg)
-    , ("Data.Semigroup.<>", sappendDispatch reg)
+    -- It was never shimmed in the first place; bottoms out on host
+    -- 'hGetContents' (pinned below) once that name is demanded.
+    --
+    -- Slice: 'readFile' / 'writeFile' / 'appendFile' graduate to source.
+    -- Source bodies (GHC.Internal.System.IO / System.IO) are ordinary
+    -- wrappers:
+    --   readFile name = openFile name ReadMode >>= hGetContents
+    --   writeFile f txt = withFile f WriteMode (\hdl -> hPutStr hdl txt)
+    --   appendFile f txt = withFile f AppendMode (\hdl -> hPutStr hdl txt)
+    -- They bottom out on host 'openFile' / 'withFile' / 'hGetContents' /
+    -- 'hClose' / 'hPutStr' — temporary Handle-device carve-outs (same
+    -- family as hPutStrLn / hGetLine): source Handle ADT + locale
+    -- encoding is not modelled yet, so these names are pinned via
+    -- 'ffiBuiltinNames' and must resolve to PrimHandle host shims.
+    -- Monad bind and sequence are deliberately omitted: they are class
+    -- methods with real source in GHC.Internal.Base and resolve through
+    -- the seeded class-method dispatcher.
+    -- 'pure' / 'return' deliberately omitted: both are class methods
+    -- with real source in @GHC.Internal.Base@.  Bare references route
+    -- through the seeded class-method dispatcher and its
+    -- result-polymorphic fallback.
+    -- fmap / <*>: source-loaded from the corresponding Functor /
+    -- Applicative instances in GHC.Internal.Base.  No host-backed
+    -- dispatchers -- per CLAUDE.md "No host-backed class method
+    -- dispatchers".  Resolved via classMethodDispatcher.
+    -- 'Semigroup.(<>)' deliberately omitted: it is a class method with
+    -- real source in @GHC.Internal.Base@, so bare references resolve
+    -- through the seeded class-method dispatcher.
     --
     -- 'join' deliberately omitted: it has source at
     -- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
     --     join :: Monad m => m (m a) -> m a
     --     join x = x >>= id
-    -- The source dispatches via the Monad class — '>>=' is still
-    -- shimmed ('bindDispatch reg' below) so the IO/Maybe/Either
-    -- variants reach their existing dispatcher; user-defined Monad
-    -- instances flow through the registry the same way.
+    -- The source dispatches via the Monad class-method dispatcher.
     --
     -- 'void', 'first', 'second', 'runIdentity' all graduated to
     -- pure source.  Their definitions are:
@@ -557,60 +558,25 @@ builtins reg =
     --   first  f (a, b) = (f a, b) -- Arrow (->) instance method
     --   second g (a, b) = (a, g b) -- ditto
     --   runIdentity (Identity x) = x  -- newtype field accessor
-    -- IORef
-    , ("newIORef",    newIORefB)
-    , ("GHC.IORef.newIORef", newIORefB)
-    , ("GHC.Internal.IORef.newIORef", newIORefB)
-    , ("GHC.Internal.Data.IORef.newIORef", newIORefB)
-    , ("Data.IORef.newIORef", newIORefB)
-    , ("readIORef",   readIORefB)
-    , ("GHC.IORef.readIORef", readIORefB)
-    , ("GHC.Internal.IORef.readIORef", readIORefB)
-    , ("GHC.Internal.Data.IORef.readIORef", readIORefB)
-    , ("Data.IORef.readIORef", readIORefB)
-    , ("writeIORef",  writeIORefB)
-    , ("GHC.IORef.writeIORef", writeIORefB)
-    , ("GHC.Internal.IORef.writeIORef", writeIORefB)
-    , ("GHC.Internal.Data.IORef.writeIORef", writeIORefB)
-    , ("Data.IORef.writeIORef", writeIORefB)
-    , ("modifyIORef", modifyIORefB)
-    , ("GHC.IORef.modifyIORef", modifyIORefB)
-    , ("GHC.Internal.IORef.modifyIORef", modifyIORefB)
-    , ("GHC.Internal.Data.IORef.modifyIORef", modifyIORefB)
-    , ("Data.IORef.modifyIORef", modifyIORefB)
-    , ("modifyIORef'",modifyIORefB)             -- same, no laziness diff here
-    , ("GHC.IORef.modifyIORef'", modifyIORefB)
-    , ("GHC.Internal.IORef.modifyIORef'", modifyIORefB)
-    , ("GHC.Internal.Data.IORef.modifyIORef'", modifyIORefB)
-    , ("Data.IORef.modifyIORef'", modifyIORefB)
-    , ("atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.Internal.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("GHC.Internal.Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    , ("Data.IORef.atomicModifyIORef'", atomicModifyIORefB)
-    -- mkWeakIORef is source-defined only as a thin wrapper over mkWeak#,
-    -- so the observable operation is RTS-exclusive.  We keep the Weak inert:
-    -- network's mkSocket discards it after registering the close finalizer.
-    , ("mkWeakIORef", mkWeakIORefB)
-    , ("GHC.IORef.mkWeakIORef", mkWeakIORefB)
-    , ("GHC.Internal.Data.IORef.mkWeakIORef", mkWeakIORefB)
-    , ("Data.IORef.mkWeakIORef", mkWeakIORefB)
-    -- File IO
-    , ("openFile",    openFileB)
+    -- IORef wrappers are deliberately omitted.  Data.IORef,
+    -- GHC.IORef, GHC.Internal.IORef, and GHC.Internal.Data.IORef all
+    -- have real source; they lower to the MutVar# and Weak# primops below.
+    -- File IO (Handle-device boundary; high-level readFile/writeFile/
+    -- appendFile are source-loaded — see slice comment above).
+      ("openFile",    openFileB)
     , ("hClose",      hCloseB)
+    , ("withFile",    withFileB)
+    , ("hGetContents", hGetContentsB)
     , ("hPutStr",     hPutStrB)
     , ("hPutChar",    hPutCharB)
     , ("hPutStrLn",   hPutStrLnB)
     , ("hGetLine",    hGetLineB)
     , ("hFlush",      hFlushB)
     , ("hSetBuffering", hSetBufferingB)
-    , ("readFile",    readFileB)
-    , ("writeFile",   writeFileB)
-    , ("appendFile",  appendFileB)
     -- Control flow
     , ("seq",         seqB)
-    , ("error",       errorB)
-    , ("undefined",   undefinedB)
+    -- error / undefined source-load from GHC.Internal.Err and bottom out
+    -- in errorCall* helpers plus the raise# primop below.
     -- B.1: debug-only superclass-relation probe.  Source-loaded code
     -- can call @__ihc_class_supers \"MyOrd\"@ to inspect the global
     -- superclass map; useful for testing that the scanner captured
@@ -631,7 +597,6 @@ builtins reg =
     -- of a comparison primop result (@==#@, @<#@, etc.) into a regular
     -- Bool.  Our Int# is VInt, so it's a plain @/= 0@.
     , ("isTrue#",     isTrueHashB)
-    , ("fromIntegral", fromIntegralB)
     -- Phase 1: BigNat# runtime representation (first slice of the
     -- full source-loaded Integer roadmap, see
     -- @plans/full-ghc-bignum-source-load.md@).  Source-loading the
@@ -648,21 +613,12 @@ builtins reg =
     -- comparison primops (this block, below); Phase 2.B–F add
     -- arithmetic / bit-ops / remaining conversions / show / long-tail.
     , ("bigNatFromWord#",          bigNatFromWordB)
-    -- Phase 2.A: comparison primops.  All thin wrappers over host
-    -- 'Natural' comparison; signatures from
-    -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
-    -- 'Bool#' is encoded as VInt 1 / VInt 0 (per IHC's existing
-    -- 'isTrue#' / '==#' convention; see 'primBoolVal').
-    , ("bigNatCompare",            bigNatCompareB)        -- BigNat# -> BigNat# -> Ordering
-    , ("bigNatEq#",                makeBigNatCmpOp "bigNatEq#" (==))
-    , ("bigNatNe#",                makeBigNatCmpOp "bigNatNe#" (/=))
-    , ("bigNatLt#",                makeBigNatCmpOp "bigNatLt#" (<))
-    , ("bigNatLe#",                makeBigNatCmpOp "bigNatLe#" (<=))
-    , ("bigNatGt#",                makeBigNatCmpOp "bigNatGt#" (>))
-    , ("bigNatGe#",                makeBigNatCmpOp "bigNatGe#" (>=))
-    , ("bigNatIsZero#",            makeBigNatUnaryBool "bigNatIsZero#" (== 0))
-    , ("bigNatIsOne#",             makeBigNatUnaryBool "bigNatIsOne#" (== 1))
-    , ("bigNatSize#",              bigNatSizeHashB)       -- BigNat# -> Int# (limb count)
+    -- bigNatCompare and the bigNat*# comparison predicates source-load
+    -- from ghc-bignum.  Their backend compare loop is pure Haskell over
+    -- the retained wordArraySize#/indexWordArray# leaves.
+    -- bigNatSize#, bigNatIsZero#, and bigNatIsOne# source-load from
+    -- ghc-bignum; their bodies bottom on wordArraySize# and
+    -- indexWordArray#, which are retained lower leaves.
     -- Phase 2.B: arithmetic primops.  Thin wrappers over host
     -- 'Numeric.Natural' arithmetic.  Signatures from
     -- @~/.cache/ihc/sources/ghc-bignum-1.3/src/GHC/Num/BigNat.hs@.
@@ -694,7 +650,8 @@ builtins reg =
     , ("bigNatRem",                makeBigNatBinOp "bigNatRem" rem)
     , ("bigNatGcd",                makeBigNatBinOp "bigNatGcd" gcd)
     , ("bigNatLcm",                makeBigNatBinOp "bigNatLcm" lcm)
-    , ("bigNatSqr",                bigNatSqrB)
+    -- bigNatSqr source-loads from ghc-bignum:
+    -- bigNatSqr a = bigNatMul a a.
     , ("bigNatQuotRem#",           bigNatQuotRemHashB)
     , ("bigNatAddWord#",           makeBigNatWordOp "bigNatAddWord#" (+))
     , ("bigNatMulWord#",           makeBigNatWordOp "bigNatMulWord#" (*))
@@ -732,11 +689,7 @@ builtins reg =
     --   bigNatToWordMaybe# :: BigNat# -> (# (# #) | Word# #)
     --   bigNatToAddr* / bigNatFromAddr* / bigNatTo|FromByteArray* /
     --     bigNatFromWordArray*                         (IO + Addr#)
-    , ("bigNatToWord#",            bigNatToWordHashB)         -- BigNat# -> Word#
-    , ("bigNatToInt#",             bigNatToIntHashB)          -- BigNat# -> Int#
-    , ("bigNatFromAbsInt#",        bigNatFromAbsIntHashB)     -- Int# -> BigNat#
     , ("bigNatFromWord64#",        bigNatFromWordB)           -- alias on 64-bit
-    , ("bigNatToWord64#",          bigNatToWordHashB)         -- alias on 64-bit
     , ("bigNatEncodeDouble#",      bigNatEncodeDoubleHashB)   -- m * 2^e
     -- Integer <-> BigNat# bridges (from GHC.Num.Integer)
     , ("integerFromBigNat#",       integerFromBigNatHashB)
@@ -744,9 +697,9 @@ builtins reg =
     , ("integerFromBigNatSign#",   integerFromBigNatSignHashB)
     , ("integerToBigNatClamp#",    integerToBigNatClampHashB)
     -- Logarithms
-    , ("bigNatLog2#",              bigNatLog2HashB)           -- BigNat# -> Word#
-    , ("bigNatLogBase#",           bigNatLogBaseHashB)        -- BigNat# -> BigNat# -> Word#
-    , ("bigNatLogBaseWord#",       bigNatLogBaseWordHashB)    -- Word# -> BigNat# -> Word#
+    -- bigNatLogBaseWord# source-loads from ghc-bignum:
+    -- base <= 1 -> unexpectedValue_Word#; base == 2 -> bigNatLog2#;
+    -- otherwise bigNatLogBase# (bigNatFromWord# base) a.
     -- Phase 2.E: completion tranche.  The Phase 2 plan listed
     -- 'bigNatShow' / 'bigNatRead' / 'bigNatToHexString' as the show/read
     -- tranche, but none of those primops exist in ghc-bignum source —
@@ -759,18 +712,21 @@ builtins reg =
     , ("bigNatClearBit#",          makeBigNatShiftOp "bigNatClearBit#" (\n i -> clearBit n i))
     , ("bigNatSetBit#",            makeBigNatShiftOp "bigNatSetBit#"   (\n i -> setBit n i))
     , ("bigNatComplementBit#",     makeBigNatShiftOp "bigNatComplementBit#" (\n i -> complementBit n i))
-    , ("bigNatGtWord#",            makeBigNatWordCmpOp "bigNatGtWord#" (>))
-    , ("bigNatLeWord#",            makeBigNatWordCmpOp "bigNatLeWord#" (<=))
-    , ("bigNatEqWord#",            makeBigNatWordCmpOp "bigNatEqWord#" (==))
-    , ("bigNatCompareWord#",       bigNatCompareWordHashB)    -- BigNat# -> Word# -> Ordering
-    , ("bigNatIsTwo#",             makeBigNatUnaryBool "bigNatIsTwo#" (== 2))
-    , ("bigNatCheck#",             bigNatCheckHashB)          -- BigNat# -> Bool# (always 1 for our backing)
-    , ("bigNatIndex#",             bigNatIndexHashB)          -- BigNat# -> Int# -> Word# (i-th 64-bit limb)
+    -- bigNatGtWord#, bigNatLeWord#, and bigNatEqWord# source-load from
+    -- ghc-bignum; their bodies compose source-loaded BigNat readers over
+    -- the retained wordArraySize#/indexWordArray# leaves.
+    -- bigNatCompareWord#, bigNatIsTwo#, and bigNatCheck# source-load
+    -- from ghc-bignum over retained word-array reader leaves
+    -- (wordArraySize#, indexWordArray#, sizeofByteArray#).
+    -- bigNatIndex# source-loads directly from ghc-bignum:
+    -- bigNatIndex# x i = indexWordArray# x i.
     , ("bigNatZero#",              bigNatZeroHashB)           -- (# #) -> BigNat#
     , ("bigNatOne#",               bigNatOneHashB)            -- (# #) -> BigNat#
-    , ("bigNatCtz#",               bigNatCtzHashB)            -- BigNat# -> Word# (trailing zero bits)
-    , ("bigNatCtzWord#",           bigNatCtzWordHashB)        -- BigNat# -> Word# (trailing zero limbs)
-    , ("bigNatSizeInBase#",        bigNatSizeInBaseHashB)     -- Word# -> BigNat# -> Word#
+    -- bigNatCtz# and bigNatCtzWord# source-load from ghc-bignum;
+    -- their loops use indexWordArray# and the GHC.Prim ctz# leaf.
+    -- bigNatSizeInBase# source-loads from ghc-bignum:
+    -- base <= 1 -> unexpectedValue_Word#; zero -> 0##;
+    -- otherwise bigNatLogBaseWord# base a + 1##.
     -- Phase 4: ghc-bignum 'integerMul (IS x) (IS y)' overflow path
     -- constructs BigNats from a high/low Word# pair.  Without this
     -- shim, in-Int64 × in-Int64 → out-of-Int64 multiplications
@@ -787,11 +743,19 @@ builtins reg =
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
-    , ("lazy",                     lazyB)
-    -- Phase 2.8: unsafePerformIO family
-    , ("unsafePerformIO",          unsafePerformIOB)
-    , ("unsafeDupablePerformIO",   unsafePerformIOB)
-    , ("accursedUnutterablePerformIO", unsafePerformIOB)
+    -- 'lazy' / 'GHC.Magic.lazy' / 'GHC.Exts.lazy' resolve from source
+    -- (ghc-prim GHC.Magic: @lazy x = x@; re-exported via Base / Exts).
+    -- Demand-driven re-export discovery materialises the identity body.
+    -- 'unsafePerformIO' / 'unsafeDupablePerformIO' graduated to
+    -- source-loaded from GHC.Internal.IO.Unsafe:
+    --   unsafePerformIO m = unsafeDupablePerformIO (noDuplicate >> m)
+    --   unsafeDupablePerformIO (IO m) = case runRW# m of (# _, a #) -> lazy a
+    -- Bottoms on runRW# / noDuplicate# / source lazy.
+    -- matchPat on VIO already reconstructs the State# function so the
+    -- @(IO m)@ pattern match works (Eval.hs).
+    -- 'accursedUnutterablePerformIO' graduated to source-loaded from
+    -- Data.ByteString.Internal.Type:
+    --   accursedUnutterablePerformIO (IO m) = case m realWorld# of (# _, r #) -> r
     -- Phase 2.8: boxing/unboxing constructors
     , ("I#",  iHashB)
     , ("W#",  wHashB)
@@ -809,6 +773,7 @@ builtins reg =
     , ("plusAddr#",   plusAddrB)
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
+    , ("indexCharOffAddr#", indexCharOffAddrHashB)
     -- Addr# comparison primops — RTS-exclusive (Addr# is unboxed; no
     -- source 'Eq Addr#' instance).  Used by the derived
     -- @instance Eq (Ptr a)@ from @data Ptr a = Ptr Addr#@'s synthesis
@@ -820,66 +785,50 @@ builtins reg =
     , ("leAddr#",     addrCmpHashB (<=))
     , ("gtAddr#",     addrCmpHashB (>))
     , ("geAddr#",     addrCmpHashB (>=))
-    -- GHC.Prim-only raw-address Int access.  Source-loaded
-    -- GHC.Internal.Storable defines writeIntOffPtr/readIntOffPtr in terms of
+    -- GHC.Prim-only raw-address access.  Source-loaded
+    -- GHC.Internal.Storable defines write*OffPtr/read*OffPtr in terms of
     -- these primops; there is no .hs implementation to interpret below them.
     , ("readIntOffAddr#",  readIntOffAddrHashB)
     , ("writeIntOffAddr#", writeIntOffAddrHashB)
+    , ("readWord8OffAddr#",  readWord8OffAddrHashB)
+    , ("writeWord8OffAddr#", writeWord8OffAddrHashB)
+    , ("readWideCharOffAddr#",  readWideCharOffAddrHashB)
+    , ("writeWideCharOffAddr#", writeWideCharOffAddrHashB)
     -- Ptr arithmetic (plusPtr/minusPtr/nullPtr/castPtr) is now
     -- source-loaded from GHC.Internal.Ptr — its bodies bottom on
     -- plusAddr#/minusAddr#/nullAddr#/coerce, all already available.
     -- Phase 2.8: ForeignPtr
     , ("mallocPlainForeignPtrBytes", mallocForeignPtrBytesB)
     , ("mallocForeignPtrBytes",      mallocForeignPtrBytesB)
-    , ("withForeignPtr",             withForeignPtrB)
-    , ("unsafeWithForeignPtr",       withForeignPtrB)
-    , ("Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.withForeignPtr", withForeignPtrB)
-    , ("GHC.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.withForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.unsafeWithForeignPtr", withForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.withForeignPtr", withForeignPtrB)
+    -- withForeignPtr / unsafeWithForeignPtr / touchForeignPtr source-load
+    -- from GHC.Internal.ForeignPtr. They bottom out in keepAlive# and touch#.
     -- 'plusForeignPtr' / 'minusForeignPtr' source-loaded; the
     -- reconstruction round-trips through 'foreignPtrValToForeignPtr'.
-    , ("touchForeignPtr",            touchForeignPtrB)
-    , ("newForeignPtr_",             newForeignPtr_B)
-    , ("newForeignPtr",              newForeignPtrB)
+    -- 'newForeignPtr_' graduated to source-loaded from
+    -- GHC.Internal.ForeignPtr:
+    --   newForeignPtr_ (Ptr obj) = do
+    --     r <- newIORef NoFinalizers
+    --     return (ForeignPtr obj (PlainForeignPtr r))
+    -- Bottoms on newIORef + ForeignPtr/PlainForeignPtr constructors;
+    -- foreignPtrValToForeignPtr / withForeignPtr already accept the
+    -- VCon "ForeignPtr" shape.
+    -- newForeignPtr source-loads from ForeignPtr.Imp:
+    -- newForeignPtr finalizer p = newForeignPtr_ p >>= \fp ->
+    -- addForeignPtrFinalizer finalizer fp >> pure fp.
     , ("addForeignPtrFinalizer",     addForeignPtrFinalizerB)
-    , ("Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
-    , ("Foreign.ForeignPtr.Safe.newForeignPtr", newForeignPtrB)
-    , ("GHC.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.newForeignPtr", newForeignPtrB)
-    , ("GHC.Internal.Foreign.ForeignPtr.Imp.newForeignPtr", newForeignPtrB)
     , ("Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("Foreign.ForeignPtr.Safe.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.Internal.Foreign.ForeignPtr.addForeignPtrFinalizer", addForeignPtrFinalizerB)
     , ("GHC.Internal.Foreign.ForeignPtr.Imp.addForeignPtrFinalizer", addForeignPtrFinalizerB)
-    -- Phase 2.8: Storable ops on Ptr
+    -- Phase 2.8: Storable ops on Ptr.  Qualified module entries source-load
+    -- through the Storable class; keep only bare host fallbacks for raw
+    -- pointer operations where optimistic execution lacks enough type evidence.
     , ("peek",         peekB)
-    , ("Foreign.peek", peekB)
-    , ("Foreign.Storable.peek", peekB)
-    , ("GHC.Internal.Foreign.Storable.peek", peekB)
-    , ("Network.Socket.Imports.peek", peekB)
     , ("poke",         pokeB)
-    , ("Foreign.poke", pokeB)
-    , ("Foreign.Storable.poke", pokeB)
-    , ("GHC.Internal.Foreign.Storable.poke", pokeB)
-    , ("Network.Socket.Imports.poke", pokeB)
     , ("peekByteOff",  peekByteOffB)
-    , ("Foreign.peekByteOff", peekByteOffB)
-    , ("Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("GHC.Internal.Foreign.Storable.peekByteOff", peekByteOffB)
-    , ("Network.Socket.Imports.peekByteOff", peekByteOffB)
     , ("pokeByteOff",  pokeByteOffB)
-    , ("Foreign.pokeByteOff", pokeByteOffB)
-    , ("Foreign.Storable.pokeByteOff", pokeByteOffB)
-    , ("GHC.Internal.Foreign.Storable.pokeByteOff", pokeByteOffB)
-    , ("Network.Socket.Imports.pokeByteOff", pokeByteOffB)
     -- Phase 2.8: MutableByteArray# family
     , ("newByteArray#",             newByteArrayB)
     , ("newPinnedByteArray#",       newPinnedByteArrayB)
@@ -887,6 +836,15 @@ builtins reg =
     , ("writeWord8Array#",          writeWord8ArrayB)
     , ("readWord8Array#",           readWord8ArrayB)
     , ("indexWord8Array#",          indexWord8ArrayB)
+    -- GHC.Prim primop, no .hs source.  ghc-bignum's WordArray#
+    -- source uses it to read 64-bit limbs from the BigNat# ByteArray#
+    -- representation; IHC also supports PrimBigNat here while that
+    -- representation is Natural-backed.
+    , ("indexWordArray#",           indexWordArrayHashB)
+    -- GHC.Prim primop, no .hs source.  ghc-bignum's BigNat# -> Int#
+    -- path indexes the low limb through this leaf; the host runtime
+    -- uses the same Natural-backed limb access here.
+    , ("indexIntArray#",            indexIntArrayHashB)
     , ("unsafeFreezeByteArray#",    unsafeFreezeByteArrayB)
     , ("byteArrayContents#",        byteArrayContentsB)
     , ("mutableByteArrayContents#", mutableByteArrayContentsB)
@@ -930,6 +888,11 @@ builtins reg =
     , ("int2Word#",         int2WordB)
     , ("word2Int#",         word2IntB)
     , ("word8ToWord#",      word8ToWordB)
+    , ("wordToWord8#",      wordToWord8B)
+    , ("word32ToWord#",     word32ToWordB)
+    , ("GHC.Prim.word32ToWord#", word32ToWordB)
+    , ("wordToWord32#",     wordToWord32B)
+    , ("GHC.Prim.wordToWord32#", wordToWord32B)
     , ("setAddrRange#",     setAddrRangeB)
     , ("copyAddrToAddrNonOverlapping#", copyAddrToAddrNonOverlappingB)
     , ("copyAddrToAddr#",   copyAddrToAddrB)
@@ -996,6 +959,12 @@ builtins reg =
     , ("int64ToInt#",       identityIntPrimop)
     , ("int64ToWord64#",    identityIntPrimop)
     , ("word64ToInt64#",    identityIntPrimop)
+    -- 64-bit word-size compatibility aliases from source-loaded
+    -- Data.Memory.Internal.CompatPrim64 / ghc-bignum. These are
+    -- representation no-ops on our target, so a builtin leaf keeps
+    -- the source-loaded path honest without reintroducing a BigNat shim.
+    , ("wordToWord64#",     identityIntPrimop)
+    , ("word64ToWord#",     identityIntPrimop)
     , ("timesInt2#",        timesInt2B)
     , ("timesWord2#",       timesWord2B)
     , ("ltChar#",           ltCharHashB)
@@ -1010,12 +979,58 @@ builtins reg =
     , ("eqWord#",   eqWordB)
     , ("gtWord#",   gtWordB)
     , ("geWord#",   geWordB)
+    -- Word8# comparison primops are compiler intrinsics used by
+    -- source-loaded GHC.Internal.Word and text's UTF-8 paths.
+    , ("ltWord8#",  ltWord8B)
+    , ("leWord8#",  leWord8B)
+    , ("eqWord8#",  eqWord8B)
+    , ("gtWord8#",  gtWord8B)
+    , ("geWord8#",  geWord8B)
+    , ("neWord8#",  neWord8B)
+    -- Word8# arithmetic (Num Word8 bottoms). Results stay boxed as
+    -- VCon "W8#" so typeTagOf → Word8.
+    , ("plusWord8#",  plusWord8B)
+    , ("subWord8#",   subWord8B)
+    , ("timesWord8#", timesWord8B)
     , ("minusWord#", minusWordB)
     , ("plusWord#",  plusWordB)
     , ("timesWord#", timesWordB)
     , ("quotWord#",  quotWordB)
     , ("remWord#",   remWordB)
     , ("popCnt#",    popCntB)
+    -- GHC.Prim primop, no .hs source.  Required by source-loaded
+    -- ghc-bignum word/BigNat trailing-zero helpers.
+    , ("ctz#",       ctzHashB)
+    , ("clz#",       clzHashB)
+    -- Sized WordN# bit-count primops (GHC.Prim, no .hs source).
+    -- Word32 FiniteBits / Bits bottom out on these via
+    -- @countLeadingZeros (W32# x) = clz32# (word32ToWord# x)@ etc.
+    -- Without them warp's chunked encoder (F.countLeadingZeros /
+    -- F.unsafeShiftR on Word32 chunk lengths) dies mid-response.
+    , ("popCnt8#",   popCntWidthB 8)
+    , ("popCnt16#",  popCntWidthB 16)
+    , ("popCnt32#",  popCntWidthB 32)
+    , ("popCnt64#",  popCntWidthB 64)
+    , ("clz8#",      clzWidthB 8)
+    , ("clz16#",     clzWidthB 16)
+    , ("clz32#",     clzWidthB 32)
+    , ("clz64#",     clzWidthB 64)
+    , ("ctz8#",      ctzWidthB 8)
+    , ("ctz16#",     ctzWidthB 16)
+    , ("ctz32#",     ctzWidthB 32)
+    , ("ctz64#",     ctzWidthB 64)
+    , ("GHC.Prim.popCnt8#",  popCntWidthB 8)
+    , ("GHC.Prim.popCnt16#", popCntWidthB 16)
+    , ("GHC.Prim.popCnt32#", popCntWidthB 32)
+    , ("GHC.Prim.popCnt64#", popCntWidthB 64)
+    , ("GHC.Prim.clz8#",     clzWidthB 8)
+    , ("GHC.Prim.clz16#",    clzWidthB 16)
+    , ("GHC.Prim.clz32#",    clzWidthB 32)
+    , ("GHC.Prim.clz64#",    clzWidthB 64)
+    , ("GHC.Prim.ctz8#",     ctzWidthB 8)
+    , ("GHC.Prim.ctz16#",    ctzWidthB 16)
+    , ("GHC.Prim.ctz32#",    ctzWidthB 32)
+    , ("GHC.Prim.ctz64#",    ctzWidthB 64)
     , ("indexOfTheOnlyBit#", indexOfTheOnlyBitB)
     -- Phase 2.8: Int# arithmetic primops
     , ("negateInt#",   negateIntB)
@@ -1084,6 +1099,26 @@ builtins reg =
     -- @sqrtDouble (D# x) = D# (sqrtDouble# x)@) now that the bare-name
     -- @sqrt@ shim is gone.  Reuses the shared 'unaryOpFloat' helper.
     , ("sqrtDouble#",  unaryOpFloat sqrt)
+    -- Floating Double bottoms (Float.hs:1574–1591) — all GHC.Prim
+    -- intrinsics with no .hs source.  packIntegral / logBase need
+    -- logDouble#; register the full Floating Double unary suite so
+    -- the next missing primop does not re-block warp response packing.
+    , ("expDouble#",   unaryOpFloat exp)
+    , ("expm1Double#", unaryOpFloat (\x -> exp x - 1))
+    , ("logDouble#",   unaryOpFloat log)
+    , ("log1pDouble#", unaryOpFloat (\x -> log (1 + x)))
+    , ("sinDouble#",   unaryOpFloat sin)
+    , ("cosDouble#",   unaryOpFloat cos)
+    , ("tanDouble#",   unaryOpFloat tan)
+    , ("asinDouble#",  unaryOpFloat asin)
+    , ("acosDouble#",  unaryOpFloat acos)
+    , ("atanDouble#",  unaryOpFloat atan)
+    , ("sinhDouble#",  unaryOpFloat sinh)
+    , ("coshDouble#",  unaryOpFloat cosh)
+    , ("tanhDouble#",  unaryOpFloat tanh)
+    , ("asinhDouble#", unaryOpFloat asinh)
+    , ("acoshDouble#", unaryOpFloat acosh)
+    , ("atanhDouble#", unaryOpFloat atanh)
     -- @decodeDouble_Int64# :: Double# -> (# Int64#, Int# #)@.
     -- Bottom-of-stack primop for 'decodeFloat' on Double:
     -- 'GHC.Num.Integer.integerDecodeDouble#' wraps it
@@ -1100,111 +1135,52 @@ builtins reg =
     , ("double2Int#",         double2IntHashB)
     , ("double2Float#",       double2FloatHashB)
     , ("float2Double#",       float2DoubleHashB)
+    -- GHC.CString now source-loads from ghc-prim. Its Haskell bodies
+    -- bottom out on the Addr#/Char# primops above plus the scanned
+    -- foreign import ccall "strlen" leaf, so the high-level
+    -- cstringLength#/unpackCString# shims do not belong here.
     -- Phase 2.8: misc
-    , ("cstringLength#",  cstringLengthB)
-    , ("unpackCString#",  unpackCStringB)
-    , ("unpackCStringUtf8#", unpackCStringB)
-    -- Foreign.C.String shortcuts — source bodies reach for RTS locale
-    -- state via getForeignEncoding; we bypass that and go straight to
-    -- ASCII-byte marshalling (matches GHC's default for libc FFI).
+    -- Foreign.C.String shortcuts — the locale-aware source bodies reach
+    -- for RTS locale state via getForeignEncoding; keep only those host
+    -- shims.  The CAString variants are byte-wise Haskell and source-load.
+    -- withCStringLen0 is NOT registered: real source is
+    --   withCStringLen0 :: TextEncoding -> String -> (CStringLen -> IO a) -> IO a
+    -- (Encoding.hs) — a 3-arg encoding-first API.  A 2-arg host alias
+    -- to withCStringLen would shadow the correct source arity.
     , ("withCString",     withCStringB)
     , ("withCStringLen",  withCStringLenB)
-    , ("withCStringLen0", withCStringLenB)
-    , ("with",            withB)
-    , ("Foreign.Marshal.Utils.with", withB)
-    , ("GHC.Internal.Foreign.Marshal.Utils.with", withB)
+    -- Foreign.Marshal.Utils.with source-loads from
+    -- GHC.Internal.Foreign.Marshal.Utils:
+    -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
-    , ("peekCAString",    peekCStringB)
     , ("newCString",      newCStringB)
-    , ("newCAString",     newCStringB)
+    -- Foreign.Storable.sizeOf / alignment source-load for qualified module
+    -- entries.  Keep only the bare optimistic fallback for polymorphic
+    -- library code like alloca's sizeOf (undefined :: a), where IHC has no
+    -- typechecker dictionary to recover a concrete Storable instance.
     , ("sizeOf",       sizeOfB)
-    , ("Foreign.Storable.sizeOf", sizeOfB)
-    , ("GHC.Internal.Foreign.Storable.sizeOf", sizeOfB)
-    , ("Network.Socket.Imports.sizeOf", sizeOfB)
     , ("alignment",    alignmentB)
-    , ("Foreign.Storable.alignment", alignmentB)
-    , ("GHC.Internal.Foreign.Storable.alignment", alignmentB)
-    , ("Network.Socket.Imports.alignment", alignmentB)
-    -- Network.Socket.socket creates an OS file descriptor and wraps it in
-    -- network's Socket constructor.  The fd allocation is inherently an
-    -- OS/RTS boundary, so IHC hosts this syscall while preserving the source
-    -- Socket value shape used by the rest of the interpreted network package.
-    , ("socket", socketCreateB)
-    , ("Network.Socket.socket", socketCreateB)
-    , ("Network.Socket.Syscall.socket", socketCreateB)
-    -- setsockopt is an OS syscall.  Keep the Haskell option constants and
-    -- Socket shape, but perform the fd-level call in the host.
-    , ("setSocketOption", socketSetOptionB)
-    , ("Network.Socket.setSocketOption", socketSetOptionB)
-    , ("Network.Socket.Options.setSocketOption", socketSetOptionB)
-    -- listen(2) is another fd-level syscall in Network.Socket.Syscall.
-    , ("listen", socketListenB)
-    , ("Network.Socket.listen", socketListenB)
-    , ("Network.Socket.Syscall.listen", socketListenB)
-    , ("Network.Socket.listen", socketListenB)
-    , ("Network.Socket.Syscall.listen", socketListenB)
-    -- accept(2) blocks for the next connection and returns a network Socket
-    -- plus SockAddr.  This is an OS boundary; the Haskell connection logic
-    -- above it remains source-interpreted.
-    , ("accept", socketAcceptB)
-    , ("Network.Socket.accept", socketAcceptB)
-    , ("Network.Socket.SockAddr.accept", socketAcceptB)
-    , ("Network.Socket.Syscall.accept", socketAcceptB)
-    -- getsockname(2), used by Warp to populate connMySockAddr.
-    , ("getSocketName", socketGetNameB)
-    , ("Network.Socket.getSocketName", socketGetNameB)
-    , ("Network.Socket.SockAddr.getSocketName", socketGetNameB)
-    , ("Network.Socket.Name.getSocketName", socketGetNameB)
-    -- Raw heap buffer allocation used by Warp's response buffers.
-    , ("mallocBytes", mallocBytesB)
-    , ("Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
-    , ("GHC.Internal.Foreign.Marshal.Alloc.mallocBytes", mallocBytesB)
-    , ("free", freeB)
-    , ("Foreign.Marshal.Alloc.free", freeB)
-    , ("GHC.Internal.Foreign.Marshal.Alloc.free", freeB)
-    , ("bind", socketBindB)
-    , ("Network.Socket.bind", socketBindB)
-    , ("Network.Socket.Types.bind", socketBindB)
-    , ("Network.Socket.SockAddr.bind", socketBindB)
-    , ("Network.Socket.Syscall.bind", socketBindB)
-    -- Network.Socket.bind is the actual OS bind(2) boundary for AF_INET/AF_INET6
-    -- sockets. We keep SockAddr data constructors source-interpreted, but perform
-    -- the sockaddr marshalling + bind syscall in the host.
-    -- Network.Socket.close / close' ultimately coordinate fd shutdown through
-    -- closeFdWith and the host RTS/OS socket object. We keep network's Socket
-    -- value shape source-compatible, but perform the actual invalidation +
-    -- close(2) in the host.
-    , ("close", socketCloseB False)
-    , ("close'", socketCloseB True)
-    , ("Network.Socket.close", socketCloseB False)
-    , ("Network.Socket.close'", socketCloseB True)
-    , ("Network.Socket.Types.close", socketCloseB False)
-    , ("Network.Socket.Types.close'", socketCloseB True)
-    -- Network.Socket.withFdSocket reads the live fd out of the mutable Socket
-    -- cell and runs an IO callback. The Socket is host-backed already, so we
-    -- bridge this directly rather than re-entering the interpreted wrapper.
-    , ("withFdSocket", withFdSocketB)
-    , ("Network.Socket.withFdSocket", withFdSocketB)
-    , ("Network.Socket.Types.withFdSocket", withFdSocketB)
-    -- Network.Socket's Socket value is already represented by IHC as a
-    -- host-backed fd-bearing constructor. fdSocket/unsafeFdSocket expose that
-    -- fd as IO CInt in network >= 3, so this is an RTS/OS bridge over the
-    -- existing host socket object rather than a Hackage-library shim.
-    , ("fdSocket", socketFdB)
-    , ("unsafeFdSocket", socketFdB)
-    , ("Network.Socket.fdSocket", socketFdB)
-    , ("Network.Socket.unsafeFdSocket", socketFdB)
-    , ("Network.Socket.Types.fdSocket", socketFdB)
-    , ("Network.Socket.Types.unsafeFdSocket", socketFdB)
-    -- sendBuf/recvBuf are the fd-level OS send(2)/recv(2) boundaries used by
-    -- Network.Socket.ByteString. Keep the ByteString API source-interpreted,
-    -- but perform the actual socket syscall in the host.
-    , ("sendBuf", socketSendBufB)
-    , ("recvBuf", socketRecvBufB)
-    , ("Network.Socket.Buffer.sendBuf", socketSendBufB)
-    , ("Network.Socket.Buffer.recvBuf", socketRecvBufB)
-    , ("Network.Socket.sendBuf", socketSendBufB)
-    , ("Network.Socket.recvBuf", socketRecvBufB)
+    -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
+    -- import dispatches through the generic FFI path.
+    -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
+    -- lower setSockOpt foreign imports.
+    -- Network.Socket.Syscall.listen source-loads; its listen(2) foreign
+    -- import dispatches through the generic FFI path.
+    -- Network.Socket.Syscall.accept source-loads; its accept(2) foreign
+    -- import dispatches through the generic FFI path.
+    -- Network.Socket.Syscall.connect source-loads; its connect(2) foreign
+    -- import dispatches through the generic FFI path.
+    -- Network.Socket.Name.getSocketName source-loads; its getsockname(2)
+    -- foreign import dispatches through the generic FFI path.
+    -- Network.Socket.Syscall.bind source-loads; its bind(2) foreign import
+    -- dispatches through the generic FFI path.
+    -- Network.Socket.Types.close / close' source-load; the actual close(2)
+    -- happens through lower foreign imports / closeFdWith.
+    -- Network.Socket.Types.withFdSocket source-loads over the Socket IORef.
+    -- Network.Socket.Types.fdSocket / unsafeFdSocket source-load over the
+    -- same Socket IORef representation.
+    -- Network.Socket.Buffer.sendBuf / recvBuf source-load; their foreign
+    -- imports dispatch through the generic FFI path.
     -- Phase C.3 (builtins-removal): the @Settings@ field accessors
     -- (settingsPort/Host/Timeout/FdCacheDuration/FileInfoCacheDuration)
     -- used to live here as positional shims that indexed into a host-
@@ -1213,37 +1189,8 @@ builtins reg =
     -- registers all Settings fields in lmFieldReg, and tryFieldSlot
     -- synthesises the accessors automatically.  Helpers warpSettings*B
     -- and settingsFieldB went with them.
-    -- Network.Socket AddrInfo record-field accessors.  The host backing
-    -- builds AddrInfo as @VCon "AddrInfo" [flags, family, socktype,
-    -- protocol, addr, canonName]@ via 'peekAddrInfoVal'; warp's
-    -- 'Network.Wai.Handler.Warp.Run' calls @NS.addrFamily@ etc. on the
-    -- result, so each accessor needs a builtin that pulls the
-    -- corresponding field index.
-    , ("addrFlags",      addrInfoFieldB "addrFlags" 0)
-    , ("Network.Socket.addrFlags", addrInfoFieldB "addrFlags" 0)
-    , ("Network.Socket.Info.addrFlags", addrInfoFieldB "addrFlags" 0)
-    , ("addrFamily",     addrInfoFieldB "addrFamily" 1)
-    , ("Network.Socket.addrFamily", addrInfoFieldB "addrFamily" 1)
-    , ("Network.Socket.Info.addrFamily", addrInfoFieldB "addrFamily" 1)
-    , ("addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("Network.Socket.addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("Network.Socket.Info.addrSocketType", addrInfoFieldB "addrSocketType" 2)
-    , ("addrProtocol",   addrInfoFieldB "addrProtocol" 3)
-    , ("Network.Socket.addrProtocol", addrInfoFieldB "addrProtocol" 3)
-    , ("Network.Socket.Info.addrProtocol", addrInfoFieldB "addrProtocol" 3)
-    , ("addrAddress",    addrInfoFieldB "addrAddress" 4)
-    , ("Network.Socket.addrAddress", addrInfoFieldB "addrAddress" 4)
-    , ("Network.Socket.Info.addrAddress", addrInfoFieldB "addrAddress" 4)
-    , ("addrCanonName",  addrInfoFieldB "addrCanonName" 5)
-    , ("Network.Socket.addrCanonName", addrInfoFieldB "addrCanonName" 5)
-    , ("Network.Socket.Info.addrCanonName", addrInfoFieldB "addrCanonName" 5)
-    -- Network.Socket.getAddrInfo: host @getaddrinfo(3)@.  warp's listen
-    -- pipeline calls it through streaming-commons' bindPortGenEx.  We
-    -- ignore hints (NULL) for now — the OS gives back a TCP-stream-
-    -- compatible list anyway, which is all warp examines.
-    , ("getAddrInfo",     getAddrInfoB)
-    , ("Network.Socket.getAddrInfo", getAddrInfoB)
-    , ("Network.Socket.Info.getAddrInfo", getAddrInfoB)
+    -- Network.Socket.Info.getAddrInfo source-loads; its getaddrinfo(3)
+    -- foreign imports dispatch through the generic FFI path.
     -- Phase 2.8: additional numeric ops needed by containers (graduated)
     --   * 'fromInteger' (Num class) → 'Num Int.fromInteger'
     --     at GHC/Internal/Num.hs:115 — body @fromInteger i = I# (integerToInt# i)@.
@@ -1252,8 +1199,8 @@ builtins reg =
     --   * 'toInteger' (Integral class) → 'Integral Int.toInteger'
     --     at GHC/Internal/Real.hs:442 — body @toInteger (I# i) = IS i@.
     --     Returns 'VCon "IS" [VInt n]'; downstream consumers either
-    --     pattern-match through the IS bridge or call 'fromIntegral'
-    --     (line 301), whose 'numericNewtypeCons' covers IS.
+    --     pattern-match through the IS bridge or dispatch on the
+    --     normalized Integer tag in 'IHC.Classes.typeTagOf'.
     --   * 'quot' / 'rem' (Integral class) → 'Integral Int.{quot,rem}'
     --     at Real.hs:445-455, routed through quotInt / remInt
     --     (Base.hs:2376-2390) bottoming on quotInt# / remInt# primops.
@@ -1306,32 +1253,29 @@ builtins reg =
     --   Double#/Float# power primops (@**##@ / @powerFloat#@) are
     --   GHC.Prim intrinsics — registered as carve-outs below near the
     --   Double# arithmetic primops (full chain documented there).
-    -- Phase 2.10a: concurrency primitives.  forkIO is backed by GHC's
-    -- RTS thread primitive (`fork#` in GHC.Internal.Conc.Sync), so the
-    -- module-qualified names forward to the same host operation as the bare
-    -- builtin instead of interpreting the low-level RTS wrapper source.
-    , ("forkIO",          forkIOB)
-    , ("Control.Concurrent.forkIO", forkIOB)
-    , ("GHC.Conc.Sync.forkIO", forkIOB)
-    , ("GHC.Internal.Conc.Sync.forkIO", forkIOB)
+    -- Phase 2.10a: concurrency primitives.  forkIO / forkIOWithUnmask
+    -- are deliberately omitted: GHC.Internal.Conc.Sync has real source and
+    -- lowers them to unIO plus the fork# primop below.
     -- Compiler-intrinsic 'fork#' primop. ghc-prim has no .hs source;
     -- forkIO and warp's defaultFork bottom out into this.
     , ("fork#",           forkHashB)
     , ("GHC.Prim.fork#",  forkHashB)
-    , ("killThread",      killThreadB)
-    , ("myThreadId",      myThreadIdB)
+    -- throwTo / killThread / myThreadId are deliberately omitted:
+    -- GHC.Internal.Conc.Sync has real source and lowers them to
+    -- killThread# / myThreadId# plus the source ThreadId constructor.
+    , ("killThread#",     killThreadHashB)
+    , ("GHC.Prim.killThread#", killThreadHashB)
     , ("myThreadId#",     myThreadIdHashB)
-    , ("fromThreadId",    fromThreadIdB)
-    , ("GHC.Conc.Sync.fromThreadId", fromThreadIdB)
-    , ("GHC.Internal.Conc.Sync.fromThreadId", fromThreadIdB)
-    , ("labelThread",     labelThreadB)
-    , ("GHC.Conc.Sync.labelThread", labelThreadB)
-    , ("GHC.Internal.Conc.Sync.labelThread", labelThreadB)
-    , ("labelThreadByteArray#", labelThreadByteArrayHashB)
-    , ("GHC.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
-    , ("GHC.Internal.Conc.Sync.labelThreadByteArray#", labelThreadByteArrayHashB)
-    , ("threadDelay",     threadDelayB)
-    , ("getNumCapabilities", getNumCapabilitiesB)
+    -- labelThread / labelThreadByteArray# source-load from
+    -- GHC.Internal.Conc.Sync. They bottom out in the raw labelThread#
+    -- primop, which is eventlog/debug metadata only in IHC.
+    , ("labelThread#", labelThreadHashB)
+    , ("GHC.Prim.labelThread#", labelThreadHashB)
+    -- threadDelay source-loads from GHC.Internal.Conc.IO/POSIX and bottoms
+    -- out in the raw delay# primop when the source-side RTS event-manager path
+    -- is not selected.
+    , ("delay#", delayHashB)
+    , ("GHC.Prim.delay#", delayHashB)
     -- closeFdWith coordinates with GHC's RTS event manager. IHC does not
     -- run that manager, so the compatible behavior is to run the supplied
     -- low-level close action directly.
@@ -1349,129 +1293,80 @@ builtins reg =
     , ("GHC.Conc.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Conc.IO.threadWaitWrite", threadWaitWriteB)
     , ("GHC.Internal.Conc.IO.threadWaitWrite", threadWaitWriteB)
-    -- IHC does not run GHC's RTS event manager.  Source modules such as
-    -- auto-update branch on this probe; returning Nothing selects their
-    -- ordinary threadDelay/forkIO implementation instead of the event-manager
-    -- backend.
-    , ("getSystemEventManager", getSystemEventManagerB)
-    , ("GHC.Event.getSystemEventManager", getSystemEventManagerB)
-    , ("GHC.Event.Thread.getSystemEventManager", getSystemEventManagerB)
+    -- threadWaitReadSTM / threadWaitWriteSTM: warp makeGracefulRecv waits
+    -- via @atomically (checkShutdown <|> sockWait)@.  Source path bottoms
+    -- out in Event.registerFd with a nested Fd/CInt that IHC often leaves
+    -- as a VFun shell ("Fd payload not VInt: <function>").  Host-back the
+    -- STM wait pair directly so cancellable recv works.
+    , ("threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Conc.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Conc.IO.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Internal.Conc.IO.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("GHC.Internal.Event.Thread.threadWaitReadSTM", threadWaitReadSTMB)
+    , ("threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Conc.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Internal.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
+    , ("GHC.Internal.Event.Thread.threadWaitWriteSTM", threadWaitWriteSTMB)
+    -- Network.Socket.STM.waitReadSocketSTM / waitWriteSocketSTM graduated
+    -- to pure source (network package).  Bodies are ordinary wrappers:
+    --   waitReadSocketSTM s = fst <$> waitAndCancelReadSocketSTM s
+    --   waitAndCancelReadSocketSTM s = withFdSocket s $ threadWaitReadSTM . Fd
+    -- (and the Write twin).  Per CLAUDE.md rule 4, no Hackage shims.
+    -- Bottoms on host-backed threadWaitReadSTM / threadWaitWriteSTM above
+    -- once withFdSocket peels the Socket IORef to a CInt/Fd.
+    -- GHC.Internal.Event.Thread.threadWait evt fd — the single choke point the
+    -- threaded socket-wait path (threadWaitRead/Write -> Event.threadWaitRead
+    -- -> threadWait) reduces to.  The source body registers on the RTS event
+    -- manager IHC never runs; host-back it to the host RTS IO manager directly.
+    , ("threadWait", threadWaitB)
+    , ("GHC.Internal.Event.Thread.threadWait", threadWaitB)
+    -- GHC.Internal.Event.Manager.registerFd / unregisterFd_ — the event-manager
+    -- registration both threadWait (IO) and threadWaitSTM (the cancellable STM
+    -- wait network/warp use for recv) funnel through after getSystemEventManager_.
+    -- IHC does not run the RTS event manager; emulate a OneShot registration on
+    -- the host RTS IO manager (see 'registerFdB').
+    , ("registerFd", registerFdB)
+    , ("GHC.Internal.Event.Manager.registerFd", registerFdB)
+    , ("unregisterFd_", unregisterFd_B)
+    , ("GHC.Internal.Event.Manager.unregisterFd_", unregisterFd_B)
+    -- IHC does not run GHC's RTS event manager.  We return a stub 'Just mgr'
+    -- (see 'getSystemEventManagerB') so the threaded socket-wait path
+    -- (threadWait / threadWaitSTM) proceeds via our host-backed registerFd.
+    -- Code that branches on this probe (e.g. auto-update's mkAutoUpdate) then
+    -- takes the event-manager backend, which routes through the equally
+    -- host-backed timer manager (getSystemTimerManager / registerTimeout).
     , ("GHC.Internal.Event.getSystemEventManager", getSystemEventManagerB)
     , ("GHC.Internal.Event.Thread.getSystemEventManager", getSystemEventManagerB)
     -- IHC also does not run GHC's RTS timer manager.  Warp/time-manager use
     -- these operations only to register idle timeout callbacks; expose a
     -- no-op timer manager so request handling can proceed without evaluating
     -- the RTS-only TimerManager implementation.
-    , ("getSystemTimerManager", getSystemTimerManagerB)
-    , ("GHC.Event.getSystemTimerManager", getSystemTimerManagerB)
-    , ("GHC.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.getSystemTimerManager", getSystemTimerManagerB)
     , ("GHC.Internal.Event.Thread.getSystemTimerManager", getSystemTimerManagerB)
-    , ("registerTimeout", registerTimeoutB)
-    , ("GHC.Event.registerTimeout", registerTimeoutB)
-    , ("GHC.Event.TimerManager.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.registerTimeout", registerTimeoutB)
     , ("GHC.Internal.Event.TimerManager.registerTimeout", registerTimeoutB)
-    , ("unregisterTimeout", unregisterTimeoutB)
-    , ("GHC.Event.unregisterTimeout", unregisterTimeoutB)
-    , ("GHC.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.unregisterTimeout", unregisterTimeoutB)
     , ("GHC.Internal.Event.TimerManager.unregisterTimeout", unregisterTimeoutB)
-    , ("updateTimeout", updateTimeoutB)
-    , ("GHC.Event.updateTimeout", updateTimeoutB)
-    , ("GHC.Event.TimerManager.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.updateTimeout", updateTimeoutB)
     , ("GHC.Internal.Event.TimerManager.updateTimeout", updateTimeoutB)
-    , ("withHandle", timeManagerWithHandleB)
-    , ("withHandleKillThread", timeManagerWithHandleB)
-    , ("System.TimeManager.withHandle", timeManagerWithHandleB)
-    , ("System.TimeManager.withHandleKillThread", timeManagerWithHandleB)
-    -- @System.TimeManager.initialize@ / @stopManager@ are RTS-tied helpers
-    -- (their upstream definitions just box / unbox a 'Manager Int' since the
-    -- timeout work itself is delegated to the GHC RTS timer manager).  IHC
-    -- skips that backend entirely, so the bare-name and qualified bindings
-    -- both resolve to no-op host shims that keep warp's @withII@ happy.
-    , ("initialize", timeManagerInitializeB)
-    , ("System.TimeManager.initialize", timeManagerInitializeB)
-    , ("stopManager", timeManagerStopManagerB)
-    , ("System.TimeManager.stopManager", timeManagerStopManagerB)
-    -- System.Posix.IO comes from the boot `unix` package, whose source is
-    -- not present in ~/.cache/ihc/sources for this run.  setFdOption mutates
-    -- an OS file descriptor flag; expose the host operation so Warp can mark
-    -- accepted/listening sockets CloseOnExec during startup.
-    , ("setFdOption", setFdOptionB)
-    , ("System.Posix.IO.setFdOption", setFdOptionB)
-    -- Phase 2.10a: MVar
-    --
-    -- Source-loaded MVar operations (GHC.Internal.MVar.takeMVar etc.)
-    -- pattern-match @(MVar mvar#)@ against the value, which fails
-    -- for our 'VPrimObj (PrimMVar _)' shape — the pattern-match
-    -- failure then bubbles up through the user's catch chain and
-    -- silently kills the worker.  Bind every FQN that source code
-    -- might resolve to so our host primitives win.
-    , ("newMVar",         newMVarB)
-    , ("Control.Concurrent.MVar.newMVar", newMVarB)
-    , ("GHC.MVar.newMVar", newMVarB)
-    , ("GHC.Internal.MVar.newMVar", newMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.newMVar", newMVarB)
-    , ("newEmptyMVar",    newEmptyMVarB)
-    , ("Control.Concurrent.MVar.newEmptyMVar", newEmptyMVarB)
-    , ("GHC.MVar.newEmptyMVar", newEmptyMVarB)
-    , ("GHC.Internal.MVar.newEmptyMVar", newEmptyMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.newEmptyMVar", newEmptyMVarB)
-    , ("takeMVar",        takeMVarB)
-    , ("Control.Concurrent.MVar.takeMVar", takeMVarB)
-    , ("GHC.MVar.takeMVar", takeMVarB)
-    , ("GHC.Internal.MVar.takeMVar", takeMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.takeMVar", takeMVarB)
-    , ("putMVar",         putMVarB)
-    , ("Control.Concurrent.MVar.putMVar", putMVarB)
-    , ("GHC.MVar.putMVar", putMVarB)
-    , ("GHC.Internal.MVar.putMVar", putMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.putMVar", putMVarB)
-    , ("readMVar",        readMVarB)
-    , ("Control.Concurrent.MVar.readMVar", readMVarB)
-    , ("GHC.MVar.readMVar", readMVarB)
-    , ("GHC.Internal.MVar.readMVar", readMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.readMVar", readMVarB)
-    , ("modifyMVar_",     modifyMVar_B)
-    , ("Control.Concurrent.MVar.modifyMVar_", modifyMVar_B)
-    , ("modifyMVar",      modifyMVarB)
-    , ("Control.Concurrent.MVar.modifyMVar", modifyMVarB)
-    , ("tryTakeMVar",     tryTakeMVarB)
-    , ("Control.Concurrent.MVar.tryTakeMVar", tryTakeMVarB)
-    , ("GHC.MVar.tryTakeMVar", tryTakeMVarB)
-    , ("GHC.Internal.MVar.tryTakeMVar", tryTakeMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.tryTakeMVar", tryTakeMVarB)
-    , ("tryPutMVar",      tryPutMVarB)
-    , ("Control.Concurrent.MVar.tryPutMVar", tryPutMVarB)
-    , ("GHC.MVar.tryPutMVar", tryPutMVarB)
-    , ("GHC.Internal.MVar.tryPutMVar", tryPutMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.tryPutMVar", tryPutMVarB)
-    , ("isEmptyMVar",     isEmptyMVarB)
-    , ("Control.Concurrent.MVar.isEmptyMVar", isEmptyMVarB)
-    , ("GHC.MVar.isEmptyMVar", isEmptyMVarB)
-    , ("GHC.Internal.MVar.isEmptyMVar", isEmptyMVarB)
-    , ("GHC.Internal.Control.Concurrent.MVar.isEmptyMVar", isEmptyMVarB)
-    , ("withMVar",        withMVarB)
-    , ("Control.Concurrent.MVar.withMVar", withMVarB)
-    , ("swapMVar",        swapMVarB)
-    , ("Control.Concurrent.MVar.swapMVar", swapMVarB)
-    -- Phase 2.10a: STM
-    , ("atomically",      atomicallyB)
-    , ("retry",           retryB)
-    , ("orElse",          orElseB)
-    , ("check",           checkB)
-    , ("newTVar",         newTVarB)
-    , ("newTVarIO",       newTVarIOB)
-    , ("readTVar",        readTVarB)
-    , ("writeTVar",       writeTVarB)
-    , ("modifyTVar'",     modifyTVar'B)
-    , ("modifyTVar",      modifyTVar'B)
-    , ("readTVarIO",      readTVarIOB)
+    -- System.TimeManager.withHandle / withHandleKillThread source-load:
+    -- the package definitions are ordinary bracket/register wrappers. The
+    -- RTS-only boundary remains the timer manager operations above.
+    -- System.TimeManager.initialize / stopManager source-load: upstream
+    -- definitions are ordinary Haskell wrappers around the Manager newtype.
+    -- System.Posix.IO.setFdOption source-loads from unix and bottoms out in
+    -- System.Posix.Internals.c_fcntl_read/write foreign imports.
+    -- MVar wrappers are deliberately omitted. Control.Concurrent.MVar,
+    -- GHC.MVar, GHC.Internal.MVar, and GHC.Internal.Control.Concurrent.MVar
+    -- have real source; they lower to the MVar# primops below.
+    -- STM/TVar wrappers are deliberately omitted. GHC.Internal.Conc.Sync
+    -- and the public Control.Concurrent.STM re-exports have real source;
+    -- they lower to the STM/TVar# primops below.
     -- Phase 2.10a: exceptions
-    , ("throwIO",         throwIOB)
-    , ("throw",           throwIOB)
+    -- throwIO / throw are deliberately omitted. GHC.Internal.IO.throwIO
+    -- and GHC.Internal.Exception.throw have real source; they lower to
+    -- toExceptionWithBacktrace plus the raiseIO# / raise# primops below.
     -- GHC primops from GHC.Prim: compiler-intrinsic, no Haskell source.
     -- Source-loaded `error`, `throw`, `undefined`, `head []`, numeric
     -- overflow paths etc. all bottom out into these. See commit message
@@ -1571,8 +1466,10 @@ builtins reg =
     , ("GHC.Internal.Exception.toException", toExceptionB)
     -- fromException: pair of toException. Used by source-loaded catch:
     --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
-    -- With Val-level dynamic typing we cannot implement the type match;
-    -- we always return Just, so the user handler sees the raw exception Val.
+    -- With Val-level dynamic typing we return the wrapper in `Just`;
+    -- matchPat handles concrete constructor demands through the
+    -- SomeException wrapper and lets failed downcast guards fall through
+    -- to `Nothing`.
     , ("fromException",   fromExceptionB)
     , ("Control.Exception.fromException", fromExceptionB)
     , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
@@ -1632,33 +1529,10 @@ builtins reg =
     -- =================================================================
     -- end VIO <-> State# bridge
     -- =================================================================
-    -- Phase 2.10a exception shim. `catch` HAS real source in
-    -- ghc-internal/src/GHC/Internal/IO.hs and bottoms out into
-    -- primops we already implement (`catch#`/`unIO`/`raiseIO#`), so
-    -- per "minimum surface only" it is a graduation candidate.
-    -- Graduation is BLOCKED on TWO interpreter gaps (both reproduced;
-    -- see test/Fixtures/Unsupported/io_catch_graduated.hs):
-    --   1. ECase eagerly runs a `VIO` scrutinee even when the case
-    --      destructures the `IO` newtype (`catch (IO io) h = …`), so
-    --      the action throws OUTSIDE `catch#`'s protection. Fixable in
-    --      IHC.Eval `go (ECase …)` — a core-evaluator change kept
-    --      separate from the shim removal to bound the blast radius.
-    --   2. Even past (1): source `catch`'s
-    --        handler' e = case fromException e of
-    --                       Just e' -> unIO (handler e') ; Nothing -> raiseIO# e
-    --      needs `fromException` to return `Just` for the @SomeException@
-    --      handler case (GHC: @instance Exception SomeException where
-    --      fromException = Just@). `fromExceptionB` deliberately returns
-    --      `Nothing` for downcast-safety (warp/wai `Just (Con _) <-
-    --      fromException e` guards — see its inline note); flipping it
-    --      regresses those, and matchPat has no `SomeException`
-    --      newtype-transparency for concrete-ctor patterns to compensate.
-    --      Needs runtime-type-directed `fromException`/`cast`.
-    , ("catch",           catchB)
-    , ("GHC.IO.catch",    catchB)
-    , ("GHC.Internal.IO.catch", catchB)
-    , ("Control.Exception.catch", catchB)
-    , ("GHC.Internal.Control.Exception.catch", catchB)
+    -- catch: source-loaded from GHC.Internal.IO:
+    --   catch (IO io) handler = IO $ catch# io handler'
+    -- The source bottoms out on the catch# primop plus the VIO/State#
+    -- bridge (`unIO`) and the Val-level `fromException` helper above.
     -- evaluate: removed shim. Source-loaded from GHC.Internal.IO:
     --   `evaluate a = IO $ \s -> seq# a s`
     -- bottoms out into the `seq#` GHC.Prim primop (registered below),
@@ -1672,13 +1546,14 @@ builtins reg =
     -- try / handle: removed shim (PR #171). Source-loaded from
     -- GHC.Internal.Control.Exception.Base: `try a = catch (Right <$> a)
     -- (pure . Left)` / `handle = flip catch`; bottoms out on the
-    -- source-loaded `catch` chain (catch# primop) once `catch` graduates.
+    -- source-loaded `catch` chain (catch# primop).
     -- bracket / bracket_ / bracketOnError / finally / onException:
     -- removed shim (PR #166). Source-loaded from
     -- GHC.Internal.Control.Exception.Base — each bottoms out on the
     -- source-loaded `catch` / `mask` chain.
-    , ("throwTo",         throwToB)
-    , ("displayException", displayExceptionB)
+    -- throwTo source-loads from GHC.Internal.Conc.Sync and bottoms out
+    -- on the killThread# primop above.
+    -- displayException is a source Exception class method.
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
     , ("typeRep",        typeRepB)
     , ("typeOf",         typeOfB)
@@ -1725,10 +1600,15 @@ builtins reg =
     , ("atomicModifyMutVar_#",  atomicModifyMutVarUB)
     , ("atomicSwapMutVar#",     atomicSwapMutVarB)
     , ("casMutVar#",            casMutVarB)
+    -- GHC.Prim.reallyUnsafePtrEquality#: raw pointer-equality primop.
+    -- Source GHC.Prim.PtrEq defines sameMutVar# and friends in terms of it.
+    , ("reallyUnsafePtrEquality#", reallyUnsafePtrEqualityHashB)
     -- Weak# primops.  Weak pointers are RTS objects; source modules only
     -- wrap these operations in ordinary newtypes.
     , ("mkWeak#",               mkWeakHashB)
     , ("mkWeakNoFinalizer#",    mkWeakNoFinalizerHashB)
+    , ("deRefWeak#",            deRefWeakHashB)
+    , ("finalizeWeak#",         finalizeWeakHashB)
     -- Phase 2.11: TH Lift builtins.
     ] ++ thBuiltinPairs
 
@@ -1745,7 +1625,9 @@ unaryOpFloat op = pure $ VFun $ \a -> do
         VInt n   -> pure (VFloat (op (fromIntegral n)))
         _ -> error ("unaryOpFloat: non-numeric arg: " <> showValForDebug av)
 
--- cmpInt removed in Phase 2.3 — replaced by eqDispatch/ordDispatch
+-- cmpInt removed in Phase 2.3 — replaced by source-loaded Eq/Ord
+-- class dispatch.  The primitive comparison helpers below remain only
+-- for GHC.Prim-level operations with no .hs source.
 
 -- | Boolean-returning version of a comparison: returns VCon "True" or "False".
 boolVal :: Bool -> Val
@@ -1801,12 +1683,50 @@ makeWordArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
             pure (VInt (fromIntegral (op (fromIntegral x) (fromIntegral y))))
         _ -> error (name <> ": bad args")
 
--- | Extract a host IORef from a 'VPrimObj' or fail with a
--- context-tagged error. Used by readIORef / writeIORef /
--- modifyIORef / atomicModifyIORef'.
-extractIORef :: String -> Val -> IO (IORef Thunk)
-extractIORef _   (VPrimObj (PrimIORef rf)) = pure rf
-extractIORef ctx v = error (ctx <> ": not an IORef: " <> showValForDebug v)
+-- | Unwrap Word8# payload: bare VInt or boxed VCon "W8#".
+asWord8Val :: Val -> Maybe Word8
+asWord8Val (VInt n) = Just (fromIntegral n)
+asWord8Val (VInteger n)
+    | n >= 0, n <= 255 = Just (fromInteger n)
+asWord8Val _ = Nothing
+
+forceWord8Payload :: Thunk -> IO (Maybe Word8)
+forceWord8Payload t = do
+    v <- force legacyHooks t
+    case v of
+        VCon "W8#" [inner] -> force legacyHooks inner >>= pure . asWord8Val
+        other -> pure (asWord8Val other)
+
+-- | Binary Word8# comparison primop. Accepts bare VInt or boxed W8#.
+makeWord8CmpOp :: String -> (Word8 -> Word8 -> Bool) -> IO Val
+makeWord8CmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    ma <- forceWord8Payload a
+    mb <- forceWord8Payload b
+    case (ma, mb) of
+        (Just x, Just y) -> pure (primBoolVal (op x y))
+        _ -> do
+            av <- force legacyHooks a; bv <- force legacyHooks b
+            error (name <> ": bad args: " <> showValForDebug av
+                   <> " " <> showValForDebug bv)
+
+-- | Binary Word8# arithmetic; result boxed as VCon "W8#" for Num Word8.
+makeWord8ArithOp :: String -> (Word8 -> Word8 -> Word8) -> IO Val
+makeWord8ArithOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    ma <- forceWord8Payload a
+    mb <- forceWord8Payload b
+    case (ma, mb) of
+        (Just x, Just y) -> do
+            t <- newWHNFThunk (VInt (fromIntegral (op x y)))
+            pure (VCon "W8#" [t])
+        _ -> do
+            av <- force legacyHooks a; bv <- force legacyHooks b
+            error (name <> ": bad args: " <> showValForDebug av
+                   <> " " <> showValForDebug bv)
+
+plusWord8B, subWord8B, timesWord8B :: IO Val
+plusWord8B  = makeWord8ArithOp "plusWord8#"  (+)
+subWord8B   = makeWord8ArithOp "subWord8#"   (-)
+timesWord8B = makeWord8ArithOp "timesWord8#" (*)
 
 -- | Test for truthy value: VCon "True"/VInt non-zero is True.
 isTruthy :: Val -> Bool
@@ -1817,29 +1737,13 @@ isTruthy (VInt _)         = True
 isTruthy other = error ("isTruthy: not a Bool: " <> showValForDebug other)
 
 --------------------------------------------------------------------------------
--- Phase 2.3: type-class dispatch for Eq, Ord, Show
+-- Phase 2.3: type-class dispatch helpers for Eq, Ord, Show
 --
--- For Int, Char, Bool, List: handled inline.
--- For user-defined types: look up the ClassRegistry.
+-- Eq/Ord class methods source-load through the scheduler's class-method
+-- dispatcher.  'eqVals' remains as an internal helper for derived
+-- instances and structural Ord fallback.
 --------------------------------------------------------------------------------
 
--- | Eq dispatch: look up "==" method from the class registry.
--- Method slot 0 = (==), slot 1 = (/=).
-eqDispatch :: ClassRegistry -> IO Val
-eqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    eqVals reg av bv
-
--- | /= dispatch.
-neqDispatch :: ClassRegistry -> IO Val
-neqDispatch reg = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    r <- eqVals reg av bv
-    pure (boolVal (not (isTruthy r)))
-
--- | Core equality test on WHNF values.
 -- | Force a 'VLazyMethod' result from 'lookupInstanceMethod', tolerating
 -- parse/eval failures by treating them as "no instance".  Instance method
 -- bodies are registered lazily in the class registry (see
@@ -1858,6 +1762,7 @@ forceInstanceMethod (Just v) = do
     isPlaceholder (VCon n []) = BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
     isPlaceholder _           = False
 
+-- | Core equality test on WHNF values.
 eqVals :: ClassRegistry -> Val -> Val -> IO Val
 eqVals reg av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (x == y))
@@ -1868,6 +1773,16 @@ eqVals reg av bv = case (av, bv) of
     (VInt x, VChar y)    -> pure (boolVal (toEnum (fromIntegral x) == y))
     (VChar x, VInt y)    -> pure (boolVal (x == toEnum (fromIntegral y)))
     (VStr x, VStr y)     -> pure (boolVal (x == y))
+    (VStr x, _) -> do
+        m <- charListBytes bv
+        case m of
+            Just y  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
+    (_, VStr y) -> do
+        m <- charListBytes av
+        case m of
+            Just x  -> pure (boolVal (x == y))
+            Nothing -> fallbackNoBuiltinEq
     (VPrimObj (PrimPtr p1), VPrimObj (PrimPtr p2)) ->
         pure (boolVal (p1 == p2))
     (VUnit, VPrimObj (PrimPtr p)) ->
@@ -1911,14 +1826,34 @@ eqVals reg av bv = case (av, bv) of
     (VCon "False" _, VCon "False" _) -> pure (boolVal True)
     (VCon "True" _, VCon "False" _)  -> pure (boolVal False)
     (VCon "False" _, VCon "True" _)  -> pure (boolVal False)
-    -- Data.ByteString shim (see isBuiltinBackedModule): compare by
-    -- content via the host Eq ByteString, not by ForeignPtr identity.
-    -- Default VCon field-by-field would compare fp1 == fp2 which is
-    -- always False for freshly-allocated buffers with the same bytes.
+    -- ByteString's source-loaded Eq instance eventually needs byte-content
+    -- equality.  Keep that representation bridge here rather than reviving
+    -- any Data.ByteString API shim: default VCon field-by-field equality
+    -- would compare ForeignPtr identity and fail for equal fresh buffers.
+    --
+    -- Also coerce [Char]/VStr on either side: OverloadedStrings leaves
+    -- @"server"@ as a char list until a BS consumer packs it.  Without
+    -- this, @bs == "server"@ in warp's responseKeyIndex (first arg real
+    -- BS, second still [Char]) falls through to structural VCon compare
+    -- and always yields False → idx = -1 → empty IndexedHeader.
     (VCon "BS" _, VCon "BS" _) -> do
         ba <- bsValToBS av
         bb <- bsValToBS bv
         pure (boolVal (ba == bb))
+    (VCon "BS" _, _) -> do
+        mBb <- charListBytes bv
+        case mBb of
+            Just bb -> do
+                ba <- bsValToBS av
+                pure (boolVal (ba == bb))
+            Nothing -> fallbackNoBuiltinEq
+    (_, VCon "BS" _) -> do
+        mBa <- charListBytes av
+        case mBa of
+            Just ba -> do
+                bb <- bsValToBS bv
+                pure (boolVal (ba == bb))
+            Nothing -> fallbackNoBuiltinEq
     (VCon n1 ts1, VCon n2 ts2) -> do
         -- A user-defined @instance Eq T@ may override the default
         -- structural equality (e.g. comparing only one field of a
@@ -1946,7 +1881,15 @@ eqVals reg av bv = case (av, bv) of
                         eqVals reg v1 v2)
                         (zip ts1 ts2)
                     pure (boolVal (all isTruthy results))
-    _ -> do
+    _ -> fallbackNoBuiltinEq
+  where
+    charListBytes v = do
+        isChars <- isCharList v
+        if isChars
+            then Just . BC.pack <$> valToString v
+            else pure Nothing
+
+    fallbackNoBuiltinEq = do
         -- Try user-defined instance.
         let tag = typeTagOf av
         mEqMethod <- lookupInstanceMethod reg "Eq" tag "==" >>= forceInstanceMethod
@@ -1961,16 +1904,11 @@ eqVals reg av bv = case (av, bv) of
                         <> showValForDebug av
                         <> " vs " <> showValForDebug bv)
 
--- | Ord dispatch. Slot in the method list:
+-- | Internal Ord relation helper. Slot in the method list:
 --   0 = (<), 1 = (<=), 2 = (>), 3 = (>=), 4 = compare
--- We implement all four directly for builtin types and use
--- registry lookup for user-defined types.
-ordDispatch :: ClassRegistry -> Int -> IO Val
-ordDispatch reg slot = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a
-    bv <- force legacyHooks b
-    ordCmp reg slot av bv
-
+-- Top-level relation operators are not registered as builtins; they
+-- source-load through @GHC.Classes@.  This helper is kept for derived /
+-- structural comparisons and representation-level recursion.
 ordCmp :: ClassRegistry -> Int -> Val -> Val -> IO Val
 ordCmp _reg slot av bv = case (av, bv) of
     (VInt x, VInt y)     -> pure (boolVal (intOrdSlot slot x y))
@@ -1985,9 +1923,9 @@ ordCmp _reg slot av bv = case (av, bv) of
         pure (boolVal (ptrOrdSlot slot p1 p2))
     (VPrimObj (PrimForeignPtr fp1), VPrimObj (PrimForeignPtr fp2)) ->
         pure (boolVal (foreignPtrOrdSlot slot fp1 fp2))
-    -- Data.ByteString shim (see eqVals): compare by content via the
-    -- host Ord, not structural VCon-field compare (which compares
-    -- ForeignPtr addresses and gives meaningless results).
+    -- ByteString's source-loaded Ord instance eventually needs byte-content
+    -- ordering.  This is a representation bridge, not a Data.ByteString API
+    -- shim; structural VCon comparison would order by ForeignPtr address.
     (VCon "BS" _, VCon "BS" _) -> do
         ba <- bsValToBS av
         bb <- bsValToBS bv
@@ -2118,7 +2056,7 @@ clearCtorIndex = writeIORef ctorIndexRegistry Map.empty
 -- may have reused for other purposes by the time of the next
 -- 'isMarkedWord8Ptr' check.
 clearForeignPtrWord8Ranges :: IO ()
-clearForeignPtrWord8Ranges = writeIORef foreignPtrWord8RangesRef []
+clearForeignPtrWord8Ranges = clearWord8PtrRanges
 
 -- | Kill every interpreter-spawned thread from the prior
 -- 'loadProgramFromSource' run and clear the registry.  Called by
@@ -2285,10 +2223,21 @@ showValWith reg av = case av of
         -- non-printables escaped. Matches the GHC stock instance.
         bs <- bsValToBS av
         pure (show bs)
+    -- Prim boxes first — stock Show Word8/Int8 print the numeric
+    -- payload only.  Do this before instance lookup so a missing or
+    -- placeholder Show Word8 cannot fall through to "W8# 255".
+    VCon n [t]
+        | n `elem` wordSizedPrimShowCons || n `elem` intSizedPrimShowCons -> do
+            v <- force legacyHooks t
+            showValWith reg v
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
-        let tag = n
-        mShowMethod <- lookupInstanceMethod reg "Show" tag "show" >>= forceInstanceMethod
+        -- Prefer type-name tag (Word8 for W8#, Maybe for Just, …) so
+        -- Show instances registered under the type — not the prim box
+        -- ctor — are found.  Fall back to the raw ctor name for ADTs
+        -- that register per-constructor (registerOne).
+        let tags = nubTags [typeTagOf av, n]
+        mShowMethod <- findShowMethod tags
         case mShowMethod of
             Just showMethod -> do
                 shown <- CE.try @SomeException $ do
@@ -2300,6 +2249,19 @@ showValWith reg av = case av of
                     Left _  -> showVal av
             _ -> showVal av
     _ -> showVal av
+  where
+    nubTags = go []
+      where
+        go acc [] = reverse acc
+        go acc (t:ts)
+            | t `elem` acc = go acc ts
+            | otherwise    = go (t:acc) ts
+    findShowMethod [] = pure Nothing
+    findShowMethod (tag:tags) = do
+        m <- lookupInstanceMethod reg "Show" tag "show" >>= forceInstanceMethod
+        case m of
+            Just _  -> pure m
+            Nothing -> findShowMethod tags
 
 --------------------------------------------------------------------------------
 -- Lists as user-facing strings / generic containers
@@ -2359,6 +2321,14 @@ showDouble d
         let s = show d
         in if '.' `elem` s || 'e' `elem` s then s else s <> ".0"
 
+-- | Prim box constructors for fixed-width Word/Int.  Shown as bare
+-- numeric payloads (stock Show Word8 / Int8), not "W8# n".
+wordSizedPrimShowCons :: [ByteString]
+wordSizedPrimShowCons = ["W8#", "W16#", "W32#", "W64#", "W#"]
+
+intSizedPrimShowCons :: [ByteString]
+intSizedPrimShowCons = ["I8#", "I16#", "I32#", "I64#", "I#"]
+
 showVal :: Val -> IO String
 showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
@@ -2377,6 +2347,14 @@ showVal v@(VCon ":" _) = do
             pure ("[" <> intercalate "," parts <> "]")
 showVal (VStr s)    = pure (show (BC.unpack s))
 showVal (VCon name thunks)
+    -- Fixed-width Int/Word boxes: GHC Show prints the numeric payload
+    -- only (Show Word8 uses fromIntegral to Int).  When the source
+    -- Show instance isn't available yet (hostShowFallback path), still
+    -- match stock output instead of "W8# 255".
+    | name `elem` wordSizedPrimShowCons || name `elem` intSizedPrimShowCons
+    , [t] <- thunks = do
+        v <- force legacyHooks t
+        showVal v
     | isUnboxedTupleConName name = do
         parts <- mapM (\t -> do v <- force legacyHooks t; showVal v) thunks
         pure ("(#" <> intercalate "," parts <> "#)")
@@ -2741,177 +2719,6 @@ classSupersProbeB = pure $ VFun $ \aT -> pure $ VIO $ do
             pure (VCon ":" [headT, restT])
     buildList supers
 
-errorB :: IO Val
-errorB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    s  <- valToString av
-    hPutStrLn stderr ("ihc error called: " <> s)
-    hFlush stderr
-    error ("ihc: " <> s)
-
-undefinedB :: IO Val
-undefinedB = pure (VIO (error "Prelude.undefined"))
-
---------------------------------------------------------------------------------
--- Monad core. Every builtin here is a plain global binding so Phase
--- 2.3 class-dispatch can later overlay it with dictionary-threaded
--- versions. The IO monad appears either as host-backed 'VIO' or as the
--- source-loaded @IO@ newtype, depending on how far evaluation has gone.
---------------------------------------------------------------------------------
-
--- | @return x = VIO (pure x)@. The @x@ thunk is not forced until the
--- receiver runs the action (preserving Haskell laziness).
-returnB :: IO Val
-returnB = pure $ VFun $ \a -> pure (VIO (force legacyHooks a))
-
--- | Class-dispatched @>>=@.  For 'VIO' values (the common IO case) this
--- is the same as the old 'bindB'.  For ST computations (VCon "ST" _), the
--- ST monad bind is implemented directly: build a new ST computation that
--- sequences the two.  For other values the 'Monad' instance in the class
--- registry is consulted.
-bindDispatch :: ClassRegistry -> IO Val
-bindDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \kt -> do
-    mv <- force legacyHooks ma
-    case mv of
-        VIO _        -> ioBind mv kt
-        VCon "IO" [_] -> ioBind mv kt
-        -- ST monad bind:
-        -- (ST m) >>= k = ST (\s -> case m s of { (# s', r #) -> case k r of { ST k2 -> k2 s' }})
-        -- Note: primop state functions may return VIO actions; run them with runIOVal.
-        -- If k r returns VIO (from `return`/`pure` via the IO-backed builtin),
-        -- we run it eagerly and wrap the result in a new (# s', a #) tuple --
-        -- the ST ≈ IO bridge (CLAUDE.md: ST is compiler-intrinsic, IO machinery reused).
-        VCon "ST" [mFuncT] -> do
-            mFuncV <- force legacyHooks mFuncT
-            ktV    <- force legacyHooks kt
-            stFunc <- newWHNFThunk $ VFun $ \sT -> do
-                resRaw <- apply legacyHooks mFuncV sT    -- apply :: Val -> Thunk -> IO Val
-                resV   <- runIOVal legacyHooks resRaw    -- run VIO if needed (primop results)
-                case stResultComponents resV of
-                    Just (newST, rT) -> do
-                        stkRaw <- apply legacyHooks ktV rT   -- k applied to r; may be ST or VIO
-                        -- DO NOT runIOVal here unconditionally: that would strip a
-                        -- `VIO (pure x)` (from `return`/`pure`) down to a bare x and
-                        -- lose the state-threading shape. Branch on stkRaw first.
-                        case stkRaw of
-                            VCon "ST" [k2FuncT] -> do
-                                k2FuncV  <- force legacyHooks k2FuncT
-                                resRaw2  <- apply legacyHooks k2FuncV newST
-                                runIOVal legacyHooks resRaw2
-                            -- VIO from `return`/`pure` in ST: run it, wrap as (# s, a #)
-                            VIO io -> do
-                                r  <- io
-                                rT <- newWHNFThunk r
-                                pure (VCon "(#,#)" [newST, rT])
-                            other -> do
-                                -- Run any outstanding VIO layers; wrap as (# s, a #).
-                                -- This keeps `stkRaw = VIO (VIO ...)` and other
-                                -- deeply-wrapped results compatible with the ST shape.
-                                v  <- runIOVal legacyHooks other
-                                case v of
-                                    VCon "ST" [k2FuncT] -> do
-                                        k2FuncV <- force legacyHooks k2FuncT
-                                        resRaw2 <- apply legacyHooks k2FuncV newST
-                                        runIOVal legacyHooks resRaw2
-                                    _ -> do
-                                        vT <- newWHNFThunk v
-                                        pure (VCon "(#,#)" [newST, vT])
-                    Nothing -> pure resV  -- m didn't return a state/result pair
-            pure (VCon "ST" [stFunc])
-        _ -> do
-            -- Look up Monad instance for this value's type tag.
-            let tag = typeTagOf mv
-            mBindMethod <- lookupInstanceMethod reg "Monad" tag ">>=" >>= forceInstanceMethod
-            case mBindMethod of
-                Just bindMethod -> do
-                    maT <- newWHNFThunk mv
-                    r1  <- apply legacyHooks bindMethod maT
-                    apply legacyHooks r1 kt
-                _ ->
-                    -- No instance found; fall back to IO bind (will error at
-                    -- runtime if mv is not VIO, but gives a sensible message).
-                    pure $ VIO $ do
-                        v  <- runIOVal legacyHooks mv
-                        kv <- force legacyHooks kt
-                        vT <- newWHNFThunk v
-                        r  <- apply legacyHooks kv vT
-                        runIOVal legacyHooks r
-  where
-    ioBind mv kt = pure $ VIO $ do
-        v  <- runIOVal legacyHooks mv
-        kv <- force legacyHooks kt
-        vT <- newWHNFThunk v
-        r  <- apply legacyHooks kv vT
-        runIOVal legacyHooks r
-
--- | @m >> n@ = run m (discarding result), then run n.
-seqDispatch :: ClassRegistry -> IO Val
-seqDispatch reg = pure $ VFun $ \ma -> pure $ VFun $ \mb -> do
-    mv <- force legacyHooks ma
-    case mv of
-        VIO _         -> ioSeq mv mb
-        VCon "IO" [_] -> ioSeq mv mb
-        -- ST monad seq:
-        -- m >> n = m >>= \_ -> n  for ST
-        -- Note: primop state functions may return VIO actions; run them with runIOVal.
-        -- If n is VIO (from `return`/`pure`), we run it and wrap as (# s', a #).
-        VCon "ST" [mFuncT] -> do
-            mFuncV <- force legacyHooks mFuncT
-            stFunc <- newWHNFThunk $ VFun $ \sT -> do
-                resRaw <- apply legacyHooks mFuncV sT    -- apply :: Val -> Thunk -> IO Val
-                resV   <- runIOVal legacyHooks resRaw    -- run VIO if needed
-                case stResultComponents resV of
-                    Just (newST, _) -> do
-                        nbV <- force legacyHooks mb
-                        case nbV of
-                            VCon "ST" [k2FuncT] -> do
-                                k2FuncV  <- force legacyHooks k2FuncT
-                                resRaw2  <- apply legacyHooks k2FuncV newST
-                                runIOVal legacyHooks resRaw2
-                            -- VIO from `return`/`pure`: run and wrap as (# s, a #)
-                            VIO io -> do
-                                r  <- io
-                                rT <- newWHNFThunk r
-                                pure (VCon "(#,#)" [newST, rT])
-                            other -> do
-                                v <- runIOVal legacyHooks other
-                                case v of
-                                    VCon "ST" [k2FuncT] -> do
-                                        k2FuncV <- force legacyHooks k2FuncT
-                                        resRaw2 <- apply legacyHooks k2FuncV newST
-                                        runIOVal legacyHooks resRaw2
-                                    _ -> do
-                                        vT <- newWHNFThunk v
-                                        pure (VCon "(#,#)" [newST, vT])
-                    Nothing -> pure resV
-            pure (VCon "ST" [stFunc])
-        _ -> do
-            let tag = typeTagOf mv
-            mSeqMethod <- lookupInstanceMethod reg "Monad" tag ">>" >>= forceInstanceMethod
-            case mSeqMethod of
-                Just seqMethod -> do
-                    maT <- newWHNFThunk mv
-                    r1  <- apply legacyHooks seqMethod maT
-                    apply legacyHooks r1 mb
-                _ ->
-                    pure $ VIO $ do
-                        _ <- runIOVal legacyHooks mv
-                        nv <- force legacyHooks mb
-                        runIOVal legacyHooks nv
-  where
-    ioSeq mv mb = pure $ VIO $ do
-        _ <- runIOVal legacyHooks mv
-        nv <- force legacyHooks mb
-        runIOVal legacyHooks nv
-
--- Strict ST state functions produce unboxed tuples in state-first order,
--- while lazy ST produces boxed pairs in value-first order. Constructor names
--- are not type-qualified in the interpreter, so ST bind must bridge both.
-stResultComponents :: Val -> Maybe (Thunk, Thunk)
-stResultComponents (VCon "(#,#)" [stateT, valueT]) = Just (stateT, valueT)
-stResultComponents (VCon "(,)" [valueT, stateT])   = Just (stateT, valueT)
-stResultComponents _                               = Nothing
-
 -- | Dispatching @fmap@. Forces the container argument and looks up a
 -- @(Functor, typeTagOf mv)@ entry in the 'ClassRegistry'. If one is
 -- registered (either hand-written or synthesised from a @deriving
@@ -2920,9 +2727,9 @@ stResultComponents _                               = Nothing
 -- uses keep working, and a @fmap@ on a container type that truly has
 -- no registered instance still produces a runtime error from the IO
 -- path rather than silently misbehaving.
--- Legacy host-backed fmap dispatcher — awaiting full removal.
--- Kept as dead code to preserve the pattern for reference during
--- migration of other dispatchers (bindDispatch, apDispatch, etc.).
+-- Legacy host-backed fmap dispatcher -- kept out of the registry as a
+-- reference while completing the remaining class-method dispatcher
+-- removals.
 _fmapDispatch :: ClassRegistry -> IO Val
 _fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
     mv <- force legacyHooks mt
@@ -2946,87 +2753,6 @@ _fmapDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
                 ( "fmap: no Functor instance registered for type `"
                   <> BC.unpack tag <> "`" )
 
--- | Dispatching @<>@ — 'Semigroup' append.  Forces the LHS, picks an
--- instance based on its type tag, and applies @<>@ to both args.
--- Handles the host-string case ('VStr') with direct concatenation
--- since IHC sometimes carries strings as 'VStr' rather than as a
--- @VCon ":"@ chain (see 'charListToByteStringVal').
-sappendDispatch :: ClassRegistry -> IO Val
-sappendDispatch reg = pure $ VFun $ \xT -> pure $ VFun $ \yT -> do
-    xv <- force legacyHooks xT
-    case xv of
-        -- Direct fast path for cons-list strings: avoid round-tripping
-        -- through Semigroup [] which is registered but cycles back here.
-        VCon ":" _ -> do
-            yv <- force legacyHooks yT
-            consAppend xv yv
-        VCon "[]" [] -> force legacyHooks yT
-        VStr _ -> do
-            yv <- force legacyHooks yT
-            consAppend xv yv
-        _ -> do
-            let tag = typeTagOf xv
-            mMethod <- lookupInstanceMethod reg
-                          (BC.pack "Semigroup") tag (BC.pack "<>")
-                          >>= forceInstanceMethod
-            case mMethod of
-                Just method -> do
-                    xT' <- newWHNFThunk xv
-                    r1 <- apply legacyHooks method xT'
-                    apply legacyHooks r1 yT
-                Nothing -> error
-                    ( "<>: no Semigroup instance registered for type `"
-                   <> BC.unpack tag <> "`" )
-  where
-    -- Cons-list / VStr concatenation.  Forces both as cons-lists.
-    consAppend (VCon ":" [hT, tT]) ys = do
-        tv <- force legacyHooks tT
-        rest <- consAppend tv ys
-        restT <- newWHNFThunk rest
-        pure (VCon ":" [hT, restT])
-    consAppend (VCon "[]" []) ys = pure ys
-    consAppend (VStr s) ys = do
-        -- Promote VStr to a cons-list so we can append onto it.
-        consList <- stringToListValIO (BC.unpack s)
-        consAppend consList ys
-    consAppend other _ =
-        error ("<>: unexpected list shape: " <> showValForDebug other)
-
-
--- | Dispatching @<*>@. Forces the first argument and looks up an
--- @(Applicative, typeTagOf fv)@ entry in the 'ClassRegistry'. If the
--- first argument's tag has no Applicative instance (e.g. @Nothing@'s
--- "Nothing" tag may not be registered while only "Just" is), we also try
--- the second argument's tag — for the same Applicative both sides share
--- the type but distinct constructors. Falls back to a VIO-only inline
--- implementation so existing IO uses keep working.
-apDispatch :: ClassRegistry -> IO Val
-apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
-    fv <- force legacyHooks ft
-    let tryTag tag = lookupInstanceMethod reg (BC.pack "Applicative") tag (BC.pack "<*>")
-                       >>= forceInstanceMethod
-    mApMethod <- tryTag (typeTagOf fv)
-    mApMethod2 <- case mApMethod of
-        Just _  -> pure mApMethod
-        Nothing -> do
-            mv <- force legacyHooks mt
-            tryTag (typeTagOf mv)
-    case mApMethod2 of
-        Just apMethod -> do
-            fT <- newWHNFThunk fv
-            r1 <- apply legacyHooks apMethod fT
-            apply legacyHooks r1 mt
-        Nothing -> case fv of
-            VIO _ -> pure $ VIO $ do
-                f1 <- runIOVal legacyHooks fv
-                mv <- force legacyHooks mt
-                v  <- runIOVal legacyHooks mv
-                vT <- newWHNFThunk v
-                apply legacyHooks f1 vT
-            _ -> error
-                ( "<*>: no Applicative instance registered for type `"
-                  <> BC.unpack (typeTagOf fv) <> "`" )
-
 -- | @join mm = do { m <- mm; m }@.
 -- 'joinB' was removed in slice 5b — 'join' is now interpreted from
 -- ~/.cache/ihc/sources/ghc-internal-9.1003.0/src/GHC/Internal/Base.hs:1292-1293
@@ -3039,68 +2765,6 @@ apDispatch reg = pure $ VFun $ \ft -> pure $ VFun $ \mt -> do
 
 -- runIOVal lives in 'IHC.Eval' (and now also covers STM, which used to
 -- be a separate copy here).  We import it from there.
-
---------------------------------------------------------------------------------
--- IORef primops. Each returns 'VIO' — construction, read, and write
--- are all IO actions.
---------------------------------------------------------------------------------
-
-newIORefB :: IO Val
-newIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    -- Store the THUNK directly so error-throwing initialisers
-    -- (e.g. warp's @newIORef $ error "keepAliveRef not filled"@) are
-    -- only evaluated on read.
-    rf <- newIORef a
-    pure (VPrimObj (PrimIORef rf))
-
-readIORefB :: IO Val
-readIORefB = pure $ VFun $ \a -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "readIORef"
-    readIORef rf >>= force legacyHooks
-
-writeIORefB :: IO Val
-writeIORefB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "writeIORef"
-    -- Install the thunk directly; readers force on demand.
-    writeIORef rf b
-    pure VUnit
-
--- | @modifyIORef ref f@. We force f then apply it to a thunk holding
--- the current ref contents. Works for both the lazy and strict forms
--- (Phase 2.4 does not differentiate beyond that).
-modifyIORefB :: IO Val
-modifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "modifyIORef"
-    fv <- force legacyHooks f
-    curT <- readIORef rf
-    new <- apply legacyHooks fv curT
-    newT <- newWHNFThunk new
-    writeIORef rf newT
-    pure VUnit
-
--- | @atomicModifyIORef' ref f@ for ihc's host-backed IORef.  This mirrors
--- the existing IORef builtins and is atomic enough for ihc's single-threaded
--- evaluator: read the current value, apply @f@ to get @(new, result)@, store
--- @new@, and return @result@.
-atomicModifyIORefB :: IO Val
-atomicModifyIORefB = pure $ VFun $ \a -> pure $ VFun $ \f -> pure $ VIO $ do
-    rf <- force legacyHooks a >>= extractIORef "atomicModifyIORef'"
-    fv <- force legacyHooks f
-    curT <- readIORef rf
-    pair <- apply legacyHooks fv curT >>= runIOVal legacyHooks
-    case pair of
-        VCon _ [newT, resultT] -> do
-            result <- force legacyHooks resultT
-            writeIORef rf newT
-            pure result
-        _ -> error ("atomicModifyIORef': function did not return a pair: "
-                    <> showValForDebug pair)
-
-mkWeakIORefB :: IO Val
-mkWeakIORefB = pure $ VFun $ \refT -> pure $ VFun $ \_finalizerT -> pure $ VIO $ do
-    refV <- force legacyHooks refT
-    weakPayload <- newWHNFThunk refV
-    pure (VCon "Weak" [weakPayload])
 
 --------------------------------------------------------------------------------
 -- MutVar# primops (Phase 3.6).
@@ -3240,10 +2904,58 @@ casMutVarB = pure $ VFun $ \mvThunk -> pure $ VFun $ \_expectedThunk ->
             pure (VCon "(#,,#)" [stT, zT, newThunk])
         _ -> error ("casMutVar#: not a MutVar#: " <> showValForDebug mvV)
 
+-- | @reallyUnsafePtrEquality# :: a -> b -> Int#@.
+-- GHC.Prim.PtrEq has source for its typed wrappers; this is the raw
+-- compiler primop they bottom out on.  Do not force arbitrary lifted
+-- values: callers commonly use this only as an optimisation guard.
+reallyUnsafePtrEqualityHashB :: IO Val
+reallyUnsafePtrEqualityHashB = pure $ VFun $ \lhsT -> pure $ VFun $ \rhsT -> do
+    same <- sameThunkObject lhsT rhsT
+    pure (primBoolVal same)
+  where
+    sameThunkObject lhsT rhsT
+        | lhsT == rhsT = pure True
+        | otherwise = do
+            lhs <- peekRuntimeObject 8 lhsT
+            rhs <- peekRuntimeObject 8 rhsT
+            case (lhs, rhs) of
+                (Just lhsV, Just rhsV) -> pure (sameRuntimeObject lhsV rhsV)
+                _ -> pure False
+
+    peekRuntimeObject :: Int -> Thunk -> IO (Maybe Val)
+    peekRuntimeObject 0 _ = pure Nothing
+    peekRuntimeObject depth t = do
+        state <- readIORef t
+        case state of
+            Evaluated v -> pure (Just v)
+            Unevaluated (Closure env _ expr)
+                | Just t' <- chaseExpr env expr
+                , t' /= t -> peekRuntimeObject (depth - 1) t'
+            _ -> pure Nothing
+
+    chaseExpr env (EVar name) = lookupEnv name env
+    chaseExpr env (ETyApp expr _) = chaseExpr env expr
+    chaseExpr _ _ = Nothing
+
+    sameRuntimeObject (VPrimObj (PrimIORef l)) (VPrimObj (PrimIORef r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimByteArray l)) (VPrimObj (PrimByteArray r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimArray l)) (VPrimObj (PrimArray r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimBoxedArray _ l)) (VPrimObj (PrimBoxedArray _ r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimMVar l)) (VPrimObj (PrimMVar r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimTVar l)) (VPrimObj (PrimTVar r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimThreadId l)) (VPrimObj (PrimThreadId r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimPtr l)) (VPrimObj (PrimPtr r)) = l == r
+    sameRuntimeObject (VPrimObj (PrimForeignPtr l)) (VPrimObj (PrimForeignPtr r)) =
+        unsafeForeignPtrToPtr l == unsafeForeignPtrToPtr r
+    sameRuntimeObject (VPrimObj PrimRealWorld) (VPrimObj PrimRealWorld) = True
+    sameRuntimeObject _ _ = False
+
 mkWeakHashB :: IO Val
 mkWeakHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ VFun $ \_finalizerT -> pure $ VFun $ \_stT -> do
     valV <- force legacyHooks valT
     stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+    -- Strong ref under interpretation: GC never drops keys, so the
+    -- "weak" object is just the value itself.  deRefWeak# always succeeds.
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
 
@@ -3254,59 +2966,148 @@ mkWeakNoFinalizerHashB = pure $ VFun $ \_keyT -> pure $ VFun $ \valT -> pure $ V
     weakT <- newWHNFThunk valV
     pure (VCon "(#,#)" [stT, weakT])
 
+-- | @deRefWeak# :: Weak# v -> State# s -> (# State# s, Int#, v #)@.
+-- Flag 0# = dead, non-zero = alive (see GHC.Internal.Weak.deRefWeak).
+-- Our mkWeak* always keep the value alive, so flag is always 1#.
+deRefWeakHashB :: IO Val
+deRefWeakHashB = pure $ VFun $ \weakT -> pure $ VFun $ \_stT -> do
+    valV <- force legacyHooks weakT
+    stT  <- newWHNFThunk (VPrimObj PrimRealWorld)
+    flagT <- newWHNFThunk (VInt 1)
+    valOut <- newWHNFThunk valV
+    pure (VCon "(#,,#)" [stT, flagT, valOut])
+
+-- | @finalizeWeak# :: Weak# v -> State# s
+--                 -> (# State# s, Int#, State# s -> (# State# s, () #) #)@.
+-- Flag 0# = already dead / no finalizer.  We never store finalizers on
+-- the strong-ref Weak# representation, so always return 0#.
+finalizeWeakHashB :: IO Val
+finalizeWeakHashB = pure $ VFun $ \_weakT -> pure $ VFun $ \_stT -> do
+    stT   <- newWHNFThunk (VPrimObj PrimRealWorld)
+    flagT <- newWHNFThunk (VInt 0)
+    -- Dummy finalizer thunk (unused when flag is 0#).
+    unitT <- newWHNFThunk VUnit
+    dummy <- newWHNFThunk (VFun $ \sT -> pure (VCon "(#,#)" [sT, unitT]))
+    pure (VCon "(#,,#)" [stT, flagT, dummy])
+
 --------------------------------------------------------------------------------
 -- File IO primops.
 --------------------------------------------------------------------------------
 
 -- | Construct a source-loaded @FileHandle path (MVar Handle__)@ value.
--- The MVar holds @VCon "Handle__" [VPrimObj PrimHandle h]@ so source
--- code can pattern-match on @Handle__ {..}@ (record wildcard).
-mkFileHandleVal :: String -> Handle -> IO Val
-mkFileHandleVal path h = do
+-- The MVar keeps the host 'Handle' in @haDevice@ and exposes enough of
+-- GHC's source-level @Handle__@ record shape for source handle helpers
+-- to pattern-match on @Handle__ {..}@.  The buffers only carry enough
+-- shape for source handle helpers to allocate their own spare buffers;
+-- ordinary byte/char IO is still performed by host-backed primitives such
+-- as 'hPutCharB' and 'hGetLineB'.
+mkFileHandleVal :: String -> Handle -> IOMode -> IO Val
+mkFileHandleVal path h mode = do
     pathT <- newWHNFThunk =<< stringToListValIO path
-    -- Build a VCon "Handle__" with 13 positional fields matching the
-    -- source Handle__ record from GHC.Internal.IO.Handle.Types.
-    -- Most fields are stubs (VUnit); haType is the one that matters
-    -- (the source-loaded withHandle code inspects it).
-    let handleMode = case h of
-            _ | h == stdin  -> "ReadHandle"
-              | h == stdout -> "WriteHandle"
-              | h == stderr -> "WriteHandle"
-              | otherwise   -> "ReadWriteHandle"
-    handleT <- newWHNFThunk (VPrimObj (PrimHandle h))
-    haTypeT <- newWHNFThunk (VCon handleMode [])
-    -- haByteBuffer, haCharBuffer etc. — IORef stubs.  The builtins
-    -- handle actual I/O via the PrimHandle; source code that reads
-    -- these IORefs gets empty buffer stubs.
-    emptyBufRef <- newIORef =<< newWHNFThunk VUnit
-    stubT   <- newWHNFThunk (VPrimObj (PrimIORef emptyBufRef))
-    nothingT <- newWHNFThunk (VCon "Nothing" [])
-    lnT     <- newWHNFThunk (VCon "LF" [])  -- Newline = LF
-    nobufT  <- newWHNFThunk (VCon "LineBuffering" [])
-    -- haBuffers needs BufferListNil, not VUnit
-    bufListRef <- newIORef =<< newWHNFThunk (VCon "BufferListNil" [])
-    bufListT <- newWHNFThunk (VPrimObj (PrimIORef bufListRef))
-    -- 13 fields in order: haDevice haType haByteBuffer haBufferMode
-    -- haLastDecode haCharBuffer haBuffers haEncoder haDecoder
-    -- haCodec haInputNL haOutputNL haOtherSide
-    let handle__ = VCon "Handle__"
-            [ handleT   -- haDevice (PrimHandle — used by requireHandle)
-            , haTypeT   -- haType (HandleType)
-            , stubT     -- haByteBuffer (IORef stub)
-            , nobufT    -- haBufferMode
-            , stubT     -- haLastDecode (IORef stub)
-            , stubT     -- haCharBuffer (IORef stub)
-            , bufListT  -- haBuffers (IORef BufferListNil)
-            , nothingT  -- haEncoder
-            , nothingT  -- haDecoder
-            , nothingT  -- haCodec
-            , lnT       -- haInputNL
-            , lnT       -- haOutputNL
-            , nothingT  -- haOtherSide
-            ]
-    mv    <- newMVar handle__
+    handleState <- mkHandleStateVal h mode
+    mv    <- newMVar handleState
     mvarT <- newWHNFThunk (VPrimObj (PrimMVar mv))
     pure (VCon "FileHandle" [pathT, mvarT])
+
+mkHandleStateVal :: Handle -> IOMode -> IO Val
+mkHandleStateVal h mode = do
+    handleT     <- newWHNFThunk (VPrimObj (PrimHandle h))
+    typeT       <- newWHNFThunk (handleTypeVal mode)
+    byteBufT    <- newWHNFThunk =<< (mkEmptyReadBufferVal >>= mkIORefVal)
+    modeT       <- newWHNFThunk (VCon "LineBuffering" [])
+    unitT       <- newWHNFThunk VUnit
+    lastBufT    <- newWHNFThunk =<< mkEmptyReadBufferVal
+    lastDecodeT <- newWHNFThunk =<< mkIORefVal (VCon "(,)" [unitT, lastBufT])
+    charBufT    <- newWHNFThunk =<< (mkEmptyReadBufferVal >>= mkIORefVal)
+    spareBufsT  <- newWHNFThunk =<< mkIORefVal (VCon "BufferListNil" [])
+    encoderT    <- newWHNFThunk nothingVal
+    decoderT    <- newWHNFThunk nothingVal
+    codecT      <- newWHNFThunk nothingVal
+    inputNLT    <- newWHNFThunk newlineVal
+    outputNLT   <- newWHNFThunk newlineVal
+    otherSideT  <- newWHNFThunk nothingVal
+    pure (VCon "Handle__"
+        [ handleT
+        , typeT
+        , byteBufT
+        , modeT
+        , lastDecodeT
+        , charBufT
+        , spareBufsT
+        , encoderT
+        , decoderT
+        , codecT
+        , inputNLT
+        , outputNLT
+        , otherSideT
+        ])
+
+mkIORefVal :: Val -> IO Val
+mkIORefVal v = do
+    t <- newWHNFThunk v
+    ref <- newIORef t
+    pure (VPrimObj (PrimIORef ref))
+
+handleTypeVal :: IOMode -> Val
+handleTypeVal ReadMode      = VCon "ReadHandle" []
+handleTypeVal WriteMode     = VCon "WriteHandle" []
+handleTypeVal AppendMode    = VCon "AppendHandle" []
+handleTypeVal ReadWriteMode = VCon "ReadWriteHandle" []
+
+mkEmptyReadBufferVal :: IO Val
+mkEmptyReadBufferVal = do
+    fp      <- mallocForeignPtrBytes (handleBufferSize * 4)
+    markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (handleBufferSize * 4)
+    rawT    <- newWHNFThunk =<< mkForeignPtrVal fp
+    stateT  <- newWHNFThunk (VCon "ReadBuffer" [])
+    -- GHC's source text output path asks for a spare char buffer sized
+    -- from haCharBuffer.  A one-slot placeholder makes writeLines commit
+    -- zero chars forever because it always keeps room for the next char.
+    sizeT   <- newWHNFThunk (VInt (fromIntegral handleBufferSize))
+    offsetT <- newWHNFThunk (VInt 0)
+    leftT   <- newWHNFThunk (VInt 0)
+    rightT  <- newWHNFThunk (VInt 0)
+    pure (VCon "Buffer" [rawT, stateT, sizeT, offsetT, leftT, rightT])
+
+handleBufferSize :: Int
+handleBufferSize = 4096
+
+-- | Flush a source-level @Buffer Word8@ through a synthetic host-backed
+-- Handle__ device.  The source @BufferedIO FD@ instance cannot apply to
+-- our @PrimHandle@ device, but the actual device write is RTS-exclusive:
+-- copy the pending byte range to the host 'Handle' and return an emptied
+-- source buffer.
+flushHostHandleBuffer :: Val -> Val -> IO (Maybe Val)
+flushHostHandleBuffer devV bufV = case (devV, bufV) of
+    (VPrimObj (PrimHandle h), VCon "Buffer" [rawT, stateT, sizeT, offsetT, leftT, rightT]) -> do
+        rawV   <- force legacyHooks rawT
+        stateV <- force legacyHooks stateT
+        sizeV  <- force legacyHooks sizeT
+        offV   <- force legacyHooks offsetT
+        leftV  <- force legacyHooks leftT
+        rightV <- force legacyHooks rightT
+        fp <- foreignPtrValToForeignPtr rawV
+        case (leftV, rightV) of
+            (VInt l, VInt r)
+                | r > l -> withForeignPtr fp $ \p ->
+                    hPutBuf h (castPtr (p `plusPtr` fromIntegral l))
+                        (fromIntegral (r - l))
+            _ -> pure ()
+        hFlush h
+        rawT'   <- newWHNFThunk rawV
+        stateT' <- newWHNFThunk stateV
+        sizeT'  <- newWHNFThunk sizeV
+        offT'   <- newWHNFThunk offV
+        leftT'  <- newWHNFThunk (VInt 0)
+        rightT' <- newWHNFThunk (VInt 0)
+        pure (Just (VCon "Buffer" [rawT', stateT', sizeT', offT', leftT', rightT']))
+    _ -> pure Nothing
+
+nothingVal :: Val
+nothingVal = VCon "Nothing" []
+
+newlineVal :: Val
+newlineVal = VCon "LF" []
 
 -- | Extract the host Handle from a source-loaded FileHandle/DuplexHandle
 -- or a legacy VPrimObj PrimHandle.
@@ -3354,7 +3155,7 @@ openFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     mv  <- force legacyHooks b
     let mode = ioModeFromVal mv
     h <- openFile path mode
-    mkFileHandleVal path h
+    mkFileHandleVal path h mode
 
 hCloseB :: IO Val
 hCloseB = pure $ VFun $ \a -> pure $ VIO $ do
@@ -3407,6 +3208,39 @@ hSetBufferingB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     hSetBuffering h (bufferModeFromVal mv)
     pure VUnit
 
+-- | @withFile path mode action@ — open, run @action@ with the host
+-- 'Handle', close on success or exception.  Host-backed (Handle-device
+-- carve-out): source @withFile@ is @bracket (openFile …) hClose@, but
+-- the full source Handle/encoding layer is not modelled yet.  Lets
+-- source-loaded 'writeFile' / 'appendFile' (and direct 'withFile'
+-- users) bottom out here instead of a whole-file host shim.
+withFileB :: IO Val
+withFileB = pure $ VFun $ \pathT -> pure $ VFun $ \modeT -> pure $ VFun $ \kT -> pure $ VIO $ do
+    pv   <- force legacyHooks pathT
+    path <- valToString pv
+    mv   <- force legacyHooks modeT
+    let mode = ioModeFromVal mv
+    kv   <- force legacyHooks kT
+    CE.bracket
+        (do
+            h    <- openFile path mode
+            hVal <- mkFileHandleVal path h mode
+            pure (h, hVal))
+        (\(h, _) -> hClose h)
+        (\(_, hVal) -> do
+            hT <- newWHNFThunk hVal
+            r  <- apply legacyHooks kv hT
+            runIOVal legacyHooks r)
+
+-- | @hGetContents h@ — read the remainder of the handle as a String
+-- ([Char]).  Host-backed (same Handle-device carve-out as 'hGetLine');
+-- source-loaded 'readFile' / 'getContents' bottom out here.
+hGetContentsB :: IO Val
+hGetContentsB = pure $ VFun $ \a -> pure $ VIO $ do
+    h <- force legacyHooks a >>= requireHandle "hGetContents"
+    s <- hGetContents h
+    stringToListValIO s
+
 --------------------------------------------------------------------------------
 -- Control flow.
 --------------------------------------------------------------------------------
@@ -3446,95 +3280,6 @@ isTrueHashB = pure $ VFun $ \a -> do
         VInt _ -> pure (VCon (BC.pack "True")  [])
         _      -> error ("isTrue#: not an Int: " <> showValForDebug av)
 
--- | 'fromIntegral' / 'fromInteger' coercion. Accepts Int or Float/Double;
--- returns the value unchanged (we have one Int type and one Float type).
--- | 'maxBound' / 'minBound' — class methods of Bounded.  Nullary, so our
--- arg-directed dispatcher can't pick an instance without a type hint.
--- Default to Int bounds, which is what most real-world code wants
--- (`maxBound :: Int` shows up in text's `length` and many others).
--- Code that explicitly asks for `maxBound :: Word8` via @TypeApplications@
--- is handled separately by the @VClassMethod + @T@ path.
-maxBoundB :: IO Val
-maxBoundB = pure (VInt maxBound)
-
-minBoundB :: IO Val
-minBoundB = pure (VInt minBound)
-
--- | @encodeFloat m e@ — @m * 2^e@ as a 'Double' (or 'Float', we
--- represent both as 'VFloat').  Host shim because the source-loaded
--- @RealFloat Double.encodeFloat@ instance method isn't being routed
--- by the class dispatcher (instance-method-registration gap; the
--- underlying 'integerEncodeDouble#' source-loads fine).  Accepts
--- 'VInt' or 'VInteger' for the mantissa.
-encodeFloatB :: IO Val
-encodeFloatB = pure $ VFun $ \mT -> pure $ VFun $ \eT -> do
-    mv <- force legacyHooks mT
-    ev <- force legacyHooks eT
-    let mInt = case mv of
-            VInt n     -> toInteger n
-            VInteger n -> n
-            VPrimObj (PrimBigNat n) -> toInteger n
-            _ -> error ("encodeFloat: bad mantissa: " <> showValForDebug mv)
-        eInt = case ev of
-            VInt n -> fromIntegral n :: Int
-            _      -> error ("encodeFloat: bad exponent: " <> showValForDebug ev)
-    pure (VFloat (encodeFloat mInt eInt :: Double))
-
--- | @decodeFloat x@ — @(m, e)@ such that @x == m * 2^e@.  Returns
--- a tuple of '(Integer, Int)'.  Source-loaded path bottoms out at
--- 'decodeDouble_Int64#' (already shipped) but the surrounding
--- 'RealFloat Double.decodeFloat' instance method dispatch is
--- blocked on the same instance-registration gap as 'encodeFloat'.
-decodeFloatB :: IO Val
-decodeFloatB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VFloat d -> do
-            let (m, e) = decodeFloat d :: (Integer, Int)
-            -- Mantissa is Integer; Phase 3 collapse handles the wrapping
-            mV <- pure $ if m >= toInteger (minBound :: Int64)
-                         && m <= toInteger (maxBound :: Int64)
-                            then VInt (fromInteger m)
-                            else VInteger m
-            mT <- newWHNFThunk mV
-            eT <- newWHNFThunk (VInt (fromIntegral e))
-            pure (VCon "(,)" [mT, eT])
-        _ -> error ("decodeFloat: not a Double: " <> showValForDebug av)
-
-fromIntegralB :: IO Val
-fromIntegralB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt n   -> pure (VInt n)
-        VFloat d -> pure (VFloat d)
-        VChar c  -> pure (VInt (fromIntegral (ord c)))
-        -- Newtype numeric wrappers we handle by name so we don't eat
-        -- every single-field constructor (ST, Identity, Maybe-Just, …).
-        VCon c [t]
-          | c `elem` numericNewtypeCons -> do
-              inner <- force legacyHooks t
-              case inner of
-                  VInt n   -> pure (VInt n)
-                  VFloat d -> pure (VFloat d)
-                  _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
-        _ -> error ("fromIntegral: not a numeric value: " <> showValForDebug av)
-  where
-    numericNewtypeCons =
-        [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
-        , "CShort", "CUShort", "CLLong", "CULLong"
-        , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
-        , "Int8", "Int16", "Int32", "Int64"
-        , "Word", "Word8", "Word16", "Word32", "Word64"
-        , "CFloat", "CDouble"
-        -- 'Integer' has a multi-ctor representation in @ghc-bignum@:
-        --   data Integer = IS !Int# | IP !ByteArray# | IN !ByteArray#
-        -- The 'IS' constructor (small Integer fitting in an Int) flows
-        -- here when source-loaded numeric code constructs an Integer
-        -- and warp/wai then runs it through 'fromIntegral'.  Treat it
-        -- as the Int it wraps.
-        , "IS"
-        ]
-
 --------------------------------------------------------------------------------
 -- Phase 1+2.A: BigNat# runtime representation + comparison primops
 --------------------------------------------------------------------------------
@@ -3566,58 +3311,16 @@ bigNatFromWordB = pure $ VFun $ \w -> do
 
 -- | Extract a host 'Natural' from a 'VPrimObj (PrimBigNat _)'
 -- argument or fail with a context-tagged error.  Used by the
--- Phase 2.A comparison primops and the rest of the
--- @bigNat*#@ family that lands later.
+-- retained @bigNat*#@ family that still sits on the PrimBigNat
+-- representation boundary.
 extractBigNat :: String -> Val -> IO Natural
 extractBigNat _   (VPrimObj (PrimBigNat n)) = pure n
 extractBigNat ctx v = error (ctx <> ": not a BigNat#: " <> showValForDebug v)
 
--- | Phase 2.A: binary BigNat# comparison primop.  Both args must
--- be @VPrimObj (PrimBigNat _)@; the result is @Bool#@ encoded as
--- @VInt 1 / VInt 0@.  Mirrors 'makeIntCmpOp' / 'makeWordCmpOp'.
-makeBigNatCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
-makeBigNatCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat name av
-    nb <- extractBigNat name bv
-    pure (primBoolVal (op na nb))
-
--- | Phase 2.A: unary BigNat# predicate primop, returning @Bool#@.
--- Used for @bigNatIsZero#@ and @bigNatIsOne#@.
-makeBigNatUnaryBool :: String -> (Natural -> Bool) -> IO Val
-makeBigNatUnaryBool name p = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat name av
-    pure (primBoolVal (p n))
-
--- | @bigNatCompare :: BigNat# -> BigNat# -> Ordering@ — note no
--- @#@ suffix; ghc-bignum's source returns the lifted 'Ordering'
--- type.  The unboxed-tuple-returning @bigNatCompare#@ name listed
--- in the Phase 2 plan was a typo (no such ghc-bignum primop).
-bigNatCompareB :: IO Val
-bigNatCompareB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat "bigNatCompare" av
-    nb <- extractBigNat "bigNatCompare" bv
-    pure $ case compare na nb of
-        LT -> VCon "LT" []
-        EQ -> VCon "EQ" []
-        GT -> VCon "GT" []
-
--- | @bigNatSize# :: BigNat# -> Int#@ — returns the number of
--- 64-bit Word# limbs needed to represent the BigNat in
--- ghc-bignum's canonical layout.  For our 'Natural'-backed
--- representation we compute it via repeated 64-bit shifts,
--- matching @wordArraySize#@'s O(limbs) cost.  By convention,
--- @bigNatSize# 0## == 0#@ (ghc-bignum BigNat.hs:81 + 111-112).
-bigNatSizeHashB :: IO Val
-bigNatSizeHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatSize#" av
-    pure (VInt (fromIntegral (bigNatLimbCount n)))
-
 -- | Count 64-bit limbs in a 'Natural'.  Zero is canonically
--- represented with size 0 in ghc-bignum.
+-- represented with size 0 in ghc-bignum.  Used by the retained
+-- sizeofByteArray# PrimBigNat leaf so source-loaded wordArraySize#
+-- observes the same limb count.
 bigNatLimbCount :: Natural -> Int
 bigNatLimbCount = go 0
   where
@@ -3658,16 +3361,6 @@ coerceWordArg _   (VInteger n) =
     pure (fromInteger (n `mod` (1 `shiftL` 64)))
 coerceWordArg ctx v =
     error (ctx <> ": not a Word#: " <> showValForDebug v)
-
--- | @bigNatSqr :: BigNat# -> BigNat#@ — square of a BigNat#.
--- Equivalent to @bigNatMul a a@ but ghc-bignum keeps a dedicated
--- primop because GMP has a specialised path; over host 'Natural'
--- the speedup is negligible, so we just multiply.
-bigNatSqrB :: IO Val
-bigNatSqrB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatSqr" av
-    pure (VPrimObj (PrimBigNat (n * n)))
 
 -- | Build an unboxed-sum value @(# … | … #)@ — see the @(#|#)@
 -- constructor registration in 'builtinEnv'.  @tag@ is the 1-based
@@ -3823,43 +3516,6 @@ bigNatAndIntHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         _ -> error
             ("bigNatAndInt#: not an Int#: " <> showValForDebug bv)
 
--- | Phase 2.D: @bigNatToWord# :: BigNat# -> Word#@ — returns the
--- low 64 bits of the BigNat, reinterpreted as a Word#.  For a
--- BigNat that fits in one limb, this is just the limb value.  For
--- larger BigNats, the high limbs are dropped (matches
--- @wordArrayLast@-on-low-limb behaviour in ghc-bignum).
---
--- Same body powers 'bigNatToWord64#' since Word# == Word64# on
--- 64-bit (our target).
-bigNatToWordHashB :: IO Val
-bigNatToWordHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatToWord#" av
-    pure (VInt (fromIntegral (fromIntegral n :: Word)))
-
--- | Phase 2.D: @bigNatToInt# :: BigNat# -> Int#@ — like
--- 'bigNatToWord#' but reinterprets the low 64 bits as signed Int#.
--- Equivalent to @word2Int# (bigNatToWord# n)@ in ghc-bignum.
-bigNatToIntHashB :: IO Val
-bigNatToIntHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatToInt#" av
-    pure (VInt (fromIntegral (fromIntegral n :: Word)))
-
--- | Phase 2.D: @bigNatFromAbsInt# :: Int# -> BigNat#@ — absolute
--- value of an Int# as a BigNat.  ghc-bignum uses this for the
--- @IS k@ → BigNat# transition in 'integerNegate' etc.  For
--- @minBound :: Int@, the magnitude exceeds maxBound, so we use
--- 'abs' over 'Integer' to avoid overflow.
-bigNatFromAbsIntHashB :: IO Val
-bigNatFromAbsIntHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VInt i ->
-            pure (VPrimObj (PrimBigNat (fromInteger (abs (toInteger i)))))
-        _ -> error
-            ("bigNatFromAbsInt#: not an Int#: " <> showValForDebug av)
-
 -- | Phase 2.D: @bigNatEncodeDouble# :: BigNat# -> Int# -> Double#@
 -- — returns @m * 2^e@ as a Double#.  Uses host 'encodeFloat'
 -- which is the canonical Haskell primitive for this conversion.
@@ -3971,111 +3627,6 @@ integerToBigNatClampHashB = pure $ VFun $ \a -> do
         _ -> error
             ("integerToBigNatClamp#: not an Integer: " <> showValForDebug av)
 
--- | Phase 2.D: @bigNatLog2# :: BigNat# -> Word#@ — floor(log2 n).
--- ghc-bignum returns 0 for n = 0; we match that.
-bigNatLog2HashB :: IO Val
-bigNatLog2HashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatLog2#" av
-    pure (VInt (fromIntegral (naturalLog2 n)))
-
--- | Pure helper for floor(log2 n).  Returns 0 for n = 0
--- (matching ghc-bignum's @bigNatLog2# 0 == 0##@).
-naturalLog2 :: Natural -> Int
-naturalLog2 0 = 0
-naturalLog2 n = go 0 n
-  where
-    go !i 1 = i
-    go !i k = go (i + 1) (k `shiftR` 1)
-
--- | Phase 2.D: @bigNatLogBase# :: BigNat# -> BigNat# -> Word#@.
--- ghc-bignum raises 'unexpectedValue_Word#' for base ≤ 1; we
--- 'error' (matches the host shim convention for source-loaded
--- @raiseUnexpectedValue@).
-bigNatLogBaseHashB :: IO Val
-bigNatLogBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- extractBigNat "bigNatLogBase#" av
-    n    <- extractBigNat "bigNatLogBase#" bv
-    pure (VInt (fromIntegral (naturalLogBase base n)))
-
--- | Phase 2.D: @bigNatLogBaseWord# :: Word# -> BigNat# -> Word#@.
-bigNatLogBaseWordHashB :: IO Val
-bigNatLogBaseWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- coerceWordArg "bigNatLogBaseWord#" av
-    n    <- extractBigNat "bigNatLogBaseWord#" bv
-    pure (VInt (fromIntegral (naturalLogBase base n)))
-
--- | Pure helper for floor(log_b n).  Errors if @b <= 1@ (matches
--- ghc-bignum's @unexpectedValue_Word#@).  Returns 0 for n = 0 as a
--- practical default; ghc-bignum's source is undefined here.
-naturalLogBase :: Natural -> Natural -> Int
-naturalLogBase b _ | b <= 1 = error "bigNatLogBase#: base must be > 1"
-naturalLogBase _ 0          = 0
-naturalLogBase 2 n          = naturalLog2 n
-naturalLogBase b n          = go 0 n
-  where
-    go !i k | k < b     = i
-            | otherwise = go (i + 1) (k `div` b)
-
--- | Phase 2.E: @BigNat# -> Word# -> Bool#@ comparison primop.
--- Both args extracted via the standard Natural reinterpretation
--- chain; result is VInt 1/0 per 'primBoolVal'.  Mirrors
--- 'makeBigNatCmpOp' from Phase 2.A.
-makeBigNatWordCmpOp :: String -> (Natural -> Natural -> Bool) -> IO Val
-makeBigNatWordCmpOp name op = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat name av
-    -- 'coerceWordArg' (not a bare @VInt@ match): Word# literals such
-    -- as @ABS_INT_MINBOUND## = 0x8000000000000000@ exceed
-    -- @maxBound :: Int64@ so the parser stores them as 'VInteger',
-    -- not 'VInt'.  ghc-bignum's 'integerNegate' (@IP b@ arm) calls
-    -- @bigNatEqWord# b ABS_INT_MINBOUND##@, which would otherwise
-    -- fail "not a Word#".  Mirrors the Phase 3 'makeBigNatWordOp'
-    -- fix.
-    nb <- coerceWordArg name bv
-    pure (primBoolVal (op na nb))
-
--- | @bigNatCompareWord# :: BigNat# -> Word# -> Ordering@.
-bigNatCompareWordHashB :: IO Val
-bigNatCompareWordHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat "bigNatCompareWord#" av
-    nb <- coerceWordArg "bigNatCompareWord#" bv
-    pure $ case compare na nb of
-        LT -> VCon "LT" []
-        EQ -> VCon "EQ" []
-        GT -> VCon "GT" []
-
--- | @bigNatCheck# :: BigNat# -> Bool#@ — ghc-bignum's canonical-form
--- sanity check (high limb non-zero, etc.).  Our 'Natural'-backed
--- representation is always canonical by construction, so this is
--- a constant True.
-bigNatCheckHashB :: IO Val
-bigNatCheckHashB = pure $ VFun $ \a -> do
-    _ <- force legacyHooks a
-    pure (primBoolVal True)
-
--- | @bigNatIndex# :: BigNat# -> Int# -> Word#@ — extract the i-th
--- 64-bit limb (little-endian).  Bounds-checking is the caller's
--- responsibility per ghc-bignum convention (out-of-range returns 0
--- in our backing since shifted-out bits are 0).
-bigNatIndexHashB :: IO Val
-bigNatIndexHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    na <- extractBigNat "bigNatIndex#" av
-    case bv of
-        VInt i ->
-            -- Right-shift by 64*i, then mask off to the low 64 bits.
-            -- For i out of range (i >= limbCount na), the shift
-            -- produces 0; the .&. 0xFFFFFFFFFFFFFFFF is implicit in
-            -- the fromIntegral :: Natural -> Word truncation.
-            let shifted = na `shiftR` (64 * fromIntegral i)
-            in pure (VInt (fromIntegral (fromIntegral shifted :: Word)))
-        _ -> error
-            ("bigNatIndex#: not an Int#: " <> showValForDebug bv)
-
 -- | @bigNatZero# :: (# #) -> BigNat#@ — constant zero BigNat.  The
 -- @(# #)@ argument is the unit unboxed tuple ghc-bignum uses to
 -- force evaluation at use site (see "Note [Why (# #)?]" at
@@ -4092,23 +3643,6 @@ bigNatOneHashB = pure $ VFun $ \a -> do
     _ <- force legacyHooks a
     pure (VPrimObj (PrimBigNat 1))
 
--- | @bigNatCtz# :: BigNat# -> Word#@ — count trailing zero bits.
--- Returns 0 for n = 0 (ghc-bignum convention, BigNat.hs:1213).
-bigNatCtzHashB :: IO Val
-bigNatCtzHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatCtz#" av
-    pure (VInt (fromIntegral (naturalCtz n)))
-
--- | @bigNatCtzWord# :: BigNat# -> Word#@ — count trailing zero
--- 64-bit limbs.  Returns 0 for n = 0.  Equivalent to
--- @bigNatCtz# n `div` 64@.
-bigNatCtzWordHashB :: IO Val
-bigNatCtzWordHashB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    n  <- extractBigNat "bigNatCtzWord#" av
-    pure (VInt (fromIntegral (naturalCtz n `div` 64)))
-
 -- | Pure helper: count trailing zero bits of a 'Natural'.  Returns 0
 -- for n = 0 (matches ghc-bignum's @bigNatCtz# 0 == 0##@).
 naturalCtz :: Natural -> Int
@@ -4118,22 +3652,6 @@ naturalCtz n = go 0 n
     go !i k
       | k .&. 1 == 1 = i
       | otherwise    = go (i + 1) (k `shiftR` 1)
-
--- | @bigNatSizeInBase# :: Word# -> BigNat# -> Word#@ — number of
--- digits to represent @n@ in @base@.  ghc-bignum errors for
--- @base <= 1@; we match.  For n = 0 returns 0 (ghc-bignum
--- convention).  Otherwise returns @floor(logBase base n) + 1@.
-bigNatSizeInBaseHashB :: IO Val
-bigNatSizeInBaseHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
-    av <- force legacyHooks a; bv <- force legacyHooks b
-    base <- coerceWordArg "bigNatSizeInBase#" av
-    n    <- extractBigNat "bigNatSizeInBase#" bv
-    pure (VInt
-        (if base <= 1
-            then error "bigNatSizeInBase#: base must be > 1"
-            else if n == 0
-                then 0
-                else fromIntegral (naturalLogBase base n) + 1))
 
 -- | Phase 4: @bigNatFromWord2# :: Word# -> Word# -> BigNat#@ —
 -- construct a BigNat from a high/low Word# pair.  Used by
@@ -4202,18 +3720,6 @@ runRWB = pure $ VFun $ \ft -> do
     -- the caller sees the concrete value / unboxed tuple.
     runIOVal legacyHooks resRaw
 
-lazyB :: IO Val
-lazyB = pure $ VFun $ \a -> force legacyHooks a
-
---------------------------------------------------------------------------------
--- Phase 2.8: unsafePerformIO family
---------------------------------------------------------------------------------
-
-unsafePerformIOB :: IO Val
-unsafePerformIOB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    runIOVal legacyHooks av
-
 --------------------------------------------------------------------------------
 -- Phase 2.8: boxing/unboxing constructors
 --------------------------------------------------------------------------------
@@ -4224,12 +3730,21 @@ iHashB = pure $ VFun $ \a -> force legacyHooks a
 wHashB :: IO Val
 wHashB = pure $ VFun $ \a -> force legacyHooks a
 
+-- Box Word8 as VCon "W8#" so typeTagOf can map to "Word8" and Num
+-- Word8 dispatch does not collapse to Num Int (bare VInt).  Without
+-- this, @(5::Word8) - 48@ evaluates as Int (-43) instead of modular
+-- Word8 213, and Word8 digit math on the warp request path is wrong.
 w8HashB :: IO Val
 w8HashB = pure $ VFun $ \a -> do
     av <- force legacyHooks a
     case av of
-        VInt n -> pure (VInt (n .&. 0xff))
-        _      -> force legacyHooks a
+        VInt n -> do
+            t <- newWHNFThunk (VInt (n .&. 0xff))
+            pure (VCon "W8#" [t])
+        VCon "W8#" _ -> pure av
+        _ -> do
+            t <- newWHNFThunk av
+            pure (VCon "W8#" [t])
 
 cHashB :: IO Val
 cHashB = pure $ VFun $ \a -> force legacyHooks a
@@ -4313,6 +3828,22 @@ addr2IntB = pure $ VFun $ \a -> do
             pure (VInt (fromIntegral (FP.ptrToIntPtr p)))
         _ -> error ("addr2Int#: not a Ptr: " <> showValForDebug av)
 
+-- | @indexCharOffAddr# :: Addr# -> Int# -> Char#@.
+-- Genuine GHC.Prim leaf used by the source-loaded GHC.CString
+-- unpacking loops. It reads one byte from the raw address and returns
+-- the byte-valued Char# that GHC.CString then decodes as ASCII/UTF-8.
+indexCharOffAddrHashB :: IO Val
+indexCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    p <- valToHostPtr addrV
+    case idxV of
+        VInt i -> do
+            b <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
+            pure (VChar (chr (fromIntegral b)))
+        _ -> error ("indexCharOffAddr#: offset not an Int: "
+                    <> showValForDebug idxV)
+
 -- | @setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld@
 -- Memset primop used by source-loaded @fillBytes@.  The state value
 -- IS the side-effect carrier in our interpreter: the runIOVal IO
@@ -4385,6 +3916,27 @@ copyAddrToAddrB =
 word8ToWordB :: IO Val
 word8ToWordB = pure $ VFun $ \t -> force legacyHooks t
 
+-- | @wordToWord8# :: Word# -> Word8#@ — narrowing to the low 8 bits.
+wordToWord8B :: IO Val
+wordToWord8B = pure $ VFun $ \t -> do
+    v <- force legacyHooks t
+    case v of
+        VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word8)))
+        _      -> error ("wordToWord8#: bad arg: " <> showValForDebug v)
+
+-- | @word32ToWord# :: Word32# -> Word#@ — widening; no-op on our Val.
+-- Source-loaded @GHC.Internal.Word@ uses this for @Integral Word32@.
+word32ToWordB :: IO Val
+word32ToWordB = pure $ VFun $ \t -> force legacyHooks t
+
+-- | @wordToWord32# :: Word# -> Word32#@ — narrowing to the low 32 bits.
+wordToWord32B :: IO Val
+wordToWord32B = pure $ VFun $ \t -> do
+    v <- force legacyHooks t
+    case v of
+        VInt n -> pure (VInt (fromIntegral (fromIntegral n :: Word32)))
+        _      -> error ("wordToWord32#: bad arg: " <> showValForDebug v)
+
 -- | @eqAddr#@ / @neAddr#@ / @ltAddr#@ / @leAddr#@ / @gtAddr#@ /
 -- @geAddr#@ — host-backed comparison primops on the unboxed @Addr#@.
 -- All six produce @Int#@ in source semantics (1 / 0); we map to the
@@ -4447,6 +3999,76 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
 
+-- | @readWord8OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Word8# #)@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Word8@.
+readWord8OffAddrHashB :: IO Val
+readWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                        pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            nT  <- newWHNFThunk (VInt (fromIntegral n))
+            pure (VCon "(#,#)" [stT, nT])
+        _ -> error ("readWord8OffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeWord8OffAddr# :: Addr# -> Int# -> Word8# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Word8@.
+writeWord8OffAddrHashB :: IO Val
+writeWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                         pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV  <- force legacyHooks valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
+            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
+                        (fromIntegral n :: Word8)
+            pure (VPrimObj PrimRealWorld)
+        (VPrimObj (PrimPtr p), VInt i, VInteger n) -> do
+            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
+                        (fromInteger n :: Word8)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeWord8OffAddr#: bad args: "
+                    <> showValForDebug addrV <> ", "
+                    <> showValForDebug idxV <> ", "
+                    <> showValForDebug valV)
+
+-- | @readWideCharOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Char# #)@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Char@.
+readWideCharOffAddrHashB :: IO Val
+readWideCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                           pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (castPtr p :: Ptr Word32) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            cT  <- newWHNFThunk (VChar (chr (fromIntegral n)))
+            pure (VCon "(#,#)" [stT, cT])
+        _ -> error ("readWideCharOffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeWideCharOffAddr# :: Addr# -> Int# -> Char# -> State# s -> State# s@.
+-- GHC.Prim raw-address access used by source-loaded @Storable Char@.
+writeWideCharOffAddrHashB :: IO Val
+writeWideCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                            pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV  <- force legacyHooks valT
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VChar c) -> do
+            pokeElemOff (castPtr p :: Ptr Word32) (fromIntegral i)
+                        (fromIntegral (ord c) :: Word32)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeWideCharOffAddr#: bad args: "
+                    <> showValForDebug addrV <> ", "
+                    <> showValForDebug idxV <> ", "
+                    <> showValForDebug valV)
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: ForeignPtr
 --------------------------------------------------------------------------------
@@ -4462,16 +4084,13 @@ mallocForeignPtrBytesB = pure $ VFun $ \a -> pure $ VIO $ do
         _ -> error ("mallocForeignPtrBytes: not an Int: " <> showValForDebug av)
 
 --------------------------------------------------------------------------------
--- Data.ByteString shims
---
--- Temporary short-circuits for Data.ByteString operations. Data.ByteString.hs
--- source-loads correctly but takes ~9 minutes to complete because discovery
--- of GHC.Internal.Show's transitive closure cascades through thousands of
--- bindings. See isBuiltinBackedModule comment. Remove once the perf fix
--- lands on Scheduler discovery.
+-- ByteString representation helpers
 --
 -- A ByteString is represented at runtime as @VCon "BS" [ForeignPtr, length]@,
 -- matching Data.ByteString.Internal.Type.ByteString's real constructor.
+-- These helpers unpack that runtime representation for class-dispatch
+-- bridges and RTS/FFI boundaries. They are not registered as Data.ByteString
+-- API functions; pack/length/append/etc. source-load from bytestring.
 --------------------------------------------------------------------------------
 
 -- | Unpack a bytestring into its '(ForeignPtr Word8, Int)' payload.
@@ -4509,21 +4128,6 @@ bsValPayload v = case v of
 uniqueCounterRef :: IORef Int64
 uniqueCounterRef = unsafePerformIO (newIORef 0)
 
-newUniqueB :: IO Val
-newUniqueB = pure $ VIO $ do
-    n <- atomicModifyIORef' uniqueCounterRef $ \x ->
-        let x' = x + 1 in (x', x')
-    nT <- newWHNFThunk (VInt n)
-    pure (VCon "Unique" [nT])
-
-hashUniqueB :: IO Val
-hashUniqueB = pure $ VFun $ \uT -> do
-    uv <- force legacyHooks uT
-    case uv of
-        VCon "Unique" [nT] -> force legacyHooks nT
-        VInt n             -> pure (VInt n)
-        other              -> error ("hashUnique: not Unique: " <> showValForDebug other)
-
 -- | Extract the underlying BS ByteString from a 'VCon "BS"' payload.
 bsValToBS :: Val -> IO BS.ByteString
 bsValToBS v = do
@@ -4531,37 +4135,24 @@ bsValToBS v = do
     withForeignPtr fp $ \ptr ->
         BS.packCStringLen (castPtr ptr, len)
 
-withForeignPtrB :: IO Val
-withForeignPtrB = pure $ VFun $ \fpT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    fpv <- force legacyHooks fpT; fv <- force legacyHooks fT
-    fp <- foreignPtrValToForeignPtr fpv
-    markForeignPtrWord8 fp
-    withForeignPtr fp $ \ptr -> do
-        markWord8Ptr (castPtr ptr)
-        pT <- newWHNFThunk (VPrimObj (PrimPtr (castPtr ptr)))
-        rv <- apply legacyHooks fv pT
-        runIOVal legacyHooks rv
-
-touchForeignPtrB :: IO Val
-touchForeignPtrB = pure $ VFun $ \fpT -> pure $ VIO $ do
-    fpv <- force legacyHooks fpT
-    fp <- foreignPtrValToForeignPtr fpv
-    touchForeignPtr fp
-    pure VUnit
-
-newForeignPtr_B :: IO Val
-newForeignPtr_B = pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force legacyHooks pT
-    p <- ptrValToPtr pv
-    fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
-
-newForeignPtrB :: IO Val
-newForeignPtrB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \pT -> pure $ VIO $ do
-    pv <- force legacyHooks pT
-    p <- ptrValToPtr pv
-    fp <- newForeignPtr_ (castPtr p)
-    mkForeignPtrVal fp
+-- | Host content-equality for ByteString values, coercing [Char]/VStr
+-- on either side (OverloadedStrings second arg of @bs == "server"@).
+-- Used by class-method Eq dispatch for tag @BS@ so warp's
+-- responseKeyIndex works without a prior warm-up of Eq ByteString.
+eqByteStringHost :: Val -> Val -> IO Bool
+eqByteStringHost a b = do
+    ma <- asHostBS a
+    mb <- asHostBS b
+    pure (case (ma, mb) of
+            (Just x, Just y) -> x == y
+            _                -> False)
+  where
+    asHostBS v@(VCon "BS" _) = Just <$> bsValToBS v
+    asHostBS v = do
+        isChars <- isCharList v
+        if isChars
+            then Just . BC.pack <$> valToString v
+            else pure Nothing
 
 addForeignPtrFinalizerB :: IO Val
 addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pure $ VIO $ do
@@ -4577,25 +4168,35 @@ peekB :: IO Val
 peekB = pure $ VFun $ \a -> pure $ VIO $ do
     av <- force legacyHooks a
     p <- ptrValToPtr av
-    isWord8 <- isMarkedWord8Ptr p
-    if isWord8
-        then do
-            w <- peek (p :: Ptr Word8)
-            pure (VInt (fromIntegral w))
-        else do
-            flags <- peekByteOff (castPtr p :: Ptr Word32) 0
-            family <- peekByteOff (castPtr p :: Ptr Word32) 4
-            socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
-            protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
-            if looksLikeAddrInfo flags family socktype protocol
-                then peekAddrInfoVal p flags family socktype protocol
+    mTyped <- lookupTypedHostPtr p
+    case mTyped of
+        Just "Word32" -> peekTypedWord32Ptr p
+        _ -> do
+            isWord8 <- isMarkedWord8Ptr p
+            if isWord8
+                then do
+                    w <- peek (p :: Ptr Word8)
+                    pure (VInt (fromIntegral w))
                 else do
-                    ptrWord <- peek (castPtr p :: Ptr Word64)
-                    if ptrWord >= 4096
-                        then pure (VPrimObj (PrimPtr (wordPtrToPtr ptrWord)))
+                    flags <- peekByteOff (castPtr p :: Ptr Word32) 0
+                    family <- peekByteOff (castPtr p :: Ptr Word32) 4
+                    socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
+                    protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
+                    if looksLikeAddrInfo flags family socktype protocol
+                        then peekAddrInfoVal p flags family socktype protocol
                         else do
-                            w <- peek (p :: Ptr Word8)
-                            pure (VInt (fromIntegral w))
+                            ptrWord <- peek (castPtr p :: Ptr Word64)
+                            if ptrWord >= 4096
+                                then pure (VPrimObj (PrimPtr (wordPtrToPtr ptrWord)))
+                                else do
+                                    w <- peek (p :: Ptr Word8)
+                                    pure (VInt (fromIntegral w))
+
+peekTypedWord32Ptr :: Ptr Word8 -> IO Val
+peekTypedWord32Ptr p = do
+    w <- peek (castPtr p :: Ptr Word32)
+    t <- newWHNFThunk (VInt (fromIntegral w))
+    pure (VCon "W32#" [t])
 
 looksLikeAddrInfo :: Word32 -> Word32 -> Word32 -> Word32 -> Bool
 looksLikeAddrInfo flags family socktype protocol =
@@ -4606,13 +4207,19 @@ looksLikeAddrInfo flags family socktype protocol =
 
 peekAddrInfoVal :: Ptr Word8 -> Word32 -> Word32 -> Word32 -> Word32 -> IO Val
 peekAddrInfoVal p flags family socktype protocol = do
-    -- Linux struct addrinfo layout (64-bit):
-    -- offset 16: ai_addrlen (socklen_t, 4 bytes + padding)
-    -- offset 24: ai_addr (struct sockaddr*)
-    -- offset 32: ai_canonname (char*)
-    -- offset 40: ai_next (struct addrinfo*)
-    addrPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 24
-    canonPtrWord <- peekByteOff (castPtr p :: Ptr Word64) 32
+    -- struct addrinfo layout differs in pointer field order:
+    -- Linux:  ai_addr at 24, ai_canonname at 32, ai_next at 40.
+    -- Darwin: ai_canonname at 24, ai_addr at 32, ai_next at 40.
+    (addrPtrWord, canonPtrWord) <-
+        if isDarwin
+            then do
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 24
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
+            else do
+                addr <- peekByteOff (castPtr p :: Ptr Word64) 24
+                canon <- peekByteOff (castPtr p :: Ptr Word64) 32
+                pure (addr, canon)
     flagsT <- newWHNFThunk =<< addrInfoFlagsVal flags
     familyT <- newWHNFThunk =<< oneFieldCon "Family" family
     socktypeT <- newWHNFThunk =<< oneFieldCon "SocketType" socktype
@@ -4621,162 +4228,75 @@ peekAddrInfoVal p flags family socktype protocol = do
     canonT <- newWHNFThunk =<< maybeCStringVal canonPtrWord
     pure (VCon "AddrInfo" [flagsT, familyT, socktypeT, protocolT, addrT, canonT])
 
--- | Read a single @struct addrinfo@ at @p@ and return a 'Val'.  Used by
--- 'getAddrInfoB' when walking the linked list returned by
--- @getaddrinfo(3)@.
-peekFullAddrInfoVal :: Ptr Word8 -> IO Val
-peekFullAddrInfoVal p = do
-    flags    <- peekByteOff (castPtr p :: Ptr Word32) 0
-    family   <- peekByteOff (castPtr p :: Ptr Word32) 4
-    socktype <- peekByteOff (castPtr p :: Ptr Word32) 8
-    protocol <- peekByteOff (castPtr p :: Ptr Word32) 12
-    peekAddrInfoVal p flags family socktype protocol
+pokeAddrInfoHintsVal :: Ptr Word8 -> Val -> IO ()
+pokeAddrInfoHintsVal p val = do
+    (flags, family, socktype, protocol) <- addrInfoHintFields val
+    fillBytes p 0 48
+    pokeByteOff (castPtr p :: Ptr Word32) 0  flags
+    pokeByteOff (castPtr p :: Ptr Word32) 4  family
+    pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
+    pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
 
--- | @getAddrInfo :: Maybe AddrInfo -> Maybe HostName -> Maybe ServiceName
--- -> IO [AddrInfo]@.  Calls into the host's @getaddrinfo(3)@.  Parses
--- the @hints@ argument and passes through the OS-relevant fields
--- (addrFlags, addrFamily, addrSocketType, addrProtocol).  Walks the
--- linked list via @ai_next@ at offset 40 (Darwin/Linux x86_64+arm64
--- layout) and materialises each entry as a 'VCon "AddrInfo"' before
--- @freeaddrinfo@-ing the chain.
---
--- Without parsing hints, warp's @bindPortGenEx@ would receive a
--- mixed UDP+TCP result list, and the first @setSocketOption sock
--- NoDelay 1@ on the UDP entry would throw EINVAL.  The exception
--- is caught by @tryAddrs@ and the next addr (TCP) used, but the
--- per-attempt churn is wasted work.
-getAddrInfoB :: IO Val
-getAddrInfoB = pure $ VFun $ \hintsT -> pure $ VFun $ \hostT -> pure $ VFun $ \serviceT -> pure $ VIO $ do
-    hintsV <- force legacyHooks hintsT
-    hostV <- force legacyHooks hostT
-    serviceV <- force legacyHooks serviceT
-    withMaybeCString hostV $ \hostP ->
-        withMaybeCString serviceV $ \serviceP ->
-            withHintsPtr hintsV $ \hintsP ->
-                alloca $ \(resPP :: Ptr (Ptr Word8)) -> do
-                    rc <- c_getaddrinfo_host hostP serviceP hintsP resPP
-                    if rc /= 0
-                        then ioError (userError ("getaddrinfo: returned " ++ show rc))
-                        else do
-                            firstP <- peek resPP
-                            if firstP == nullPtr
-                                then pure (VCon "[]" [])
-                                else do
-                                    lst <- walkAddrInfo firstP
-                                    c_freeaddrinfo_host firstP
-                                    pure lst
+addrInfoHintFields :: Val -> IO (Word32, Word32, Word32, Word32)
+addrInfoHintFields val = case val of
+    VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
+        flagsV    <- force legacyHooks flagsT
+        familyV   <- force legacyHooks familyT
+        socktypeV <- force legacyHooks socktypeT
+        protocolV <- force legacyHooks protocolT
+        flags    <- addrInfoFlagBits flagsV
+        family   <- socketConInt familyV
+        socktype <- socketConInt socktypeV
+        protocol <- socketConInt protocolV
+        pure (flags, family, socktype, protocol)
+    _ -> pure (0, 0, 0, 0)
+
+addrInfoFlagBits :: Val -> IO Word32
+addrInfoFlagBits = go 0
   where
-    walkAddrInfo :: Ptr Word8 -> IO Val
-    walkAddrInfo p = do
-        v <- peekFullAddrInfoVal p
-        nextWord <- peekByteOff (castPtr p :: Ptr Word64) 40
-        let nextP = wordPtrToPtr nextWord
-        rest <- if nextP == nullPtr
-                    then pure (VCon "[]" [])
-                    else walkAddrInfo nextP
-        hd <- newWHNFThunk v
-        tl <- newWHNFThunk rest
-        pure (VCon ":" [hd, tl])
+    go !acc v = case v of
+        VCon "[]" []      -> pure acc
+        VCon ":" [hT, tT] -> do
+            hV <- force legacyHooks hT
+            tV <- force legacyHooks tT
+            go (acc .|. addrInfoFlagBit hV) tV
+        _ -> pure acc
 
-    withMaybeCString :: Val -> (Ptr Word8 -> IO a) -> IO a
-    withMaybeCString v action = case v of
-        VCon "Nothing" []   -> action nullPtr
-        VCon "Just" [innerT] -> do
-            inner <- force legacyHooks innerT
-            s <- valToString inner
-            withCString s (action . castPtr)
-        other -> error ("getAddrInfo: not Maybe String: " <> showValForDebug other)
+addrInfoFlagBit :: Val -> Word32
+addrInfoFlagBit (VCon "AI_ADDRCONFIG" _) = 1024
+addrInfoFlagBit (VCon "AI_ALL" _)        = 256
+addrInfoFlagBit (VCon "AI_CANONNAME" _)  = 2
+addrInfoFlagBit (VCon "AI_NUMERICHOST" _) = 4
+addrInfoFlagBit (VCon "AI_NUMERICSERV" _) = 4096
+addrInfoFlagBit (VCon "AI_PASSIVE" _)    = 1
+addrInfoFlagBit (VCon "AI_V4MAPPED" _)   = 2048
+addrInfoFlagBit _                        = 0
 
-    -- Build a host @struct addrinfo@ from a @Maybe AddrInfo@ Val and
-    -- pass its pointer to the action.  Without this, @c_getaddrinfo@
-    -- gets a NULL hints pointer and returns ALL socket types — warp
-    -- requests Stream-only, but we'd hand back UDP entries too, then
-    -- @setSocketOption sock TCP_NODELAY@ on the UDP socket fails with
-    -- EINVAL.  The first 4 fields (flags, family, socktype, protocol)
-    -- are 4-byte ints; the rest can be zero-filled because
-    -- getaddrinfo only reads the first four when given hints.
-    withHintsPtr :: Val -> (Ptr Word8 -> IO a) -> IO a
-    withHintsPtr v action = case v of
-        VCon "Nothing" [] -> action nullPtr
-        VCon "Just" [innerT] -> do
-            inner <- force legacyHooks innerT
-            (flags, family, socktype, protocol) <- extractHintsFields inner
-            allocaBytes 48 $ \p -> do
-                fillBytes p 0 48
-                pokeByteOff (castPtr p :: Ptr Word32) 0  flags
-                pokeByteOff (castPtr p :: Ptr Word32) 4  family
-                pokeByteOff (castPtr p :: Ptr Word32) 8  socktype
-                pokeByteOff (castPtr p :: Ptr Word32) 12 protocol
-                action p
-        _ -> action nullPtr
+socketConInt :: Val -> IO Word32
+socketConInt v = case v of
+    VCon _ [innerT] -> do
+        inner <- force legacyHooks innerT
+        case inner of
+            VInt n -> pure (fromIntegral n)
+            _      -> socketConByName v
+    VInt n -> pure (fromIntegral n)
+    _      -> socketConByName v
 
-    -- Extract (flags, family, socktype, protocol) from an AddrInfo
-    -- record value.  Pattern: VCon "AddrInfo" [flagsT, familyT,
-    -- socktypeT, protocolT, addressT, canonNameT].  The flags field is
-    -- a list of constructors like @[AI_PASSIVE]@ that we OR-fold; the
-    -- family / socktype / protocol fields are single-field VCons
-    -- wrapping @CInt@ codes.
-    extractHintsFields :: Val -> IO (Word32, Word32, Word32, Word32)
-    extractHintsFields val = case val of
-        VCon "AddrInfo" (flagsT : familyT : socktypeT : protocolT : _) -> do
-            flagsV    <- force legacyHooks flagsT
-            familyV   <- force legacyHooks familyT
-            socktypeV <- force legacyHooks socktypeT
-            protocolV <- force legacyHooks protocolT
-            flags    <- foldFlagBits flagsV
-            family   <- conIntField "addrFamily" familyV
-            socktype <- conIntField "addrSocketType" socktypeV
-            protocol <- conIntField "addrProtocol" protocolV
-            pure (flags, family, socktype, protocol)
-        _ -> pure (0, 0, 0, 0)
-
-    -- @[AI_FOO, AI_BAR]@ → bitwise-or of named flag values.
-    foldFlagBits :: Val -> IO Word32
-    foldFlagBits = go 0
-      where
-        go !acc v = case v of
-            VCon "[]" []        -> pure acc
-            VCon ":" [hT, tT]   -> do
-                hV <- force legacyHooks hT
-                tV <- force legacyHooks tT
-                let bit = case hV of
-                        VCon "AI_ADDRCONFIG" _ -> 1024
-                        VCon "AI_ALL" _        -> 256
-                        VCon "AI_CANONNAME" _  -> 2
-                        VCon "AI_NUMERICHOST" _ -> 4
-                        VCon "AI_NUMERICSERV" _ -> 4096
-                        VCon "AI_PASSIVE" _    -> 1
-                        VCon "AI_V4MAPPED" _   -> 2048
-                        _                       -> 0
-                go (acc .|. bit) tV
-            _ -> pure acc
-
-    conIntField :: String -> Val -> IO Word32
-    conIntField _name v = case v of
-        VCon _ [innerT] -> do
-            inner <- force legacyHooks innerT
-            case inner of
-                VInt n -> pure (fromIntegral n)
-                _      -> conByName v
-        VInt n          -> pure (fromIntegral n)
-        _               -> conByName v
-
-    -- Source-loaded constructors: map name → C value
-    conByName :: Val -> IO Word32
-    conByName (VCon n _) = case Map.lookup n socketConMap of
+socketConByName :: Val -> IO Word32
+socketConByName (VCon n _) =
+    case Map.lookup n socketConMap of
         Just v  -> pure v
         Nothing -> error ("socket con: unknown constructor " <> BC.unpack n)
-    conByName v = error ("socket con: not a constructor: " <> showValForDebug v)
+socketConByName v =
+    error ("socket con: not a constructor: " <> showValForDebug v)
 
-    socketConMap :: Map.Map ByteString Word32
-    socketConMap = Map.fromList
-        -- SocketType
-        [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
-        , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
-        -- Family (common ones)
-        , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
-        , ("AF_INET6", if isDarwin then 30 else 10)
-        ]
+socketConMap :: Map.Map ByteString Word32
+socketConMap = Map.fromList
+    [ ("NoSocketType", 0), ("Stream", 1), ("Datagram", 2)
+    , ("Raw", 3), ("RDM", 4), ("SeqPacket", 5)
+    , ("AF_UNSPEC", 0), ("AF_UNIX", 1), ("AF_INET", 2)
+    , ("AF_INET6", if isDarwin then 30 else 10)
+    ]
 
 addrInfoFlagsVal :: Word32 -> IO Val
 addrInfoFlagsVal flags =
@@ -4819,21 +4339,6 @@ peekSaFamily p = do
     if raw16 <= 255
         then pure (fromIntegral raw16)         -- Linux: plain sa_family
         else peekByteOff p 1 :: IO Word8       -- macOS: sa_family after sa_len
-
--- | Write @sa_family@ to a @struct sockaddr@.  On macOS writes
--- sa_len + sa_family (offsets 0 + 1); on Linux writes sa_family
--- as a Word16 at offset 0.
-pokeSaFamily :: Ptr Word8 -> Word8 -> IO ()
-pokeSaFamily p fam
-    | isDarwin  = do
-        pokeByteOff p 0 (0 :: Word8)   -- sa_len (set by bind/connect)
-        pokeByteOff p 1 fam
-    | otherwise =
-        pokeByteOff p 0 (fromIntegral fam :: Word16)
-
--- | AF_INET6 value for the current platform.
-afInet6 :: Word8
-afInet6 = if isDarwin then 30 else 10
 
 -- | Detect macOS at runtime via System.Info.
 isDarwin :: Bool
@@ -4911,237 +4416,6 @@ htons16 = byteSwap16
 htonl32 :: Word32 -> Word32
 htonl32 = byteSwap32
 
-socketBindB :: IO Val
-socketBindB = pure $ VFun $ \sockT -> pure $ VFun $ \addrT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    addrV <- force legacyHooks addrT
-    fd <- socketFdFromVal sockV
-    (sz, pokeAddr) <- sockAddrPoke addrV
-    allocaBytes sz $ \p -> do
-        fillBytes p 0 sz
-        pokeAddr (castPtr p)
-        rc <- c_bind_host (fromIntegral fd) (castPtr p) (fromIntegral sz)
-        if rc == -1
-            then do
-                Errno e <- getErrno
-                ioError (userError ("Network.Socket.bind: errno=" <> show e))
-            else pure VUnit
-
-socketCreateB :: IO Val
-socketCreateB = pure $ VFun $ \familyT -> pure $ VFun $ \stypeT -> pure $ VFun $ \protocolT -> pure $ VIO $ do
-    family <- familyField familyT
-    stype <- socketTypeField stypeT
-    protocol <- intField "socket.protocol" protocolT
-    fd <- c_socket_host (fromIntegral family) (fromIntegral stype) (fromIntegral protocol)
-    if fd == -1
-        then ioError (userError "Network.Socket.socket")
-        else do
-            fdT <- newWHNFThunk (VInt (fromIntegral fd))
-            ref <- newIORef fdT
-            refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-            pure (VCon "Socket" [refT, fdT])
-
-socketSetOptionB :: IO Val
-socketSetOptionB = pure $ VFun $ \sockT -> pure $ VFun $ \optT -> pure $ VFun $ \valueT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    (level, opt) <- socketOptionField optT
-    value <- intField "setSocketOption.value" valueT
-    allocaBytes (sizeOf (undefined :: CInt)) $ \p -> do
-        poke (castPtr p :: Ptr CInt) (fromIntegral value)
-        rc <- c_setsockopt_host (fromIntegral fd) (fromIntegral level) (fromIntegral opt) (castPtr p) (fromIntegral (sizeOf (undefined :: CInt)))
-        if rc == -1
-            then ioError (userError "Network.Socket.setSocketOption")
-            else pure VUnit
-
-socketListenB :: IO Val
-socketListenB = pure $ VFun $ \sockT -> pure $ VFun $ \backlogT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    backlog <- intField "listen.backlog" backlogT
-    rc <- c_listen_host (fromIntegral fd) (fromIntegral backlog)
-    System.IO.hFlush System.IO.stderr
-    if rc == -1
-        then ioError (userError "Network.Socket.listen")
-        else pure VUnit
-
-socketAcceptB :: IO Val
-socketAcceptB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    -- Set socket to blocking mode for accept.  The network library
-    -- creates sockets in non-blocking mode for GHC's IO manager,
-    -- but IHC's single-threaded accept loop needs a blocking accept.
-    c_setBlocking (fromIntegral fd)
-    allocaBytes 128 $ \addrP ->
-      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        fillBytes addrP 0 128
-        poke (castPtr lenP :: Ptr CInt) 128
-        -- safe FFI: blocks OS thread, releases GHC capability
-        newFd <- c_accept_host (fromIntegral fd)
-                               (castPtr addrP)
-                               (castPtr lenP)
-        when (newFd == -1) $ do
-            Errno e <- getErrno
-            ioError (userError ("Network.Socket.accept: errno=" <> show e))
-        fdValT <- newWHNFThunk (VInt (fromIntegral newFd))
-        ref <- newIORef fdValT
-        refT <- newWHNFThunk (VPrimObj (PrimIORef ref))
-        sockOutT <- newWHNFThunk (VCon "Socket" [refT, fdValT])
-        addrV <- peekSockAddrVal (castPtr addrP)
-        addrT <- newWHNFThunk addrV
-        pure (VCon "(,)" [sockOutT, addrT])
-
-socketGetNameB :: IO Val
-socketGetNameB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    allocaBytes 128 $ \addrP ->
-      allocaBytes (sizeOf (undefined :: CInt)) $ \lenP -> do
-        fillBytes addrP 0 128
-        poke (castPtr lenP :: Ptr CInt) 128
-        rc <- c_getsockname_host (fromIntegral fd) (castPtr addrP) (castPtr lenP)
-        if rc == -1
-            then ioError (userError "Network.Socket.getSocketName")
-            else peekSockAddrVal (castPtr addrP)
-
-socketFdFromVal :: Val -> IO Int64
-socketFdFromVal v = do
-    fdV <- socketCurrentFdVal v
-    case fdV of
-        VInt fd -> pure fd
-        other   -> error ("Socket fd is not an Int: " <> showValForDebug other)
-
-socketCurrentFdVal :: Val -> IO Val
-socketCurrentFdVal (VCon "Socket" [refT, _fdT]) = do
-    refV <- force legacyHooks refT
-    case refV of
-        VPrimObj (PrimIORef rf) -> readIORef rf >>= force legacyHooks
-        other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
-socketCurrentFdVal other = error ("bind: not a Socket: " <> showValForDebug other)
-
-socketFdB :: IO Val
-socketFdB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    pure (VInt fd)
-
-socketCloseB :: Bool -> (IO Val)
-socketCloseB throwOnError = pure $ VFun $ \sockT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    case sockV of
-        VCon "Socket" [refT, _fdT] -> do
-            refV <- force legacyHooks refT
-            case refV of
-                VPrimObj (PrimIORef rf) -> do
-                    sentinelT <- newWHNFThunk (VInt (-1))
-                    oldT <- atomicModifyIORef' rf $ \cur -> (sentinelT, cur)
-                    oldFdV <- force legacyHooks oldT
-                    case oldFdV of
-                        VInt oldFd
-                            | oldFd == -1 -> pure VUnit
-                            | otherwise -> do
-                                rc <- c_close_host (fromIntegral oldFd)
-                                if rc == -1 && throwOnError
-                                    then ioError (userError "Network.Socket.close'")
-                                    else pure VUnit
-                        other -> error ("Socket fd cell is not an Int: " <> showValForDebug other)
-                other -> error ("Socket ref is not an IORef: " <> showValForDebug other)
-        other -> error ("close: not a Socket: " <> showValForDebug other)
-
-withFdSocketB :: IO Val
-withFdSocketB = pure $ VFun $ \sockT -> pure $ VFun $ \fnT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    fd <- socketFdFromVal sockV
-    fnV <- force legacyHooks fnT
-    fdT <- newWHNFThunk (VInt fd)
-    r <- apply legacyHooks fnV fdT
-    runIOVal legacyHooks r
-
-socketSendBufB :: IO Val
-socketSendBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    ptrV <- force legacyHooks ptrT
-    lenV <- force legacyHooks lenT
-    fd <- socketFdFromVal sockV
-    ptr <- ptrValToPtr ptrV
-    case lenV of
-        VInt n | n >= 0 -> do
-            r <- c_send_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
-            if r < 0
-                then ioError (userError "Network.Socket.sendBuf")
-                else pure (VInt (fromIntegral r))
-        _ -> error ("sendBuf: not a non-negative Int: " <> showValForDebug lenV)
-
-socketRecvBufB :: IO Val
-socketRecvBufB = pure $ VFun $ \sockT -> pure $ VFun $ \ptrT -> pure $ VFun $ \lenT -> pure $ VIO $ do
-    sockV <- force legacyHooks sockT
-    ptrV <- force legacyHooks ptrT
-    lenV <- force legacyHooks lenT
-    fd <- socketFdFromVal sockV
-    ptr <- ptrValToPtr ptrV
-    case lenV of
-        VInt n | n > 0 -> do
-            r <- c_recv_host (fromIntegral fd) (castPtr ptr) (fromIntegral n) 0
-            if r < 0
-                then ioError (userError "Network.Socket.recvBuf")
-                else pure (VInt (fromIntegral r))
-        _ -> error ("recvBuf: not a positive Int: " <> showValForDebug lenV)
-
-mallocBytesB :: IO Val
-mallocBytesB = pure $ VFun $ \nT -> pure $ VIO $ do
-    n <- intField "mallocBytes.size" nT
-    p <- mallocBytes (max 1 (fromIntegral n))
-    pure (VPrimObj (PrimPtr (castPtr p)))
-
-freeB :: IO Val
-freeB = pure $ VFun $ \ptrT -> pure $ VIO $ do
-    ptrV <- force legacyHooks ptrT
-    p <- ptrValToPtr ptrV
-    free p
-    pure VUnit
-
--- | Generic field accessor for the host-built @VCon "AddrInfo" [flags,
--- family, socktype, protocol, addr, canonName]@ value.  Used to back
--- @addrFamily@ / @addrAddress@ / etc. when warp's source code accesses
--- record fields on a host-constructed AddrInfo.
-addrInfoFieldB :: String -> Int -> IO Val
-addrInfoFieldB label idx = pure $ VFun $ \aiT -> do
-    aiV <- force legacyHooks aiT
-    case aiV of
-        VCon "AddrInfo" fields
-            | idx < length fields -> force legacyHooks (fields !! idx)
-        other -> error (label <> ": not AddrInfo: " <> showValForDebug other)
-
-sockAddrPoke :: Val -> IO (Int, Ptr Word8 -> IO ())
-sockAddrPoke (VCon "SockAddrInet" [portT, addrT]) = do
-    port <- intField "SockAddrInet.port" portT
-    addr <- intField "SockAddrInet.addr" addrT
-    -- HostAddress is a Word32 already in network byte order (its host-LE
-    -- bytes ARE the network bytes).  PortNumber is host order, so htons
-    -- is required for sin_port; sin_addr is poked raw.
-    pure (16, \p -> do
-        pokeSaFamily p 2
-        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
-        pokeByteOff p 4 (fromIntegral addr :: Word32))
-sockAddrPoke (VCon "SockAddrInet6" [portT, flowT, addrT, scopeT]) = do
-    port <- intField "SockAddrInet6.port" portT
-    flow <- intField "SockAddrInet6.flow" flowT
-    scope <- intField "SockAddrInet6.scope" scopeT
-    (a0, a1, a2, a3) <- hostAddress6Fields addrT
-    -- HostAddress6 = (Word32, Word32, Word32, Word32) in HOST byte order,
-    -- so each chunk needs htonl on poke.  ScopeID is raw (host concept).
-    pure (28, \p -> do
-        pokeSaFamily p afInet6
-        pokeByteOff p 2 (htons16 (fromIntegral port) :: Word16)
-        pokeByteOff p 4 (htonl32 (fromIntegral flow) :: Word32)
-        pokeByteOff p 8 (htonl32 (fromIntegral a0) :: Word32)
-        pokeByteOff p 12 (htonl32 (fromIntegral a1) :: Word32)
-        pokeByteOff p 16 (htonl32 (fromIntegral a2) :: Word32)
-        pokeByteOff p 20 (htonl32 (fromIntegral a3) :: Word32)
-        pokeByteOff p 24 (fromIntegral scope :: Word32))
-sockAddrPoke other = error ("bind: unsupported SockAddr: " <> showValForDebug other)
-
 hostAddress6Fields :: Thunk -> IO (Int64, Int64, Int64, Int64)
 hostAddress6Fields addrT = do
     addrV <- force legacyHooks addrT
@@ -5161,93 +4435,21 @@ intField label t = do
         VInt n -> pure n
         other  -> error (label <> " is not an Int: " <> showValForDebug other)
 
-familyField :: Thunk -> IO Int64
-familyField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "Family" [nT] -> intField "socket.family" nT
-        -- Source-loaded Family constructors
-        VCon "AF_UNSPEC" [] -> pure 0
-        VCon "AF_UNIX"   [] -> pure 1
-        VCon "AF_INET"   [] -> pure 2
-        VCon "AF_INET6"  [] -> pure (if isDarwin then 30 else 10)
-        VInt n              -> pure n
-        other               -> error ("socket.family: not a Family: " <> showValForDebug other)
-
-socketTypeField :: Thunk -> IO Int64
-socketTypeField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "SocketType" [nT] -> intField "socket.type" nT
-        -- Source-loaded SocketType constructors from Network.Socket.Types
-        VCon "NoSocketType"  [] -> pure 0
-        VCon "Stream"        [] -> pure 1
-        VCon "Datagram"      [] -> pure 2
-        VCon "Raw"           [] -> pure 3
-        VCon "RDM"           [] -> pure 4
-        VCon "SeqPacket"     [] -> pure 5
-        VInt n                  -> pure n
-        other                   -> error ("socket.type: not a SocketType: " <> showValForDebug other)
-
-socketOptionField :: Thunk -> IO (Int64, Int64)
-socketOptionField t = do
-    v <- force legacyHooks t
-    case v of
-        VCon "SockOpt" [levelT, optT] -> do
-            level <- intField "socket.option.level" levelT
-            opt <- intField "socket.option.name" optT
-            pure (level, opt)
-        other -> error ("setSocketOption: not a SocketOption: " <> showValForDebug other)
-
-foreign import ccall unsafe "socket"
-    c_socket_host :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall unsafe "setsockopt"
-    c_setsockopt_host :: CInt -> CInt -> CInt -> Ptr Word8 -> CInt -> IO CInt
-
-foreign import ccall unsafe "listen"
-    c_listen_host :: CInt -> CInt -> IO CInt
-
-foreign import ccall safe "accept"
-    c_accept_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
-
--- | Set a socket fd to blocking mode (clear O_NONBLOCK).
-c_setBlocking :: CInt -> IO ()
-c_setBlocking fd = do
-    flags <- c_fcntl fd 3 0  -- F_GETFL = 3
-    let newFlags = flags .&. complement 0x800  -- O_NONBLOCK = 0x800 on Linux
-    _ <- c_fcntl fd 4 newFlags  -- F_SETFL = 4
-    pure ()
-
-foreign import ccall unsafe "fcntl" c_fcntl :: CInt -> CInt -> CInt -> IO CInt
-
-foreign import ccall unsafe "getsockname"
-    c_getsockname_host :: CInt -> Ptr Word8 -> Ptr CInt -> IO CInt
-
-foreign import ccall unsafe "bind"
-    c_bind_host :: CInt -> Ptr Word8 -> CInt -> IO CInt
-
-foreign import ccall unsafe "close"
-    c_close_host :: CInt -> IO CInt
-
-foreign import ccall unsafe "send"
-    c_send_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
-
-foreign import ccall unsafe "recv"
-    c_recv_host :: CInt -> Ptr Word8 -> CSize -> CInt -> IO CInt
-
-foreign import ccall unsafe "getaddrinfo"
-    c_getaddrinfo_host :: Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Ptr (Ptr Word8) -> IO CInt
-
-foreign import ccall unsafe "freeaddrinfo"
-    c_freeaddrinfo_host :: Ptr Word8 -> IO ()
-
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     av <- force legacyHooks a; bv <- force legacyHooks b
     p <- ptrValToPtr av
     case bv of
+        VCon "AddrInfo" _ -> do
+            pokeAddrInfoHintsVal p bv
+            pure VUnit
         VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+        -- Boxed Word8 (after W8# carrier for Num Word8 dispatch).
+        VCon "W8#" [t] -> do
+            inner <- force legacyHooks t
+            case inner of
+                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+                _      -> error ("poke: W8# inner not an Int: " <> showValForDebug inner)
         -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
         -- values reaching @poke@ via the Char8 path arrive as
         -- 'VCon "IS" [VInt n]' rather than the bare 'VInt' the
@@ -5294,18 +4496,100 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
     av <- force legacyHooks a; bv <- force legacyHooks b; cv <- force legacyHooks c
     p <- ptrValToPtr av
     case bv of
-        VInt off ->
-            case cv of
-                VInt n -> do
-                    pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
-                    pure VUnit
-                _ | off == 24 || off == 32 || off == 40 -> do
-                    ptr <- ptrValToPtr cv
-                    pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)
-                        (fromIntegral (ptrToIntPtr (castPtr ptr)) :: Word64)
-                    pure VUnit
-                _ -> error ("pokeByteOff: value not an Int: " <> showValForDebug cv)
+        VInt off -> do
+            handled <- pokeSockAddrByteOff p (fromIntegral off) cv
+            if handled
+                then pure VUnit
+                else case cv of
+                    VInt n -> do
+                        pokeByteOff (p :: Ptr Word8) (fromIntegral off) (fromIntegral n :: Word8)
+                        pure VUnit
+                    -- Num Word8 boxes as VCon "W8#" after W8# carrier work.
+                    VCon c [t]
+                        | c == BC.pack "W8#" || c == BC.pack "W#"
+                          || c == BC.pack "IS" -> do
+                            inner <- force legacyHooks t
+                            case inner of
+                                VInt n -> do
+                                    pokeByteOff (p :: Ptr Word8) (fromIntegral off)
+                                        (fromIntegral n :: Word8)
+                                    pure VUnit
+                                _ -> error ("pokeByteOff: W8#/IS inner not Int: "
+                                            <> showValForDebug inner)
+                    _ | off == 24 || off == 32 || off == 40 -> do
+                        ptr <- ptrValToPtr cv
+                        pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)
+                            (fromIntegral (ptrToIntPtr (castPtr ptr)) :: Word64)
+                        pure VUnit
+                    _ -> error ("pokeByteOff: value not an Int: " <> showValForDebug cv)
         _ -> error ("pokeByteOff: bad args: " <> showValForDebug av)
+
+pokeSockAddrByteOff :: Ptr Word8 -> Int -> Val -> IO Bool
+pokeSockAddrByteOff p off v = do
+    mLen <- lookupSockAddrBuffer p
+    case (mLen, off) of
+        (Just 16, 0) -> pokeWord16Raw p off v
+        (Just 16, 2) -> pokePortNumber p off v
+        (Just 16, 4) -> pokeWord32Raw p off v
+        (Just 28, 0) -> pokeWord16Raw p off v
+        (Just 28, 2) -> pokePortNumber p off v
+        (Just 28, 4) -> pokeWord32Raw p off v
+        (Just 28, 8) -> pokeIn6Addr p off v
+        (Just 28, 24) -> pokeWord32Raw p off v
+        _ -> pure False
+  where
+    pokeWord16Raw ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr Word16" val
+        pokeByteOff (castPtr ptr :: Ptr Word16) byteOff (fromIntegral n :: Word16)
+        pure True
+    pokePortNumber ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr PortNumber" val
+        pokeByteOff (castPtr ptr :: Ptr Word16) byteOff (htons16 (fromIntegral n) :: Word16)
+        pure True
+    pokeWord32Raw ptr byteOff val = do
+        n <- intVal "pokeByteOff sockaddr Word32" val
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (fromIntegral n :: Word32)
+        pure True
+    pokeIn6Addr ptr byteOff (VCon "In6Addr" [addrT]) = do
+        (a0, a1, a2, a3) <- hostAddress6Fields addrT
+        pokeNetwork32 ptr byteOff      a0
+        pokeNetwork32 ptr (byteOff + 4)  a1
+        pokeNetwork32 ptr (byteOff + 8)  a2
+        pokeNetwork32 ptr (byteOff + 12) a3
+        pure True
+    pokeIn6Addr ptr byteOff other = do
+        n <- intVal "pokeByteOff sockaddr In6Addr" other
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (fromIntegral n :: Word32)
+        pure True
+    pokeNetwork32 ptr byteOff n =
+        pokeByteOff (castPtr ptr :: Ptr Word32) byteOff (htonl32 (fromIntegral n) :: Word32)
+
+intVal :: String -> Val -> IO Int64
+intVal _ (VInt n) = pure n
+intVal _ (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = pure (fromInteger n)
+intVal label (VCon con [t])
+    | bareRuntimeCon con `elem` numericRuntimeNewtypes =
+        force legacyHooks t >>= intVal label
+intVal label other =
+    error (label <> ": expected numeric value, got " <> showValForDebug other)
+
+bareRuntimeCon :: ByteString -> ByteString
+bareRuntimeCon n = case BC.elemIndexEnd '.' n of
+    Just idx -> BC.drop (idx + 1) n
+    Nothing  -> n
+
+numericRuntimeNewtypes :: [ByteString]
+numericRuntimeNewtypes =
+    map BC.pack
+        [ "CSize", "CInt", "CLong", "CULong", "CUInt", "CChar", "CUChar"
+        , "CShort", "CUShort", "CLLong", "CULLong"
+        , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
+        , "Int8", "Int16", "Int32", "Int64"
+        , "Word", "Word8", "Word16", "Word32", "Word64"
+        , "PortNum", "Family"
+        ]
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: MutableByteArray# family (backed by IORef ByteString)
@@ -5372,6 +4656,54 @@ indexWord8ArrayB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
                     pure (VInt (fromIntegral (BS.index bs (fromIntegral idx))))
                 _ -> error "indexWord8Array#: bad index"
         _ -> error ("indexWord8Array#: not a MutableByteArray: " <> showValForDebug av)
+
+indexWordArrayHashB :: IO Val
+indexWordArrayHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    idx <- case bv of
+        VInt i | i >= 0 -> pure i
+        _ -> error ("indexWordArray#: not a non-negative Int#: " <> showValForDebug bv)
+    case av of
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (word64ToInt64 (bigNatWordLimbAt n idx)))
+        VPrimObj (PrimByteArray ref) -> do
+            bs <- readIORef ref
+            pure (VInt (word64ToInt64 (byteStringWord64At bs idx)))
+        _ -> error ("indexWordArray#: not a WordArray#: " <> showValForDebug av)
+
+indexIntArrayHashB :: IO Val
+indexIntArrayHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
+    av <- force legacyHooks a; bv <- force legacyHooks b
+    idx <- case bv of
+        VInt i | i >= 0 -> pure i
+        _ -> error ("indexIntArray#: not a non-negative Int#: " <> showValForDebug bv)
+    case av of
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (word64ToInt64 (bigNatWordLimbAt n idx)))
+        VPrimObj (PrimByteArray ref) -> do
+            bs <- readIORef ref
+            pure (VInt (word64ToInt64 (byteStringWord64At bs idx)))
+        _ -> error ("indexIntArray#: not a IntArray#: " <> showValForDebug av)
+
+bigNatWordLimbAt :: Natural -> Int64 -> Word64
+bigNatWordLimbAt n idx =
+    fromIntegral (n `shiftR` (64 * fromIntegral idx))
+
+byteStringWord64At :: ByteString -> Int64 -> Word64
+byteStringWord64At bs idx
+    | off < 0 || off + 8 > BS.length bs =
+        error "indexWordArray#: index out of bounds"
+    | otherwise =
+        foldl
+            (\acc (shiftBy, byte) ->
+                acc .|. (fromIntegral byte `shiftL` shiftBy))
+            0
+            (zip [0,8..56] (BS.unpack (BS.take 8 (BS.drop off bs))))
+  where
+    off = fromIntegral idx * 8
+
+word64ToInt64 :: Word64 -> Int64
+word64ToInt64 = fromIntegral
 
 unsafeFreezeByteArrayB :: IO Val
 unsafeFreezeByteArrayB = pure $ VFun $ \a -> pure $ VFun $ \stT -> pure $ VIO $ do
@@ -5509,6 +4841,8 @@ sizeofByteArrayB = pure $ VFun $ \a -> do
         VPrimObj (PrimByteArray ref) -> do
             bs <- readIORef ref
             pure (VInt (fromIntegral (BS.length bs)))
+        VPrimObj (PrimBigNat n) ->
+            pure (VInt (fromIntegral (8 * bigNatLimbCount n)))
         _ -> error ("sizeofByteArray#: not a ByteArray: " <> showValForDebug av)
 
 resizeMutableByteArrayB :: IO Val
@@ -5840,6 +5174,14 @@ eqWordB = makeWordCmpOp "eqWord#" (==)
 gtWordB = makeWordCmpOp "gtWord#" (>)
 geWordB = makeWordCmpOp "geWord#" (>=)
 
+ltWord8B, leWord8B, eqWord8B, gtWord8B, geWord8B, neWord8B :: IO Val
+ltWord8B = makeWord8CmpOp "ltWord8#" (<)
+leWord8B = makeWord8CmpOp "leWord8#" (<=)
+eqWord8B = makeWord8CmpOp "eqWord8#" (==)
+gtWord8B = makeWord8CmpOp "gtWord8#" (>)
+geWord8B = makeWord8CmpOp "geWord8#" (>=)
+neWord8B = makeWord8CmpOp "neWord8#" (/=)
+
 plusWordB, minusWordB, timesWordB, quotWordB, remWordB :: IO Val
 plusWordB  = makeWordArithOp "plusWord#"  (+)
 minusWordB = makeWordArithOp "minusWord#" (-)
@@ -5853,6 +5195,66 @@ popCntB = pure $ VFun $ \a -> do
     case av of
         VInt n -> pure (VInt (fromIntegral (popCount (fromIntegral n :: Word64))))
         _      -> error ("popCnt#: bad arg: " <> showValForDebug av)
+
+ctzHashB :: IO Val
+ctzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let w = fromIntegral n :: Word64
+                z | w == 0    = 64
+                  | otherwise = countTrailingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("ctz#: bad arg: " <> showValForDebug av)
+
+clzHashB :: IO Val
+clzHashB = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let w = fromIntegral n :: Word64
+                z | w == 0    = 64
+                  | otherwise = countLeadingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("clz#: bad arg: " <> showValForDebug av)
+
+-- | Sized @popCntN# :: Word# -> Word#@ — popcount of the low N bits.
+popCntWidthB :: Int -> IO Val
+popCntWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+            in pure (VInt (fromIntegral (popCount w)))
+        _ -> error ("popCnt" <> show width <> "#: bad arg: " <> showValForDebug av)
+
+-- | Sized @clzN# :: Word# -> Word#@ — leading zeros among the low N bits.
+-- For @w == 0@ the result is @N@ (matches GHC).
+clzWidthB :: Int -> IO Val
+clzWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+                z | w == 0    = width
+                  | otherwise = countLeadingZeros w - (64 - width)
+            in pure (VInt (fromIntegral z))
+        _ -> error ("clz" <> show width <> "#: bad arg: " <> showValForDebug av)
+
+-- | Sized @ctzN# :: Word# -> Word#@ — trailing zeros among the low N bits.
+ctzWidthB :: Int -> IO Val
+ctzWidthB width = pure $ VFun $ \a -> do
+    av <- force legacyHooks a
+    case av of
+        VInt n ->
+            let mask = if width >= 64 then maxBound else (1 `shiftL` width) - 1
+                w    = fromIntegral n .&. mask :: Word64
+                z | w == 0    = width
+                  | otherwise = countTrailingZeros w
+            in pure (VInt (fromIntegral z))
+        _ -> error ("ctz" <> show width <> "#: bad arg: " <> showValForDebug av)
 
 indexOfTheOnlyBitB :: IO Val
 indexOfTheOnlyBitB = pure $ VFun $ \a -> do
@@ -5986,10 +5388,9 @@ identityIntPrimop = pure $ VFun $ \a -> do
 -- source-loaded code where literal overflow routed an
 -- in-range value through 'LInteger' (e.g. @-2^63@ via
 -- NegativeLiterals on @-0x8000000000000000@).
--- 'floatToIntB' removed in Phase 5 — host shims for
--- floor / ceiling / round / truncate graduated out.  If the
--- source-loaded RealFrac chain regresses, restore from git
--- history.
+-- 'floatToIntB' and the floor / ceiling / round / truncate shims were
+-- removed in Phase 5.  Those methods now source-load through RealFrac /
+-- RealFloat and bottom out on the Double#/Integer primops below.
 
 
 asInt64 :: Val -> Maybe Int64
@@ -6129,32 +5530,6 @@ mulIntMayOfloB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VInt _, VInt _) -> pure (VInt 0)
         _ -> error "mulIntMayOflo#: bad args"
 
---------------------------------------------------------------------------------
--- Phase 2.8: misc primops
---------------------------------------------------------------------------------
-
-cstringLengthB :: IO Val
-cstringLengthB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            let go i = do
-                  w <- peek (plusPtr p i :: Ptr Word8)
-                  if w == 0 then pure (VInt (fromIntegral i)) else go (i + 1)
-            go (0 :: Int)
-        VStr s -> pure (VInt (fromIntegral (BC.length s)))
-        _ -> error ("cstringLength#: bad arg: " <> showValForDebug av)
-
-unpackCStringB :: IO Val
-unpackCStringB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    case av of
-        VPrimObj (PrimPtr p) -> do
-            s <- peekCAString (castPtr p)
-            stringToListValIO s
-        VStr s -> stringToListValIO (BC.unpack s)
-        _ -> error ("unpackCString#: bad arg: " <> showValForDebug av)
-
 -- Foreign.C.String helpers.  The real @Foreign.C.String.withCString@ in
 -- base reaches for @getForeignEncoding@, which sits on RTS locale
 -- plumbing we don't model.  We register a direct host shortcut that
@@ -6212,19 +5587,6 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
     BS.useAsCString bs $ \src -> copyBytes cp (castPtr src) len
     poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
     pure (VPrimObj (PrimPtr cp))
-
-withB :: IO Val
-withB = pure $ VFun $ \valT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    valV <- force legacyHooks valT
-    fV <- force legacyHooks fT
-    p <- mallocBytes 8
-    fillBytes p 0 8
-    case valV of
-        VInt n -> poke (castPtr p :: Ptr CInt) (fromIntegral n)
-        _      -> pure ()
-    ptrT <- newWHNFThunk (VPrimObj (PrimPtr p))
-    r <- apply legacyHooks fV ptrT
-    runIOVal legacyHooks r
 
 sizeOfB :: IO Val
 sizeOfB = pure $ VFun $ \a -> do
@@ -6306,37 +5668,6 @@ powerFloatHashB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
         (VFloat x, VFloat y) -> pure (VFloat (x ** y))
         _ -> error ("powerFloat#: bad args: " <> showValForDebug av)
 
---------------------------------------------------------------------------------
--- Simple file IO: readFile, writeFile, appendFile
---------------------------------------------------------------------------------
-
--- | @readFile path@ — read the entire file as a String ([Char]).
-readFileB :: IO Val
-readFileB = pure $ VFun $ \a -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    contents <- readFile path
-    stringToListValIO contents
-
--- | @writeFile path contents@ — write a String to the file (truncating).
-writeFileB :: IO Val
-writeFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    cv   <- force legacyHooks b
-    s    <- valToString cv
-    writeFile path s
-    pure VUnit
-
--- | @appendFile path contents@ — append a String to the file.
-appendFileB :: IO Val
-appendFileB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    pv   <- force legacyHooks a
-    path <- valToString pv
-    cv   <- force legacyHooks b
-    s    <- valToString cv
-    appendFile path s
-    pure VUnit
 
 --------------------------------------------------------------------------------
 -- User-defined constructors
@@ -6448,6 +5779,27 @@ tryIntegerCollapse "IN" [t] = do
                     then pure (VInt (fromInteger (negate (toInteger n))))
                     else pure (VInteger (negate (toInteger n)))
         _ -> pure (VCon "IN" [t])
+-- Natural = NS !Word# | NB !BigNat# — collapse like Integer so
+-- @(5 :: Natural)@ and @NS w@ share the same VInt/VInteger runtime
+-- as Word/Integer paths; matchPat bridges re-expose NS/NB.
+tryIntegerCollapse "NS" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VInt _ -> pure v
+        VInteger n
+            | n >= 0
+            , n <= toInteger (maxBound :: Word64)
+            -> pure (VInt (fromIntegral n))
+        VCon "W#" [inner] -> force legacyHooks inner
+        _ -> pure (VCon "NS" [t])
+tryIntegerCollapse "NB" [t] = do
+    v <- force legacyHooks t
+    case v of
+        VPrimObj (PrimBigNat n) ->
+            if n <= fromIntegral (maxBound :: Word64)
+                then pure (VInt (fromIntegral n))
+                else pure (VInteger (fromIntegral n))
+        _ -> pure (VCon "NB" [t])
 tryIntegerCollapse name thunks = pure (VCon name thunks)
 
 -- | Build an environment binding each record-field name to an accessor
@@ -6576,8 +5928,38 @@ buildFieldEnv reg = do
         | any ((BC.pack "StaticString" ==) . fst) clauses
         , fieldName == BC.pack "getString"
         = Just (pure (charListAppender listVal))
+        -- CI ByteString / HeaderName (http-types, warp).  Pre-fix
+        -- foldedCase returned a host VStr; original returned the raw
+        -- [Char] list.  BS.== / BS.length then either hung (Eq on VStr
+        -- vs real BS via class dispatch) or missed, so
+        -- indexResponseHeader [("Server",…)] never matched / hung.
+        -- Pack real @BS ForeignPtr Int@ payloads (ASCII foldCase).
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "original"
+        = Just (stringToByteStringVal listVal id)
+        | any ((BC.pack "CI" ==) . fst) clauses
+        , fieldName == BC.pack "foldedCase"
+        = Just (stringToByteStringVal listVal (map toLower))
         | otherwise = Nothing
 
+    -- Pack a [Char]/VStr as a source-shaped ByteString, optionally
+    -- mapping the characters first (ASCII case fold for foldedCase).
+    stringToByteStringVal listVal mapChars = do
+        s <- valToString listVal
+        let bs = BC.pack (mapChars s)
+            len = BS.length bs
+        fp <- mallocForeignPtrBytes (max 1 len)
+        withForeignPtr fp $ \dst ->
+            when (len > 0) $
+                BS.useAsCStringLen bs $ \(src, n) ->
+                    copyBytes (castPtr dst) (castPtr src) n
+        markWord8PtrRange (castPtr (unsafeForeignPtrToPtr fp)) (max 1 len)
+        markTypedHostPtr (castPtr (unsafeForeignPtrToPtr fp) :: Ptr Word8)
+            (BC.pack "Word8")
+        fpV <- mkForeignPtrVal fp
+        fpT <- newWHNFThunk fpV
+        lenT <- newWHNFThunk (VInt (fromIntegral len))
+        pure (VCon "BS" [fpT, lenT])
     -- @(listVal ++)@: a 'VFun' that, given another list, returns
     -- @listVal ++ that@.  Built by walking 'listVal' once and chaining
     -- cons cells.  Mirrors the runtime shape of 'StaticString's
@@ -6609,16 +5991,6 @@ buildFieldEnv reg = do
 --------------------------------------------------------------------------------
 -- Phase 2.10a: concurrency - thread primitives
 --------------------------------------------------------------------------------
-
--- | @forkIO action@ - fork a new thread running the IO action.
-forkIOB :: IO Val
-forkIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tid <- forkIO $ do
-        _ <- runIOVal legacyHooks av
-        pure ()
-    registerSpawnedThread tid
-    pure (VPrimObj (PrimThreadId tid))
 
 -- | @fork# :: IO () -> State# RealWorld -> (# State# RealWorld, ThreadId# #)@
 -- — GHC primop used by source-loaded @forkIO@ and warp's @defaultFork@
@@ -6657,40 +6029,37 @@ forkHashB = pure $ VFun $ \aT -> pure $ VFun $ \_sT -> do
     runActionVal v = case v of
         VFun f -> do
             stok <- newWHNFThunk (VPrimObj PrimRealWorld)
-            f stok
+            r <- f stok
+            -- State# transformer may return VIO, unboxed (# s, a #), or
+            -- already a WHNF result. Always drive through runIOVal so
+            -- nested IO (makeGracefulRecv, http1, the app) actually runs
+            -- when the body is a deferred VIO rather than an already-
+            -- forced unboxed pair.
+            runIOVal legacyHooks r
         VFunIP _ f -> do
             stok <- newWHNFThunk (VPrimObj PrimRealWorld)
-            f Map.empty stok
+            r <- f Map.empty stok
+            runIOVal legacyHooks r
         _ -> runIOVal legacyHooks v
 
--- | @killThread tid@ - asynchronously raise 'ThreadKilled' in the thread.
-killThreadB :: IO Val
-killThreadB = pure $ VFun $ \tidT -> pure $ VIO $ do
+-- | @killThread# :: ThreadId# -> a -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. Source-loaded @throwTo (ThreadId tid) ex@ bottoms out
+-- here after wrapping @ex@ with @toException@.
+killThreadHashB :: IO Val
+killThreadHashB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VFun $ \_stT -> do
     tidV <- force legacyHooks tidT
-    case tidV of
-        VPrimObj (PrimThreadId tid) -> do
-            killThread tid
-            pure VUnit
-        _ -> error ("killThread: not a ThreadId: " <> showValForDebug tidV)
-
--- | @myThreadId@ - return the current thread's id.
-myThreadIdB :: IO Val
-myThreadIdB = pure $ VIO $ do
-    tid <- myThreadId
-    pure (VPrimObj (PrimThreadId tid))
-
-fromThreadIdB :: IO Val
-fromThreadIdB = pure $ VFun $ \tidT -> do
-    tidV <- force legacyHooks tidT
-    case tidV of
-        VPrimObj (PrimThreadId tid) ->
-            pure (VInt (fromIntegral (threadIdKey tid)))
-        other -> error ("fromThreadId: not a ThreadId: " <> showValForDebug other)
+    excV <- force legacyHooks excT
+    tid <- extractThreadIdHash tidV
+    exc <- valToIhcException excV
+    throwTo tid exc
+    pure (VPrimObj PrimRealWorld)
   where
-    threadIdKey tid =
-        let s = show tid
-            step h c = h * 16777619 + fromIntegral (ord c)
-        in foldl step (2166136261 :: Word64) s
+    extractThreadIdHash (VPrimObj (PrimThreadId tid)) = pure tid
+    extractThreadIdHash (VCon "ThreadId" [innerT]) = do
+        inner <- force legacyHooks innerT
+        extractThreadIdHash inner
+    extractThreadIdHash other =
+        error ("killThread#: not a ThreadId#: " <> showValForDebug other)
 
 myThreadIdHashB :: IO Val
 myThreadIdHashB = pure $ VFun $ \stT -> do
@@ -6698,21 +6067,24 @@ myThreadIdHashB = pure $ VFun $ \stT -> do
     tidT <- newWHNFThunk (VPrimObj (PrimThreadId tid))
     pure (VCon "(#,#)" [stT, tidT])
 
-labelThreadB :: IO Val
-labelThreadB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
-    pure $ VIO $ pure VUnit
+-- | @labelThread# :: ThreadId# -> ByteArray# -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. GHC uses it for eventlog/debug labels; IHC does not
+-- expose an eventlog, so preserve only the state-threading shape.
+labelThreadHashB :: IO Val
+labelThreadHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT -> pure $ VFun $ \sT ->
+    force legacyHooks sT
 
-labelThreadByteArrayHashB :: IO Val
-labelThreadByteArrayHashB = pure $ VFun $ \_tidT -> pure $ VFun $ \_labelT ->
-    pure $ VIO $ pure VUnit
-
--- | @threadDelay microseconds@ - sleep.
-threadDelayB :: IO Val
-threadDelayB = pure $ VFun $ \nT -> pure $ VIO $ do
+-- | @delay# :: Int# -> State# RealWorld -> State# RealWorld@.
+-- GHC.Prim primop. Source-loaded @threadDelay@ wraps this in IO and adds
+-- the unit result; the primop itself only threads the state token.
+delayHashB :: IO Val
+delayHashB = pure $ VFun $ \nT -> pure $ VFun $ \sT -> do
     nv <- force legacyHooks nT
     case nv of
-        VInt n -> do { threadDelay (fromIntegral n); pure VUnit }
-        _ -> error ("threadDelay: not an Int: " <> showValForDebug nv)
+        VInt n -> do
+            threadDelay (fromIntegral n)
+            force legacyHooks sT
+        _ -> error ("delay#: not an Int#: " <> showValForDebug nv)
 
 closeFdWithB :: IO Val
 closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do
@@ -6738,23 +6110,158 @@ threadWaitWriteB = pure $ VFun $ \fdT -> pure $ VIO $ do
     threadWaitWrite (fromIntegral n)
     pure VUnit
 
--- | Unwrap a @Fd@-like argument to its underlying @Int@.  Accepts the
--- common shapes the source @System.Posix.Types.Fd@ newtype can take
--- after interpretation: bare 'VInt', or @VCon "Fd" [VInt n]@.
-fdArgToInt :: Thunk -> String -> IO Int64
-fdArgToInt t primName = do
+-- | @threadWaitReadSTM :: Fd -> IO (STM (), IO ())@.
+threadWaitReadSTMB :: IO Val
+threadWaitReadSTMB = pure $ VFun $ \fdT -> pure $ VIO $
+    threadWaitSTMimpl fdT
+        (\i -> threadWaitRead (fromIntegral i))
+        "threadWaitReadSTM"
+
+threadWaitWriteSTMB :: IO Val
+threadWaitWriteSTMB = pure $ VFun $ \fdT -> pure $ VIO $
+    threadWaitSTMimpl fdT
+        (\i -> threadWaitWrite (fromIntegral i))
+        "threadWaitWriteSTM"
+
+
+-- | Build @(STM (), IO ())@ for a host-backed fd wait.
+threadWaitSTMimpl
+    :: Thunk
+    -> (Int -> IO ())
+    -> String
+    -> IO Val
+threadWaitSTMimpl fdT waitIO primName = do
+    n <- fdArgToInt fdT primName
+    threadWaitSTMimplInt n waitIO
+
+threadWaitSTMimplInt :: Int64 -> (Int -> IO ()) -> IO Val
+threadWaitSTMimplInt n waitIO = do
+    ready <- newTVarIO False
+    _ <- forkIO $ do
+        waitIO (fromIntegral n)
+        atomically (writeTVar ready True)
+    let waitStm = VFun $ \_sT -> pure $ VIO $ do
+            go
+            unitT <- newWHNFThunk VUnit
+            sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+            pure (VCon "(#,#)" [sT', unitT])
+          where
+            go = do
+                ok <- readTVarIO ready
+                if ok then pure ()
+                else threadDelay 1000 >> go
+    let cancel = VIO (pure VUnit)
+    waitStmT <- newWHNFThunk waitStm
+    stmT <- newWHNFThunk (VCon "STM" [waitStmT])
+    cancelT <- newWHNFThunk cancel
+    pure (VCon "(,)" [stmT, cancelT])
+
+-- | @threadWait :: Event -> Fd -> IO ()@ (GHC.Internal.Event.Thread).
+-- The source body dispatches to the RTS event manager (registerFd + an MVar
+-- handshake), which IHC does not run.  Delegate straight to the host RTS IO
+-- manager, selecting read vs. write from the 'Event' bitmask
+-- (@evtRead = Event 1@, @evtWrite = Event 2@; @Event@ is a newtype so the
+-- runtime value is either the bare Int or @Con [Int]@).
+threadWaitB :: IO Val
+threadWaitB = pure $ VFun $ \evtT -> pure $ VFun $ \fdT -> pure $ VIO $ do
+    fd  <- fdArgToInt fdT "threadWait"
+    evt <- eventBitsOf evtT
+    if evt .&. 2 /= 0
+        then threadWaitWrite (fromIntegral fd)
+        else threadWaitRead  (fromIntegral fd)
+    pure VUnit
+
+-- | Extract the 'GHC.Internal.Event.Internal.Types.Event' bitmask
+-- (@evtRead = Event 1@, @evtWrite = Event 2@) from a runtime value.  'Event'
+-- is a newtype, so the value is either the bare Int or @Con [Int]@.  Defaults
+-- to read (1) for any unexpected shape.
+eventBitsOf :: Thunk -> IO Int64
+eventBitsOf t = do
     v <- force legacyHooks t
     case v of
         VInt n          -> pure n
-        VCon _ [inner] -> do
-            iv <- force legacyHooks inner
+        VCon _ [innerT]  -> do
+            iv <- force legacyHooks innerT
             case iv of
                 VInt n -> pure n
-                _ -> error (primName <> ": Fd payload not VInt: " <> showValForDebug iv)
-        _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
+                _      -> pure 1
+        _ -> pure 1
 
+-- | @registerFd :: EventManager -> IOCallback -> Fd -> Event -> Lifetime -> IO FdKey@
+-- (GHC.Internal.Event.Manager).  IHC does not run the RTS event manager, so we
+-- emulate a OneShot registration with a host thread: wait on the fd through the
+-- host RTS IO manager (read or write per the 'Event' bitmask), then fire the
+-- interpreted callback as @cb fdKey evt@.  This is the single choke point both
+-- the IO wait path ('threadWait') and the STM wait path ('threadWaitSTM', used
+-- by network/warp for cancellable recv) reduce to after 'getSystemEventManager_'.
+-- The 'EventManager' and 'FdKey' are opaque: the callback ignores the FdKey and
+-- our 'unregisterFd_' ignores both.
+registerFdB :: IO Val
+registerFdB = pure $ VFun $ \_mgrT -> pure $ VFun $ \cbT -> pure $ VFun $ \fdT ->
+    pure $ VFun $ \evtT -> pure $ VFun $ \_lifeT -> pure $ VIO $ do
+        fd  <- fdArgToInt fdT "registerFd"
+        evt <- eventBitsOf evtT
+        cbV <- force legacyHooks cbT
+        fdKeyT <- newWHNFThunk (VCon "FdKey" [])
+        _ <- forkIO $ do
+            if evt .&. 2 /= 0
+                then threadWaitWrite (fromIntegral fd)
+                else threadWaitRead  (fromIntegral fd)
+            -- cb fdKey evt :: IO ()
+            r1 <- apply legacyHooks cbV fdKeyT
+            r2 <- apply legacyHooks r1 evtT
+            _  <- runIOVal legacyHooks r2
+            pure ()
+        force legacyHooks fdKeyT
+
+-- | @unregisterFd_ :: EventManager -> FdKey -> IO Bool@.  The OneShot waiter
+-- 'registerFdB' spawned self-completes, so there is nothing to deregister;
+-- report success.  (On the cancel path the waiter may linger until the fd
+-- becomes ready — harmless for the common warp recv path.)
+unregisterFd_B :: IO Val
+unregisterFd_B = pure $ VFun $ \_mgrT -> pure $ VFun $ \_regT -> pure $ VIO $
+    pure (boolVal True)
+
+-- | Unwrap a @Fd@/@CInt@-like argument to its underlying @Int@.
+-- Source newtypes nest: @Fd (CInt n)@, @CInt (I32# n)@, bare 'VInt',
+-- or a single-field 'VCon'.  Walk constructors until we hit 'VInt'.
+-- (Bug: @threadWaitReadSTM . Fd@ with nested CInt used to fail as
+-- "Fd payload not VInt: <function>" when the newtype ctor was still a
+-- VFun shell, hanging warp's makeGracefulRecv forever.)
+fdArgToInt :: Thunk -> String -> IO Int64
+fdArgToInt t primName = force legacyHooks t >>= go 0
+  where
+    go :: Int -> Val -> IO Int64
+    go depth v
+        | depth > 8 = error (primName <> ": Fd nest too deep: " <> showValForDebug v)
+        | otherwise = case v of
+            VInt n -> pure n
+            VInteger n -> pure (fromIntegral n)
+            -- Char#/Int# leakage (fd 36 → '$').
+            VChar c -> pure (fromIntegral (fromEnum c))
+            -- Newtype / data wrappers: peel one field.
+            VCon _ [inner] -> force legacyHooks inner >>= go (depth + 1)
+            -- Nullary / multi-field: not an Fd.
+            VCon n _ ->
+                error (primName <> ": unexpected Fd ctor " <> BC.unpack n
+                       <> ": " <> showValForDebug v)
+            -- Newtype constructor still a function (unapplied shell) —
+            -- should not reach here if applied; report clearly.
+            VFun{} ->
+                error (primName <> ": Fd still a function (unapplied newtype?): "
+                       <> showValForDebug v)
+            _ -> error (primName <> ": not Fd-like: " <> showValForDebug v)
+
+-- | @getSystemEventManager :: IO (Maybe EventManager)@.  Returns a stub
+-- manager so the threaded socket-wait path (threadWait / threadWaitSTM via
+-- @Just mgr <- getSystemEventManager@) proceeds; the manager is opaque and only
+-- ever passed back to our host-backed 'registerFdB' / 'unregisterFd_B', which
+-- ignore it.  (Was @Nothing@; that dead-ended network/warp's recv on
+-- "Just mgr <- getSystemEventManager".)
 getSystemEventManagerB :: IO Val
-getSystemEventManagerB = pure $ VIO $ pure (VCon "Nothing" [])
+getSystemEventManagerB = pure $ VIO $ do
+    mgrT <- newWHNFThunk (VCon "IhcEventManager" [])
+    pure (VCon "Just" [mgrT])
 
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
@@ -6796,243 +6303,6 @@ updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \
             VInt _ -> pure VUnit
             _ -> error ("updateTimeout: timeout is not an Int: " <> showValForDebug usecV)
 
-timeManagerWithHandleB :: IO Val
-timeManagerWithHandleB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_timeoutActionT -> pure $ VFun $ \actionT ->
-    pure $ VIO $ do
-        actionV <- force legacyHooks actionT
-        h <- emptyTimeManagerHandle
-        hT <- newWHNFThunk h
-        r <- apply legacyHooks actionV hT
-        runIOVal legacyHooks r
-  where
-    emptyTimeManagerHandle = do
-        timeoutT <- newWHNFThunk (VInt 0)
-        actionT <- newWHNFThunk (VIO (pure VUnit))
-        keyRefT <- newWHNFThunk VUnit
-        stateT <- newWHNFThunk VUnit
-        pure (VCon "Handle" [timeoutT, actionT, keyRefT, stateT])
-
--- | @System.TimeManager.initialize :: Int -> IO Manager@.  Upstream's
--- implementation since time-manager 0.3.0 is just @pure . Manager . max 0@,
--- since timeouts are implemented via the GHC RTS timer manager.  IHC does
--- not run the RTS timer manager either, so we mirror the same behaviour:
--- box the (clamped) timeout value into a @Manager@ constructor and hand it
--- back. 'timeManagerWithHandleB' / 'timeManagerStopManagerB' do not look at
--- the payload, so any well-formed @VCon "Manager" [VInt n]@ is fine.
-timeManagerInitializeB :: IO Val
-timeManagerInitializeB = pure $ VFun $ \timeoutT -> pure $ VIO $ do
-    timeoutV <- force legacyHooks timeoutT
-    case timeoutV of
-        VInt n -> do
-            nT <- newWHNFThunk (VInt (max 0 n))
-            pure (VCon "Manager" [nT])
-        other -> error ("System.TimeManager.initialize: not an Int: " <> showValForDebug other)
-
--- | @System.TimeManager.stopManager :: Manager -> IO ()@.  Upstream marked
--- this as deprecated in 0.3.0 and now defines it as @\\_ -> pure ()@; we do
--- the same.
-timeManagerStopManagerB :: IO Val
-timeManagerStopManagerB = pure $ VFun $ \_mgrT -> pure $ VIO $ pure VUnit
-
-setFdOptionB :: IO Val
-setFdOptionB = pure $ VFun $ \fdT -> pure $ VFun $ \_optT -> pure $ VFun $ \enabledT -> pure $ VIO $ do
-    fdV <- force legacyHooks fdT
-    enabledV <- force legacyHooks enabledT
-    fd <- unwrapFd fdV
-    PosixIO.setFdOption (fromIntegral fd :: Fd) PosixIO.CloseOnExec (isTruthy enabledV)
-    pure VUnit
-  where
-    -- Accept either a raw VInt (host-backed sockets pass the raw fd) or
-    -- the @Fd@ newtype wrapper @VCon "Fd" [VInt _]@ (source code that
-    -- imports @System.Posix.Types (Fd)@ and constructs values through
-    -- the constructor).
-    unwrapFd (VInt n) = pure n
-    unwrapFd (VCon "Fd" [innerT]) = do
-        innerV <- force legacyHooks innerT
-        unwrapFd innerV
-    unwrapFd other = error ("setFdOption: not an fd: " <> showValForDebug other)
-
--- | @getNumCapabilities@ - return 1 (simplified).
-getNumCapabilitiesB :: IO Val
-getNumCapabilitiesB = pure $ VIO $ pure (VInt 1)
-
---------------------------------------------------------------------------------
--- Phase 2.10a: MVar primitives
---------------------------------------------------------------------------------
-
-requireMVar :: String -> Val -> IO (MVar Val)
-requireMVar fn v = case v of
-    VPrimObj (PrimMVar mv) -> pure mv
-    _ -> error (fn <> ": not an MVar: " <> showValForDebug v)
-
-newMVarB :: IO Val
-newMVarB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    mv <- newMVar av
-    pure (VPrimObj (PrimMVar mv))
-
-newEmptyMVarB :: IO Val
-newEmptyMVarB = pure $ VIO $ do
-    mv <- newEmptyMVar
-    pure (VPrimObj (PrimMVar mv))
-
-takeMVarB :: IO Val
-takeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "takeMVar" mvv
-    takeMVar mv
-
-putMVarB :: IO Val
-putMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "putMVar" mvv
-    av  <- force legacyHooks aT
-    putMVar mv av
-    pure VUnit
-
-readMVarB :: IO Val
-readMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "readMVar" mvv
-    readMVar mv
-
-modifyMVar_B :: IO Val
-modifyMVar_B = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "modifyMVar_" mvv
-    fv  <- force legacyHooks fT
-    modifyMVar_ mv $ \cur -> do
-        curT <- newWHNFThunk cur
-        rv   <- apply legacyHooks fv curT
-        runIOVal legacyHooks rv
-    pure VUnit
-
-modifyMVarB :: IO Val
-modifyMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "modifyMVar" mvv
-    fv  <- force legacyHooks fT
-    modifyMVar mv $ \cur -> do
-        curT  <- newWHNFThunk cur
-        rv    <- apply legacyHooks fv curT
-        pairV <- runIOVal legacyHooks rv
-        case pairV of
-            VCon _ [newT, extraT] -> do
-                newV   <- force legacyHooks newT
-                extraV <- force legacyHooks extraT
-                pure (newV, extraV)
-            _ -> error ("modifyMVar: f did not return a pair: "
-                        <> showValForDebug pairV)
-
-tryTakeMVarB :: IO Val
-tryTakeMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "tryTakeMVar" mvv
-    r   <- tryTakeMVar mv
-    case r of
-        Nothing -> pure (VCon "Nothing" [])
-        Just v  -> do { t <- newWHNFThunk v; pure (VCon "Just" [t]) }
-
-tryPutMVarB :: IO Val
-tryPutMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "tryPutMVar" mvv
-    av  <- force legacyHooks aT
-    ok  <- tryPutMVar mv av
-    pure (boolVal ok)
-
-isEmptyMVarB :: IO Val
-isEmptyMVarB = pure $ VFun $ \mvT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "isEmptyMVar" mvv
-    b   <- isEmptyMVar mv
-    pure (boolVal b)
-
-withMVarB :: IO Val
-withMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "withMVar" mvv
-    fv  <- force legacyHooks fT
-    withMVar mv $ \cur -> do
-        curT <- newWHNFThunk cur
-        rv   <- apply legacyHooks fv curT
-        runIOVal legacyHooks rv
-
-swapMVarB :: IO Val
-swapMVarB = pure $ VFun $ \mvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    mvv <- force legacyHooks mvT
-    mv  <- requireMVar "swapMVar" mvv
-    av  <- force legacyHooks aT
-    swapMVar mv av
-
---------------------------------------------------------------------------------
--- Phase 2.10a: STM primitives
---------------------------------------------------------------------------------
-
-atomicallyB :: IO Val
-atomicallyB = pure $ VFun $ \stmT -> pure $ VIO $ do
-    stmV <- force legacyHooks stmT
-    runIOVal legacyHooks stmV
-
-retryB :: IO Val
-retryB = pure $ VIO $ atomically retry
-
-orElseB :: IO Val
-orElseB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    bv <- force legacyHooks bT
-    -- Approximate: try av first, fall back to bv on exception
-    CE.catch (runIOVal legacyHooks av) (\(_ :: CE.SomeException) -> runIOVal legacyHooks bv)
-
-checkB :: IO Val
-checkB = pure $ VFun $ \bT -> pure $ VIO $ do
-    bv <- force legacyHooks bT
-    atomically (check (isTruthy bv))
-    pure VUnit
-
-newTVarB :: IO Val
-newTVarB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tv <- newTVarIO av
-    pure (VPrimObj (PrimTVar tv))
-
-newTVarIOB :: IO Val
-newTVarIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av <- force legacyHooks aT
-    tv <- newTVarIO av
-    pure (VPrimObj (PrimTVar tv))
-
-readTVarB :: IO Val
-readTVarB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    tv  <- requireTVarPrim "readTVar" tvv
-    atomically (readTVar tv)
-
-writeTVarB :: IO Val
-writeTVarB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    av  <- force legacyHooks aT
-    tv  <- requireTVarPrim "writeTVar" tvv
-    atomically (writeTVar tv av)
-    pure VUnit
-
-modifyTVar'B :: IO Val
-modifyTVar'B = pure $ VFun $ \tvT -> pure $ VFun $ \fT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    fv  <- force legacyHooks fT
-    tv  <- requireTVarPrim "modifyTVar'" tvv
-    cur  <- atomically (readTVar tv)
-    curT <- newWHNFThunk cur
-    new  <- apply legacyHooks fv curT
-    atomically (writeTVar tv new)
-    pure VUnit
-
-readTVarIOB :: IO Val
-readTVarIOB = pure $ VFun $ \tvT -> pure $ VIO $ do
-    tvv <- force legacyHooks tvT
-    tv  <- requireTVarPrim "readTVarIO" tvv
-    readTVarIO tv
-
 --------------------------------------------------------------------------------
 -- Phase 2.10: STM primops (# -suffixed, GHC.Prim)
 --
@@ -7071,23 +6341,54 @@ ensureStatePair v = case v of
 --                 -> (# State# RealWorld, a #)@
 --
 -- Source-loaded: @atomically (STM m) = IO (\\s -> (atomically# m) s)@.
--- Since ihc is single-threaded at the eval level, an STM action IS an
--- IO action in our world — we just apply the state-transformer.
+-- Single-threaded STM-as-IO: apply the state transformer, but on
+-- 'retry#' re-execute after a short delay so concurrent writers
+-- (e.g. 'registerFd' callback writing a TVar for
+-- 'threadWaitReadSTM') can make progress.  Without the re-exec loop,
+-- warp's 'makeGracefulRecv' hangs forever on
+-- @atomically (checkShutdown \<|> sockWait)@ because the first
+-- 'retry' would surface and the second branch would also retry out.
 atomicallyHashB :: IO Val
 atomicallyHashB = pure $ VFun $ \stmT -> pure $ VFun $ \sT -> do
-    stmV <- force legacyHooks stmT
-    rRaw <- apply legacyHooks stmV sT
-    v    <- runIOVal legacyHooks rRaw
-    ensureStatePair v
+    let loop = do
+            stmV <- force legacyHooks stmT
+            r <- CE.try @CE.SomeException $ do
+                rRaw <- apply legacyHooks stmV sT
+                runIOVal legacyHooks rRaw
+            case r of
+                Right v -> ensureStatePair v
+                Left e
+                    | isStmRetryException e -> do
+                        -- Yield to forked waiters (registerFd) and re-run.
+                        threadDelay 1000  -- 1 ms
+                        loop
+                    | otherwise -> CE.throwIO e
+    loop
 
 -- | @retry# :: State# RealWorld -> (# State# RealWorld, a #)@.
 --
--- In a concurrent runtime this blocks until a watched TVar changes.
--- Since we're single-threaded, a retry can never succeed — treat it
--- as an exception (the host 'atomically' call would do the same on
--- the underlying 'BlockedIndefinitelyOnSTM').
+-- Signals the enclosing 'atomically#' to re-execute (and
+-- source-loaded 'orElse' via 'catchRetry#').  Must not be a bare
+-- forever-block: IHC is single-threaded at the eval level, so
+-- concurrent TVar writers only run between atomically iterations.
 retryHashB :: IO Val
-retryHashB = pure $ VFun $ \_sT -> atomically retry
+retryHashB = pure $ VFun $ \_sT -> CE.throwIO StmRetryException
+
+-- | Marker for STM 'retry#'.  Distinct from arbitrary IOErrors so
+-- 'atomically#' / 'catchRetry#' do not treat every failure as retry.
+data StmRetryException = StmRetryException
+    deriving (Show)
+instance CE.Exception StmRetryException
+
+isStmRetryException :: CE.SomeException -> Bool
+isStmRetryException e =
+    case CE.fromException e of
+        Just StmRetryException -> True
+        Nothing ->
+            -- Legacy: older retry# used userError "STM retry"
+            case CE.fromException e of
+                Just (CE.ErrorCall msg) -> msg == "STM retry"
+                Nothing -> False
 
 -- | @catchRetry# :: (State# RealWorld -> (# State# RealWorld, a #))
 --                -> (State# RealWorld -> (# State# RealWorld, a #))
@@ -7095,8 +6396,10 @@ retryHashB = pure $ VFun $ \_sT -> atomically retry
 --                -> (# State# RealWorld, a #)@
 --
 -- Source-loaded: @orElse (STM m) e = STM $ \\s -> catchRetry# m (unSTM e) s@.
--- Try the first action; if it raises a retry-like exception, fall
--- back to the second.
+-- Try the first action; if it raises a *retry* exception, fall back to
+-- the second.  Non-retry exceptions propagate.  If the second also
+-- retries, re-raise 'StmRetryException' so the enclosing 'atomically#'
+-- re-executes the whole transaction (both arms get another chance).
 catchRetryHashB :: IO Val
 catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT -> do
     aV <- force legacyHooks aT
@@ -7107,9 +6410,15 @@ catchRetryHashB = pure $ VFun $ \aT -> pure $ VFun $ \bT -> pure $ VFun $ \sT ->
     r <- CE.try @CE.SomeException (runAction aV)
     case r of
         Right v -> ensureStatePair v
-        Left _  -> do
-            v <- runAction bV
-            ensureStatePair v
+        Left e
+            | isStmRetryException e -> do
+                r2 <- CE.try @CE.SomeException (runAction bV)
+                case r2 of
+                    Right v -> ensureStatePair v
+                    Left e2
+                        | isStmRetryException e2 -> CE.throwIO StmRetryException
+                        | otherwise -> CE.throwIO e2
+            | otherwise -> CE.throwIO e
 
 -- | @catchSTM# :: (State# RealWorld -> (# State# RealWorld, a #))
 --              -> (b -> State# RealWorld -> (# State# RealWorld, a #))
@@ -7233,12 +6542,6 @@ extractExceptionMessage val = case val of
 -- | Extract the 'Val' from an 'IhcException'.
 ihcExceptionToVal :: IhcException -> IO Val
 ihcExceptionToVal (IhcException _ t) = force legacyHooks t
-
-throwIOB :: IO Val
-throwIOB = pure $ VFun $ \aT -> pure $ VIO $ do
-    av  <- force legacyHooks aT
-    exc <- valToIhcException av
-    throwIO exc
 
 -- | @raise# :: a -> b@ — GHC primop. Compiler-intrinsic; no Haskell
 -- source. Source-loaded @error@ / @throw@ / @undefined@ and the
@@ -7425,17 +6728,18 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
     let runAction = do
             rRaw <- apply legacyHooks ioV sT
             runIOVal legacyHooks rRaw
-    rRes <- CE.try @IhcException (CE.try @SomeException runAction)
+    rRes <- CE.try @SomeException (CE.try @IhcException runAction)
     case rRes of
         Right (Right v) -> ensurePair v
-        Right (Left se) -> do
-            -- Non-IhcException host error — wrap & hand to handler.
-            let msg = BC.pack (show se)
-            excT <- newWHNFThunk (VStr msg)
-            invokeHandler hV excT
-        Left exc -> do
-            excVal <- ihcExceptionToVal exc
+        Right (Left exc) -> do
+            rawExcVal <- ihcExceptionToVal exc
+            excVal <- ensureSomeExceptionVal rawExcVal
             excT   <- newWHNFThunk excVal
+            invokeHandler hV excT
+        Left se -> do
+            -- Non-IhcException host error — wrap & hand to handler.
+            excVal <- hostExceptionToSomeExceptionVal se
+            excT <- newWHNFThunk excVal
             invokeHandler hV excT
   where
     -- Ensure the result is shaped as (# State#, a #). If the IO action
@@ -7459,6 +6763,31 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
             _ -> do
                 v <- runIOVal legacyHooks r1
                 ensurePair v
+
+-- | Convert a host-thrown 'SomeException' into the Val shape that
+-- source-loaded exception code expects from the @catch#@ primop.
+--
+-- This helper is part of the primop boundary, not a replacement for
+-- source-level @catch@: ordinary exception combinators still load from
+-- @GHC.Internal.IO@ / @Control.Exception@ and bottom out here.
+hostExceptionToSomeExceptionVal :: SomeException -> IO Val
+hostExceptionToSomeExceptionVal e = do
+    descT <- newWHNFThunk =<< stringToListValIO (show e)
+    handleT <- newWHNFThunk (VCon "Nothing" [])
+    typeT <- newWHNFThunk (VCon "OtherError" [])
+    locT <- newWHNFThunk =<< stringToListValIO ""
+    errnoT <- newWHNFThunk (VCon "Nothing" [])
+    fileT <- newWHNFThunk (VCon "Nothing" [])
+    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
+    ioErrT <- newWHNFThunk ioErrVal
+    pure (VCon "SomeException" [ioErrT])
+
+ensureSomeExceptionVal :: Val -> IO Val
+ensureSomeExceptionVal v = case v of
+    VCon "SomeException" _ -> pure v
+    _ -> do
+        innerT <- newWHNFThunk v
+        pure (VCon "SomeException" [innerT])
 
 -- | @newMVar# :: State# s -> (# State# s, MVar# s a #)@
 --
@@ -7661,12 +6990,10 @@ toExceptionB = pure $ VFun $ \eT -> do
             eT' <- newWHNFThunk ev
             pure (VCon "SomeException" [eT'])
 
--- | @fromException :: Exception e => SomeException -> Maybe e@ — inverse
--- of 'toException'. In real GHC the dispatch is type-directed; at the Val
--- level there is no type to check against, so we always unwrap and wrap in
--- 'Just'. Source-loaded @catch@ uses this to route handlers: returning
--- 'Just' keeps the exception value flowing to the user handler (which is
--- what we want), 'Nothing' would rethrow.
+-- | @fromException :: Exception e => SomeException -> Maybe e@.
+-- Real GHC is type-directed.  At the Val level we return @Just@ for
+-- 'SomeException' inputs; 'matchPat' supplies the limited downcast
+-- behavior we can infer from demanded constructor patterns.
 fromExceptionB :: IO Val
 fromExceptionB = pure $ VFun $ \eT -> do
     -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
@@ -7680,14 +7007,12 @@ fromExceptionB = pure $ VFun $ \eT -> do
     -- IOError (@Just (IOError ...)@ doesn't match @Just
     -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
     --
-    -- Defaulting to 'Nothing' is the safe answer for exception-type
-    -- DOWNCASTS — the common pattern in warp / wai / standard handler
-    -- code.  Code that genuinely wants the wrapped value can pattern
-    -- match @SomeException e <- ...@ directly (we wrap host
-    -- exceptions in 'VCon "SomeException" [innerT]', and the record-
-    -- accessor / matchPat legacyHooks paths already descend through the wrap).
-    _ <- force legacyHooks eT
-    pure (VCon "Nothing" [])
+    ev <- force legacyHooks eT
+    case ev of
+        VCon "SomeException" _ -> do
+            evT <- newWHNFThunk ev
+            pure (VCon "Just" [evT])
+        _ -> pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --
@@ -7729,70 +7054,6 @@ runStateTransformer stateFnT = do
     case res of
         VCon "(#,#)" [_stateT, resultT] -> force legacyHooks resultT
         _ -> pure res
-
-catchB :: IO Val
-catchB = pure $ VFun $ \aT -> pure $ VFun $ \hT -> pure $ VIO $ do
-    hv <- force legacyHooks hT
-    -- Wrap BOTH force and runIOVal inside try: the >> operator's
-    -- ioSeq returns VIO, and applying it (inside force) runs the IO
-    -- which may throw BEFORE runIOVal is reached.
-    r <- CE.try @SomeException $ do
-            av <- force legacyHooks aT
-            runIOVal legacyHooks av
-    case r of
-        Right v -> pure v
-        Left e  -> do
-            excVal <- case CE.fromException e of
-                Just (ihcExc :: IhcException) -> ihcExceptionToVal ihcExc
-                Nothing                       -> hostExceptionToVal e
-            excT <- newWHNFThunk excVal
-            rv   <- apply legacyHooks hv excT
-            runIOVal legacyHooks rv
-
--- | Convert a host-thrown 'SomeException' into a Val that source-level
--- pattern matching on 'IOError' can introspect.  Most Haskell code in
--- the ecosystem reaches for 'ioe_errno', 'ioeGetErrorType', and
--- 'displayException', so we materialise a record that supplies these
--- fields with conservative defaults (no errno, OtherError type, the
--- exception's @show@ as description).
-hostExceptionToVal :: SomeException -> IO Val
-hostExceptionToVal e = do
-    descT <- newWHNFThunk =<< stringToListValIO (show e)
-    handleT <- newWHNFThunk (VCon "Nothing" [])
-    typeT <- newWHNFThunk (VCon "OtherError" [])
-    locT <- newWHNFThunk =<< stringToListValIO ""
-    errnoT <- newWHNFThunk (VCon "Nothing" [])
-    fileT <- newWHNFThunk (VCon "Nothing" [])
-    -- Wrap in 'SomeException' so handlers that pattern-match
-    -- @\(SomeException e) -> ...@ (e.g. warp's 'throughAsync',
-    -- 'settingsOnException') see the expected ctor.  Existing handlers
-    -- that match on the inner @IOError@ ctor still work via
-    -- newtype-transparent pattern matching: 'matchPat' on
-    -- @PCon "IOError"@ against a single-field @VCon "SomeException"@
-    -- projects the inner field and retries.
-    let ioErrVal = VCon "IOError" [handleT, typeT, locT, descT, errnoT, fileT]
-    ioErrT <- newWHNFThunk ioErrVal
-    pure (VCon "SomeException" [ioErrT])
-
-throwToB :: IO Val
-throwToB = pure $ VFun $ \tidT -> pure $ VFun $ \excT -> pure $ VIO $ do
-    tidV <- force legacyHooks tidT
-    excV <- force legacyHooks excT
-    case tidV of
-        VPrimObj (PrimThreadId tid) -> do
-            exc <- valToIhcException excV
-            throwTo tid exc
-            pure VUnit
-        _ -> error ("throwTo: not a ThreadId: " <> showValForDebug tidV)
-
-displayExceptionB :: IO Val
-displayExceptionB = pure $ VFun $ \eT -> do
-    ev <- force legacyHooks eT
-    let s = case ev of
-                VStr msg  -> BC.unpack msg
-                VCon n _  -> BC.unpack n
-                _         -> showValForDebug ev
-    stringToListValIO s
 
 --------------------------------------------------------------------------------
 -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic builtins

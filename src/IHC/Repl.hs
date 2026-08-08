@@ -34,7 +34,7 @@ import IHC.Builtins (showValWith, buildConEnv, buildFieldEnv)
 import IHC.Classes (ClassRegistry, registerInstance, registerInstanceMulti)
 import IHC.Classes (legacyHooks)
 import IHC.Driver (resolveSearchPathFor)
-import IHC.Eval (eval, force, runIOVal)
+import IHC.Eval (eval, force, ownerSentinelKey, runIOVal)
 import IHC.Lexer (nextToken, startCursor, Token(..), TokenKind(..))
 import IHC.ModuleHeader (ImportDecl(..), ImportSpec(..), parseSingleImport)
 import IHC.Parser (defaultFixityTable, parseExprOnly, parseBodyExprWithFixity)
@@ -419,8 +419,7 @@ mkDefault env src decl methodName =
     case Map.lookup methodName (classDefaults decl) of
         Just lhs -> do
             r <- try (do
-                        expr <- parseBodyExprWithFixity src defaultFixityTable
-                                    (lhsClauses lhs)
+                        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
                         t <- newThunk env expr
                         force legacyHooks t)
                     :: IO (Either SomeException Val)
@@ -484,7 +483,7 @@ evalInstanceMethods src env methods =
     HashMap.fromList <$> mapM evalOne methods
   where
     evalOne (methodName, lhs) = do
-        expr <- parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
         t    <- newThunk env expr
         v    <- force legacyHooks t
         pure (methodName, v)
@@ -574,8 +573,9 @@ tryEvalSessionBind loadedRef importsRef fldReg env name rhs = do
         Right expr0 -> do
             let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
+            evalEnv <- withReplOwner env'
             r2 <- try (do
-                        v  <- eval legacyHooks env' emptyIPMap expr
+                        v  <- eval legacyHooks evalEnv emptyIPMap expr
                         runIOVal legacyHooks v)
                     :: IO (Either SomeException Val)
             case r2 of
@@ -635,12 +635,13 @@ tryEvalLetDecl loadedRef importsRef fldReg env name input = do
         Right expr0 -> do
             let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env0 <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
+            envWithOwner <- withReplOwner env0
             -- Knot-tying: allocate a slot first, extend the env to
             -- include the binding, then fill the slot with a closure
             -- that captures the extended env.  This makes the binding
             -- visible to itself (recursion) and to later REPL lines.
-            slot <- newIORef (BlackHole "<repl-placeholder>")
-            let env' = HashMap.insert key slot env0
+            slot <- newIORef (BlackHole Nothing "<repl-placeholder>")
+            let env' = HashMap.insert key slot envWithOwner
             writeIORef slot (Unevaluated (Closure env' emptyIPMap expr))
             pure (Right env')
 
@@ -661,7 +662,7 @@ parseLetBinding src name = do
     case mLhs of
         Nothing  -> throwIO (userError ("let: cannot parse binding for `"
                                          <> BC.unpack name <> "`"))
-        Just lhs -> parseBodyExprWithFixity src defaultFixityTable (lhsClauses lhs)
+        Just lhs -> parseBodyExprWithFixity src defaultFixityTable lhs
 
 tryEvalExpr :: IORef [FilePath] -> IORef [ImportDecl] -> FieldRegistry -> Env -> ClassRegistry -> String -> IO (Either String ())
 tryEvalExpr loadedRef importsRef fldReg env classReg input = do
@@ -673,7 +674,8 @@ tryEvalExpr loadedRef importsRef fldReg env classReg input = do
         Right expr0 -> do
             let expr = desugarRecordPats fldReg (desugarRecordCons fldReg expr0)
             env' <- ensureQualifiedNamesLoaded loadedRef importsRef env expr
-            r2 <- try (evalAndPrint env' classReg expr)
+            evalEnv <- withReplOwner env'
+            r2 <- try (evalAndPrint evalEnv classReg expr)
                     :: IO (Either SomeException ())
             case r2 of
                 Left  e  -> pure (Left (show e))
@@ -742,6 +744,11 @@ ensureQualifiedNamesLoaded loadedRef importsRef env expr = do
         let imp' = imp { impSpec = ImportOnly (nub names) }
         (env', _) <- loadImportIntoEnv searchPath imp' accEnv
         pure env'
+
+withReplOwner :: Env -> IO Env
+withReplOwner env = do
+    owner <- newWHNFThunk (VStr (BC.pack "$repl"))
+    pure (HashMap.insert ownerSentinelKey owner env)
 
 evalAndPrint :: Env -> ClassRegistry -> Expr -> IO ()
 evalAndPrint env classReg expr = do

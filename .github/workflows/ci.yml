@@ -90,15 +90,22 @@ jobs:
   # at each fixture boundary; a full-suite heap profile now shows
   # steady ~1.5 MB STACK instead of monotonic 4 GB growth, so Linux
   # completes within the cap and a red result gates PRs again.
+  # Linux smoke check on self-hosted office-builder (NixOS, system Nix).
+  # macOS job above stays on GitHub-hosted macos-14 (JIT / Apple Silicon).
   linux-test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ihc-linux]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: cachix/install-nix-action@v27
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          nix_path: nixpkgs=channel:nixos-unstable
-
       - name: Run pure-interpreter tests (nix flake check)
-        run: nix flake check --print-build-logs
+        run: |
+          set -euo pipefail
+          nix_bin="$(command -v nix || true)"
+          if [ -z "$nix_bin" ] && [ -x /run/current-system/sw/bin/nix ]; then
+            nix_bin="/run/current-system/sw/bin/nix"
+          fi
+          if [ -z "$nix_bin" ]; then
+            echo "::error title=Missing Nix binary::system Nix is required on ihc-linux runners"
+            exit 1
+          fi
+          "$nix_bin" flake check --print-build-logs

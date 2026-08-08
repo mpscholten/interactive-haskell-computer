@@ -49,7 +49,7 @@ import Data.Map.Strict (Map)
 
 import IHC.AST
 import IHC.Lexer
-import IHC.Scan (Clause(..))
+import IHC.Scan (BindingLhs(..), Clause(..))
 import IHC.Source
 import IHC.StringUtils (isAsciiSpace)
 
@@ -131,6 +131,34 @@ defaultFixityTable = Map.fromList
     , ("!",   (AssocL, 9))
     , (".",   (AssocR, 9))
     , ("!!",  (AssocL, 9))
+    -- GHC.Prim unboxed operators.  GHC.Prim has no .hs source, so its
+    -- primop fixities are never scanned from a module — they must be
+    -- seeded here, or mixed expressions mis-parse at the default
+    -- (AssocL, 9).  Concretely: GHC.Arr.listArray's fill loop tests
+    -- @i# ==# n# -# 1#@; without these, @==#@ and @-#@ share precedence 9
+    -- and it parses as @(i# ==# n#) -# 1#@ → @isTrue#@ of a nonzero diff →
+    -- the loop stops after the first element, dropping the array's last
+    -- entry.  Fixities match GHC's primops.txt.pp.
+    , ("+#",   (AssocL, 6))
+    , ("-#",   (AssocL, 6))
+    , ("*#",   (AssocL, 7))
+    , ("==#",  (AssocN, 4))
+    , ("/=#",  (AssocN, 4))
+    , ("<#",   (AssocN, 4))
+    , ("<=#",  (AssocN, 4))
+    , (">#",   (AssocN, 4))
+    , (">=#",  (AssocN, 4))
+    , ("+##",  (AssocL, 6))
+    , ("-##",  (AssocL, 6))
+    , ("*##",  (AssocL, 7))
+    , ("/##",  (AssocL, 7))
+    , ("**##", (AssocR, 8))
+    , ("==##", (AssocN, 4))
+    , ("/=##", (AssocN, 4))
+    , ("<##",  (AssocN, 4))
+    , ("<=##", (AssocN, 4))
+    , (">##",  (AssocN, 4))
+    , (">=##", (AssocN, 4))
     ]
 
 lookupFixity :: FixityTable -> Name -> (Assoc, Int)
@@ -158,7 +186,7 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
             _ -> go acc cur'
 
     grab assoc acc cur = do
-        let (precTok, cur1) = skipNewlines cur
+        let (precTok, curBeforePrec, curAfterPrec) = skipNewlinesWithStart cur
         case tkKind precTok of
             TkInt n
                 | n < 0 || n > 9 -> throwIO (ParseError
@@ -167,10 +195,11 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
                     , peCol  = tkCol precTok
                     , peMsg  = "fixity precedence must be in 0..9, got "
                                <> show n })
-                | otherwise -> consumeOps assoc (fromInteger n) acc (advance cur1)
-            _ -> go acc cur
-
-    advance cur = snd (nextToken src cur)
+                | otherwise -> consumeOps assoc (fromInteger n) acc curAfterPrec
+            TkEof -> pure acc
+            _
+                | tkCol precTok == 1 -> go acc curBeforePrec
+                | otherwise          -> consumeOps assoc 9 acc curBeforePrec
 
     -- After `infixl N`, collect a comma-separated list of op names
     -- until we leave the line (any column-1 token or EOF).
@@ -187,27 +216,32 @@ scanFixityDecls src tbl0 = go tbl0 startCursor
             TkComma    -> consumeOps assoc prec acc cur1
             TkBacktick ->
                 let (idTok, cur2) = nextToken src cur1
-                    (_closeTok, cur3) = nextToken src cur2
-                in case tkKind idTok of
-                    TkIdent n ->
+                    (closeTok, cur3) = nextToken src cur2
+                in case (backtickOpName (tkKind idTok), tkKind closeTok) of
+                    (Just n, TkBacktick) ->
                         let key = BC.pack "`" <> n <> BC.pack "`"
                         in consumeOps assoc prec (Map.insert key (assoc, prec) acc) cur3
                     _ -> consumeOps assoc prec acc cur2
-            TkSymOp n  -> consumeOps assoc prec (Map.insert n (assoc, prec) acc) cur1
-            TkPlus     -> consumeOps assoc prec (Map.insert "+" (assoc, prec) acc) cur1
-            TkMinus    -> consumeOps assoc prec (Map.insert "-" (assoc, prec) acc) cur1
-            TkStar     -> consumeOps assoc prec (Map.insert "*" (assoc, prec) acc) cur1
-            TkPlusPlus -> consumeOps assoc prec (Map.insert "++" (assoc, prec) acc) cur1
-            TkColon    -> consumeOps assoc prec (Map.insert ":" (assoc, prec) acc) cur1
-            TkDollar   -> consumeOps assoc prec (Map.insert "$" (assoc, prec) acc) cur1
-            TkDot      -> consumeOps assoc prec (Map.insert "." (assoc, prec) acc) cur1
-            _          -> go acc cur1
+            _ | Just name <- tokenOpName (tkKind tok) ->
+                consumeOps assoc prec (Map.insert name (assoc, prec) acc) cur1
+            _ -> go acc cur1
 
     skipNewlines cur =
         let (t, c) = nextToken src cur in
         case tkKind t of
             TkNewline -> skipNewlines c
             _         -> (t, c)
+
+    skipNewlinesWithStart cur =
+        let (t, c) = nextToken src cur in
+        case tkKind t of
+            TkNewline -> skipNewlinesWithStart c
+            _         -> (t, cur, c)
+
+    backtickOpName = \case
+        TkIdent n -> Just n
+        TkConId n -> Just n
+        _         -> Nothing
 
 --------------------------------------------------------------------------------
 -- Parser context
@@ -223,13 +257,30 @@ data Ctx = Ctx
 -- | Parse all clauses with the default fixity table. Kept so existing
 -- scheduler call sites keep working without passing a table.
 parseBodyExpr :: Source -> [Clause] -> IO Expr
-parseBodyExpr src = parseBodyExprWithFixity src defaultFixityTable
+parseBodyExpr src clauses = parseBodyExprWithFixity src defaultFixityTable (funLhs clauses)
+  where
+    -- Local reimplementation so callers that only have clauses still work
+    -- without importing Scan.funLhs (kept private to Scan).
+    funLhs cs = BindingLhs cs Nothing
 
-parseBodyExprWithFixity :: Source -> FixityTable -> [Clause] -> IO Expr
-parseBodyExprWithFixity src _ [] = throwIO (ParseError
+-- | Parse a binding body from its scanned 'BindingLhs'.  Ordinary function
+-- bindings desugar via multi-clause matching; pattern-binding projections
+-- (@lhsPatVar = Just v@) desugar to @case rhs of { ~pat -> v }@.
+parseBodyExprWithFixity :: Source -> FixityTable -> BindingLhs -> IO Expr
+parseBodyExprWithFixity src fx (BindingLhs _clauses (Just var)) =
+    case _clauses of
+        [cl] -> parsePatBindProjection src fx var cl
+        _    -> throwIO (ParseError
+            { peFile = srcName src, peLine = 0, peCol = 0
+            , peMsg  = "pattern-binding projection expects exactly one clause" })
+parseBodyExprWithFixity src fx (BindingLhs clauses Nothing) =
+    parseClausesBody src fx clauses
+
+parseClausesBody :: Source -> FixityTable -> [Clause] -> IO Expr
+parseClausesBody src _ [] = throwIO (ParseError
     { peFile = srcName src, peLine = 0, peCol = 0
     , peMsg  = "empty clause list" })
-parseBodyExprWithFixity src fx clauses = liftLex $ do
+parseClausesBody src fx clauses = liftLex $ do
     parsed <- mapM (parseClause src fx) clauses
     let arity = case parsed of
             ((ps, _) : _) -> length ps
@@ -242,6 +293,30 @@ parseBodyExprWithFixity src fx clauses = liftLex $ do
                         , peMsg  = "clauses have differing arities" }))
           parsed
     pure (desugarClauses parsed arity)
+
+-- | Desugar a top-level pattern binding projection for @var@.
+-- @(a, b) | True = (1, 2)@ looking up @a@ becomes
+-- @case <guarded-rhs> of { ~(a, b) -> a }@ (Report §3.12 irrefutable).
+parsePatBindProjection :: Source -> FixityTable -> Name -> Clause -> IO Expr
+parsePatBindProjection src fx var (Clause patsSpan rhsSpan) = liftLex $ do
+    let (coreSpan, mWhere) = splitOnWhere src rhsSpan
+    whereBinds <- case mWhere of
+        Nothing -> pure []
+        Just ws -> parseBindingsIn src fx ws
+    pat <- parsePatIn src fx patsSpan
+    rhs <- parseRhsIn src fx coreSpan
+    let failExpr = EApp (EVar "error")
+                        (stringToConsList "Non-exhaustive pattern in pattern binding")
+        body0 = case rhs of
+            RhsPlain e     -> e
+            RhsGuards brs  -> guardChain brs failExpr
+        body = case whereBinds of
+            [] -> body0
+            bs -> ELet bs body0
+    pure $ ECase body
+        [ Alt (PIrref pat) (EVar var)
+        , Alt PWild failExpr
+        ]
 
 -- | Parse a single expression from raw bytes — intended for REPL input.
 -- The entire source is treated as one expression (no binding LHS, no `=`).
@@ -284,6 +359,9 @@ data Rhs
 data Guard
     = GuardExpr !Expr
     | GuardPat !Pat !Expr
+    -- | Local-declaration guard @| let decls@ (Haskell 2010 §3.13 / §4.4.3).
+    -- Desugars to @let decls in <rest of guard chain / body>@.
+    | GuardLet ![Bind]
 
 parseClause :: Source -> FixityTable -> Clause -> IO ParsedClause
 parseClause src fx (Clause patsSpan rhsSpan) = do
@@ -300,6 +378,7 @@ parseClause src fx (Clause patsSpan rhsSpan) = do
         wrapGuard = \case
             GuardExpr g   -> GuardExpr (wrapWhere g)
             GuardPat p ge -> GuardPat p (wrapWhere ge)
+            GuardLet bs   -> GuardLet [ (n, wrapWhere e) | (n, e) <- bs ]
     let rhs' = case rhs of
             RhsPlain e    -> RhsPlain  (wrapWhere e)
             RhsGuards ges -> RhsGuards [(map wrapGuard gs, wrapWhere b) | (gs, b) <- ges]
@@ -357,8 +436,9 @@ parsePatsIn src fx (start, end) = do
                     Nothing -> pure (reverse acc)
             -- Operator infix LHS form: `arg1 OP arg2 = body`
             -- The symbolic operator (e.g. @?=, <>) between the two
-            -- argument patterns must be skipped.
-            TkSymOp _ -> loop ctx cur1 acc
+            -- argument patterns must be skipped. A leading `~` is the
+            -- irrefutable-pattern prefix, not an operator separator.
+            TkSymOp op | op /= BC.pack "~" -> loop ctx cur1 acc
             -- '@'-prefixed operator infix LHS: arg1 @?= arg2 = body
             -- '@' is TkAt (not isOpChar), followed by TkSymOp for the rest.
             -- Skip both tokens and continue collecting patterns.
@@ -396,7 +476,7 @@ parsePatsIn src fx (start, end) = do
                             TkBacktick -> loopInfix ctx cur3 acc
                             _          -> pure (reverse acc)
                     Nothing -> pure (reverse acc)
-            TkSymOp _ -> loopInfix ctx cur1 acc
+            TkSymOp op | op /= BC.pack "~" -> loopInfix ctx cur1 acc
             k | isDedicatedInfixOpKind k -> loopInfix ctx cur1 acc
             TkAt ->
                 let (peek2, cur2) = nextSig ctx cur1
@@ -455,7 +535,9 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
         let (tok, cur') = nextSig ctx0 cur in
         case tkKind tok of
             TkEof                       -> pure False
-            TkSymOp _  | depth == 0     -> pure True
+            TkSymOp op | depth == 0
+                       , op /= BC.pack "~" -> pure True
+            TkSymOp _  | depth == 0     -> go cur' depth sawPat
             TkBacktick | depth == 0     -> pure True
             TkMinus    | depth == 0
                        , sawPat         -> pure True
@@ -471,6 +553,147 @@ hasTopLevelInfixOp ctx0 cur0 = go cur0 (0 :: Int) False
             _ | depth == 0
               , startsPat (tkKind tok)  -> go cur' depth True
             _                           -> go cur' depth sawPat
+
+-- | Look ahead for a top-level (paren-depth 0) /constructor/ operator
+-- before @=@ / @|@.  Constructor operators are @:@ and any 'TkSymOp'
+-- whose spelling starts with @:@ (Haskell 2010 §2.4 / §4.3.2 @conop@).
+--
+-- Used to distinguish unparenthesised pattern bindings
+--
+-- @
+--   a :| as = rhs     -- pattern bind (conop)
+--   x : xs  = rhs     -- pattern bind (list cons)
+-- @
+--
+-- from ordinary function bindings and variable-operator equations
+--
+-- @
+--   f x     = rhs     -- function
+--   x + y   = rhs     -- varop funlhs for (+)
+-- @
+--
+-- Without this, @let a :| as = x@ is mis-parsed as a function named
+-- @a@, then fails with "expected `=` or `|`; saw TkSymOp \":|\"",
+-- which is the root of the Data.List.NonEmpty lazy @:|@ pattern miss
+-- (base's @instance Monad NonEmpty@ uses @where b :| bs = f a@).
+hasTopLevelConOpBeforeEq :: Ctx -> Cursor -> Bool
+hasTopLevelConOpBeforeEq ctx0 cur0 = go cur0 (0 :: Int)
+  where
+    go cur !depth =
+        let (tok, cur') = nextSig ctx0 cur in
+        case tkKind tok of
+            TkEof                    -> False
+            TkEq     | depth == 0    -> False
+            TkBar    | depth == 0    -> False
+            TkColon  | depth == 0    -> True
+            TkSymOp op
+                | depth == 0
+                , isConOpSpelling op -> True
+            TkLParen                 -> go cur' (depth + 1)
+            TkLBracket               -> go cur' (depth + 1)
+            TkLBrace                 -> go cur' (depth + 1)
+            TkRParen                 -> go cur' (max 0 (depth - 1))
+            TkRBracket               -> go cur' (max 0 (depth - 1))
+            TkRBrace                 -> go cur' (max 0 (depth - 1))
+            _                        -> go cur' depth
+
+    isConOpSpelling op = case BC.uncons op of
+        Just (':', _) -> True
+        _             -> False
+
+-- | Look ahead for a top-level (paren-depth 0) /variable/ operator before
+-- @=@ / @|@ — i.e. an infix funlhs of the form @pat1 op pat2 = rhs@.
+-- Constructor operators (@:@ / @:|@ / …) are excluded; those are pattern
+-- bindings handled by 'hasTopLevelConOpBeforeEq', not function equations.
+--
+-- Used by expression-level @let@ to accept multi-clause local infix
+-- definitions such as conduit's @zipSinks@:
+--
+-- @
+--   let Leftover _ i >< _ = absurd i
+--       _            >< Leftover _ i = absurd i
+--       Done x       >< Done y       = rest (x, y)
+--   in …
+-- @
+peekTopLevelVarOpBeforeEq :: Ctx -> Cursor -> Maybe Name
+peekTopLevelVarOpBeforeEq ctx0 cur0 = go cur0 (0 :: Int) False
+  where
+    go cur depth !sawPat =
+        let (tok, cur') = nextSig ctx0 cur in
+        case tkKind tok of
+            TkEof                    -> Nothing
+            TkEq     | depth == 0    -> Nothing
+            TkBar    | depth == 0    -> Nothing
+            -- Conops are pattern-bind markers, not varop funlhs.
+            TkColon  | depth == 0    -> Nothing
+            TkSymOp op
+                | depth == 0
+                , op /= BC.pack "~" ->
+                    case BC.uncons op of
+                        Just (':', _) -> Nothing
+                        _             -> Just op
+            TkBacktick | depth == 0 ->
+                case readBacktickName ctx0 cur' of
+                    Just (n, _) -> Just n
+                    Nothing     -> Nothing
+            -- '@'-prefixed ops (@?=, …) count as varops when sawPat.
+            TkAt | depth == 0, sawPat ->
+                let (nextTok, _) = nextSig ctx0 cur' in
+                case tkKind nextTok of
+                    TkSymOp suf -> Just (BC.cons '@' suf)
+                    _           -> go cur' depth sawPat
+            TkMinus | depth == 0, sawPat -> Just (BC.pack "-")
+            TkMinus | depth == 0         -> go cur' depth sawPat
+            k | depth == 0
+              , isDedicatedInfixOpKind k
+              , Just n <- tokenOpName k
+              , n /= BC.pack ":"         -> Just n
+            TkLParen                     -> go cur' (depth + 1) sawPat
+            TkLBracket                   -> go cur' (depth + 1) sawPat
+            TkLBrace                     -> go cur' (depth + 1) sawPat
+            TkRParen                     -> go cur' (max 0 (depth - 1)) True
+            TkRBracket                   -> go cur' (max 0 (depth - 1)) True
+            TkRBrace                     -> go cur' (max 0 (depth - 1)) True
+            _ | depth == 0
+              , startsPat (tkKind tok)   -> go cur' depth True
+            _                            -> go cur' depth sawPat
+
+-- | Walk forward from a position just after @where@ and return both the
+-- byte offset at which the where-block ends and a 'Cursor' positioned
+-- there with correct line/col.  Block ends at the first non-newline
+-- token whose column is @<= whereTokCol@ (or EOF / ctx end).
+--
+-- Shared by do-let and expression-level let so a trailing @where@ on a
+-- binding is consumed before the next sibling / @in@.
+findWhereBlockEndAt :: Ctx -> Int -> Cursor -> (Int, Cursor)
+findWhereBlockEndAt ctx whereTokCol startCur = go startCur
+  where
+    go c
+        | cPos c >= ctxEnd ctx = (ctxEnd ctx, c)
+        | otherwise =
+            let (t, c') = nextToken (ctxSrc ctx) c in
+            case tkKind t of
+                TkEof     -> (cPos c, c)
+                TkNewline -> go c'
+                _ | tkCol t <= whereTokCol ->
+                      (tkStart t, Cursor (tkStart t) (tkLine t) (tkCol t))
+                  | otherwise -> go c'
+
+-- | Fold where-bindings into an RHS (plain or guarded).
+wrapRhsWhereBinds :: [Bind] -> Rhs -> Rhs
+wrapRhsWhereBinds [] r = r
+wrapRhsWhereBinds bs r = case r of
+    RhsPlain e    -> RhsPlain (ELet bs e)
+    RhsGuards ges -> RhsGuards
+        [ ( map wrapG gs
+          , ELet bs b
+          )
+        | (gs, b) <- ges
+        ]
+  where
+    wrapG (GuardExpr g)   = GuardExpr (ELet bs g)
+    wrapG (GuardPat p ge) = GuardPat p (ELet bs ge)
+    wrapG (GuardLet gs)   = GuardLet (gs ++ bs)
 
 parseRhsIn :: Source -> FixityTable -> Span -> IO Rhs
 parseRhsIn src fx (start, end) = do
@@ -499,31 +722,173 @@ parseRhsIn src fx (start, end) = do
             TkBar -> parseGuards ctx cur4 ((gs, b) : acc)
             _     -> pure (reverse ((gs, b) : acc))
 
+-- | Parse a comma-separated list of guards after @|@ (Haskell Report
+-- §3.13 / §4.4.3.1).  Each element is either a boolean guard (@expr@)
+-- or a pattern guard (@pat <- expr@).  Mixed lists are allowed, e.g.
+--
+-- > | lf > 3*lr + 1, i <- div (lf + lr) 2, (f',f'') <- splitAt i f = …
+-- > | i + grain < j, k <- i + shiftR (j - i) 1 = …
+-- > | isStaticTree node, isNonTrivialStaticNode node = …
+--
+-- Used by function-equation RHS guards, let/where guards, and case-alt
+-- guards.  Stops (without consuming) at the token that terminates the
+-- list — typically @=@ for equations or @->@ for case alts.
 parseGuardList :: Ctx -> Cursor -> IO ([Guard], Cursor)
 parseGuardList ctx cur0 = go cur0 []
   where
     go cur acc = do
-        patAttempt <- try (parseTopPat ctx cur) :: IO (Either ParseError (Pat, Cursor))
-        case patAttempt of
-            Right (pat, curPat) ->
-                let (tok, curAfterTok) = nextSig ctx curPat in
-                case tkKind tok of
-                    TkLArrow -> do
-                        (rhs, curRhs) <- parseExpr ctx curAfterTok
-                        continue curRhs (GuardPat pat rhs : acc)
-                    _ -> parseBoolGuard cur acc
-            Left _ ->
-                parseBoolGuard cur acc
+        -- Local-decl guard: @| let decls@ (no @in@).  Must win over the
+        -- expression path, which would otherwise parse @let@ as a full
+        -- @let … in …@ expression and fail with "expected `in`".
+        let (peekTok, peekCur) = nextSig ctx cur
+        case tkKind peekTok of
+            TkLet -> do
+                (binds, curBinds) <- parseGuardLetBinds ctx peekCur
+                continue curBinds (GuardLet binds : acc)
+            _ -> do
+                patAttempt <- try (parseTopPat ctx cur) :: IO (Either ParseError (Pat, Cursor))
+                case patAttempt of
+                    Right (pat, curPat) ->
+                        let (tok, curAfterTok) = nextSig ctx curPat in
+                        case tkKind tok of
+                            TkLArrow -> do
+                                (rhs, curRhs) <- parseExpr ctx curAfterTok
+                                continue curRhs (GuardPat pat rhs : acc)
+                            _ -> parseBoolGuard cur acc
+                    Left _ ->
+                        parseBoolGuard cur acc
 
+    -- Boolean guards must also accept a trailing comma so that
+    -- @| cond1, cond2 = …@ and @| cond, p <- e = …@ parse.  Previously
+    -- only pattern guards continued on @,@ — boolean guards returned
+    -- immediately, so the next token was @,@ and the caller reported
+    -- "expected `=` after guard; saw TkComma".
     parseBoolGuard cur acc = do
         (g, cur1) <- parseExpr ctx cur
-        pure (reverse (GuardExpr g : acc), cur1)
+        continue cur1 (GuardExpr g : acc)
 
     continue cur acc = do
         let (tok, curNext) = nextSig ctx cur
         case tkKind tok of
             TkComma -> go curNext acc
             _       -> pure (reverse acc, cur)
+
+-- | Parse the declaration list of a local-decl guard after consuming @let@.
+-- Bindings only — no @in@.  Layout or braced.  Stops before the next
+-- guard separator (@,@) or the guard-list terminator (@=@ / @->@ / @|@).
+parseGuardLetBinds :: Ctx -> Cursor -> IO ([Bind], Cursor)
+parseGuardLetBinds ctx cur0 = do
+    let (firstTok, _) = nextSig ctx cur0
+    case tkKind firstTok of
+        TkLBrace -> bracedGuardLet ctx cur0
+        TkEof    -> pure ([], cur0)
+        _        -> do
+            let bindCol = tkCol firstTok
+            layoutGuardLet ctx bindCol cur0 []
+  where
+    bracedGuardLet c cur = do
+        let (tok, cur1) = nextSig c cur
+        case tkKind tok of
+            TkLBrace -> bracedItems c cur1 []
+            _        -> parseErr c "expected `{` after `let` in guard" tok
+
+    bracedItems c cur acc
+        | cPos cur >= ctxEnd c = pure (reverse acc, cur)
+        | otherwise = do
+            let (tok, _) = nextSig c cur
+            case tkKind tok of
+                TkRBrace -> do
+                    let (_, cur') = nextSig c cur
+                    pure (reverse acc, cur')
+                TkEof -> pure (reverse acc, cur)
+                _ -> do
+                    (bs, cur1) <- parseOneGuardLetBind c (tkCol tok) cur
+                    let (sep, cur2) = nextSig c cur1
+                    case tkKind sep of
+                        TkSemi   -> bracedItems c cur2 (reverse bs ++ acc)
+                        TkRBrace -> pure (reverse (reverse bs ++ acc), cur2)
+                        _        -> bracedItems c cur1 (reverse bs ++ acc)
+
+    layoutGuardLet c bindCol cur acc = do
+        let (peek, _) = nextSig c cur
+        case tkKind peek of
+            TkEof   -> pure (reverse acc, cur)
+            -- Guard-list separators / terminators end the let decls.
+            TkComma -> pure (reverse acc, cur)
+            TkBar   -> pure (reverse acc, cur)
+            TkEq    -> pure (reverse acc, cur)
+            TkArrow -> pure (reverse acc, cur)
+            _ | tkCol peek > 0 && tkCol peek < bindCol ->
+                  pure (reverse acc, cur)
+              | tkCol peek == bindCol || null acc -> do
+                  (bs, cur1) <- parseOneGuardLetBind c bindCol cur
+                  layoutGuardLet c bindCol cur1 (reverse bs ++ acc)
+              | otherwise ->
+                  pure (reverse acc, cur)
+
+    -- One @name [pats] = expr@ (or guarded) binding inside a guard-let.
+    parseOneGuardLetBind c bindCol cur = do
+        let rhsCtx = c { ctxMinCol = max (ctxMinCol c) bindCol }
+            (nameTok, cur1) = nextSig c cur
+        case tkKind nameTok of
+            TkIdent n -> do
+                (params, cur2) <- collectLetParams c cur1 []
+                let (sepTok, cur3) = nextSig c cur2
+                (rhs, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (e, curE) <- parseExpr rhsCtx cur3
+                        pure (RhsPlain e, curE)
+                    TkBar -> do
+                        (branches, curE) <- parseLetGuardBranchesInGuard c rhsCtx cur3 []
+                        pure (RhsGuards branches, curE)
+                    _ -> parseErr c "expected `=` or `|` in guard-let binding" sepTok
+                pure ([(n, desugarClauses [(params, rhs)] (length params))], cur4)
+            _ | startsPat (tkKind nameTok) -> do
+                (pat, cur2) <- parseTopPat c cur
+                let (eqTok, cur3) = nextSig c cur2
+                case tkKind eqTok of
+                    TkEq -> do
+                        (e, cur4) <- parseExpr rhsCtx cur3
+                        let tmpName = BC.pack ("$glet" ++ show bindCol)
+                            vars = guardLetPatVars pat
+                            perVar v =
+                                ( v
+                                , ECase (EVar tmpName)
+                                    [ Alt (PIrref pat) (EVar v)
+                                    , Alt PWild (EApp (EVar "error")
+                                                  (stringToConsList
+                                                    "Non-exhaustive pattern in guard let"))
+                                    ]
+                                )
+                        pure ((tmpName, e) : map perVar vars, cur4)
+                    _ -> parseErr c "expected `=` in guard-let pattern binding" eqTok
+              | otherwise ->
+                parseErr c "expected identifier or pattern after `let` in guard" nameTok
+
+    parseLetGuardBranchesInGuard c rhsCtx cur acc = do
+        (gs, cur1) <- parseGuardList c cur
+        let (eqTok, cur2) = nextSig c cur1
+        case tkKind eqTok of
+            TkEq -> pure ()
+            _    -> parseErr c "expected `=` after guard in guard-let" eqTok
+        (b, cur3) <- parseExpr rhsCtx cur2
+        let acc' = acc ++ [(gs, b)]
+            (sep, cur4) = nextSig c cur3
+        case tkKind sep of
+            TkBar -> parseLetGuardBranchesInGuard c rhsCtx cur4 acc'
+            _     -> pure (acc', cur3)
+
+    guardLetPatVars (PVar n)        = [n]
+    guardLetPatVars (PAs n p)       = n : guardLetPatVars p
+    guardLetPatVars (PBang p)       = guardLetPatVars p
+    guardLetPatVars (PIrref p)      = guardLetPatVars p
+    guardLetPatVars (PTuple ps)     = concatMap guardLetPatVars ps
+    guardLetPatVars (PCon _ ps)     = concatMap guardLetPatVars ps
+    guardLetPatVars (PRecord _ fps) = concatMap (guardLetPatVars . snd) fps
+    guardLetPatVars (PRecordWild _) = []
+    guardLetPatVars (PView _ p)     = guardLetPatVars p
+    guardLetPatVars PWild           = []
+    guardLetPatVars (PLit _)        = []
 
 --------------------------------------------------------------------------------
 -- Clause desugaring
@@ -550,10 +915,22 @@ desugarClauses [(pats, RhsPlain body)] _
         in foldr ELam body' names
 desugarClauses clauses arity =
     let argNames = [BC.pack ("$a" ++ show i) | i <- [0 .. arity - 1]]
+        -- Include the failing argument values in the error so warp-style
+        -- "Non-exhaustive patterns in function: [[IS…],[IP…],[IN…]]"
+        -- failures name the runtime shape (VInt / NS / W# / …).
+        failMsg = stringToConsList
+                    ("Non-exhaustive patterns in function: "
+                      <> show (map fst clauses)
+                      <> " args=")
+        showArgs = foldr
+            (\a acc -> EApp (EApp (EVar "++")
+                                   (EApp (EVar "show") (EVar a)))
+                             (EApp (EApp (EVar "++") (stringToConsList " "))
+                                   acc))
+            (stringToConsList "")
+            argNames
         ultimateFail = EApp (EVar "error")
-                            (stringToConsList
-                                ("Non-exhaustive patterns in function: "
-                                  <> show (map fst clauses)))
+                            (EApp (EApp (EVar "++") failMsg) showArgs)
         bodyExpr = buildClauses argNames clauses ultimateFail
     in foldr ELam bodyExpr argNames
 
@@ -586,6 +963,12 @@ guardStep (GuardPat p scrut : rest) body fb =
         [ Alt p (guardStep rest body fb)
         , Alt PWild fb
         ]
+-- Local-decl guard: introduce the binds around the remainder of the
+-- guard chain and body (Haskell 2010 §3.13).
+guardStep (GuardLet binds : rest) body fb =
+    case binds of
+        [] -> guardStep rest body fb
+        bs -> ELet bs (guardStep rest body fb)
 
 matchPatterns :: [(Pat, Name)] -> Expr -> Expr -> Expr
 matchPatterns [] body _ = body
@@ -795,6 +1178,7 @@ parseBindingsIn src fx (start, end) = do
                     wrapGuard = \case
                         GuardExpr g   -> GuardExpr (wrap g)
                         GuardPat p ge -> GuardPat p (wrap ge)
+                        GuardLet bs   -> GuardLet [ (n, wrap e) | (n, e) <- bs ]
                     rhs' = case rhs of
                         RhsPlain e    -> RhsPlain (wrap e)
                         RhsGuards ges -> RhsGuards [(map wrapGuard gs, wrap b) | (gs, b) <- ges]
@@ -825,14 +1209,15 @@ parseBindingsIn src fx (start, end) = do
     -- Returns (tmpBind, perVarBinds, curAfter).
     -- e.g. (a, b) = rhs  =>
     --   $wh0 = rhs
-    --   a    = case $wh0 of { (a, _) -> a }
-    --   b    = case $wh0 of { (_, b) -> b }
+    --   a    = case $wh0 of { ~(a, _) -> a }
+    --   b    = case $wh0 of { ~(_, b) -> b }
+    -- Report §3.12: where/let pattern matches are irrefutable.
     parseWherePatBind ctx accLen cur = do
         -- Use 'parseTopPat' so constructor-application LHS patterns
         -- like @BS _ m = bs@ (i.e. PCon with arguments) and infix
-        -- @x : xs = ys@ are accepted.  'parseSubPat' only consumes
-        -- a single atomic pattern token — for @BS _ m = bs@ it
-        -- consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
+        -- @x : xs = ys@ / @a :| as = ne@ are accepted.  'parseSubPat'
+        -- only consumes a single atomic pattern token — for @BS _ m = bs@
+        -- it consumed @BS@ as a nullary 'PCon "BS" []' and then bailed
         -- with @expected `=`; saw TkUnderscore@.  This had been
         -- silently failing inside 'discoverInModule' (the error was
         -- caught and turned into 'unbound variable Data.ByteString.
@@ -848,13 +1233,13 @@ parseBindingsIn src fx (start, end) = do
                     tmpBind  = (tmpName, rhsE)
                     vars     = patVars pat
                     -- For each bound variable v, produce:
-                    --   v = case $tmp of { pat -> v }
-                    -- where pat is the original pattern (variables other than v
-                    -- are still bound by the same match; we just project v out).
+                    --   v = case $tmp of { ~pat -> v }
+                    -- Irrefutable so that @where b :| bs = f a@ matches
+                    -- Report §3.12 lazy pattern-binding semantics.
                     perVarBind v =
                         ( v
                         , ECase (EVar tmpName)
-                            [ Alt pat (EVar v)
+                            [ Alt (PIrref pat) (EVar v)
                             , Alt PWild (EApp (EVar "error")
                                           (stringToConsList
                                             "Non-exhaustive pattern in where"))
@@ -883,6 +1268,14 @@ parseBindingsIn src fx (start, end) = do
     -- (e.g. `f _ [] = ...; f x (y:_) = ...`) are properly desugared.
     -- Returns a list of Bind because a pattern binding expands to multiple binds.
     parseOne ctx bindCol accLen cur = do
+        -- RHS expressions must stop at sibling bindings at @bindCol@.
+        -- Without this, a pattern/as-pattern binding whose RHS is a
+        -- constructor application (e.g. @brInner@(BufferRange opInner _)
+        -- = BufferRange (op+2) (ope-1)@) greedily eats the next binding
+        -- (@doneH …@) as extra arguments — leaving @doneH@ unbound.
+        -- That shape is the HTTP chunked-encoder's inner where-block in
+        -- @bsb-http-chunked@ / @Data.ByteString.Builder.HTTP.Chunked@.
+        let rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
         let (peekTok, cur1Peek) = nextSig ctx cur
         case tkKind peekTok of
             -- As-pattern binding: @name @ pat = rhs@ (e.g.
@@ -895,18 +1288,19 @@ parseBindingsIn src fx (start, end) = do
                 | (atTok, _) <- nextSig ctx cur1Peek
                 , tkKind atTok == TkAt -> do
                     let (_, cur2Peek)   = nextSig ctx cur1Peek    -- consume @
-                    (subPat, cur3Peek)  <- parseSubPat ctx cur2Peek
+                    -- parseTopPat so @name@(Con a b)@ keeps constructor args.
+                    (subPat, cur3Peek)  <- parseTopPat ctx cur2Peek
                     let (eqTok, cur4Peek) = nextSig ctx cur3Peek
                     case tkKind eqTok of
                         TkEq -> do
-                            (rhsE, cur5Peek) <- parseExpr ctx cur4Peek
+                            (rhsE, cur5Peek) <- parseExpr rhsCtx cur4Peek
                             -- Project the bound vars of subPat out of name.
                             let nameBind = (n, rhsE)
                                 vars     = patVars subPat
                                 perVarBind v =
                                     ( v
                                     , ECase (EVar n)
-                                        [ Alt subPat (EVar v)
+                                        [ Alt (PIrref subPat) (EVar v)
                                         , Alt PWild (EApp (EVar "error")
                                                       (stringToConsList
                                                         "Non-exhaustive as-pattern in where"))
@@ -917,6 +1311,14 @@ parseBindingsIn src fx (start, end) = do
                         _ -> parseErr ctx
                                 "expected `=` after as-pattern in where-binding"
                                 eqTok
+            -- Unparenthesised infix conop pattern binding in where:
+            --   where b :| bs = f a
+            -- (base's Monad NonEmpty).  Route to parseWherePatBind before
+            -- the function-binding path swallows the leading ident.
+            TkIdent _
+                | hasTopLevelConOpBeforeEq ctx cur -> do
+                    (newBinds, cur') <- parseWherePatBind rhsCtx accLen cur
+                    pure (newBinds, cur')
             TkIdent _ -> do
                 -- Normal named binding (identifier starts the binding).
                 (name, params0, rhs0, cur1) <- parseClauseRaw ctx cur
@@ -943,11 +1345,12 @@ parseBindingsIn src fx (start, end) = do
                 case tkKind eqTok of
                     TkEq -> pure ()
                     _    -> parseErr ctx "expected `=` after ?ip in where-binding" eqTok
-                (_, cur3) <- parseExpr ctx cur2
+                (_, cur3) <- parseExpr rhsCtx cur2
                 pure ([], cur3)
             _ | startsPat (tkKind peekTok) -> do
-                -- Pattern binding: (a, b) = rhs, Con x = rhs, etc.
-                (newBinds, cur') <- parseWherePatBind ctx accLen cur
+                -- Pattern binding: (a, b) = rhs, Con x = rhs, !x = rhs,
+                -- !brInner@(BufferRange op _) = …, etc.
+                (newBinds, cur') <- parseWherePatBind rhsCtx accLen cur
                 pure (newBinds, cur')
               | otherwise ->
                 parseErr ctx "expected identifier or pattern in where-binding" peekTok
@@ -1124,6 +1527,10 @@ parseExprNoSig ctx cur0 = do
     case tkKind tok of
         TkIf        -> parseIf ctx cur1
         TkDo        -> parseDo ctx cur1
+        -- RecursiveDo: non-recursive mdo desugars like do (sufficient for
+        -- the common case with no cross-bind recursion). Full mfix
+        -- desugaring is future work.
+        TkMDo       -> parseDo ctx cur1
         TkLet       -> parseLet ctx cur1
         TkCase      -> parseCase ctx cur1
         TkBackslash -> parseLambda ctx cur1
@@ -1150,6 +1557,13 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkRBracket | b == 0 && p == 0 && c == 0 -> pure cur
             TkRBrace | b == 0 && p == 0 && c == 0 -> pure cur
             TkComma | b == 0 && p == 0 && c == 0 -> pure cur
+            -- `..` ends the annotation in an arithmetic sequence like
+            -- @[minBound :: StdMethod .. maxBound]@ (http-types' methodArray);
+            -- a type annotation never contains a top-level @..@, so this only
+            -- fires on the range operator.  Without it the scanner swallows
+            -- @StdMethod .. maxBound@ as the type and the range collapses to a
+            -- 1-element list.
+            TkDotDot | b == 0 && p == 0 && c == 0 -> pure cur
             TkOf    | b == 0 && p == 0 && c == 0 -> pure cur   -- `case e :: T of …`
             TkThen  | b == 0 && p == 0 && c == 0 -> pure cur
             TkElse  | b == 0 && p == 0 && c == 0 -> pure cur
@@ -1644,6 +2058,7 @@ parseStmt ctx cur0 = do
                   , tkCol t <= ctxMinCol ctx -> False
                 TkLArrow | par == 0 && br == 0 && brace == 0 -> True
                 TkDo | par == 0 && br == 0 && brace == 0 -> False
+                TkMDo | par == 0 && br == 0 && brace == 0 -> False
                 TkIf | par == 0 && br == 0 && brace == 0 -> False
                 TkLet | par == 0 && br == 0 && brace == 0 -> False
                 TkCase | par == 0 && br == 0 && brace == 0 -> False
@@ -1716,7 +2131,7 @@ parseDoLet ctx cur0 = do
                     pure ([SImplicitLet iBinds], curEnd)
                 _ -> do
                     (binds, curEnd) <- bracedBinds curAfter []
-                    pure ([SLet binds], curEnd)
+                    pure (doLetStmts binds, curEnd)
         -- Per Haskell Report §3.17.2 + GHC BangPatterns: `let !x = e`
         -- inside a do-block must force e to WHNF before the rest of the
         -- block runs. Lower the simple single-binding form to
@@ -1745,7 +2160,7 @@ parseDoLet ctx cur0 = do
                                 else do
                                     -- Multi-binding let; fall back to layout.
                                     (binds, curEnd) <- layoutBinds bindCol cur0 []
-                                    pure ([SLet binds], curEnd)
+                                    pure (doLetStmts binds, curEnd)
                         _ -> fallbackLayout firstTok
                 _ -> fallbackLayout firstTok
         _ -> fallbackLayout firstTok
@@ -1754,7 +2169,9 @@ parseDoLet ctx cur0 = do
         let bindCol = tkCol firstTok
         in do
             (binds, curEnd) <- layoutBinds bindCol cur0 []
-            pure ([SLet binds], curEnd)
+            pure (doLetStmts binds, curEnd)
+
+    doLetStmts binds = [SLet binds]
 
     parseImplicitDoBinds bindCol cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
@@ -1823,18 +2240,38 @@ parseDoLet ctx cur0 = do
                 pure (desugarClauses [([], RhsGuards branches)] 0, cur3')
             _ -> parseErr ctx "expected `=` or `|` in pattern let-binding" sepTok
         let tmpName = BC.pack ("$doPat" ++ show n)
+            strictName = BC.pack ("$doPatStrict" ++ show n)
             vars    = doLetPatVars pat
+            -- Report §3.12: let patterns are irrefutable unless bang-strict.
+            matchPat'
+                | isStrictDoLetPat pat = pat
+                | otherwise            = PIrref pat
             perVar v =
                 ( v
                 , ECase (EVar tmpName)
-                    [ Alt pat (EVar v)
+                    [ Alt matchPat' (EVar v)
                     , Alt PWild (EApp (EVar "error")
                                   (stringToConsList
                                     "Non-exhaustive pattern in let"))
                     ]
                 )
-            newBinds = (tmpName, rhsE) : map perVar vars
+            strictBind =
+                ( strictName
+                , ECase (EVar tmpName)
+                    [ Alt pat (EVar "()")
+                    , Alt PWild (EApp (EVar "error")
+                                  (stringToConsList
+                                    "Non-exhaustive pattern in strict let"))
+                    ]
+                )
+            newBinds =
+                (tmpName, rhsE)
+                : map perVar vars
+                ++ [strictBind | isStrictDoLetPat pat]
         pure (newBinds, cur3)
+
+    isStrictDoLetPat (PBang _) = True
+    isStrictDoLetPat _         = False
 
     parseDoLetClauseRaw bindCol cur = do
         let (nameTok, cur1) = nextSig ctx cur
@@ -1870,54 +2307,15 @@ parseDoLet ctx cur0 = do
         case tkKind peekWhere of
             TkWhere -> do
                 let whereTokCol = tkCol peekWhere
-                    (whereEndPos, curEnd) = findWhereBlockEnd whereTokCol curAfterWhere
+                    (whereEndPos, curEnd) =
+                        findWhereBlockEndAt ctx whereTokCol curAfterWhere
                 if cPos curAfterWhere >= whereEndPos
                     then pure (rhs, cur)
                     else do
                         binds <- parseBindingsIn (ctxSrc ctx) (ctxFixity ctx)
                                                  (cPos curAfterWhere, whereEndPos)
-                        pure (wrapWhereBinds binds rhs, curEnd)
+                        pure (wrapRhsWhereBinds binds rhs, curEnd)
             _ -> pure (rhs, cur)
-
-
-    -- Walk forward from a position just after @where@ and return both
-    -- the byte offset at which the where-block ends and a 'Cursor'
-    -- positioned there with correct line/col (the lexer needs accurate
-    -- line/col on the cursor passed to subsequent 'nextToken' calls,
-    -- otherwise downstream 'tkCol' checks compare against stale columns
-    -- from the cursor's previous position).  Block ends at the first
-    -- non-newline token whose column is <= @whereTokCol@.
-    findWhereBlockEnd whereTokCol startCur = go startCur
-      where
-        go c
-            | cPos c >= ctxEnd ctx = (ctxEnd ctx, c)
-            | otherwise =
-                let (t, c') = nextToken (ctxSrc ctx) c in
-                case tkKind t of
-                    TkEof     -> (cPos c, c)
-                    TkNewline -> go c'
-                    _ | tkCol t <= whereTokCol ->
-                          -- Build a cursor at the start of @t@ with
-                          -- the lexer-reported line/col for that
-                          -- position.  Using @c@ (the cursor before
-                          -- this nextToken call) would carry stale
-                          -- line/col from before whitespace was
-                          -- skipped.
-                          (tkStart t, Cursor (tkStart t) (tkLine t) (tkCol t))
-                      | otherwise              -> go c'
-
-    wrapWhereBinds [] r = r
-    wrapWhereBinds bs r = case r of
-        RhsPlain e    -> RhsPlain (ELet bs e)
-        RhsGuards ges -> RhsGuards
-            [ ( map (wrapGuardBinds bs) gs
-              , ELet bs b
-              )
-            | (gs, b) <- ges
-            ]
-
-    wrapGuardBinds bs (GuardExpr g)   = GuardExpr (ELet bs g)
-    wrapGuardBinds bs (GuardPat p ge) = GuardPat p (ELet bs ge)
 
     collectMoreDoLetClauses bindCol name cur acc = do
         let (peek, _) = nextSig ctx cur
@@ -1940,7 +2338,17 @@ parseDoLet ctx cur0 = do
             Nothing -> do
                 let (nameTok, cur1) = nextSig ctx cur
                 case tkKind nameTok of
-                    TkIdent n -> do
+                    TkIdent n
+                        | hasTopLevelConOpBeforeEq ctx cur -> do
+                            -- Unparenthesised infix conop pattern in do-let:
+                            --   let a :| as = ne
+                            (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                            let (peek, _) = nextSig ctx cur4
+                                acc' = reverse patBinds ++ acc
+                            if tkCol peek == bindCol && tkKind peek /= TkEof
+                                then layoutBinds bindCol cur4 acc'
+                                else pure (reverse acc', cur4)
+                        | otherwise -> do
                         let _ = cur1
                         (_, params0, rhs0, cur4a) <- parseDoLetClauseRaw bindCol cur
                         (moreClauses, cur4) <- collectMoreDoLetClauses bindCol n cur4a []
@@ -1992,27 +2400,39 @@ parseDoLet ctx cur0 = do
 
     bracedIdentBind cur acc = do
         let (nameTok, cur1) = nextSig ctx cur
-        name <- case tkKind nameTok of
-            TkIdent n -> pure n
-            _         -> parseErr ctx "expected identifier in let-binding" nameTok
-        (params, cur2) <- collectLetParams ctx cur1 []
-        let (sepTok, cur3) = nextSig ctx cur2
-        (e, cur4) <- case tkKind sepTok of
-            TkEq -> do
-                (rhs, cur4') <- parseExpr ctx cur3
-                pure (wrapParams params rhs, cur4')
-            TkBar -> do
-                (branches, cur4') <- parseDoLetGuardBranches ctx cur3 []
-                let rhs = desugarClauses
-                            [(params, RhsGuards branches)]
-                            (length params)
-                pure (rhs, cur4')
-            _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
-        let (sep, curN) = nextSig ctx cur4
-        case tkKind sep of
-            TkSemi   -> bracedBinds curN ((name, e) : acc)
-            TkRBrace -> pure (reverse ((name, e) : acc), curN)
-            _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+        -- Unparenthesised infix conop pattern: `{ a :| as = ne; … }`
+        case tkKind nameTok of
+            TkIdent _
+                | hasTopLevelConOpBeforeEq ctx cur -> do
+                    (patBinds, cur4) <- parseDoLetPatBind (length acc) cur
+                    let (sep, curN) = nextSig ctx cur4
+                        acc' = reverse patBinds ++ acc
+                    case tkKind sep of
+                        TkSemi   -> bracedBinds curN acc'
+                        TkRBrace -> pure (reverse acc', curN)
+                        _        -> parseErr ctx "expected `;` or `}` in let-block" sep
+            _ -> do
+                name <- case tkKind nameTok of
+                    TkIdent n -> pure n
+                    _         -> parseErr ctx "expected identifier in let-binding" nameTok
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (sepTok, cur3) = nextSig ctx cur2
+                (e, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (rhs, cur4') <- parseExpr ctx cur3
+                        pure (wrapParams params rhs, cur4')
+                    TkBar -> do
+                        (branches, cur4') <- parseDoLetGuardBranches ctx cur3 []
+                        let rhs = desugarClauses
+                                    [(params, RhsGuards branches)]
+                                    (length params)
+                        pure (rhs, cur4')
+                    _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+                let (sep, curN) = nextSig ctx cur4
+                case tkKind sep of
+                    TkSemi   -> bracedBinds curN ((name, e) : acc)
+                    TkRBrace -> pure (reverse ((name, e) : acc), curN)
+                    _        -> parseErr ctx "expected `;` or `}` in let-block" sep
 
     parseDoLetGuardBranches ctx cur acc = do
         (gs, cur1) <- parseGuardList ctx cur
@@ -2095,23 +2515,72 @@ parseLet ctx cur0 = do
             TkIn -> pure ()
             _    -> parseErr ctx "expected `in` in let-binding" inTok
         (body0, curBody) <- parseExpr ctx curIn
-        -- Desugar all items: normal bindings accumulate into ELet,
-        -- pattern bindings get a fresh temp name + body wrapped in ECase.
+        -- Desugar all items into one recursive let group. Pattern-bound
+        -- variables must be in scope for sibling bindings too, e.g.
+        --   let (a, b) = rhs
+        --       c = b
+        --   in c
+        -- so expose each variable as its own lazy projection binding instead
+        -- of wrapping only the final body in a case.
         let (normalBinds, body1) = foldl desugarItem ([], body0) (reverse items)
         pure (if null normalBinds then body1 else ELet normalBinds body1, curBody)
       where
         desugarItem (normalAcc, bodyAcc) (Left (n, e)) =
             ((n, e) : normalAcc, bodyAcc)
         desugarItem (normalAcc, bodyAcc) (Right (pat, rhsE)) =
-            -- let (a, b) = rhs in body
-            -- desugars to: let $patN = rhs in case $patN of { pat -> body; _ -> error }
+            -- let (a, b) = rhs
+            -- desugars to:
+            --   let $patN = rhs
+            --       a = case $patN of { ~(a, _) -> a }
+            --       b = case $patN of { ~(_, b) -> b }
+            -- Haskell Report §3.12: pattern matches in let/where are always
+            -- irrefutable (lazy).  Wrap non-bang patterns in 'PIrref' so
+            -- the match is deferred until a bound variable is forced —
+            -- matching base's @where b :| bs = f a@ in Monad NonEmpty.
+            -- For a strict pattern binding (`let !pat = rhs`), also wrap
+            -- the body in a case on the shared temporary.  The projection
+            -- bindings stay in the recursive let group so sibling RHSs can
+            -- still refer to the pattern variables, but the body now has the
+            -- strictness edge that source IO/state loops rely on.
             let tmpName = BC.pack ("$pat" ++ show (length normalAcc))
-                newBody = ECase (EVar tmpName)
+                vars = letPatVars pat
+                matchPat'
+                    | isStrictLetPat pat = pat
+                    | otherwise          = PIrref pat
+                perVarBind v =
+                    ( v
+                    , ECase (EVar tmpName)
+                        [ Alt matchPat' (EVar v)
+                        , Alt PWild (EApp (EVar "error")
+                                      (stringToConsList
+                                        "Non-exhaustive pattern in let"))
+                        ]
+                    )
+                bodyAcc'
+                    | isStrictLetPat pat =
+                        ECase (EVar tmpName)
                             [ Alt pat bodyAcc
                             , Alt PWild (EApp (EVar "error")
-                                          (stringToConsList "Non-exhaustive pattern in let"))
+                                          (stringToConsList
+                                            "Non-exhaustive pattern in strict let"))
                             ]
-            in ((tmpName, rhsE) : normalAcc, newBody)
+                    | otherwise = bodyAcc
+            in ((tmpName, rhsE) : map perVarBind vars ++ normalAcc, bodyAcc')
+
+        isStrictLetPat (PBang _) = True
+        isStrictLetPat _         = False
+
+        letPatVars (PVar n)        = [n]
+        letPatVars (PAs n p)       = n : letPatVars p
+        letPatVars (PBang p)       = letPatVars p
+        letPatVars (PIrref p)      = letPatVars p
+        letPatVars (PTuple ps)     = concatMap letPatVars ps
+        letPatVars (PCon _ ps)     = concatMap letPatVars ps
+        letPatVars (PRecord _ fps) = concatMap (letPatVars . snd) fps
+        letPatVars (PRecordWild _) = []
+        letPatVars (PView _ p)     = letPatVars p
+        letPatVars PWild           = []
+        letPatVars (PLit _)        = []
 
     finishLet binds curEnd = do
         let (inTok, curIn) = nextSig ctx curEnd
@@ -2138,48 +2607,168 @@ parseLet ctx cur0 = do
     --   name params = expr
     --   name params | guard = expr | guard = expr
     --   (pat, ...) = expr            (pattern binding, returned as Right)
+    --   a :| as = expr / x:xs = expr  (infix conop pattern binding)
+    --   pat1 op pat2 = expr           (infix varop multi-clause funlhs)
+    --   name = expr where binds       (trailing where on the binding)
     parseOneLetItem bindCol cur = do
         let rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
         let (nameTok, cur1) = nextSig ctx cur
-        case tkKind nameTok of
-            TkIdent n -> do
-                (params, cur2) <- collectLetParams ctx cur1 []
-                let (sepTok, cur3) = nextSig ctx cur2
-                case tkKind sepTok of
-                    TkEq -> do
-                        (e, cur4) <- parseExpr rhsCtx cur3
-                        pure (Left (n, wrapParams params e), cur4)
-                    TkBar -> do
-                        (branches, cur4) <- parseLetGuardBranches rhsCtx cur3 []
-                        let e = desugarClauses [(params, RhsGuards branches)] (length params)
-                        pure (Left (n, e), cur4)
-                    _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
-            _ | startsPat (tkKind nameTok) -> do
-                -- Pattern binding: (a, b) = expr, Con x = expr, !x = expr, etc.
-                -- Use parseTopPat so applied constructors (e.g. `Foo a b`) are
-                -- collected into a single PCon instead of stopping at the bare
-                -- constructor name — IHP's @let QueryBuilder sq = ...@ idiom.
-                (pat, cur2) <- parseTopPat ctx cur
-                let (eqTok, cur3) = nextSig ctx cur2
-                case tkKind eqTok of
-                    TkEq -> do
-                        (e, cur4) <- parseExpr rhsCtx cur3
-                        -- @let !x = e@ is just a strict simple-name binding;
-                        -- since IHC currently ignores the strictness annotation
-                        -- (Parser.hs:20) we strip the bang and treat it as a
-                        -- normal @Left (x, e)@ binding.  This matters for
-                        -- mixed multi-binding lets like
-                        --   @let !d = ...; go_up x = ... d ... in ...@
-                        -- (e.g. @GHC.Enum.efdtIntUp@): pattern bindings are
-                        -- desugared via a @case@-projection that only binds the
-                        -- pattern's variables inside the alt's body, not in
-                        -- the surrounding @ELet@ siblings, so without this
-                        -- strip the inner @go_up@ would see @d@ as unbound.
-                        case pat of
-                            PBang (PVar n) -> pure (Left (n, e), cur4)
-                            _              -> pure (Right (pat, e), cur4)
-                    _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
-              | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
+        -- Infix varop funlhs first (non-conop): `a + b = e` /
+        -- `Leftover _ i >< _ = e`.  Must win over both the identifier-
+        -- function path and the pattern-bind path, else we treat the left
+        -- side as a function/pattern name and choke on the operator
+        -- ("expected `=` in pattern let-binding; saw TkSymOp \"><\"").
+        case peekTopLevelVarOpBeforeEq ctx cur of
+            Just _ -> do
+                (opName, clause0, curAfter0) <- parseOneInfixLetClause rhsCtx cur
+                (moreClauses, curFinal) <-
+                    collectMoreInfixLetClauses bindCol opName curAfter0 []
+                let allClauses = clause0 : moreClauses
+                    e = desugarClauses allClauses 2
+                pure (Left (opName, e), curFinal)
+            Nothing -> case tkKind nameTok of
+                TkIdent n
+                    -- Unparenthesised infix conop pattern: `a :| as = rhs`.
+                    -- Must win over the function-binding path, else we treat
+                    -- `a` as the function name and choke on the `:|`.
+                    | hasTopLevelConOpBeforeEq ctx cur -> do
+                        (pat, cur2) <- parseTopPat ctx cur
+                        let (eqTok, cur3) = nextSig ctx cur2
+                        case tkKind eqTok of
+                            TkEq -> do
+                                (e, cur4) <- parseExpr rhsCtx cur3
+                                pure (Right (pat, e), cur4)
+                            _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
+                    | otherwise -> do
+                    -- Multi-clause let functions, e.g. bytestring's
+                    -- packUptoLenChars:
+                    --   let go !p []     = ...
+                    --       go !p (c:cs) = ...
+                    --   in go p0 cs0
+                    -- Without collecting same-name clauses, the last equation
+                    -- shadows the rest and wrapParams turns @(c:cs)@ into a
+                    -- single-pattern lambda that fails on @[]@ with
+                    -- "Non-exhaustive patterns in let: PCon \":\" …".  That
+                    -- blocked Lazy.Char8.pack / responseLBS string bodies.
+                    (params0, cur2) <- collectLetParams ctx cur1 []
+                    let (sepTok, cur3) = nextSig ctx cur2
+                    (rhs0, cur4) <- case tkKind sepTok of
+                        TkEq -> do
+                            (e, c) <- parseExpr rhsCtx cur3
+                            pure (RhsPlain e, c)
+                        TkBar -> do
+                            (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
+                            pure (RhsGuards branches, c)
+                        _ -> parseErr ctx "expected `=` or `|` in let-binding" sepTok
+                    -- Trailing @where@ on this equation (conduit's
+                    -- fuseReturnLeftovers: @goLeft … = case … where recurse = …@).
+                    -- Without this, layoutLetItems stops at TkWhere and
+                    -- finishLetItems fails with "expected `in`; saw TkWhere".
+                    (rhs1, cur5) <- attachLetWhere rhs0 cur4
+                    (moreClauses, curFinal) <-
+                        collectMoreLetClauses bindCol n cur5 []
+                    let allClauses = (params0, rhs1) : moreClauses
+                        e = desugarClauses allClauses (length params0)
+                    pure (Left (n, e), curFinal)
+                _ | startsPat (tkKind nameTok) -> do
+                    -- Pattern binding: (a, b) = expr, Con x = expr, !x = expr, etc.
+                    -- Use parseTopPat so applied constructors (e.g. `Foo a b`) are
+                    -- collected into a single PCon instead of stopping at the bare
+                    -- constructor name — IHP's @let QueryBuilder sq = ...@ idiom.
+                    (pat, cur2) <- parseTopPat ctx cur
+                    let (eqTok, cur3) = nextSig ctx cur2
+                    case tkKind eqTok of
+                        TkEq -> do
+                            (e, cur4) <- parseExpr rhsCtx cur3
+                            pure (Right (pat, e), cur4)
+                        _ -> parseErr ctx "expected `=` in pattern let-binding" eqTok
+                  | otherwise -> parseErr ctx "expected identifier or pattern after `let`" nameTok
+
+    -- Parse one infix funlhs clause: @pat1 op pat2 = rhs@ (or guards),
+    -- including a trailing @where@.  Returns (opName, (@[left,right]@, rhs),
+    -- cursor-after).  Caller has already confirmed via
+    -- 'peekTopLevelVarOpBeforeEq' that this is a varop funlhs.
+    parseOneInfixLetClause rhsCtx cur = do
+        (leftPat, curL) <- parseTopPat ctx cur
+        (opName, curOp) <- consumeLetInfixOp curL
+        (rightPat, curR) <- parseTopPat ctx curOp
+        let (sepTok, cur3) = nextSig ctx curR
+        (rhs0, cur4) <- case tkKind sepTok of
+            TkEq -> do
+                (e, c) <- parseExpr rhsCtx cur3
+                pure (RhsPlain e, c)
+            TkBar -> do
+                (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
+                pure (RhsGuards branches, c)
+            _ -> parseErr ctx "expected `=` or `|` in infix let-binding" sepTok
+        (rhs1, cur5) <- attachLetWhere rhs0 cur4
+        pure (opName, ([leftPat, rightPat], rhs1), cur5)
+
+    -- Consume a binary operator token (symbolic, dedicated, backtick, or
+    -- '@'-prefixed) between the two patterns of an infix let funlhs.
+    consumeLetInfixOp cur = do
+        let (tok, cur1) = nextSig ctx cur
+        case tkKind tok of
+            TkBacktick ->
+                case readBacktickName ctx cur1 of
+                    Just (n, cur2) -> do
+                        let (closeTok, cur3) = nextSig ctx cur2
+                        case tkKind closeTok of
+                            TkBacktick -> pure (n, cur3)
+                            _ -> parseErr ctx
+                                    "expected closing backtick in infix let-binding"
+                                    closeTok
+                    Nothing -> parseErr ctx
+                                    "expected operator name in backtick infix let"
+                                    tok
+            TkAt ->
+                let (nextTok, cur2) = nextSig ctx cur1 in
+                case tkKind nextTok of
+                    TkSymOp suf -> pure (BC.cons '@' suf, cur2)
+                    _ -> parseErr ctx "expected symbolic op after `@` in infix let" nextTok
+            k | Just n <- tokenOpName k
+              , n /= BC.pack "~" -> pure (n, cur1)
+              | otherwise ->
+                    parseErr ctx "expected infix operator in let-binding" tok
+
+    -- Collect additional same-operator equations for a multi-clause infix
+    -- let binding (mirrors top-level Scan.collectMoreOpClauses).
+    collectMoreInfixLetClauses bindCol opName cur acc = do
+        let (peek, _) = nextSig ctx cur
+            rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
+        case tkKind peek of
+            TkIn  -> pure (acc, cur)
+            TkEof -> pure (acc, cur)
+            -- Explicit @;@ separator between clauses (rare for layout
+            -- multi-clause, but cheap to accept).
+            TkSemi ->
+                let (_, curSemi) = nextSig ctx cur
+                in collectMoreInfixLetClauses bindCol opName curSemi acc
+            _ | tkCol peek == bindCol
+              , peekTopLevelVarOpBeforeEq ctx cur == Just opName -> do
+                    (_op, clause, cur') <- parseOneInfixLetClause rhsCtx cur
+                    collectMoreInfixLetClauses bindCol opName cur'
+                        (acc ++ [clause])
+              | otherwise -> pure (acc, cur)
+
+    -- Consume a trailing @where@ on a let-binding's RHS so that
+    -- expression-level @let f x = body where helper = … in …@ parses.
+    -- Mirrors 'attachDoLetWhere' (do-block lets already had this path).
+    -- Also covers bytestring foldl'/foldr' nested-where loops.
+    attachLetWhere rhs cur = do
+        let (peekWhere, curAfterWhere) = nextSig ctx cur
+        case tkKind peekWhere of
+            TkWhere -> do
+                let whereTokCol = tkCol peekWhere
+                    (whereEndPos, curEnd) =
+                        findWhereBlockEndAt ctx whereTokCol curAfterWhere
+                if cPos curAfterWhere >= whereEndPos
+                    then pure (rhs, cur)
+                    else do
+                        binds <- parseBindingsIn (ctxSrc ctx) (ctxFixity ctx)
+                                                 (cPos curAfterWhere, whereEndPos)
+                        pure (wrapRhsWhereBinds binds rhs, curEnd)
+            _ -> pure (rhs, cur)
 
     -- Parse `| guard = expr` branches, returning when no more `|` is seen.
     parseLetGuardBranches ctx cur acc = do
@@ -2195,19 +2784,56 @@ parseLet ctx cur0 = do
             TkBar -> parseLetGuardBranches ctx cur4 acc'
             _     -> pure (acc', cur3)
 
+    -- Collect additional same-name equations for a multi-clause let
+    -- binding (mirrors 'collectMoreWhereClauses' / 'collectMoreDoLetClauses').
+    collectMoreLetClauses bindCol name cur acc = do
+        let (peek, _) = nextSig ctx cur
+            rhsCtx = ctx { ctxMinCol = max (ctxMinCol ctx) bindCol }
+        case tkKind peek of
+            TkIdent n | n == name && tkCol peek == bindCol -> do
+                let (_, cur1) = nextSig ctx cur   -- consume name
+                (params, cur2) <- collectLetParams ctx cur1 []
+                let (sepTok, cur3) = nextSig ctx cur2
+                (rhs0, cur4) <- case tkKind sepTok of
+                    TkEq -> do
+                        (e, c) <- parseExpr rhsCtx cur3
+                        pure (RhsPlain e, c)
+                    TkBar -> do
+                        (branches, c) <- parseLetGuardBranches rhsCtx cur3 []
+                        pure (RhsGuards branches, c)
+                    _ -> parseErr ctx
+                            "expected `=` or `|` in multi-clause let-binding"
+                            sepTok
+                (rhs, cur5) <- attachLetWhere rhs0 cur4
+                collectMoreLetClauses bindCol name cur5
+                    (acc ++ [(params, rhs)])
+            _ -> pure (acc, cur)
+
     -- Collect layout-mode let items (bindings and pattern bindings).
-    -- All items must be at `bindCol`.
+    -- All items must be at `bindCol` (unless separated by explicit @;@).
     -- Stop when we see `in`, EOF, or a token at a column < bindCol.
     -- Type signature lines (@name :: type@) are silently skipped.
+    --
+    -- Explicit @;@ separators (Haskell Report layout: optional braces)
+    -- allow one-line multi-bind lets such as lens Traversal's
+    -- @let b = …; (is, as) = unzip … in …@.  After @;@ the next binding
+    -- need not sit at @bindCol@ (it continues on the same line).
     layoutLetItems bindCol cur acc = do
         mSkip <- trySkipLetSig bindCol cur
         case mSkip of
             Just cur' -> do
                 -- Type sig skipped; continue if more bindings follow.
-                let (peek, _) = nextSig ctx cur'
+                let (peek, curPeek) = nextSig ctx cur'
                 case tkKind peek of
                     TkIn  -> pure (reverse acc, cur')
                     TkEof -> pure (reverse acc, cur')
+                    TkSemi ->
+                        -- Stray @;@ after a sig: eat it and continue/stop.
+                        let (after, _) = nextSig ctx curPeek in
+                        case tkKind after of
+                            TkIn  -> pure (reverse acc, curPeek)
+                            TkEof -> pure (reverse acc, curPeek)
+                            _     -> layoutLetItems bindCol curPeek acc
                     _ | tkCol peek == bindCol ->
                             layoutLetItems bindCol cur' acc
                       | otherwise -> pure (reverse acc, cur')
@@ -2215,10 +2841,20 @@ parseLet ctx cur0 = do
                 (item, cur') <- parseOneLetItem bindCol cur
                 let acc' = item : acc
                 -- Peek at the next significant token.
-                let (peek, _) = nextSig ctx cur'
+                let (peek, curPeek) = nextSig ctx cur'
                 case tkKind peek of
                     TkIn  -> pure (reverse acc', cur')
                     TkEof -> pure (reverse acc', cur')
+                    -- @let a = e1; b = e2 in …@ / @let a = e1; (x,y) = e2 in …@
+                    -- Consume the @;@ and keep collecting (column-free, like
+                    -- layoutIPBinds).  If @in@ follows immediately, stop with
+                    -- the cursor just after @;@ so finishLetItems sees @in@.
+                    TkSemi ->
+                        let (after, _) = nextSig ctx curPeek in
+                        case tkKind after of
+                            TkIn  -> pure (reverse acc', curPeek)
+                            TkEof -> pure (reverse acc', curPeek)
+                            _     -> layoutLetItems bindCol curPeek acc'
                     _ | tkCol peek == bindCol && tkKind peek /= TkIn ->
                             -- Same column and not `in` — another binding follows.
                             layoutLetItems bindCol cur' acc'
@@ -2507,7 +3143,29 @@ parseAltWhereBinds ctx cur0 = do
     -- @curAfter@ points past the first token (used when the first token
     -- is an identifier and we want to start collecting params/args).
     parseOneAltWhereBind innerCtx curBefore curAfter nameTok = case tkKind nameTok of
-        TkIdent name -> do
+        TkIdent name
+            | hasTopLevelConOpBeforeEq innerCtx curBefore -> do
+                -- Unparenthesised infix conop pattern: `a :| as = ne`
+                (pat, curPat) <- parseTopPat innerCtx curBefore
+                let (sepTok, curSep) = nextSig innerCtx curPat
+                case tkKind sepTok of
+                    TkEq -> do
+                        (rhsE, curE) <- parseExpr innerCtx curSep
+                        let tmpName = BC.pack "$altwh0"
+                            tmpBind = (tmpName, rhsE)
+                            vars = patVarsAlt pat
+                            perVarBind v =
+                                ( v
+                                , ECase (EVar tmpName)
+                                    [ Alt (PIrref pat) (EVar v)
+                                    , Alt PWild (EApp (EVar "error")
+                                                  (stringToConsList
+                                                    "Non-exhaustive pattern in alt-where"))
+                                    ]
+                                )
+                        pure (tmpBind : map perVarBind vars, curE)
+                    _ -> pure ([], curPat)
+            | otherwise -> do
             -- Simple variable binding: collect params then parse body.
             (params, curP) <- collectLetParams innerCtx curAfter []
             let (sepTok, curSep) = nextSig innerCtx curP
@@ -2530,7 +3188,7 @@ parseAltWhereBinds ctx cur0 = do
                         perVarBind v =
                             ( v
                             , ECase (EVar tmpName)
-                                [ Alt pat (EVar v)
+                                [ Alt (PIrref pat) (EVar v)
                                 , Alt PWild (EApp (EVar "error")
                                               (stringToConsList
                                                 "Non-exhaustive pattern in alt-where"))
@@ -2809,6 +3467,7 @@ peekViewArrow ctx cur0 = go cur0 (0 :: Int)
             TkLBrace              -> go cur' (depth + 1)
             TkRBrace              -> go cur' (depth - 1)
             TkComma  | depth == 0 -> False   -- tuple pattern, not view
+            TkDColon | depth == 0 -> False   -- typed pattern; arrows belong to the type
             TkArrow  | depth == 0 -> True
             _                     -> go cur' depth
 
@@ -3024,6 +3683,7 @@ parseBinOp ctx minBp cur0 = do
             TkBackslash  -> True
             TkIf         -> True
             TkDo         -> True
+            TkMDo        -> True
             TkLet        -> True
             TkCase       -> True
             k            -> startsAtom k
@@ -3089,19 +3749,119 @@ peekOp ctx cur =
             -- '@'-prefixed operator: @?=, @=?, etc.
             -- '@' (0x40) is not in isOpChar so it produces TkAt; the suffix is
             -- a separate TkSymOp.  Combine them into a single operator name.
+            -- Also recombine mid-@ lens ops when the suffix continues after
+            -- further '@' splits (rare for pure prefix forms).
             TkAt ->
                 let (nextTok, cur'') = nextSig ctx cur'
                 in case tkKind nextTok of
                     TkSymOp suf ->
-                        let name   = BC.pack "@" <> suf
-                            (a, p) = lookupFixity (ctxFixity ctx) name
-                        in Just (name, a, p, cur'')
+                        let name0 = BC.pack "@" <> suf
+                        in case extendOpThroughAt ctx name0 nextTok cur'' of
+                            Just (name, curEnd) ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name
+                                in Just (name, a, p, curEnd)
+                            Nothing ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name0
+                                in Just (name0, a, p, cur'')
+                    _ | Just more <- tokenOpName (tkKind nextTok) ->
+                        let name0 = BC.pack "@" <> more
+                        in case extendOpThroughAt ctx name0 nextTok cur'' of
+                            Just (name, curEnd) ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name
+                                in Just (name, a, p, curEnd)
+                            Nothing ->
+                                let (a, p) = lookupFixity (ctxFixity ctx) name0
+                                in Just (name0, a, p, cur'')
                     _ -> Nothing
+            -- Qualified symbolic operator: @P.>*<@ / @M.N.op@.  After the
+            -- lexer split of qualifier-dot + operator, tokens are
+            -- @ConId/Ident@ + adjacent @TkDot@ + adjacent op.  Without this
+            -- branch Pratt treats the module id as a juxta-arg and fails
+            -- with "not a function" on @char8@ applied to @>*<@.
+            -- Required by bsb-http-chunked @P.char8 P.>*< P.char8@.
+            TkConId mod0 -> peekQualifiedOp ctx mod0 tok cur'
+            TkIdent mod0 -> peekQualifiedOp ctx mod0 tok cur'
             _ -> case tokenOpName (tkKind tok) of
                 Nothing   -> Nothing
                 Just name ->
-                    let (a, p) = lookupFixity (ctxFixity ctx) name
-                    in Just (name, a, p, cur')
+                    -- Lens (and similar) operators embed '@' which the lexer
+                    -- emits as a separate TkAt — e.g. @^@..@ → TkSymOp "^"
+                    -- + TkAt + TkDotDot.  Recombine adjacent @-pieces into
+                    -- one operator name so Pratt can treat them as a single
+                    -- infix (FieldTH @ts ^@.. folded@).
+                    case extendOpThroughAt ctx name tok cur' of
+                        Just (fullName, curEnd) ->
+                            let (a, p) = lookupFixity (ctxFixity ctx) fullName
+                            in Just (fullName, a, p, curEnd)
+                        Nothing ->
+                            let (a, p) = lookupFixity (ctxFixity ctx) name
+                            in Just (name, a, p, cur')
+
+-- | After an operator token, try to recombine a following adjacent @'@'@
+-- plus more operator characters into a single name.  The lexer treats
+-- @'@'@ as 'TkAt' (not 'isOpChar'), so operators like lens @^@..@,
+-- @^@.@, @%@~@ arrive as multiple tokens and must be glued here.
+-- Returns 'Nothing' when there is no adjacent @'@'@ extension.
+extendOpThroughAt
+    :: Ctx -> Name -> Token -> Cursor
+    -> Maybe (Name, Cursor)
+extendOpThroughAt ctx name0 lastTok cur0 =
+    go name0 lastTok cur0 False
+  where
+    src = ctxSrc ctx
+    go acc lastTok' cur extended =
+        let (atTok, curAfterAt) = nextToken src cur
+        in case tkKind atTok of
+            TkAt | tkStart atTok == tkEnd lastTok' ->
+                let (segTok, curAfterSeg) = nextToken src curAfterAt
+                in if tkStart segTok == tkEnd atTok
+                      then case opSegmentName (tkKind segTok) of
+                          Just more ->
+                              go (acc <> BC.pack "@" <> more)
+                                 segTok curAfterSeg True
+                          Nothing ->
+                              -- Trailing bare '@' (e.g. @^@@ alone).
+                              Just (acc <> BC.pack "@", curAfterAt)
+                      else
+                          -- '@' not glued to a following op — still part
+                          -- of the operator (e.g. @foo^@@ bar@).
+                          Just (acc <> BC.pack "@", curAfterAt)
+            _ | extended -> Just (acc, cur)
+              | otherwise -> Nothing
+
+    -- Operator-segment names, including 'TkDotDot' which is NOT in
+    -- general 'tokenOpName' (so enum @..@ in list ranges is unaffected).
+    opSegmentName k = case k of
+        TkDotDot -> Just (BC.pack "..")
+        _        -> tokenOpName k
+
+-- | After consuming a module segment, try to read @.op@ (and further
+-- @.Seg.op@ chains) as a single qualified operator name for Pratt.
+peekQualifiedOp :: Ctx -> Name -> Token -> Cursor -> Maybe (Name, Assoc, Int, Cursor)
+peekQualifiedOp ctx firstSeg firstTok cur0 =
+    go firstSeg firstTok cur0
+  where
+    src = ctxSrc ctx
+    go acc lastTok cur =
+        let (dotTok, curAfterDot) = nextToken src cur
+        in case tkKind dotTok of
+            TkDot | tkStart dotTok == tkEnd lastTok ->
+                let (segTok, curAfterSeg) = nextToken src curAfterDot
+                in case tkKind segTok of
+                    TkConId n | tkStart segTok == tkEnd dotTok ->
+                        go (acc <> BC.pack "." <> n) segTok curAfterSeg
+                    TkIdent n | tkStart segTok == tkEnd dotTok ->
+                        -- @M.foo@ is a qualified var, not an infix op
+                        Nothing
+                    _ | Just opName <- tokenOpName (tkKind segTok)
+                      , tkStart segTok == tkEnd dotTok ->
+                        let name   = acc <> BC.pack "." <> opName
+                            -- Fixity is keyed on the bare operator
+                            -- (fixity decls don't use the module prefix).
+                            (a, p) = lookupFixity (ctxFixity ctx) opName
+                        in Just (name, a, p, curAfterSeg)
+                    _ -> Nothing
+            _ -> Nothing
 
 -- | Parse an identifier-like name inside backticks, allowing qualified
 -- segments such as @B.snoc@ or @Data.List.elem@.
@@ -3187,6 +3947,7 @@ parseUnary ctx cur0 = do
             pure (ENeg e, cur2)
         TkIf         -> parseIf         ctx cur1
         TkDo         -> parseDo         ctx cur1
+        TkMDo        -> parseDo         ctx cur1  -- RecursiveDo: same as do for non-recursive case
         TkLet        -> parseLet        ctx cur1
         TkCase       -> parseCase       ctx cur1
         TkBackslash  -> parseLambda     ctx cur1
@@ -3241,7 +4002,23 @@ parseApp ctx cur0 = do
             _ | isBlockArgStart (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
                     (arg, curA) <- parseBlockArg ctx cur
                     loop (EApp fn arg) curA
-            _ | startsAtom (tkKind tok) && tkCol tok > ctxMinCol ctx -> do
+            -- Qualified infix op (@P.>*<@): ConId/Ident that begins a
+            -- @M.op@ sequence is NOT a juxta-arg — leave it for Pratt
+            -- ('peekOp' / 'peekQualifiedOp').  Without this, juxta
+            -- steals @P@ and the op becomes a broken application.
+            _ | startsAtom (tkKind tok)
+              , tkCol tok > ctxMinCol ctx
+              , case tkKind tok of
+                    TkConId n ->
+                        case peekQualifiedOp ctx n tok cur' of
+                            Just _  -> False   -- infix op; stop app
+                            Nothing -> True
+                    TkIdent n ->
+                        case peekQualifiedOp ctx n tok cur' of
+                            Just _  -> False
+                            Nothing -> True
+                    _ -> True
+              -> do
                     (arg, curA) <- parseAtomPostfix ctx cur
                     loop (EApp fn arg) curA
             -- NegativeLiterals (always-on): @TkMinus@ /immediately/
@@ -3255,6 +4032,7 @@ parseApp ctx cur0 = do
             -- @INT_MINBOUND@ expands to @-0x8000000000000000@).
             TkMinus
               | tkCol tok > ctxMinCol ctx
+              , tkStart tok > cPos cur
               , let (litTok, _) = nextToken (ctxSrc ctx) cur'
               , tkStart litTok == tkEnd tok
               , case tkKind litTok of
@@ -3269,6 +4047,7 @@ parseApp ctx cur0 = do
 
     isBlockArgStart k = case k of
         TkDo        -> True
+        TkMDo       -> True
         TkCase      -> True
         TkIf        -> True
         TkLet       -> True
@@ -3279,6 +4058,7 @@ parseApp ctx cur0 = do
         let (tok, cur1) = nextSig c cur
         case tkKind tok of
             TkDo        -> parseDo     c cur1
+            TkMDo       -> parseDo     c cur1  -- RecursiveDo: same as do for non-recursive case
             TkCase      -> parseCase   c cur1
             TkIf        -> parseIf     c cur1
             TkLet       -> parseLet    c cur1
@@ -3411,6 +4191,10 @@ captureTypeArg ctx cur0 =
                 TkConId{} -> pure (slice (tkEnd tok2), cur2)
                 TkIdent{} -> pure (slice (tkEnd tok2), cur2)
                 _         -> pure (slice (tkEnd tok), cur1)
+        -- TH name quote / promoted constructor: lexer now emits
+        -- TkNameQuote for `'Just` / `'pure` forms.  Capture the whole
+        -- source span (leading tick through the name) as the type arg.
+        TkNameQuote _ -> pure (slice (tkEnd tok), cur1)
         -- Legacy fallback: older lexings where `'X` was still TkChar 'X'.
         -- Kept for safety while the lexer migration settles.
         TkChar _   ->
@@ -3444,6 +4228,7 @@ startsAtom TkFloat{}       = True
 startsAtom TkStr{}         = True
 startsAtom TkAddrStr{}     = True   -- Phase 2.x: "..."# Addr# literal
 startsAtom TkChar{}        = True
+startsAtom TkNameQuote{}   = True  -- TH name quote 'pure / '(.)
 startsAtom TkLabel{}       = True  -- Phase 3.5: #name is a valid argument
 startsAtom TkLParen        = True
 startsAtom TkLBracket      = True
@@ -3453,6 +4238,10 @@ startsAtom TkPrimId{}      = True
 startsAtom TkLUnbox        = True
 startsAtom TkImplicitRef{} = True  -- Phase 3.6: ?name can start an atom
 startsAtom TkSpliceLParen  = True  -- Phase 2.11: $( starts a TH splice
+-- Note: TkDollar is intentionally NOT startsAtom. Bare `$` is the infix
+-- application operator; juxta must not steal it as an argument. When `$`
+-- appears at the start of an expression (e.g. inside [| $var |]), parseAtom
+-- still handles the TH id-splice form via its TkDollar branch.
 startsAtom TkOQuote        = True  -- Phase 2.12: [| starts a TH expression bracket
 startsAtom TkOQuoteD       = True  -- Phase 2.12: [d| (silently skipped)
 startsAtom TkOQuoteT       = True  -- Phase 2.12: [t| (silently skipped)
@@ -3486,6 +4275,11 @@ parseAtom ctx cur0 = do
         -- 'unsafePackLenLiteral' / 'allBytes' rely on this shape.
         TkAddrStr s -> pure (ELit (LAddrStr s), cur1)
         TkChar c   -> pure (ELit (LChar c), cur1)
+        -- TemplateHaskellQuotes name quote: 'pure, 'Left, '(.), '(<*>).
+        -- Lower to EVar of the quoted name so expression parse succeeds
+        -- (probe / parseBodyExpr bar).  Runtime Name resolution is a
+        -- separate TH concern; parse success is the goal here.
+        TkNameQuote n -> pure (EVar n, cur1)
         TkLabel n  -> pure (ELabel n, cur1)   -- Phase 3.5: OverloadedLabels
         -- Phase 3.6: ?name in expression position -> implicit parameter reference
         -- Also support postfix dot-chain: ?ctx.field -> field ?ctx
@@ -3520,6 +4314,21 @@ parseAtom ctx cur0 = do
             case tkKind closeTok of
                 TkRParen -> pure (ESplice inner, cur3)
                 _        -> parseErr ctx "expected `)` to close splice $(...)" closeTok
+        -- Phase 2.11/2.12: bare TH id-splice `$var` (common inside [| … |]).
+        -- `$(…)` is already 'TkSpliceLParen'. Bare `$` is also the infix
+        -- application operator via Pratt; when `$` appears in *atom*
+        -- position followed by an identifier, treat it as a TH splice of
+        -- that name (GHC TemplateHaskellQuotes / splice syntax).
+        TkDollar -> do
+            let (tok2, cur2) = nextSig ctx cur1
+            case tkKind tok2 of
+                TkIdent n  | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                TkConId n  | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                TkPrimId n | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                _ -> parseErr ctx "unexpected `$` (expected id-splice `$var` or use `$` infix)" tok
         -- Phase 2.12: TemplateHaskellQuotes
         -- [| expr |]  or  [e| expr |]  — expression bracket: parse body, emit EQuote.
         TkOQuote -> do
@@ -3610,20 +4419,28 @@ parseParenExpr ctx _openTok cur0 = do
                                     in pure (ELam n body, curC)
                                 _ -> parseErr ctx "expected `)` in composition section" closeTok
         -- Operator-as-value, optionally followed by right-operand (section).
-        _ | Just opName <- tokenOpName (tkKind peek)
+        -- Also recombine mid-@ lens ops so @(^@..)@ / @(^@.)@ are single names
+        -- (lexer splits on TkAt because '@' is not isOpChar).
+        _ | Just opName0 <- tokenOpName (tkKind peek)
           , tkKind peek /= TkMinus        -- `(-1)` is NEG 1, not a section
           -> do
-            let (afterOp, curAfterOp) = nextSig ctx curP
+            let (opName, curAfterOp0) =
+                    case extendOpThroughAt ctx opName0 peek curP of
+                        Just (full, c) -> (full, c)
+                        Nothing        -> (opName0, curP)
+                (afterOp, curAfterOp) = nextSig ctx curAfterOp0
             case tkKind afterOp of
                 TkRParen -> pure (EVar opName, curAfterOp)
                 _ -> do
                     -- Right section: (op rhs) = \$x -> $x op rhs
+                    -- Restart from curP (not curAfterOp0) so a non-extended
+                    -- multi-token RHS like @(+ 1)@ still sees the op token.
                     (rhs, curR) <- parseExpr ctx curP
                     let (closeTok, curC) = nextSig ctx curR
                     case tkKind closeTok of
                         TkRParen ->
                             let n = "$s"
-                                body = EApp (EApp (EVar opName) (EVar n)) rhs
+                                body = EApp (EApp (EVar opName0) (EVar n)) rhs
                             in pure (ELam n body, curC)
                         _ -> parseErr ctx "expected `)` in section" closeTok
           | tkKind peek == TkBacktick -> do
@@ -4048,8 +4865,8 @@ parseListLit ctx cur0 = do
                 let (peek, _) = nextSig ctx cur1
                 case tkKind peek of
                     TkRBracket ->
-                        -- [first ..] — infinite range, not yet supported; skip
-                        pure (buildCons [first], snd (nextSig ctx cur1))
+                        -- [first ..] — open-ended range = enumFrom first.
+                        pure (EApp (EVar "enumFrom") first, snd (nextSig ctx cur1))
                     _ -> do
                         (hi, cur3) <- parseExpr ctx cur1
                         let (close, cur4) = nextSig ctx cur3
@@ -4066,8 +4883,9 @@ parseListLit ctx cur0 = do
                         let (peek3, _) = nextSig ctx cur3
                         case tkKind peek3 of
                             TkRBracket ->
-                                -- [first, second ..] — infinite stepped range, skip
-                                pure (buildCons [first, second], snd (nextSig ctx cur3))
+                                -- [first, second ..] — open-ended stepped range = enumFromThen.
+                                pure ( EApp (EApp (EVar "enumFromThen") first) second
+                                     , snd (nextSig ctx cur3) )
                             _ -> do
                                 (hi, cur4) <- parseExpr ctx cur3
                                 let (close, cur5) = nextSig ctx cur4

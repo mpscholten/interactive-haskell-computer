@@ -155,3 +155,14 @@ spec = describe "Hs2010 — Modules" $ do
             "module M where\nimport N hiding (C)\n" `shouldParseHeaderTo`
                 mh "M" ExportAll
                     [ImportDecl "N" False Nothing (ImportHiding ["C"])]
+
+        it "PackageImports import \"pkg\" M ignores package qualifier" $
+            "module M where\nimport \"base\" Data.List (sort)\n" `shouldParseHeaderTo`
+                mh "M" ExportAll
+                    [ImportDecl "Data.List" False Nothing (ImportOnly ["sort"])]
+
+        it "PackageImports keeps qualified alias and import list" $
+            "module M where\nimport qualified \"text\" Data.Text as T (pack)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "Data.Text" True (Just "T") (ImportOnly ["pack"])]

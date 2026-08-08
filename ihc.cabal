@@ -98,7 +98,15 @@ executable ihc
       , filepath
       , ihc
       , text
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2
+    -- -rdynamic exports the executable's own symbols (including the
+    -- statically-linked GHC RTS) into the dynamic symbol table, so that
+    -- interpreted FFI imports of RTS-exclusive symbols (rtsSupportsBoundThreads,
+    -- getNumberOfProcessors, getMonotonicNSec, getOrSet* stores, …) resolve via
+    -- IHC.FFI.resolveSymbol's dlsym(RTLD_DEFAULT) fallback. These have no
+    -- Haskell source and live only in the RTS; this is the same RTS-exclusive
+    -- carve-out as the VIO/State# bridges (see CLAUDE.md). Portable: GHC maps
+    -- -rdynamic to --export-dynamic (ELF) / -export_dynamic (mach-o).
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N -M4G" -O2 -rdynamic
 
 executable ihc-parse-probe
     import:           warnings, lang
@@ -157,6 +165,7 @@ test-suite ihc-test
       , Properties.TupleSectionDesugar
       , HsExtTypeFams
       , HsExtMisc
+      , IhcTestBinary
       , HsExtRecords
       , Hs2010LexNum
       , HsExtTypeApps
@@ -212,6 +221,8 @@ test-suite ihc-test
       -- "random Haskell programs" plan — see
       -- plans/can-we-convert-the-temporal-castle.md).
       , QuickCheck       >= 2.14
+    build-tool-depends:
+        ihc:ihc
     -- Tests run sequentially under hspec; -N1 pins a single capability
     -- so parallel GC doesn't spin every core on this single-threaded
     -- workload.  (The shutdown hang a leaked unkillable masked fixture
@@ -243,4 +254,11 @@ test-suite ihc-test
     -- ('IHC.MemDebug.dumpMemStats').  -T only maintains counters (no
     -- extra GC); overhead is unmeasurable and it is inert unless the
     -- flag is set, so it is kept permanently.
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M8G -T"
+    --
+    -- -rdynamic: same rationale as executable ihc (PR #185).  CI runs
+    -- this binary under nix with per-package cbits .so files dlopened
+    -- RTLD_GLOBAL; ghc-internal's PrelIOUtils.c calls RTS errorBelch /
+    -- debugBelch.  Without exporting the test binary's static RTS into
+    -- the dynamic symbol table, Linux aborts mid-suite with
+    -- "undefined symbol: errorBelch".
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N1 -M8G -T" -rdynamic

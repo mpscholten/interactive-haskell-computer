@@ -113,18 +113,10 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
             shouldLexAs "as" (TkIdent "as")
         it "1.2.8 soft keyword `forall` is lexed as a plain identifier (ParserBugs Bug 3)" $
             shouldLexAs "forall" (TkIdent "forall")
-        it "1.2.8 soft keyword `qualified` usable as varid" $ do
-            r <- lexOne "qualified"
-            case r of
-                Right (TkIdent "qualified") -> pure ()
-                _ -> pendingWith
-                    "known gap: `qualified` is a hard keyword; cannot bind as varid"
-        it "1.2.8 soft keyword `hiding` usable as varid" $ do
-            r <- lexOne "hiding"
-            case r of
-                Right (TkIdent "hiding") -> pure ()
-                _ -> pendingWith
-                    "known gap: `hiding` is a hard keyword; cannot bind as varid"
+        it "1.2.8 soft keyword `qualified` usable as varid" $
+            shouldLexAs "qualified" (TkIdent "qualified")
+        it "1.2.8 soft keyword `hiding` usable as varid" $
+            shouldLexAs "hiding" (TkIdent "hiding")
         it "1.2.9 maximal munch: `cases` is one identifier" $
             shouldLexAs "cases" (TkIdent "cases")
         it "1.2.9 maximal munch: `lett` is one identifier (not let + t)" $
@@ -164,6 +156,22 @@ spec = describe "Hs2010 — Lexical identifiers & operators" $ do
             shouldLexAs "!" TkBang
         it "1.3.5 `!=` is a regular symbolic operator (not bang + equals)" $
             shouldLexAs "!=" (TkSymOp "!=")
+        -- Dot-led multi-char ops must not be split into TkDot + remainder
+        -- (aeson/lens .=, conduit .|, lens .#, Data.Bits .&.).
+        it "1.3.6 dot-op `.=` lexes as TkSymOp (aeson/lens)" $
+            shouldLexAs ".=" (TkSymOp ".=")
+        it "1.3.6 dot-op `.|` lexes as TkSymOp (conduit)" $
+            shouldLexAs ".|" (TkSymOp ".|")
+        it "1.3.6 dot-op `.#` lexes as TkSymOp (lens)" $
+            shouldLexAs ".#" (TkSymOp ".#")
+        it "1.3.6 dot-op `.$` lexes as TkSymOp" $
+            shouldLexAs ".$" (TkSymOp ".$")
+        it "1.3.6 dot-op `.~` lexes as TkSymOp" $
+            shouldLexAs ".~" (TkSymOp ".~")
+        it "1.3.6 bitwise `.&.` lexes as one TkSymOp" $
+            shouldLexAs ".&." (TkSymOp ".&.")
+        it "1.3.6 bitwise `.|.` lexes as one TkSymOp" $
+            shouldLexAs ".|." (TkSymOp ".|.")
 
     describe "§1.4 Qualified names" $ do
         it "1.4.1 qvarid `Foo.bar` parses as a qualified expression" $

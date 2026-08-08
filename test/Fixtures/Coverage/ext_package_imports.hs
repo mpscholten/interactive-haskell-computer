@@ -1,4 +1,5 @@
--- Gap: `PackageImports` — `import "pkg-name" Module`. Seen in: ihp-schema-compiler/IHP/SchemaCompiler.hs:20 (`import "interpolate" Data.String.Interpolate`). Ref: ihp-unsupported-scan.md.
+-- Coverage: `PackageImports` accepts `import "pkg-name" Module` and ignores
+-- the package qualifier for module-name resolution.
 {-# LANGUAGE PackageImports #-}
 import "base" Data.List (sort)
 

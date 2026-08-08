@@ -13,8 +13,10 @@ module HsExtMisc (spec) where
 
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as BC
 import Test.Hspec
 
+import IHC.AST (Expr(..))
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
@@ -101,6 +103,28 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
             r <- parseExprStrict "$$(foo)"
             assertParsesOrPending "known gap: typed splice $$(...) not yet supported" r
 
+        -- Name quotes (TemplateHaskellQuotes): 'varid, 'Conid, '(op).
+        -- lens Control.Lens.Internal.TH uses these for pureValName etc.
+        it "TH: 'pure name quote parses" $ do
+            r <- parseExprStrict "'pure"
+            assertParses r
+
+        it "TH: 'Left name quote parses" $ do
+            r <- parseExprStrict "'Left"
+            assertParses r
+
+        it "TH: '(.) parenthesized operator name quote parses" $ do
+            r <- parseExprStrict "'(.)"
+            assertParses r
+
+        it "TH: '(<*>) parenthesized operator name quote parses" $ do
+            r <- parseExprStrict "'(<*>)"
+            assertParses r
+
+        it "TH: 'fmap name quote yields EVar" $ do
+            e <- parseExprAtEof (mkSource "<test>" "'fmap") defaultFixityTable
+            e `shouldBe` EVar "fmap"
+
     describe "QuasiQuotes" $ do
         it "QQ: [hsx| <h1>hi</h1> |] parses" $ do
             r <- parseExprStrict "[hsx| <h1>hi</h1> |]"
@@ -113,6 +137,19 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
         it "QQ: [sql| SELECT * FROM t |] parses" $ do
             r <- parseExprStrict "[sql| SELECT * FROM t |]"
             assertParses r
+
+        -- Unit 3: parser emits EQuasiQuote name body (not the old
+        -- error-placeholder EApp). Body bytes are the raw interior of
+        -- the brackets, including leading/trailing whitespace.
+        it "QQ: [hsx|…|] yields EQuasiQuote with body bytes" $ do
+            e <- parseExprAtEof (mkSource "<test>" "[hsx| <h1>hi</h1> |]")
+                                defaultFixityTable
+            case e of
+                EQuasiQuote name body -> do
+                    name `shouldBe` BC.pack "hsx"
+                    body `shouldBe` BC.pack " <h1>hi</h1> "
+                other -> expectationFailure
+                    ("expected EQuasiQuote, got: " <> show other)
 
     describe "CPP" $ do
         it "CPP: #ifdef ... #endif at module top level" $ do
@@ -201,7 +238,7 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
     describe "RecursiveDo" $ do
         it "RecursiveDo: mdo { x <- foo; pure x }" $ do
             r <- parseExprStrict "mdo { x <- foo; pure x }"
-            assertParsesOrPending "known gap: `mdo` keyword not recognised" r
+            assertParses r
 
         it "RecursiveDo: do { rec { x <- foo }; pure x }" $ do
             r <- parseExprStrict "do { rec { x <- foo }; pure x }"

@@ -109,7 +109,20 @@ data Clause = Clause
 
 data BindingLhs = BindingLhs
     { lhsClauses :: ![Clause]
+      -- | @Just v@ means this is a top-level pattern-binding projection for
+      -- variable @v@ (e.g. @a@ from @(a, b) | True = (1, 2)@).  @clausePats@
+      -- then spans the full LHS pattern and @clauseRhs@ the @=@/@|@ RHS.
+      -- 'parseBodyExprWithFixity' desugars to @case rhs of { ~pat -> v }@.
+    , lhsPatVar  :: !(Maybe ByteString)
     } deriving (Eq, Show)
+
+-- | Ordinary function / value binding (no pattern-bind projection).
+funLhs :: [Clause] -> BindingLhs
+funLhs cs = BindingLhs cs Nothing
+
+-- | Top-level pattern-binding projection for @var@.
+patLhs :: ByteString -> Clause -> BindingLhs
+patLhs var cl = BindingLhs [cl] (Just var)
 
 type KnownSymbols = IORef (Map ByteString SymbolInfo, Cursor)
 
@@ -196,16 +209,35 @@ memoiseScan tag src compute = do
 -- | Read the exported name from a top-level @pattern Name ...@ declaration.
 -- The lexer treats @pattern@ as a plain identifier, so the normal binding
 -- scanner would otherwise cache a binding named "pattern" and miss the real
--- runtime name.  We only materialize the simple constructor/identifier form
--- used by packages like @network@; actual pattern matching semantics are still
--- handled later by the ordinary parser/evaluator pipeline.
+-- runtime name.  Accepts:
+--
+--   * @pattern Name ...@          — ConId / Ident
+--   * @pattern (:<) ...@          — parenthesised operator
+--   * @pattern x :< xs = ...@     — infix operator form (name is the op)
+--
+-- Actual pattern matching semantics are still handled later by the ordinary
+-- parser/evaluator pipeline (via 'scanPatternSynonyms').
 readPatternSynName :: Source -> Cursor -> Maybe (ByteString, Cursor)
 readPatternSynName src curAfterPattern =
     let (nameTok, curAfterName) = nextToken src curAfterPattern
+        parenStart = Cursor (tkStart nameTok) (tkLine nameTok) (tkCol nameTok)
     in case tkKind nameTok of
-        TkConId n  -> Just (n, curAfterName)
-        TkIdent n  -> Just (n, curAfterName)
-        _          -> Nothing
+        TkConId n -> Just (n, curAfterName)
+        -- Infix operator form: @pattern x :< xs = ...@.  Report the
+        -- operator as the synonym name; leave the cursor after the left
+        -- argument so clause scanning still sees @op right = body@.
+        -- A bare lowercase Ident is not a legal pattern-synonym name in
+        -- GHC, but we accept it as a fall-through for robustness.
+        TkIdent n ->
+            case peekInfixOp src curAfterName of
+                Just op -> Just (op, curAfterName)
+                Nothing -> Just (n, curAfterName)
+        -- Parenthesised operator: @pattern (:<) ...@ / @pattern (:<) :: ...@.
+        TkLParen ->
+            case peekPrefixOpBinding src parenStart of
+                Just (op, curAfterClose) -> Just (op, curAfterClose)
+                Nothing                  -> Nothing
+        _ -> Nothing
 
 -- | Scan the entire source file and return the names of all top-level
 -- value bindings (column-1 lowercase identifiers with an @=@ or guards).
@@ -248,19 +280,26 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                 curSkipped <- skipThroughBinding src name cur'
                 let acc' = if bindName `elem` acc then acc else bindName : acc
                 go acc' curSkipped
-            -- Constructor at col 1 only counts as a binding LHS when it
-            -- is the FIRST argument of an infix-operator binding, e.g.
-            -- @True && x = x@ in ghc-prim's GHC.Classes (see the matching
-            -- comment on 'findBinding' below).  Skip otherwise.
+            -- Constructor at col 1: infix-op LHS (@True && x = x@) OR a
+            -- pattern binding (@Just x = m@).  Pattern-bound vars are
+            -- reported so demand-driven discovery can find them.
             TkConId _ | tkCol tok == 1 ->
                 case peekInfixOp src cur' of
                     Just opName -> do
                         curSkipped <- skipThroughPrefixOpBinding src opName cur'
                         let acc' = if opName `elem` acc then acc else opName : acc
                         go acc' curSkipped
-                    Nothing -> go acc cur'
+                    Nothing -> do
+                        let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                        mPat <- tryScanTopLevelPatBind src startCur
+                        case mPat of
+                            Just (vars, _, curAfter) ->
+                                go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
+                                   curAfter
+                            Nothing -> go acc cur'
             -- Prefix operator binding: @(|>) x f = ...@.
             -- Or paren-wrapped pattern + backtick infix: @(I# x) \`eqInt\` (I# y) = ...@.
+            -- Or pattern binding: @(a, b) = e@ / @(a, b) | g = e@.
             TkLParen | tkCol tok == 1 -> do
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 case peekPrefixOpBinding src startCur of
@@ -274,7 +313,22 @@ scanAllTopLevelNamesRaw src = go [] startCursor
                                 curSkipped <- skipThroughPrefixOpBinding src opName curAfterBackticks
                                 let acc' = if opName `elem` acc then acc else opName : acc
                                 go acc' curSkipped
-                            Nothing -> go acc cur'
+                            Nothing -> do
+                                mPat <- tryScanTopLevelPatBind src startCur
+                                case mPat of
+                                    Just (vars, _, curAfter) ->
+                                        go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
+                                           curAfter
+                                    Nothing -> go acc cur'
+            -- List-pattern binding at col 1: @[x, y] = xs@.
+            TkLBracket | tkCol tok == 1 -> do
+                let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
+                mPat <- tryScanTopLevelPatBind src startCur
+                case mPat of
+                    Just (vars, _, curAfter) ->
+                        go (foldr (\v a -> if v `elem` a then a else v:a) acc vars)
+                           curAfter
+                    Nothing -> go acc cur'
             TkLUnbox | tkCol tok == 1 -> do
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 case peekPrefixOpBinding src startCur of
@@ -471,24 +525,34 @@ peekInfixOp src cur =
                 TkPrimId op | primIdIsValueLevel op -> closedByBacktick op
                 _ -> Nothing
         -- Immediately followed by '@'-prefixed op: `arg @?= ...`
+        -- Also recombine mid-@ continuations (@?=.. etc. are rare but
+        -- @-prefix ops can themselves be extended).
         TkAt ->
-            let (t2, _) = peekSigTokFrom src c1
+            let (t2, c2) = peekSigTokFrom src c1
             in case tkKind t2 of
-                TkSymOp suf -> Just (BC.pack "@" <> suf)
-                _           -> Nothing
+                TkSymOp suf ->
+                    let (full, _) = extendOpNameThroughAt src (BC.pack "@" <> suf) t2 c2
+                    in Just full
+                _ | Just more <- tokenOpNameBS (tkKind t2) ->
+                    let (full, _) = extendOpNameThroughAt src (BC.pack "@" <> more) t2 c2
+                    in Just full
+                _ -> Nothing
         -- Immediately followed by a symbolic operator: `arg1 |> arg2 = ...`.
         -- The op must be followed by something that could be a second argument
         -- (ident, paren-wrapped pattern, literal, etc.) — otherwise this is
         -- not an infix-op binding LHS.
-        _ | Just opName <- tokenOpNameBS (tkKind t1)
-          , opName /= "~"    -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
-          , opName /= "!"    -- bang-pattern/strict marker in `f !x = ...`,
+        -- Mid-@ lens ops (^@.., ^@.) recombine via 'extendOpNameThroughAt'
+        -- so `xs ^@.. f = ...` registers under "^@.." not "^".
+        _ | Just opName0 <- tokenOpNameBS (tkKind t1)
+          , opName0 /= "~"   -- lazy-pattern marker in `f ~pat = ...`, not infix LHS
+          , opName0 /= "!"   -- bang-pattern/strict marker in `f !x = ...`,
                              -- and also `arr ! i` array-index at expression
                              -- position (the RHS of a do-stmt, let, etc.).
                              -- Misclassifying either `f !x = ...` or
                              -- `main = do ... arr ! i ...` as an infix-LHS
                              -- drops the real binding's clause.
-          -> let (t2, _) = peekSigTokFrom src c1
+          -> let (opName, cAfterOp) = extendOpNameThroughAt src opName0 t1 c1
+                 (t2, _) = peekSigTokFrom src cAfterOp
              in case tkKind t2 of
                  -- For `-` specifically: only treat as infix-op binding
                  -- when the second arg is an identifier or paren-pattern.
@@ -502,11 +566,14 @@ peekInfixOp src cur =
                  TkIdent _    -> Just opName
                  TkConId _    -> Just opName
                  TkLParen     -> Just opName
-                 TkLBracket   | opName /= "-" -> Just opName
-                 TkUnderscore | opName /= "-" -> Just opName
-                 TkInt   _    | opName /= "-" -> Just opName
-                 TkStr   _    | opName /= "-" -> Just opName
-                 TkChar  _    | opName /= "-" -> Just opName
+                 TkLBracket   | opName0 /= "-" -> Just opName
+                 TkUnderscore | opName0 /= "-" -> Just opName
+                 TkInt   _    | opName0 /= "-" -> Just opName
+                 TkStr   _    | opName0 /= "-" -> Just opName
+                 TkChar  _    | opName0 /= "-" -> Just opName
+                 -- Mid-@ glue without a following arg token is still an
+                 -- op name (the next token was consumed into the name).
+                 TkAt         -> Just opName
                  _            -> Nothing
         _ -> Nothing
 
@@ -534,6 +601,37 @@ tokenOpNameBS = \case
     TkSymOp n  -> Just n
     _          -> Nothing
 
+-- | Operator segment after a mid-@ glue point.  Includes 'TkDotDot' so
+-- lens @^@..@ recombines; kept out of 'tokenOpNameBS' so enum ranges
+-- are unaffected.
+opSegmentNameBS :: TokenKind -> Maybe ByteString
+opSegmentNameBS TkDotDot = Just (BC.pack "..")
+opSegmentNameBS k        = tokenOpNameBS k
+
+-- | After an operator token, recombine a following adjacent @'@'@ plus
+-- more operator characters into a single name (lens @^@..@ / @^@.@).
+-- Returns the extended name and the cursor after the full operator.
+-- When there is no adjacent @'@'@, returns the original name and cursor.
+extendOpNameThroughAt
+    :: Source -> ByteString -> Token -> Cursor -> (ByteString, Cursor)
+extendOpNameThroughAt src name0 lastTok cur0 =
+    go name0 lastTok cur0
+  where
+    go acc lastTok' cur =
+        let (atTok, curAfterAt) = nextToken src cur
+        in case tkKind atTok of
+            TkAt | tkStart atTok == tkEnd lastTok' ->
+                let (segTok, curAfterSeg) = nextToken src curAfterAt
+                in if tkStart segTok == tkEnd atTok
+                      then case opSegmentNameBS (tkKind segTok) of
+                          Just more ->
+                              go (acc <> BC.pack "@" <> more) segTok curAfterSeg
+                          Nothing ->
+                              (acc <> BC.pack "@", curAfterAt)
+                      else
+                          (acc <> BC.pack "@", curAfterAt)
+            _ -> (acc, cur)
+
 -- | True iff a 'TkPrimId' name is a value-level identifier ending in @#@
 -- (e.g. @compareInt#@, @divInt#@), as opposed to a type/constructor-level
 -- one like @Int#@ or @State#@.  Lowercase-start ⇒ value level.
@@ -555,8 +653,10 @@ peekPrefixOpBinding src cur0 =
         TkLParen ->
             let (t2, c2) = peekSigTokFrom src c1
             in case tokenOpNameBS (tkKind t2) of
-                Just opName ->
-                    let (t3, c3) = peekSigTokFrom src c2
+                Just opName0 ->
+                    -- Mid-@ recombination: @(^@..)@ / @(^@.)@
+                    let (opName, cAfterOp) = extendOpNameThroughAt src opName0 t2 c2
+                        (t3, c3) = peekSigTokFrom src cAfterOp
                     in case tkKind t3 of
                         TkRParen -> Just (opName, c3)
                         _        -> Nothing
@@ -569,9 +669,10 @@ peekPrefixOpBinding src cur0 =
             in case tkKind t2 of
                 TkRParen -> Just (BC.pack "#", c2)
                 _ | Just suffix <- tokenOpNameBS (tkKind t2) ->
-                    let (t3, c3) = peekSigTokFrom src c2
+                    let (full, cAfter) = extendOpNameThroughAt src (BC.pack "#" <> suffix) t2 c2
+                        (t3, c3) = peekSigTokFrom src cAfter
                     in case tkKind t3 of
-                        TkRParen -> Just (BC.pack "#" <> suffix, c3)
+                        TkRParen -> Just (full, c3)
                         _        -> Nothing
                 _ -> Nothing
         _ -> Nothing
@@ -660,21 +761,16 @@ findBinding src ref target = do
                 | tkCol tok == 1 && primIdIsValueLevel name ->
                     handleTopIdent acc name tok cur'
                 | otherwise -> go acc cur'
-            -- Constructor at col 1 only counts as a binding LHS when it
-            -- is the FIRST argument of an infix-operator binding, e.g.
-            --   True  && x = x
-            --   False && _ = False
-            -- (ghc-prim's GHC.Classes (&&) / (||) / not have this shape).
-            -- A standalone @True = ...@ would be ill-typed Haskell, and a
-            -- pattern binding like @Just x = expr@ has its own dispatch
-            -- elsewhere (this scanner only registers function-binding
-            -- LHSs).  Skip when no infix operator follows.
+            -- Constructor at col 1: infix-op LHS (@True && x = x@) OR a
+            -- pattern binding (@Just x = m@).  Pattern binds register each
+            -- bound variable as a projection 'BindingLhs' (lhsPatVar).
             TkConId _ | tkCol tok == 1 ->
                 case peekInfixOp src cur' of
                     Just opName -> handleConIdInfixLhs acc opName tok cur'
-                    Nothing     -> go acc cur'
+                    Nothing     -> handleTopPatBind acc tok cur'
             -- Prefix-form operator binding: @(|>) x f = ...@
             -- Or paren-wrapped-pattern infix binding: @(I# x) \`eqInt\` (I# y) = ...@
+            -- Or pattern binding: @(a, b) = e@ / @(a, b) | g = e@.
             TkLParen | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 in case peekPrefixOpBinding src startCur of
@@ -684,7 +780,10 @@ findBinding src ref target = do
                         case peekParenPatBacktickInfixBinding src startCur of
                             Just (opName, curAfterBackticks) ->
                                 handleParenPatInfix acc opName tok curAfterBackticks
-                            Nothing -> go acc cur'
+                            Nothing -> handleTopPatBind acc tok cur'
+            -- List-pattern binding at col 1: @[x, y] = xs@.
+            TkLBracket | tkCol tok == 1 ->
+                handleTopPatBind acc tok cur'
             TkLUnbox | tkCol tok == 1 ->
                 let startCur = Cursor (tkStart tok) (tkLine tok) (tkCol tok)
                 in case peekPrefixOpBinding src startCur of
@@ -695,6 +794,26 @@ findBinding src ref target = do
             -- type synonym declarations so they are never mistaken for bindings.
             TkTypeKw | tkCol tok == 1 -> go acc (skipTypeDecl src cur')
             _ -> go acc cur'
+
+    -- Top-level pattern binding at col 1: @(a, b) | True = (1, 2)@,
+    -- @Just x = m@, @[x, y] = xs@.  Register each bound variable as a
+    -- 'patLhs' projection so demand-driven discovery of @a@/@b@ materialises
+    -- the correct case-projection expression.
+    handleTopPatBind acc startTok _cur = do
+        let startCur = Cursor (tkStart startTok) (tkLine startTok) (tkCol startTok)
+        mPat <- tryScanTopLevelPatBind src startCur
+        case mPat of
+            Nothing ->
+                -- Not a pattern bind (or no bound vars); advance past this token.
+                go acc (Cursor (tkEnd startTok) (tkLine startTok) (tkCol startTok + 1))
+            Just (vars, clause, curAfter) -> do
+                let acc' = foldl' (\m v -> Map.insert v (SpanOnly (patLhs v clause)) m)
+                                  acc vars
+                case [v | v <- vars, v == target] of
+                    (v:_) -> do
+                        writeIORef ref (acc', curAfter)
+                        pure (Just (patLhs v clause))
+                    [] -> go acc' curAfter
 
     -- Found @pattern Name ...@ at column 1.  A type signature
     -- (@pattern Name :: T@) has no clause and is skipped; the later value
@@ -717,7 +836,7 @@ findBinding src ref target = do
                         -- params.  No-op for the simple `pattern Name p = body`
                         -- form (no `<-` in span).
                         clause' <- narrowBidirectionalPatSynSpan src patName clause
-                        let lhs  = BindingLhs [clause']
+                        let lhs  = funLhs [clause']
                             acc' = Map.insert patName (SpanOnly lhs) acc
                         if patName == target
                             then do
@@ -735,7 +854,7 @@ findBinding src ref target = do
             Just (clause, curAfter) -> do
                 (moreClauses, curFinal) <-
                     collectMoreOpClauses opName [clause] curAfter
-                let lhs  = BindingLhs (reverse moreClauses)
+                let lhs  = funLhs (reverse moreClauses)
                     acc' = Map.insert opName (SpanOnly lhs) acc
                 if opName == target
                     then do
@@ -757,7 +876,7 @@ findBinding src ref target = do
                         (tkStart startTok, snd (clausePats clause)) }
                 (moreClauses, curFinal) <-
                     collectMoreOpClauses opName [clause'] curAfter
-                let lhs  = BindingLhs (reverse moreClauses)
+                let lhs  = funLhs (reverse moreClauses)
                     acc' = Map.insert opName (SpanOnly lhs) acc
                 if opName == target
                     then do
@@ -855,7 +974,7 @@ findBinding src ref target = do
                         (tkStart startTok, snd (clausePats clause)) }
                 (moreClauses, curFinal) <-
                     collectMoreOpClauses opName [clause'] curAfter
-                let lhs  = BindingLhs (reverse moreClauses)
+                let lhs  = funLhs (reverse moreClauses)
                     acc' = Map.insert opName (SpanOnly lhs) acc
                 if opName == target
                     then do
@@ -891,7 +1010,7 @@ findBinding src ref target = do
                 (moreClauses, curFinal) <- case mInfixOp of
                     Just op -> collectMoreOpClauses op [clause'] curAfter
                     Nothing -> collectMoreClauses name [clause'] curAfter
-                let lhs  = BindingLhs (reverse moreClauses)
+                let lhs  = funLhs (reverse moreClauses)
                     acc' = Map.insert realName (SpanOnly lhs) acc
                 if realName == target
                     then do
@@ -1112,6 +1231,12 @@ skipBracedItem src cur0 = cursorAt src (findBracedItemEnd src (cPos cur0))
 -- Nested parens/brackets/braces are tracked so an @=@ inside a record
 -- literal (not supported yet, but future-proof) or a @|@ inside a
 -- bracketed expression isn't mistaken for the RHS separator.
+--
+-- Note: a local-decl guard @| let y = e@ contains an @=@ nested after
+-- the first top-level @|@. Callers that only need the clause separator
+-- (@findEqOrBarOnLine@ used from 'scanOneClauseAfterName') correctly
+-- stop at that first @|@; the @=@ inside the let is part of the RHS
+-- span and is not examined here.
 findEqOrBarOnLine :: Source -> Cursor -> IO (Maybe (Pos, Cursor))
 findEqOrBarOnLine src cur0 = go cur0 (0 :: Int)
   where
@@ -1136,6 +1261,56 @@ findEqOrBarOnLine src cur0 = go cur0 (0 :: Int)
                     _ | tkCol nxt == 1 -> pure Nothing
                       | otherwise      -> go cur' depth
             _ -> go cur' depth
+
+--------------------------------------------------------------------------------
+-- Top-level pattern bindings: @(a, b) = e@ / @(a, b) | g = e@ / @Just x = m@
+--------------------------------------------------------------------------------
+
+-- | Try to read a top-level pattern binding starting at @startCur@
+-- (positioned on the first token of the pattern). On success returns
+-- the bound variable names (lowercase identifiers in the pattern), the
+-- single 'Clause' spanning the pattern + RHS (guards allowed), and a
+-- cursor past the body.
+--
+-- Returns 'Nothing' when no top-level @=@/@|@ separator is found (so
+-- the caller can fall through to other col-1 interpretations).
+tryScanTopLevelPatBind
+    :: Source -> Cursor -> IO (Maybe ([ByteString], Clause, Cursor))
+tryScanTopLevelPatBind src startCur = do
+    let patsStart = cPos (skipTrivia src startCur)
+    mEqOrBar <- findEqOrBarOnLine src startCur
+    case mEqOrBar of
+        Nothing -> pure Nothing
+        Just (sepTokStart, _) -> do
+            let bodyStart = sepTokStart
+                bodyEnd   = findBodyEndAtCol src 1 bodyStart
+                patsEnd   = sepTokStart
+                clause    = Clause (patsStart, patsEnd) (bodyStart, bodyEnd)
+                curAfter  = Cursor bodyEnd 0 1
+                vars      = collectPatternBindVars src (patsStart, patsEnd)
+            if null vars
+                then pure Nothing
+                else pure (Just (vars, clause, curAfter))
+
+-- | Collect variable names bound by a pattern span without a full parse.
+-- Walks tokens and gathers every 'TkIdent' (lowercase binders, as-pattern
+-- names, etc.). Constructor tokens ('TkConId') are skipped — they name
+-- the match, not a bound variable.
+collectPatternBindVars :: Source -> Span -> [ByteString]
+collectPatternBindVars src (start, end) = go (cursorAt src start) []
+  where
+    go cur acc
+        | cPos cur >= end = reverse acc
+        | otherwise =
+            let (tok, cur') = nextToken src cur
+            in if tkStart tok >= end
+                then reverse acc
+                else case tkKind tok of
+                    TkIdent n -> go cur' (n : acc)
+                    TkPrimId n
+                        | primIdIsValueLevel n -> go cur' (n : acc)
+                        | otherwise            -> go cur' acc
+                    _ -> go cur' acc
 
 -- | Scan until the end of the current line (or EOF). Used only for
 -- recovering after a malformed LHS; the real body-extent logic is
@@ -1819,7 +1994,16 @@ scanDataDecls src
                             else pure curAfterDot
                 collectCtors tyName cIdx (dReg, fReg) curAfterConstraint
             TkIdent _ -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
-            TkLParen -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
+            -- A '(' at constructor-start is usually an infix constructor,
+            -- but it can also begin a tuple constraint context of an
+            -- existential ctor, e.g. `forall a. (C1 a, C2 a) => Ctor {..}`.
+            TkLParen -> do
+                isConstraint <- checkIfConstraint cur
+                if isConstraint
+                    then do
+                        curAfterArrow <- skipConstraintContext cur
+                        collectCtors tyName cIdx (dReg, fReg) curAfterArrow
+                    else collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             TkLBracket -> collectInfixCtor tyName cIdx (dReg, fReg) tok cur'
             -- Constructors with MagicHash suffixes, e.g. lazy ST's
             -- `data State s = S# (State# s)`, lex as TkPrimId rather
@@ -2131,7 +2315,7 @@ data FunctorDerivDecl = FunctorDerivDecl
 
 -- | One data/newtype declaration with the classes mentioned in its deriving
 -- clause. Used for small stock-derived dictionaries whose implementation only
--- needs constructor order, e.g. nullary Enum/Bounded.
+-- needs constructor order, e.g. nullary Enum/Bounded/Ix.
 data SimpleDerivDecl = SimpleDerivDecl
     { sdTyName  :: !ByteString
     , sdClasses :: ![ByteString]
@@ -2158,7 +2342,7 @@ scanSimpleDerivingsRaw src
             Nothing -> go acc cur0
             Just tyName -> do
                 (classes, curAfter) <- findDeriving cur0
-                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded"]) classes
+                let wanted = filter (`elem` map BC.pack ["Enum", "Bounded", "Ix"]) classes
                 if null wanted
                     then go acc curAfter
                     else go (SimpleDerivDecl tyName wanted : acc) curAfter
@@ -2194,6 +2378,18 @@ scanSimpleDerivingsRaw src
             TkIdent s | s == BC.pack "stock"
                      || s == BC.pack "anyclass" -> scanClasses cur'
             TkNewtype -> scanClasses cur'
+            -- A multi-line deriving clause puts the class list on the line(s)
+            -- AFTER the `deriving` keyword (or after a `stock`/`anyclass`
+            -- strategy), e.g. http-types' StdMethod:
+            --     deriving
+            --         ( Read, Show, …, Bounded, Ix, … )
+            -- Skip the intervening newline(s) so the `(`/class name is still
+            -- found.  Without this, `deriving\n(` hits the catch-all below and
+            -- returns ZERO classes — so derived Enum/Bounded/Ix were silently
+            -- dropped and e.g. `minBound :: StdMethod` fell back to the Int
+            -- instance (heap-exhausting `[minBound..maxBound]`, and Int-bounds
+            -- `methodArray` → "Ix Int.index: non-Int index" on the warp path).
+            TkNewline -> scanClasses cur'
             TkLParen  -> collectClassList [] cur'
             TkConId c -> pure [c]
             _         -> pure []
@@ -2455,12 +2651,23 @@ scanFunctorDerivingsRaw src
                             loop acc cAfterArr
                         else do
                             -- Peek: '{' → record syntax; else positional.
-                            let (peek, _) = nextToken src c'
-                            (roles, cEnd) <- case tkKind peek of
-                                TkLBrace -> do
-                                    let (_, cBrace) = nextToken src c'
-                                    collectRecordRoles tvN cBrace
-                                _ -> collectPositionalRoles tvN c'
+                            -- Skip intervening newlines so multi-line record
+                            -- decls are recognized (common style in Hackage):
+                            --   data T = MkT
+                            --     { field :: Int
+                            --     }
+                            --     deriving (Eq)
+                            -- Without this, '{' on the next line is missed,
+                            -- derived Eq is never registered, and Eq.== falls
+                            -- through to the class default (==) = not (/=)
+                            -- which mutually recurses with (/=) = not (==)
+                            -- → infinite spin (warp composeHeader /
+                            -- HttpVersion equality).
+                            (roles, cEnd) <- do
+                                mRec <- peekRecordBrace c'
+                                case mRec of
+                                    Just cBrace -> collectRecordRoles tvN cBrace
+                                    Nothing     -> collectPositionalRoles tvN c'
                             let ctor = FunctorCtor name roles
                             -- After fields, see if another ctor follows.
                             let (sep, cSep) = nextToken src cEnd
@@ -2468,6 +2675,16 @@ scanFunctorDerivingsRaw src
                                 TkBar     -> loop (ctor : acc) cSep
                                 _         -> pure (reverse (ctor : acc), cEnd)
                 _ -> loop acc c'
+
+    -- Skip newlines and return Just (cursor after '{') if a record brace
+    -- follows; Nothing if the next non-newline token is not '{'.
+    peekRecordBrace :: Cursor -> IO (Maybe Cursor)
+    peekRecordBrace cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkNewline -> peekRecordBrace cur'
+            TkLBrace  -> pure (Just cur')
+            _         -> pure Nothing
 
     -- Positional field parser. Each field is a type-atom (single token or
     -- a parenthesised/bracketed group) optionally preceded by '!' or '~'.
@@ -2615,6 +2832,10 @@ scanFunctorDerivingsRaw src
             TkIdent s | s == BC.pack "stock"
                      || s == BC.pack "anyclass" -> scanClasses cur'
             TkNewtype  -> scanClasses cur'
+            -- Multi-line deriving clause (`deriving\n    ( … )`): skip the
+            -- newline(s) so the class list is still found.  (Same defect/fix
+            -- as 'scanSimpleDerivingsRaw'.)
+            TkNewline -> scanClasses cur'
             TkLParen  -> collectClassList [] cur'
             TkConId c -> pure [c]
             _         -> pure []
@@ -2859,12 +3080,24 @@ scanInstanceDeclsRaw src
                 -- and applied forms like @instance Functor ((->) r)@.
                 [TkArrow] -> Just (BC.pack "(->)")
                 (TkLParen : TkArrow : TkRParen : _) -> Just (BC.pack "(->)")
-                (TkConId n : rest) -> Just (normalizeTyTag (qualifiedConHeadTokens n rest))
+                (TkConId n : rest)
+                    | n `elem` map BC.pack ["ShareInput", "NoShareInput"]
+                    , Just arg <- simpleAppliedTypeArg rest ->
+                        Just (normalizeTyTag (n <> BC.pack " " <> arg))
+                    | otherwise ->
+                        Just (normalizeTyTag (qualifiedConHeadTokens n rest))
                 (TkIdent n : _)    -> Just (normalizeTyTag n)
                 _                  -> Nothing
       where
         spanCommas :: [TokenKind] -> ([TokenKind], [TokenKind])
         spanCommas = span (\case TkComma -> True; _ -> False)
+
+        simpleAppliedTypeArg :: [TokenKind] -> Maybe ByteString
+        simpleAppliedTypeArg toks =
+            case dropNoise toks of
+                (TkConId n : rest) -> Just (qualifiedConHeadTokens n rest)
+                (TkIdent n : _)    -> Just n
+                _                  -> Nothing
 
     qualifiedConHead :: ByteString -> Cursor -> (ByteString, Cursor)
     qualifiedConHead first cur =
@@ -2952,16 +3185,19 @@ scanInstanceDeclsRaw src
                                     Just (clause, curNext) -> do
                                         (moreClauses, curFinal) <-
                                             collectInstanceClauses name (tkCol tok) [clause] curNext
-                                        let lhs  = BindingLhs (reverse moreClauses)
+                                        let lhs  = funLhs (reverse moreClauses)
                                             acc' = Map.insert name lhs acc
                                         scanMethods acc' curFinal
             -- Phase 3.6: operator methods like @(>>=)@, @(>>)@, @(<>)@, @(+)@.
             -- Pattern: @TkLParen TkSymOp name TkRParen ...@
+            -- Mid-@ lens ops: @(^@..)@ recombines via extendOpNameThroughAt.
             TkLParen | tkCol tok > 1 -> do
                 let (opTok, cur'') = nextToken src cur'
                 case tokenOpNameBS (tkKind opTok) of
-                    Just opName -> do
-                        let (closeTok, cur''') = nextToken src cur''
+                    Just opName0 -> do
+                        let (opName, curAfterOp) =
+                                extendOpNameThroughAt src opName0 opTok cur''
+                            (closeTok, cur''') = nextToken src curAfterOp
                         case tkKind closeTok of
                             TkRParen -> do
                                 -- InstanceSigs: @(<>) :: ...@ inside an
@@ -2989,7 +3225,7 @@ scanInstanceDeclsRaw src
                                                 -- catch-all.
                                                 (moreClauses, curFinal) <-
                                                     collectInstancePrefixOpClauses opName (tkCol tok) [clause] curNext
-                                                let lhs  = BindingLhs (reverse moreClauses)
+                                                let lhs  = funLhs (reverse moreClauses)
                                                     acc' = Map.insert opName lhs acc
                                                 scanMethods acc' curFinal
                             -- `(pat ...)` introducing an infix method: e.g.
@@ -3028,9 +3264,9 @@ scanInstanceDeclsRaw src
                           (moreClauses, curFinal) <-
                               collectInfixClauses opName (tkCol tok) [clause] curNext
                           let existing = case Map.lookup opName acc of
-                                             Just (BindingLhs cs) -> cs
+                                             Just (BindingLhs cs _) -> cs
                                              Nothing              -> []
-                              lhs  = BindingLhs
+                              lhs  = funLhs
                                        (existing ++ reverse moreClauses)
                               acc' = Map.insert opName lhs acc
                           scanMethods acc' curFinal
@@ -3098,9 +3334,9 @@ scanInstanceDeclsRaw src
 
     insertClause name clause acc =
         let existing = case Map.lookup name acc of
-                           Just (BindingLhs cs) -> cs
+                           Just (BindingLhs cs _) -> cs
                            Nothing              -> []
-        in Map.insert name (BindingLhs (existing ++ [clause])) acc
+        in Map.insert name (funLhs (existing ++ [clause])) acc
 
     tryInfixThenBraced acc cur fallbackCur = do
         mInfix <- tryInfixMethodBraced cur
@@ -3141,9 +3377,9 @@ scanInstanceDeclsRaw src
                 -- Preserve any earlier prefix-form clause stored under
                 -- the same opName (unusual, but defensive).
                 let existing = case Map.lookup opName acc of
-                                   Just (BindingLhs cs) -> cs
+                                   Just (BindingLhs cs _) -> cs
                                    Nothing              -> []
-                    lhs      = BindingLhs
+                    lhs      = funLhs
                                    (existing ++ reverse moreClauses)
                     acc'     = Map.insert opName lhs acc
                 scanMethods acc' curFinal
@@ -3199,7 +3435,10 @@ scanInstanceDeclsRaw src
                 -- method named @~@ instead of the prefix-form @bimap@,
                 -- and the real method body is lost.
                 TkSymOp op | depth == 0
-                           , op /= BC.pack "~" -> pure (Just op)
+                           , op /= BC.pack "~" ->
+                    -- Recombine mid-@ lens ops: ^@.. not just ^.
+                    let (full, _) = extendOpNameThroughAt s op tok cur'
+                    in pure (Just full)
                 -- Backtick infix: @a `name` b@ at depth 0 names @name@
                 -- as the method.  Used by source bodies like
                 --   !a `mod` b | ... = …
@@ -3265,7 +3504,9 @@ scanInstanceDeclsRaw src
                 TkSemi    | depth == 0   -> pure Nothing
                 TkRBrace  | depth == 0   -> pure Nothing
                 TkSymOp op | depth == 0
-                           , op /= BC.pack "~" -> pure (Just op)
+                           , op /= BC.pack "~" ->
+                    let (full, _) = extendOpNameThroughAt s op tok cur'
+                    in pure (Just full)
                 TkBacktick | depth == 0 ->
                     let (nameTok, curN) = nextToken s cur'
                     in case tkKind nameTok of
@@ -3666,7 +3907,7 @@ scanClassDeclsRaw src
                                             Nothing -> clause
                                     (moreClauses, curFinal) <-
                                         collectClassClauses methodName (tkCol tok) [clause'] curNext
-                                    let lhs  = BindingLhs (reverse moreClauses)
+                                    let lhs  = funLhs (reverse moreClauses)
                                         defs' = Map.insert methodName lhs defs
                                     scanBody sigs defs' curFinal
                 -- Operator methods: `(<>) :: ...` or `(<>) x y = ...`.
@@ -3705,7 +3946,7 @@ scanClassDeclsRaw src
                                             case mClause of
                                                 Nothing -> scanBody sigs defs cur'
                                                 Just (clause, curNext) -> do
-                                                    let lhs  = BindingLhs [clause]
+                                                    let lhs  = funLhs [clause]
                                                         defs' = Map.insert opName lhs defs
                                                     scanBody sigs defs' curNext
                                 _ -> scanBody sigs defs cur'
@@ -3886,6 +4127,11 @@ scanForeignImportsRaw src
                         tok = if null ws then s else last ws
                     in if BC.take 1 tok == BC.pack "&"
                            then (True,  Just (BC.drop 1 tok))
+                       -- A single word containing '.' is a header hint
+                       -- (e.g. "string.h"), not a C symbol.  Fall back
+                       -- to the Haskell identifier name.
+                       else if BC.elem '.' tok && length ws == 1
+                           then (False, Nothing)
                            else (False, Just tok)
                 Nothing -> (False, Nothing)
         let (t2, cur2) = peekSigTokFrom src curAfterSym
@@ -4111,6 +4357,11 @@ tyConToFFI c _ = case c of
     "Double"   -> Just FFIDouble
     "Bool"     -> Just FFIInt
     "Char"     -> Just FFIChar
+    "Int#"     -> Just FFIInt64
+    "Word#"    -> Just FFIWord64
+    "ThreadId#" -> Just FFIThreadId
+    "CLLong"   -> Just FFIInt64
+    "CULLong"  -> Just FFIWord64
     "CString"  -> Just FFICString
     "CStringLen" -> Just (FFIPtr FFIVoid)  -- CStringLen = (CString, Int) — tuple, deferred
     "Ptr"      -> Just (FFIPtr FFIVoid)
@@ -4498,13 +4749,15 @@ collectMoreSigNames src acc cur = do
         _ -> pure (reverse acc, cur)
 
 -- | Match @(op) :: ...@ — operator-name type sig.
+-- Recombines mid-@ lens ops so @(^@..) :: ...@ registers as "^@..".
 peekOperatorSig :: Source -> Cursor -> Maybe (ByteString, Cursor)
 peekOperatorSig src cur =
     let (tok, cur') = nextToken src cur in
     case tokenOpNameBS (tkKind tok) of
-        Just op ->
-            let (tok2, cur2) = nextToken src cur' in
-            case tkKind tok2 of
+        Just op0 ->
+            let (op, curAfterOp) = extendOpNameThroughAt src op0 tok cur'
+                (tok2, cur2) = nextToken src curAfterOp
+            in case tkKind tok2 of
                 TkRParen -> Just (op, cur2)
                 _        -> Nothing
         Nothing -> Nothing
@@ -4600,22 +4853,44 @@ scanPatternSynonymsRaw src
     -- After the @pattern@ keyword: read name, collect parameter idents,
     -- then look for either @<-@ or @=@ (signaling the body).  If we
     -- only see @::@ followed by a type, this is a signature — skip it.
+    --
+    -- Supported name forms:
+    --   * @pattern Head x = ...@       — ConId (prefix)
+    --   * @pattern (:<) x xs = ...@    — parenthesised operator (prefix)
+    --   * @pattern x :< xs = ...@      — infix operator (params around op)
     handlePatternDecl cur = do
         let (nameTok, curAfterName) = nextToken src cur
+            parenStart = Cursor (tkStart nameTok) (tkLine nameTok) (tkCol nameTok)
         case tkKind nameTok of
             TkConId n -> handleAfterName n curAfterName
-            -- @pattern (:<) ...@ — ignore for now (operator-name
-            -- pattern synonyms are not supported in this phase).
+            -- Parenthesised operator: @pattern (:<) ...@ / type sig.
+            TkLParen ->
+                case peekPrefixOpBinding src parenStart of
+                    Just (op, curAfterClose) -> handleAfterName op curAfterClose
+                    Nothing                  -> pure Nothing
+            -- Infix operator form: @pattern x :< xs = ...@.
+            -- Left arg is @x@; operator is the synonym name; remaining
+            -- idents after the op are further params.
+            TkIdent left ->
+                let (opTok, curAfterOp) = nextToken src curAfterName
+                in case tokenOpNameBS (tkKind opTok) of
+                    Just op -> do
+                        (rightParams, curAfterParams) <- collectPatParams src curAfterOp
+                        handleAfterNameWithParams op (left : rightParams) curAfterParams
+                    Nothing -> pure Nothing
             _ -> pure Nothing
 
     handleAfterName n curAfterName = do
         (params, curAfterParams) <- collectPatParams src curAfterName
+        handleAfterNameWithParams n params curAfterParams
+
+    handleAfterNameWithParams n params curAfterParams = do
         let (sepTok, curAfterSep) = nextToken src curAfterParams
         case tkKind sepTok of
             TkLArrow -> readBody n params curAfterSep
             TkEq     -> readBody n params curAfterSep
-            -- Type signature @pattern Name :: T@: skip the rest of the
-            -- decl by reading until newline at col 1.
+            -- Type signature @pattern Name :: T@ / @pattern (:<) :: T@:
+            -- skip silently (no body to register).
             _        -> pure Nothing
 
     readBody n params curBody = do

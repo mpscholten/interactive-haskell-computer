@@ -22,9 +22,9 @@
 -- silently discarded, since ihc resolves modules by name across its
 -- source cache.
 --
--- Not yet supported: @module Foo (module Bar) where@ re-exports. These
--- degrade gracefully — the scanner stops at the unrecognised form and
--- the rest of the file is still reachable.
+-- @module Foo (module Bar) where@ re-exports are parsed; the scheduler
+-- follows the re-export chain and resolves import aliases such as
+-- @module Backend@ from @import Foo as Backend@.
 -- Operator imports like @import Foo ((<>))@ are now parsed correctly
 -- (the operator name is skipped/ignored, but subsequent names in the
 -- list are preserved and the import is not aborted).
@@ -94,12 +94,20 @@ data ExportItem
 -- read bindings.
 parseModuleHeader :: Source -> Cursor -> IO (Maybe ModuleHeader, Cursor)
 parseModuleHeader src cur0 = do
-    let (tok, _) = skipNewlines src cur0
+    -- Use 'nextSigTok' (not 'skipNewlines'/'nextToken'): leading
+    -- @{-# LANGUAGE … #-}@ pragmas and block comments are treated as
+    -- whitespace by the sig-level lexer.  'skipNewlines' only drops
+    -- 'TkNewline', so a file that starts with a language pragma
+    -- (network's Network.Socket, almost every modern module) was
+    -- previously classified as headerless — 'emptyHeader' with
+    -- 'ExportAll' and zero imports.  That made re-exported record
+    -- fields (AddrInfo via Socket → Info) invisible to record-update
+    -- desugaring (streaming-commons @NS.defaultHints { NS.addrFlags = … }@).
+    let (tok, cur1) = nextSigTok src cur0
     case tkKind tok of
         TkModule -> do
-            -- Advance past the `module` keyword.
-            let (_, curAfterMod) = nextSigTok src cur0
-            (name, exports, cur2) <- parseModuleLine src curAfterMod
+            -- cur1 is already past the `module` keyword.
+            (name, exports, cur2) <- parseModuleLine src cur1
             (imports, cur3) <- parseImports src cur2
             pure (Just (ModuleHeader (Just name) exports imports), cur3)
         TkImport -> do
@@ -198,45 +206,44 @@ parseExportList src cur0 = go [] cur0
                     Nothing   -> pure (ExportList (reverse acc), cur1)
             TkConId n -> do
                 -- Check for Tree(..) or Tree(a,b), but also handle
-                -- qualified export names like B.fromStrict or B.ByteString.
+                -- qualified export names like B.fromStrict, B.ByteString,
+                -- and multi-segment forms such as
+                -- GHC.Internal.Data.Coerce.coerce (seen in GHC.Internal.Exts).
                 -- A ConId immediately followed by '.' (no space) means this
-                -- is a qualified export — advance past 'ConId.bare' and
-                -- record the bare name.
+                -- is a qualified export — walk every segment and record the
+                -- final bare name.  Stopping after one hop left the next
+                -- go-iteration staring at a mid-name TkDot, which hit the
+                -- catch-all and aborted the export list early — dropping
+                -- @) where@ and EVERY subsequent import (Internal.Exts
+                -- ended up with mhImports = [], so re-exports like @lazy@
+                -- could not be chased to GHC.Magic).
                 let (peek, curP) = nextSigTok src cur1
                 case tkKind peek of
                     TkLParen -> do
                         (subs, cur2) <- parseExportSubs src curP
                         go (ExportType n (Just subs) : acc) cur2
                     TkDot -> do
-                        -- Qualified export: <ConId>.<bare> or <ConId>.<ConId>.
                         -- The dot is a qualifier separator only when it abuts
                         -- the ConId (no whitespace) — Haskell 2010 §5.2 / §2.4.
                         -- GHC rejects @module M (B . bar) where@ as a parse
                         -- error, so we must NOT silently rewrite that form
                         -- to the qualified export of @bar@.
-                        let (dotTok, curAfterDot) = nextToken src cur1
-                            (conTok, _)            = nextSigTok src cur
+                        let (dotTok, _) = nextToken src cur1
+                            (conTok, _) = nextSigTok src cur
                             abuts = tkStart dotTok == tkEnd conTok
-                        case tkKind dotTok of
-                            TkDot
-                                | abuts -> do
-                                    let (bareTok, curAfterBare) = nextToken src curAfterDot
-                                    case tkKind bareTok of
-                                        TkIdent bare -> do
-                                            -- qualified lower-case export (e.g. B.fromStrict)
-                                            go (ExportName bare : acc) curAfterBare
-                                        TkConId bare -> do
-                                            -- qualified upper-case export (e.g. B.ByteString)
-                                            let (peek2, curP2) = nextSigTok src curAfterBare
-                                            case tkKind peek2 of
-                                                TkLParen -> do
-                                                    (subs, cur3) <- parseExportSubs src curP2
-                                                    go (ExportType bare (Just subs) : acc) cur3
-                                                _ -> go (ExportType bare Nothing : acc) curAfterBare
-                                        _ ->
-                                            -- Unrecognized qualified form: emit bare ConId
-                                            go (ExportType n Nothing : acc) cur1
-                            _ -> go (ExportType n Nothing : acc) cur1
+                        if not abuts
+                            then go (ExportType n Nothing : acc) cur1
+                            else do
+                                (bare, mSubs, curAfter) <-
+                                    consumeQualifiedExportTail src cur1
+                                case mSubs of
+                                    Just subs ->
+                                        go (ExportType bare (Just subs) : acc) curAfter
+                                    Nothing
+                                        | isConLike bare ->
+                                            go (ExportType bare Nothing : acc) curAfter
+                                        | otherwise ->
+                                            go (ExportName bare : acc) curAfter
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
             -- Parenthesised operator export: @(++)@, @(!)@, @(@?=@), etc.
@@ -275,33 +282,129 @@ parseExportList src cur0 = go [] cur0
                             go acc curSkip
             _        -> pure (ExportList (reverse acc), cur)
 
-    parseExportSubs s c0 = loop [] c0
+    parseExportSubs s c0 = do
+        (subs, sawDotDot, cEnd) <- loop [] False c0
+        -- @T(.., pattern P)@ / @ErrorCall(.., ErrorCall)@: a `..`
+        -- wildcard bundled with extra (pattern-synonym) names.  IHC's
+        -- @Just []@ wildcard already over-approximates every constructor,
+        -- field selector and pattern synonym of @T@, so once a `..`
+        -- appears we collapse the group to that wildcard.  Crucially we
+        -- keep consuming tokens up to the matching @)@ first: the previous
+        -- code returned early at the @..@ when it was not immediately
+        -- followed by @)@, leaving the cursor mid-group.  The group's own
+        -- @)@ was then mistaken for the export-list terminator, so
+        -- @) where@ and EVERY import below were silently dropped — e.g.
+        -- @GHC.Internal.Exception@'s @ErrorCall(..,ErrorCall)@ zeroed its
+        -- import list, making re-exported values like @divZeroException@
+        -- (from @GHC.Internal.Exception.Type@) unresolvable and turning
+        -- @div 1 0@ into an @unbound variable@ crash instead of a proper
+        -- @divide by zero@ 'ArithException'.
+        pure (if sawDotDot then [] else subs, cEnd)
       where
-        loop subs c = do
+        loop subs dd c = do
             let (tok, c1) = nextSigTok s c
             case tkKind tok of
-                TkRParen  -> pure (reverse subs, c1)
-                TkDotDot  -> do
-                    let (close, c2) = nextSigTok s c1
-                    case tkKind close of
-                        TkRParen -> pure ([], c2)      -- Tree(..)
-                        _        -> pure (reverse subs, c1)
-                TkComma   -> loop subs c1
-                TkIdent n -> loop (n : subs) c1
-                TkConId n -> loop (n : subs) c1
+                TkRParen  -> pure (reverse subs, dd, c1)
+                TkDotDot  -> loop subs True c1
+                TkComma   -> loop subs dd c1
+                TkIdent n -> loop (n : subs) dd c1
+                TkConId n -> loop (n : subs) dd c1
                 -- Operator in parens inside subs: Class((>>=), (>>), return).
-                -- Skip the parenthesised operator and continue.
+                -- Keep the operator name so class-method exports like
+                -- Bits((.&.), (.|.)) can be resolved through facade modules.
                 TkLParen  -> do
-                    cAfterOp <- skipToCloseParen s c1 1
-                    loop subs cAfterOp
+                    let (inner, c2) = nextSigTok s c1
+                    case operatorTokenName (tkKind inner) of
+                        Just op -> do
+                            let (close, c3) = nextSigTok s c2
+                            let c' = case tkKind close of
+                                    TkRParen -> c3
+                                    _        -> c2
+                            loop (op : subs) dd c'
+                        Nothing -> case tkKind inner of
+                            TkAt -> do
+                                let (rest, c3) = nextSigTok s c2
+                                let (fullOp, cAfterOp) = case tkKind rest of
+                                        TkSymOp suf -> (BC.pack "@" <> suf, c3)
+                                        _           -> (BC.pack "@", c2)
+                                let (close, c4) = nextSigTok s cAfterOp
+                                let c' = case tkKind close of
+                                        TkRParen -> c4
+                                        _        -> cAfterOp
+                                loop (fullOp : subs) dd c'
+                            _ -> do
+                                cAfterOp <- skipToCloseParen s c1 1
+                                loop subs dd cAfterOp
                 -- Bare operator (symbolic or backtick-wrapped): skip it.
-                TkSymOp _ -> loop subs c1
+                TkSymOp _ -> loop subs dd c1
                 TkBacktick -> do
                     -- Skip `op`
                     let (_op, c2) = nextSigTok s c1
                     let (_bt, c3) = nextSigTok s c2
-                    loop subs c3
-                _         -> pure (reverse subs, c)
+                    loop subs dd c3
+                _         -> pure (reverse subs, dd, c)
+
+-- | Walk @.Seg1.Seg2...final@ after the first ConId of a qualified export
+-- name.  Returns the final segment (lower- or upper-case), optional
+-- @T(..)@/sub-export list, and the cursor past the whole name.
+--
+-- Multi-segment forms (e.g. @GHC.Internal.Data.Coerce.coerce@) must be
+-- fully consumed; leaving a mid-name @TkDot@ for the next export-list
+-- iteration aborts the list and drops every import below @where@.
+consumeQualifiedExportTail
+    :: Source
+    -> Cursor
+    -> IO (ByteString, Maybe [ByteString], Cursor)
+consumeQualifiedExportTail src cur0 = go cur0
+  where
+    go cur = do
+        let (dotTok, curAfterDot) = nextToken src cur
+        case tkKind dotTok of
+            TkDot -> do
+                let (segTok, curAfterSeg) = nextToken src curAfterDot
+                case tkKind segTok of
+                    TkIdent bare ->
+                        pure (bare, Nothing, curAfterSeg)
+                    TkConId bare -> do
+                        let (peek, curP) = nextSigTok src curAfterSeg
+                        case tkKind peek of
+                            TkLParen -> do
+                                (subs, curEnd) <- parseExportSubs src curP
+                                pure (bare, Just subs, curEnd)
+                            TkDot ->
+                                -- Another qualifier segment (e.g. Internal.Data)
+                                go curAfterSeg
+                            _ ->
+                                pure (bare, Nothing, curAfterSeg)
+                    TkPrimId bare ->
+                        pure (bare, Nothing, curAfterSeg)
+                    _ ->
+                        -- Malformed qualifier; surface empty bare and stop
+                        pure (BC.empty, Nothing, cur)
+            _ -> pure (BC.empty, Nothing, cur)
+
+    parseExportSubs s c0 = do
+        (subs, sawDotDot, cEnd) <- loop [] False c0
+        pure (if sawDotDot then [] else subs, cEnd)
+      where
+        loop subs dd c = do
+            let (tok, c1) = nextSigTok s c
+            case tkKind tok of
+                TkRParen  -> pure (reverse subs, dd, c1)
+                TkDotDot  -> loop subs True c1
+                TkComma   -> loop subs dd c1
+                TkIdent n -> loop (n : subs) dd c1
+                TkConId n -> loop (n : subs) dd c1
+                TkPrimId n -> loop (n : subs) dd c1
+                _         -> pure (reverse subs, dd, c)
+
+-- | True when a bare export segment looks like a type/constructor name
+-- (uppercase or @:@-operator constructor), so it is recorded as
+-- 'ExportType' rather than 'ExportName'.
+isConLike :: ByteString -> Bool
+isConLike name = case BC.uncons name of
+    Just (c, _) -> (c >= 'A' && c <= 'Z') || c == ':'
+    Nothing     -> False
 
 --------------------------------------------------------------------------------
 -- import block
@@ -330,15 +433,10 @@ parseOneImport :: Source -> Cursor -> IO (Maybe (ImportDecl, Cursor))
 parseOneImport src cur0 = do
     let (t1, cur1) = nextSigTok src cur0
     (qualified, curQ) <- case tkKind t1 of
-        TkQualified -> pure (True, cur1)
-        _           -> pure (False, cur0)
-    -- PackageImports: an optional "pkg" string between `qualified` (if
-    -- present) and the module name. We accept it unconditionally and
-    -- discard the contents — module resolution is by name only.
-    let (tPkg, curAfterPkg) = nextSigTok src curQ
-    let curName = case tkKind tPkg of
-            TkStr _ -> curAfterPkg
-            _       -> curQ
+        -- 'qualified' is a soft keyword (TkIdent "qualified"); match by string.
+        TkIdent "qualified" -> pure (True, cur1)
+        _                   -> pure (False, cur0)
+    let curName = skipPackageImportQualifier src curQ
     (mModName, cur2) <- parseDottedName src curName
     case mModName of
         Nothing   -> pure Nothing
@@ -355,7 +453,8 @@ parseOneImport src cur0 = do
             -- Optional: hiding (...) or (...)
             let (t3, cur5) = nextSigTok src cur4
             (spec, curF) <- case tkKind t3 of
-                TkHiding -> do
+                -- 'hiding' is a soft keyword; match by string like 'as'.
+                TkIdent "hiding" -> do
                     let (lp, curLp) = nextSigTok src cur5
                     case tkKind lp of
                         TkLParen -> do
@@ -373,6 +472,17 @@ parseOneImport src cur0 = do
                     , impSpec      = spec
                     }
             pure (Just (decl, curF))
+
+-- | PackageImports: an optional @"pkg"@ string may appear between
+-- @qualified@ (if present) and the module name.  IHC currently resolves
+-- imports by module name across its source cache, so the package qualifier is
+-- accepted and discarded instead of becoming part of 'ImportDecl'.
+skipPackageImportQualifier :: Source -> Cursor -> Cursor
+skipPackageImportQualifier src cur =
+    let (tok, cur') = nextSigTok src cur
+    in case tkKind tok of
+        TkStr _ -> cur'
+        _       -> cur
 
 -- | Called just after the opening @(@. Returns the list of imported
 -- names and the cursor past the closing @)@.

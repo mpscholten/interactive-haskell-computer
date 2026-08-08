@@ -551,6 +551,7 @@ thBuiltinPairs =
     , ("Language.Haskell.TH.extsEnabled",        extsEnabledBuiltin)
     , ("Language.Haskell.TH.Syntax.extsEnabled", extsEnabledBuiltin)
     ]
+    ++ thLocPairs
     -- Phase 2.13: TH AST constructors.  These have no Haskell source in
     -- our cache (the template-haskell package isn't source-loaded) and
     -- the decoder expects VCon-shaped values, so we auto-generate
@@ -665,21 +666,65 @@ thConstructorPairs =
     concatMap oneCtor thConstructorCatalog
   where
     oneCtor (name, arity) =
-        let mkV = pure (buildCtor name arity)
+        let mkV = pure (buildTHCtor name arity)
         in [ (name,                                    mkV)
            , ("Language.Haskell.TH." <> name,          mkV)
            , ("Language.Haskell.TH.Syntax." <> name,   mkV)
            , ("Language.Haskell.TH.Lib." <> name,      mkV)
            ]
 
-    buildCtor :: Name -> Int -> Val
-    buildCtor name 0    = VCon name []
-    buildCtor name n    = buildLam name n []
+-- | Build a curried constructor value that collects @arity@ lazy
+-- arguments and returns the matching TH-shaped 'VCon'.
+buildTHCtor :: Name -> Int -> Val
+buildTHCtor name 0 = VCon name []
+buildTHCtor name n = buildLam n []
+  where
+    buildLam 0 acc    = VCon name (reverse acc)
+    buildLam left acc = VFun $ \t ->
+        pure (buildLam (left - 1) (t : acc))
 
-    buildLam :: Name -> Int -> [Thunk] -> Val
-    buildLam name 0    acc = VCon name (reverse acc)
-    buildLam name left acc = VFun $ \t ->
-        pure (buildLam name (left - 1) (t : acc))
+-- | 'Loc' and its record selectors.  'Loc' is part of the synthetic TH
+-- runtime surface: 'locationBuiltin' returns this exact 'VCon' shape,
+-- and HSX reads it via qualified selectors like @TH.loc_filename@.
+thLocPairs :: [(ByteString, IO Val)]
+thLocPairs =
+    thSyntaxNames "Loc" (pure (buildTHCtor "Loc" 5))
+    ++ concatMap oneField thLocFieldCatalog
+  where
+    oneField (fieldName, idx) =
+        thSyntaxNames fieldName (locFieldBuiltin fieldName idx)
+
+thLocFieldCatalog :: [(ByteString, Int)]
+thLocFieldCatalog =
+    [ ("loc_filename", 0)
+    , ("loc_package",  1)
+    , ("loc_module",   2)
+    , ("loc_start",    3)
+    , ("loc_end",      4)
+    ]
+
+thSyntaxNames :: ByteString -> IO Val -> [(ByteString, IO Val)]
+thSyntaxNames name mkV =
+    [ (name, mkV)
+    , ("TH." <> name, mkV)
+    , ("Language.Haskell.TH." <> name, mkV)
+    , ("Language.Haskell.TH.Syntax." <> name, mkV)
+    ]
+
+locFieldBuiltin :: ByteString -> Int -> IO Val
+locFieldBuiltin fieldName idx = pure $ VFun $ \locT -> do
+    locV <- force legacyHooks locT
+    case locV of
+        VCon "Loc" fields
+            | idx < length fields -> force legacyHooks (fields !! idx)
+            | otherwise ->
+                throwTH
+                    (BC.unpack fieldName <> ": Loc has only "
+                     <> show (length fields) <> " fields")
+        other ->
+            throwTH
+                (BC.unpack fieldName <> ": expected Loc, got "
+                 <> showValForDebug other)
 
 --------------------------------------------------------------------------------
 -- Phase 2.13: Q monad + Name primitives

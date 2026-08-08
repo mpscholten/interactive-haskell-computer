@@ -212,7 +212,7 @@ typeRepListEq _ _ = pure False
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
-forceThunkState (BlackHole _) = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (BlackHole _ _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 -- | A class instance's method table. HashMap keyed by method name, so
@@ -315,7 +315,8 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
 --   * @42@       (a @Nat@ literal)   → @42@
 --   * @\'x\'@    (a @Char@ literal)   → @x@
 normalizeTyTag :: ByteString -> ByteString
-normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
+normalizeTyTag bs0 =
+    rewriteHeadSyn (stripQuotes (trimAscii (stripParens bs0)))
   where
     stripParens s
         | BC.length s >= 2
@@ -332,6 +333,25 @@ normalizeTyTag bs0 = stripQuotes (trimAscii (stripParens bs0))
         , BC.last s == '\''   = BC.init (BC.tail s)
         | otherwise           = s
 
+    -- Collapse type-application / synonym spellings so result-polymorphic
+    -- methods (@pure \@Parser@, @pure \@(Parsec Void Text)@, …) hit the
+    -- same instance key the source instance was registered under.
+    --   * take the head constructor of a multi-token type app
+    --   * @Parsec@ is @type Parsec e s = ParsecT e s Identity@
+    -- Preserve @ShareInput T@ / @NoShareInput T@ compound tags used by
+    -- megaparsec Stream dispatch (see 'tryStreamWrappedChunkMethod').
+    rewriteHeadSyn s
+        | BC.pack "ShareInput " `BC.isPrefixOf` s = s
+        | BC.pack "NoShareInput " `BC.isPrefixOf` s = s
+        | otherwise =
+            let headCon =
+                    case BC.break (\c -> c == ' ' || c == '\t') s of
+                        (h, _) | not (BC.null h) -> h
+                        _                        -> s
+            in case headCon of
+                h | h == BC.pack "Parsec" -> BC.pack "ParsecT"
+                h                         -> h
+
 -- | Return a stable string tag for the runtime type of a value.
 -- Used by dispatch builtins to find the right class instance.
 typeTagOf :: Val -> ByteString
@@ -345,6 +365,9 @@ typeTagOf (VCon "[]" _) = BC.pack "[]"
 typeTagOf (VCon ":" _)  = BC.pack "[]"
 typeTagOf (VCon "True"  _) = BC.pack "Bool"
 typeTagOf (VCon "False" _) = BC.pack "Bool"
+typeTagOf (VCon "LT" _) = BC.pack "Ordering"
+typeTagOf (VCon "EQ" _) = BC.pack "Ordering"
+typeTagOf (VCon "GT" _) = BC.pack "Ordering"
 typeTagOf (VCon "(,)" _)   = BC.pack "(,)"
 typeTagOf (VCon "(,,)" _)  = BC.pack "(,,)"
 -- Common-case ctor -> type-name normalisation for built-in data types
@@ -355,6 +378,21 @@ typeTagOf (VCon "Just"    _) = BC.pack "Maybe"
 typeTagOf (VCon "Nothing" _) = BC.pack "Maybe"
 typeTagOf (VCon "Left"    _) = BC.pack "Either"
 typeTagOf (VCon "Right"   _) = BC.pack "Either"
+-- ghc-bignum's source Integer constructors all share the Integer
+-- instance set.  Some small Integers survive as VCon "IS" before the
+-- construct-collapse path runs, so class dispatch must see the type.
+typeTagOf (VCon "IS" _) = BC.pack "Integer"
+typeTagOf (VCon "IP" _) = BC.pack "Integer"
+typeTagOf (VCon "IN" _) = BC.pack "Integer"
+-- ghc-bignum Natural constructors (NS !Word# | NB !BigNat#).
+typeTagOf (VCon "NS" _) = BC.pack "Natural"
+typeTagOf (VCon "NB" _) = BC.pack "Natural"
+-- Fixed-width word boxing constructors — must not dispatch as Int.
+typeTagOf (VCon "W8#" _)  = BC.pack "Word8"
+typeTagOf (VCon "W16#" _) = BC.pack "Word16"
+typeTagOf (VCon "W32#" _) = BC.pack "Word32"
+typeTagOf (VCon "W64#" _) = BC.pack "Word64"
+typeTagOf (VCon "W#" _)   = BC.pack "Word"
 typeTagOf (VCon n _) =
     -- For source-loaded ADTs we now key dispatch on the constructor
     -- name directly. 'IHC.Scheduler.registerOne' (line ~1779) registers
@@ -367,7 +405,8 @@ typeTagOf (VCon n _) =
     -- the bare type name) caused the strict-vs-lazy ByteString
     -- collision: both registered under @\"ByteString\"@ and last-write
     -- won.  See typeTagOf's special cases above for the hand-coded
-    -- common types (@Just@, @Nothing@, @Left@, @Right@, @True@, etc.)
+    -- common types (@Just@, @Nothing@, @Left@, @Right@, @True@, @LT@,
+    -- etc.)
     -- whose instances are only keyed under the type name.
     n
 typeTagOf (VFun _)      = BC.pack "<function>"

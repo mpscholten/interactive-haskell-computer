@@ -4,8 +4,8 @@
 -- match), and recurse via the dispatcher when constructors match.
 --
 -- Routed through a polymorphic @eqIt@ so the elaborator emits
--- @ETypedMethod \"Eq\" \"==\" \"Maybe2\"@ — bypassing the still-
--- present @eqDispatch@ builtin shim and exercising the synthesis.
+-- @ETypedMethod \"Eq\" \"==\" \"Maybe2\"@ and exercises the same
+-- source/synth path that bare @==@ now reaches through class dispatch.
 data Maybe2 a = Nothing2 | Just2 a deriving Eq
 
 eqIt :: Eq a => a -> a -> Bool
