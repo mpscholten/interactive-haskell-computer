@@ -48,6 +48,7 @@ import Control.Exception (try, SomeException)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
@@ -159,7 +160,12 @@ force :: IHCHooks -> Thunk -> IO Val
 force hooks t = do
     st <- readIORef t
     case st of
-        Evaluated v -> pure v
+        Evaluated v -> do
+            -- Already-memoised path: still count so tight loops over
+            -- forced method thunks (e.g. default Eq mutual recursion)
+            -- show up under IHC_EVAL_STATS.
+            noteForceKind "whnf" (valKindTag v)
+            pure v
         BlackHole owner msg -> do
             self <- myThreadId
             case owner of
@@ -169,12 +175,16 @@ force hooks t = do
                 -- 'Settings'/etc. thunks). This is NOT a loop — GHC's RTS
                 -- blocks on a foreign black-hole. Yield and retry until the
                 -- owner publishes the 'Evaluated' result.
-                Just o | o /= self -> yield >> force hooks t
+                Just o | o /= self -> do
+                    noteBlackHoleWait
+                    yield
+                    force hooks t
                 -- Same thread re-entered (a genuine `<<loop>>`), or an
                 -- owner-less knot-tying placeholder was demanded before it
                 -- was filled: that IS a real loop.
                 _ -> throwIO (LoopException msg)
         Unevaluated (Closure env ipm expr) -> do
+            noteForceEval (show expr)
             self <- myThreadId
             writeIORef t (BlackHole (Just self) (take 500 (show expr)))
             v <- eval hooks env ipm expr
@@ -185,11 +195,31 @@ force hooks t = do
         -- protocol) so a concurrent forcer waits (foreign owner) or sees a
         -- loop (same thread). See 'IHC.Val.newLazyBuiltinThunk'.
         LazyBuiltin mkV -> do
+            noteForceKind "lazy" "<lazy-builtin>"
             self <- myThreadId
             writeIORef t (BlackHole (Just self) "<lazy-builtin>")
             v <- mkV
             writeIORef t (Evaluated v)
             pure v
+
+-- | Cheap tag for WHNF force samples (no deep show).
+valKindTag :: Val -> String
+valKindTag = \case
+    VInt _            -> "VInt"
+    VInteger _        -> "VInteger"
+    VFloat _          -> "VFloat"
+    VChar _           -> "VChar"
+    VStr _            -> "VStr"
+    VUnit             -> "VUnit"
+    VFun _            -> "VFun"
+    VFunIP _ _        -> "VFunIP"
+    VCon n _          -> "VCon:" <> BC.unpack n
+    VIO _             -> "VIO"
+    VPrimObj _        -> "VPrimObj"
+    VLabel _          -> "VLabel"
+    VClassMethod n _ ts _ ->
+        "VClassMethod:" <> BC.unpack n <> "@" <> show (length ts)
+    VLazyMethod _     -> "VLazyMethod"
 
 --------------------------------------------------------------------------------
 -- eval
@@ -1701,6 +1731,18 @@ matchPat hooks pat@(PCon "I#" [_]) (VCon c [t])
 matchPat hooks (PCon "I#" [p]) (VCon c [t])
     | bareConName c `elem` intSizedPrimCons =
         matchFields hooks [(p, t)] []
+-- Cross-rep: Word#/Word8# carriers often appear as the second operand of
+-- @fromIntegral n + (48 :: Word8)@ (http-date @i2w8@, PackInt @_0 + …@)
+-- while the left stays a bare 'VInt' after optimistic fromIntegral. Num
+-- Int's @(I# x) + (I# y)@ must accept the W8#/W# payload so the digit
+-- packing path does not PatternMatchFail with args=<int> W8# 48.
+matchPat hooks (PCon "I#" [p]) (VCon c [t])
+    | bareConName c `elem` wordSizedPrimCons =
+        matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VCon "W#" [t]) =
+    matchFields hooks [(p, t)] []
+matchPat hooks (PCon "I#" [p]) (VCon "W8#" [t]) =
+    matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
     matchFields hooks [(p, t)] []
 matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =

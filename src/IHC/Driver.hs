@@ -26,7 +26,7 @@ import IHC.CabalProject
     , resolve
     )
 import IHC.Classes (legacyHooks)
-import IHC.Diagnostics (warnStubOnce)
+import IHC.Diagnostics (evalStatsEnabled, evalStatsEvery, warnStubOnce)
 import IHC.Eval (force)
 import IHC.PackageStore (acquire, buildSearchEnv)
 import IHC.Scheduler (loadProgramFromSource)
@@ -35,6 +35,13 @@ import IHC.Val (Val(..))
 
 runFile :: FilePath -> IO Int
 runFile path = do
+    -- Heartbeat when IHC_EVAL_STATS is on so a mis-exported env var is
+    -- obvious before we wait for the first force sample.
+    if evalStatsEnabled
+        then hPutStrLn stderr
+                ("[ihc:eval] stats ON every=" <> show evalStatsEvery
+                 <> " (IHC_EVAL_STATS / IHC_EVAL_STATS_EVERY)")
+        else pure ()
     src <- readSourceFile path
     searchPath <- resolveSearchPathFor path
     runWithSearchPath searchPath src
