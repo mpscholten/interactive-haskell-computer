@@ -4031,6 +4031,10 @@ startsAtom TkPrimId{}      = True
 startsAtom TkLUnbox        = True
 startsAtom TkImplicitRef{} = True  -- Phase 3.6: ?name can start an atom
 startsAtom TkSpliceLParen  = True  -- Phase 2.11: $( starts a TH splice
+-- Note: TkDollar is intentionally NOT startsAtom. Bare `$` is the infix
+-- application operator; juxta must not steal it as an argument. When `$`
+-- appears at the start of an expression (e.g. inside [| $var |]), parseAtom
+-- still handles the TH id-splice form via its TkDollar branch.
 startsAtom TkOQuote        = True  -- Phase 2.12: [| starts a TH expression bracket
 startsAtom TkOQuoteD       = True  -- Phase 2.12: [d| (silently skipped)
 startsAtom TkOQuoteT       = True  -- Phase 2.12: [t| (silently skipped)
@@ -4103,6 +4107,21 @@ parseAtom ctx cur0 = do
             case tkKind closeTok of
                 TkRParen -> pure (ESplice inner, cur3)
                 _        -> parseErr ctx "expected `)` to close splice $(...)" closeTok
+        -- Phase 2.11/2.12: bare TH id-splice `$var` (common inside [| … |]).
+        -- `$(…)` is already 'TkSpliceLParen'. Bare `$` is also the infix
+        -- application operator via Pratt; when `$` appears in *atom*
+        -- position followed by an identifier, treat it as a TH splice of
+        -- that name (GHC TemplateHaskellQuotes / splice syntax).
+        TkDollar -> do
+            let (tok2, cur2) = nextSig ctx cur1
+            case tkKind tok2 of
+                TkIdent n  | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                TkConId n  | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                TkPrimId n | tkStart tok2 == tkEnd tok ->
+                    pure (ESplice (EVar n), cur2)
+                _ -> parseErr ctx "unexpected `$` (expected id-splice `$var` or use `$` infix)" tok
         -- Phase 2.12: TemplateHaskellQuotes
         -- [| expr |]  or  [e| expr |]  — expression bracket: parse body, emit EQuote.
         TkOQuote -> do
