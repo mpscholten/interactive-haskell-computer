@@ -730,11 +730,29 @@ builtins reg =
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
+    -- 'lazy' is GHC.Magic identity with compiler-rewritten strictness
+    -- (Magic.hs: @lazy x = x@; CoreToStg rewrites the strictness
+    -- annotation).  At Val level it is identity.  Host-backed under
+    -- bare + FQN keys because demand-driven re-export resolution of
+    -- @GHC.Exts.lazy@ (a re-export of @GHC.Magic.lazy@) does not yet
+    -- materialise a slot when source-loaded unsafePerformIO bottoms
+    -- on it — tracked as a re-export discovery follow-up, not a
+    -- permanent "minimum surface" exception.  FQNs keep both
+    -- @import GHC.Exts (lazy)@ rewrites and bare @lazy@ references
+    -- working without short-circuiting the Magic module itself.
     , ("lazy",                     lazyB)
-    -- Phase 2.8: unsafePerformIO family
-    , ("unsafePerformIO",          unsafePerformIOB)
-    , ("unsafeDupablePerformIO",   unsafePerformIOB)
-    , ("accursedUnutterablePerformIO", unsafePerformIOB)
+    , ("GHC.Magic.lazy",           lazyB)
+    , ("GHC.Exts.lazy",            lazyB)
+    -- 'unsafePerformIO' / 'unsafeDupablePerformIO' graduated to
+    -- source-loaded from GHC.Internal.IO.Unsafe:
+    --   unsafePerformIO m = unsafeDupablePerformIO (noDuplicate >> m)
+    --   unsafeDupablePerformIO (IO m) = case runRW# m of (# _, a #) -> lazy a
+    -- Bottoms on runRW# / noDuplicate# / lazy (all above or source).
+    -- matchPat on VIO already reconstructs the State# function so the
+    -- @(IO m)@ pattern match works (Eval.hs).
+    -- 'accursedUnutterablePerformIO' graduated to source-loaded from
+    -- Data.ByteString.Internal.Type:
+    --   accursedUnutterablePerformIO (IO m) = case m realWorld# of (# _, r #) -> r
     -- Phase 2.8: boxing/unboxing constructors
     , ("I#",  iHashB)
     , ("W#",  wHashB)
@@ -1277,12 +1295,13 @@ builtins reg =
     , ("GHC.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
     , ("GHC.Internal.Conc.IO.threadWaitWriteSTM", threadWaitWriteSTMB)
     , ("GHC.Internal.Event.Thread.threadWaitWriteSTM", threadWaitWriteSTMB)
-    -- Higher-level: waitReadSocketSTM :: Socket -> IO (STM ())
-    -- Avoids broken Fd/CInt newtype unwrapping on the source path.
-    , ("waitReadSocketSTM", waitReadSocketSTMB)
-    , ("Network.Socket.STM.waitReadSocketSTM", waitReadSocketSTMB)
-    , ("waitWriteSocketSTM", waitWriteSocketSTMB)
-    , ("Network.Socket.STM.waitWriteSocketSTM", waitWriteSocketSTMB)
+    -- Network.Socket.STM.waitReadSocketSTM / waitWriteSocketSTM graduated
+    -- to pure source (network package).  Bodies are ordinary wrappers:
+    --   waitReadSocketSTM s = fst <$> waitAndCancelReadSocketSTM s
+    --   waitAndCancelReadSocketSTM s = withFdSocket s $ threadWaitReadSTM . Fd
+    -- (and the Write twin).  Per CLAUDE.md rule 4, no Hackage shims.
+    -- Bottoms on host-backed threadWaitReadSTM / threadWaitWriteSTM above
+    -- once withFdSocket peels the Socket IORef to a CInt/Fd.
     -- GHC.Internal.Event.Thread.threadWait evt fd — the single choke point the
     -- threaded socket-wait path (threadWaitRead/Write -> Event.threadWaitRead
     -- -> threadWait) reduces to.  The source body registers on the RTS event
@@ -3615,17 +3634,9 @@ runRWB = pure $ VFun $ \ft -> do
     -- the caller sees the concrete value / unboxed tuple.
     runIOVal legacyHooks resRaw
 
+-- | @lazy :: a -> a@ — identity at Val level (see registration note).
 lazyB :: IO Val
 lazyB = pure $ VFun $ \a -> force legacyHooks a
-
---------------------------------------------------------------------------------
--- Phase 2.8: unsafePerformIO family
---------------------------------------------------------------------------------
-
-unsafePerformIOB :: IO Val
-unsafePerformIOB = pure $ VFun $ \a -> do
-    av <- force legacyHooks a
-    runIOVal legacyHooks av
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: boxing/unboxing constructors
@@ -6067,89 +6078,6 @@ threadWaitWriteSTMB = pure $ VFun $ \fdT -> pure $ VIO $
         (\i -> threadWaitWrite (fromIntegral i))
         "threadWaitWriteSTM"
 
--- | @waitReadSocketSTM :: Socket -> IO (STM ())@
-waitReadSocketSTMB :: IO Val
-waitReadSocketSTMB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    n <- socketValToFdInt sockT "waitReadSocketSTM"
-    pair <- threadWaitSTMimplInt n
-        (\i -> threadWaitRead (fromIntegral i))
-    -- Return only the STM () half (fst of the pair).
-    case pair of
-        VCon "(,)" [stmT, _] -> force legacyHooks stmT
-        _ -> pure pair
-
-waitWriteSocketSTMB :: IO Val
-waitWriteSocketSTMB = pure $ VFun $ \sockT -> pure $ VIO $ do
-    n <- socketValToFdInt sockT "waitWriteSocketSTM"
-    pair <- threadWaitSTMimplInt n
-        (\i -> threadWaitWrite (fromIntegral i))
-    case pair of
-        VCon "(,)" [stmT, _] -> force legacyHooks stmT
-        _ -> pure pair
-
--- | Extract CInt fd from @Socket (IORef CInt) CInt@.
-socketValToFdInt :: Thunk -> String -> IO Int64
-socketValToFdInt t primName = do
-    v <- force legacyHooks t
-    case v of
-        VCon "Socket" [refT, ofdT] -> do
-            -- Prefer live IORef contents (ofd can lag / be a Char-leaked
-            -- copy of the same ordinal). Fall back to ofd if ref is closed.
-            refN <- peelSocketRef refT primName
-            if refN >= 0
-                then pure refN
-                else do
-                    ofd <- force legacyHooks ofdT
-                    peelIntegral ofd
-        -- Tolerate extra fields / alternate ctor layouts.
-        VCon "Socket" (refT : ofdT : _) -> do
-            refN <- peelSocketRef refT primName
-            if refN >= 0
-                then pure refN
-                else force legacyHooks ofdT >>= peelIntegral
-        _ -> error (primName <> ": not a Socket: " <> showValForDebug v)
-
--- | Read the CInt fd from a Socket's IORef field.
--- Source shape is @IORef (STRef (MutVar# s a))@ → peel wrappers until
--- 'PrimIORef'. Host-created sockets may store a bare 'PrimIORef'.
-peelSocketRef :: Thunk -> String -> IO Int64
-peelSocketRef refT primName = do
-    refV <- force legacyHooks refT
-    peelIORefVal refV primName >>= \contentT ->
-        force legacyHooks contentT >>= peelIntegral
-
--- | Walk @IORef@ / @STRef@ / bare 'PrimIORef' to the underlying thunk content.
-peelIORefVal :: Val -> String -> IO Thunk
-peelIORefVal v primName = go 0 v
-  where
-    go d val
-        | d > 8 = error (primName <> ": IORef nest too deep: "
-                         <> showValForDebug val)
-        | otherwise = case val of
-            VPrimObj (PrimIORef ref) -> readIORef ref
-            VCon "IORef" [inner] -> force legacyHooks inner >>= go (d + 1)
-            VCon "STRef" [inner] -> force legacyHooks inner >>= go (d + 1)
-            -- MutVar# sometimes surfaces as a named con wrapping PrimIORef.
-            VCon "MutVar#" [inner] -> force legacyHooks inner >>= go (d + 1)
-            VCon n _ ->
-                error (primName <> ": IORef shape: " <> showValForDebug val
-                       <> " (ctor " <> BC.unpack n <> ")")
-            _ -> error (primName <> ": IORef shape: " <> showValForDebug val)
-
-peelIntegral :: Val -> IO Int64
-peelIntegral = go (0 :: Int)
-  where
-    go :: Int -> Val -> IO Int64
-    go d v
-        | d > 8 = error ("peelIntegral: too deep: " <> showValForDebug v)
-        | otherwise = case v of
-            VInt n -> pure n
-            VInteger n -> pure (fromIntegral n)
-            -- CInt/Fd sometimes land as VChar when small ordinals leak through
-            -- the Char#/Int# shared representation (fd 36 → '$').
-            VChar c -> pure (fromIntegral (fromEnum c))
-            VCon _ [inner] -> force legacyHooks inner >>= go (d + 1)
-            _ -> error ("peelIntegral: not integral: " <> showValForDebug v)
 
 -- | Build @(STM (), IO ())@ for a host-backed fd wait.
 threadWaitSTMimpl
@@ -6264,7 +6192,7 @@ fdArgToInt t primName = force legacyHooks t >>= go 0
         | otherwise = case v of
             VInt n -> pure n
             VInteger n -> pure (fromIntegral n)
-            -- Same Char#/Int# leakage as peelIntegral (fd 36 → '$').
+            -- Char#/Int# leakage (fd 36 → '$').
             VChar c -> pure (fromIntegral (fromEnum c))
             -- Newtype / data wrappers: peel one field.
             VCon _ [inner] -> force legacyHooks inner >>= go (depth + 1)
