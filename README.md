@@ -14,9 +14,10 @@ A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goa
 
 The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns out to align cleanly with what agents do well: small steps, narrow blast radius, fixture-driven feedback. The project is as much a study of that alignment as it is a Haskell interpreter.
 
-## Status (2026-08-02)
+## Status (2026-08-08)
 
-- **421 coverage fixtures** exercise the tree-walking lazy evaluator (up from 332 in May).
+- **~495 coverage fixtures** exercise the tree-walking lazy evaluator (up from 421 on 2026-08-02, 332 in May).
+- **Parser probe at 100% on the Hackage/IHP sample set.** `ihc-parse-probe` reports **zero parse errors** on top-level value-binding RHSs for: the representative IHP 50-file sample (**462/462** bindings OK), hasql, hasql-pool, servant, servant-server, lens `Control.Lens` (35-file core), and conduit. April baselines were ~79% (IHP) / ~69–94% (Hackage); residual gaps (dot-ops like `.=`/`.|`, char lits `'['`/`'{'`, comma/pattern guards, layout-`let` edges, TH name quotes / `$var` splices, `\\` as an operator) are closed. Re-run with `scripts/ihp-parse-probe.sh` / `scripts/hackage-parse-probe.sh` (or `exe:ihc-parse-probe`). Older gap notes in `ihp-parser-gaps.md` / `hackage-parser-gaps.md` are historical.
 - **The great de-shimming.** Since May, ~110 host shims have been deleted and replaced with interpreted source. The `isBuiltinBackedModule` whitelist is now genuinely minimal — only source-less, compiler-intrinsic `GHC.*` modules (`GHC.Prim`, `GHC.Types`, `GHC.Prim.PrimOpWrappers`, `Unsafe.Coerce`, the TH splice stubs). Everything with real `.hs` source is now interpreted from that source, including:
   - **`Network.Socket`** — `socket`, `bind`, `listen`, `accept`, `connect`, `getAddrInfo`, `getSocketName`, buffer helpers, facade re-exports. No host socket shims remain.
   - **`Foreign` layer** — `Storable` (`peek`/`poke`/`sizeOf`/`alignment`/`peekElemOff`), `ForeignPtr` (`newForeignPtr`/`withForeignPtr`), `Foreign.Marshal.Alloc` (`malloc`/`free`), `CAString` byte helpers.
@@ -25,12 +26,12 @@ The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns o
   - **Full `ghc-bignum` `BigNat` pipeline** — word/array readers, comparisons, size predicates, index, `log`/`toWord`/`toInt`, square. All source-loaded; the shims are gone.
 - **STM reworked onto primops.** `atomically`/`retry`/`orElse`/`catchSTM`/`newTVar`/`readTVar`/`writeTVar` are source-loaded from `GHC.Conc.Sync` and bottom out on `atomically#`/`retry#`/`newTVar#`/… primops. STM collapses onto IO at the (single-threaded) eval level, mirroring the `ST s ≈ IO` bridge.
 - **Warp reaches request processing.** The full socket path source-loads; warp binds its port, accepts a connection, and receives + processes an HTTP request end-to-end. The remaining blocker to serving the first *response* is a post-receive CPU busy-spin in the interpreted response path (see below).
-- **HSX hello-world (Phase 2.14) foundation in progress** — caches primed, smoke fixture, `EQuasiQuote` parser wiring; route from `[hsx|…|]` → TH `Exp` → `renderHtml` mapped in `docs/HSX-PATH.md`.
-- **Recent parser/scanner work** — package-qualified imports (`import "pkg" M`), Template Haskell location selectors, Haskell 2010 fixity scanning, braced case-alternative guards, Megaparsec stream dispatch.
+- **HSX hello-world (Phase 2.14) foundation in progress** — caches primed, smoke fixture, `EQuasiQuote` parser wiring; route from `[hsx|…|]` → TH `Exp` → `renderHtml` mapped in `docs/HSX-PATH.md`. Binding-level parse of IHP/HSX sources is no longer the gate; the remaining work is TH `quoteExp` dispatch and evaluating the blaze/HSX pipeline.
+- **Lexer/parser surface** — package-qualified imports, Pratt fixity (including 2-char `.ops` like `.=`/`.|`/`.#`), layout `let` (semicolon multi-bind, `where` on bindings, local infix multiclause), comma/pattern guards, char lits for `'['`/`'('`/`'{'`, TH name quotes / id-splices, QuasiQuotes, record update/dot, MultiWayIf, `\case`, sections, backticks.
 - **ByteString fully source-loaded**; exception handling (`try`/`handle`/`bracket`/`finally`/`mask`) source-loaded from ghc-internal.
 - **Cabal-aware source loader**: detects project root, reads `cabal.project.freeze`, parallel `cabal get` into `~/.cache/ihc/sources/`, per-package extensions/cpp-options.
 - **Type classes via dictionary passing**: `ClassRegistry` maps `(ClassName, TypeTag)` to method lists; a generic class-method dispatcher resolves instances — no per-method host shims.
-- Lazy evaluation with `IORef`-backed thunks (thread-aware black-hole protocol); ADTs + pattern matching + lists + `[Char]` strings + tuples + as/bang patterns; Pratt operator parser with module-level fixity tables; hand-rolled CPP; IO monad; multi-module loading with qualified imports; lambdas (`\case`), sections, backtick infix, `MultiWayIf`.
+- Lazy evaluation with `IORef`-backed thunks (thread-aware black-hole protocol); ADTs + pattern matching + lists + `[Char]` strings + tuples + as/bang patterns; hand-rolled CPP; IO monad; multi-module loading with qualified imports.
 - **Cold-start 140x–280x faster than ghci/runghc** (0.018s vs 2.5s for small programs).
 
 Everything via interpretation — **no JIT path on the runtime today**.
@@ -46,9 +47,9 @@ The socket-FFI chain that used to block all I/O is resolved — `Network.Socket`
 
 Diagnostic recipe for the spin: sample the spinning thread or add an eval-counter probe in `IHC.Eval.force`; the loop is emergent from warp's full closure and hasn't reduced standalone.
 
-**HSX hello-world (Phase 2.14)** is the other active milestone: interpret `[hsx|<h1>Hello world</h1>|]` → TH `Exp` → `renderHtml` end-to-end, no shims. Foundation phase is in progress (`docs/HSX-PATH.md`).
+**HSX hello-world (Phase 2.14)** is the other active milestone: interpret `[hsx|<h1>Hello world</h1>|]` → TH `Exp` → `renderHtml` end-to-end, no shims. Foundation phase is in progress (`docs/HSX-PATH.md`). Value-binding parse of the IHP/HSX sample is green; the open work is TH/QQ expansion and runtime evaluation of the blaze pipeline.
 
-**Longer-term IHP readiness** needs a long tail of language extensions that IHP leans on heavily — from the IHP source scan, the highest-frequency missing ones are `AllowAmbiguousTypes`, `UndecidableInstances`, `ScopedTypeVariables`, `FlexibleInstances`/`FlexibleContexts`, `ConstraintKinds`, and `FunctionalDependencies`, on top of the roadmap items `TypeFamilies`, `DataKinds`, `OverloadedLabels`, `ImplicitParams`, and full Template Haskell (see the roadmap below and `ihp-unsupported-scan.md`).
+**Longer-term IHP readiness** is no longer gated on basic expression parsing for the packages above. Remaining work is mainly **semantic**: class dispatch at scale, full Template Haskell (`quoteExp`, quotation, `reify`), type families / DataKinds / OverloadedLabels / ImplicitParams elaboration, and the warp response-path spin. See the roadmap below and `ihp-unsupported-scan.md`.
 
 ## Roadmap
 
@@ -111,6 +112,8 @@ names as positional args to fetch additional tarballs.
 | `src/IHC/ModuleHeader.hs` | `module Foo where`, `import qualified … as …` parsing |
 | `src/IHC/AST.hs` | `Expr`, `Pat`, `Lit`, `Stmt` |
 | `src/IHC/Parser.hs` | recursive-descent → AST, Pratt operator layer |
+| `probe/ParseProbe.hs` | `ihc-parse-probe` — binding-RHS parse rates over package trees |
+| `scripts/*-parse-probe.sh` | IHP / Hackage sample drivers for the parse probe |
 | `src/IHC/Val.hs` | `Val`, `Thunk`, `Env`, `PrimObj` |
 | `src/IHC/Eval.hs` | force / eval / apply / matchPat |
 | `src/IHC/Builtins.hs` | host-Haskell primitives (no FFI shims) |
