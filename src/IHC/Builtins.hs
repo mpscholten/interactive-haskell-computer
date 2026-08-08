@@ -2193,8 +2193,12 @@ showValWith reg av = case av of
         pure (show bs)
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
-        let tag = n
-        mShowMethod <- lookupInstanceMethod reg "Show" tag "show" >>= forceInstanceMethod
+        -- Prefer type-name tag (Word8 for W8#, Maybe for Just, …) so
+        -- Show instances registered under the type — not the prim box
+        -- ctor — are found.  Fall back to the raw ctor name for ADTs
+        -- that register per-constructor (registerOne).
+        let tags = nubTags [typeTagOf av, n]
+        mShowMethod <- findShowMethod tags
         case mShowMethod of
             Just showMethod -> do
                 shown <- CE.try @SomeException $ do
@@ -2206,6 +2210,19 @@ showValWith reg av = case av of
                     Left _  -> showVal av
             _ -> showVal av
     _ -> showVal av
+  where
+    nubTags = go []
+      where
+        go acc [] = reverse acc
+        go acc (t:ts)
+            | t `elem` acc = go acc ts
+            | otherwise    = go (t:acc) ts
+    findShowMethod [] = pure Nothing
+    findShowMethod (tag:tags) = do
+        m <- lookupInstanceMethod reg "Show" tag "show" >>= forceInstanceMethod
+        case m of
+            Just _  -> pure m
+            Nothing -> findShowMethod tags
 
 --------------------------------------------------------------------------------
 -- Lists as user-facing strings / generic containers
@@ -2265,6 +2282,14 @@ showDouble d
         let s = show d
         in if '.' `elem` s || 'e' `elem` s then s else s <> ".0"
 
+-- | Prim box constructors for fixed-width Word/Int.  Shown as bare
+-- numeric payloads (stock Show Word8 / Int8), not "W8# n".
+wordSizedPrimShowCons :: [ByteString]
+wordSizedPrimShowCons = ["W8#", "W16#", "W32#", "W64#", "W#"]
+
+intSizedPrimShowCons :: [ByteString]
+intSizedPrimShowCons = ["I8#", "I16#", "I32#", "I64#", "I#"]
+
 showVal :: Val -> IO String
 showVal (VLabel name) = pure ("#" <> BC.unpack name)   -- Phase 3.5
 showVal (VInt n)    = pure (show n)
@@ -2283,6 +2308,14 @@ showVal v@(VCon ":" _) = do
             pure ("[" <> intercalate "," parts <> "]")
 showVal (VStr s)    = pure (show (BC.unpack s))
 showVal (VCon name thunks)
+    -- Fixed-width Int/Word boxes: GHC Show prints the numeric payload
+    -- only (Show Word8 uses fromIntegral to Int).  When the source
+    -- Show instance isn't available yet (hostShowFallback path), still
+    -- match stock output instead of "W8# 255".
+    | name `elem` wordSizedPrimShowCons || name `elem` intSizedPrimShowCons
+    , [t] <- thunks = do
+        v <- force legacyHooks t
+        showVal v
     | isUnboxedTupleConName name = do
         parts <- mapM (\t -> do v <- force legacyHooks t; showVal v) thunks
         pure ("(#" <> intercalate "," parts <> "#)")

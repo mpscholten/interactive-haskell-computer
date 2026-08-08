@@ -1,15 +1,20 @@
--- runSTArray + mapM_ write (warp Header.traverseHeader).
--- Needs ST (>>) that tolerates return () defaulting issues, CI/ByteString
--- IsString packing, and Eq BS for responseKeyIndex.
+-- Warp response header index (indexResponseHeader).
+--
+-- Pre-3.4.x warp returned an Array; current warp (3.4.15) returns a flat
+-- ResponseHeaderPresence record of Bools / Maybe HeaderValue.  This
+-- fixture locks the presence-record API + OverloadedStrings CI key
+-- matching for "Server".
 {-# LANGUAGE OverloadedStrings #-}
-import Network.Wai.Handler.Warp.Header (indexResponseHeader)
-import Data.Array ((!))
-import qualified Data.ByteString.Char8 as C8
+import Network.Wai.Handler.Warp.Header
+    ( indexResponseHeader
+    , hasServer
+    , hasContentLength
+    , hasDate
+    )
 
 main :: IO ()
 main = do
     let rsp = indexResponseHeader [("Server", "ihc")]
-    -- ResServer = 1
-    case rsp ! 1 of
-        Just v  -> putStrLn (C8.unpack v)
-        Nothing -> putStrLn "Nothing"
+    print (hasServer rsp)
+    print (hasContentLength rsp)
+    print (hasDate rsp)
