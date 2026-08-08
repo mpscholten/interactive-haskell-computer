@@ -2191,6 +2191,13 @@ showValWith reg av = case av of
         -- non-printables escaped. Matches the GHC stock instance.
         bs <- bsValToBS av
         pure (show bs)
+    -- Prim boxes first — stock Show Word8/Int8 print the numeric
+    -- payload only.  Do this before instance lookup so a missing or
+    -- placeholder Show Word8 cannot fall through to "W8# 255".
+    VCon n [t]
+        | n `elem` wordSizedPrimShowCons || n `elem` intSizedPrimShowCons -> do
+            v <- force legacyHooks t
+            showValWith reg v
     VCon n _ | isTupleConName n -> showVal av
     VCon n _ -> do
         -- Prefer type-name tag (Word8 for W8#, Maybe for Just, …) so
