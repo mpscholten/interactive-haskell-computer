@@ -9895,6 +9895,7 @@ isBuiltinBackedModule n =
         && n /= BC.pack "Language.Haskell.TH.Syntax"
         && n /= BC.pack "Language.Haskell.TH.CodeDo"
         && n /= BC.pack "Language.Haskell.TH.PprLib"
+        && n /= BC.pack "Language.Haskell.TH.Lib"
         && n /= BC.pack "Language.Haskell.TH.Lib.Internal"
         && n /= BC.pack "Language.Haskell.TH.LanguageExtensions")
 
