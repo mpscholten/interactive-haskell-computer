@@ -15,6 +15,7 @@ import System.Process
     )
 import Test.Hspec
 
+import qualified BuiltinsAudit
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
@@ -151,6 +152,7 @@ parseFailures line =
 
 allSpecs :: Spec
 allSpecs = do
+    BuiltinsAudit.spec
     ParserBugs.spec
     Properties.Totality.spec
     Properties.RoundTrip.spec
