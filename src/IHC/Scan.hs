@@ -2030,9 +2030,28 @@ scanDataDecls src
                 let (sep, curSig) = nextToken src cur'
                 case tkKind sep of
                     TkDColon -> do
-                        (arity, curEnd) <- countGadtArity 0 0 curSig
-                        let dReg' = Map.insert name (tyName, arity, idx) dReg
-                        collectGadtCtors tyName (idx + 1) (dReg', fReg) curEnd
+                        let (firstSigTok, curAfterFirst) = nextToken src curSig
+                        case tkKind firstSigTok of
+                            -- GADT record constructor:
+                            --   C :: { f1 :: T1, ... } -> Result
+                            -- Record fields determine constructor arity; the
+                            -- trailing arrow only separates the record payload
+                            -- from the result type.
+                            TkLBrace -> do
+                                (arity, fields, curAfterRecord) <-
+                                    collectRecordFields 0 [] curAfterFirst
+                                (_ignored, curEnd) <- countGadtArity 0 0 curAfterRecord
+                                let dReg' = Map.insert name (tyName, arity, idx) dReg
+                                    fReg' = foldr
+                                        (\(fieldName, fieldIdx) acc ->
+                                            Map.insertWith (++) fieldName [(name, fieldIdx)] acc)
+                                        fReg
+                                        fields
+                                collectGadtCtors tyName (idx + 1) (dReg', fReg') curEnd
+                            _ -> do
+                                (arity, curEnd) <- countGadtArity 0 0 curSig
+                                let dReg' = Map.insert name (tyName, arity, idx) dReg
+                                collectGadtCtors tyName (idx + 1) (dReg', fReg) curEnd
                     _ -> collectGadtCtors tyName idx (dReg, fReg) cur'
             -- Column-1 non-newline means next top-level decl.
             _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure ((dReg, fReg), cur)

@@ -92,7 +92,7 @@ import System.IO
 import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
-    ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
+    ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf, normalizeTyTag
     , mkTypeRep, typeRepEq
     , drainCataloguedInstancesForClass
     , legacyHooks
@@ -325,7 +325,7 @@ builtinEnv reg = do
     -- Phase 2.9.5: Built-in Typeable dictionaries for primitive types.
     -- Lazy-init: each dict costs two IORef allocs + a VCon, and most
     -- programs only touch typeableDict_Int / _Char / _Bool.
-    typeableInsts <- buildBuiltinTypeableInsts
+    typeableInsts <- buildBuiltinTypeableInsts reg
     -- Phase 3.5: Default IsLabel dispatch.
     -- Register the IHP-style default instance `(s ~ s') => IsLabel s (Proxy s')`
     -- under the synthetic type tag "Proxy": when `fromLabel` is applied to a
@@ -1560,6 +1560,10 @@ builtins reg =
     -- displayException is a source Exception class method.
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
     , ("typeRep",        typeRepB)
+    -- typeRep# is the sole method of compiler-generated Typeable
+    -- dictionaries. GHC.Internal.Data.Typeable.Internal defines the ordinary
+    -- `typeRep = typeRep#` wrapper in source.
+    , ("typeRep#",       pure (typeRepHashDispatcher reg))
     , ("typeOf",         typeOfB)
     , ("cast",           castB)
     , ("eqT",            eqTB)
@@ -1569,9 +1573,6 @@ builtins reg =
     , ("dynTypeRep",     dynTypeRepB)
     , ("mkTyCon3",       mkTyCon3B)
     , ("mkTyConApp",     mkTyConAppB)
-    , ("tyConName",      tyConNameB)
-    , ("typeRepTyCon",   typeRepTyConB)
-    , ("typeRepArgs",    typeRepArgsB)
     -- Phase 3.5: OverloadedLabels
     , ("fromLabel",    fromLabelB reg)
     -- DataKinds Tier 1: GHC.TypeLits runtime dispatch.
@@ -7166,31 +7167,14 @@ mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
     argsThunk  <- newWHNFThunk argsV
     pure (VCon "TypeRep" [tyConThunk, argsThunk])
 
-tyConNameB :: IO Val
-tyConNameB = pure $ VFun $ \tyConT -> do
-    tyConV <- force legacyHooks tyConT
-    case tyConV of
-        VCon "TyCon" [nameT] -> force legacyHooks nameT
-        _ -> pure (VCon "[]" [])
-
-typeRepTyConB :: IO Val
-typeRepTyConB = pure $ VFun $ \trT -> do
-    trV <- force legacyHooks trT
-    case trV of
-        VCon "TypeRep" [tcT, _] -> force legacyHooks tcT
-        _ -> pure (VCon "TyCon" [])
-
-typeRepArgsB :: IO Val
-typeRepArgsB = pure $ VFun $ \trT -> do
-    trV <- force legacyHooks trT
-    case trV of
-        VCon "TypeRep" [_, argsT] -> force legacyHooks argsT
-        _ -> pure (VCon "[]" [])
-
 -- | Extract a TypeRep from a Typeable dict or raw TypeRep value.
 extractTypeRep :: Val -> IO Val
 extractTypeRep (VCon "Dict_Typeable" [trT]) = force legacyHooks trT
-extractTypeRep v@(VCon "TypeRep" _)         = pure v
+extractTypeRep v@(VCon "TrType" _)          = pure v
+extractTypeRep v@(VCon "TrTyCon" _)         = pure v
+extractTypeRep v@(VCon "TrApp" _)           = pure v
+extractTypeRep v@(VCon "TrFun" _)           = pure v
+extractTypeRep (VCon "SomeTypeRep" [trT])   = force legacyHooks trT
 extractTypeRep _                            = mkTypeRep "Unknown"
 
 -- | Dynamic constructor as a curried function value.
@@ -7205,8 +7189,8 @@ dynamicCtorB = pure $ VFun $ \trT -> pure $ VFun $ \valT -> do
 -- Each dict is registered as a 'LazyBuiltin' thunk so startup doesn't pay
 -- the cost of allocating a TypeRep + wrapper VCon for every primitive
 -- type — a hello-world program never touches any of these.
-buildBuiltinTypeableInsts :: IO [(Name, Thunk)]
-buildBuiltinTypeableInsts = mapM mkDict prims
+buildBuiltinTypeableInsts :: ClassRegistry -> IO [(Name, Thunk)]
+buildBuiltinTypeableInsts reg = mapM mkDict prims
   where
     prims :: [(Name, Name)]
     prims =
@@ -7237,4 +7221,25 @@ buildBuiltinTypeableInsts = mapM mkDict prims
             tr  <- mkTypeRep tyName
             trT <- newWHNFThunk tr
             pure (VCon "Dict_Typeable" [trT])
+        -- Typeable instances are emitted by the compiler, not declared in
+        -- Haskell source. Publish their nullary method through the same class
+        -- registry used by source-defined instances so constrained source
+        -- functions can capture and resolve it normally.
+        tr <- mkTypeRep tyName
+        registerInstance reg (BC.pack "Typeable") tag
+            (HashMap.fromList
+                [ (BC.pack "typeRep#", tr)
+                , (BC.pack "typeRep", tr)
+                ])
         pure ("typeableDict_" <> tag, dictT)
+
+typeRepHashDispatcher :: ClassRegistry -> Val
+typeRepHashDispatcher reg = self
+  where
+    self = VClassMethod (BC.pack "Typeable") (BC.pack "typeRep#") 0 [] $ \tags _ ->
+        case tags of
+            (tag:_) -> do
+                m <- lookupInstanceMethod reg (BC.pack "Typeable")
+                        (normalizeTyTag tag) (BC.pack "typeRep#")
+                maybe (pure self) (forceMethodVal legacyHooks) m
+            [] -> pure self

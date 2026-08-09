@@ -616,7 +616,22 @@ eval hooks env ipm = go
                 -- ETyApp (which contributes one positional tag).  Replace
                 -- any tags inherited through a constrained alias instead of
                 -- duplicating them when aliases delegate to other aliases.
-                pure (VClassMethod cls m slot (map normalizeTyTag instanceTags) fn)
+                case instanceTags of
+                    (candidate:_)
+                      | isRuntimeTypeVariable candidate
+                      , Just tagT <- lookupIPMap (dictionaryContextKey cls) ipm -> do
+                            tagV <- force hooks tagT
+                            case tagV of
+                                VStr tag -> do
+                                    mReg <- getSharedClassReg hooks
+                                    case mReg of
+                                        Nothing -> pure (VClassMethod cls m slot [] fn)
+                                        Just reg -> do
+                                            mMethod <- lookupInstanceMethod reg cls tag m
+                                            maybe (pure (VClassMethod cls m slot [] fn))
+                                                  (forceMethodVal hooks) mMethod
+                                _ -> pure (VClassMethod cls m slot [] fn)
+                    _ -> pure (VClassMethod cls m slot (map normalizeTyTag instanceTags) fn)
             VFunIP lexicalIP f -> pure $ VFunIP lexicalIP $ \callerIP argT -> do
                 argV <- force hooks argT
                 dictIP <- dictionaryContext constraints argV

@@ -80,6 +80,7 @@ module IHC.Classes
     ) where
 
 import Control.Exception (SomeException, catch)
+import Control.Monad (foldM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.HashMap.Strict as HashMap
@@ -100,42 +101,56 @@ import IHC.Val
 -- Phase 2.9.5: TypeRep construction helpers
 --------------------------------------------------------------------------------
 
--- | Build a TyCon value: VCon "TyCon" [nameThunk].
--- The name is the type constructor name as a [Char] list.
+-- | Build the compiler-generated six-field GHC.Types.TyCon value used by
+-- modern Type.Reflection. Fingerprints are intentionally stable placeholders:
+-- IHC's structural equality compares the constructor/application tree.
 mkTyCon :: ByteString -> IO Val
 mkTyCon name = do
-    nameT <- stringToThunk (BC.unpack name)
-    pure (VCon "TyCon" [nameT])
+    zeroHiT <- newWHNFThunk (VInt 0)
+    zeroLoT <- newWHNFThunk (VInt 0)
+    pkgNameT <- stringToThunk "ihc"
+    modNameT <- stringToThunk "GHC.Types"
+    pkgT <- newWHNFThunk (VCon "TrNameD" [pkgNameT])
+    modT <- newWHNFThunk (VCon "TrNameD" [modNameT])
+    moduleT <- newWHNFThunk (VCon "Module" [pkgT, modT])
+    nameCharsT <- stringToThunk (BC.unpack name)
+    nameT <- newWHNFThunk (VCon "TrNameD" [nameCharsT])
+    kindVarsT <- newWHNFThunk (VInt 0)
+    liftedT <- newWHNFThunk (VCon "LiftedRep" [])
+    boxedT <- newWHNFThunk (VCon "BoxedRep" [liftedT])
+    kindT <- newWHNFThunk (VCon "KindRepTYPE" [boxedT])
+    pure (VCon "TyCon" [zeroHiT, zeroLoT, moduleT, nameT, kindVarsT, kindT])
 
 -- | Build a TypeRep for a nullary type constructor (no applied args).
--- VCon "TypeRep" [tyConThunk, emptyListThunk]
+-- @TrTyCon fingerprint tycon kindVars kind@ is the representation emitted by
+-- GHC for a saturated nullary type constructor.
 mkTypeRep :: ByteString -> IO Val
 mkTypeRep name = do
     tyConV <- mkTyCon name
     tyConT <- newWHNFThunk tyConV
+    hiT <- newWHNFThunk (VInt 0)
+    loT <- newWHNFThunk (VInt 0)
+    fpT <- newWHNFThunk (VCon "Fingerprint" [hiT, loT])
     nilT   <- newWHNFThunk (VCon "[]" [])
-    pure (VCon "TypeRep" [tyConT, nilT])
+    kindT <- newWHNFThunk (VCon "TrType" [])
+    pure (VCon "TrTyCon" [fpT, tyConT, nilT, kindT])
 
 -- | Build a TypeRep for an applied type: f applied to args.
 -- VCon "TypeRep" [tyConThunk, argsListThunk]
 -- where args are sub-TypeReps for each applied argument.
 mkTypeRepApp :: ByteString -> [Val] -> IO Val
 mkTypeRepApp name argReps = do
-    tyConV <- mkTyCon name
-    tyConT <- newWHNFThunk tyConV
-    argTs  <- mapM newWHNFThunk argReps
-    -- Build a [TypeRep] list.
-    listV  <- valListFromThunks argTs
-    listT  <- newWHNFThunk listV
-    pure (VCon "TypeRep" [tyConT, listT])
-
--- Build a Haskell list Val from a list of thunks.
-valListFromThunks :: [Thunk] -> IO Val
-valListFromThunks []     = pure (VCon "[]" [])
-valListFromThunks (t:ts) = do
-    rest  <- valListFromThunks ts
-    restT <- newWHNFThunk rest
-    pure (VCon ":" [t, restT])
+    root <- mkTypeRep name
+    foldM applyRep root argReps
+  where
+    applyRep funRep argRep = do
+        hiT <- newWHNFThunk (VInt 0)
+        loT <- newWHNFThunk (VInt 0)
+        fpT <- newWHNFThunk (VCon "Fingerprint" [hiT, loT])
+        funT <- newWHNFThunk funRep
+        argT <- newWHNFThunk argRep
+        kindT <- newWHNFThunk (VCon "TrType" [])
+        pure (VCon "TrApp" [fpT, funT, argT, kindT])
 
 -- | Build a [Char] list Val from a String.
 stringToThunk :: String -> IO Thunk
@@ -160,13 +175,18 @@ builtinTypeRep = mkTypeRep
 -- Two TypeReps are equal iff their TyCon names and all argument TypeReps
 -- are equal. This mirrors Eq TypeRep in GHC's implementation.
 typeRepEq :: Val -> Val -> IO Bool
-typeRepEq (VCon "TypeRep" [tc1, args1]) (VCon "TypeRep" [tc2, args2]) = do
-    b1 <- tyConEq tc1 tc2
-    if not b1 then pure False
-    else do
-        v1 <- readIORef args1 >>= forceThunkState
-        v2 <- readIORef args2 >>= forceThunkState
-        typeRepListEq v1 v2
+typeRepEq (VCon "SomeTypeRep" [a]) b = readIORef a >>= forceThunkState >>= (`typeRepEq` b)
+typeRepEq a (VCon "SomeTypeRep" [b]) = readIORef b >>= forceThunkState >>= typeRepEq a
+typeRepEq (VCon "TrType" []) (VCon "TrType" []) = pure True
+typeRepEq (VCon "TrTyCon" [_fp1, tc1, _kvs1, _kind1])
+          (VCon "TrTyCon" [_fp2, tc2, _kvs2, _kind2]) = tyConEq tc1 tc2
+typeRepEq (VCon "TrApp" [_fp1, f1, a1, _kind1])
+          (VCon "TrApp" [_fp2, f2, a2, _kind2]) = do
+    fv1 <- readIORef f1 >>= forceThunkState
+    fv2 <- readIORef f2 >>= forceThunkState
+    av1 <- readIORef a1 >>= forceThunkState
+    av2 <- readIORef a2 >>= forceThunkState
+    (&&) <$> typeRepEq fv1 fv2 <*> typeRepEq av1 av2
 typeRepEq _ _ = pure False
 
 tyConEq :: Thunk -> Thunk -> IO Bool
@@ -174,7 +194,16 @@ tyConEq t1 t2 = do
     v1 <- readIORef t1 >>= forceThunkState
     v2 <- readIORef t2 >>= forceThunkState
     case (v1, v2) of
-        (VCon "TyCon" [n1], VCon "TyCon" [n2]) -> strEq n1 n2
+        (VCon "TyCon" [_h1,_l1,_m1,n1,_ka1,_k1],
+         VCon "TyCon" [_h2,_l2,_m2,n2,_ka2,_k2]) -> trNameEq n1 n2
+        _ -> pure False
+
+trNameEq :: Thunk -> Thunk -> IO Bool
+trNameEq t1 t2 = do
+    v1 <- readIORef t1 >>= forceThunkState
+    v2 <- readIORef t2 >>= forceThunkState
+    case (v1, v2) of
+        (VCon "TrNameD" [n1], VCon "TrNameD" [n2]) -> strEq n1 n2
         _ -> pure False
 
 strEq :: Thunk -> Thunk -> IO Bool
@@ -200,19 +229,6 @@ readThunkPure t =
     case unsafePerformIO (readIORef t) of
         Evaluated v  -> v
         _            -> VStr (BC.pack "<thunk>")
-
-typeRepListEq :: Val -> Val -> IO Bool
-typeRepListEq (VCon "[]" []) (VCon "[]" []) = pure True
-typeRepListEq (VCon ":" [h1,t1]) (VCon ":" [h2,t2]) = do
-    v1 <- readIORef h1 >>= forceThunkState
-    v2 <- readIORef h2 >>= forceThunkState
-    b  <- typeRepEq v1 v2
-    if not b then pure False
-    else do
-        r1 <- readIORef t1 >>= forceThunkState
-        r2 <- readIORef t2 >>= forceThunkState
-        typeRepListEq r1 r2
-typeRepListEq _ _ = pure False
 
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
