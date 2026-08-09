@@ -7,13 +7,17 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import System.Environment
     (getArgs, getEnvironment, getExecutablePath, lookupEnv)
 import System.Exit (ExitCode(..), exitWith)
-import System.IO (BufferMode(..), hFlush, hGetLine, hIsEOF, hSetBuffering, stdout)
+import System.IO
+    ( BufferMode(..), hFlush, hGetLine, hIsEOF, hPutStrLn, hSetBuffering
+    , stderr, stdout
+    )
 import System.Posix.Signals (sigKILL, signalProcess)
 import System.Process
     ( CreateProcess(..), StdStream(..), createProcess, getPid
     , getProcessExitCode, proc, waitForProcess
     )
 import Test.Hspec
+import Text.Read (readMaybe)
 
 import qualified BuiltinsAudit
 import qualified CabalLoader
@@ -108,6 +112,7 @@ parentMain = do
     hSetBuffering stdout LineBuffering
     fref  <- newIORef Nothing        -- parsed failure count, once the summary is seen
     armed <- newIORef False          -- grace-then-SIGKILL armed?
+    timedOut <- newIORef False
     let killChild = getPid ph >>= maybe (pure ()) (signalProcess sigKILL)
         pump = do
             eof <- hIsEOF hOut       -- blocks until a line or the pipe closes
@@ -128,15 +133,29 @@ parentMain = do
                                 when (alive == Nothing) killChild
                             pure ()
                 pump
+    timeoutSeconds <- maybe 1200 id . (>>= readMaybe)
+        <$> lookupEnv "IHC_TEST_TIMEOUT_SECONDS"
+    _ <- forkIO $ do
+        threadDelay (timeoutSeconds * 1000 * 1000)
+        alive <- getProcessExitCode ph
+        when (alive == Nothing) $ do
+            writeIORef timedOut True
+            hPutStrLn stderr
+                ("ihc-test: suite exceeded " <> show timeoutSeconds
+                    <> " seconds; terminating wedged child")
+            killChild
     pump                             -- until the child's stdout closes (clean exit or SIGKILL)
     ec <- waitForProcess ph
     mf <- readIORef fref
-    exitWith $ case mf of
-        Just 0  -> ExitSuccess       -- hspec summary is authoritative
-        Just _  -> ExitFailure 1
-        Nothing -> case ec of        -- no summary => child crashed; trust its code
-            ExitSuccess -> ExitSuccess
-            _           -> ExitFailure 1
+    didTimeOut <- readIORef timedOut
+    exitWith $ if didTimeOut
+        then ExitFailure 124
+        else case mf of
+            Just 0  -> ExitSuccess   -- hspec summary is authoritative
+            Just _  -> ExitFailure 1
+            Nothing -> case ec of    -- no summary => child crashed; trust its code
+                ExitSuccess -> ExitSuccess
+                _           -> ExitFailure 1
 
 -- hspec prints e.g. @603 examples, 0 failures, 72 pending@; pull the
 -- integer immediately preceding the @failure(s)@ token.
