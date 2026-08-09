@@ -9875,6 +9875,7 @@ isBuiltinBackedModule n =
         && n /= BC.pack "Language.Haskell.TH.Syntax"
         && n /= BC.pack "Language.Haskell.TH.CodeDo"
         && n /= BC.pack "Language.Haskell.TH.PprLib"
+        && n /= BC.pack "Language.Haskell.TH.Lib.Internal"
         && n /= BC.pack "Language.Haskell.TH.LanguageExtensions")
 
 -- | Emit a diagnostic to stderr when a missing module is being
