@@ -129,7 +129,11 @@ annotateNullaryBoundedArg f x = case x of
 elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
 elaborateExpectedArg hooks owner f x = do
     initialSigs <- readIORef globalTypeSigsRef
-    sigs <- foldM loadMissingSig initialSigs (expressionHeads x)
+    -- Include the partially-applied callee as well as the new argument.
+    -- Owner-scoped metadata is what lets inference see a source-loaded
+    -- method's real scheme without relying on the process-global flat map.
+    sigs <- foldM loadMissingSig initialSigs
+        (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
     if not (needsExpectedElaboration sigs x)
         then pure x
         else case appHeadAndArity f of
@@ -143,8 +147,26 @@ elaborateExpectedArg hooks owner f x = do
                                 case mReg of
                                     Nothing -> pure x
                                     Just classReg -> do
+                                        -- Infer the residual type of the
+                                        -- partially-applied callee first. This
+                                        -- retains substitutions learned from
+                                        -- every earlier argument, unlike merely
+                                        -- indexing the original scheme's arrow
+                                        -- list. For example, after
+                                        -- @same True@, @same :: a -> a -> a@
+                                        -- has residual domain @Bool@.
+                                        residual <- try
+                                            (Elab.elaborate classReg sigs syns
+                                                Elab.InferFreely f)
+                                            :: IO (Either SomeException (Expr, TA.Type))
+                                        let expected = case residual of
+                                                Right (_, residualTy) ->
+                                                    case tyArrowArgs residualTy of
+                                                        (argTy : _, _) -> argTy
+                                                        _ -> args !! supplied
+                                                Left _ -> args !! supplied
                                         result <- try (Elab.elaborate classReg sigs syns
-                                                        (Elab.ExpectType (args !! supplied)) x)
+                                                        (Elab.ExpectType expected) x)
                                             :: IO (Either SomeException (Expr, TA.Type))
                                         pure (either (const x) fst result)
                             _ -> pure x
@@ -158,7 +180,7 @@ elaborateExpectedArg hooks owner f x = do
             mScheme <- lookupTypeSigFallback hooks owner name
             pure $ maybe sigs (\scheme -> Map.insert name scheme sigs) mScheme
 
-    expressionHeads = Set.toList . go
+    expressionHeadSet = go
       where
         go (EVar name) = Set.singleton name
         go (EApp innerF innerX) = Set.union (go innerF) (go innerX)
