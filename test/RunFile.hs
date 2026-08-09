@@ -938,6 +938,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Red\n"
 
+    it "TH language extensions are interpreted from ghc-boot-th source" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_language_extensions_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "TemplateHaskell\nQualifiedDo\n"
+
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------

@@ -9757,15 +9757,14 @@ isBuiltinBackedModule n =
     -- therefore compiler-intrinsic and must be host-backed; the builtin
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
-    -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
-    -- builtins for splice execution.  Most submodules are stubbed because
-    -- their content is replaced by IHC.TH's synthetic primops.
-    -- HOWEVER: 'Language.Haskell.TH.Quote' is a small pure module that
-    -- declares 'data QuasiQuoter = QuasiQuoter { quoteExp, … }'.  The
-    -- QQ-dispatch path needs that constructor (record-construction in
-    -- ihp-hsx etc.) and it has no primops backing it — interpret it
-    -- from source.
-    || ("Language.Haskell.TH" `BC.isPrefixOf` n && n /= BC.pack "Language.Haskell.TH.Quote")
+    -- Quote is the pure QuasiQuoter record module. LanguageExtensions is
+    -- likewise ordinary source, backed by the generated ghc-boot-th module
+    -- collected by flake.nix. Syntax and modules layered above it remain at
+    -- the compiler boundary until source Q can execute with a concrete
+    -- Quasi-IO dictionary instead of the current host VIO carrier.
+    || ("Language.Haskell.TH" `BC.isPrefixOf` n
+        && n /= BC.pack "Language.Haskell.TH.Quote"
+        && n /= BC.pack "Language.Haskell.TH.LanguageExtensions")
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
