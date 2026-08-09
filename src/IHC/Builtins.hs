@@ -5883,7 +5883,13 @@ buildFieldEnv reg = do
                              <> "` has only " <> show (length args)
                              <> " fields, index " <> show idx
                              <> " out of range"))
-                    Nothing -> tryIsStringFallback fieldName clauses v conName
+                    -- Newtype constructors are erased even when their
+                    -- payload is itself represented by a VCon. A selector
+                    -- with one index-zero clause therefore projects the
+                    -- already-unwrapped value regardless of runtime shape.
+                    Nothing
+                      | [(_, 0)] <- clauses -> pure v
+                      | otherwise -> tryIsStringFallback fieldName clauses v conName
             -- Nullary class methods like @mempty@ need result-type
             -- evidence before a newtype field accessor can project them.
             -- A single-constructor field registry gives us that evidence.

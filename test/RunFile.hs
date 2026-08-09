@@ -953,6 +953,10 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "CodeDo\n"
 
+    it "erased newtype selector projects a constructor-shaped payload" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/newtype_selector_vcon.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Just 3\n"
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------
