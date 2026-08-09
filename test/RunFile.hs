@@ -20,7 +20,8 @@ import IHC.Driver
 import IHC.Eval (eval, force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (emptyKnownSymbols, findBinding)
-import IHC.Scheduler (loadProgramFromSource, schemesHaveCommonInstance)
+import IHC.Scheduler
+    ( loadProgramFromSource, schemesHaveCommonInstance, resolveTypeSigMetadata )
 import IHC.Source (readSourceFile)
 import IHC.TypeAST (Scheme(..), Type(..), Pred(..))
 import IHC.TH (thExpToExpr)
@@ -560,6 +561,23 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             providerC = Scheme [n "c"] [] (pair (TyVar (n "c")) (TyCon (n "Bool")))
         schemesHaveCommonInstance [providerA, providerB, providerC]
             `shouldReturn` False
+
+    it "module metadata: class methods respect C(..), C(method), hiding, and ambiguity" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_metadata_exports"
+            predicateClass (Just (Scheme _ (Pred cls _ : _) _)) = Just cls
+            predicateClass _ = Nothing
+        runMainWithSiblings (root </> "Main.hs") `shouldReturn` 0
+        resolveTypeSigMetadata Nothing "OwnerAll.markerAll" `shouldReturn`
+            Just (Scheme [] [] (TyCon "Integer"))
+        resolveTypeSigMetadata (Just "OwnerAll") "pick"
+            `shouldReturn` (Just (Scheme ["a"] [Pred "CA" [TyVar "a"]] (TyVar "a")))
+        _ <- resolveTypeSigMetadata Nothing "OwnerExplicit.markerExplicit"
+        explicit <- resolveTypeSigMetadata (Just "OwnerExplicit") "pick"
+        predicateClass explicit `shouldBe` Just "CB"
+        _ <- resolveTypeSigMetadata Nothing "OwnerHidden.markerHidden"
+        resolveTypeSigMetadata (Just "OwnerHidden") "pick" `shouldReturn` Nothing
+        _ <- resolveTypeSigMetadata Nothing "OwnerAmbiguous.markerAmbiguous"
+        resolveTypeSigMetadata (Just "OwnerAmbiguous") "pick" `shouldReturn` Nothing
 
     it "module: visible provider signatures with different constraints remain ambiguous" do
         let n = BC.pack

@@ -41,6 +41,7 @@ module IHC.Scheduler
     , splitQualified
     , schemesCompatible
     , schemesHaveCommonInstance
+    , resolveTypeSigMetadata
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
@@ -8131,9 +8132,18 @@ resolveTypeSigMetadata mOwner requested = do
         searchPath <- readIORef globalSearchPathRef
         includeMap <- readIORef globalIncludeMapRef
         registry <- newIORef (Map.map Loaded mods)
-        case mOwner >>= (`Map.lookup` mods) of
+        case mOwner of
             Nothing -> resolveQualified registry searchPath includeMap mods requested
-            Just owner -> resolveFromOwner registry searchPath includeMap Set.empty owner requested
+            Just ownerName -> do
+                mLoadedOwner <- case Map.lookup ownerName mods of
+                    Just owner -> pure (Just owner)
+                    Nothing -> do
+                        loaded <- try (loadModule registry searchPath includeMap ownerName)
+                            :: IO (Either SomeException LoadedModule)
+                        pure (either (const Nothing) Just loaded)
+                case mLoadedOwner of
+                    Just owner -> resolveFromOwner registry searchPath includeMap Set.empty owner requested
+                    Nothing -> pure Nothing
 
     resolveQualified registry searchPath includeMap mods name =
         case splitAtLastDot name of
@@ -8162,7 +8172,6 @@ resolveTypeSigMetadata mOwner requested = do
                         imports =
                             [ imp
                             | imp <- mhImports (lmHeader owner)
-                            , specAllows (impSpec imp) bare
                             , case mQual of
                                 Nothing -> not (impQualified imp)
                                 Just q  -> q == fromMaybe (impModule imp) (impAlias imp)
@@ -8175,9 +8184,12 @@ resolveTypeSigMetadata mOwner requested = do
                 :: IO (Either SomeException LoadedModule)
             case loaded of
                 Left _ -> pure []
-                Right target
-                    | not (exportsName target bare) -> pure []
-                    | otherwise -> do
+                Right target -> do
+                    allowed <- specAllowsLoaded target (impSpec imp) bare
+                    exportsMethod <- exportsClassMethodDirect target bare
+                    if not allowed || not (exportsName target bare || exportsMethod)
+                      then pure []
+                      else do
                         (declaredThere, targetScheme) <- lookupOwnedSig target bare
                         case (declaredThere, targetScheme) of
                           (_, Just scheme) -> pure [scheme]
@@ -11232,6 +11244,30 @@ exportsNameDirect lm n = case mhExports (lmHeader lm) of
     matchDirect (ExportType m (Just subs)) =
         n == m || n `elem` subs
     matchDirect (ExportModule _) = False
+
+-- | Whether a source-declared class method is directly exported by a module.
+-- Class exports share the @ExportType@ representation with data types, but
+-- their children do not occur in 'lmTypeCtorReg', so ordinary 'exportsName'
+-- cannot recognize @C(..)@.  Keep this IO because class declarations are
+-- demand-scanned and memoised from source.
+exportsClassMethodDirect :: LoadedModule -> ByteString -> IO Bool
+exportsClassMethodDirect lm methodName = do
+    decls <- scanClassDecls (lmSource lm)
+        `catch` (\(_ :: SomeException) -> pure [])
+    let declaringClasses =
+            [ classClassName decl
+            | decl <- decls
+            , methodName `elem` classMethodNames decl
+            ]
+        exported item = case item of
+            ExportName n -> n == methodName && not (null declaringClasses)
+            ExportType cls (Just []) -> cls `elem` declaringClasses
+            ExportType cls (Just methods) ->
+                cls `elem` declaringClasses && methodName `elem` methods
+            _ -> False
+    pure $ case mhExports (lmHeader lm) of
+        ExportAll -> not (null declaringClasses)
+        ExportList items -> any exported items
 
 -- | Like 'exportsNameDirect' but also returns True when the export
 -- list contains a @module Foo@ entry (because the name may come from
