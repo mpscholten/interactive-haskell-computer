@@ -151,6 +151,17 @@ seedBuiltinClassMethodSigs = do
                     (TyVar a)
         -- maxBound :: Bounded a => a
         maxBoundSig = minBoundSig
+        -- Exception selectors live in a class declaration rather than as
+        -- top-level bindings.  Keep their signatures available before the
+        -- defining module is demand-loaded so calls elaborate to typed
+        -- method dispatch instead of relying on host shims.
+        toExceptionSig = Scheme [a]
+                    [Pred (BC.pack "Exception") [TyVar a]]
+                    (TyArrow (TyVar a) (TyCon (BC.pack "SomeException")))
+        fromExceptionSig = Scheme [a]
+                    [Pred (BC.pack "Exception") [TyVar a]]
+                    (TyArrow (TyCon (BC.pack "SomeException"))
+                        (TyApp (TyCon (BC.pack "Maybe")) (TyVar a)))
     modifyIORef' globalTypeSigsRef $ \s ->
         Map.unions
             [ Map.fromList
@@ -159,6 +170,8 @@ seedBuiltinClassMethodSigs = do
                 , (BC.pack "mempty",   memptySig)
                 , (BC.pack "minBound", minBoundSig)
                 , (BC.pack "maxBound", maxBoundSig)
+                , (BC.pack "toException", toExceptionSig)
+                , (BC.pack "fromException", fromExceptionSig)
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]
@@ -171,6 +184,8 @@ seedBuiltinClassMethodSigs = do
         , "mempty"
         , "minBound"
         , "maxBound"
+        , "toException"
+        , "fromException"
         ]
     -- Seed method→class for the builtin numeric/enum/float classes so
     -- the env-fallback can synthesise a 'classMethodDispatcher' on demand
@@ -183,6 +198,8 @@ seedBuiltinClassMethodSigs = do
         Map.fromListWith (++) $ map (\(m, c) -> (BC.pack m, [BC.pack c]))
             -- Num
             [ ("+",          "Num")
+            , ("toException", "Exception")
+            , ("fromException", "Exception")
             , ("-",          "Num")
             , ("*",          "Num")
             , ("negate",     "Num")

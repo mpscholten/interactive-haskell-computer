@@ -333,6 +333,31 @@ valKindTag = \case
 -- eval
 --------------------------------------------------------------------------------
 
+-- | @fromException :: SomeException -> Maybe e@ dispatches on @e@, which is
+-- normally fixed by the surrounding case pattern rather than a value argument.
+-- Carry that demanded constructor into the ordinary ETyApp/class dispatcher.
+annotateFromExceptionCase :: Expr -> [Alt] -> Expr
+annotateFromExceptionCase scrut alts =
+    case (scrut, firstJustCtor alts) of
+        (EApp f arg, Just tag)
+            | isFromExceptionHead f -> EApp (ETyApp f tag) arg
+        _ -> scrut
+  where
+    isFromExceptionHead (EVar n) = bare n == BC.pack "fromException"
+    isFromExceptionHead (ETyApp inner _) = isFromExceptionHead inner
+    isFromExceptionHead _ = False
+
+    bare n = case BC.elemIndexEnd '.' n of
+        Just idx -> BC.drop (idx + 1) n
+        Nothing  -> n
+
+    firstJustCtor [] = Nothing
+    firstJustCtor (Alt pat _ : rest) =
+        case pat of
+            PCon "Just" [PCon ctor _] -> Just ctor
+            PAs _ (PCon "Just" [PCon ctor _]) -> Just ctor
+            _ -> firstJustCtor rest
+
 eval :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
 eval hooks env ipm = go
   where
@@ -459,7 +484,8 @@ eval hooks env ipm = go
         eval hooks env' ipm body
 
     go (ECase scrut alts) = do
-        scrutT <- newThunkIP env ipm scrut
+        let scrut' = annotateFromExceptionCase scrut alts
+        scrutT <- newThunkIP env ipm scrut'
         tryAltsFromThunk scrutT alts
 
     go (EIf c t e) = do

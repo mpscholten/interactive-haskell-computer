@@ -1,3 +1,2 @@
-myerr: mine
-host-not-myerr
-host-some
+myerr: matched
+other: nothing

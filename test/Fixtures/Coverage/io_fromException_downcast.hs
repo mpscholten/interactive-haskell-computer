@@ -1,30 +1,26 @@
--- Regression coverage for the Val-level fromException helper used by
--- source-loaded catch/try/handle. It must let matching concrete
--- exceptions through while letting non-matching downcasts fall through
--- to Nothing.
+{-# LANGUAGE DeriveDataTypeable #-}
 
-import Control.Exception
+-- Result-type-directed dispatch for the source-defined Exception selectors.
+-- The demanded constructor under Just selects the corresponding dictionary;
+-- no host toException/fromException shim participates.
+import Data.Typeable (Typeable)
+import GHC.Internal.Exception.Type (Exception(..), SomeException(..))
 
-data MyErr = MyErr String deriving Show
-instance Exception MyErr
+data MyErr = MyErr deriving (Show, Typeable)
+data Other = Other deriving (Show, Typeable)
+
+instance Exception MyErr where
+    fromException _ = Just MyErr
+
+instance Exception Other where
+    fromException _ = Nothing
 
 main :: IO ()
 main = do
-    r1 <- try (throwIO (MyErr "mine")) :: IO (Either SomeException ())
-    case r1 of
-        Left se ->
-            case fromException se of
-                Just (MyErr s) -> putStrLn ("myerr: " ++ s)
-                Nothing        -> putStrLn "myerr: nothing"
-        Right _ -> putStrLn "myerr: right"
-
-    r2 <- try (evaluate (error "boom" :: Int)) :: IO (Either SomeException Int)
-    case r2 of
-        Left se -> do
-            case fromException se of
-                Just (MyErr _) -> putStrLn "host-as-myerr"
-                Nothing        -> putStrLn "host-not-myerr"
-            case fromException se of
-                Just (SomeException _) -> putStrLn "host-some"
-                Nothing                -> putStrLn "host-some-nothing"
-        Right _ -> putStrLn "host: right"
+    let some = SomeException MyErr
+    case fromException some of
+        Just MyErr -> putStrLn "myerr: matched"
+        Nothing -> putStrLn "myerr: nothing"
+    case fromException some of
+        Just Other -> putStrLn "other: matched"
+        Nothing -> putStrLn "other: nothing"

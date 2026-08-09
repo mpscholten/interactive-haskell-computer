@@ -1460,24 +1460,6 @@ builtins reg =
     -- is cosmetic at the Val level, and our `extractExceptionMessage`
     -- already understands the SomeException wrapper).
     , ("toExceptionWithBacktrace", toExceptionWithBacktraceB)
-    -- toException: class method of Exception. Source-loaded throwIO
-    -- chain also reaches this via `throwIO e = IO (raiseIO# (toException e))`.
-    -- In the Val world we have no type-driven dispatch, so identity-with-
-    -- SomeException-wrap is fine (same contract as toExceptionWithBacktrace).
-    , ("toException",     toExceptionB)
-    , ("Control.Exception.toException", toExceptionB)
-    , ("GHC.Internal.Control.Exception.toException", toExceptionB)
-    , ("GHC.Internal.Exception.toException", toExceptionB)
-    -- fromException: pair of toException. Used by source-loaded catch:
-    --   handler' e = case fromException e of Just e' -> h e'; Nothing -> raiseIO# e
-    -- With Val-level dynamic typing we return the wrapper in `Just`;
-    -- matchPat handles concrete constructor demands through the
-    -- SomeException wrapper and lets failed downcast guards fall through
-    -- to `Nothing`.
-    , ("fromException",   fromExceptionB)
-    , ("Control.Exception.fromException", fromExceptionB)
-    , ("GHC.Internal.Control.Exception.fromException", fromExceptionB)
-    , ("GHC.Internal.Exception.fromException", fromExceptionB)
     -- =================================================================
     -- VIO <-> State# bridge -- RTS-exclusive
     --
@@ -6995,43 +6977,6 @@ toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
         _                       -> do
             eT' <- newWHNFThunk ev
             pure (VCon "SomeException" [eT'])
-
--- | @toException :: Exception e => e -> SomeException@ — identity-with-wrap
--- at the Val level (we lack the Exception class dispatch; SomeException is
--- idempotent). Complements 'toExceptionWithBacktraceB' for the pure throw
--- path (@throwIO e = IO (raiseIO# (toException e))@).
-toExceptionB :: IO Val
-toExceptionB = pure $ VFun $ \eT -> do
-    ev <- force legacyHooks eT
-    case ev of
-        VCon "SomeException" _ -> pure ev
-        _                       -> do
-            eT' <- newWHNFThunk ev
-            pure (VCon "SomeException" [eT'])
-
--- | @fromException :: Exception e => SomeException -> Maybe e@.
--- Real GHC is type-directed.  At the Val level we return @Just@ for
--- 'SomeException' inputs; 'matchPat' supplies the limited downcast
--- behavior we can infer from demanded constructor patterns.
-fromExceptionB :: IO Val
-fromExceptionB = pure $ VFun $ \eT -> do
-    -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
-    -- is type-driven in real Haskell: it returns 'Just' only if the
-    -- 'SomeException' wraps a value of type 'e'.  Without type info at
-    -- runtime our previous "always Just" implementation made guards
-    -- like @Just (ExceptionInsideResponseBody _) <- fromException e@
-    -- match every exception, and downcast queries like
-    -- @case fromException e of Just (SomeAsyncException _) -> True ;
-    -- Nothing -> False@ raise 'PatternMatchFail' when @e@ is a plain
-    -- IOError (@Just (IOError ...)@ doesn't match @Just
-    -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
-    --
-    ev <- force legacyHooks eT
-    case ev of
-        VCon "SomeException" _ -> do
-            evT <- newWHNFThunk ev
-            pure (VCon "Just" [evT])
-        _ -> pure (VCon "Nothing" [])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --

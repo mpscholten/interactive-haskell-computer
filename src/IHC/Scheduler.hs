@@ -486,9 +486,30 @@ loadProgramFromSource searchPath src0 = do
                 | expr <- Map.elems bodies
                 , fv   <- discoveryFreeVars expr ++ syntheticClassMethodNames expr
                 ]
-            allProviders = Manifest.providerModulesForMethods Manifest.manifestIndex entryFvs
+            -- Exception has many boot-library instances. Its selectors
+            -- dispatch through source dictionaries and must not eagerly
+            -- load every provider merely because a program mentions them.
+            providerSeedFvs = foldr Set.delete entryFvs
+                (map BC.pack ["toException", "fromException"])
+            allProviders = Manifest.providerModulesForMethods
+                Manifest.manifestIndex providerSeedFvs
             ghcInternalPrefix = BC.pack "GHC.Internal."
             providers = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
+        -- The selectors' executable defaults live in the class-declaring
+        -- source module. Load that one module (not the universe of
+        -- Exception instance providers) so instances that omit an override
+        -- receive the normal Haskell default dictionary entries.
+        let importsExceptionClass = any (`elem` map BC.pack
+                [ "Control.Exception"
+                , "Control.Exception.Base"
+                , "GHC.Internal.Exception"
+                , "GHC.Internal.Exception.Type"
+                ]) entryImports
+        when (importsExceptionClass || Set.size providerSeedFvs < Set.size entryFvs) $ do
+            _ <- try (loadModule registry fullSearchPath includeMap
+                    (BC.pack "GHC.Internal.Exception.Type"))
+                    :: IO (Either SomeException LoadedModule)
+            pure ()
         forM_ (Set.toList providers) $ \m -> do
             _ <- try (loadModule registry fullSearchPath includeMap m)
                     :: IO (Either SomeException LoadedModule)
@@ -4070,7 +4091,21 @@ classMethodDispatcher reg cls methodName = selfVal
                                   -- closure should be visible — they may have been
                                   -- registered by a later import via the shared ref).
                                   mMethodShared <- lookupInSharedRegForced cls tag methodName
-                                  let mMethod = preferMethod mMethod0 mMethodShared
+                                  let mMethodBase = preferMethod mMethod0 mMethodShared
+                                  -- An Exception instance commonly relies on
+                                  -- the source class defaults for
+                                  -- toException/fromException.  A placeholder
+                                  -- is a real dictionary hit, not evidence
+                                  -- that every core Exception provider should
+                                  -- be loaded.  Select the source default
+                                  -- before the manifest miss hook.
+                                  mMethod <- case mMethodBase of
+                                      Just v | isMethodPlaceholder v
+                                          , cls == BC.pack "Exception" -> do
+                                              d0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                              ds <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                              pure (preferMethod d0 ds)
+                                      _ -> pure mMethodBase
                                   case mMethod of
                                     Just methodVal
                                       | not (isMethodPlaceholder methodVal) ->
@@ -8414,22 +8449,29 @@ resolveFallback _mOwner name
         resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusCode")
     | name == BC.pack "H.statusMessage" =
         resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusMessage")
-resolveFallback mOwner name = do
-    -- Builtins override the source-discovery path: an entry like
-    -- @"Control.Exception.toException"@ in the base env (added by
-    -- 'buildBaseEnv' for class methods that have no top-level body in
-    -- their owning module) must be served directly, even though
-    -- @lmBodies@ doesn't contain @toException@.  Without this, qualified
-    -- references like @E.toException@ — rewritten to
-    -- @Control.Exception.toException@ by the alias-prefix branches above
-    -- — fall through to the source-loading path, miss the class-method
-    -- (it's in the class declaration, not a top-level binding), and
-    -- the caller sees @unbound variable `E.toException`@ when warp's
-    -- @acceptNewConnection@ catches a non-recoverable accept errno.
-    baseEnv <- readIORef envBaseForFallbackRef
-    case HashMap.lookup name baseEnv of
-        Just t  -> pure (Just t)
-        Nothing -> resolveFallbackSource mOwner name
+resolveFallback mOwner name
+    -- Control.Exception is a source-only facade.  Route its ordinary
+    -- re-exports to the modules that actually define them so removing a
+    -- class-selector builtin cannot accidentally sever the discovery chain.
+    | name == BC.pack "Control.Exception.throwIO"
+   || name == BC.pack "throwIO" =
+        resolveFallbackSource mOwner (BC.pack "GHC.Internal.IO.throwIO")
+    | name == BC.pack "Control.Exception.evaluate"
+   || name == BC.pack "evaluate" =
+        resolveFallbackSource mOwner (BC.pack "GHC.Internal.IO.evaluate")
+    | name == BC.pack "Control.Exception.try"
+   || name == BC.pack "try" =
+        resolveFallbackSource mOwner
+            (BC.pack "GHC.Internal.Control.Exception.Base.try")
+    | otherwise = do
+        -- Class-method dispatchers and genuine runtime builtins already
+        -- installed in the tied base environment take precedence over a
+        -- source fallback. Exception selectors now enter through the former,
+        -- not through Builtins.
+        baseEnv <- readIORef envBaseForFallbackRef
+        case HashMap.lookup name baseEnv of
+            Just t  -> pure (Just t)
+            Nothing -> resolveFallbackSource mOwner name
 
 -- | The ghc-bignum modules whose @bigNat*@ / @wordArray*@ helpers
 -- IHC host-shims (Natural-backed runtime, per
@@ -11840,6 +11882,7 @@ extraDiscoverShortCircuit = Set.fromList $ map BC.pack
     [ "==", "/=", "compare", "<", "<=", ">", ">=", "show", "showsPrec"
     , "<>", "mappend", "mconcat", "mempty"
     , "fmap", "<*>", ">>=", ">>", "pure", "return"
+    , "toException", "fromException"
     ]
 
 -- | Curated subset threaded into the *per-FV chase* of

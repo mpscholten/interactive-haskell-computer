@@ -1532,6 +1532,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                     (\m -> "unbound variable `errorCallWithCallStackException`"
                            `isInfixOf` m)
 
+    it "Exception selectors use source instance methods" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/exception_source_dispatch.hs")
+        n `shouldBe` 0
+        out `shouldBe` "source toException\nsource fromException\n"
+
     --------------------------------------------------------------------
     -- HSX + Blaze hello-world smoke fixtures.
     --
