@@ -3833,6 +3833,11 @@ data ClassDecl = ClassDecl
     -- and multi-param classes uniformly through the (class, [tag])
     -- composite key.
     , classSuperclasses :: ![ByteString]
+    -- | Standalone schemes for methods declared by this class.  Each
+    -- scheme includes the enclosing class predicate (for example,
+    -- @C a => ...@), making it usable by ordinary owner-scoped metadata
+    -- lookup without special-casing class declarations downstream.
+    , classMethodSchemes :: !(Map ByteString Scheme)
     } deriving (Eq, Show)
 
 -- | Scan the whole source for top-level @class@ declarations and return
@@ -3867,11 +3872,17 @@ scanClassDeclsRaw src
     -- After `class`, parse head to find the class name, then walk the
     -- `where` body collecting method sigs + default-method bindings.
     scanOneClass cur0 = do
-        ((mClassName, supers), curWhere) <- parseClassHead cur0
+        ((mClassName, supers, classVars), curWhere) <- parseClassHead cur0
         case mClassName of
             Just cls -> do
-                (methodNames, defaults) <- parseClassBody curWhere
-                pure (Just (ClassDecl cls methodNames defaults supers))
+                (methodNames, defaults, rawSchemes) <- parseClassBody curWhere
+                let addClassPred (Scheme vars preds body) =
+                        Scheme (foldr (\v vs -> if v `elem` vs then vs else v : vs)
+                                      vars classVars)
+                               (Pred cls (map TyVar classVars) : preds)
+                               body
+                    schemes = Map.map addClassPred rawSchemes
+                pure (Just (ClassDecl cls methodNames defaults supers schemes))
             Nothing -> pure Nothing
 
     -- Parse: [context =>] ClassName tyvar* [| fundep, ...] where
@@ -3891,7 +3902,7 @@ scanClassDeclsRaw src
     -- lowercase tyvars in the fundep body from ever being mistaken for
     -- something meaningful, and documents the intent explicitly rather
     -- than relying on the default fallthrough.
-    parseClassHead cur0 = scanHead cur0 Nothing [] (0 :: Int) False
+    parseClassHead cur0 = scanHead cur0 Nothing [] [] (0 :: Int) Nothing False
       where
         -- @mCls@: candidate class name (set after we see TkConId).
         -- @preRev@: ConIds seen BEFORE @=>@, in reverse source order.
@@ -3899,36 +3910,51 @@ scanClassDeclsRaw src
         --   @mCls@ is reset to look for the real class name.
         --   When @=>@ never fires, @preRev@ holds the (single) class
         --   name and the superclass list is empty.
-        scanHead cur mCls preRev !depth seenArrow = do
+        scanHead cur mCls preRev paramsRev !depth kindDepth seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (finalize mCls preRev seenArrow, cur)
+                TkEof    -> pure (finalize mCls preRev paramsRev seenArrow, cur)
                 TkWhere | depth == 0 ->
-                    pure (finalize mCls preRev seenArrow, cur')
-                TkNewline -> scanHead cur' mCls preRev depth seenArrow
+                    pure (finalize mCls preRev paramsRev seenArrow, cur')
+                TkNewline -> scanHead cur' mCls preRev paramsRev depth kindDepth seenArrow
                 -- `=>` at depth 0 ends the context: pre-arrow ConIds
                 -- become superclasses, reset class candidate, look
                 -- for the real class name on the right of `=>`.
-                TkDArrow | depth == 0 -> scanHead cur' Nothing preRev depth True
+                TkDArrow | depth == 0 -> scanHead cur' Nothing preRev [] depth Nothing True
                 -- FunctionalDependencies clause: `| a -> b` — skip.
-                TkBar | depth == 0 -> skipFundep cur' mCls preRev seenArrow
+                TkBar | depth == 0 -> skipFundep cur' mCls preRev paramsRev seenArrow
                 TkConId n
                     | seenArrow ->
                         case mCls of
-                            Nothing -> scanHead cur' (Just n) preRev depth seenArrow
-                            Just _  -> scanHead cur' mCls preRev depth seenArrow
+                            Nothing -> scanHead cur' (Just n) preRev paramsRev depth kindDepth seenArrow
+                            Just _  -> scanHead cur' mCls preRev paramsRev depth kindDepth seenArrow
                     | otherwise ->
                         -- Could be the class name (if no @=>@ ever
                         -- comes) or a superclass (if it does).  Stash
                         -- in preRev; finalize/finalize-on-`=>` decides
                         -- which.  Set @mCls@ so it's still available
                         -- if we exit without `=>`.
-                        scanHead cur' (Just n) (n : preRev) depth seenArrow
-                TkLParen   -> scanHead cur' mCls preRev (depth + 1) seenArrow
-                TkRParen   -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
-                TkLBracket -> scanHead cur' mCls preRev (depth + 1) seenArrow
-                TkRBracket -> scanHead cur' mCls preRev (max 0 (depth - 1)) seenArrow
-                _ -> scanHead cur' mCls preRev depth seenArrow
+                        scanHead cur' (Just n) (n : preRev) paramsRev depth kindDepth seenArrow
+                -- Plain binders live at head depth zero; kinded binders are
+                -- the first identifier one level inside @(a :: k)@.  Once
+                -- @::@ is seen, identifiers belong to the kind, not the
+                -- class parameter list.
+                TkIdent v | Just _ <- mCls
+                          , kindDepth == Nothing
+                          , depth == 0 || depth == 1 ->
+                    scanHead cur' mCls preRev (v : paramsRev) depth kindDepth seenArrow
+                TkDColon | Just _ <- mCls ->
+                    scanHead cur' mCls preRev paramsRev depth (Just depth) seenArrow
+                TkLParen   -> scanHead cur' mCls preRev paramsRev (depth + 1) kindDepth seenArrow
+                TkRParen   ->
+                    let depth' = max 0 (depth - 1)
+                        kindDepth' = case kindDepth of
+                            Just kd | kd == depth -> Nothing
+                            other -> other
+                    in scanHead cur' mCls preRev paramsRev depth' kindDepth' seenArrow
+                TkLBracket -> scanHead cur' mCls preRev paramsRev (depth + 1) kindDepth seenArrow
+                TkRBracket -> scanHead cur' mCls preRev paramsRev (max 0 (depth - 1)) kindDepth seenArrow
+                _ -> scanHead cur' mCls preRev paramsRev depth kindDepth seenArrow
 
         -- Decide what's the class name and what's the superclass list
         -- given @mCls@, the pre-`=>` ConId list (reversed), and
@@ -3938,30 +3964,30 @@ scanClassDeclsRaw src
         --   reset); @preRev@ in source order is the superclass list.
         -- * No `=>`: the first ConId in source order is the class
         --   name; superclass list is empty.
-        finalize :: Maybe ByteString -> [ByteString] -> Bool
-                 -> (Maybe ByteString, [ByteString])
-        finalize mCls preRev seenArrow
-            | seenArrow = (mCls, reverse preRev)
+        finalize :: Maybe ByteString -> [ByteString] -> [ByteString] -> Bool
+                 -> (Maybe ByteString, [ByteString], [ByteString])
+        finalize mCls preRev paramsRev seenArrow
+            | seenArrow = (mCls, reverse preRev, reverse paramsRev)
             | otherwise =
                 case reverse preRev of
-                    []      -> (Nothing, [])
-                    (c : _) -> (Just c, [])
+                    []      -> (Nothing, [], [])
+                    (c : _) -> (Just c, [], reverse paramsRev)
 
         -- After `|` in the class head, consume the fundep list without
         -- interpreting it. Stop at `where`/EOF; keep any class-name
         -- candidate and the pre-arrow ConId list already captured.
-        skipFundep cur mCls preRev seenArrow = do
+        skipFundep cur mCls preRev paramsRev seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof   -> pure (finalize mCls preRev seenArrow, cur)
-                TkWhere -> pure (finalize mCls preRev seenArrow, cur')
+                TkEof   -> pure (finalize mCls preRev paramsRev seenArrow, cur)
+                TkWhere -> pure (finalize mCls preRev paramsRev seenArrow, cur')
                 TkLParen -> do
                     curAfter <- skipParensC 1 cur'
-                    skipFundep curAfter mCls preRev seenArrow
+                    skipFundep curAfter mCls preRev paramsRev seenArrow
                 TkLBracket -> do
                     curAfter <- skipBracketsC 1 cur'
-                    skipFundep curAfter mCls preRev seenArrow
-                _ -> skipFundep cur' mCls preRev seenArrow
+                    skipFundep curAfter mCls preRev paramsRev seenArrow
+                _ -> skipFundep cur' mCls preRev paramsRev seenArrow
 
     skipParensC :: Int -> Cursor -> IO Cursor
     skipParensC !d cur
@@ -3990,7 +4016,7 @@ scanClassDeclsRaw src
     --   * a default:  `name [pat*] = body`      — captured as BindingLhs
     parseClassBody cur0 = scanBody Map.empty Map.empty cur0
       where
-        -- @sigs@: Map from method-name to () (acts as a Set).
+        -- @sigs@: Map from method-name to its parsed declaration scheme.
         -- @defs@: Map from method-name to default BindingLhs.
         scanBody !sigs !defs cur = do
             let (tok, cur') = nextToken src cur
@@ -4017,8 +4043,8 @@ scanClassDeclsRaw src
                     -- every name before `::` and skip through the type.
                     mSigNames <- trySkipClassSig (tkCol tok) name cur'
                     case mSigNames of
-                        Just (names, curAfter) -> do
-                            let sigs' = foldr (`Map.insert` ()) sigs names
+                        Just (names, scheme, curAfter) -> do
+                            let sigs' = foldr (`Map.insert` scheme) sigs names
                             scanBody sigs' defs curAfter
                         Nothing -> do
                             -- Default-method body: handle both prefix
@@ -4076,16 +4102,16 @@ scanClassDeclsRaw src
                                         TkDColon -> do
                                             mNames <- trySkipClassSig (tkCol tok) opName cur'''
                                             case mNames of
-                                                Just (names, curAfter) -> do
-                                                    let sigs' = foldr (`Map.insert` ()) sigs names
+                                                Just (names, scheme, curAfter) -> do
+                                                    let sigs' = foldr (`Map.insert` scheme) sigs names
                                                     scanBody sigs' defs curAfter
                                                 Nothing -> scanBody sigs defs cur'
                                         TkComma -> do
-                                            (names, curAfter) <- collectSigNames (tkCol tok) [opName] cur4
-                                            case names of
-                                                [] -> scanBody sigs defs cur'
-                                                _  -> do
-                                                    let sigs' = foldr (`Map.insert` ()) sigs names
+                                            mSig <- collectSigNames (tkCol tok) [opName] cur4
+                                            case mSig of
+                                                Nothing -> scanBody sigs defs cur'
+                                                Just (names, scheme, curAfter) -> do
+                                                    let sigs' = foldr (`Map.insert` scheme) sigs names
                                                     scanBody sigs' defs curAfter
                                         _ -> do
                                             mClause <- scanOneClauseAfterNameAtCol src (tkCol tok) cur'''
@@ -4109,8 +4135,9 @@ scanClassDeclsRaw src
 
         finishBody sigs defs =
             -- Method-names = union of sigs and default-bodies, sorted.
-            let allNames = Map.keys (Map.union sigs (Map.map (const ()) defs))
-            in (allNames, defs)
+            let allNames = Map.keys (Map.union (Map.map (const ()) sigs)
+                                               (Map.map (const ()) defs))
+            in (allNames, defs, sigs)
 
     -- | Try to parse a @name[, name]* :: type@ signature line inside the
     -- class body. @firstName@ is the identifier at the start of the line
@@ -4121,14 +4148,11 @@ scanClassDeclsRaw src
         let (t, c) = peekSigC cur
         case tkKind t of
             TkDColon -> do
-                curAfter <- skipClassSigType bindCol c
-                pure (Just ([firstName], curAfter))
+                (typeToks, curAfter) <- collectClassSigType bindCol c
+                pure $ (\scheme -> ([firstName], scheme, curAfter)) <$> parseScheme typeToks
             TkComma -> do
                 -- Walk a comma-separated list of names.
-                (names, curAfter) <- collectSigNames bindCol [firstName] c
-                case names of
-                    [] -> pure Nothing
-                    _  -> pure (Just (names, curAfter))
+                collectSigNames bindCol [firstName] c
             _ -> pure Nothing
 
     collectSigNames bindCol acc cur = do
@@ -4139,9 +4163,10 @@ scanClassDeclsRaw src
                 case tkKind t2 of
                     TkComma  -> collectSigNames bindCol (n : acc) c2
                     TkDColon -> do
-                        curAfter <- skipClassSigType bindCol c2
-                        pure (reverse (n : acc), curAfter)
-                    _ -> pure ([], cur)
+                        (typeToks, curAfter) <- collectClassSigType bindCol c2
+                        pure $ (\scheme -> (reverse (n : acc), scheme, curAfter))
+                            <$> parseScheme typeToks
+                    _ -> pure Nothing
             TkLParen -> do
                 -- Operator name in sig list: (<>).
                 let (opTok, c2) = peekSigC c
@@ -4154,12 +4179,35 @@ scanClassDeclsRaw src
                                 case tkKind t4 of
                                     TkComma  -> collectSigNames bindCol (opName : acc) c4
                                     TkDColon -> do
-                                        curAfter <- skipClassSigType bindCol c4
-                                        pure (reverse (opName : acc), curAfter)
-                                    _ -> pure ([], cur)
-                            _ -> pure ([], cur)
-                    _ -> pure ([], cur)
-            _ -> pure ([], cur)
+                                        (typeToks, curAfter) <- collectClassSigType bindCol c4
+                                        pure $ (\scheme -> (reverse (opName : acc), scheme, curAfter))
+                                            <$> parseScheme typeToks
+                                    _ -> pure Nothing
+                            _ -> pure Nothing
+                    _ -> pure Nothing
+            _ -> pure Nothing
+
+    collectClassSigType bindCol cur0 = go [] cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+      where
+        go acc cur b p c = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof -> pure (reverse acc, cur)
+                TkNewline -> go acc cur' b p c
+                _ | tkCol tok <= bindCol && b == 0 && p == 0 && c == 0 ->
+                      pure (reverse acc, cur)
+                TkLParen   -> add tok cur' b (p + 1) c
+                TkLBracket -> add tok cur' (b + 1) p c
+                TkLBrace   -> add tok cur' b p (c + 1)
+                TkRParen   | p > 0 -> add tok cur' b (p - 1) c
+                TkRBracket | b > 0 -> add tok cur' (b - 1) p c
+                TkRBrace   | c > 0 -> add tok cur' b p (c - 1)
+                _ -> add tok cur' b p c
+          where
+            add tok cur' b' p' c' =
+                case tokenToTT tok of
+                    Just tt -> go (tt : acc) cur' b' p' c'
+                    Nothing -> go acc cur' b' p' c'
 
     -- Skip the type body after a `::`.  Stops when a significant token
     -- appears at column @<= bindCol@ at bracket depth 0.
