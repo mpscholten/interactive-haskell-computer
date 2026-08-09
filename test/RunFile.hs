@@ -2,6 +2,7 @@ module RunFile (spec) where
 
 import Control.Exception (bracket_, displayException, try, SomeException)
 import Control.Monad (forM_)
+import Data.IORef
 import Data.List (isInfixOf, sort, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
@@ -12,16 +13,18 @@ import System.Environment (lookupEnv)
 
 import Test.Hspec
 
+import IHC.AST (Expr(..), Lit(..))
 import IHC.Classes (legacyHooks)
 import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
-import IHC.Eval (force)
+import IHC.Eval (eval, force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (emptyKnownSymbols, findBinding)
 import IHC.Scheduler (loadProgramFromSource, schemesHaveCommonInstance)
 import IHC.Source (readSourceFile)
 import IHC.TypeAST (Scheme(..), Type(..))
-import IHC.Val (Val(..))
+import IHC.TH (thExpToExpr)
+import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk)
 
 -- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
 -- an explicit search path so imports like @import Foo@ can resolve to
@@ -64,6 +67,28 @@ captureStdout action = do
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    it "EQuote antiquotation evaluates one Q Exp hole" do
+        exp40 <- integerExpVal 40
+        holeT <- newWHNFThunk (VIO (pure exp40))
+        quoted <- eval legacyHooks (extendEnv "hole" holeT emptyEnv) emptyIPMap
+                    (EQuote (ESplice (EVar "hole")))
+        decoded <- thExpToExpr quoted
+        decoded `shouldBe` ELit (LInt 40)
+
+    it "EQuote antiquotation does not execute a nested Q layer" do
+        executions <- newIORef (0 :: Int)
+        exp40 <- integerExpVal 40
+        let inner = VIO (modifyIORef' executions (+ 1) >> pure exp40)
+            outer = VIO (modifyIORef' executions (+ 1) >> pure inner)
+        holeT <- newWHNFThunk outer
+        quoted <- eval legacyHooks (extendEnv "hole" holeT emptyEnv) emptyIPMap
+                    (EQuote (ESplice (EVar "hole")))
+        count <- readIORef executions
+        count `shouldBe` 1
+        case quoted of
+            VIO _ -> pure ()
+            _ -> expectationFailure "expected inner Q action to remain suspended"
+
     -- Regression: the scheduler used to leak state between consecutive
     -- runFile calls in the same process.  After the first call,
     -- 'globalLoadedModulesRef' was populated with ~150 modules; the
@@ -1518,3 +1543,9 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runMainWithSiblings "examples/blaze_hello/Main.hs")
         n `shouldBe` 0
         out `shouldBe` "<h1>Hello world</h1>\n"
+
+integerExpVal :: Int -> IO Val
+integerExpVal n = do
+    nT <- newWHNFThunk (VInt (fromIntegral n))
+    litT <- newWHNFThunk (VCon "IntegerL" [nT])
+    pure (VCon "LitE" [litT])
