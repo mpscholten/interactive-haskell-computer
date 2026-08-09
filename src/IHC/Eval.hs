@@ -538,7 +538,7 @@ eval hooks env ipm = go
     -- Phase 2.12: TemplateHaskellQuotes bracket [| expr |].
     -- Produce a TH Exp-shaped Val encoding of the *syntax* of expr.
     -- We do NOT evaluate expr — we encode its AST.
-    go (EQuote inner) = evalQuote inner
+    go (EQuote inner) = evalQuote hooks env ipm inner
 
     -- QuasiQuoter dispatch: @[qqName|body|]@.  Look up qqName, project
     -- @quoteExp :: String -> Q Exp@ via '$fldProj$quoteExp', apply to the
@@ -2993,8 +2993,8 @@ unboxedTupleArity name
 -- IHC.TH already imports IHC.Eval.
 --------------------------------------------------------------------------------
 
-evalQuote :: Expr -> IO Val
-evalQuote (EVar n)
+evalQuote :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
+evalQuote _hooks _env _ipm (EVar n)
     -- Capitalised name → ConE; lowercase/operator → VarE.
     | not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z' = do
         nt <- newWHNFThunk (VStr n)
@@ -3002,20 +3002,20 @@ evalQuote (EVar n)
     | otherwise = do
         nt <- newWHNFThunk (VStr n)
         pure (VCon "VarE" [nt])
-evalQuote (ELit (LInt n)) = do
+evalQuote _hooks _env _ipm (ELit (LInt n)) = do
     nT   <- newWHNFThunk (VInt n)
     litT <- newWHNFThunk (VCon "IntegerL" [nT])
     pure (VCon "LitE" [litT])
-evalQuote (ELit (LFloat d)) = do
+evalQuote _hooks _env _ipm (ELit (LFloat d)) = do
     -- Store as IntegerL(round) — RationalL needs more infra for MVP.
     nT   <- newWHNFThunk (VInt (round d))
     litT <- newWHNFThunk (VCon "IntegerL" [nT])
     pure (VCon "LitE" [litT])
-evalQuote (ELit (LChar c)) = do
+evalQuote _hooks _env _ipm (ELit (LChar c)) = do
     cT   <- newWHNFThunk (VChar c)
     litT <- newWHNFThunk (VCon "CharL" [cT])
     pure (VCon "LitE" [litT])
-evalQuote (ELit (LStr bs)) = do
+evalQuote _hooks _env _ipm (ELit (LStr bs)) = do
     charListVal <- buildCharList (BC.unpack bs)
     lT   <- newWHNFThunk charListVal
     litT <- newWHNFThunk (VCon "StringL" [lT])
@@ -3027,20 +3027,20 @@ evalQuote (ELit (LStr bs)) = do
         rest <- buildCharList cs
         t    <- newWHNFThunk rest
         pure (VCon ":" [h, t])
-evalQuote (EApp f x) = do
-    fV <- evalQuote f
-    xV <- evalQuote x
+evalQuote hooks env ipm (EApp f x) = do
+    fV <- evalQuote hooks env ipm f
+    xV <- evalQuote hooks env ipm x
     fT <- newWHNFThunk fV
     xT <- newWHNFThunk xV
     pure (VCon "AppE" [fT, xT])
-evalQuote (ENeg e) = do
+evalQuote hooks env ipm (ENeg e) = do
     -- negate x  →  AppE (VarE "negate") (evalQuote x)
-    negT <- newWHNFThunk =<< evalQuote (EVar "negate")
-    xV   <- evalQuote e
+    negT <- newWHNFThunk =<< evalQuote hooks env ipm (EVar "negate")
+    xV   <- evalQuote hooks env ipm e
     xT   <- newWHNFThunk xV
     pure (VCon "AppE" [negT, xT])
-evalQuote (ETuple es) = do
-    elemVals <- mapM evalQuote es
+evalQuote hooks env ipm (ETuple es) = do
+    elemVals <- mapM (evalQuote hooks env ipm) es
     elemTs   <- mapM newWHNFThunk elemVals
     listVal  <- buildThunkList elemTs
     lT       <- newWHNFThunk listVal
@@ -3051,7 +3051,16 @@ evalQuote (ETuple es) = do
         tailVal <- buildThunkList xs
         tailT   <- newWHNFThunk tailVal
         pure (VCon ":" [x, tailT])
+-- Antiquotation: evaluate the hole in the lexical environment of the
+-- quotation.  A splice expression conventionally has type @Q Exp@, which
+-- IHC represents as a (possibly nested) VIO wrapper around the TH Exp tree.
+evalQuote hooks env ipm (ESplice hole) = do
+    value <- eval hooks env ipm hole
+    unwrapQuoteSplice value
+  where
+    unwrapQuoteSplice (VIO action) = action >>= unwrapQuoteSplice
+    unwrapQuoteSplice value        = pure value
 -- Unsupported forms: emit a VarE "<unsupported>" placeholder.
-evalQuote _ = do
+evalQuote _hooks _env _ipm _ = do
     nt <- newWHNFThunk (VStr "<unsupported>")
     pure (VCon "VarE" [nt])

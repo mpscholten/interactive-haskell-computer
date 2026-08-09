@@ -392,7 +392,7 @@ expandSplicesInExpr env ipm depth expr
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval legacyHooks env ipm innerExpanded
+        thVal <- evalSpliceQ innerExpanded >>= unwrapQ
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -442,6 +442,25 @@ expandSplicesInExpr env ipm depth expr
         e' <- go e
         pure (EConstrainedValue e' constraints)
     go EGuardFail = pure EGuardFail
+
+    -- @Q@ is represented by 'VIO', but an otherwise unconstrained @pure@
+    -- cannot be value-dispatched before its argument is consumed.  The splice
+    -- boundary supplies the missing type information (@Q Exp@), so implement
+    -- that boundary operation directly.  This is the runtime representation
+    -- of Q's Applicative injection, not a library-specific shortcut.
+    evalSpliceQ (EApp pureExpr valueExpr)
+        | Just method <- varHead pureExpr
+        , lastComponent method == "pure" =
+            pure (VIO (eval legacyHooks env ipm valueExpr))
+    evalSpliceQ e = eval legacyHooks env ipm e
+
+    varHead (EVar n)      = Just n
+    varHead (ETyApp e _)  = varHead e
+    varHead _             = Nothing
+
+    lastComponent n = case reverse (BC.split '.' n) of
+        x:_ -> x
+        []  -> n
 
     goAlt (Alt p e) = Alt p <$> go e
 
