@@ -36,6 +36,7 @@ import Data.Bits ((.&.))
 import Data.Char (ord, toLower)
 import Data.Int (Int8, Int16, Int32, Int64)
 import Data.IORef
+import qualified Data.HashMap.Strict as HashMap
 import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.ForeignPtr (mallocForeignPtrBytes, withForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
@@ -310,7 +311,7 @@ force hooks t = do
             writeIORef t (Evaluated v)
             pure v
 
--- | Cheap tag for WHNF force samples (no deep show).
+-- | Cheap tag for WHNF force samples (without deep forcing).
 valKindTag :: Val -> String
 valKindTag = \case
     VInt _            -> "VInt"
@@ -1094,7 +1095,11 @@ eval hooks env ipm = go
     applyIOResultAnnotation resultTy v = do
         case ptrPointeeHead resultTy of
             Just elemTy
-                | elemTy `elem` map BC.pack ["CChar", "CSChar", "CUChar", "Word8"] ->
+                | elemTy `elem` map BC.pack
+                    [ "Char", "CChar", "CSChar", "CUChar"
+                    , "Word8", "Word16", "Word32", "Word64"
+                    , "Int8", "Int16", "Int32", "Int64", "Int"
+                    ] ->
                     markTypedPtrVal elemTy v
             _ -> pure ()
         applyNumericTyAnnotation resultTy v
@@ -2165,6 +2170,8 @@ matchPat hooks (PCon name pats) v@(VCon vname vthunks)
         matchFieldsLocal rest ((n, t) : acc)
     matchFieldsLocal ((PWild, _) : rest) acc =
         matchFieldsLocal rest acc
+    matchFieldsLocal ((PView _ PWild, _) : rest) acc =
+        matchFieldsLocal rest acc
     -- Per Haskell Report §3.17.2 + GHC BangPatterns: a bang sub-pattern
     -- forces the corresponding field thunk to WHNF before binding. The
     -- generic _ -> force arm below handles non-PVar inner patterns
@@ -2322,15 +2329,21 @@ matchPat hooks (PRecord _ _) _ = pure Nothing
 matchPat _hooks (PRecordWild conName) (VCon cn _)
     | cn == conName = pure (Just [])
 matchPat _hooks (PRecordWild _) _ = pure Nothing
--- ViewPatterns: (f -> p) matches v when f v matches p.
--- We evaluate f v and then match the result against p.
+-- A wildcard view result cannot bind or reject anything. This matters for
+-- record pattern-synonym occurrences that omit a view-backed field: after
+-- parameter substitution `(getEncode -> encode)` becomes
+-- `(getEncode -> _)`, and evaluating getEncode would be needless work.
+matchPat _hooks (PView _ PWild) _ = pure (Just [])
+-- View patterns nested inside a registered pattern synonym are expanded only
+-- at match time, after the scheduler's ordinary case-pattern desugaring pass.
+-- Evaluate their function through the normal fallback resolver and match the
+-- transformed value. Pattern-synonym view expressions are top-level-scoped,
+-- so imported/module names can be supplied by demand resolution.
 matchPat hooks (PView fn p) v = do
-    -- f is an Expr; we need an Env to evaluate it. We don't have the
-    -- env here, so ViewPatterns MUST be desugared before reaching Eval.
-    -- This case is a safeguard — in practice desugarRecordPats converts
-    -- PView into a case expression via desugarViewPat in the scheduler.
-    error ("IHC.Eval: PView reached matchPat — view pattern not desugared: "
-            <> show fn <> " -> " <> show p)
+    fnVal <- eval hooks HashMap.empty Map.empty fn
+    vT <- newWHNFThunk v
+    viewed <- apply hooks fnVal vT
+    matchPat hooks p viewed
 
 -- | Sentinel key used to carry the owning-module name through 'Env'.
 -- The closure constructed for a top-level binding @M.foo@ has its

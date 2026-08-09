@@ -54,7 +54,7 @@ import Data.IORef
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Foreign.LibFFI
     ( Arg, callFFI
     , argCInt, argCUInt, argCLong, argCULong
@@ -70,6 +70,7 @@ import Foreign.LibFFI
     )
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
+import Foreign.C.Types (CInt(..), CUInt(..), CSize(..))
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
 import qualified GHC.Conc.Sync as HostConc
 import System.Directory (doesDirectoryExist, listDirectory)
@@ -87,6 +88,26 @@ foreign import ccall "&RtsFlags"
 
 foreign import ccall "&enabled_capabilities"
     hsEnabledCapabilitiesPtr :: Ptr Word32
+
+foreign import ccall unsafe "ihc_o_rdonly" c_oRdOnly :: IO CInt
+foreign import ccall unsafe "ihc_o_wronly" c_oWrOnly :: IO CInt
+foreign import ccall unsafe "ihc_o_rdwr" c_oRdWr :: IO CInt
+foreign import ccall unsafe "ihc_o_append" c_oAppend :: IO CInt
+foreign import ccall unsafe "ihc_o_creat" c_oCreat :: IO CInt
+foreign import ccall unsafe "ihc_o_excl" c_oExcl :: IO CInt
+foreign import ccall unsafe "ihc_o_trunc" c_oTrunc :: IO CInt
+foreign import ccall unsafe "ihc_o_noctty" c_oNoCtty :: IO CInt
+foreign import ccall unsafe "ihc_o_nonblock" c_oNonblock :: IO CInt
+foreign import ccall unsafe "ihc_o_binary" c_oBinary :: IO CInt
+foreign import ccall unsafe "ihc_s_isreg" c_sIsReg :: CUInt -> IO CInt
+foreign import ccall unsafe "ihc_s_ischr" c_sIsChr :: CUInt -> IO CInt
+foreign import ccall unsafe "ihc_s_isblk" c_sIsBlk :: CUInt -> IO CInt
+foreign import ccall unsafe "ihc_s_isdir" c_sIsDir :: CUInt -> IO CInt
+foreign import ccall unsafe "ihc_s_isfifo" c_sIsFifo :: CUInt -> IO CInt
+foreign import ccall unsafe "ihc_sizeof_stat" c_sizeofStat :: IO CSize
+foreign import ccall unsafe "ihc_st_mode" c_stMode :: Ptr () -> IO CUInt
+foreign import ccall unsafe "ihc_st_dev" c_stDev :: Ptr () -> IO Word64
+foreign import ccall unsafe "ihc_st_ino" c_stIno :: Ptr () -> IO Word64
 
 --------------------------------------------------------------------------------
 -- Types
@@ -255,6 +276,12 @@ resolveSymbol sym = do
             [ ("hsnet_getaddrinfo",  "getaddrinfo")
             , ("hsnet_freeaddrinfo", "freeaddrinfo")
             , ("hsnet_getnameinfo",  "getnameinfo")
+            -- ghc-internal's HsBase wrappers are thin OS boundaries.  The
+            -- generic interpreter links libc rather than libHSbase, so map
+            -- the wrapper name to the underlying POSIX entry point.
+            , ("__hscore_open", "open")
+            , ("__hscore_fstat", "fstat")
+            , ("__hscore_lstat", "lstat")
             ])
 
     findInLibs lookupSym = do
@@ -417,25 +444,12 @@ dispatchRet ty fp args = case ty of
         pure (VPrimObj (PrimPtr (castPtr p)))
     FFICString -> do
         p <- callFFI fp retCString args
-        if p == nullPtr
-            then pure (VCon "[]" [])
-            else do
-                bs <- BS.packCString p
-                bsToConsList bs
-
--- | Build a strict Haskell 'String' (an IHC cons-list of 'VChar') from
--- a 'ByteString'.  Materialises eagerly — trivial for the short strings
--- libc returns.  Replace with a lazy tail thunk if a workload ever
--- needs it.
-bsToConsList :: BS.ByteString -> IO Val
-bsToConsList bs = go (BS.unpack bs)
-  where
-    go []     = pure (VCon "[]" [])
-    go (c:cs) = do
-        hT  <- newWHNFThunk (VChar (toEnum (fromIntegral c)))
-        tV  <- go cs
-        tT  <- newWHNFThunk tV
-        pure (VCon ":" [hT, tT])
+        -- CString is a type synonym for Ptr CChar.  Keep the address so
+        -- interpreted peek/Storable code sees the source-level pointer
+        -- representation instead of an eagerly decoded String.
+        let raw = castPtr p
+        markTypedHostPtr raw (BC.pack "CChar")
+        pure (VPrimObj (PrimPtr raw))
 
 --------------------------------------------------------------------------------
 -- Entry points
@@ -456,6 +470,27 @@ callForeign decl argVals
           -- threadDelay choose the delay# primop path, which is the actual
           -- non-event-manager primitive boundary IHC implements.
           pure (VInt 0)
+    | Just getConst <- Map.lookup (fdSymbol decl) posixIntConstants
+    , null argVals =
+          VInt . fromIntegral <$> getConst
+    | fdSymbol decl == BC.pack "__hscore_sizeof_stat"
+    , null argVals =
+          VInt . fromIntegral <$> c_sizeofStat
+    | Just predicate <- Map.lookup (fdSymbol decl) posixModePredicates
+    , [modeV] <- argVals =
+          VInt . fromIntegral <$> predicate (fromIntegral (asInt modeV))
+    | fdSymbol decl == BC.pack "__hscore_st_mode"
+    , [ptrV] <- argVals = do
+          p <- ptrFromVal ptrV
+          VInt . fromIntegral <$> c_stMode p
+    | fdSymbol decl == BC.pack "__hscore_st_dev"
+    , [ptrV] <- argVals = do
+          p <- ptrFromVal ptrV
+          VInteger . toInteger <$> c_stDev p
+    | fdSymbol decl == BC.pack "__hscore_st_ino"
+    , [ptrV] <- argVals = do
+          p <- ptrFromVal ptrV
+          VInteger . toInteger <$> c_stIno p
     | fdSymbol decl == BC.pack "memset"
     , [ptrV, byteV, lenV] <- argVals = do
           result <- dispatchResolved
@@ -477,6 +512,27 @@ callForeign decl argVals
               Just fp -> do
                   argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
                   dispatchRet (fdRetType decl) fp argsFfi
+
+    posixIntConstants = Map.fromList
+        [ (BC.pack "__hscore_o_rdonly", c_oRdOnly)
+        , (BC.pack "__hscore_o_wronly", c_oWrOnly)
+        , (BC.pack "__hscore_o_rdwr", c_oRdWr)
+        , (BC.pack "__hscore_o_append", c_oAppend)
+        , (BC.pack "__hscore_o_creat", c_oCreat)
+        , (BC.pack "__hscore_o_excl", c_oExcl)
+        , (BC.pack "__hscore_o_trunc", c_oTrunc)
+        , (BC.pack "__hscore_o_noctty", c_oNoCtty)
+        , (BC.pack "__hscore_o_nonblock", c_oNonblock)
+        , (BC.pack "__hscore_o_binary", c_oBinary)
+        ]
+
+    posixModePredicates = Map.fromList
+        [ (BC.pack "S_ISREG", c_sIsReg)
+        , (BC.pack "S_ISCHR", c_sIsChr)
+        , (BC.pack "S_ISBLK", c_sIsBlk)
+        , (BC.pack "S_ISDIR", c_sIsDir)
+        , (BC.pack "S_ISFIFO", c_sIsFifo)
+        ]
 
 extractThreadId :: Val -> IO HostConc.ThreadId
 extractThreadId (VPrimObj (PrimThreadId tid)) = pure tid

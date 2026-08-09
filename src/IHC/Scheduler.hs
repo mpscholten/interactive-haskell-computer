@@ -82,6 +82,8 @@ import IHC.Builtins
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
     , isHostWord8PtrVal, peekHostWord8ByteOff, pokeHostWord8ByteOff
+    , isHostCharPtrVal, looksLikeHostCharPtrVal
+    , peekHostCharElemOff, pokeHostCharElemOff
     , ordCmp
     , eqByteStringHost
     , reapSpawnedThreads
@@ -590,11 +592,11 @@ loadProgramFromSource searchPath src0 = do
                     , "registerTimeout", "unregisterTimeout", "updateTimeout"
                     -- Handle-text I/O + standard handles: host-backed until
                     -- the source-level Handle ADT layer exists (see
-                    -- ffiBuiltinNames comment).  openFile/hClose/withFile/
-                    -- hGetContents pinned so source FD cannot steal them
+                    -- ffiBuiltinNames comment). openFile/hClose/hGetContents
+                    -- are pinned so source FD cannot steal them
                     -- from graduated readFile/writeFile/appendFile.
                     , "hPutStrLn", "hPutStr", "hGetLine", "hFlush"
-                    , "openFile", "hClose", "withFile", "hGetContents"
+                    , "openFile", "hClose", "hGetContents"
                     , "stdout", "stderr", "stdin"
                     ])
         builtinOverrides =
@@ -1683,7 +1685,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
                     -- source-level Handle ADT layer exists (mirrors
                     -- hPutStrLn). Needed so source FD cannot steal them
                     -- from graduated readFile/writeFile/appendFile.
-                    , "openFile", "hClose", "withFile", "hGetContents"
+                    , "openFile", "hClose", "hGetContents"
                     , "stdout", "stderr", "stdin"
                     ])
         qualPrefix = case impAlias imp of
@@ -3768,7 +3770,7 @@ lookupInSharedRegMultiForced cls tags methodName = do
             Right v' -> pure v'
             Left  _  -> pure (identifyingPlaceholder cls methodName)
 
--- | Build a dispatcher Val for a single class method.
+-- | Build the runtime dispatcher for a single class method.
 --
 -- @classMethodDispatcher reg cls methodName@ returns a VFun that,
 -- when applied to its first argument, looks up the instance dict for
@@ -3784,13 +3786,16 @@ classMethodDispatcher reg cls methodName = selfVal
     selfVal = VClassMethod methodName 0 [] $ \tags argT -> case tags of
         typedTags@(_ : _ : _) -> do
             let normTags = map normalizeTyTag typedTags
-            mM <- lookupInstanceMethodMultiForced reg cls normTags methodName
-            mShared <- lookupInSharedRegMultiForced cls normTags methodName
-            case preferMethod mM mShared of
-                Just methodVal
-                  | not (isMethodPlaceholder methodVal) ->
-                      applyAll methodVal [argT]
-                _ -> argDirectedDispatch argT
+            if BC.pack "IO" `elem` normTags && isPureLikeResult cls methodName
+                then applyAll ioPureIntrinsic [argT]
+                else do
+                    mM <- lookupInstanceMethodMultiForced reg cls normTags methodName
+                    mShared <- lookupInSharedRegMultiForced cls normTags methodName
+                    case preferMethod mM mShared of
+                        Just methodVal
+                          | not (isMethodPlaceholder methodVal) ->
+                              applyAll methodVal [argT]
+                        _ -> argDirectedDispatch argT
         (firstTag:_)
           | isDispatchableTag firstTag
           , cls == BC.pack "Storable"
@@ -3818,16 +3823,19 @@ classMethodDispatcher reg cls methodName = selfVal
         -- Non-exhaustive IS|IP|IN with args=<function>.  That was the
         -- warp request-path crash after accept.
         (firstTag:_) | isDispatchableTag firstTag -> do
-            mM <- lookupInstanceMethodForced reg cls firstTag methodName
-            mShared <- lookupInSharedRegForced cls firstTag methodName
-            case preferMethod mM mShared of
-                Just methodVal
-                  | not (isMethodPlaceholder methodVal) -> do
-                      argV <- force legacyHooks argT
-                      case argV of
-                          VUnit -> pure methodVal
-                          _     -> applyAll methodVal [argT]
-                _ -> pure selfVal   -- no instance; tell caller "no match"
+            if firstTag == BC.pack "IO" && isPureLikeResult cls methodName
+                then applyAll ioPureIntrinsic [argT]
+                else do
+                    mM <- lookupInstanceMethodForced reg cls firstTag methodName
+                    mShared <- lookupInSharedRegForced cls firstTag methodName
+                    case preferMethod mM mShared of
+                        Just methodVal
+                          | not (isMethodPlaceholder methodVal) -> do
+                              argV <- force legacyHooks argT
+                              case argV of
+                                  VUnit -> pure methodVal
+                                  _     -> applyAll methodVal [argT]
+                        _ -> pure selfVal   -- no instance; tell caller "no match"
         _ -> argDirectedDispatch argT
     argDirectedDispatch argT0 = do
         let go = dispatch 4 []
@@ -4287,11 +4295,19 @@ classMethodDispatcher reg cls methodName = selfVal
 
     resultPolymorphicMethodForArg mArgTag = do
         let tags = resultPolymorphicDefaultTagsForArg mArgTag cls methodName
-        when (prefersSTResultCarrier mArgTag cls methodName) $
-            triggerCoreInstanceLoad legacyHooks cls
+        -- The carrier exists only in the result type for these methods, so
+        -- argument-directed dispatch can reach this path before the module
+        -- providing the relevant instances has otherwise been demanded.
+        -- Load the class catalogue first; without this, `return value` in a
+        -- boot-library IO body remains an unapplied dispatcher VFun.
+        when (not (null tags)) $
+          triggerCoreInstanceLoad legacyHooks cls
         tryTags tags
       where
         tryTags [] = pure Nothing
+        tryTags (tag:_)
+          | tag == BC.pack "IO"
+          , isPureLikeResult cls methodName = pure (Just ioPureIntrinsic)
         tryTags (tag:rest) = do
             mConcrete <- lookupConcreteInstanceMethod cls tag methodName
             case mConcrete of
@@ -4332,10 +4348,6 @@ classMethodDispatcher reg cls methodName = selfVal
             [BC.pack "ST", BC.pack "IO", BC.pack "STM", BC.pack "ParsecT"]
         | otherwise =
             resultPolymorphicDefaultTags clsName method
-
-    prefersSTResultCarrier mArgTag clsName method =
-        isPureLikeResult clsName method
-        && maybe False isSTResultCarrierTag mArgTag
 
     resultPolymorphicDefaultTags clsName method
         | clsName == BC.pack "GetAddrInfo"
@@ -4403,7 +4415,7 @@ classMethodDispatcher reg cls methodName = selfVal
         -- selected.  Try IO / ST / STM before ParsecT for @fmap@ and
         -- pure-like methods so ordinary source IO keeps resolving to the
         -- source-loaded boot-library instances.  Keep @>>=@ / @>>@ on the
-        -- older ParsecT-only fallback: ST code can expose state functions
+        -- Conservative carrier fallback: ST code can expose state functions
         -- during bind dispatch, and defaulting those to IO breaks runSTArray.
         --
         -- This order is important for warp's @waitForZero@, which does
@@ -4430,12 +4442,22 @@ classMethodDispatcher reg cls methodName = selfVal
         = [BC.pack "IO", BC.pack "ST", BC.pack "STM", BC.pack "ParsecT"]
         | clsName == BC.pack "Monad"
         , method `elem` map BC.pack [">>=", ">>"]
-        = [BC.pack "ParsecT"]
+        = [BC.pack "IO", BC.pack "ParsecT"]
         | otherwise = []
 
     isPureLikeResult clsName method =
         (clsName == BC.pack "Applicative" && method == BC.pack "pure")
      || (clsName == BC.pack "Monad"       && method == BC.pack "return")
+
+    -- IO is a compiler-built State# newtype. During boot source loading its
+    -- Applicative/Monad method bodies can themselves depend on the operation
+    -- currently being resolved. This is the exact constructor semantics.
+    ioPureIntrinsic = VFun $ \valueT -> do
+        stateFnT <- newWHNFThunk $ VFun $ \stateT -> do
+            stateV <- force legacyHooks stateT
+            stateOutT <- newWHNFThunk stateV
+            pure (VCon (BC.pack "(#,#)") [stateOutT, valueT])
+        pure (VCon (BC.pack "IO") [stateFnT])
 
     isSTResultCarrierTag tag =
         tag `elem` map BC.pack ["STArray", "STUArray"]
@@ -4580,13 +4602,16 @@ classMethodDispatcher reg cls methodName = selfVal
         = case reverse accArgs of
             [ptrT, offT] -> do
                 ptrV <- force legacyHooks ptrT
-                isWord8 <- isHostWord8PtrVal ptrV
-                    `catch` (\(_ :: SomeException) -> pure False)
-                if isWord8
-                    then pure (Just (VIO $ do
-                        offV <- force legacyHooks offT
-                        pokeHostWord8ByteOff ptrV offV av))
-                    else pure Nothing
+                offV <- force legacyHooks offT
+                case av of
+                  VChar _ -> pure (Just (VIO (pokeHostCharElemOff ptrV offV av)))
+                  _ -> do
+                    isWord8 <- isHostWord8PtrVal ptrV
+                        `catch` (\(_ :: SomeException) -> pure False)
+                    if isWord8
+                        then pure (Just (VIO $ do
+                            pokeHostWord8ByteOff ptrV offV av))
+                        else pure Nothing
             _ -> pure Nothing
         | cls == BC.pack "Storable"
         , methodName == BC.pack "poke"
@@ -4800,8 +4825,14 @@ classMethodDispatcher reg cls methodName = selfVal
                 ptrV <- force legacyHooks ptrT
                 isWord8 <- isHostWord8PtrVal ptrV
                     `catch` (\(_ :: SomeException) -> pure False)
-                pure $
-                    if isWord8
+                isChar <- isHostCharPtrVal ptrV
+                    `catch` (\(_ :: SomeException) -> pure False)
+                looksChar <- if isChar then pure True else if isWord8 then pure False else
+                    looksLikeHostCharPtrVal ptrV offV
+                        `catch` (\(_ :: SomeException) -> pure False)
+                pure $ if looksChar
+                    then Just (VIO (peekHostCharElemOff ptrV offV))
+                    else if isWord8
                         then Just (VIO (peekHostWord8ByteOff ptrV offV))
                         else Nothing
             _ -> pure Nothing
@@ -5891,7 +5922,7 @@ ffiBuiltinNames = Set.fromList
     -- 'readFile'/'writeFile'/'appendFile' (and 'getContents') bottom out
     -- on these; without pinning, FD / GHC.IO.Handle source rewrites can
     -- steal the names and break the PrimHandle path.
-    , "openFile", "hClose", "withFile", "hGetContents"
+    , "openFile", "hClose", "hGetContents"
     ]
 
 -- | Build a map from each locally-visible imported name to its
@@ -9157,9 +9188,9 @@ resolveFallbackSource mOwner name = do
                 transientReg <- newIORef (Map.map Loaded mods)
                 searchPath <- readIORef globalSearchPathRef
                 includeMap <- readIORef globalIncludeMapRef
+                baseEnv <- readIORef envBaseForFallbackRef
                 rw <- buildImportRewrites True transientReg searchPath includeMap owner Set.empty
                         `catch` (\(_ :: SomeException) -> pure Map.empty)
-                baseEnv <- readIORef envBaseForFallbackRef
                 extraRw <- buildTargetedImportRewrites
                                 transientReg searchPath includeMap owner baseEnv rw expr
                 let rwAll = Map.union rw extraRw
@@ -9823,8 +9854,37 @@ buildLoadedModule name isEntry header src = do
     -- Errors during body parsing are non-fatal — we just skip the
     -- synonym (it'll behave like an unknown constructor at match time).
     psDecls <- scanPatternSynonyms src
-    psPairs <- catMaybes <$> mapM (parsePatSynDecl src defaultFixityTable) psDecls
+    psPairs0 <- catMaybes <$> mapM (parsePatSynDecl src defaultFixityTable) psDecls
+    localNames <- Set.fromList <$> scanAllTopLevelNames src
+    let inlineLocalViews pat = case pat of
+            PCon con ps    -> PCon con <$> mapM inlineLocalViews ps
+            PAs n p        -> PAs n <$> inlineLocalViews p
+            PBang p        -> PBang <$> inlineLocalViews p
+            PIrref p       -> PIrref <$> inlineLocalViews p
+            PTuple ps      -> PTuple <$> mapM inlineLocalViews ps
+            PRecord con fs -> PRecord con <$> mapM
+                (\(f, p) -> do p' <- inlineLocalViews p; pure (f, p')) fs
+            PView (EVar fn) p
+              | Set.member fn localNames -> do
+                  mLhs <- findOrResolveLhs src known fn
+                  mBody <- mapM (Parser.parseBodyExprWithFixity src defaultFixityTable) mLhs
+                  PView (fromMaybe (EVar fn) mBody) <$> inlineLocalViews p
+            PView e p      -> PView e <$> inlineLocalViews p
+            other          -> pure other
+    psPairs <- forM psPairs0 $ \(patName, patSyn) -> do
+        body <- inlineLocalViews (PatSyn.psBody patSyn)
+        pure (patName, patSyn { PatSyn.psBody = body })
     PatSyn.registerPatSyns psPairs
+    -- Record pattern synonyms introduce selector functions just like record
+    -- data constructors.  Feed them through the ordinary FieldRegistry so
+    -- record matching/construction and selector synthesis stay generic.
+    let patSynFields = Map.fromListWith (++)
+            [ (field, [(conName, idx)])
+            | decl <- psDecls
+            , let conName = psdName decl
+            , (idx, field) <- zip [0..] (psdFields decl)
+            ]
+        fldR' = Map.unionWith (++) fldR patSynFields
     bodies              <- newIORef Map.empty
     -- Pre-populate 'lmBodies' with a sentinel @EVar ffiSynthKey@ for
     -- every scanned 'foreign import ccall' decl.  discoverInModule will
@@ -9844,7 +9904,7 @@ buildLoadedModule name isEntry header src = do
         , lmSource      = src
         , lmKnown       = known
         , lmDataReg     = dataR
-        , lmFieldReg    = fldR
+        , lmFieldReg    = fldR'
         , lmTypeCtorReg = tCtR
         , lmBodies      = bodies
         , lmIsEntry     = isEntry

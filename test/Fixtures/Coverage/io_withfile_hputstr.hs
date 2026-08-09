@@ -1,6 +1,4 @@
--- Direct host withFile + hPutStr (and openFile/hGetContents for read
--- side-check). Exercises the Handle-device carve-out used by graduated
--- writeFile/appendFile without going through those wrappers.
+-- Direct withFile + hPutStr, with host-backed Handle-device leaves.
 import System.IO (withFile, hPutStr, IOMode(WriteMode), openFile, hGetContents, hClose, IOMode(ReadMode))
 
 main = do

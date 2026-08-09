@@ -28,6 +28,7 @@ common lang
 library
     import:           warnings, lang
     hs-source-dirs:   src
+    c-sources:        cbits/ihc_posix.c
     exposed-modules:
         IHC
       , IHC.AST

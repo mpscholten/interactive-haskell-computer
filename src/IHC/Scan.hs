@@ -2289,9 +2289,26 @@ scanDataDecls src
             TkNewline -> collectRecordFields idx fields cur'
             TkComma   -> collectRecordFields idx fields cur'
             TkIdent fname -> do
-                -- Skip '::' and the type expression up to next ',' or '}'.
-                curAfterType <- skipFieldType cur'
-                collectRecordFields (idx + 1) ((fname, idx) : fields) curAfterType
+                -- A record field must be followed by `::`. Haddock prose is
+                -- tokenised by the lightweight scanner too; requiring the
+                -- separator prevents words after commas in long comments
+                -- from becoming phantom fields.
+                let (sep, curAfterSep) = nextToken src cur'
+                case tkKind sep of
+                    TkDColon -> do
+                        curAfterType <- skipType 0 curAfterSep
+                        collectRecordFields (idx + 1) ((fname, idx) : fields) curAfterType
+                    _ -> collectRecordFields idx fields cur'
+            -- MagicHash record selectors (e.g. BufferCodec#'s encode# and
+            -- recover#) are ordinary source fields. Missing them makes record
+            -- construction under-apply the constructor and leaves a VFun.
+            TkPrimId fname | primIdIsValueLevel fname -> do
+                let (sep, curAfterSep) = nextToken src cur'
+                case tkKind sep of
+                    TkDColon -> do
+                        curAfterType <- skipType 0 curAfterSep
+                        collectRecordFields (idx + 1) ((fname, idx) : fields) curAfterType
+                    _ -> collectRecordFields idx fields cur'
             TkBang -> do
                 -- Strict field: '!' followed by identifier.
                 let (fTok, cur'') = nextToken src cur'
@@ -2324,12 +2341,11 @@ scanDataDecls src
             TkRBracket -> skipType (max 0 (depth - 1)) cur'
             TkLBrace   -> skipType (depth + 1) cur'
             TkRBrace   -> skipType (max 0 (depth - 1)) cur'
-            TkNewline  -> do
-                let (peek, _) = nextToken src cur'
-                case tkKind peek of
-                    TkEof -> pure cur'
-                    _ | tkCol peek == 1 -> pure cur'
-                      | otherwise       -> skipType depth cur'
+            -- We are inside an explicit record brace, so only a depth-zero
+            -- comma or the closing brace terminates the field type. Column-1
+            -- tokens can legitimately occur after long Haddock comments in a
+            -- multi-line type (BufferCodec# is the motivating case).
+            TkNewline  -> skipType depth cur'
             _          -> skipType depth cur'
 
     -- Count positional atoms up to '|', '{', column-1 token, or EOF.
@@ -5007,6 +5023,7 @@ collectTypeVarsList src cur0 = go [] cur0
 data PatternSynonymDecl = PatternSynonymDecl
     { psdName   :: !ByteString
     , psdParams :: ![ByteString]   -- parameter identifiers (lowercase)
+    , psdFields :: ![ByteString]   -- record-synonym fields, empty for prefix/infix forms
     , psdBody   :: !Span           -- byte span containing the body pattern
     }
     deriving Show
@@ -5066,24 +5083,34 @@ scanPatternSynonymsRaw src
             _ -> pure Nothing
 
     handleAfterName n curAfterName = do
-        (params, curAfterParams) <- collectPatParams src curAfterName
-        handleAfterNameWithParams n params curAfterParams
+        let (nextTok, curAfterNext) = nextToken src curAfterName
+        case tkKind nextTok of
+            TkLBrace -> do
+                (fields, curAfterFields) <- collectPatSynRecordFields src curAfterNext
+                handleAfterNameWithFields n fields fields curAfterFields
+            _ -> do
+                (params, curAfterParams) <- collectPatParams src curAfterName
+                handleAfterNameWithFields n params [] curAfterParams
 
     handleAfterNameWithParams n params curAfterParams = do
+        handleAfterNameWithFields n params [] curAfterParams
+
+    handleAfterNameWithFields n params fields curAfterParams = do
         let (sepTok, curAfterSep) = nextToken src curAfterParams
         case tkKind sepTok of
-            TkLArrow -> readBody n params curAfterSep
-            TkEq     -> readBody n params curAfterSep
+            TkLArrow -> readBody n params fields curAfterSep
+            TkEq     -> readBody n params fields curAfterSep
             -- Type signature @pattern Name :: T@ / @pattern (:<) :: T@:
             -- skip silently (no body to register).
             _        -> pure Nothing
 
-    readBody n params curBody = do
+    readBody n params fields curBody = do
         let bodyStart = cPos (skipTrivia src curBody)
             bodyEnd   = findBodyEnd src bodyStart
             decl      = PatternSynonymDecl
                           { psdName   = n
                           , psdParams = params
+                          , psdFields = fields
                           , psdBody   = (bodyStart, bodyEnd)
                           }
         pure (Just (decl, Cursor bodyEnd 0 1))
@@ -5098,4 +5125,19 @@ collectPatParams src cur0 = go [] cur0
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkIdent n -> go (n : acc) cur'
+            _         -> pure (reverse acc, cur)
+
+-- | Read the field list in a record pattern-synonym declaration such as
+-- @pattern P {x, y} = C x y@.  Record pattern-synonym fields are also the
+-- synonym's positional parameters, in declaration order.
+collectPatSynRecordFields :: Source -> Cursor -> IO ([ByteString], Cursor)
+collectPatSynRecordFields src = go []
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkIdent n -> go (n : acc) cur'
+            TkComma   -> go acc cur'
+            TkRBrace  -> pure (reverse acc, cur')
+            TkEof     -> pure (reverse acc, cur')
             _         -> pure (reverse acc, cur)

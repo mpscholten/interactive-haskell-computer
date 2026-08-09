@@ -4193,6 +4193,7 @@ readRecordFieldName ctx tok0 cur0 = do
     segment kind cur = case kind of
         TkIdent n -> Just (n, cur)
         TkConId n -> Just (n, cur)
+        TkPrimId n -> Just (n, cur) -- MagicHash record selectors (encode#, recover#)
         _         -> Nothing
 
     go lastName cur =
@@ -4359,7 +4360,21 @@ parseAtom ctx cur0 = do
         TkIdent n
             | n == "_" -> parseErr ctx "wildcard `_` in expression position" tok
             | otherwise -> applyRecordDots ctx tok (EVar n) cur1
-        TkPrimId n -> pure (EVar n, cur1)
+        TkPrimId n
+            -- MagicHash permits data constructors such as BufferCodec#.
+            -- They participate in record construction exactly like ordinary
+            -- constructor identifiers; treating every TkPrimId as a plain
+            -- variable leaves the following `{ ... }` unconsumed.
+            | recordConstructorName n ->
+                let (nextTk, curAfterBrace) = nextSig ctx cur1 in
+                case tkKind nextTk of
+                    TkLBrace -> do
+                        (fields, curEnd, isWild) <- parseRecordFields ctx n curAfterBrace []
+                        if isWild
+                            then pure (ERecordWild n, curEnd)
+                            else pure (ERecordCon n fields, curEnd)
+                    _ -> pure (EVar n, cur1)
+            | otherwise -> pure (EVar n, cur1)
         TkConId n -> do
             -- Check for record construction: Con { f1 = v1, f2 = v2 }
             -- We use nextSig to skip whitespace so "Con { }" and "Con{}" both work.

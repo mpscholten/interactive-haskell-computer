@@ -1,4 +1,4 @@
--- | Global registry of pattern synonym declarations.
+-- | Per-run registry of pattern synonym declarations.
 --
 -- A pattern synonym is a top-level decl of the form
 --

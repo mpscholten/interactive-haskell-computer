@@ -22,6 +22,10 @@ module IHC.Builtins
     , eqByteStringHost
     , peekHostWord8ByteOff
     , pokeHostWord8ByteOff
+    , isHostCharPtrVal
+    , looksLikeHostCharPtrVal
+    , peekHostCharElemOff
+    , pokeHostCharElemOff
     , reapSpawnedThreads
     ) where
 
@@ -98,7 +102,8 @@ import IHC.Classes
     , legacyHooks
     )
 import qualified IHC.Classes
-import IHC.Eval (apply, force, forceMethodVal, runIOVal)
+import IHC.Eval (apply, force, forceMethodVal, matchPat, runIOVal)
+import qualified IHC.PatSyn as PatSyn
 import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
 import IHC.Val
@@ -172,6 +177,40 @@ pokeHostWord8ByteOff ptrV offV valV = do
         pure (fromIntegral (ord c) :: Word8)
     word8FromVal other =
         error ("pokeHostWord8ByteOff: bad byte: " <> showValForDebug other)
+
+isHostCharPtrVal :: Val -> IO Bool
+isHostCharPtrVal v = do
+    p <- ptrValToPtr v
+    (== Just (BC.pack "Char")) <$> lookupTypedHostPtr p
+
+looksLikeHostCharPtrVal :: Val -> Val -> IO Bool
+looksLikeHostCharPtrVal ptrV offV = do
+    p <- ptrValToPtr ptrV
+    idx <- byteOffsetFromVal "looksLikeHostCharPtrVal" offV
+    raw <- peekByteOff (p :: Ptr Word8) (idx * 4) :: IO Word64
+    let lo = raw .&. 0xffffffff
+        hi = raw `shiftR` 32
+        scalar x = x <= 0x10ffff && not (x >= 0xd800 && x <= 0xdfff)
+        looksChar = scalar lo && scalar hi && hi /= 0
+    when looksChar (markTypedHostPtr p (BC.pack "Char"))
+    pure looksChar
+
+pokeHostCharElemOff :: Val -> Val -> Val -> IO Val
+pokeHostCharElemOff ptrV offV valV = do
+    p <- ptrValToPtr ptrV
+    idx <- byteOffsetFromVal "pokeHostCharElemOff" offV
+    c <- case valV of
+        VChar ch -> pure ch
+        other    -> error ("pokeHostCharElemOff: not a Char: " <> showValForDebug other)
+    pokeElemOff (castPtr p :: Ptr Char) idx c
+    markTypedHostPtr p (BC.pack "Char")
+    pure VUnit
+
+peekHostCharElemOff :: Val -> Val -> IO Val
+peekHostCharElemOff ptrV offV = do
+    p <- ptrValToPtr ptrV
+    idx <- byteOffsetFromVal "peekHostCharElemOff" offV
+    VChar <$> peekElemOff (castPtr p :: Ptr Char) idx
 
 peekHostWord8ByteOff :: Val -> Val -> IO Val
 peekHostWord8ByteOff ptrV offV = do
@@ -526,7 +565,7 @@ builtins reg =
     --   readFile name = openFile name ReadMode >>= hGetContents
     --   writeFile f txt = withFile f WriteMode (\hdl -> hPutStr hdl txt)
     --   appendFile f txt = withFile f AppendMode (\hdl -> hPutStr hdl txt)
-    -- They bottom out on host 'openFile' / 'withFile' / 'hGetContents' /
+    -- They bottom out on host 'openFile' / 'hGetContents' /
     -- 'hClose' / 'hPutStr' — temporary Handle-device carve-outs (same
     -- family as hPutStrLn / hGetLine): source Handle ADT + locale
     -- encoding is not modelled yet, so these names are pinned via
@@ -565,7 +604,6 @@ builtins reg =
     -- appendFile are source-loaded — see slice comment above).
       ("openFile",    openFileB)
     , ("hClose",      hCloseB)
-    , ("withFile",    withFileB)
     , ("hGetContents", hGetContentsB)
     , ("hPutStr",     hPutStrB)
     , ("hPutChar",    hPutCharB)
@@ -3212,30 +3250,6 @@ hSetBufferingB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
     hSetBuffering h (bufferModeFromVal mv)
     pure VUnit
 
--- | @withFile path mode action@ — open, run @action@ with the host
--- 'Handle', close on success or exception.  Host-backed (Handle-device
--- carve-out): source @withFile@ is @bracket (openFile …) hClose@, but
--- the full source Handle/encoding layer is not modelled yet.  Lets
--- source-loaded 'writeFile' / 'appendFile' (and direct 'withFile'
--- users) bottom out here instead of a whole-file host shim.
-withFileB :: IO Val
-withFileB = pure $ VFun $ \pathT -> pure $ VFun $ \modeT -> pure $ VFun $ \kT -> pure $ VIO $ do
-    pv   <- force legacyHooks pathT
-    path <- valToString pv
-    mv   <- force legacyHooks modeT
-    let mode = ioModeFromVal mv
-    kv   <- force legacyHooks kT
-    CE.bracket
-        (do
-            h    <- openFile path mode
-            hVal <- mkFileHandleVal path h mode
-            pure (h, hVal))
-        (\(h, _) -> hClose h)
-        (\(_, hVal) -> do
-            hT <- newWHNFThunk hVal
-            r  <- apply legacyHooks kv hT
-            runIOVal legacyHooks r)
-
 -- | @hGetContents h@ — read the remainder of the handle as a String
 -- ([Char]).  Host-backed (same Handle-device carve-out as 'hGetLine');
 -- source-loaded 'readFile' / 'getContents' bottom out here.
@@ -4082,6 +4096,7 @@ writeWideCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
         (VPrimObj (PrimPtr p), VInt i, VChar c) -> do
             pokeElemOff (castPtr p :: Ptr Word32) (fromIntegral i)
                         (fromIntegral (ord c) :: Word32)
+            markTypedHostPtr p (BC.pack "Char")
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeWideCharOffAddr#: bad args: "
                     <> showValForDebug addrV <> ", "
@@ -5883,7 +5898,9 @@ buildFieldEnv reg = do
                              <> "` has only " <> show (length args)
                              <> " fields, index " <> show idx
                              <> " out of range"))
-                    Nothing -> tryIsStringFallback fieldName clauses v conName
+                    Nothing -> do
+                        matched <- tryPatternSynonymAccessor fieldName clauses v
+                        maybe (tryIsStringFallback fieldName clauses v conName) pure matched
             -- Nullary class methods like @mempty@ need result-type
             -- evidence before a newtype field accessor can project them.
             -- A single-constructor field registry gives us that evidence.
@@ -5907,6 +5924,23 @@ buildFieldEnv reg = do
                       ("record accessor `" <> BC.unpack fieldName
                        <> "` applied to non-constructor value: "
                        <> showValForDebug v))
+
+    -- A record pattern synonym's selector follows the synonym matcher, not
+    -- the storage index of its underlying constructor.  This matters for
+    -- view-pattern fields such as BufferCodec.encode, which wraps encode# in
+    -- an IO action rather than exposing the raw four-result state function.
+    tryPatternSynonymAccessor fieldName clauses value = go clauses
+      where
+        go [] = pure Nothing
+        go ((patName, _):rest) = do
+            mPatSyn <- PatSyn.lookupPatSyn patName
+            case mPatSyn of
+                Just patSyn | fieldName `elem` PatSyn.psParams patSyn -> do
+                    matched <- matchPat legacyHooks (PatSyn.psBody patSyn) value
+                    case matched >>= lookup fieldName of
+                        Just fieldT -> Just <$> force legacyHooks fieldT
+                        Nothing     -> go rest
+                _ -> go rest
 
     -- Optimistic OverloadedStrings bridge for record accessors.
     --
@@ -6524,10 +6558,25 @@ writeTVarHashB = pure $ VFun $ \tvT -> pure $ VFun $ \aT -> pure $ VFun $ \_sT -
 
 -- | Wrap a 'Val' in an 'IhcException' for host-level throwing.
 valToIhcException :: Val -> IO IhcException
-valToIhcException v = do
+valToIhcException v0 = do
+    v <- unwrapNoBacktrace v0
     msg <- extractExceptionMessage v
     t   <- newWHNFThunk v
     pure (IhcException msg t)
+  where
+    -- NoBacktrace's source Exception instance delegates to its payload.
+    -- Preserve that representation at the raise# host boundary so the
+    -- wrapper does not erase the actual exception while crossing the RTS.
+    unwrapNoBacktrace (VCon "NoBacktrace" [innerT]) =
+        force legacyHooks innerT >>= unwrapNoBacktrace
+    unwrapNoBacktrace (VCon "SomeException" [innerT]) = do
+        inner <- force legacyHooks innerT >>= unwrapNoBacktrace
+        case inner of
+            VCon "SomeException" _ -> pure inner
+            _ -> do
+                innerT' <- newWHNFThunk inner
+                pure (VCon "SomeException" [innerT'])
+    unwrapNoBacktrace v = pure v
 
 -- | Extract a user-readable message from an exception value.
 -- Unwraps 'SomeException' and pulls the payload out of 'ErrorCall' /
