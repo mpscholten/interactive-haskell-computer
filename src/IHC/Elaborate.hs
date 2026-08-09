@@ -569,7 +569,10 @@ expandSyn syns = go
                               in foldl TyApp expanded extra
                         _ -> foldl TyApp head_ argsExpanded
                 _ -> foldl TyApp (go head_) argsExpanded
-        TyCon _      -> t
+        TyCon n      ->
+            case Map.lookup n syns of
+                Just (0, rhs) -> go rhs
+                _             -> t
         TyVar _      -> t
         TyArrow a b  -> TyArrow (go a) (go b)
         TyForall vs preds body -> TyForall vs preds (go body)

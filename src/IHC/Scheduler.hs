@@ -77,6 +77,7 @@ import qualified System.IO
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import IHC.AST
+import qualified IHC.Elaborate as Elab
 import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
@@ -5483,7 +5484,7 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 -- warp request path) even though the single-file repro worked.
 wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig lm n e =
-    let e' = annotateBindInputTypes e
+    let e' = annotateResultContext (annotateBindInputTypes e)
     in case e' of
         -- RHS is literally a bare nullary class method
         -- (@x :: T; x = minBound@): annotate with the result-type tag.
@@ -5506,6 +5507,53 @@ wrapNullaryResultSig lm n e =
           -> ETyApp e' tyBytes
         _ -> e'
   where
+    annotateResultContext expr =
+        case Map.lookup (lastNameComponent n) (lmTypeSigs lm) >>= normalizedResultTag of
+            Just tag -> rewriteMethods tag expr
+            Nothing  -> expr
+
+    normalizedResultTag (Scheme _ _ body) =
+        let (_, resultTy) = tyArrowArgs body
+            expand 0 ty = ty
+            expand fuel ty =
+                let ty' = Elab.resolveSynonymHop (lmTypeSynonyms lm) ty
+                in if ty' == ty then ty else expand (fuel - 1) ty'
+        in typeResultTag (expand (16 :: Int) resultTy)
+
+    rewriteMethods tag = go
+      where
+        go (EVar nm)
+            | bare == "pure"   = ETypedMethod "Applicative" "pure" tag
+            | bare == "return" = ETypedMethod "Monad" "return" tag
+            | bare == "fmap"   = ETypedMethod "Functor" "fmap" tag
+            | bare == "<*>"    = ETypedMethod "Applicative" "<*>" tag
+            | bare == "*>"     = ETypedMethod "Applicative" "*>" tag
+            | bare == "<*"     = ETypedMethod "Applicative" "<*" tag
+            | bare == ">>="    = ETypedMethod "Monad" ">>=" tag
+            | bare == ">>"     = ETypedMethod "Monad" ">>" tag
+          where bare = lastNameComponent nm
+        go (EApp f x) = EApp (go f) (go x)
+        go (ELam a body) = ELam a (go body)
+        go (ELet bs body) = ELet [(bn, go rhs) | (bn, rhs) <- bs] (go body)
+        go (ECase s as) = ECase (go s) [Alt p (go rhs) | Alt p rhs <- as]
+        go (EIf c t f) = EIf (go c) (go t) (go f)
+        go (EDo stmts) = EDo (map goStmt stmts)
+        go (ENeg inner) = ENeg (go inner)
+        go (ETuple xs) = ETuple (map go xs)
+        go (EImplicitLet bs body) =
+            EImplicitLet [(bn, go rhs) | (bn, rhs) <- bs] (go body)
+        go (ERecordCon c fs) = ERecordCon c [(fn, go rhs) | (fn, rhs) <- fs]
+        go (ERecordUpdate base fs) =
+            ERecordUpdate (go base) [(fn, go rhs) | (fn, rhs) <- fs]
+        go (ETyApp inner ty) = ETyApp (go inner) ty
+        go other = other
+
+        goStmt (SExpr rhs) = SExpr (go rhs)
+        goStmt (SBind bn rhs) = SBind bn (go rhs)
+        goStmt (SBangBind bn rhs) = SBangBind bn (go rhs)
+        goStmt (SLet bs) = SLet [(bn, go rhs) | (bn, rhs) <- bs]
+        goStmt (SImplicitLet bs) = SImplicitLet [(bn, go rhs) | (bn, rhs) <- bs]
+
     annotateBindInputTypes :: Expr -> Expr
     annotateBindInputTypes = go
       where
@@ -8111,7 +8159,12 @@ mergeGlobalLoadedModules newMods
 -- a previously-missing name might now resolve.
 insertLmBody :: LoadedModule -> ByteString -> Expr -> IO ()
 insertLmBody lm name expr = do
-    modifyIORef' (lmBodies lm) (Map.insert name expr)
+    -- Preserve the binding's declared result context at discovery time.
+    -- Some demand paths consume lmBodies directly and never pass through
+    -- exportBodies/buildSlotFromOwner, so delaying this rewrite until thunk
+    -- construction loses class-method evidence for those paths.
+    modifyIORef' (lmBodies lm)
+        (Map.insert name (wrapNullaryResultSig lm name expr))
     bumpEnvFallbackGen
 
 installEnvFallbackHook :: IO ()
@@ -9821,6 +9874,7 @@ isBuiltinBackedModule n =
         && n /= BC.pack "Language.Haskell.TH.Quote"
         && n /= BC.pack "Language.Haskell.TH.Syntax"
         && n /= BC.pack "Language.Haskell.TH.CodeDo"
+        && n /= BC.pack "Language.Haskell.TH.PprLib"
         && n /= BC.pack "Language.Haskell.TH.LanguageExtensions")
 
 -- | Emit a diagnostic to stderr when a missing module is being

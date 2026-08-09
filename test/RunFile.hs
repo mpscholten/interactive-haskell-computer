@@ -957,6 +957,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/newtype_selector_vcon.hs")
         n   `shouldBe` 0
         out `shouldBe` "Just 3\n"
+
+    it "TH PprLib resolves Monad context through its Doc synonym" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_pprlib_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "False\n"
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------
