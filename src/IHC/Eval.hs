@@ -388,15 +388,14 @@ eval hooks env ipm = go
                 Nothing -> error ("IHC.Eval: unbound variable `"
                                   <> BC.unpack name <> "`")
 
+    -- A signature on the lazy witness argument determines the Storable
+    -- dictionary.  Move that annotation onto the class method before normal
+    -- application, so dispatch selects the source-loaded instance without
+    -- forcing @undefined :: a@.
     go (EApp f x)
-        | Just (method, ty) <- lazyStorableMethodTyArg f x =
-            case storableSizeAlignLiteral method ty of
-                Just v  -> pure v
-                Nothing
-                    | isPolymorphicStorableTy ty ->
-                        pure (storableSizeAlignFallback method)
-                    | otherwise ->
-                        go (EApp (ETyApp f ty) x)
+        | Just ty <- lazyStorableWitnessTy f x =
+            go (EApp (ETyApp f ty) x)
+
     -- Signature-directed specialisation of bare nullary Bounded methods.
     -- GHC specialises @measureOff maxBound@ to @maxBound :: Int@ from
     -- @measureOff :: Int -> Text -> Int@.  Without that, @Data.Text.length
@@ -845,111 +844,19 @@ eval hooks env ipm = go
                 pure (Just (VIO (typedPeek isElemOff resultTy ptrE offE)))
             _ -> pure Nothing
 
-    lazyStorableMethodTyArg :: Expr -> Expr -> Maybe (ByteString, ByteString)
-    lazyStorableMethodTyArg fn arg =
+    lazyStorableWitnessTy :: Expr -> Expr -> Maybe ByteString
+    lazyStorableWitnessTy fn arg =
         case (storableMethodHead fn, arg) of
             (Just method, ETyApp _ ty)
                 | lastNameComponent method `elem` map BC.pack ["sizeOf", "alignment"] ->
-                    Just (lastNameComponent method, ty)
+                    Just ty
             _ -> Nothing
       where
-        storableMethodHead (EVar method)   = Just method
-        storableMethodHead (ETyApp inner _) = storableMethodHead inner
-        storableMethodHead _               = Nothing
-
-    isPolymorphicStorableTy :: ByteString -> Bool
-    isPolymorphicStorableTy ty =
-        let tag = lastNameComponent (normalizeTyTag ty)
-        in not (BC.null tag)
-           && not (isAsciiUpper (BC.head tag))
-           && BC.head tag /= '('
-           && BC.head tag /= '['
-      where
-        isAsciiUpper c = c >= 'A' && c <= 'Z'
-
-    storableSizeAlignFallback :: ByteString -> Val
-    storableSizeAlignFallback method
-        | method == BC.pack "alignment" = VInt 8
-        | otherwise                     = VInt 64
-
-    storableSizeAlignLiteral :: ByteString -> ByteString -> Maybe Val
-    storableSizeAlignLiteral method ty =
-        case method of
-            "sizeOf"    -> VInt . fromIntegral <$> tableSize headTy
-            "alignment" -> VInt . fromIntegral <$> tableAlign headTy
-            _           -> Nothing
-      where
-        headTy = tyAnnotationHead ty
-        ptrSize = FStorable.sizeOf (undefined :: Ptr Word8)
-        ptrAlign = FStorable.alignment (undefined :: Ptr Word8)
-        tableSize h = case h of
-            "Ptr"      -> Just ptrSize
-            "FunPtr"   -> Just ptrSize
-            "Char"     -> Just (FStorable.sizeOf (undefined :: Char))
-            "Double"   -> Just (FStorable.sizeOf (undefined :: Double))
-            "Float"    -> Just (FStorable.sizeOf (undefined :: Float))
-            "Word8"    -> Just (FStorable.sizeOf (undefined :: Word8))
-            "Word16"   -> Just (FStorable.sizeOf (undefined :: Word16))
-            "Word32"   -> Just (FStorable.sizeOf (undefined :: Word32))
-            "Word64"   -> Just (FStorable.sizeOf (undefined :: Word64))
-            "Word"     -> Just (FStorable.sizeOf (undefined :: Word))
-            "Int8"     -> Just (FStorable.sizeOf (undefined :: Int8))
-            "Int16"    -> Just (FStorable.sizeOf (undefined :: Int16))
-            "Int32"    -> Just (FStorable.sizeOf (undefined :: Int32))
-            "Int64"    -> Just (FStorable.sizeOf (undefined :: Int64))
-            "Int"      -> Just (FStorable.sizeOf (undefined :: Int))
-            "CChar"    -> Just (FStorable.sizeOf (undefined :: Int8))
-            "CUChar"   -> Just (FStorable.sizeOf (undefined :: Word8))
-            "CBool"    -> Just (FStorable.sizeOf (undefined :: Word8))
-            "CShort"   -> Just (FStorable.sizeOf (undefined :: Int16))
-            "CUShort"  -> Just (FStorable.sizeOf (undefined :: Word16))
-            "CInt"     -> Just (FStorable.sizeOf (undefined :: Int32))
-            "CUInt"    -> Just (FStorable.sizeOf (undefined :: Word32))
-            "CLong"    -> Just (FStorable.sizeOf (undefined :: Int64))
-            "CULong"   -> Just (FStorable.sizeOf (undefined :: Word64))
-            "CLLong"   -> Just (FStorable.sizeOf (undefined :: Int64))
-            "CULLong"  -> Just (FStorable.sizeOf (undefined :: Word64))
-            "CSize"    -> Just (FStorable.sizeOf (undefined :: Word))
-            "CSsize"   -> Just (FStorable.sizeOf (undefined :: Int64))
-            "CSSize"   -> Just (FStorable.sizeOf (undefined :: Int64))
-            "CIntPtr"  -> Just (FStorable.sizeOf (undefined :: Int64))
-            "CUIntPtr" -> Just (FStorable.sizeOf (undefined :: Word64))
-            "CPtrdiff" -> Just (FStorable.sizeOf (undefined :: Int64))
-            _           -> Nothing
-        tableAlign h = case h of
-            "Ptr"      -> Just ptrAlign
-            "FunPtr"   -> Just ptrAlign
-            "Char"     -> Just (FStorable.alignment (undefined :: Char))
-            "Double"   -> Just (FStorable.alignment (undefined :: Double))
-            "Float"    -> Just (FStorable.alignment (undefined :: Float))
-            "Word8"    -> Just (FStorable.alignment (undefined :: Word8))
-            "Word16"   -> Just (FStorable.alignment (undefined :: Word16))
-            "Word32"   -> Just (FStorable.alignment (undefined :: Word32))
-            "Word64"   -> Just (FStorable.alignment (undefined :: Word64))
-            "Word"     -> Just (FStorable.alignment (undefined :: Word))
-            "Int8"     -> Just (FStorable.alignment (undefined :: Int8))
-            "Int16"    -> Just (FStorable.alignment (undefined :: Int16))
-            "Int32"    -> Just (FStorable.alignment (undefined :: Int32))
-            "Int64"    -> Just (FStorable.alignment (undefined :: Int64))
-            "Int"      -> Just (FStorable.alignment (undefined :: Int))
-            "CChar"    -> Just (FStorable.alignment (undefined :: Int8))
-            "CUChar"   -> Just (FStorable.alignment (undefined :: Word8))
-            "CBool"    -> Just (FStorable.alignment (undefined :: Word8))
-            "CShort"   -> Just (FStorable.alignment (undefined :: Int16))
-            "CUShort"  -> Just (FStorable.alignment (undefined :: Word16))
-            "CInt"     -> Just (FStorable.alignment (undefined :: Int32))
-            "CUInt"    -> Just (FStorable.alignment (undefined :: Word32))
-            "CLong"    -> Just (FStorable.alignment (undefined :: Int64))
-            "CULong"   -> Just (FStorable.alignment (undefined :: Word64))
-            "CLLong"   -> Just (FStorable.alignment (undefined :: Int64))
-            "CULLong"  -> Just (FStorable.alignment (undefined :: Word64))
-            "CSize"    -> Just (FStorable.alignment (undefined :: Word))
-            "CSsize"   -> Just (FStorable.alignment (undefined :: Int64))
-            "CSSize"   -> Just (FStorable.alignment (undefined :: Int64))
-            "CIntPtr"  -> Just (FStorable.alignment (undefined :: Int64))
-            "CUIntPtr" -> Just (FStorable.alignment (undefined :: Word64))
-            "CPtrdiff" -> Just (FStorable.alignment (undefined :: Int64))
-            _           -> Nothing
+        -- Only rewrite the original bare method.  Once the dictionary tag is
+        -- attached as ETyApp, normal evaluation must proceed rather than
+        -- wrapping it repeatedly.
+        storableMethodHead (EVar method) = Just method
+        storableMethodHead _             = Nothing
 
     typedPeek :: Bool -> ByteString -> Expr -> Expr -> IO Val
     typedPeek isElemOff resultTy ptrE offE = do

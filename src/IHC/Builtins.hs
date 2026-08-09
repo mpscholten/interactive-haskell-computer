@@ -1154,12 +1154,10 @@ builtins reg =
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
     , ("newCString",      newCStringB)
-    -- Foreign.Storable.sizeOf / alignment source-load for qualified module
-    -- entries.  Keep only the bare optimistic fallback for polymorphic
-    -- library code like alloca's sizeOf (undefined :: a), where IHC has no
-    -- typechecker dictionary to recover a concrete Storable instance.
-    , ("sizeOf",       sizeOfB)
-    , ("alignment",    alignmentB)
+    -- Foreign.Storable.sizeOf / alignment source-load through the Storable
+    -- class.  Signature-directed type applications select the source-loaded
+    -- instance dictionary; ordinary Haskell class methods must not be
+    -- shadowed by bare host fallbacks.
     -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
     -- import dispatches through the generic FFI path.
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
@@ -5587,16 +5585,6 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
     BS.useAsCString bs $ \src -> copyBytes cp (castPtr src) len
     poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
     pure (VPrimObj (PrimPtr cp))
-
-sizeOfB :: IO Val
-sizeOfB = pure $ VFun $ \a -> do
-    let _ = a
-    pure (VInt 64)
-
-alignmentB :: IO Val
-alignmentB = pure $ VFun $ \a -> do
-    let _ = a
-    pure (VInt 8)
 
 --------------------------------------------------------------------------------
 -- Phase 2.8: additional numeric / bit ops

@@ -1351,6 +1351,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "rts flags ok\ngc flags ok\nprof flags ok\nticky flags ok\n"
 
+    it "Foreign.Storable sizeOf/alignment dispatch to source-loaded instances" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/foreign_storable_size_align_source_ops.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "8\n8\n"
+
     it "UserInfixOp: (|>) defined via section form `x |> f = f x`" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator.hs")
         n   `shouldBe` 0
