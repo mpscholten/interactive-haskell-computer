@@ -1281,6 +1281,21 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello\n"
 
+    it "megaparsec takeWhile1P: strict Text Stream method is fully applied" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/megaparsec_takewhile1p_text.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\n"
+
+    it "megaparsec do: final unannotated pure keeps the ParsecT carrier" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/megaparsec_do_final_pure.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "x\n"
+
+    it "callee expected type: cs String result resolves to strict Text" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/expected_arg_cs_text.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "hello\n"
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------

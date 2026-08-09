@@ -1,10 +1,11 @@
 # HSX hello-world: architecture & path to rendered HTML
 
-Status: **megaparsec Text path partially unblocked** (2026-08-08).
-Foundation (QQ plumbing, blaze render baseline) is green. First real
-HSX run now dies later in the stack: megaparsec multi-statement
-do-blocks need unannotated `pure` to resolve to `ParsecT`, but
-result-poly `pure` defaults to IO (ParsecT-first breaks warp IO).
+Status: **megaparsec Text path and `cs` conversion unblocked** (2026-08-09).
+Foundation (QQ plumbing, blaze render baseline) is green. The real HSX
+run now passes the former `takeWhile_` lazy-tuple failure: callee-signature
+expected-type propagation converts `(cs code)` to strict `Text` before
+calling `parseHsx`. The in-process sentinel advances to a module-loading
+nontermination before `EQuasiQuote` evaluation begins.
 
 Sibling slices this batch: Unit 1 = cache-priming script, Unit 2 =
 smoke fixture, Unit 3 = parser `EQuasiQuote` wiring, Units 5/6/7 =
@@ -189,14 +190,20 @@ Key files:
 
 ### Still open for full `[hsx|…]`
 
-- **Unannotated `pure` / `return` in ParsecT do-blocks (current tip).**
+- **Unannotated `pure` / `return` in ParsecT do-blocks.**
   Result-poly defaults pure to IO-first (required for warp). HSX's
   `parseHsx` ends with `pure node` unannotated → IO-shaped value →
   `unParser` sees `(#,#)`. Type-annotated `pure @(Parsec …)` works;
   reordering defaults to ParsecT-first when the instance is loaded
-  breaks `pure` in IO after megaparsec is in the process. Need
-  expected-type elaboration of pure from the enclosing `Parser`/
-  `ParsecT` binding or do-block, without a global default flip.
+  breaks `pure` in IO after megaparsec is in the process. Non-IO do
+  sequencing now retains the ParsecT carrier for nested final
+  `pure`/`return` expressions (`megaparsec_do_final_pure`).
+- **Module-loading nontermination (current tip).** The focused `cs` → strict
+  `Text` regression is green, and the former `PTuple [ts,input']` failure is
+  fixed. The in-process HSX sentinel now stalls inside
+  `loadProgramFromSource`, before it returns `main` and before any
+  `EQuasiQuote` evaluator trace fires. The next diagnostic slice is to trace
+  individual entry imports, manifest-provider loading, and splice expansion.
 - **TH surface used by HSX `quoteHsxExpression`.** `location` /
   `extsEnabled` stubs exist; nested brackets + `$(pure expr)` antiquotes,
   `Lift Text` remain. See `docs/HSX-TH-NEEDS.md`.
