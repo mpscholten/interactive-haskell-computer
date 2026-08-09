@@ -515,7 +515,10 @@ applyMethodSubst sub = go
         EConstrainedValue inner constraints ->
             case traverse resolveConstraint constraints of
                 Just resolved -> EConstrainedValue (go inner) resolved
-                Nothing       -> go inner
+                -- Preserve erased predicates on ordinary functions. Runtime
+                -- application resolves their variables from the argument and
+                -- captures the resulting dictionary context in lazy thunks.
+                Nothing       -> EConstrainedValue (go inner) constraints
         EApp f x     -> EApp (go f) (go x)
         ELam n body  -> ELam n (go body)
         ELet bs body -> ELet [(n, go b) | (n, b) <- bs] (go body)

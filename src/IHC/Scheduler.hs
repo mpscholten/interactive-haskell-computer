@@ -3781,7 +3781,7 @@ classMethodDispatcher reg cls methodName = selfVal
     -- We knot-tie `selfVal` so the closure can return it as a
     -- "not dispatched" marker when tag-path lookup misses — matchPat
     -- in Eval treats a returned VClassMethod as "no match".
-    selfVal = VClassMethod methodName 0 [] $ \tags argT -> case tags of
+    selfVal = VClassMethod cls methodName 0 [] $ \tags argT -> case tags of
         typedTags@(_ : _ : _) -> do
             let normTags = map normalizeTyTag typedTags
             mM <- lookupInstanceMethodMultiForced reg cls normTags methodName

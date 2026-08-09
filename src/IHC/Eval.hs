@@ -49,7 +49,7 @@ import qualified Data.Set as Set
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, typeTagOf, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
@@ -325,7 +325,7 @@ valKindTag = \case
     VIO _             -> "VIO"
     VPrimObj _        -> "VPrimObj"
     VLabel _          -> "VLabel"
-    VClassMethod n _ ts _ ->
+    VClassMethod _ n _ ts _ ->
         "VClassMethod:" <> BC.unpack n <> "@" <> show (length ts)
     VLazyMethod _     -> "VLazyMethod"
 
@@ -363,7 +363,7 @@ eval hooks env ipm = go
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
 
     go (EVar name) = case lookupEnv name env of
-        Just t  -> force hooks t
+        Just t  -> force hooks t >>= resolveContextualClassMethod
         Nothing
             | Just ctor <- unboxedTupleCtorValue name -> pure ctor
             | otherwise -> do
@@ -384,9 +384,24 @@ eval hooks env ipm = go
             owner <- currentOwner hooks env
             mT    <- lookupEnvFallback legacyHooks owner name
             case mT of
-                Just t  -> force hooks t
+                Just t  -> force hooks t >>= resolveContextualClassMethod
                 Nothing -> error ("IHC.Eval: unbound variable `"
                                   <> BC.unpack name <> "`")
+      where
+        resolveContextualClassMethod v@(VClassMethod cls method _ tags _)
+            | null tags
+            , Just tagT <- lookupIPMap (dictionaryContextKey cls) ipm = do
+                tagV <- force hooks tagT
+                case tagV of
+                    VStr tag -> do
+                        mReg <- getSharedClassReg hooks
+                        case mReg of
+                            Nothing -> pure v
+                            Just reg -> do
+                                mMethod <- lookupInstanceMethod reg cls tag method
+                                maybe (pure v) (forceMethodVal hooks) mMethod
+                    _ -> pure v
+        resolveContextualClassMethod v = pure v
 
     go (EApp f x)
         | Just (method, ty) <- lazyStorableMethodTyArg f x =
@@ -592,17 +607,33 @@ eval hooks env ipm = go
     -- currently supported single-dictionary form, attach every parameter tag
     -- to the dispatcher produced by the source value. Multi-parameter lookup
     -- then follows the ordinary VClassMethod path.
-    go (EConstrainedValue inner [(_cls, instanceTags)]) = do
+    go (EConstrainedValue inner constraints) = do
         v <- go inner
         case v of
-            VClassMethod m slot _ fn ->
+            VClassMethod cls m slot _ fn
+              | [(_constraintClass, instanceTags)] <- constraints ->
                 -- This node carries the complete predicate key, unlike an
                 -- ETyApp (which contributes one positional tag).  Replace
                 -- any tags inherited through a constrained alias instead of
                 -- duplicating them when aliases delegate to other aliases.
-                pure (VClassMethod m slot (map normalizeTyTag instanceTags) fn)
+                pure (VClassMethod cls m slot (map normalizeTyTag instanceTags) fn)
+            VFunIP lexicalIP f -> pure $ VFunIP lexicalIP $ \callerIP argT -> do
+                argV <- force hooks argT
+                dictIP <- dictionaryContext constraints argV
+                f (Map.union dictIP callerIP) argT
             _ -> pure v
-    go (EConstrainedValue inner _) = go inner
+      where
+        dictionaryContext cs argV = Map.fromList <$> mapM (one (typeTagOf argV)) cs
+        one runtimeTag (cls, tags) = do
+            let tag = case tags of
+                    (candidate:_) | isRuntimeTypeVariable candidate -> runtimeTag
+                    (candidate:_) -> normalizeTyTag candidate
+                    [] -> runtimeTag
+            tagT <- newWHNFThunk (VStr tag)
+            pure (dictionaryContextKey cls, tagT)
+        isRuntimeTypeVariable tag = case BC.uncons tag of
+            Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
+            Nothing -> True
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -805,8 +836,8 @@ eval hooks env ipm = go
                 -- Multi-key class dispatch: @setField \@\"name\" \@User \@String@
                 -- accumulates type-arg tags onto the dispatcher so the final
                 -- call can look up the instance by composite key.
-                VClassMethod m slot tags fn ->
-                    pure (VClassMethod m slot (tags ++ [normalizeTyTag ty]) fn)
+                VClassMethod cls m slot tags fn ->
+                    pure (VClassMethod cls m slot (tags ++ [normalizeTyTag ty]) fn)
                 -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
                 -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
                 -- when a bare VLabel flows through a non-@Proxy@ type
@@ -2307,7 +2338,7 @@ matchPat hooks (PCon "STM" [p]) v =
 -- then re-match.  This is the backbone of nullary class-method
 -- dispatch (mempty, maxBound, empty, …) in an otherwise
 -- arg-directed runtime.
-matchPat hooks pat@(PCon pname _) (VClassMethod _ _ _ go) = do
+matchPat hooks pat@(PCon pname _) (VClassMethod _ _ _ _ go) = do
     dummyT <- newWHNFThunk VUnit
     resolved <- go [pname] dummyT
     case resolved of
@@ -2423,7 +2454,7 @@ matchFields hooks ((pat, t) : rest) acc = do
 apply :: IHCHooks -> Val -> Thunk -> IO Val
 apply _     (VFun f)                    arg = f arg
 apply _     (VFunIP _ f)                arg = f Map.empty arg
-apply _     (VClassMethod _ _ tags go)  arg = go tags arg
+apply _     (VClassMethod _ _ _ tags go)  arg = go tags arg
 -- Source may see the compiler/runtime state-token newtype constructors
 -- as constructor-shaped values rather than the builtin constructor
 -- functions. Applying the nullary shell should build the one-field
@@ -2456,7 +2487,7 @@ apply _     v                           _   = error ("IHC.Eval.apply: not a func
 applyIP :: IHCHooks -> ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _     _         (VFun f)                   arg = f arg
 applyIP _     callerIPM (VFunIP _ f)               arg = f callerIPM arg
-applyIP _     _         (VClassMethod _ _ tags go) arg = go tags arg
+applyIP _     _         (VClassMethod _ _ _ tags go) arg = go tags arg
 applyIP _     _         (VCon n [])                arg
     | isStateTokenNewtypeCtor n = pure (VCon n [arg])
 -- Newtype-transparent application: see note on 'apply' above.

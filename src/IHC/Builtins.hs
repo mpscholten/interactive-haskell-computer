@@ -2376,7 +2376,7 @@ showVal (VCon name thunks)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
-showVal (VClassMethod _ _ _ _) = pure "<function>"
+showVal (VClassMethod _ _ _ _ _) = pure "<function>"
 showVal (VLazyMethod _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
 showVal (VPrimObj (PrimIORef  _))      = pure "<IORef>"
@@ -2454,7 +2454,7 @@ fromLabelB reg = pure $ VFun $ \a -> do
                     case fromLabelM of
                         VFun _               -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
                         VFunIP _ _           -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
-                        VClassMethod _ _ _ _ -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
+                        VClassMethod _ _ _ _ _ -> do { aT <- newWHNFThunk av; apply legacyHooks fromLabelM aT }
                         v                    -> pure v
                 _ -> pure (VCon "Proxy" [])   -- default: Proxy IsLabel instance
         other -> error ("fromLabel: expected a Label value, got: "
@@ -5887,7 +5887,7 @@ buildFieldEnv reg = do
             -- Nullary class methods like @mempty@ need result-type
             -- evidence before a newtype field accessor can project them.
             -- A single-constructor field registry gives us that evidence.
-            VClassMethod _ _ _ go
+            VClassMethod _ _ _ _ go
               | [(conName, _)] <- clauses -> do
                   dummyT <- newWHNFThunk VUnit
                   resolved <- go [conName] dummyT

@@ -419,7 +419,7 @@ typeTagOf (VCon n _) =
     n
 typeTagOf (VFun _)      = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
-typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
+typeTagOf (VClassMethod _ _ _ _ _) = BC.pack "<function>"
 typeTagOf (VLazyMethod _) = BC.pack "<function>"
 typeTagOf (VIO _)       = BC.pack "<IO>"
 typeTagOf (VPrimObj (PrimIORef _))       = BC.pack "<IORef>"

@@ -37,6 +37,7 @@ module IHC.Val
     , emptyIPMap
     , extendIPMap
     , lookupIPMap
+    , dictionaryContextKey
       -- * Failures
     , LoopException(..)
     , PatternMatchFail(..)
@@ -104,7 +105,7 @@ data Val
     -- lookup+apply at the point the dispatcher is applied to a runtime
     -- argument; the 'Name' and 'Int' payloads are informational (method
     -- name + class-slot) kept for error messages.
-    | VClassMethod !Name !Int ![ByteString] !([ByteString] -> Thunk -> IO Val)
+    | VClassMethod !Name !Name !Int ![ByteString] !([ByteString] -> Thunk -> IO Val)
     -- | Unforced instance method body. Produced by 'evalMethodWithLazy'
     -- during 'registerInstancesFrom' and forced by the class-method
     -- dispatcher ('classMethodDispatcher') when the method is looked up.
@@ -184,7 +185,7 @@ showValForDebug (VPrimObj (PrimTVar _))       = "<TVar>"
 showValForDebug (VPrimObj (PrimThreadId _))   = "<ThreadId>"
 showValForDebug (VPrimObj (PrimBigNat n))     = "<BigNat# " <> show n <> ">"
 showValForDebug (VLabel name)                = "#" <> BC.unpack name
-showValForDebug (VClassMethod m _ tags _)     =
+showValForDebug (VClassMethod _ m _ tags _)     =
     "<classMethod " <> BC.unpack m
     <> (if null tags then "" else " @" <> show (map BC.unpack tags)) <> ">"
 showValForDebug (VLazyMethod _)               = "<lazyMethod>"
@@ -224,6 +225,9 @@ extendIPMap = Map.insert
 
 lookupIPMap :: Name -> ImplicitParamMap -> Maybe Thunk
 lookupIPMap = Map.lookup
+
+dictionaryContextKey :: Name -> Name
+dictionaryContextKey cls = BC.pack "$$dict:" <> cls
 
 -- | A closure captures both the regular environment and the implicit-param
 -- map at the point of its creation (lexical scoping for both).
