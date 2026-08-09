@@ -389,7 +389,7 @@ eval hooks env ipm = go
                                   <> BC.unpack name <> "`")
       where
         resolveContextualClassMethod v@(VClassMethod cls method _ tags _)
-            | null tags
+            | null tags || all isRuntimeTypeVariable tags
             , Just tagT <- lookupIPMap (dictionaryContextKey cls) ipm = do
                 tagV <- force hooks tagT
                 case tagV of
@@ -402,6 +402,10 @@ eval hooks env ipm = go
                                 maybe (pure v) (forceMethodVal hooks) mMethod
                     _ -> pure v
         resolveContextualClassMethod v = pure v
+
+        isRuntimeTypeVariable tag = case BC.uncons tag of
+            Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
+            Nothing -> True
 
     go (EApp f x)
         | Just (method, ty) <- lazyStorableMethodTyArg f x =
@@ -635,7 +639,11 @@ eval hooks env ipm = go
             VFunIP lexicalIP f -> pure $ VFunIP lexicalIP $ \callerIP argT -> do
                 argV <- force hooks argT
                 dictIP <- dictionaryContext constraints argV
-                f (Map.union dictIP callerIP) argT
+                -- A wrapper such as @typeRep :: Typeable a => proxy a -> ...@
+                -- cannot recover @a@ from the erased proxy value. Preserve a
+                -- dictionary supplied by its constrained caller; only infer
+                -- from the runtime argument when no such dictionary exists.
+                f (Map.union callerIP dictIP) argT
             _ -> pure v
       where
         dictionaryContext cs argV = Map.fromList <$> mapM (one (typeTagOf argV)) cs

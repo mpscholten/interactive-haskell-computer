@@ -1,14 +1,18 @@
 import qualified GHC.Internal.Data.Typeable.Internal as T
-import qualified GHC.Internal.Data.Typeable as Public
-import Prelude (IO, length, print, putStrLn)
+import Data.Typeable (Proxy(..), TypeRep, Typeable, typeRep)
+import qualified Data.Typeable as Public
+import Prelude (IO, Int, length, print, putStrLn)
+
+repOf :: Typeable a => a -> TypeRep
+repOf _ = typeRep Proxy
 
 main :: IO ()
 main =
   do
     putStrLn
         (T.tyConName
-            (T.typeRepTyCon (typeRep typeableDict_Int Proxy)))
+            (Public.typeRepTyCon (repOf (0 :: Int))))
     print
         (length
             (Public.typeRepArgs
-                (T.SomeTypeRep (typeRep typeableDict_Int Proxy))))
+                (repOf (0 :: Int))))

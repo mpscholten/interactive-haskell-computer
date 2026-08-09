@@ -130,7 +130,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), Pred(..), applySubst, applySubstPred, freeTyVars, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -5429,7 +5429,13 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig lm n e =
     let e' = annotateBindInputTypes e
-    in case e' of
+        attachConstraints result = case Map.lookup n (lmTypeSigs lm) of
+            Just (Scheme _ preds body) ->
+                case sourceConstraints preds body of
+                    [] -> result
+                    cs -> EConstrainedValue result cs
+            Nothing -> result
+    in attachConstraints $ case e' of
         -- RHS is literally a bare nullary class method
         -- (@x :: T; x = minBound@): annotate with the result-type tag.
         EVar v
@@ -5451,6 +5457,28 @@ wrapNullaryResultSig lm n e =
           -> ETyApp e' tyBytes
         _ -> e'
   where
+    sourceConstraints preds body = mapMaybe one preds
+      where
+        bodyVars = freeTyVars body
+        -- Typeable dictionaries are compiler-generated and therefore have no
+        -- source instance declaration that could reconstruct the erased
+        -- dictionary later. Preserve that predicate on source definitions;
+        -- ordinary source classes continue through their existing elaboration
+        -- and instance-dispatch path.
+        one (Pred cls args)
+            | cls == BC.pack "Typeable"
+            , all isPlainArg args
+            , any (not . Set.null . Set.intersection bodyVars . freeTyVars) args =
+                Just (cls, map argName args)
+            | otherwise = Nothing
+        one QPred{} = Nothing
+        isPlainArg TyVar{} = True
+        isPlainArg TyCon{} = True
+        isPlainArg _ = False
+        argName (TyVar name) = name
+        argName (TyCon name) = name
+        argName _ = BC.empty
+
     annotateBindInputTypes :: Expr -> Expr
     annotateBindInputTypes = go
       where

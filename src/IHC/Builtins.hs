@@ -1559,7 +1559,6 @@ builtins reg =
     -- on the killThread# primop above.
     -- displayException is a source Exception class method.
     -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
-    , ("typeRep",        typeRepB)
     -- typeRep# is the sole method of compiler-generated Typeable
     -- dictionaries. GHC.Internal.Data.Typeable.Internal defines the ordinary
     -- `typeRep = typeRep#` wrapper in source.
@@ -7084,11 +7083,6 @@ runStateTransformer stateFnT = do
 --   Dynamic  = VCon "Dynamic"  [typeRepThunk, valThunk]
 --   Typeable dict = VCon "Dict_Typeable" [typeRepThunk]
 
-typeRepB :: IO Val
-typeRepB = pure $ VFun $ \dictT -> pure $ VFun $ \_proxyT -> do
-    dictV <- force legacyHooks dictT
-    extractTypeRep dictV
-
 typeOfB :: IO Val
 typeOfB = pure $ VFun $ \dictT -> pure $ VFun $ \_valT -> do
     dictV <- force legacyHooks dictT
@@ -7228,9 +7222,7 @@ buildBuiltinTypeableInsts reg = mapM mkDict prims
         tr <- mkTypeRep tyName
         registerInstance reg (BC.pack "Typeable") tag
             (HashMap.fromList
-                [ (BC.pack "typeRep#", tr)
-                , (BC.pack "typeRep", tr)
-                ])
+                [ (BC.pack "typeRep#", tr) ])
         pure ("typeableDict_" <> tag, dictT)
 
 typeRepHashDispatcher :: ClassRegistry -> Val
