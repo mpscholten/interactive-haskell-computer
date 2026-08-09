@@ -9885,20 +9885,10 @@ isBuiltinBackedModule n =
     -- therefore compiler-intrinsic and must be host-backed; the builtin
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
-    -- Quote, Syntax, and LanguageExtensions are interpreted from package
-    -- source. The compiler-known Q result context is connected to the host
-    -- Quasi-IO carrier by registerTHQBridge; only actual compiler callbacks
-    -- remain leaves in IHC.TH. Modules layered above Syntax stay here until
-    -- their additional source dependencies are supported.
-    || ("Language.Haskell.TH" `BC.isPrefixOf` n
-        && n /= BC.pack "Language.Haskell.TH.Quote"
-        && n /= BC.pack "Language.Haskell.TH.Syntax"
-        && n /= BC.pack "Language.Haskell.TH.CodeDo"
-        && n /= BC.pack "Language.Haskell.TH.PprLib"
-        && n /= BC.pack "Language.Haskell.TH.Ppr"
-        && n /= BC.pack "Language.Haskell.TH.Lib"
-        && n /= BC.pack "Language.Haskell.TH.Lib.Internal"
-        && n /= BC.pack "Language.Haskell.TH.LanguageExtensions")
+    -- Every Language.Haskell.TH module has package source and is interpreted.
+    -- Actual compiler callbacks remain leaf values in IHC.TH, while the
+    -- source-declared Q dictionary crosses to the Quasi-IO carrier through
+    -- registerTHQBridge.
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
