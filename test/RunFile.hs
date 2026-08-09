@@ -22,7 +22,7 @@ import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (emptyKnownSymbols, findBinding)
 import IHC.Scheduler (loadProgramFromSource, schemesHaveCommonInstance)
 import IHC.Source (readSourceFile)
-import IHC.TypeAST (Scheme(..), Type(..))
+import IHC.TypeAST (Scheme(..), Type(..), Pred(..))
 import IHC.TH (thExpToExpr)
 import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk)
 
@@ -559,6 +559,15 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             providerB = Scheme [n "b"] [] (pair (TyCon (n "Int")) (TyVar (n "b")))
             providerC = Scheme [n "c"] [] (pair (TyVar (n "c")) (TyCon (n "Bool")))
         schemesHaveCommonInstance [providerA, providerB, providerC]
+            `shouldReturn` False
+
+    it "module: visible provider signatures with different constraints remain ambiguous" do
+        let n = BC.pack
+            a = TyVar (n "a")
+            body = TyArrow a (TyCon (n "String"))
+            providerShow = Scheme [n "a"] [Pred (n "Show") [a]] body
+            providerRead = Scheme [n "a"] [Pred (n "Read") [a]] body
+        schemesHaveCommonInstance [providerShow, providerRead]
             `shouldReturn` False
 
     it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do

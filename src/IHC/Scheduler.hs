@@ -129,7 +129,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), applySubst, tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -7850,16 +7850,40 @@ schemesHaveCommonInstance :: [Scheme] -> IO Bool
 schemesHaveCommonInstance [] = pure True
 schemesHaveCommonInstance schemes = do
     fs <- TU.newFreshSource
-    bodies <- mapM (fmap snd . TU.instantiate fs) schemes
-    pure $ case bodies of
+    instances <- mapM (TU.instantiate fs) schemes
+    pure $ case instances of
         [] -> True
-        representative : rest -> go representative rest
+        (preds, representative) : rest -> go representative [preds] rest
   where
-    go _ [] = True
-    go representative (candidate : rest) =
+    go _ predicateGroups [] = allContextsEquivalent predicateGroups
+    go representative predicateGroups ((candidatePreds, candidate) : rest) =
         case TU.mgu representative candidate of
             Left _ -> False
-            Right sub -> go (applySubst sub representative) rest
+            Right sub ->
+                go (applySubst sub representative)
+                   (map (map (applySubstPred sub)) (predicateGroups ++ [candidatePreds]))
+                   rest
+
+    -- Context order is irrelevant, but multiplicity is retained.  Exact
+    -- equality after body unification is intentionally conservative: class
+    -- entailment is not available in this metadata-only path, so distinct
+    -- constraints must remain ambiguous rather than selecting the first.
+    allContextsEquivalent [] = True
+    allContextsEquivalent (context : rest) = all (sameContext context) rest
+
+    sameContext left right = consume left right
+      where
+        consume [] [] = True
+        consume [] _  = False
+        consume (p:ps) candidates = case removeFirst p candidates of
+            Nothing -> False
+            Just remaining -> consume ps remaining
+
+        removeFirst :: Pred -> [Pred] -> Maybe [Pred]
+        removeFirst _ [] = Nothing
+        removeFirst wanted (p:ps)
+            | wanted == p = Just ps
+            | otherwise = (p :) <$> removeFirst wanted ps
 
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
