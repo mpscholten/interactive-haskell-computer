@@ -131,7 +131,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -5512,13 +5512,33 @@ wrapNullaryResultSig lm n e =
             Just tag -> rewriteMethods tag expr
             Nothing  -> expr
 
-    normalizedResultTag (Scheme _ _ body) =
+    normalizedResultTag (Scheme _ preds body) =
         let (_, resultTy) = tyArrowArgs body
             expand 0 ty = ty
             expand fuel ty =
                 let ty' = Elab.resolveSynonymHop (lmTypeSynonyms lm) ty
                 in if ty' == ty then ty else expand (fuel - 1) ty'
-        in typeResultTag (expand (16 :: Int) resultTy)
+            normalized = expand (16 :: Int) resultTy
+        in typeResultTag normalized <|> quoteQCarrier preds normalized
+
+    -- A splice executes a `Quote m` smart constructor with the compiler's
+    -- concrete Q carrier. Preserve that caller dictionary at the source-body
+    -- boundary: Lib.Internal remains polymorphic source, while its ambiguous
+    -- superclass methods (`pure`, `fmap`, `>>=`...) dispatch through Q when
+    -- the result carrier is exactly the Quote-constrained variable.
+    quoteQCarrier preds resultTy = do
+        carrier <- resultCarrierVar resultTy
+        if any (isQuoteConstraint carrier) preds
+            then Just "Q"
+            else Nothing
+
+    resultCarrierVar ty = case fst (tyApps ty) of
+        TyVar v -> Just v
+        _       -> Nothing
+
+    isQuoteConstraint carrier (Pred cls [TyVar v]) =
+        lastNameComponent cls == "Quote" && v == carrier
+    isQuoteConstraint _ _ = False
 
     rewriteMethods tag = go
       where

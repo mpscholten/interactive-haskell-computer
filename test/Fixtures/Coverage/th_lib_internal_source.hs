@@ -1,5 +1,7 @@
-import Language.Haskell.TH.Lib.Internal (varK)
-import Language.Haskell.TH.Syntax (Type(..), mkName)
+{-# LANGUAGE TemplateHaskell #-}
+
+import Language.Haskell.TH.Lib.Internal (litE, varK)
+import Language.Haskell.TH.Syntax (Lit(..), Type(..), mkName)
 
 main :: IO ()
-main = varK (mkName "x") `seq` pure ()
+main = print $(litE (IntegerL 11))
