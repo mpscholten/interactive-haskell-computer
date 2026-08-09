@@ -143,6 +143,7 @@ exprSubtrees e = e : case e of
     EQuasiQuote{}             -> []
     ELabel{}                  -> []
     ETyApp x _                -> exprSubtrees x
+    EConstrainedValue x _     -> exprSubtrees x
     ETypedMethod{}            -> []
     EGuardFail                -> []
   where
