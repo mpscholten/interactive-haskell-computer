@@ -47,7 +47,7 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, typeTagOf, lookupEnvFallback, lookupInstanceMethod, lookupInstanceMethodMulti, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
@@ -111,6 +111,57 @@ annotateNullaryBoundedArg f x = case x of
     -- (Int, Char, …), not a type application or variable.
     isMonoCon (TA.TyCon _) = True
     isMonoCon _            = False
+    orElse (Just a) _ = Just a
+    orElse Nothing  b = b
+
+-- | Propagate a concrete callee-argument type into a result-polymorphic
+-- conversion expression.  HSX calls @parseHsx ... (cs code)@; the runtime
+-- shape of @code@ identifies the input side of @ConvertibleStrings@ but only
+-- @parseHsx@'s fourth-argument type identifies the required strict Text
+-- result.  Retain exactly that expected type instead of guessing globally.
+annotateExpectedConversionArg :: Expr -> Expr -> IO Expr
+annotateExpectedConversionArg f x
+    | isConversion x = do
+        sigs <- readIORef globalTypeSigsRef
+        pure $ case appHeadAndArity f of
+            Just (fn, supplied) ->
+                case Map.lookup (bareName fn) sigs `orElse` Map.lookup fn sigs of
+                    Just (Scheme _ _ body) ->
+                        case tyArrowArgs body of
+                            (args, _)
+                              | supplied < length args
+                              , Just ty <- renderSimpleType (args !! supplied) ->
+                                  annotateResultType x ty
+                            _ -> x
+                    Nothing -> x
+            Nothing -> x
+    | otherwise = pure x
+  where
+    isConversion (EApp h _) = case stripApps h of
+        EVar n -> bareName n == BC.pack "cs"
+        _      -> False
+    isConversion _ = False
+    annotateResultType (EApp h arg) ty =
+        EApp (ETyApp (conversionMethod h) ty) arg
+    annotateResultType e ty = ETyApp e ty
+    -- @cs@ is the source alias @cs = convertString@. Attach the result tag
+    -- to the actual class dispatcher rather than to the alias wrapper, which
+    -- would consume the value argument before the tag reaches the dispatcher.
+    conversionMethod (EVar n)
+        | bareName n == BC.pack "cs" =
+            EVar (BC.pack "Data.String.Conversions.convertString")
+    conversionMethod h = h
+    stripApps (ETyApp e _) = stripApps e
+    stripApps e = e
+    appHeadAndArity = go 0
+      where
+        go n (EApp h _) = go (n + 1) h
+        go n (EVar fn)  = Just (fn, n)
+        go n (ETyApp h _) = go n h
+        go _ _ = Nothing
+    renderSimpleType ty = case ty of
+        TA.TyCon n -> Just n
+        _ -> Nothing
     orElse (Just a) _ = Just a
     orElse Nothing  b = b
 
@@ -343,7 +394,8 @@ eval hooks env ipm = go
     -- resolve it.  Does NOT default unbound uses to Int (that poisoned
     -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
-        x' <- annotateNullaryBoundedArg f x
+        x0 <- annotateNullaryBoundedArg f x
+        x' <- annotateExpectedConversionArg f x0
         goApp f x'
       where
         goApp f' x'' = do
@@ -716,6 +768,26 @@ eval hooks env ipm = go
 
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
+        | isConvertStringFn e = pure $ VFun $ \argT -> do
+            argV <- force hooks argT
+            mReg <- getSharedClassReg legacyHooks
+            case mReg of
+                Nothing -> error "convertString: no shared class registry"
+                Just classReg -> do
+                    let inTag0 = typeTagOf argV
+                        inTags | inTag0 == BC.pack "[]" = [BC.pack "[]", BC.pack "String"]
+                               | otherwise = [normalizeTyTag inTag0]
+                        outTags = [ normalizeTyTag ty, ty, bareName ty
+                                  , BC.pack "StrictText", BC.pack "ST" ]
+                    m <- firstMethod classReg
+                        [[i, o] | i <- inTags, o <- outTags]
+                    case m of
+                        Just methodVal -> do
+                            method <- forceMethodVal hooks methodVal
+                            apply hooks method argT
+                        Nothing -> error
+                            ("convertString: no ConvertibleStrings instance for "
+                             <> show inTags <> " -> " <> BC.unpack ty)
         | otherwise      = do
             v <- go e
             case v of
@@ -755,6 +827,17 @@ eval hooks env ipm = go
                     | Just resultTy <- ioResultAnnotation ty ->
                         pure (VIO (action >>= applyIOResultAnnotation resultTy))
                 _               -> applyNumericTyAnnotation ty v
+
+    isConvertStringFn (EVar n) = bareName n == BC.pack "convertString"
+    isConvertStringFn _ = False
+
+    firstMethod _ [] = pure Nothing
+    firstMethod classReg (tags:rest) = do
+        mv <- lookupInstanceMethodMulti classReg
+            (BC.pack "ConvertibleStrings") tags (BC.pack "convertString")
+        case mv of
+            Just v -> pure (Just v)
+            Nothing -> firstMethod classReg rest
 
     tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
     tryTypedPeek e ty =
@@ -1271,7 +1354,9 @@ eval hooks env ipm = go
                                    <> show pat)
                     Nothing ->
                         error ("Irrefutable pattern failed for pattern "
-                               <> show pat)
+                               <> show pat
+                               <> "; scrutinee was "
+                               <> showValForDebug v)
             pure (name, t)
 
     forceCaseScrut :: Thunk -> [Alt] -> IO Val
@@ -1658,7 +1743,9 @@ matchPat hooks (PIrref p)   v          = do
                                <> show p)
                 Nothing ->
                     error ("Irrefutable pattern failed for pattern "
-                           <> show p)
+                           <> show p
+                           <> "; scrutinee was "
+                           <> showValForDebug v)
         pure (name, t)) vars
     pure (Just binds)
 matchPat hooks (PAs n p)    v          = do
@@ -2521,7 +2608,13 @@ doMonadicSequence hooks env ipm mv mBind rest = do
     actT <- newWHNFThunk mv
     let actName = BC.pack "$doAct"
         envAct  = extendEnv actName actT env
-        restE   = EDo rest
+        -- Reaching this path with a function-shaped action currently means
+        -- the source-loaded ParsecT carrier (Maybe, ST, and IO have dedicated
+        -- representations above).  Preserve that result context for a final
+        -- unannotated pure/return.  Otherwise optimistic result defaulting
+        -- selects IO and feeds an IO state function into ParsecT's next
+        -- continuation, eventually corrupting the parser input.
+        restE   = EDo (annotateParsecResult rest)
         bodyE   = case mBind of
             Nothing ->
                 EApp (EApp (EVar ">>") (EVar actName)) restE
@@ -2532,6 +2625,38 @@ doMonadicSequence hooks env ipm mv mBind rest = do
                 EApp (EApp (EVar ">>=") (EVar actName))
                      (ELam n (EApp (EApp (EVar "seq") (EVar n)) restE))
     eval hooks envAct ipm bodyE
+
+-- | Attach the carrier type to the result-polymorphic final action in a
+-- source-shaped ParsecT do-block.  This is the small amount of expected-type
+-- propagation needed for @do { x <- p; pure x }@ without globally changing
+-- the IO-first default used by warp and ordinary IO programs.
+annotateParsecResult :: [Stmt] -> [Stmt]
+annotateParsecResult [] = []
+annotateParsecResult [SExpr e] = [SExpr (annotatePureLike e)]
+annotateParsecResult (s:ss) = s : annotateParsecResult ss
+
+annotatePureLike :: Expr -> Expr
+annotatePureLike (EApp (EVar n) x)
+    | bareName n == BC.pack "pure" || bareName n == BC.pack "return" =
+        EApp (ETyApp (EVar n) (BC.pack "ParsecT")) (annotatePureLike x)
+annotatePureLike e = case e of
+    -- Only propagate through result-position constructs. Rewriting arbitrary
+    -- application arguments or let RHSs could retag a genuinely nested
+    -- Maybe/IO @pure@ as ParsecT.
+    ELam n b -> ELam n (annotatePureLike b)
+    ELet bs b -> ELet bs (annotatePureLike b)
+    ECase s as -> ECase (annotatePureLike s)
+        [Alt p (annotatePureLike rhs) | Alt p rhs <- as]
+    EIf c t f -> EIf (annotatePureLike c) (annotatePureLike t)
+                    (annotatePureLike f)
+    EDo ss -> EDo (annotateParsecResult ss)
+    ETyApp x ty -> ETyApp (annotatePureLike x) ty
+    _ -> e
+
+bareName :: Name -> Name
+bareName n = case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+    Just i  -> BC.drop (i + 1) n
+    Nothing -> n
 
 doSTSequence
     :: IHCHooks
