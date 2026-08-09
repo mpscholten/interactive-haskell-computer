@@ -438,6 +438,9 @@ expandSplicesInExpr env ipm depth expr
         e' <- go e
         pure (ETyApp e' ty)
     go (ETypedMethod cls method tag) = pure (ETypedMethod cls method tag)
+    go (EConstrainedValue e constraints) = do
+        e' <- go e
+        pure (EConstrainedValue e' constraints)
     go EGuardFail = pure EGuardFail
 
     goAlt (Alt p e) = Alt p <$> go e
@@ -512,6 +515,7 @@ exprToVal (ENeg e) = do
 -- expression as the TH Exp; a future splice pass that cares about type
 -- applications can inspect the 'ETyApp' node before reaching here.
 exprToVal (ETyApp e _ty) = exprToVal e
+exprToVal (EConstrainedValue e _constraints) = exprToVal e
 -- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
 exprToVal _ =
     force legacyHooks =<< newWHNFThunk (VCon "VarE" [])

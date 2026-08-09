@@ -61,6 +61,11 @@ data Expr
     -- instead of going through the VClassMethod dispatcher.  Produced
     -- only by elaboration — parsers never emit this node.
     | ETypedMethod !Name !Name !Name
+    -- | An expression whose class constraints have been resolved to
+    -- concrete runtime dispatch tags.  Each pair is a class name and its
+    -- full, source-order list of instance tags; unlike 'ETypedMethod' this
+    -- also represents multi-parameter constraints.
+    | EConstrainedValue !Expr ![(Name, [Name])]
     -- | Internal sentinel used by guarded case alternatives. If an
     -- alternative pattern matches but its guards fail, evaluation should
     -- continue with the next alternative.

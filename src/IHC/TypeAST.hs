@@ -37,12 +37,13 @@ data Type
         -- ^ polymorphic: @forall a. Eq a => a -> Bool@
     deriving (Eq, Show)
 
--- | Class constraint: @Monad m@ = @Pred "Monad" (TyVar "m")@.
--- Multi-parameter constraints (e.g. @MonadState s m@) use 'TyApp' to
--- group the arguments: @Pred "MonadState" (TyApp (TyVar "s") (TyVar "m"))@
--- — callers flatten via 'predArgs' when matching instances.
+-- | Class constraint: @Monad m@ = @Pred "Monad" [TyVar "m"]@.
+-- Multi-parameter constraints retain their argument boundaries, e.g.
+-- @MonadState s m@ = @Pred "MonadState" [TyVar "s", TyVar "m"]@.
+-- This is distinct from a single applied argument such as
+-- @C (f a)@ = @Pred "C" [TyApp (TyVar "f") (TyVar "a")]@.
 data Pred
-    = Pred !Name !Type
+    = Pred !Name ![Type]
     -- | B.5b — quantified constraint, e.g. @forall a. Eq a => Eq (f a)@.
     -- @QPred vars body context@ binds 'vars' over a 'body' predicate
     -- that depends on 'context' predicates.  Today only the parser /
@@ -89,7 +90,7 @@ applySubstVisited visited s t = case t of
         in TyForall vs (map (applySubstPred s') preds) (applySubstVisited visited s' body)
 
 applySubstPred :: Subst -> Pred -> Pred
-applySubstPred s (Pred cls t) = Pred cls (applySubst s t)
+applySubstPred s (Pred cls ts) = Pred cls (map (applySubst s) ts)
 applySubstPred s (QPred vs ctx body) =
     -- Bound type vars shadow the substitution under the QPred.
     let s' = foldr Map.delete s vs
@@ -118,7 +119,7 @@ freeTyVars t = case t of
                 (freeTyVars body : map freeTyVarsPred preds))
             (Set.fromList vs)
   where
-    freeTyVarsPred (Pred _ x) = freeTyVars x
+    freeTyVarsPred (Pred _ xs) = Set.unions (map freeTyVars xs)
     freeTyVarsPred (QPred vs ctx body) =
         Set.difference
             (Set.unions (freeTyVarsPred body : map freeTyVarsPred ctx))
@@ -130,7 +131,7 @@ freeTyVarsScheme (Scheme vs preds body) =
         (Set.unions (freeTyVars body : map predFreeTyVars preds))
         (Set.fromList vs)
   where
-    predFreeTyVars (Pred _ x) = freeTyVars x
+    predFreeTyVars (Pred _ xs) = Set.unions (map freeTyVars xs)
     predFreeTyVars (QPred qvs ctx p) =
         Set.difference
             (Set.unions (predFreeTyVars p : map predFreeTyVars ctx))

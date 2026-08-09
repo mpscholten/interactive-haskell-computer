@@ -350,7 +350,10 @@ normalizeTyTag bs0 =
                         _                        -> s
             in case headCon of
                 h | h == BC.pack "Parsec" -> BC.pack "ParsecT"
-                h                         -> h
+                h | h == BC.pack "String" -> BC.pack "[]"
+                h -> case BC.elemIndexEnd '.' h of
+                    Just i | i + 1 < BC.length h -> BC.drop (i + 1) h
+                    _ -> h
 
 -- | Return a stable string tag for the runtime type of a value.
 -- Used by dispatch builtins to find the right class instance.

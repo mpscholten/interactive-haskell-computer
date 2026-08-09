@@ -1995,6 +1995,7 @@ parseDo ctx cur0 = do
             ELabel  _          -> []
             ETyApp e _         -> fv bound e
             ETypedMethod {}    -> []
+            EConstrainedValue e _ -> fv bound e
             EGuardFail         -> []
 
         fvStmts _     []                  = []

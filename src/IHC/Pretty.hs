@@ -89,6 +89,9 @@ prettyExpr = \case
     -- (@\@(Maybe Int)@) carry the parens too, which the
     -- generator does not yet emit.
     ETyApp e n     -> "(" <> prettyExpr e <> " @" <> n <> ")"
+    -- Internal constraint evidence has no surface syntax.  Printing the
+    -- wrapped expression keeps diagnostics and round-trip consumers useful.
+    EConstrainedValue e _ -> prettyExpr e
     -- @let ?x = e1; ?y = e2 in body@.  Bindings carry the
     -- implicit-param name /without/ the leading @?@ — that
     -- prefix is part of the syntax, not the AST name.  See

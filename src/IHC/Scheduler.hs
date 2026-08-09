@@ -127,7 +127,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -2155,6 +2155,14 @@ registerOne
     -> InstanceDecl
     -> IO ()
 registerOne registry searchPath includeMap classReg typeCtors classTable env lm (InstanceDecl cls typ typeNames methods) = do
+    globalSynonyms <- readIORef globalTypeSynonymsRef
+    let synonyms = Map.union (lmTypeSynonyms lm) globalSynonyms
+        canonicalTag n
+            | n == BC.pack "String" = BC.pack "[]"
+            | Just (0, rhs) <- Map.lookup n synonyms
+            , Just h <- tyHead rhs = normalizeTyTag h
+            | otherwise = normalizeTyTag n
+        canonicalTypeNames = map canonicalTag typeNames
     -- Method bodies are registered LAZILY: each method is a VLazyMethod
     -- thunk that defers free-var discovery, import-rewrite building,
     -- and body parsing to first dispatch.  This avoids the O(N*M)
@@ -2241,6 +2249,12 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- by the line above.
     when (length typeNames > 1) $
         registerInstanceMulti classReg cls typeNames methodVals
+    -- Publish the same dictionary under synonym-expanded canonical tags.
+    -- This makes inferred runtime types (e.g. @[Char]@ and @Text@) agree with
+    -- source instance heads written through aliases (e.g. @String@ and
+    -- @StrictText@), for every multi-parameter class.
+    when (length canonicalTypeNames > 1 && canonicalTypeNames /= typeNames) $
+        registerInstanceMulti classReg cls canonicalTypeNames methodVals
     -- Also register under every runtime data constructor of that type so
     -- that 'typeTagOf (VCon n _) = n' lookups succeed.  For qualified type
     -- heads, resolve the qualifier through the owning module's imports and
@@ -6362,6 +6376,8 @@ rewriteExpr rw = go []
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
         ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
         e@ETypedMethod{} -> e   -- elaborator product; no name references to rewrite
+        EConstrainedValue inner constraints ->
+            EConstrainedValue (go bound inner) constraints
         EGuardFail      -> EGuardFail
 
     goAlt bound (Alt p e) = Alt p (go (patBound p ++ bound) e)
@@ -11276,6 +11292,7 @@ syntheticClassMethodNames = goExpr
         ELabel _    -> []
         ETyApp e _  -> goExpr e
         ETypedMethod{} -> []
+        EConstrainedValue e _ -> goExpr e
         EGuardFail  -> []
 
     goStmt (SExpr e)            = goExpr e
@@ -11340,6 +11357,7 @@ freeVars e = HashSet.toList (goAll HashSet.empty e)
         ELabel _        -> HashSet.empty   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
         ETypedMethod{}  -> HashSet.empty   -- elaborator product; no EVar refs
+        EConstrainedValue inner _ -> goAll bound inner
         EGuardFail      -> HashSet.empty
 
     -- A do-block introduces bindings left-to-right; each SBind/SLet
@@ -11401,6 +11419,7 @@ needsRecordFields = goExpr
         ELabel _     -> False
         ETyApp e _   -> goExpr e
         ETypedMethod{} -> False
+        EConstrainedValue e _ -> goExpr e
         EGuardFail    -> False
 
     goStmt = \case
@@ -11475,6 +11494,7 @@ recordSyntaxFieldNames localFldReg = fmap nubBS . goExpr
         ELabel _     -> Just []
         ETyApp e _   -> goExpr e
         ETypedMethod{} -> Just []
+        EConstrainedValue e _ -> goExpr e
         EGuardFail    -> Just []
 
     goStmt = \case
@@ -11552,6 +11572,7 @@ discoveryFreeVars = go []
         ELabel _       -> []
         ETyApp inner _ -> go bound inner
         ETypedMethod{} -> []
+        EConstrainedValue inner _ -> go bound inner
         EGuardFail     -> []
 
     goStmts _     []                  = []
@@ -11770,6 +11791,8 @@ desugarRecordCons fldReg = go
         EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
     go (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
     go (ETyApp inner ty) = ETyApp (go inner) ty   -- value-level @T: recurse into inner
+    go (EConstrainedValue inner constraints) =
+        EConstrainedValue (go inner) constraints
     go e                = e  -- EVar, ELit
 
     goStmt (SExpr e)         = SExpr (go e)
@@ -11817,6 +11840,8 @@ desugarRecordPats fldReg = goExpr
     goExpr (ESplice inner)  = ESplice (goExpr inner)
     goExpr (EQuote inner)   = EQuote inner   -- Phase 2.12: quote body is opaque
     goExpr (ETyApp inner ty) = ETyApp (goExpr inner) ty   -- value-level @T: recurse
+    goExpr (EConstrainedValue inner constraints) =
+        EConstrainedValue (goExpr inner) constraints
     goExpr e                = e  -- EVar, ELit
 
     goStmt (SExpr e)         = SExpr (goExpr e)

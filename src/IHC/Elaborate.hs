@@ -26,6 +26,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 
 
@@ -237,7 +238,9 @@ elaborateVar ienv name =
             (preds, ty) <- instantiate (ieFresh ienv) sch
             pure (EVar name, ty, preds, emptySubst)
         Nothing -> do
-            mSig <- lookupSig
+            mSig <- case builtinConstructorSig (bareName name) of
+                Just sch -> pure (Just sch)
+                Nothing  -> lookupSig
             case mSig of
                 Just sch -> do
                     (preds, ty) <- instantiate (ieFresh ienv) sch
@@ -265,7 +268,11 @@ elaborateVar ienv name =
                                  , emptySubst
                                  )
                         Nothing ->
-                            pure (EVar name, ty, preds, emptySubst)
+                            let constrained = constrainedValueHint preds ty
+                                valueExpr = case constrained of
+                                    [] -> EVar name
+                                    cs -> EConstrainedValue (EVar name) cs
+                            in pure (valueExpr, ty, preds, emptySubst)
                 Nothing ->
                     -- No signature available.  Return a fresh tyvar — the
                     -- enclosing context may still succeed if this var
@@ -273,6 +280,21 @@ elaborateVar ienv name =
                     do fresh <- TyVar <$> freshVar (ieFresh ienv)
                        pure (EVar name, fresh, [], emptySubst)
   where
+    -- GHC.Types has no Haskell source, so its list constructors are genuine
+    -- compiler-built values.  Their schemes let expected-type elaboration
+    -- recover the type of parser-desugared string literals (chains of ':' /
+    -- '[]') without depending on a source-module signature having loaded.
+    builtinConstructorSig n
+        | n == BC.pack "[]" =
+            Just (Scheme [BC.pack "a"] []
+                (TyApp (TyCon (BC.pack "[]")) (TyVar (BC.pack "a"))))
+        | n == BC.pack ":" =
+            let a = TyVar (BC.pack "a")
+                listA = TyApp (TyCon (BC.pack "[]")) a
+            in Just (Scheme [BC.pack "a"] []
+                (TyArrow a (TyArrow listA listA)))
+        | otherwise = Nothing
+
     -- Try the name as written, then its bare last component, so FQNs from a
     -- non-entry module's import-rewritten RHS still find the bare-keyed sig.
     -- BUT decline if the bare name is AMBIGUOUS (conflicting sigs across
@@ -301,11 +323,32 @@ bareName n = case BC.elemIndexEnd '.' n of
 -- an 'ETypedMethod' for this var.  Otherwise 'Nothing'.
 classMethodHint :: InferEnv -> Name -> [Pred] -> Type -> Maybe (Name, Name)
 classMethodHint ienv methodName preds body = case preds of
-    [Pred cls (TyVar v)]
+    [Pred cls [TyVar v]]
       | Set.member v (freeTyVars body)
       , isActualClassMethod ienv methodName ->
             Just (cls, v)
     _ -> Nothing
+
+-- | Preserve the complete class-instance key for constrained values and
+-- aliases.  Unlike 'classMethodHint', this is not limited to actual class
+-- methods: a constrained alias can carry a multi-parameter predicate even
+-- though its value ultimately evaluates to the real method dispatcher.
+constrainedValueHint :: [Pred] -> Type -> [(Name, [Name])]
+constrainedValueHint preds body = mapMaybe one preds
+  where
+    bodyVars = freeTyVars body
+    one (Pred cls args)
+        | all isPlainArg args
+        , any (not . Set.null . Set.intersection bodyVars . freeTyVars) args =
+            Just (cls, map argName args)
+        | otherwise = Nothing
+    one QPred{} = Nothing
+    isPlainArg TyVar{} = True
+    isPlainArg TyCon{} = True
+    isPlainArg _       = False
+    argName (TyVar n) = n
+    argName (TyCon n) = n
+    argName _         = BC.empty
 
 -- | Is @name@ actually declared as a method inside some @class C where
 -- ... :: ...@ block?  Consulted so we don't route honest top-level
@@ -469,6 +512,10 @@ applyMethodSubst sub = go
                 -- stayed ambiguous) — and (b) error at eval.  A bare 'EVar'
                 -- falls to runtime value-directed dispatch / defaults instead.
                 Nothing -> EVar method
+        EConstrainedValue inner constraints ->
+            case traverse resolveConstraint constraints of
+                Just resolved -> EConstrainedValue (go inner) resolved
+                Nothing       -> go inner
         EApp f x     -> EApp (go f) (go x)
         ELam n body  -> ELam n (go body)
         ELet bs body -> ELet [(n, go b) | (n, b) <- bs] (go body)
@@ -486,6 +533,10 @@ applyMethodSubst sub = go
         EImplicitLet bs body ->
             EImplicitLet [(n, go b) | (n, b) <- bs] (go body)
         _ -> e
+
+    resolveConstraint (cls, tags) = do
+        resolved <- traverse resolveTag tags
+        pure (cls, resolved)
 
     goStmt (SExpr e)         = SExpr (go e)
     goStmt (SBind n e)       = SBind n (go e)
