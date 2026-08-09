@@ -162,6 +162,11 @@ lower e = case e of
     ETypedMethod _cls method _instTag ->
         CVar method placeholderType
 
+    -- Constraint evidence is evaluator metadata.  Until Core grows
+    -- dictionary applications for it, lower the wrapped value normally.
+    EConstrainedValue inner _constraints ->
+        lower inner
+
     -- Guard sentinel — should have been desugared to nested case
     -- alternatives by the parser before reaching the lowering pass.
     EGuardFail -> error "IHC.Lower.lower: EGuardFail survived to lowering"

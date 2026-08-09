@@ -47,7 +47,7 @@ import qualified Data.Map.Strict as Map
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, typeTagOf, lookupEnvFallback, lookupInstanceMethod, lookupInstanceMethodMulti, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
@@ -114,54 +114,74 @@ annotateNullaryBoundedArg f x = case x of
     orElse (Just a) _ = Just a
     orElse Nothing  b = b
 
--- | Propagate a concrete callee-argument type into a result-polymorphic
--- conversion expression.  HSX calls @parseHsx ... (cs code)@; the runtime
--- shape of @code@ identifies the input side of @ConvertibleStrings@ but only
--- @parseHsx@'s fourth-argument type identifies the required strict Text
--- result.  Retain exactly that expected type instead of guessing globally.
-annotateExpectedConversionArg :: Expr -> Expr -> IO Expr
-annotateExpectedConversionArg f x
-    | isConversion x = do
-        sigs <- readIORef globalTypeSigsRef
-        pure $ case appHeadAndArity f of
+-- | Elaborate an application argument under the parameter type supplied by
+-- the callee's signature. This is the bidirectional bridge missing from the
+-- optimistic evaluator: result-polymorphic and multi-parameter constrained
+-- expressions receive their expected type without naming any library,
+-- function, or class.
+elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
+elaborateExpectedArg hooks owner f x = do
+    ensureExprMetadata x
+    sigs <- readIORef globalTypeSigsRef
+    if not (needsExpectedElaboration sigs x)
+        then pure x
+        else case appHeadAndArity f of
             Just (fn, supplied) ->
                 case Map.lookup (bareName fn) sigs `orElse` Map.lookup fn sigs of
                     Just (Scheme _ _ body) ->
                         case tyArrowArgs body of
-                            (args, _)
-                              | supplied < length args
-                              , Just ty <- renderSimpleType (args !! supplied) ->
-                                  annotateResultType x ty
-                            _ -> x
-                    Nothing -> x
-            Nothing -> x
-    | otherwise = pure x
+                            (args, _) | supplied < length args -> do
+                                mReg <- getSharedClassReg legacyHooks
+                                syns <- readIORef globalTypeSynonymsRef
+                                case mReg of
+                                    Nothing -> pure x
+                                    Just classReg -> do
+                                        result <- try (Elab.elaborate classReg sigs syns
+                                                        (Elab.ExpectType (args !! supplied)) x)
+                                            :: IO (Either SomeException (Expr, TA.Type))
+                                        pure (either (const x) fst result)
+                            _ -> pure x
+                    Nothing -> pure x
+            Nothing -> pure x
   where
-    isConversion (EApp h _) = case stripApps h of
-        EVar n -> bareName n == BC.pack "cs"
-        _      -> False
-    isConversion _ = False
-    annotateResultType (EApp h arg) ty =
-        EApp (ETyApp (conversionMethod h) ty) arg
-    annotateResultType e ty = ETyApp e ty
-    -- @cs@ is the source alias @cs = convertString@. Attach the result tag
-    -- to the actual class dispatcher rather than to the alias wrapper, which
-    -- would consume the value argument before the tag reaches the dispatcher.
-    conversionMethod (EVar n)
-        | bareName n == BC.pack "cs" =
-            EVar (BC.pack "Data.String.Conversions.convertString")
-    conversionMethod h = h
-    stripApps (ETyApp e _) = stripApps e
-    stripApps e = e
+    needsExpectedElaboration sigs = go
+      where
+        go (EVar name) = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
+            Just (Scheme _ preds _) -> not (null preds)
+            Nothing -> False
+        go (EApp innerF innerX) = go innerF || go innerX
+        go (ETyApp inner _) = go inner
+        go _ = False
+
+    -- Import discovery is lazy, but elaboration needs the signature before
+    -- the argument thunk is evaluated.  The normal owner-scoped resolver
+    -- makes the defining module (and therefore its signature) available;
+    -- obtaining the returned thunk does not force the binding.
+    ensureExprMetadata e = do
+        ensureHeadMetadata e
+        case e of
+            EApp innerF innerX -> do
+                ensureExprMetadata innerF
+                ensureExprMetadata innerX
+            ETyApp inner _ -> ensureExprMetadata inner
+            _ -> pure ()
+    ensureHeadMetadata e = case appHeadAndArity e of
+        Just (name, _) | bareName name `elem` map BC.pack [":", "[]"] ->
+            pure ()
+        Just (name, _) -> do
+            sigs <- readIORef globalTypeSigsRef
+            case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
+                Just _  -> pure ()
+                Nothing -> do
+                    _ <- lookupEnvFallback hooks owner name
+                    pure ()
+        Nothing -> pure ()
     appHeadAndArity = go 0
       where
         go n (EApp h _) = go (n + 1) h
         go n (EVar fn)  = Just (fn, n)
         go n (ETyApp h _) = go n h
         go _ _ = Nothing
-    renderSimpleType ty = case ty of
-        TA.TyCon n -> Just n
-        _ -> Nothing
     orElse (Just a) _ = Just a
     orElse Nothing  b = b
 
@@ -394,12 +414,13 @@ eval hooks env ipm = go
     -- resolve it.  Does NOT default unbound uses to Int (that poisoned
     -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
+        fv <- go f
         x0 <- annotateNullaryBoundedArg f x
-        x' <- annotateExpectedConversionArg f x0
-        goApp f x'
+        owner <- currentOwner hooks env
+        x' <- elaborateExpectedArg hooks owner f x0
+        goApp fv x'
       where
-        goApp f' x'' = do
-          fv  <- go f'                           -- function to WHNF
+        goApp fv x'' = do
           xt  <- newThunkIP env ipm x''          -- argument stays a thunk (lazy)
           case fv of
             VPrimObj _ -> do
@@ -573,6 +594,22 @@ eval hooks env ipm = go
             Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
                               <> "(elaborator fired before buildBaseEnv?)")
             Just reg -> resolveTypedMethod hooks reg cls method tag
+
+    -- A constrained alias carries the full, elaborated instance key. For the
+    -- currently supported single-dictionary form, attach every parameter tag
+    -- to the dispatcher produced by the source value. Multi-parameter lookup
+    -- then follows the ordinary VClassMethod path.
+    go (EConstrainedValue inner [(_cls, instanceTags)]) = do
+        v <- go inner
+        case v of
+            VClassMethod m slot _ fn ->
+                -- This node carries the complete predicate key, unlike an
+                -- ETyApp (which contributes one positional tag).  Replace
+                -- any tags inherited through a constrained alias instead of
+                -- duplicating them when aliases delegate to other aliases.
+                pure (VClassMethod m slot (map normalizeTyTag instanceTags) fn)
+            _ -> pure v
+    go (EConstrainedValue inner _) = go inner
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -768,26 +805,6 @@ eval hooks env ipm = go
 
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
-        | isConvertStringFn e = pure $ VFun $ \argT -> do
-            argV <- force hooks argT
-            mReg <- getSharedClassReg legacyHooks
-            case mReg of
-                Nothing -> error "convertString: no shared class registry"
-                Just classReg -> do
-                    let inTag0 = typeTagOf argV
-                        inTags | inTag0 == BC.pack "[]" = [BC.pack "[]", BC.pack "String"]
-                               | otherwise = [normalizeTyTag inTag0]
-                        outTags = [ normalizeTyTag ty, ty, bareName ty
-                                  , BC.pack "StrictText", BC.pack "ST" ]
-                    m <- firstMethod classReg
-                        [[i, o] | i <- inTags, o <- outTags]
-                    case m of
-                        Just methodVal -> do
-                            method <- forceMethodVal hooks methodVal
-                            apply hooks method argT
-                        Nothing -> error
-                            ("convertString: no ConvertibleStrings instance for "
-                             <> show inTags <> " -> " <> BC.unpack ty)
         | otherwise      = do
             v <- go e
             case v of
@@ -827,17 +844,6 @@ eval hooks env ipm = go
                     | Just resultTy <- ioResultAnnotation ty ->
                         pure (VIO (action >>= applyIOResultAnnotation resultTy))
                 _               -> applyNumericTyAnnotation ty v
-
-    isConvertStringFn (EVar n) = bareName n == BC.pack "convertString"
-    isConvertStringFn _ = False
-
-    firstMethod _ [] = pure Nothing
-    firstMethod classReg (tags:rest) = do
-        mv <- lookupInstanceMethodMulti classReg
-            (BC.pack "ConvertibleStrings") tags (BC.pack "convertString")
-        case mv of
-            Just v -> pure (Just v)
-            Nothing -> firstMethod classReg rest
 
     tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
     tryTypedPeek e ty =

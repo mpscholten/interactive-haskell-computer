@@ -4657,18 +4657,9 @@ parsePred :: [TTok] -> Maybe Pred
 parsePred toks = case toks of
     (TTCon cls : rest) -> do
         argTys <- parseTypeArgsList rest
-        -- Combine args into a single Type via left-assoc application.
-        -- Multi-param classes (MonadState s m) become
-        -- @TyApp (TyApp (TyCon "MonadState") (TyVar "s")) (TyVar "m")@
-        -- — no: we represent multi-param classes as Pred Name Type with
-        -- Type being the LAST argument, and encode upper args via
-        -- the outer Type.  For MVP, single-arg constraint; multi-arg
-        -- stored as the list folded into a right-nested TyApp (bestow
-        -- the elaborator reads all of Type's leaves).
         case argTys of
-            []      -> Nothing
-            [t]     -> Just (Pred cls t)
-            (t:ts)  -> Just (Pred cls (foldl TyApp t ts))
+            [] -> Nothing
+            _  -> Just (Pred cls argTys)
     _ -> Nothing
 
 -- | Parse a type expression.  Splits on top-level @->@ first
@@ -4825,7 +4816,7 @@ collectTypeVars body preds =
         -- its 'ctx' and 'body', so its free vars are the union minus the
         -- locally bound vars.  No producer of 'QPred' exists yet (B.5b),
         -- but covering the case keeps -Wincomplete-uni-patterns happy.
-        collectPred (Pred _ a)             = collect a
+        collectPred (Pred _ as)            = concatMap collect as
         collectPred (QPred vs ctx pbody) =
             let inner = concatMap collectPred ctx ++ collectPred pbody
             in filter (`notElem` vs) inner

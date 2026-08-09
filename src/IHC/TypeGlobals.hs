@@ -135,19 +135,19 @@ seedBuiltinClassMethodSigs = do
         m = BC.pack "m"
         -- pure :: Applicative f => a -> f a
         pureSig = Scheme [f, a]
-                    [Pred (BC.pack "Applicative") (TyVar f)]
+                    [Pred (BC.pack "Applicative") [TyVar f]]
                     (TyArrow (TyVar a) (TyApp (TyVar f) (TyVar a)))
         -- return :: Monad m => a -> m a
         returnSig = Scheme [m, a]
-                    [Pred (BC.pack "Monad") (TyVar m)]
+                    [Pred (BC.pack "Monad") [TyVar m]]
                     (TyArrow (TyVar a) (TyApp (TyVar m) (TyVar a)))
         -- mempty :: Monoid a => a
         memptySig = Scheme [a]
-                    [Pred (BC.pack "Monoid") (TyVar a)]
+                    [Pred (BC.pack "Monoid") [TyVar a]]
                     (TyVar a)
         -- minBound :: Bounded a => a
         minBoundSig = Scheme [a]
-                    [Pred (BC.pack "Bounded") (TyVar a)]
+                    [Pred (BC.pack "Bounded") [TyVar a]]
                     (TyVar a)
         -- maxBound :: Bounded a => a
         maxBoundSig = minBoundSig

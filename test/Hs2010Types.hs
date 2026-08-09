@@ -5,14 +5,17 @@ module Hs2010Types (spec) where
 
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
+import qualified Data.Map.Strict as Map
 import Test.Hspec
 
 import IHC.AST
+import IHC.Classes (newClassRegistry)
+import IHC.Elaborate (Expected(..), elaborate)
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scan (scanTypeSigs)
 import IHC.Scheduler (schemesCompatible)
 import IHC.Source (Source, mkSource)
-import IHC.TypeAST (Scheme(..), Type(..))
+import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
 
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
@@ -147,3 +150,19 @@ spec = describe "Hs2010 — Types" $ do
             s2 <- schemeOf "Bool -> Bool"
             c <- schemesCompatible s1 s2
             c `shouldBe` False
+
+    describe "expected-type elaboration of constrained values" $ do
+        it "preserves and specializes every parameter of an arbitrary MPTC" $ do
+            let sig = Scheme ["a", "b"]
+                    [Pred "Convert" [TyVar "a", TyVar "b"]]
+                    (TyArrow (TyVar "a") (TyVar "b"))
+                expr = EApp (EVar "alias") (ELit (LStr "x"))
+            reg <- newClassRegistry
+            (got, ty) <- elaborate reg (Map.singleton "alias" sig) Map.empty
+                (ExpectType (TyCon "Target")) expr
+            got `shouldBe`
+                EApp
+                    (EConstrainedValue (EVar "alias")
+                        [("Convert", ["[]", "Target"])])
+                    (ELit (LStr "x"))
+            ty `shouldBe` TyCon "Target"
