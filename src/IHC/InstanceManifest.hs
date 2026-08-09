@@ -17,7 +17,7 @@
 --
 --   * 'miClassProviders' — class name → set of modules with instances
 --   * 'miClassHeads'     — class name → instance head-type names
---   * 'miMethodOwner'    — method name → owning class
+--   * 'miMethodOwners'   — method name → declaring module/class pairs
 --   * 'miTypeProviders'  — type-ctor name → defining module
 --
 -- The index is built once per process and held in 'manifestIndexRef'.
@@ -33,6 +33,7 @@ module IHC.InstanceManifest
       PackageManifest (..)
     , ModuleManifest  (..)
     , ClassEntry      (..)
+    , MethodOwner     (..)
     , InstanceEntry   (..)
     , ManifestIndex   (..)
       -- * Generation
@@ -41,6 +42,7 @@ module IHC.InstanceManifest
     , manifestIndex
     , providersForClass
     , classForMethod
+    , methodOwnersFor
     , providerModulesForMethods
     ) where
 
@@ -98,6 +100,15 @@ data InstanceEntry = InstanceEntry
     , ieTypeNames :: ![ByteString]
     } deriving (Show)
 
+-- | Provenance for a class-method declaration.  Method names are not
+-- globally unique: an ordinary function (or another class) may use the same
+-- name.  Keeping the declaring module lets resolution validate a candidate
+-- against the import/export scope instead of trusting a lossy global map.
+data MethodOwner = MethodOwner
+    { moModuleName :: !ByteString
+    , moClassName  :: !ByteString
+    } deriving (Eq, Ord, Show)
+
 -- | The denormalised lookup tables used at runtime.  Built once per
 -- process from a scan of the source cache and cached in
 -- 'manifestIndexRef'.
@@ -108,8 +119,10 @@ data ManifestIndex = ManifestIndex
         -- ^ class name → list of head-type names appearing in instances
         --   (used to follow @instance Monad Maybe@ → load @Maybe@'s
         --   defining module via 'miTypeProviders').
-    , miMethodOwner    :: !(Map ByteString ByteString)
-        -- ^ method name → owning class
+    , miMethodOwners   :: !(Map ByteString (Set MethodOwner))
+        -- ^ method name → all declaring module/class pairs.  Retaining
+        -- provenance prevents one source-cache package from silently
+        -- overwriting another declaration with the same method name.
     , miTypeProviders  :: !(Map ByteString ByteString)
         -- ^ type-constructor name → module that declares it.
         --   Loading a module's instance heads (@instance Monad Maybe@
@@ -283,7 +296,7 @@ buildIndex :: [ModuleManifest] -> ManifestIndex
 buildIndex ms = ManifestIndex
     { miClassProviders = providers
     , miClassHeads     = classHeads
-    , miMethodOwner    = methodOwners
+    , miMethodOwners   = methodOwners
     , miTypeProviders  = typeProviders
     }
   where
@@ -302,9 +315,11 @@ buildIndex ms = ManifestIndex
         (h : _) -> Map.insertWith (++) (ieClassName ie) [h] acc
 
     methodOwners = foldr addMethods Map.empty ms
-    addMethods mm acc = foldr addClass acc (mmClasses mm)
-    addClass ce acc0 = foldr (\m -> Map.insert m (ceClassName ce)) acc0
-                             (ceMethodNames ce)
+    addMethods mm acc = foldr (addClass (mmName mm)) acc (mmClasses mm)
+    addClass modName ce acc0 =
+        let owner = MethodOwner modName (ceClassName ce)
+        in foldr (\m -> Map.insertWith Set.union m (Set.singleton owner))
+                 acc0 (ceMethodNames ce)
 
     -- Two old/new versions of @base@ may both ship a definition for
     -- the same type (e.g. @data Maybe@ in both @GHC.Maybe@ from old
@@ -335,7 +350,17 @@ providersForClass idx cls =
 -- | Class name a method belongs to, if known.  @Nothing@ if no
 -- 'class C ... where method ...' was scanned for this name.
 classForMethod :: ManifestIndex -> ByteString -> Maybe ByteString
-classForMethod idx m = Map.lookup m (miMethodOwner idx)
+classForMethod idx m =
+    case Set.toList (Set.map moClassName (methodOwnersFor idx m)) of
+        [cls] -> Just cls
+        _     -> Nothing
+
+-- | Every declaration that claims a method name, including its source
+-- module.  Callers resolving a qualified or imported name must restrict this
+-- set to modules actually in scope before treating the name as a class
+-- method.
+methodOwnersFor :: ManifestIndex -> ByteString -> Set MethodOwner
+methodOwnersFor idx m = Map.findWithDefault Set.empty m (miMethodOwners idx)
 
 -- | Given a set of identifiers (typically the union of free variables
 -- across the user's entry source), pick out the ones that are class
