@@ -496,8 +496,10 @@ eval hooks env ipm = go
     -- Look up ?name in the current ImplicitParamMap. Miss -> runtime error.
     go (EImplicitRef name) = case lookupIPMap name ipm of
         Just t  -> force hooks t
-        Nothing -> error ("IHC.Eval: implicit parameter `?"
-                          <> BC.unpack name <> "` is not in scope")
+        Nothing -> case lookupEnv (BC.cons '?' name) env of
+            Just t  -> force hooks t
+            Nothing -> error ("IHC.Eval: implicit parameter `?"
+                              <> BC.unpack name <> "` is not in scope")
 
     -- Phase 3.6: Implicit parameter let-binding.
     -- Extend the implicit-param map for the duration of @body@.
@@ -2129,10 +2131,20 @@ matchPat hooks (PCon "Nothing" []) (VCon "Just" [excT]) = do
     case exc of
         VCon "SomeException" _ -> pure (Just [])
         _                      -> pure Nothing
-matchPat hooks pat@(PCon pname _) (VCon "SomeException" [innerT])
+matchPat hooks (PCon "SomeException" [payloadPat])
+               (VCon "SomeException" [payloadT]) = do
+    annotations <- newWHNFThunk (VCon "[]" [])
+    contextT <- newWHNFThunk (VCon "ExceptionContext" [annotations])
+    matched <- matchFields hooks [(payloadPat, payloadT)] []
+    pure (fmap ((BC.pack "?exceptionContext", contextT) :) matched)
+matchPat hooks pat@(PCon pname _) (VCon "SomeException" (innerT : _))
     | pname /= BC.pack "SomeException" = do
         inner <- force hooks innerT
         matchPat hooks pat inner
+matchPat hooks (PCon "SomeException" [payloadPat])
+               (VCon "SomeException" [payloadT, contextT]) = do
+    matched <- matchFields hooks [(payloadPat, payloadT)] []
+    pure (fmap ((BC.pack "?exceptionContext", contextT) :) matched)
 matchPat hooks (PCon name pats) v@(VCon vname vthunks)
     | sameConName name vname && (length pats == length vthunks
                                  || null pats) =

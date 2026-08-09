@@ -37,6 +37,7 @@ module IHC.Val
     , emptyIPMap
     , extendIPMap
     , lookupIPMap
+    , saturateConstructor
       -- * Failures
     , LoopException(..)
     , PatternMatchFail(..)
@@ -224,6 +225,24 @@ extendIPMap = Map.insert
 
 lookupIPMap :: Name -> ImplicitParamMap -> Maybe Thunk
 lookupIPMap = Map.lookup
+
+-- | Finish a source constructor application while preserving implicit
+-- dictionaries carried by an existential constructor.  In ghc-internal,
+-- @SomeException@ packages @HasExceptionContext@ alongside its payload.
+-- IHC represents that dictionary by retaining the current
+-- @?exceptionContext@ thunk as a hidden second field.  Pattern matching hides
+-- the field again and restores the implicit parameter in 'IHC.Eval'.
+saturateConstructor :: Name -> [Thunk] -> ImplicitParamMap -> IO Val
+saturateConstructor name fields ipm
+    | name == BC.pack "SomeException"
+    , [payload] <- fields = do
+        context <- case lookupIPMap (BC.pack "exceptionContext") ipm of
+            Just t  -> pure t
+            Nothing -> do
+                annotations <- newWHNFThunk (VCon (BC.pack "[]") [])
+                newWHNFThunk (VCon (BC.pack "ExceptionContext") [annotations])
+        pure (VCon name [payload, context])
+    | otherwise = pure (VCon name fields)
 
 -- | A closure captures both the regular environment and the implicit-param
 -- map at the point of its creation (lexical scoping for both).

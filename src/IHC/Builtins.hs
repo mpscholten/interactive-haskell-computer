@@ -1452,14 +1452,8 @@ builtins reg =
     -- 'foldr' body, which every source-loaded Foldable instance we
     -- rely on.
     , ("coerce",          unsafeCoerceB)
-    -- toExceptionWithBacktrace: lives in GHC.Internal.Exception. Source
-    -- exists there but wiring the ghc-internal package through import
-    -- resolution is a separate project; source-loaded throwIO/throw still
-    -- calls it by name. We shim it as an IO action that wraps the value in
-    -- SomeException (dropping the actual CallStack-capture — the backtrace
-    -- is cosmetic at the Val level, and our `extractExceptionMessage`
-    -- already understands the SomeException wrapper).
-    , ("toExceptionWithBacktrace", toExceptionWithBacktraceB)
+    -- toExceptionWithBacktrace has ordinary source in
+    -- GHC.Internal.Exception and is deliberately interpreted from there.
     -- toException: class method of Exception. Source-loaded throwIO
     -- chain also reaches this via `throwIO e = IO (raiseIO# (toException e))`.
     -- In the Val world we have no type-driven dispatch, so identity-with-
@@ -5734,7 +5728,16 @@ buildConEnv reg = do
     -- 'tryIntegerCollapse' below.
     buildLam :: Name -> Int -> [Thunk] -> Val
     buildLam name 0    acc = VCon name (reverse acc)
-    buildLam name left acc = VFun $ \t ->
+    buildLam name left acc
+      | name == BC.pack "SomeException" = VFunIP emptyIPMap $ \callerIPM t ->
+        if left == 1
+            then do
+                let thunks = reverse (t : acc)
+                strict <- lookupCtorStrictness name
+                forceStrictFields strict thunks
+                saturateConstructor name thunks callerIPM
+            else pure (buildLam name (left - 1) (t : acc))
+      | otherwise = VFun $ \t ->
         if left == 1
             then do
                 let thunks = reverse (t : acc)
@@ -5870,7 +5873,7 @@ buildFieldEnv reg = do
             -- 'acceptNewConnection') needs us to descend through the
             -- wrap.  Project the inner field and recurse so the
             -- accessor sees the underlying 'IOError' / etc.
-            VCon "SomeException" [innerT] ->
+            VCon "SomeException" (innerT : _) ->
                 access fieldName clauses innerT
             VCon conName args ->
                 case lookup conName clauses of
@@ -6536,7 +6539,7 @@ valToIhcException v = do
 extractExceptionMessage :: Val -> IO ByteString
 extractExceptionMessage val = case val of
     VStr s -> pure s
-    VCon "SomeException" [innerT] -> do
+    VCon "SomeException" (innerT : _) -> do
         inner <- force legacyHooks innerT
         extractExceptionMessage inner
     VCon "ErrorCall" [msgT] ->
@@ -6974,32 +6977,10 @@ maskAsyncExceptionsHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
             vT  <- newWHNFThunk v
             pure (VCon "(#,#)" [sT', vT])
 
--- | @toExceptionWithBacktrace :: (HasCallStack, Exception e) => e -> IO SomeException@
---
--- Source defined in @GHC.Internal.Exception@:
---
---   toExceptionWithBacktrace e
---     | backtraceDesired e = do bt <- collectBacktraces
---                               return (addExceptionContext bt (toException e))
---     | otherwise          = return (toException e)
---
--- Wiring ghc-internal through the import resolver is a separate task; we
--- shim it here. The backtrace is cosmetic at the Val level (no stack
--- traces are captured by the interpreter), and 'extractExceptionMessage'
--- already unwraps 'SomeException'.
-toExceptionWithBacktraceB :: IO Val
-toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
-    ev <- force legacyHooks eT
-    case ev of
-        VCon "SomeException" _ -> pure ev
-        _                       -> do
-            eT' <- newWHNFThunk ev
-            pure (VCon "SomeException" [eT'])
-
 -- | @toException :: Exception e => e -> SomeException@ — identity-with-wrap
 -- at the Val level (we lack the Exception class dispatch; SomeException is
--- idempotent). Complements 'toExceptionWithBacktraceB' for the pure throw
--- path (@throwIO e = IO (raiseIO# (toException e))@).
+-- idempotent). The source-loaded backtrace path decorates this wrapper before
+-- it reaches @raise#@.
 toExceptionB :: IO Val
 toExceptionB = pure $ VFun $ \eT -> do
     ev <- force legacyHooks eT

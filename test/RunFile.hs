@@ -1514,6 +1514,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Wrap \"from-email\"\nWrap \"from-name\"\n"
 
+    it "toExceptionWithBacktrace is interpreted from ghc-internal source" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/QuickWins/exception_backtrace_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "source backtrace context\n"
+
     it "error_message: head [] surfaces the real `Prelude.head: empty list` payload" do
         -- Source-loaded error + raise# path must produce a message
         -- containing the real payload string rather than the fallback

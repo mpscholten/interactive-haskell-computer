@@ -9050,8 +9050,14 @@ resolveFallbackSource mOwner name = do
             newLazyBuiltinThunk (pure (buildLam name arity []))
 
         buildLam name 0 acc = VCon name (reverse acc)
-        buildLam name left acc = VFun $ \t ->
-            pure (buildLam name (left - 1) (t : acc))
+        buildLam name left acc
+            | name == BC.pack "SomeException" =
+                VFunIP emptyIPMap $ \callerIPM t ->
+                    if left == 1
+                        then saturateConstructor name (reverse (t : acc)) callerIPM
+                        else pure (buildLam name (left - 1) (t : acc))
+            | otherwise = VFun $ \t ->
+                pure (buildLam name (left - 1) (t : acc))
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter", "sum" ] = Just (BC.pack "GHC.List")
@@ -9438,8 +9444,14 @@ resolveFallbackSource mOwner name = do
             newLazyBuiltinThunk (pure (buildLam name arity []))
 
         buildLam name 0 acc = VCon name (reverse acc)
-        buildLam name left acc = VFun $ \t ->
-            pure (buildLam name (left - 1) (t : acc))
+        buildLam name left acc
+            | name == BC.pack "SomeException" =
+                VFunIP emptyIPMap $ \callerIPM t ->
+                    if left == 1
+                        then saturateConstructor name (reverse (t : acc)) callerIPM
+                        else pure (buildLam name (left - 1) (t : acc))
+            | otherwise = VFun $ \t ->
+                pure (buildLam name (left - 1) (t : acc))
 
     tryKnownDirectOwnerSlot mods owner bareName =
         case preludeDirectOwner bareName of
