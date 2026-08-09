@@ -1,0 +1,2 @@
+constraints: any.base ==4.20.0.0,
+             any.template-haskell ==2.22.0.0

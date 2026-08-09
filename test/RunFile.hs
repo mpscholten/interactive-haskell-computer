@@ -843,6 +843,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Red\n"
 
+    it "TH private Map helper is interpreted from package source" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/THLibMap/Main.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "found\nmissing\n"
+
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------

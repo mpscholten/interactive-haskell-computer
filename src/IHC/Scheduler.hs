@@ -9636,15 +9636,17 @@ isBuiltinBackedModule n =
     -- therefore compiler-intrinsic and must be host-backed; the builtin
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
-    -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
-    -- builtins for splice execution.  Most submodules are stubbed because
-    -- their content is replaced by IHC.TH's synthetic primops.
-    -- HOWEVER: 'Language.Haskell.TH.Quote' is a small pure module that
-    -- declares 'data QuasiQuoter = QuasiQuoter { quoteExp, … }'.  The
-    -- QQ-dispatch path needs that constructor (record-construction in
-    -- ihp-hsx etc.) and it has no primops backing it — interpret it
-    -- from source.
-    || ("Language.Haskell.TH" `BC.isPrefixOf` n && n /= BC.pack "Language.Haskell.TH.Quote")
+    -- Language.Haskell.TH.Syntax is the compiler-facing Q interface. IHC.TH
+    -- supplies its genuinely compile-time operations while that interface is
+    -- being brought up. Modules layered on Syntax remain builtin-backed for
+    -- now, but ordinary self-contained Haskell helpers must source-load.
+    --
+    -- Quote declares the QuasiQuoter record and Lib.Map is the private,
+    -- dependency-free map implementation used by the pretty printer. Both
+    -- have ordinary .hs source and are interpreted honestly.
+    || ("Language.Haskell.TH" `BC.isPrefixOf` n
+        && n /= BC.pack "Language.Haskell.TH.Quote"
+        && n /= BC.pack "Language.Haskell.TH.Lib.Map")
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
