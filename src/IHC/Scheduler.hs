@@ -8084,7 +8084,8 @@ mergeGlobalLoadedModules newMods
 -- a previously-missing name might now resolve.
 insertLmBody :: LoadedModule -> ByteString -> Expr -> IO ()
 insertLmBody lm name expr = do
-    modifyIORef' (lmBodies lm) (Map.insert name expr)
+    modifyIORef' (lmBodies lm)
+        (Map.insert name (attachTypeableConstraints lm name expr))
     bumpEnvFallbackGen
 
 installEnvFallbackHook :: IO ()
@@ -9336,7 +9337,9 @@ resolveFallbackSource mOwner name = do
                                         else pure (lmFieldReg owner)
                                 let expr = desugarRecordPats visibleFields
                                              (desugarRecordCons visibleFields expr0')
-                                modifyIORef' (lmBodies owner) (Map.insert bareName expr)
+                                modifyIORef' (lmBodies owner)
+                                    (Map.insert bareName
+                                        (attachTypeableConstraints owner bareName expr))
                                 buildSlotFromOwner mods owner bareName
 
     buildOwnerLocalEnv owner bodies bareName selfSlot baseEnv = do

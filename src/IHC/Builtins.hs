@@ -93,7 +93,7 @@ import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf, normalizeTyTag
-    , mkTypeRep, typeRepEq
+    , mkTypeRep
     , drainCataloguedInstancesForClass
     , legacyHooks
     )
@@ -1569,7 +1569,6 @@ builtins reg =
     -- dictionaries. GHC.Internal.Data.Typeable.Internal defines the ordinary
     -- `typeRep = typeRep#` wrapper in source.
     , ("typeRep#",       pure (typeRepHashDispatcher reg))
-    , ("eqT",            eqTB)
     , ("mkTyCon3",       mkTyCon3B)
     , ("mkTyConApp",     mkTyConAppB)
     -- Phase 3.5: OverloadedLabels
@@ -2376,6 +2375,7 @@ showVal (VCon name thunks)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
+showVal (VCAFIP _ _) = pure "<constrained-caf>"
 showVal (VClassMethod _ _ _ _ _) = pure "<function>"
 showVal (VLazyMethod _) = pure "<function>"
 showVal (VIO _)     = pure "<IO>"
@@ -7083,16 +7083,6 @@ runStateTransformer stateFnT = do
 --   Dynamic  = VCon "Dynamic"  [typeRepThunk, valThunk]
 --   Typeable dict = VCon "Dict_Typeable" [typeRepThunk]
 
-eqTB :: IO Val
-eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
-    dictAV <- force legacyHooks dictAT
-    dictBV <- force legacyHooks dictBT
-    trA    <- extractTypeRep dictAV
-    trB    <- extractTypeRep dictBV
-    eq     <- typeRepEq trA trB
-    if eq
-        then do { reflT <- newWHNFThunk (VCon "Refl" []); pure (VCon "Just" [reflT]) }
-        else pure (VCon "Nothing" [])
 
 mkTyCon3B :: IO Val
 mkTyCon3B = pure $ VFun $ \_ -> pure $ VFun $ \_ -> pure $ VFun $ \nameT -> do
@@ -7107,15 +7097,6 @@ mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
     tyConThunk <- newWHNFThunk tyConV
     argsThunk  <- newWHNFThunk argsV
     pure (VCon "TypeRep" [tyConThunk, argsThunk])
-
-extractTypeRep :: Val -> IO Val
-extractTypeRep (VCon "Dict_Typeable" [trT]) = force legacyHooks trT
-extractTypeRep v@(VCon "TrType" _)          = pure v
-extractTypeRep v@(VCon "TrTyCon" _)         = pure v
-extractTypeRep v@(VCon "TrApp" _)           = pure v
-extractTypeRep v@(VCon "TrFun" _)           = pure v
-extractTypeRep (VCon "SomeTypeRep" [trT])   = force legacyHooks trT
-extractTypeRep _                            = mkTypeRep "Unknown"
 
 -- | Build built-in Typeable instance dictionaries for well-known types.
 --

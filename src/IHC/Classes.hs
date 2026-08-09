@@ -415,6 +415,7 @@ typeTagOf (VInteger _) = BC.pack "Integer"
 typeTagOf (VFloat _)  = BC.pack "Double"
 typeTagOf (VChar _)   = BC.pack "Char"
 typeTagOf (VStr _)    = BC.pack "String"   -- transitional VStr
+typeTagOf (VCAFIP _ _) = BC.pack "<constrained-caf>"
 typeTagOf VUnit       = BC.pack "()"
 typeTagOf (VCon "[]" _) = BC.pack "[]"
 typeTagOf (VCon ":" _)  = BC.pack "[]"

@@ -68,6 +68,9 @@ constraintPendingKey :: Name -> Name -> Name
 constraintPendingKey cls var =
     BC.pack "$$dict-pending:" <> cls <> BC.pack ":" <> var
 
+constrainedCAFKey :: Name
+constrainedCAFKey = BC.pack "$$constrained-caf"
+
 lookupConstraintDictionary :: Name -> Name -> ImplicitParamMap -> Maybe Thunk
 lookupConstraintDictionary cls var ipm =
     lookupIPMap (constraintVariableKey cls var) ipm
@@ -335,6 +338,7 @@ valKindTag = \case
     VUnit             -> "VUnit"
     VFun _            -> "VFun"
     VFunIP _ _        -> "VFunIP"
+    VCAFIP _ _        -> "VCAFIP"
     VCon n _          -> "VCon:" <> BC.unpack n
     VIO _             -> "VIO"
     VPrimObj _        -> "VPrimObj"
@@ -625,6 +629,24 @@ eval hooks env ipm = go
     -- currently supported single-dictionary form, attach every parameter tag
     -- to the dispatcher produced by the source value. Multi-parameter lookup
     -- then follows the ordinary VClassMethod path.
+    go (EConstrainedValue inner constraints)
+      | length constraints > 1
+      , not (isFunctionExpr inner) = do
+          metadata <- constraintMetadata constraints
+          markerT <- newWHNFThunk VUnit
+          let cafIP = Map.insert constrainedCAFKey markerT metadata
+          pure $ VCAFIP cafIP $ \callerIP ->
+              eval hooks env (Map.union callerIP ipm) inner
+      where
+        constraintMetadata cs = Map.fromList <$> mapM oneMeta cs
+        oneMeta (cls, tags) = do
+            markerT <- newWHNFThunk (VStr cls)
+            pure (constraintPendingKey cls (firstTag tags), markerT)
+        firstTag (tag:_) = tag
+        firstTag [] = BC.empty
+        isFunctionExpr ELam{} = True
+        isFunctionExpr _ = False
+
     go (EConstrainedValue inner constraints) = do
         v <- go inner
         case v of
@@ -914,6 +936,45 @@ eval hooks env ipm = go
                         lexicalIP' = Map.union typedIP lexicalIP
                     pure $ VFunIP lexicalIP' $ \callerIP argT ->
                         f (Map.union typedIP callerIP) argT
+                VCAFIP lexicalIP runCAF -> do
+                    let typeable = BC.pack "Typeable"
+                    appliedTag <- if isRuntimeTypeVariable ty
+                        then case lookupConstraintDictionary typeable ty ipm of
+                            Just outerTagT -> do
+                                outerTag <- force hooks outerTagT
+                                pure $ case outerTag of
+                                    VStr tag -> tag
+                                    _ -> normalizeTyTag ty
+                            Nothing -> pure (normalizeTyTag ty)
+                        else pure (normalizeTyTag ty)
+                    tagT <- newWHNFThunk (VStr appliedTag)
+                    let
+                        pendingPrefix = constraintPendingKey typeable BC.empty
+                        pendingVars =
+                            [ BC.drop (BC.length pendingPrefix) key
+                            | key <- Map.keys lexicalIP
+                            , pendingPrefix `BS.isPrefixOf` key
+                            ]
+                        unassigned = filter
+                            (\var -> Map.notMember
+                                (constraintVariableKey typeable var) lexicalIP)
+                            pendingVars
+                        typedPairs = case unassigned of
+                            var:_ ->
+                                [ (dictionaryContextKey typeable, tagT)
+                                , (constraintVariableKey typeable var, tagT)
+                                ]
+                            [] -> [(dictionaryContextKey typeable, tagT)]
+                        lexicalIP' = Map.union (Map.fromList typedPairs) lexicalIP
+                        complete = all
+                            (\var -> Map.member
+                                (constraintVariableKey typeable var) lexicalIP')
+                            pendingVars
+                    if complete
+                        then do
+                            result <- runCAF lexicalIP'
+                            forceNestedCAF lexicalIP' result
+                        else pure (VCAFIP lexicalIP' runCAF)
                 -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
                 -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
                 -- when a bare VLabel flows through a non-@Proxy@ type
@@ -944,9 +1005,47 @@ eval hooks env ipm = go
                     | Just resultTy <- ioResultAnnotation ty ->
                         pure (VIO (action >>= applyIOResultAnnotation resultTy))
                 _               -> applyNumericTyAnnotation ty v
+      where
+        isRuntimeTypeVariable tag = case BC.uncons tag of
+            Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
+            Nothing -> True
+
+        forceNestedCAF outer (VCAFIP nestedIP nestedRun) = do
+            let pendingPrefix = constraintPendingKey (BC.pack "Typeable") BC.empty
+                pendingVars =
+                    [ BC.drop (BC.length pendingPrefix) key
+                    | key <- Map.keys nestedIP
+                    , pendingPrefix `BS.isPrefixOf` key
+                    ]
+                outerVars =
+                    [ BC.drop (BC.length pendingPrefix) key
+                    | key <- Map.keys outer
+                    , pendingPrefix `BS.isPrefixOf` key
+                    ]
+                outerEvidence =
+                    [ thunk
+                    | var <- outerVars
+                    , Just thunk <-
+                        [Map.lookup (constraintVariableKey (BC.pack "Typeable") var) outer]
+                    ]
+                -- Source wrappers commonly alpha-rename their quantified
+                -- variables (for example @$t0/$t1@ delegating to @a/b@).
+                -- Evidence follows the positional order of explicit type
+                -- applications, so transfer it positionally rather than by
+                -- the local binder spelling.
+                evidence = Map.fromList
+                    [ (constraintVariableKey (BC.pack "Typeable") var, thunk)
+                    | (var, thunk) <- zip pendingVars outerEvidence
+                    ]
+                nestedIP' = Map.union evidence nestedIP
+            if all (\var -> Map.member
+                    (constraintVariableKey (BC.pack "Typeable") var) nestedIP') pendingVars
+                then nestedRun nestedIP' >>= forceNestedCAF nestedIP'
+                else pure (VCAFIP nestedIP' nestedRun)
+        forceNestedCAF _ value = pure value
 
     tryTypedTypeable expr ty
-        | Just method <- headName expr
+        | Just method <- typeableMethodName expr
         , lastNameComponent method `elem` map BC.pack ["typeRep", "typeRep#"] = do
             let cls = BC.pack "Typeable"
                 evidenceTy = case reverse (BC.words ty) of
@@ -972,6 +1071,10 @@ eval hooks env ipm = go
                             traverse (forceMethodVal hooks) methodV
         | otherwise = pure Nothing
       where
+        typeableMethodName (EConstrainedValue inner _) = typeableMethodName inner
+        typeableMethodName (ETyApp inner _) = typeableMethodName inner
+        typeableMethodName (EVar name) = Just name
+        typeableMethodName _ = Nothing
         lastNameComponent name = case BC.elemIndexEnd '.' name of
             Just i -> BC.drop (i + 1) name
             Nothing -> name

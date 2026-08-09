@@ -90,6 +90,9 @@ data Val
     -- The function receives the caller's ImplicitParamMap so it can
     -- merge (lexically-bound ?params win over caller's).
     | VFunIP !ImplicitParamMap !(ImplicitParamMap -> Thunk -> IO Val)
+    -- Nullary source value whose class evidence arrives through type
+    -- applications before its body may be evaluated (for example eqT).
+    | VCAFIP !ImplicitParamMap !(ImplicitParamMap -> IO Val)
     | VCon  !Name ![Thunk]             -- saturated constructor (Phase 2.1+)
     | VUnit                            -- () — IO result of putStrLn etc.
     | VIO   !(IO Val)                  -- suspended IO action (Phase 2.4)
@@ -169,6 +172,7 @@ showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)      = "<function>"
 showValForDebug (VFunIP _ _)  = "<function>"
+showValForDebug (VCAFIP _ _)  = "<constrained-caf>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
 showValForDebug (VIO _)     = "<IO>"

@@ -39,6 +39,7 @@ describeType hooks = go
     go VUnit        = pure "()"
     go (VFun   _)   = pure "a -> b"
     go (VFunIP _ _) = pure "a -> b"
+    go (VCAFIP _ _) = pure "constrained a"
     go (VClassMethod _ _ _ _ _) = pure "a -> b"
     go (VLazyMethod _) = pure "a -> b"
     go (VIO    _)   = pure "IO a"

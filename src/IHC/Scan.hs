@@ -4677,7 +4677,18 @@ parseScheme :: [TTok] -> Maybe Scheme
 parseScheme toks0 = do
     let (vars, toks1)  = consumeOptionalForall toks0
     let (preds, toks2) = consumeOptionalContext toks1
-    body <- parseType toks2
+    body <- case parseType toks2 of
+        Just parsed -> Just parsed
+        -- Keep usable constraint metadata when the result contains a type
+        -- operator the lightweight type parser does not yet model (for
+        -- example @Maybe (a :~: b)@ in Data.Typeable.eqT). The opaque body
+        -- retains every explicit forall variable, which is enough to preserve
+        -- and later discharge the compiler-generated dictionaries.
+        Nothing
+            | not (null vars)
+            , not (null preds) ->
+                Just (foldl TyApp (TyCon (BC.pack "$opaque")) (map TyVar vars))
+        Nothing -> Nothing
     let allVars = if null vars
                     then collectTypeVars body preds
                     else vars
