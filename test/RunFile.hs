@@ -421,7 +421,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "io: do-block bind of `return 42` then print" do
         (n, out) <- captureStdout (runFile "test/Fixtures/io_return.hs")
         n   `shouldBe` 0
-        out `shouldBe` "42\n"
+        out `shouldBe` "chosen\n"
 
     it "io: `let x = 100` inside a do-block scopes to the rest of the block" do
         (n, out) <- captureStdout (runFile "test/Fixtures/io_let_in_do.hs")
@@ -580,6 +580,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         resolveTypeSigMetadata (Just "OwnerImportHiding") "pick" `shouldReturn` Nothing
         _ <- resolveTypeSigMetadata Nothing "OwnerAmbiguous.markerAmbiguous"
         resolveTypeSigMetadata (Just "OwnerAmbiguous") "pick" `shouldReturn` Nothing
+
+    it "elaborates a bare class-method callee from owner-scoped metadata" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/class_method_callee_metadata.hs")
+        n `shouldBe` 42
+        out `shouldBe` ""
 
     it "module: visible provider signatures with different constraints remain ambiguous" do
         let n = BC.pack

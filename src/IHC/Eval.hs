@@ -55,7 +55,7 @@ import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
 import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -407,11 +407,15 @@ eval hooks env ipm = go
     -- resolve it.  Does NOT default unbound uses to Int (that poisoned
     -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
-        fv <- go f
-        x0 <- annotateNullaryBoundedArg f x
-        owner <- currentOwner hooks env
-        x' <- elaborateExpectedArg hooks owner f x0
-        goApp fv x'
+        mElaboratedCall <- elaborateClassMethodCallee (EApp f x)
+        case mElaboratedCall of
+          Just call' -> go call'
+          Nothing -> do
+            fv <- go f
+            x0 <- annotateNullaryBoundedArg f x
+            owner <- currentOwner hooks env
+            x' <- elaborateExpectedArg hooks owner f x0
+            goApp fv x'
       where
         goApp fv x'' = do
           xt  <- newThunkIP env ipm x''          -- argument stays a thunk (lazy)
@@ -725,6 +729,55 @@ eval hooks env ipm = go
                             ok <- allTypedMethodsResolvable classReg e'
                             if ok then pure (Just e') else pure Nothing
                         _ -> pure Nothing
+
+    -- Elaborate a complete class-method application before evaluating its
+    -- left-associated callee spine.  A method's dictionary parameter can be
+    -- determined by a later argument (for example @m :: a -> f a -> a@), but
+    -- evaluating @(m x)@ first enters the value-directed 'VClassMethod'
+    -- dispatcher before that later argument is visible.  Owner-scoped
+    -- signature metadata lets inference see the whole application and replace
+    -- the bare head with 'ETypedMethod' first.
+    --
+    -- This is deliberately fail-closed: no signature, an ambiguous import,
+    -- failed inference, an unchanged/non-method head, or a missing instance
+    -- all retain the ordinary evaluator path.
+    elaborateClassMethodCallee call = case appHead call of
+        Nothing -> pure Nothing
+        Just method -> do
+            methodNames <- readIORef globalClassMethodNamesRef
+            let isMethod = Set.member (bareName method) methodNames
+            owner <- if isMethod then currentOwner hooks env else pure Nothing
+            mScheme <- if isMethod then lookupTypeSigFallback hooks owner method
+                                  else pure Nothing
+            case mScheme of
+                Just scheme@(Scheme _ preds _) | not (null preds) -> do
+                    mReg <- getSharedClassReg legacyHooks
+                    case mReg of
+                        Nothing -> pure Nothing
+                        Just classReg -> do
+                            sigs0 <- readIORef globalTypeSigsRef
+                            syns <- readIORef globalTypeSynonymsRef
+                            let sigs = Map.insert method scheme sigs0
+                            result <- try (Elab.elaborate classReg sigs syns
+                                            Elab.InferFreely call)
+                                :: IO (Either SomeException (Expr, TA.Type))
+                            case result of
+                                Right (call', _)
+                                    | hasTypedCallee call' -> do
+                                        ok <- allTypedMethodsResolvable classReg call'
+                                        pure (if ok then Just call' else Nothing)
+                                _ -> pure Nothing
+                _ -> pure Nothing
+      where
+        appHead (EApp h _) = appHead h
+        appHead (ETyApp h _) = appHead h
+        appHead (EVar n) = Just n
+        appHead _ = Nothing
+
+        hasTypedCallee (EApp h _) = hasTypedCallee h
+        hasTypedCallee (ETyApp h _) = hasTypedCallee h
+        hasTypedCallee ETypedMethod{} = True
+        hasTypedCallee _ = False
 
     -- | True iff every 'ETypedMethod' node in @e@ has a real, non-placeholder
     -- registered instance for its resolved @(cls, tag, method)@. Used to
