@@ -972,6 +972,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_lib_source.hs")
         n   `shouldBe` 0
         out `shouldBe` "12\n"
+
+    it "TH Ppr builds documents from package source" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_ppr_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "False\n"
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------
