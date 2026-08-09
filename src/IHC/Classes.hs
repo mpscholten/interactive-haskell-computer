@@ -81,11 +81,14 @@ module IHC.Classes
 
 import Control.Exception (SomeException, catch)
 import Control.Monad (foldM)
+import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
+import Data.Char (ord)
 import qualified Data.HashMap.Strict as HashMap
 import Data.HashMap.Strict (HashMap)
 import Data.IORef
+import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -106,8 +109,9 @@ import IHC.Val
 -- IHC's structural equality compares the constructor/application tree.
 mkTyCon :: ByteString -> IO Val
 mkTyCon name = do
-    zeroHiT <- newWHNFThunk (VInt 0)
-    zeroLoT <- newWHNFThunk (VInt 0)
+    let (hi, lo) = fingerprintName name
+    zeroHiT <- newWHNFThunk (VInt hi)
+    zeroLoT <- newWHNFThunk (VInt lo)
     pkgNameT <- stringToThunk "ihc"
     modNameT <- stringToThunk "GHC.Types"
     pkgT <- newWHNFThunk (VCon "TrNameD" [pkgNameT])
@@ -128,8 +132,9 @@ mkTypeRep :: ByteString -> IO Val
 mkTypeRep name = do
     tyConV <- mkTyCon name
     tyConT <- newWHNFThunk tyConV
-    hiT <- newWHNFThunk (VInt 0)
-    loT <- newWHNFThunk (VInt 0)
+    let (hi, lo) = fingerprintName name
+    hiT <- newWHNFThunk (VInt hi)
+    loT <- newWHNFThunk (VInt lo)
     fpT <- newWHNFThunk (VCon "Fingerprint" [hiT, loT])
     nilT   <- newWHNFThunk (VCon "[]" [])
     kindT <- newWHNFThunk (VCon "TrType" [])
@@ -144,13 +149,39 @@ mkTypeRepApp name argReps = do
     foldM applyRep root argReps
   where
     applyRep funRep argRep = do
-        hiT <- newWHNFThunk (VInt 0)
-        loT <- newWHNFThunk (VInt 0)
+        let funFp = typeRepFingerprint funRep
+            argFp = typeRepFingerprint argRep
+        let (hi, lo) = mixFingerprint funFp argFp
+        hiT <- newWHNFThunk (VInt hi)
+        loT <- newWHNFThunk (VInt lo)
         fpT <- newWHNFThunk (VCon "Fingerprint" [hiT, loT])
         funT <- newWHNFThunk funRep
         argT <- newWHNFThunk argRep
         kindT <- newWHNFThunk (VCon "TrType" [])
         pure (VCon "TrApp" [fpT, funT, argT, kindT])
+
+fingerprintName :: ByteString -> (Int64, Int64)
+fingerprintName name =
+    ( BC.foldl' step 0x6c62272e07bb0142 name
+    , BC.foldl' step 0x62b821756295c58d (BC.reverse name)
+    )
+  where
+    step h c = (h `xor` fromIntegral (ord c)) * 0x00000100000001b3
+
+typeRepFingerprint :: Val -> (Int64, Int64)
+typeRepFingerprint (VCon ctor (fpT:_))
+    | ctor `elem` map BC.pack ["TrTyCon", "TrApp", "TrFun"] =
+        case readThunkPure fpT of
+            VCon "Fingerprint" [hiT, loT] ->
+                case (readThunkPure hiT, readThunkPure loT) of
+                    (VInt hi, VInt lo) -> (hi, lo)
+                    _ -> (0, 0)
+            _ -> (0, 0)
+typeRepFingerprint _ = (0, 0)
+
+mixFingerprint :: (Int64, Int64) -> (Int64, Int64) -> (Int64, Int64)
+mixFingerprint (a, b) (c, d) =
+    ((a `xor` c) * 0x00000100000001b3, (b `xor` d) * 0x517cc1b727220a95)
 
 -- | Build a [Char] list Val from a String.
 stringToThunk :: String -> IO Thunk

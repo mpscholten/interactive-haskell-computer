@@ -861,6 +861,17 @@ eval hooks env ipm = go
                 -- call can look up the instance by composite key.
                 VClassMethod cls m slot tags fn ->
                     pure (VClassMethod cls m slot (tags ++ [normalizeTyTag ty]) fn)
+                -- Explicit type application supplies the erased Typeable
+                -- evidence needed by functions whose constrained variable
+                -- occurs only in their result (for example
+                -- @fromDynamic @Int@). Preserve it in the caller dictionary
+                -- context until the constrained source closure is applied.
+                VFunIP lexicalIP f -> do
+                    tagT <- newWHNFThunk (VStr (normalizeTyTag ty))
+                    let typedIP = Map.singleton
+                            (dictionaryContextKey (BC.pack "Typeable")) tagT
+                    pure $ VFunIP lexicalIP $ \callerIP argT ->
+                        f (Map.union typedIP callerIP) argT
                 -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
                 -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
                 -- when a bare VLabel flows through a non-@Proxy@ type

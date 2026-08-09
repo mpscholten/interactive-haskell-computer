@@ -320,8 +320,7 @@ builtinEnv reg = do
     -- Phase 3.5 note: when a VLabel is used where a Proxy is expected,
     -- fromLabel produces VCon "Proxy" [VLabel name].
     proxyT    <- newWHNFThunk (VCon "Proxy" [])
-    dynCtorT  <- newLazyBuiltinThunk dynamicCtorB
-    let phase295Ctors = [("Proxy", proxyT), ("Dynamic", dynCtorT)]
+    let phase295Ctors = [("Proxy", proxyT)]
     -- Phase 2.9.5: Built-in Typeable dictionaries for primitive types.
     -- Lazy-init: each dict costs two IORef allocs + a VCon, and most
     -- programs only touch typeableDict_Int / _Char / _Bool.
@@ -1441,6 +1440,13 @@ builtins reg =
     , ("unsafeCoerce",    unsafeCoerceB)
     , ("unsafeCoerce#",   unsafeCoerceB)
     , ("unsafeCoerceUnlifted", unsafeCoerceB)
+    -- Compiler magic consumed by the source implementation of eqTypeRep and
+    -- unsafeCoerce. GHC replaces its deliberately recursive source binding
+    -- with UnsafeRefl during CoreToStg.Prep; the interpreter performs that
+    -- compiler rewrite at the builtin boundary.
+    , ("unsafeEqualityProof", pure (VCon "UnsafeRefl" []))
+    , ("GHC.Internal.Unsafe.Coerce.unsafeEqualityProof"
+      , pure (VCon "UnsafeRefl" []))
     , ("unsafeCoerceAddr", unsafeCoerceB)
     -- coerce: GHC.Prim primop, re-exported by Data.Coerce.  No Haskell
     -- source: GHC resolves the type-safe @Coercible@ constraint at
@@ -1566,10 +1572,6 @@ builtins reg =
     , ("typeOf",         typeOfB)
     , ("cast",           castB)
     , ("eqT",            eqTB)
-    , ("toDyn",          toDynB)
-    , ("fromDynamic",    fromDynamicB)
-    , ("fromDyn",        fromDynB)
-    , ("dynTypeRep",     dynTypeRepB)
     , ("mkTyCon3",       mkTyCon3B)
     , ("mkTyConApp",     mkTyConAppB)
     -- Phase 3.5: OverloadedLabels
@@ -7109,44 +7111,6 @@ eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
         then do { reflT <- newWHNFThunk (VCon "Refl" []); pure (VCon "Just" [reflT]) }
         else pure (VCon "Nothing" [])
 
-toDynB :: IO Val
-toDynB = pure $ VFun $ \dictT -> pure $ VFun $ \valT -> do
-    dictV <- force legacyHooks dictT
-    tr    <- extractTypeRep dictV
-    trT   <- newWHNFThunk tr
-    pure (VCon "Dynamic" [trT, valT])
-
-fromDynamicB :: IO Val
-fromDynamicB = pure $ VFun $ \dictBT -> pure $ VFun $ \dynT -> do
-    dictBV <- force legacyHooks dictBT
-    dynV   <- force legacyHooks dynT
-    trB    <- extractTypeRep dictBV
-    case dynV of
-        VCon "Dynamic" [trAT, storedT] -> do
-            trA <- force legacyHooks trAT
-            eq  <- typeRepEq trA trB
-            pure (if eq then VCon "Just" [storedT] else VCon "Nothing" [])
-        _ -> pure (VCon "Nothing" [])
-
-fromDynB :: IO Val
-fromDynB = pure $ VFun $ \dictT -> pure $ VFun $ \dynT -> pure $ VFun $ \defT -> do
-    dictV <- force legacyHooks dictT
-    dynV  <- force legacyHooks dynT
-    trB   <- extractTypeRep dictV
-    case dynV of
-        VCon "Dynamic" [trAT, storedT] -> do
-            trA <- force legacyHooks trAT
-            eq  <- typeRepEq trA trB
-            if eq then force legacyHooks storedT else force legacyHooks defT
-        _ -> force legacyHooks defT
-
-dynTypeRepB :: IO Val
-dynTypeRepB = pure $ VFun $ \dynT -> do
-    dynV <- force legacyHooks dynT
-    case dynV of
-        VCon "Dynamic" [trT, _] -> force legacyHooks trT
-        _ -> mkTypeRep "Unknown"
-
 mkTyCon3B :: IO Val
 mkTyCon3B = pure $ VFun $ \_ -> pure $ VFun $ \_ -> pure $ VFun $ \nameT -> do
     nameV    <- force legacyHooks nameT
@@ -7170,13 +7134,6 @@ extractTypeRep v@(VCon "TrApp" _)           = pure v
 extractTypeRep v@(VCon "TrFun" _)           = pure v
 extractTypeRep (VCon "SomeTypeRep" [trT])   = force legacyHooks trT
 extractTypeRep _                            = mkTypeRep "Unknown"
-
--- | Dynamic constructor as a curried function value.
-dynamicCtorB :: IO Val
-dynamicCtorB = pure $ VFun $ \trT -> pure $ VFun $ \valT -> do
-    trV    <- force legacyHooks trT
-    trThunk <- newWHNFThunk trV
-    pure (VCon "Dynamic" [trThunk, valT])
 
 -- | Build built-in Typeable instance dictionaries for well-known types.
 --

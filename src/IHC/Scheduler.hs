@@ -5426,45 +5426,19 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 -- @methodArray@ through the latter, so wrapping only in 'exportBodies' left the
 -- imported methodArray with Int bounds (@Ix Int.index: non-Int index@ on the
 -- warp request path) even though the single-file repro worked.
-wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
-wrapNullaryResultSig lm n e =
-    let e' = annotateBindInputTypes e
-        attachConstraints result = case Map.lookup n (lmTypeSigs lm) of
-            Just (Scheme _ preds body) ->
-                case sourceConstraints preds body of
-                    [] -> result
-                    cs -> EConstrainedValue result cs
-            Nothing -> result
-    in attachConstraints $ case e' of
-        -- RHS is literally a bare nullary class method
-        -- (@x :: T; x = minBound@): annotate with the result-type tag.
-        EVar v
-            | isNullaryClassMethodName (lastNameComponent v)
-            , Just sig <- Map.lookup n (lmTypeSigs lm)
-            , Just tag <- schemeResultTag sig
-            -> ETyApp e tag
-        -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary class
-        -- method nested inside an application/tuple — e.g.
-        -- @methodArray :: Array StdMethod Method;
-        --  methodArray = listArray (minBound, maxBound) …@.  Wrap the whole
-        -- RHS in the binding's full result type.  Guarded (arity-0 + actually
-        -- mentions a nullary method) so only the rare binding pays the lazy,
-        -- once-per-thunk elaboration.
-        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
-          , ([], resultTy) <- tyArrowArgs body
-          , any (isNullaryClassMethodName . lastNameComponent) (freeVars e')
-          , Just tyBytes <- renderTypeForAnnotation resultTy
-          -> ETyApp e' tyBytes
-        _ -> e'
+attachTypeableConstraints :: LoadedModule -> ByteString -> Expr -> Expr
+attachTypeableConstraints _ _ result@EConstrainedValue{} = result
+attachTypeableConstraints lm n result = case Map.lookup n (lmTypeSigs lm) of
+    Just (Scheme _ preds body) -> case sourceConstraints preds body of
+        [] -> result
+        cs -> EConstrainedValue result cs
+    Nothing -> result
   where
     sourceConstraints preds body = mapMaybe one preds
       where
         bodyVars = freeTyVars body
         -- Typeable dictionaries are compiler-generated and therefore have no
-        -- source instance declaration that could reconstruct the erased
-        -- dictionary later. Preserve that predicate on source definitions;
-        -- ordinary source classes continue through their existing elaboration
-        -- and instance-dispatch path.
+        -- source instance declaration that could reconstruct erased evidence.
         one (Pred cls args)
             | cls == BC.pack "Typeable"
             , all isPlainArg args
@@ -5479,6 +5453,32 @@ wrapNullaryResultSig lm n e =
         argName (TyCon name) = name
         argName _ = BC.empty
 
+wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
+wrapNullaryResultSig lm n e =
+    let e' = annotateBindInputTypes e
+        result = attachTypeableConstraints lm n $ case e' of
+            -- RHS is literally a bare nullary class method
+            -- (@x :: T; x = minBound@): annotate with the result-type tag.
+            EVar v
+                | isNullaryClassMethodName (lastNameComponent v)
+                , Just sig <- Map.lookup n (lmTypeSigs lm)
+                , Just tag <- schemeResultTag sig
+                -> ETyApp e tag
+            -- RHS is a CAF (arity-0 signature) that MENTIONS a nullary class
+            -- method nested inside an application/tuple — e.g.
+            -- @methodArray :: Array StdMethod Method;
+            --  methodArray = listArray (minBound, maxBound) …@.  Wrap the whole
+            -- RHS in the binding's full result type.  Guarded (arity-0 + actually
+            -- mentions a nullary method) so only the rare binding pays the lazy,
+            -- once-per-thunk elaboration.
+            _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+              , ([], resultTy) <- tyArrowArgs body
+              , any (isNullaryClassMethodName . lastNameComponent) (freeVars e')
+              , Just tyBytes <- renderTypeForAnnotation resultTy
+              -> ETyApp e' tyBytes
+            _ -> e'
+    in result
+  where
     annotateBindInputTypes :: Expr -> Expr
     annotateBindInputTypes = go
       where
