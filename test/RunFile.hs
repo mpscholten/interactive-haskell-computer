@@ -567,6 +567,10 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello, ok\n"
 
+    it "primop: indexWord8OffAddr# reads unsigned bytes from Addr#" do
+        n <- runFile "test/Fixtures/Coverage/index_word8_off_addr.hs"
+        n `shouldBe` 128
+
     it "module: qualified class methods (P.negate, P.maxBound) in non-entry module" do
         (n, out) <- captureStdout
             (runMainWithSiblings
