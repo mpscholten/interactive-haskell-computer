@@ -98,6 +98,7 @@ import IHC.Classes
     , unionInstanceScope, currentInstanceScope, clearInstanceScope
     , clearSuperclasses
     , setEnvFallback
+    , setTypeSigFallback
     , setCtorTypeHook
     , setCoreInstanceLoadHook, triggerCoreInstanceLoad
     , setRegisterInstancesHook, triggerRegisterInstances
@@ -322,6 +323,7 @@ loadProgramFromSource searchPath src0 = do
     -- that 'IHC.Eval.eval' can resolve FQN misses via the global
     -- module catalogue.  See 'installEnvFallbackHook'.
     installEnvFallbackHook
+    installTypeSigFallbackHook
     -- Install the ctor -> type-name hook so 'typeTagOf' on a
     -- source-loaded ADT ctor (e.g. @GET :: StdMethod@) returns the
     -- type name, not the ctor name -- required for class instance
@@ -773,6 +775,7 @@ buildBaseEnv = do
     -- 'IHC.Eval.eval' can resolve fully-qualified references lazily on
     -- EVar miss.  See 'installEnvFallbackHook' for the mechanics.
     installEnvFallbackHook
+    installTypeSigFallbackHook
     cacheWithIncludes0 <- cachedPackageSearchPathWithIncludes
     setGlobalSearchPath (map fst cacheWithIncludes0)
                         (Map.fromList cacheWithIncludes0)
@@ -8032,6 +8035,75 @@ installEnvFallbackHook =
                                             then (gen', Set.insert key prevSet)
                                             else (gen', Set.singleton key)
                                 pure Nothing
+
+-- | Resolve only a type signature in the lexical import scope of an owner.
+-- Unlike the value fallback this never discovers a binding body or creates a
+-- thunk, so bidirectional elaboration can cheaply consult lazy module
+-- metadata without defeating demand-driven evaluation.
+installTypeSigFallbackHook :: IO ()
+installTypeSigFallbackHook =
+    setTypeSigFallback legacyHooks resolveTypeSigMetadata
+
+resolveTypeSigMetadata :: Maybe ByteString -> ByteString -> IO (Maybe Scheme)
+resolveTypeSigMetadata mOwner requested = do
+    mods <- readIORef globalLoadedModulesRef
+    searchPath <- readIORef globalSearchPathRef
+    includeMap <- readIORef globalIncludeMapRef
+    registry <- newIORef (Map.map Loaded mods)
+    case mOwner >>= (`Map.lookup` mods) of
+        Nothing -> resolveQualified registry searchPath includeMap mods requested
+        Just owner -> resolveFromOwner registry searchPath includeMap Set.empty owner requested
+  where
+    resolveQualified registry searchPath includeMap mods name =
+        case splitAtLastDot name of
+            Nothing -> pure Nothing
+            Just (modName, bare) -> do
+                loaded <- try (loadModule registry searchPath includeMap modName)
+                    :: IO (Either SomeException LoadedModule)
+                pure $ case loaded of
+                    Right lm -> Map.lookup bare (lmTypeSigs lm)
+                    Left _   -> Map.lookup modName mods >>= Map.lookup bare . lmTypeSigs
+
+    resolveFromOwner registry searchPath includeMap seen owner name
+        | Set.member (lmName owner) seen = pure Nothing
+        | otherwise =
+            case Map.lookup name (lmTypeSigs owner) of
+                Just scheme -> pure (Just scheme)
+                Nothing -> do
+                    let seen' = Set.insert (lmName owner) seen
+                        (mQual, bare) = case splitAtLastDot name of
+                            Just pair -> (Just (fst pair), snd pair)
+                            Nothing   -> (Nothing, name)
+                        imports =
+                            [ imp
+                            | imp <- mhImports (lmHeader owner)
+                            , specAllows (impSpec imp) bare
+                            , case mQual of
+                                Nothing -> not (impQualified imp)
+                                Just q  -> q == fromMaybe (impModule imp) (impAlias imp)
+                            ]
+                    firstImport seen' bare imports
+      where
+        firstImport _ _ [] = pure Nothing
+        firstImport seen' bare (imp:rest) = do
+            loaded <- try (loadModule registry searchPath includeMap (impModule imp))
+                :: IO (Either SomeException LoadedModule)
+            case loaded of
+                Left _ -> firstImport seen' bare rest
+                Right target
+                    | not (exportsName target bare) -> firstImport seen' bare rest
+                    | otherwise -> case Map.lookup bare (lmTypeSigs target) of
+                        Just scheme -> pure (Just scheme)
+                        Nothing -> do
+                            nested <- resolveFromOwner registry searchPath includeMap seen' target bare
+                            case nested of
+                                Just scheme -> pure (Just scheme)
+                                Nothing     -> firstImport seen' bare rest
+
+    splitAtLastDot name = case BC.elemIndexEnd '.' name of
+        Just i | i > 0, i + 1 < BC.length name ->
+            Just (BC.take i name, BC.drop (i + 1) name)
+        _ -> Nothing
 
 -- | Install the ctor -> type-name hook used by 'IHC.Classes.typeTagOf'
 -- for source-loaded ADTs.  Without this, dispatch on a value like

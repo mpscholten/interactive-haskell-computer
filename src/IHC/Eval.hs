@@ -28,6 +28,7 @@ module IHC.Eval
 
 import Control.Exception (throwIO)
 import Control.Concurrent (myThreadId, yield)
+import Control.Monad (foldM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -43,11 +44,12 @@ import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, castPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
 import qualified Foreign.Storable as FStorable
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
@@ -121,8 +123,8 @@ annotateNullaryBoundedArg f x = case x of
 -- function, or class.
 elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
 elaborateExpectedArg hooks owner f x = do
-    ensureExprMetadata x
-    sigs <- readIORef globalTypeSigsRef
+    initialSigs <- readIORef globalTypeSigsRef
+    sigs <- foldM loadMissingSig initialSigs (expressionHeads x)
     if not (needsExpectedElaboration sigs x)
         then pure x
         else case appHeadAndArity f of
@@ -144,6 +146,20 @@ elaborateExpectedArg hooks owner f x = do
                     Nothing -> pure x
             Nothing -> pure x
   where
+    loadMissingSig sigs name
+        | Map.member name sigs || Map.member (bareName name) sigs = pure sigs
+        | bareName name `elem` map BC.pack [":", "[]"] = pure sigs
+        | otherwise = do
+            mScheme <- lookupTypeSigFallback hooks owner name
+            pure $ maybe sigs (\scheme -> Map.insert name scheme sigs) mScheme
+
+    expressionHeads = Set.toList . go
+      where
+        go (EVar name) = Set.singleton name
+        go (EApp innerF innerX) = Set.union (go innerF) (go innerX)
+        go (ETyApp inner _) = go inner
+        go _ = Set.empty
+
     needsExpectedElaboration sigs = go
       where
         go (EVar name) = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
@@ -153,29 +169,6 @@ elaborateExpectedArg hooks owner f x = do
         go (ETyApp inner _) = go inner
         go _ = False
 
-    -- Import discovery is lazy, but elaboration needs the signature before
-    -- the argument thunk is evaluated.  The normal owner-scoped resolver
-    -- makes the defining module (and therefore its signature) available;
-    -- obtaining the returned thunk does not force the binding.
-    ensureExprMetadata e = do
-        ensureHeadMetadata e
-        case e of
-            EApp innerF innerX -> do
-                ensureExprMetadata innerF
-                ensureExprMetadata innerX
-            ETyApp inner _ -> ensureExprMetadata inner
-            _ -> pure ()
-    ensureHeadMetadata e = case appHeadAndArity e of
-        Just (name, _) | bareName name `elem` map BC.pack [":", "[]"] ->
-            pure ()
-        Just (name, _) -> do
-            sigs <- readIORef globalTypeSigsRef
-            case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
-                Just _  -> pure ()
-                Nothing -> do
-                    _ <- lookupEnvFallback hooks owner name
-                    pure ()
-        Nothing -> pure ()
     appHeadAndArity = go 0
       where
         go n (EApp h _) = go (n + 1) h

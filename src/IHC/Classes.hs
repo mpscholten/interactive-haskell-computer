@@ -46,6 +46,10 @@ module IHC.Classes
     , EnvFallbackHook
     , setEnvFallback
     , lookupEnvFallback
+      -- * Demand-driven type-signature fallback
+    , TypeSigFallbackHook
+    , setTypeSigFallback
+    , lookupTypeSigFallback
       -- * Core-instance load hook
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
@@ -89,6 +93,7 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr)
 import IHC.StringUtils (trimAscii)
+import IHC.TypeAST (Scheme)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -584,6 +589,19 @@ lookupEnvFallback hooks owner name = do
     hook <- readIORef (hkEnvFallback hooks)
     hook owner name
 
+-- | Resolve a type signature in the same owner-scoped manner as the
+-- value fallback.  This lets elaboration request metadata without
+-- forcing the corresponding value or module environment.
+type TypeSigFallbackHook = Maybe ByteString -> ByteString -> IO (Maybe Scheme)
+
+setTypeSigFallback :: IHCHooks -> TypeSigFallbackHook -> IO ()
+setTypeSigFallback hooks = writeIORef (hkTypeSigFallback hooks)
+
+lookupTypeSigFallback :: IHCHooks -> Maybe ByteString -> ByteString -> IO (Maybe Scheme)
+lookupTypeSigFallback hooks owner name = do
+    hook <- readIORef (hkTypeSigFallback hooks)
+    hook owner name
+
 --------------------------------------------------------------------------------
 -- Class-method dispatcher fallback
 --
@@ -733,6 +751,7 @@ runThExpToExpr hooks v = do
 
 data IHCHooks = IHCHooks
     { hkEnvFallback         :: !(IORef EnvFallbackHook)
+    , hkTypeSigFallback     :: !(IORef TypeSigFallbackHook)
     , hkClassMethodFallback :: !(IORef (ByteString -> ByteString -> IO (Maybe Val)))
     , hkCoreInstanceLoad    :: !(IORef (ByteString -> IO ()))
     , hkCtorType            :: !(IORef (ByteString -> Maybe ByteString))
@@ -788,6 +807,7 @@ legacyClassRunState = unsafePerformIO $ do
 legacyHooks :: IHCHooks
 legacyHooks = unsafePerformIO $ do
     envFb       <- newIORef (\_ _ -> pure Nothing)
+    typeSigFb   <- newIORef (\_ _ -> pure Nothing)
     classMethFb <- newIORef (\_ _ -> pure Nothing)
     coreLoad    <- newIORef (\_ -> pure ())
     ctorType    <- newIORef (const Nothing)
@@ -798,6 +818,7 @@ legacyHooks = unsafePerformIO $ do
         (\_ -> error "IHC.Classes: thExpToExpr hook not installed")
     pure IHCHooks
         { hkEnvFallback         = envFb
+        , hkTypeSigFallback     = typeSigFb
         , hkClassMethodFallback = classMethFb
         , hkCoreInstanceLoad    = coreLoad
         , hkCtorType            = ctorType
@@ -825,6 +846,7 @@ legacyHooks = unsafePerformIO $ do
 resetSessionHooks :: IHCHooks -> IO ()
 resetSessionHooks hooks = do
     writeIORef (hkEnvFallback         hooks) (\_ _ -> pure Nothing)
+    writeIORef (hkTypeSigFallback     hooks) (\_ _ -> pure Nothing)
     writeIORef (hkClassMethodFallback hooks) (\_ _ -> pure Nothing)
     writeIORef (hkCoreInstanceLoad    hooks) (\_   -> pure ())
     writeIORef (hkCtorType            hooks) (const Nothing)

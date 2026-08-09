@@ -194,6 +194,7 @@ newIHCContext = do
 -- the storage:
 --
 --   * 'hkEnvFallback'         → @\\_ _ -> pure Nothing@
+--   * 'hkTypeSigFallback'     → @\\_ _ -> pure Nothing@
 --   * 'hkClassMethodFallback' → @\\_ _ -> pure Nothing@
 --   * 'hkCoreInstanceLoad'    → @\\_ -> pure ()@
 --   * 'hkCtorType'            → @const Nothing@
@@ -205,6 +206,7 @@ newIHCContext = do
 freshHooks :: IO IHCHooks
 freshHooks = do
     envFb       <- newIORef (\_ _ -> pure Nothing)
+    typeSigFb   <- newIORef (\_ _ -> pure Nothing)
     classMethFb <- newIORef (\_ _ -> pure Nothing)
     coreLoad    <- newIORef (\_ -> pure ())
     ctorType    <- newIORef (const Nothing)
@@ -215,6 +217,7 @@ freshHooks = do
         (\_ -> error "IHC.Context.freshHooks: thExpToExpr hook not installed")
     pure IHCHooks
         { hkEnvFallback         = envFb
+        , hkTypeSigFallback     = typeSigFb
         , hkClassMethodFallback = classMethFb
         , hkCoreInstanceLoad    = coreLoad
         , hkCtorType            = ctorType
