@@ -7,12 +7,15 @@ module Hs2010ClassInst (spec) where
 
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
+import qualified Data.Map.Strict as Map
 import Test.Hspec
 
 import IHC.Lexer (LexError)
 import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
+import IHC.Scan (ClassDecl(..), scanClassDecls)
 import IHC.Source (Source, mkSource)
+import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
 import IHC.Val (Env, Thunk)
 
 mkSrc :: ByteString -> Source
@@ -85,6 +88,19 @@ spec = describe "Hs2010 — Class & instance declarations" $ do
 
         it "3.4.6 class with method fixity declaration" $
             pendingWith "known gap: in-class fixity declarations not yet parsed"
+
+        it "retains kinded multi-parameter/fundep method metadata" $ do
+            [decl] <- scanClassDecls (mkSrc
+                "class Eq a => Convert (a :: Type) b | b -> a where\n\
+                \    convert :: Either a b -> b\n")
+            classClassName decl `shouldBe` "Convert"
+            classSuperclasses decl `shouldBe` ["Eq"]
+            Map.lookup "convert" (classMethodSchemes decl) `shouldBe`
+                Just (Scheme ["a", "b"]
+                    [Pred "Convert" [TyVar "a", TyVar "b"]]
+                    (TyArrow
+                        (TyApp (TyApp (TyCon "Either") (TyVar "a")) (TyVar "b"))
+                        (TyVar "b")))
 
     --------------------------------------------------------------------
     -- 3.5 instance declarations

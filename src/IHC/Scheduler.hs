@@ -5127,13 +5127,13 @@ buildClassMethodEnv classReg existing loadedModules = do
     -- top-level bindings that merely happen to have a single-pred
     -- constrained signature (e.g. @array :: Ix i => (i, i) -> ...@).
     let allMethodNames = Set.fromList
-            [ m | ClassDecl _ ms _ _ <- decls, m <- ms ]
+            [ m | ClassDecl _ ms _ _ _ <- decls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     -- Mirror as method→class so the env-fallback can lazily synthesise
     -- a dispatcher when a class method is referenced before its
     -- declaring class has been pulled into the env.
     let methodClassPairs =
-            [ (m, [cls]) | ClassDecl cls ms _ _ <- decls, m <- ms ]
+            [ (m, [cls]) | ClassDecl cls ms _ _ _ <- decls, m <- ms ]
     modifyIORef' globalMethodClassRef
         (Map.unionWith (\a b -> a ++ filter (`notElem` a) b)
                        (Map.fromListWith (++) methodClassPairs))
@@ -5150,7 +5150,7 @@ buildClassMethodEnv classReg existing loadedModules = do
   where
     buildModule lm decls =
         concat <$> mapM (buildOne (lmName lm)) decls
-    buildOne ownerName (ClassDecl cls methodNames _defaults _supers) =
+    buildOne ownerName (ClassDecl cls methodNames _defaults _supers _schemes) =
         concat <$> mapM (mkMethodEntries ownerName cls) methodNames
     mkMethodEntries ownerName cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
@@ -5183,7 +5183,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
         decls <- scanClassDecls (lmSource lm)
         mapM_ (oneClass lm) decls
 
-    oneClass lm decl@(ClassDecl cls _ defaults _supers)
+    oneClass lm decl@(ClassDecl cls _ defaults _supers _schemes)
         | Map.null defaults = pure ()
         | otherwise =
             -- Catalogue the default-registration work under the
@@ -5204,7 +5204,7 @@ registerClassDefaults registry searchPath includeMap classReg env loadedModules 
     -- The specific cascade: Monad.return = pure → forces pure →
     -- triggers Applicative dispatch → drains Applicative catalogue
     -- → discovers ALL Applicative default FVs eagerly → etc.
-    registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers) = do
+    registerOneClassDefault lm (ClassDecl cls methodNames defaults _supers _schemes) = do
             let needsMethodScope = cls == BC.pack "Foldable"
             methodEnv <- if needsMethodScope
                 then HashMap.fromList <$> mapM
@@ -6082,7 +6082,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
         decls <- scanClassDecls (lmSource owner)
             `catch` (\(_ :: SomeException) -> pure [])
         let declares =
-                any (\(ClassDecl cls methods _ _) ->
+                any (\(ClassDecl cls methods _ _ _) ->
                         cls `elem` classes && bareName `elem` methods)
                     decls
             exportsClassItem =
@@ -7916,9 +7916,9 @@ registerGlobalLoadedModule lm = do
     classDecls <- (scanClassDecls (lmSource lm))
         `catch` (\(_ :: SomeException) -> pure [])
     let allMethodNames = Set.fromList
-            [ m | ClassDecl _ ms _ _ <- classDecls, m <- ms ]
+            [ m | ClassDecl _ ms _ _ _ <- classDecls, m <- ms ]
         methodClassPairs =
-            [ (m, [cls]) | ClassDecl cls ms _ _ <- classDecls, m <- ms ]
+            [ (m, [cls]) | ClassDecl cls ms _ _ _ <- classDecls, m <- ms ]
     modifyIORef' globalClassMethodNamesRef (Set.union allMethodNames)
     modifyIORef' globalMethodClassRef
         (Map.unionWith (\a b -> a ++ filter (`notElem` a) b)
@@ -8141,16 +8141,20 @@ resolveTypeSigMetadata mOwner requested = do
             Just (modName, bare) -> do
                 loaded <- try (loadModule registry searchPath includeMap modName)
                     :: IO (Either SomeException LoadedModule)
-                pure $ case loaded of
-                    Right lm -> Map.lookup bare (lmTypeSigs lm)
-                    Left _   -> Map.lookup modName mods >>= Map.lookup bare . lmTypeSigs
+                case loaded of
+                    Right lm -> snd <$> lookupOwnedSig lm bare
+                    Left _ -> case Map.lookup modName mods of
+                        Just lm -> snd <$> lookupOwnedSig lm bare
+                        Nothing -> pure Nothing
 
     resolveFromOwner registry searchPath includeMap seen owner name
         | Set.member (lmName owner) seen = pure Nothing
-        | otherwise =
-            case Map.lookup name (lmTypeSigs owner) of
-                Just scheme -> pure (Just scheme)
-                Nothing -> do
+        | otherwise = do
+            (declaredHere, localScheme) <- lookupOwnedSig owner name
+            case (declaredHere, localScheme) of
+                (_, Just scheme) -> pure (Just scheme)
+                (True, Nothing) -> pure Nothing
+                (False, Nothing) -> do
                     let seen' = Set.insert (lmName owner) seen
                         (mQual, bare) = case splitAtLastDot name of
                             Just pair -> (Just (fst pair), snd pair)
@@ -8173,9 +8177,12 @@ resolveTypeSigMetadata mOwner requested = do
                 Left _ -> pure []
                 Right target
                     | not (exportsName target bare) -> pure []
-                    | otherwise -> case Map.lookup bare (lmTypeSigs target) of
-                        Just scheme -> pure [scheme]
-                        Nothing -> do
+                    | otherwise -> do
+                        (declaredThere, targetScheme) <- lookupOwnedSig target bare
+                        case (declaredThere, targetScheme) of
+                          (_, Just scheme) -> pure [scheme]
+                          (True, Nothing) -> pure []
+                          (False, Nothing) -> do
                             nested <- resolveFromOwner registry searchPath includeMap seen' target bare
                             pure (maybe [] pure nested)
 
@@ -8186,6 +8193,21 @@ resolveTypeSigMetadata mOwner requested = do
     selectCompatible schemes@(scheme:_) = do
         compatible <- schemesHaveCommonInstance schemes
         pure (if compatible then Just scheme else Nothing)
+
+    -- Class method declarations deliberately remain out of the flat global
+    -- signature registry: bare method names collide pervasively across
+    -- unrelated modules.  Resolve them only while walking a concrete owner's
+    -- lexical scope.
+    lookupOwnedSig lm name = do
+        decls <- scanClassDecls (lmSource lm)
+            `catch` (\(_ :: SomeException) -> pure [])
+        let candidates = maybe [] pure (Map.lookup name (lmTypeSigs lm)) ++
+                [ scheme
+                | decl <- decls
+                , Just scheme <- [Map.lookup name (classMethodSchemes decl)]
+                ]
+        selected <- selectCompatible candidates
+        pure (not (null candidates), selected)
 
     splitAtLastDot name = case BC.elemIndexEnd '.' name of
         Just i | i > 0, i + 1 < BC.length name ->
@@ -8797,7 +8819,7 @@ resolveFallbackSource mOwner name = do
         declaresMethod = do
             decls <- scanClassDecls (lmSource owner)
                 `catch` (\(_ :: SomeException) -> pure [])
-            pure (any (\(ClassDecl cls methods _ _) ->
+            pure (any (\(ClassDecl cls methods _ _ _) ->
                         cls `elem` classes && bareName `elem` methods)
                       decls)
 
@@ -9295,7 +9317,7 @@ resolveFallbackSource mOwner name = do
             -- elaborator-driven; raw 'EVar' bodies skip elaboration).
             classMethods =
                 [ method
-                | ClassDecl _ methods _ _ <- classDecls
+                | ClassDecl _ methods _ _ _ <- classDecls
                 , method <- methods
                 , not (HashMap.member method baseEnv)
                 ]
@@ -9440,7 +9462,7 @@ resolveFallbackSource mOwner name = do
             `catch` (\(_ :: SomeException) -> pure [])
         let localClassMethods = Set.fromList
                 [ method
-                | ClassDecl _ methods _ _ <- classDecls
+                | ClassDecl _ methods _ _ _ <- classDecls
                 , method <- methods
                 ]
             candidates =
@@ -9534,7 +9556,7 @@ resolveFallbackSource mOwner name = do
 
     tryClassMethodSlot owner bareName = do
         decls <- scanClassDecls (lmSource owner)
-        case [ cls | ClassDecl cls methods _ _ <- decls, bareName `elem` methods ] of
+        case [ cls | ClassDecl cls methods _ _ _ <- decls, bareName `elem` methods ] of
             []      -> pure Nothing
             (cls:_) -> do
                 mSharedReg <- getSharedClassReg legacyHooks
@@ -10716,7 +10738,7 @@ _resolveImportShallow registry searchPath includeMap lm name = do
     exportsClassMethod targetLm methodName = do
         decls <- scanClassDecls (lmSource targetLm)
         let matches = [ ()
-                      | ClassDecl cn ms _ _ <- decls
+                      | ClassDecl cn ms _ _ _ <- decls
                       , methodName `elem` ms
                       , case mhExports (lmHeader targetLm) of
                           ExportAll -> True
@@ -10880,7 +10902,7 @@ resolveImport' registry searchPath includeMap lm name = do
         decls <- scanClassDecls (lmSource targetLm)
         let classes =
                 [ (className, methods)
-                | ClassDecl className methods _ _ <- decls
+                | ClassDecl className methods _ _ _ <- decls
                 , methodName `elem` methods
                 ]
             exportedBy className methods = case mhExports (lmHeader targetLm) of
