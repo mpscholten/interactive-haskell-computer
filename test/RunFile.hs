@@ -576,6 +576,8 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         predicateClass explicit `shouldBe` Just "CB"
         _ <- resolveTypeSigMetadata Nothing "OwnerHidden.markerHidden"
         resolveTypeSigMetadata (Just "OwnerHidden") "pick" `shouldReturn` Nothing
+        _ <- resolveTypeSigMetadata Nothing "OwnerImportHiding.markerImportHiding"
+        resolveTypeSigMetadata (Just "OwnerImportHiding") "pick" `shouldReturn` Nothing
         _ <- resolveTypeSigMetadata Nothing "OwnerAmbiguous.markerAmbiguous"
         resolveTypeSigMetadata (Just "OwnerAmbiguous") "pick" `shouldReturn` Nothing
 
