@@ -333,8 +333,19 @@ decodeLit v =
 
 decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
+decodeName (VCon "Name" [occT, flavourT]) = do
+    occ <- force legacyHooks occT >>= decodeName
+    flavour <- force legacyHooks flavourT
+    case flavour of
+        VCon "NameQ" [modT] -> do
+            modu <- force legacyHooks modT >>= decodeName
+            pure (modu <> "." <> occ)
+        VCon "NameG" [_spaceT, _pkgT, modT] -> do
+            modu <- force legacyHooks modT >>= decodeName
+            pure (modu <> "." <> occ)
+        _ -> pure occ
 decodeName (VCon "Name" [nT]) = do
-    -- @VCon "Name" [VStr bs]@ — the shape produced by 'mkNameBuiltin'.
+    -- Legacy compiler-created one-field name representation.
     nV <- force legacyHooks nT
     case nV of
         VStr bs    -> pure bs
@@ -345,6 +356,8 @@ decodeName (VCon "NameU" [nT]) = do
 decodeName (VCon "NameS" [nT]) = do
     nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon "OccName" [nT]) = do
+    nV <- force legacyHooks nT; decodeName nV
+decodeName (VCon "ModName" [nT]) = do
     nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon n _) = pure n   -- sometimes names are stored as VCon tag
 decodeName v = throwTH ("decodeName: expected VStr, got " <> showValForDebug v)
@@ -392,7 +405,7 @@ expandSplicesInExpr env ipm depth expr
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval legacyHooks env ipm innerExpanded >>= unwrapOneQ
+        thVal <- eval legacyHooks env ipm (annotateQMethods innerExpanded) >>= unwrapOneQ
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -541,7 +554,6 @@ thBuiltinPairs =
     -- Phase 2.13: Q monad + Name primitives for top-level splices.
     , ("mkName",                              mkNameBuiltin)
     , ("Language.Haskell.TH.mkName",          mkNameBuiltin)
-    , ("Language.Haskell.TH.Syntax.mkName",   mkNameBuiltin)
     , ("newName",                             newNameBuiltin)
     , ("Language.Haskell.TH.newName",         newNameBuiltin)
     , ("Language.Haskell.TH.Syntax.newName",  newNameBuiltin)
@@ -740,9 +752,8 @@ locFieldBuiltin fieldName idx = pure $ VFun $ \locT -> do
 --
 -- The @Q@ monad is represented as @VIO@ at the Val level.  It is simply a
 -- suspended @IO Val@ action; the @return@/@>>=@ machinery is whatever the
--- interpreter uses for plain @IO@.  We encode Template Haskell Names as
--- @VCon "Name" [VStr bytes]@ to match the constructor that the decoder
--- expects.
+-- interpreter uses for plain @IO@. Compiler-created names are decoded at the
+-- boundary; ordinary name construction is interpreted from Syntax.hs.
 --------------------------------------------------------------------------------
 
 -- | Global counter for 'newName'. Reset once per load via
@@ -754,7 +765,8 @@ newNameCounterRef = unsafePerformIO (newIORef 0)
 resetNewNameCounter :: IO ()
 resetNewNameCounter = writeIORef newNameCounterRef 0
 
--- | @mkName :: String -> Name@.  Returns @VCon "Name" [VStr bytes]@.
+-- | Compatibility export for the still-host-backed TH facade. Direct Syntax
+-- imports use the source implementation.
 mkNameBuiltin :: IO Val
 mkNameBuiltin = pure $ VFun $ \argT -> do
     v <- force legacyHooks argT
@@ -867,7 +879,7 @@ valToBytes v = do
 -- a list of @(name, body)@ top-level bindings.
 thExpandSpliceDecl :: Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
 thExpandSpliceDecl env ipm spliceExpr = do
-    v0 <- eval legacyHooks env ipm spliceExpr
+    v0 <- eval legacyHooks env ipm (annotateQMethods spliceExpr)
     decsVal <- unwrapQ v0
     thDecsToBindings decsVal
 
@@ -875,6 +887,43 @@ thExpandSpliceDecl env ipm spliceExpr = do
 unwrapQ :: Val -> IO Val
 unwrapQ (VIO act) = act >>= unwrapQ
 unwrapQ v         = pure v
+
+-- | A splice has an implicit @Q@ result context even though optimistic mode
+-- does not typecheck it. Preserve that compiler-known fact by attaching the Q
+-- instance tag to otherwise ambiguous class methods, including inside local
+-- helper bindings wrapped around a top-level splice.
+annotateQMethods :: Expr -> Expr
+annotateQMethods = go
+  where
+    go (EVar "pure")   = ETypedMethod "Applicative" "pure" "Q"
+    go (EVar "<*>")    = ETypedMethod "Applicative" "<*>" "Q"
+    go (EVar "*>")     = ETypedMethod "Applicative" "*>" "Q"
+    go (EVar "fmap")   = ETypedMethod "Functor" "fmap" "Q"
+    go (EVar ">>=")    = ETypedMethod "Monad" ">>=" "Q"
+    go (EVar ">>")     = ETypedMethod "Monad" ">>" "Q"
+    go (EVar "return") = ETypedMethod "Monad" "return" "Q"
+    go (EApp f x) = EApp (go f) (go x)
+    go (ELam n e) = ELam n (go e)
+    go (ELet bs e) = ELet [(n, go b) | (n, b) <- bs] (go e)
+    go (ECase e alts) = ECase (go e) [Alt p (go b) | Alt p b <- alts]
+    go (EIf c t f) = EIf (go c) (go t) (go f)
+    go (EDo ss) = EDo (map goStmt ss)
+    go (ENeg e) = ENeg (go e)
+    go (ETuple es) = ETuple (map go es)
+    go (EImplicitLet bs e) = EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
+    go (ERecordCon n fs) = ERecordCon n [(f, go e) | (f, e) <- fs]
+    go (ERecordUpdate e fs) = ERecordUpdate (go e) [(f, go x) | (f, x) <- fs]
+    go (ESplice e) = ESplice (go e)
+    go (EQuote e) = EQuote e
+    go (ETyApp e ty) = ETyApp (go e) ty
+    go (EConstrainedValue e cs) = EConstrainedValue (go e) cs
+    go e = e
+
+    goStmt (SExpr e) = SExpr (go e)
+    goStmt (SBind n e) = SBind n (go e)
+    goStmt (SBangBind n e) = SBangBind n (go e)
+    goStmt (SLet bs) = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Decode @[Dec]@ → @[(Name, Expr)]@.
 thDecsToBindings :: Val -> IO [(Name, Expr)]

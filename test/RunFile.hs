@@ -943,6 +943,16 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "TemplateHaskell\nQualifiedDo\n"
 
+    it "source TH Q pure crosses the Quasi IO splice boundary" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_syntax_q_bridge.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "6\n"
+
+    it "TH CodeDo operators execute from package source" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_codedo_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "CodeDo\n"
+
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------
