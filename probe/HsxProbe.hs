@@ -144,6 +144,7 @@ exprSubtrees e = e : case e of
     ELabel{}                  -> []
     ETyApp x _                -> exprSubtrees x
     ETypedMethod{}            -> []
+    EConstrainedValue x _     -> exprSubtrees x
     EGuardFail                -> []
   where
     stmtSubtrees (SExpr x)          = exprSubtrees x
