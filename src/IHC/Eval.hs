@@ -3053,13 +3053,13 @@ evalQuote hooks env ipm (ETuple es) = do
         pure (VCon ":" [x, tailT])
 -- Antiquotation: evaluate the hole in the lexical environment of the
 -- quotation.  A splice expression conventionally has type @Q Exp@, which
--- IHC represents as a (possibly nested) VIO wrapper around the TH Exp tree.
+-- IHC represents as one VIO wrapper around the TH Exp tree.
 evalQuote hooks env ipm (ESplice hole) = do
     value <- eval hooks env ipm hole
-    unwrapQuoteSplice value
+    unwrapOneQuoteSplice value
   where
-    unwrapQuoteSplice (VIO action) = action >>= unwrapQuoteSplice
-    unwrapQuoteSplice value        = pure value
+    unwrapOneQuoteSplice (VIO action) = action
+    unwrapOneQuoteSplice value        = pure value
 -- Unsupported forms: emit a VarE "<unsupported>" placeholder.
 evalQuote _hooks _env _ipm _ = do
     nt <- newWHNFThunk (VStr "<unsupported>")
