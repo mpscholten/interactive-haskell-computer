@@ -27,6 +27,7 @@ module IHC.Eval
     ) where
 
 import Control.Exception (throwIO)
+import Control.Applicative ((<|>))
 import Control.Concurrent (myThreadId, yield)
 import Control.Monad (foldM)
 import Data.ByteString (ByteString)
@@ -58,6 +59,19 @@ import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
+
+constraintVariableKey :: Name -> Name -> Name
+constraintVariableKey cls var =
+    BC.pack "$$dict-var:" <> cls <> BC.pack ":" <> var
+
+constraintPendingKey :: Name -> Name -> Name
+constraintPendingKey cls var =
+    BC.pack "$$dict-pending:" <> cls <> BC.pack ":" <> var
+
+lookupConstraintDictionary :: Name -> Name -> ImplicitParamMap -> Maybe Thunk
+lookupConstraintDictionary cls var ipm =
+    lookupIPMap (constraintVariableKey cls var) ipm
+    <|> lookupIPMap (dictionaryContextKey cls) ipm
 
 --------------------------------------------------------------------------------
 -- force
@@ -623,7 +637,7 @@ eval hooks env ipm = go
                 case instanceTags of
                     (candidate:_)
                       | isRuntimeTypeVariable candidate
-                      , Just tagT <- lookupIPMap (dictionaryContextKey cls) ipm -> do
+                      , Just tagT <- lookupConstraintDictionary cls candidate ipm -> do
                             tagV <- force hooks tagT
                             case tagV of
                                 VStr tag -> do
@@ -636,24 +650,34 @@ eval hooks env ipm = go
                                                   (forceMethodVal hooks) mMethod
                                 _ -> pure (VClassMethod cls m slot [] fn)
                     _ -> pure (VClassMethod cls m slot (map normalizeTyTag instanceTags) fn)
-            VFunIP lexicalIP f -> pure $ VFunIP lexicalIP $ \callerIP argT -> do
-                argV <- force hooks argT
-                dictIP <- dictionaryContext constraints argV
-                -- A wrapper such as @typeRep :: Typeable a => proxy a -> ...@
-                -- cannot recover @a@ from the erased proxy value. Preserve a
-                -- dictionary supplied by its constrained caller; only infer
-                -- from the runtime argument when no such dictionary exists.
-                f (Map.union callerIP dictIP) argT
+            VFunIP lexicalIP f -> do
+                metadata <- constraintMetadata constraints
+                pure $ VFunIP (Map.union metadata lexicalIP) $ \callerIP argT -> do
+                    argV <- force hooks argT
+                    dictIP <- dictionaryContext constraints argV
+                    -- A wrapper such as @typeRep :: Typeable a => proxy a -> ...@
+                    -- cannot recover @a@ from the erased proxy value. Preserve a
+                    -- dictionary supplied by its constrained caller; only infer
+                    -- from the runtime argument when no such dictionary exists.
+                    f (Map.union callerIP dictIP) argT
             _ -> pure v
       where
-        dictionaryContext cs argV = Map.fromList <$> mapM (one (typeTagOf argV)) cs
+        constraintMetadata cs = Map.fromList <$> mapM oneMeta cs
+        oneMeta (cls, tags) = do
+            markerT <- newWHNFThunk (VStr cls)
+            pure (constraintPendingKey cls (firstTag tags), markerT)
+        dictionaryContext cs argV = Map.fromList . concat <$> mapM (one (typeTagOf argV)) cs
         one runtimeTag (cls, tags) = do
             let tag = case tags of
                     (candidate:_) | isRuntimeTypeVariable candidate -> runtimeTag
                     (candidate:_) -> normalizeTyTag candidate
                     [] -> runtimeTag
             tagT <- newWHNFThunk (VStr tag)
-            pure (dictionaryContextKey cls, tagT)
+            pure [ (dictionaryContextKey cls, tagT)
+                 , (constraintVariableKey cls (firstTag tags), tagT)
+                 ]
+        firstTag (tag:_) = tag
+        firstTag [] = BC.empty
         isRuntimeTypeVariable tag = case BC.uncons tag of
             Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
             Nothing -> True
@@ -853,7 +877,8 @@ eval hooks env ipm = go
     goTyApp e ty
         | isTypeLitsFn e = pure (tyAppLitsClosure (headName e) ty)
         | otherwise      = do
-            v <- go e
+            mTypeable <- tryTypedTypeable e ty
+            v <- maybe (go e) pure mTypeable
             case v of
                 VCon "Proxy" [] -> attachProxyType ty
                 -- Multi-key class dispatch: @setField \@\"name\" \@User \@String@
@@ -868,9 +893,26 @@ eval hooks env ipm = go
                 -- context until the constrained source closure is applied.
                 VFunIP lexicalIP f -> do
                     tagT <- newWHNFThunk (VStr (normalizeTyTag ty))
-                    let typedIP = Map.singleton
-                            (dictionaryContextKey (BC.pack "Typeable")) tagT
-                    pure $ VFunIP lexicalIP $ \callerIP argT ->
+                    let typeable = BC.pack "Typeable"
+                        pendingPrefix = constraintPendingKey typeable BC.empty
+                        pendingVars =
+                            [ BC.drop (BC.length pendingPrefix) key
+                            | key <- Map.keys lexicalIP
+                            , pendingPrefix `BS.isPrefixOf` key
+                            ]
+                        nextVar = case filter
+                            (\var -> Map.notMember
+                                (constraintVariableKey typeable var) lexicalIP)
+                            pendingVars of
+                                var:_ -> Just var
+                                [] -> Nothing
+                        typedPairs =
+                            (dictionaryContextKey typeable, tagT) : case nextVar of
+                                Just var -> [(constraintVariableKey typeable var, tagT)]
+                                Nothing -> []
+                        typedIP = Map.fromList typedPairs
+                        lexicalIP' = Map.union typedIP lexicalIP
+                    pure $ VFunIP lexicalIP' $ \callerIP argT ->
                         f (Map.union typedIP callerIP) argT
                 -- IsLabel dispatch: @(#email :: Wrap)@ should behave like
                 -- @fromLabel \@"email" \@Wrap@.  We have no typechecker, so
@@ -902,6 +944,40 @@ eval hooks env ipm = go
                     | Just resultTy <- ioResultAnnotation ty ->
                         pure (VIO (action >>= applyIOResultAnnotation resultTy))
                 _               -> applyNumericTyAnnotation ty v
+
+    tryTypedTypeable expr ty
+        | Just method <- headName expr
+        , lastNameComponent method `elem` map BC.pack ["typeRep", "typeRep#"] = do
+            let cls = BC.pack "Typeable"
+                evidenceTy = case reverse (BC.words ty) of
+                    candidate:_ | isRuntimeTypeVariable candidate -> candidate
+                    _ -> ty
+            mTag <- if isRuntimeTypeVariable evidenceTy
+                then case lookupConstraintDictionary cls evidenceTy ipm of
+                    Just tagT -> do
+                        tagV <- force hooks tagT
+                        pure $ case tagV of
+                            VStr tag -> Just tag
+                            _ -> Nothing
+                    Nothing -> pure Nothing
+                else pure (Just (normalizeTyTag ty))
+            case mTag of
+                Nothing -> pure Nothing
+                Just tag -> do
+                    mReg <- getSharedClassReg hooks
+                    case mReg of
+                        Nothing -> pure Nothing
+                        Just reg -> do
+                            methodV <- lookupInstanceMethod reg cls tag (BC.pack "typeRep#")
+                            traverse (forceMethodVal hooks) methodV
+        | otherwise = pure Nothing
+      where
+        lastNameComponent name = case BC.elemIndexEnd '.' name of
+            Just i -> BC.drop (i + 1) name
+            Nothing -> name
+        isRuntimeTypeVariable tag = case BC.uncons tag of
+            Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
+            Nothing -> True
 
     tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
     tryTypedPeek e ty =

@@ -1569,8 +1569,6 @@ builtins reg =
     -- dictionaries. GHC.Internal.Data.Typeable.Internal defines the ordinary
     -- `typeRep = typeRep#` wrapper in source.
     , ("typeRep#",       pure (typeRepHashDispatcher reg))
-    , ("typeOf",         typeOfB)
-    , ("cast",           castB)
     , ("eqT",            eqTB)
     , ("mkTyCon3",       mkTyCon3B)
     , ("mkTyConApp",     mkTyConAppB)
@@ -7085,21 +7083,6 @@ runStateTransformer stateFnT = do
 --   Dynamic  = VCon "Dynamic"  [typeRepThunk, valThunk]
 --   Typeable dict = VCon "Dict_Typeable" [typeRepThunk]
 
-typeOfB :: IO Val
-typeOfB = pure $ VFun $ \dictT -> pure $ VFun $ \_valT -> do
-    dictV <- force legacyHooks dictT
-    extractTypeRep dictV
-
-castB :: IO Val
-castB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> pure $ VFun $ \valT -> do
-    dictAV <- force legacyHooks dictAT
-    dictBV <- force legacyHooks dictBT
-    trA    <- extractTypeRep dictAV
-    trB    <- extractTypeRep dictBV
-    eq     <- typeRepEq trA trB
-    if eq then pure (VCon "Just" [valT])
-          else pure (VCon "Nothing" [])
-
 eqTB :: IO Val
 eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do
     dictAV <- force legacyHooks dictAT
@@ -7125,7 +7108,6 @@ mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
     argsThunk  <- newWHNFThunk argsV
     pure (VCon "TypeRep" [tyConThunk, argsThunk])
 
--- | Extract a TypeRep from a Typeable dict or raw TypeRep value.
 extractTypeRep :: Val -> IO Val
 extractTypeRep (VCon "Dict_Typeable" [trT]) = force legacyHooks trT
 extractTypeRep v@(VCon "TrType" _)          = pure v
