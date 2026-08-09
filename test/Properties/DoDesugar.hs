@@ -50,6 +50,7 @@ import Test.QuickCheck
     , ioProperty
     , oneof
     , property
+    , scale
     , vectorOf
     , (===)
     )
@@ -98,7 +99,13 @@ genLetBindings = do
 -- parseDo header), so the parser routes the block through
 -- monadicDo — the path mirrored by 'desugarDo'.
 genStmts :: Gen [Stmt]
-genStmts = do
+-- QuickCheck's global size reaches 100 during a 500-case run. 'genExpr'
+-- branches recursively, and this property generates several expressions per
+-- case, so an unlucky seed could construct an exponentially large AST and
+-- spend hours (or 8 GB of heap) rendering the counterexample. Size 12 still
+-- exercises every expression and statement constructor across 500 cases,
+-- while placing a deterministic bound on each generated do-block.
+genStmts = scale (min 12) $ do
     leadingK  <- choose (0, 2)
     leading   <- vectorOf leadingK genStmt
     middle    <- SExpr <$> genExpr
