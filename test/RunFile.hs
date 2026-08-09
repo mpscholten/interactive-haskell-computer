@@ -499,6 +499,29 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "GET\nDELETE\n"
 
+    it "module: expected-type metadata is scoped to the defining import owner" do
+        -- ProviderAlpha.pick and ProviderBeta.pick have incompatible nullary
+        -- signatures.  Loading both must not make either owner use the other
+        -- provider's expected type when elaborating minBound.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/type_sig_owner_scope/MainQualified.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "AlphaFirst\nBetaFirst\n"
+
+    it "module: owner-scoped signature metadata cache is isolated across run order" do
+        let root = "test/Fixtures/Coverage/Modules/type_sig_owner_scope"
+        -- Exercise both cache population orders in one process.  A cache keyed
+        -- only by the bare name `pick` makes the second owner order-dependent.
+        (na1, oa1) <- captureStdout (runMainWithSiblings (root </> "MainAlpha.hs"))
+        (nb1, ob1) <- captureStdout (runMainWithSiblings (root </> "MainBeta.hs"))
+        (nb2, ob2) <- captureStdout (runMainWithSiblings (root </> "MainBeta.hs"))
+        (na2, oa2) <- captureStdout (runMainWithSiblings (root </> "MainAlpha.hs"))
+        (na1, oa1) `shouldBe` (0, "AlphaFirst\n")
+        (nb1, ob1) `shouldBe` (0, "BetaFirst\n")
+        (nb2, ob2) `shouldBe` (0, "BetaFirst\n")
+        (na2, oa2) `shouldBe` (0, "AlphaFirst\n")
+
     it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do
         -- Regression for the warp hello-world startup crash: loading
         -- 'GHC.Event.KQueue' (Darwin's event backend, whose 'Event' record
