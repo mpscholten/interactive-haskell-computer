@@ -40,6 +40,7 @@ module IHC.Scheduler
     , freeVars
     , splitQualified
     , schemesCompatible
+    , schemesHaveCommonInstance
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
@@ -128,7 +129,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -7568,14 +7569,14 @@ loadModuleSlow registry searchPath includeMap name = do
                             triggerRegisterInstances legacyHooks name
                             pure lm
 
--- | Bundle of the nine module-level per-run scheduler state IORefs:
--- the loaded-module catalogue, search path / include map, the four
--- env-fallback caches, and the two import-resolution negative caches.
+-- | Bundle of the module-level per-run scheduler state IORefs: the
+-- loaded-module catalogue, search path / include map, env-fallback caches,
+-- type-signature metadata cache, and import-resolution negative caches.
 --
 -- Allocated once via the 'legacySchedulerRunState' CAF below.  The
--- nine legacy ref names that the rest of the codebase uses
+-- legacy ref names that the rest of the codebase uses
 -- ('globalLoadedModulesRef', 'globalSearchPathRef', etc.) are now
--- field-projection accessors on this single record, so the nine
+-- field-projection accessors on this single record, so the former
 -- separate 'unsafePerformIO + IORef + NOINLINE' globals collapse
 -- into one allocation.
 data LegacySchedulerRunState = LegacySchedulerRunState
@@ -7587,11 +7588,12 @@ data LegacySchedulerRunState = LegacySchedulerRunState
     , lsrsEnvRawBuiltins      :: !(IORef Env)
     , lsrsEnvFallbackNegCache :: !(IORef (Int, Set (Maybe ByteString, ByteString)))
     , lsrsEnvFallbackCacheGen :: !(IORef Int)
+    , lsrsTypeSigMetadataCache :: !(IORef (Int, Map (Maybe ByteString, ByteString) (Maybe Scheme)))
     , lsrsDiscoverNegCache    :: !(IORef (Set (ByteString, ByteString)))
     , lsrsResolveImportCache  :: !(IORef (Map (ByteString, ByteString) (Maybe ModuleName)))
     }
 
--- | One-shot allocation of the nine scheduler per-run IORefs.  Same
+-- | One-shot allocation of the scheduler per-run IORefs.  Same
 -- defaults the legacy individual @{-# NOINLINE #-}@ refs used: empty
 -- 'Map'/'Set'/'List'/'HashMap' or 'Int' 0 as appropriate.
 {-# NOINLINE legacySchedulerRunState #-}
@@ -7605,6 +7607,7 @@ legacySchedulerRunState = unsafePerformIO $ do
     fbRawBuiltins <- newIORef HashMap.empty
     fbNeg        <- newIORef (0, Set.empty)
     fbGen        <- newIORef 0
+    typeSigCache <- newIORef (0, Map.empty)
     discoverNeg  <- newIORef Set.empty
     resolveCache <- newIORef Map.empty
     pure LegacySchedulerRunState
@@ -7616,6 +7619,7 @@ legacySchedulerRunState = unsafePerformIO $ do
         , lsrsEnvRawBuiltins      = fbRawBuiltins
         , lsrsEnvFallbackNegCache = fbNeg
         , lsrsEnvFallbackCacheGen = fbGen
+        , lsrsTypeSigMetadataCache = typeSigCache
         , lsrsDiscoverNegCache    = discoverNeg
         , lsrsResolveImportCache  = resolveCache
         }
@@ -7708,6 +7712,7 @@ resetPerRunGlobals = do
     writeIORef envFallbackCache       Map.empty
     writeIORef envFallbackNegCacheRef (0, Set.empty)
     writeIORef envFallbackCacheGenRef 0
+    writeIORef typeSigMetadataCacheRef (0, Map.empty)
     writeIORef envBaseForFallbackRef  HashMap.empty
     writeIORef envRawBuiltinsForFallbackRef HashMap.empty
     writeIORef globalTypeSigsRef      Map.empty
@@ -7836,9 +7841,54 @@ schemesCompatible s1 s2 = do
         Right _ -> True
         Left _  -> False
 
+-- | Do all schemes share one common type instance?  Pairwise unifiability is
+-- not sufficient for three or more candidates: @Pair a a@, @Pair Int b@ and
+-- @Pair c Bool@ unify in every pair, but cannot all denote the same type.
+-- Instantiate every scheme from one fresh source (giving each disjoint
+-- variables), then progressively refine a representative with each MGU.
+schemesHaveCommonInstance :: [Scheme] -> IO Bool
+schemesHaveCommonInstance [] = pure True
+schemesHaveCommonInstance schemes = do
+    fs <- TU.newFreshSource
+    instances <- mapM (TU.instantiate fs) schemes
+    pure $ case instances of
+        [] -> True
+        (preds, representative) : rest -> go representative [preds] rest
+  where
+    go _ predicateGroups [] = allContextsEquivalent predicateGroups
+    go representative predicateGroups ((candidatePreds, candidate) : rest) =
+        case TU.mgu representative candidate of
+            Left _ -> False
+            Right sub ->
+                go (applySubst sub representative)
+                   (map (map (applySubstPred sub)) (predicateGroups ++ [candidatePreds]))
+                   rest
+
+    -- Context order is irrelevant, but multiplicity is retained.  Exact
+    -- equality after body unification is intentionally conservative: class
+    -- entailment is not available in this metadata-only path, so distinct
+    -- constraints must remain ambiguous rather than selecting the first.
+    allContextsEquivalent [] = True
+    allContextsEquivalent (context : rest) = all (sameContext context) rest
+
+    sameContext left right = consume left right
+      where
+        consume [] [] = True
+        consume [] _  = False
+        consume (p:ps) candidates = case removeFirst p candidates of
+            Nothing -> False
+            Just remaining -> consume ps remaining
+
+        removeFirst :: Pred -> [Pred] -> Maybe [Pred]
+        removeFirst _ [] = Nothing
+        removeFirst wanted (p:ps)
+            | wanted == p = Just ps
+            | otherwise = (p :) <$> removeFirst wanted ps
+
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
+    bumpTypeSigMetadataGen
     -- Bump the env-fallback generation: a previously-cached "Nothing"
     -- might now resolve via this module.
     bumpEnvFallbackGen
@@ -7998,6 +8048,7 @@ mergeGlobalLoadedModules newMods
     | otherwise = do
         modifyIORef' globalLoadedModulesRef (Map.union newMods)
         bumpEnvFallbackGen
+        bumpTypeSigMetadataGen
 
 -- | Insert a body into a module's 'lmBodies' and bump the env-fallback
 -- generation.  Centralised so the negative cache invalidates whenever
@@ -8044,16 +8095,46 @@ installTypeSigFallbackHook :: IO ()
 installTypeSigFallbackHook =
     setTypeSigFallback legacyHooks resolveTypeSigMetadata
 
+-- | Owner-scoped signature metadata memo.  Both hits and misses are cached:
+-- elaboration asks for the same callee at every application node, and walking
+-- an owner's re-export graph repeatedly is otherwise surprisingly expensive.
+-- The generation changes only when module metadata enters the global
+-- catalogue (body discovery deliberately does not invalidate this cache).
+typeSigMetadataCacheRef :: IORef (Int, Map (Maybe ByteString, ByteString) (Maybe Scheme))
+typeSigMetadataCacheRef = lsrsTypeSigMetadataCache legacySchedulerRunState
+
+bumpTypeSigMetadataGen :: IO ()
+bumpTypeSigMetadataGen = atomicModifyIORef' typeSigMetadataCacheRef $ \(gen, _) ->
+    ((gen + 1, Map.empty), ())
+
 resolveTypeSigMetadata :: Maybe ByteString -> ByteString -> IO (Maybe Scheme)
 resolveTypeSigMetadata mOwner requested = do
-    mods <- readIORef globalLoadedModulesRef
-    searchPath <- readIORef globalSearchPathRef
-    includeMap <- readIORef globalIncludeMapRef
-    registry <- newIORef (Map.map Loaded mods)
-    case mOwner >>= (`Map.lookup` mods) of
-        Nothing -> resolveQualified registry searchPath includeMap mods requested
-        Just owner -> resolveFromOwner registry searchPath includeMap Set.empty owner requested
+    (gen, cache) <- readIORef typeSigMetadataCacheRef
+    let key = (mOwner, requested)
+    case Map.lookup key cache of
+      Just result -> pure result
+      Nothing -> do
+        result <- resolveUncached
+        -- Loading metadata during resolution may advance the generation.  An
+        -- answer computed from the old catalogue must never be labelled with
+        -- the new generation: retry against the expanded catalogue first.
+        stored <- atomicModifyIORef' typeSigMetadataCacheRef $ \current@(gen', cache') ->
+            if gen' == gen
+                then ((gen, Map.insert key result cache'), True)
+                else (current, False)
+        if stored
+            then pure result
+            else resolveTypeSigMetadata mOwner requested
   where
+    resolveUncached = do
+        mods <- readIORef globalLoadedModulesRef
+        searchPath <- readIORef globalSearchPathRef
+        includeMap <- readIORef globalIncludeMapRef
+        registry <- newIORef (Map.map Loaded mods)
+        case mOwner >>= (`Map.lookup` mods) of
+            Nothing -> resolveQualified registry searchPath includeMap mods requested
+            Just owner -> resolveFromOwner registry searchPath includeMap Set.empty owner requested
+
     resolveQualified registry searchPath includeMap mods name =
         case splitAtLastDot name of
             Nothing -> pure Nothing
@@ -8082,23 +8163,29 @@ resolveTypeSigMetadata mOwner requested = do
                                 Nothing -> not (impQualified imp)
                                 Just q  -> q == fromMaybe (impModule imp) (impAlias imp)
                             ]
-                    firstImport seen' bare imports
+                    candidates <- concat <$> mapM (fromImport seen' bare) imports
+                    selectCompatible candidates
       where
-        firstImport _ _ [] = pure Nothing
-        firstImport seen' bare (imp:rest) = do
+        fromImport seen' bare imp = do
             loaded <- try (loadModule registry searchPath includeMap (impModule imp))
                 :: IO (Either SomeException LoadedModule)
             case loaded of
-                Left _ -> firstImport seen' bare rest
+                Left _ -> pure []
                 Right target
-                    | not (exportsName target bare) -> firstImport seen' bare rest
+                    | not (exportsName target bare) -> pure []
                     | otherwise -> case Map.lookup bare (lmTypeSigs target) of
-                        Just scheme -> pure (Just scheme)
+                        Just scheme -> pure [scheme]
                         Nothing -> do
                             nested <- resolveFromOwner registry searchPath includeMap seen' target bare
-                            case nested of
-                                Just scheme -> pure (Just scheme)
-                                Nothing     -> firstImport seen' bare rest
+                            pure (maybe [] pure nested)
+
+    -- Import order must never decide between two incompatible visible names.
+    -- Compatible re-exports/specialisations are safe: they agree on a common
+    -- instantiation, matching the global ambiguity rule above.
+    selectCompatible [] = pure Nothing
+    selectCompatible schemes@(scheme:_) = do
+        compatible <- schemesHaveCommonInstance schemes
+        pure (if compatible then Just scheme else Nothing)
 
     splitAtLastDot name = case BC.elemIndexEnd '.' name of
         Just i | i > 0, i + 1 < BC.length name ->

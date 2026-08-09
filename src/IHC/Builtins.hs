@@ -774,6 +774,10 @@ builtins reg =
     , ("minusAddr#",  minusAddrB)
     , ("addr2Int#",   addr2IntB)
     , ("indexCharOffAddr#", indexCharOffAddrHashB)
+    -- GHC.Prim.indexWord8OffAddr# is a compiler primop with no .hs body.
+    -- Source-loaded byte-oriented libraries use it for pure raw-address
+    -- reads, so it must bottom out in the interpreter's RTS memory access.
+    , ("indexWord8OffAddr#", indexWord8OffAddrHashB)
     -- Addr# comparison primops — RTS-exclusive (Addr# is unboxed; no
     -- source 'Eq Addr#' instance).  Used by the derived
     -- @instance Eq (Ptr a)@ from @data Ptr a = Ptr Addr#@'s synthesis
@@ -3842,6 +3846,21 @@ indexCharOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT -> do
             b <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
             pure (VChar (chr (fromIntegral b)))
         _ -> error ("indexCharOffAddr#: offset not an Int: "
+                    <> showValForDebug idxV)
+
+-- | @indexWord8OffAddr# :: Addr# -> Int# -> Word8#@.
+-- Genuine GHC.Prim leaf: unlike readWord8OffAddr#, this is a pure indexed
+-- read and therefore has no State# argument or unboxed-tuple result.
+indexWord8OffAddrHashB :: IO Val
+indexWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    p <- valToHostPtr addrV
+    case idxV of
+        VInt i -> do
+            b <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
+            pure (VInt (fromIntegral b))
+        _ -> error ("indexWord8OffAddr#: offset not an Int: "
                     <> showValForDebug idxV)
 
 -- | @setAddrRange# :: Addr# -> Int# -> Int# -> State# RealWorld -> State# RealWorld@

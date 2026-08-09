@@ -2,7 +2,9 @@ module RunFile (spec) where
 
 import Control.Exception (bracket_, displayException, try, SomeException)
 import Control.Monad (forM_)
+import Data.IORef
 import Data.List (isInfixOf, sort, isSuffixOf)
+import qualified Data.ByteString.Char8 as BC
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
@@ -11,15 +13,18 @@ import System.Environment (lookupEnv)
 
 import Test.Hspec
 
+import IHC.AST (Expr(..), Lit(..))
 import IHC.Classes (legacyHooks)
 import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
-import IHC.Eval (force)
+import IHC.Eval (eval, force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (emptyKnownSymbols, findBinding)
-import IHC.Scheduler (loadProgramFromSource)
+import IHC.Scheduler (loadProgramFromSource, schemesHaveCommonInstance)
 import IHC.Source (readSourceFile)
-import IHC.Val (Val(..))
+import IHC.TypeAST (Scheme(..), Type(..), Pred(..))
+import IHC.TH (thExpToExpr)
+import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk)
 
 -- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
 -- an explicit search path so imports like @import Foo@ can resolve to
@@ -62,6 +67,28 @@ captureStdout action = do
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    it "EQuote antiquotation evaluates one Q Exp hole" do
+        exp40 <- integerExpVal 40
+        holeT <- newWHNFThunk (VIO (pure exp40))
+        quoted <- eval legacyHooks (extendEnv "hole" holeT emptyEnv) emptyIPMap
+                    (EQuote (ESplice (EVar "hole")))
+        decoded <- thExpToExpr quoted
+        decoded `shouldBe` ELit (LInt 40)
+
+    it "EQuote antiquotation does not execute a nested Q layer" do
+        executions <- newIORef (0 :: Int)
+        exp40 <- integerExpVal 40
+        let inner = VIO (modifyIORef' executions (+ 1) >> pure exp40)
+            outer = VIO (modifyIORef' executions (+ 1) >> pure inner)
+        holeT <- newWHNFThunk outer
+        quoted <- eval legacyHooks (extendEnv "hole" holeT emptyEnv) emptyIPMap
+                    (EQuote (ESplice (EVar "hole")))
+        count <- readIORef executions
+        count `shouldBe` 1
+        case quoted of
+            VIO _ -> pure ()
+            _ -> expectationFailure "expected inner Q action to remain suspended"
+
     -- Regression: the scheduler used to leak state between consecutive
     -- runFile calls in the same process.  After the first call,
     -- 'globalLoadedModulesRef' was populated with ~150 modules; the
@@ -499,6 +526,50 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "GET\nDELETE\n"
 
+    it "module: expected-type metadata is scoped to the defining import owner" do
+        -- ProviderAlpha.pick and ProviderBeta.pick have incompatible nullary
+        -- signatures.  Loading both must not make either owner use the other
+        -- provider's expected type when elaborating minBound.
+        (n, out) <- captureStdout
+            (runMainWithSiblings
+                "test/Fixtures/Coverage/Modules/type_sig_owner_scope/MainQualified.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "AlphaFirst\nBetaFirst\n"
+
+    it "module: owner-scoped signature metadata cache is isolated across run order" do
+        let root = "test/Fixtures/Coverage/Modules/type_sig_owner_scope"
+        -- Exercise both cache population orders in one process.  A cache keyed
+        -- only by the bare name `pick` makes the second owner order-dependent.
+        (na1, oa1) <- captureStdout (runMainWithSiblings (root </> "MainAlpha.hs"))
+        (nb1, ob1) <- captureStdout (runMainWithSiblings (root </> "MainBeta.hs"))
+        (nb2, ob2) <- captureStdout (runMainWithSiblings (root </> "MainBeta.hs"))
+        (na2, oa2) <- captureStdout (runMainWithSiblings (root </> "MainAlpha.hs"))
+        (na1, oa1) `shouldBe` (0, "AlphaFirst\n")
+        (nb1, ob1) `shouldBe` (0, "BetaFirst\n")
+        (nb2, ob2) `shouldBe` (0, "BetaFirst\n")
+        (na2, oa2) `shouldBe` (0, "AlphaFirst\n")
+
+    it "module: three visible provider signatures require one common instance" do
+        -- These three provider signatures are pairwise unifiable, but no one
+        -- instantiation satisfies all three.  Import order must therefore not
+        -- select any of them as expected-type metadata.
+        let n = BC.pack
+            pair a b = TyApp (TyApp (TyCon (n "Pair")) a) b
+            providerA = Scheme [n "a"] [] (pair (TyVar (n "a")) (TyVar (n "a")))
+            providerB = Scheme [n "b"] [] (pair (TyCon (n "Int")) (TyVar (n "b")))
+            providerC = Scheme [n "c"] [] (pair (TyVar (n "c")) (TyCon (n "Bool")))
+        schemesHaveCommonInstance [providerA, providerB, providerC]
+            `shouldReturn` False
+
+    it "module: visible provider signatures with different constraints remain ambiguous" do
+        let n = BC.pack
+            a = TyVar (n "a")
+            body = TyArrow a (TyCon (n "String"))
+            providerShow = Scheme [n "a"] [Pred (n "Show") [a]] body
+            providerRead = Scheme [n "a"] [Pred (n "Read") [a]] body
+        schemesHaveCommonInstance [providerShow, providerRead]
+            `shouldReturn` False
+
     it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do
         -- Regression for the warp hello-world startup crash: loading
         -- 'GHC.Event.KQueue' (Darwin's event backend, whose 'Event' record
@@ -543,6 +614,10 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 "test/Fixtures/Modules/magichash_in_import_list/Main.hs")
         n   `shouldBe` 0
         out `shouldBe` "hello, ok\n"
+
+    it "primop: indexWord8OffAddr# reads unsigned bytes from Addr#" do
+        n <- runFile "test/Fixtures/Coverage/index_word8_off_addr.hs"
+        n `shouldBe` 128
 
     it "module: qualified class methods (P.negate, P.maxBound) in non-entry module" do
         (n, out) <- captureStdout
@@ -1477,3 +1552,9 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runMainWithSiblings "examples/blaze_hello/Main.hs")
         n `shouldBe` 0
         out `shouldBe` "<h1>Hello world</h1>\n"
+
+integerExpVal :: Int -> IO Val
+integerExpVal n = do
+    nT <- newWHNFThunk (VInt (fromIntegral n))
+    litT <- newWHNFThunk (VCon "IntegerL" [nT])
+    pure (VCon "LitE" [litT])

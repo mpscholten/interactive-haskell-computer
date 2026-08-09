@@ -392,7 +392,7 @@ expandSplicesInExpr env ipm depth expr
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval legacyHooks env ipm innerExpanded
+        thVal <- eval legacyHooks env ipm innerExpanded >>= unwrapOneQ
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -442,6 +442,11 @@ expandSplicesInExpr env ipm depth expr
         e' <- go e
         pure (EConstrainedValue e' constraints)
     go EGuardFail = pure EGuardFail
+
+    -- A splice consumes one Q layer.  Do not recursively execute a value of
+    -- type @Q (Q Exp)@ as though it were @Q Exp@.
+    unwrapOneQ (VIO action) = action
+    unwrapOneQ value        = pure value
 
     goAlt (Alt p e) = Alt p <$> go e
 
