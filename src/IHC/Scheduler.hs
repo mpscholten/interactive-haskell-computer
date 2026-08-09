@@ -40,6 +40,7 @@ module IHC.Scheduler
     , freeVars
     , splitQualified
     , schemesCompatible
+    , schemesHaveCommonInstance
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
@@ -128,7 +129,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), applySubst, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -7840,6 +7841,26 @@ schemesCompatible s1 s2 = do
         Right _ -> True
         Left _  -> False
 
+-- | Do all schemes share one common type instance?  Pairwise unifiability is
+-- not sufficient for three or more candidates: @Pair a a@, @Pair Int b@ and
+-- @Pair c Bool@ unify in every pair, but cannot all denote the same type.
+-- Instantiate every scheme from one fresh source (giving each disjoint
+-- variables), then progressively refine a representative with each MGU.
+schemesHaveCommonInstance :: [Scheme] -> IO Bool
+schemesHaveCommonInstance [] = pure True
+schemesHaveCommonInstance schemes = do
+    fs <- TU.newFreshSource
+    bodies <- mapM (fmap snd . TU.instantiate fs) schemes
+    pure $ case bodies of
+        [] -> True
+        representative : rest -> go representative rest
+  where
+    go _ [] = True
+    go representative (candidate : rest) =
+        case TU.mgu representative candidate of
+            Left _ -> False
+            Right sub -> go (applySubst sub representative) rest
+
 registerGlobalLoadedModule :: LoadedModule -> IO ()
 registerGlobalLoadedModule lm = do
     modifyIORef' globalLoadedModulesRef (Map.insert (lmName lm) lm)
@@ -8139,11 +8160,7 @@ resolveTypeSigMetadata mOwner requested = do
     -- instantiation, matching the global ambiguity rule above.
     selectCompatible [] = pure Nothing
     selectCompatible schemes@(scheme:_) = do
-        compatible <- and <$> mapM (uncurry schemesCompatible)
-            [ (left, right)
-            | (i, left) <- zip [(0 :: Int)..] schemes
-            , right <- drop (i + 1) schemes
-            ]
+        compatible <- schemesHaveCommonInstance schemes
         pure (if compatible then Just scheme else Nothing)
 
     splitAtLastDot name = case BC.elemIndexEnd '.' name of

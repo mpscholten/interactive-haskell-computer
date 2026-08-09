@@ -3,6 +3,7 @@ module RunFile (spec) where
 import Control.Exception (bracket_, displayException, try, SomeException)
 import Control.Monad (forM_)
 import Data.List (isInfixOf, sort, isSuffixOf)
+import qualified Data.ByteString.Char8 as BC
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
@@ -17,8 +18,9 @@ import IHC.Driver
 import IHC.Eval (force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
 import IHC.Scan (emptyKnownSymbols, findBinding)
-import IHC.Scheduler (loadProgramFromSource)
+import IHC.Scheduler (loadProgramFromSource, schemesHaveCommonInstance)
 import IHC.Source (readSourceFile)
+import IHC.TypeAST (Scheme(..), Type(..))
 import IHC.Val (Val(..))
 
 -- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
@@ -521,6 +523,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (nb1, ob1) `shouldBe` (0, "BetaFirst\n")
         (nb2, ob2) `shouldBe` (0, "BetaFirst\n")
         (na2, oa2) `shouldBe` (0, "AlphaFirst\n")
+
+    it "module: three visible provider signatures require one common instance" do
+        -- These three provider signatures are pairwise unifiable, but no one
+        -- instantiation satisfies all three.  Import order must therefore not
+        -- select any of them as expected-type metadata.
+        let n = BC.pack
+            pair a b = TyApp (TyApp (TyCon (n "Pair")) a) b
+            providerA = Scheme [n "a"] [] (pair (TyVar (n "a")) (TyVar (n "a")))
+            providerB = Scheme [n "b"] [] (pair (TyCon (n "Int")) (TyVar (n "b")))
+            providerC = Scheme [n "c"] [] (pair (TyVar (n "c")) (TyCon (n "Bool")))
+        schemesHaveCommonInstance [providerA, providerB, providerC]
+            `shouldReturn` False
 
     it "module: un-exported cross-module record field selector does not shadow Prelude.filter" do
         -- Regression for the warp hello-world startup crash: loading
