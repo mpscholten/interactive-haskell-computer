@@ -18,7 +18,7 @@ import IHC.Scan (scanTypeSigs)
 import IHC.Scheduler (schemesCompatible)
 import IHC.Source (Source, mkSource)
 import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
-import IHC.TypeGlobals (globalAmbiguousSigsRef)
+import IHC.TypeGlobals (globalAmbiguousSigsRef, globalClassMethodNamesRef)
 
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
@@ -193,3 +193,39 @@ spec = describe "Hs2010 — Types" $ do
                         [("Convert", ["[]", "Target"])])
                     (ELit (LStr "x"))
             ty `shouldBe` TyCon "Target"
+
+        it "does not trust an ambiguous bare exact-map hit" $ do
+            let sig = Scheme ["f", "a"]
+                    [Pred "Produce" [TyVar "f"]]
+                    (TyArrow (TyVar "a") (TyApp (TyVar "f") (TyVar "a")))
+                expr = EApp (EVar "produce") (ELit (LInt 42))
+            reg <- newClassRegistry
+            savedMethods <- readIORef globalClassMethodNamesRef
+            savedAmbiguous <- readIORef globalAmbiguousSigsRef
+            let restore = do
+                    writeIORef globalClassMethodNamesRef savedMethods
+                    writeIORef globalAmbiguousSigsRef savedAmbiguous
+                run = do
+                    writeIORef globalClassMethodNamesRef (Set.singleton "produce")
+                    writeIORef globalAmbiguousSigsRef (Set.singleton "produce")
+                    elaborate reg (Map.singleton "produce" sig) Map.empty
+                        (ExpectType (TyApp (TyCon "Box") (TyCon "Int"))) expr
+            (got, _) <- run `finally` restore
+            got `shouldBe` expr
+
+        it "uses an annotated result to resolve an unrelated result-only class" $ do
+            let sig = Scheme ["f", "a"]
+                    [Pred "Produce" [TyVar "f"]]
+                    (TyArrow (TyVar "a") (TyApp (TyVar "f") (TyVar "a")))
+                expr = EApp (EVar "produce") (ELit (LInt 42))
+            reg <- newClassRegistry
+            savedMethods <- readIORef globalClassMethodNamesRef
+            let restore = writeIORef globalClassMethodNamesRef savedMethods
+                run = do
+                    writeIORef globalClassMethodNamesRef (Set.singleton "produce")
+                    elaborate reg (Map.singleton "produce" sig) Map.empty
+                        (ExpectType (TyApp (TyCon "Box") (TyCon "Int"))) expr
+            (got, ty) <- run `finally` restore
+            got `shouldBe` EApp (ETypedMethod "Produce" "produce" "Box")
+                                (ELit (LInt 42))
+            ty `shouldBe` TyApp (TyCon "Box") (TyCon "Int")

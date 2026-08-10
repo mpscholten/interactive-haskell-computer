@@ -1568,6 +1568,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "True\nTrue\n"
 
+    it "expected result: pure uses the annotated Q instance generically" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_pure_expected_q.hs")
+        n   `shouldBe` 0
+        out `shouldBe` ""
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------
