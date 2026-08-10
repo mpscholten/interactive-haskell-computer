@@ -461,18 +461,15 @@ expandSplicesInExpr env ipm depth expr
 
     -- Source @Q a@ stores a rank-polymorphic @forall m. Quasi m => m a@.
     -- A splice runner is entitled to choose its Quasi implementation; IHC
-    -- chooses its existing IO-backed runner.  When the action is still a
-    -- source closure, elaborate that whole action at @IO Exp@ before running
-    -- it.  This supplies the missing result-side dictionary information
-    -- without inspecting any function name (notably, no special case for
-    -- @pure@).  Exactly one Q/IO layer is consumed.
+    -- chooses its existing IO-backed runner. The ordinary result-directed
+    -- class dispatcher materialises the action's source instances while it
+    -- evaluates; the splice boundary itself does not recognize any method
+    -- name. Exactly one Q/IO layer is consumed.
     runSourceQAction actionT = do
         state <- readIORef actionT
         value <- case state of
             Unevaluated (Closure actionEnv actionIpm actionExpr) -> do
-                actionExpr' <- elaborateAt
-                    (TyApp (TyCon "IO") (TyCon "Exp")) actionExpr
-                eval legacyHooks actionEnv actionIpm actionExpr'
+                eval legacyHooks actionEnv actionIpm actionExpr
             _ -> force legacyHooks actionT
         case value of
             VIO action -> action
