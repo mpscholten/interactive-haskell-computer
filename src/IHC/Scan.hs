@@ -34,6 +34,7 @@ module IHC.Scan
     , FieldRegistry
     , TypeCtorRegistry
     , scanDataDecls
+    , scanConstructorTypeMetadata
       -- * Per-constructor strict-field bitmap (A.5)
     , lookupCtorStrictness
     , clearCtorStrictness
@@ -86,6 +87,9 @@ import IHC.Source
 import IHC.StringUtils (isAsciiSpace, trimAscii)
 import IHC.TypeAST (Type(..), Pred(..), Scheme(..))
 import qualified IHC.TypeReduce as TR
+import IHC.ConstructorMetadata
+    ( ConstructorIdentity(..), ConstructorTypeRegistry
+    , constructorMetadataFromScheme )
 
 -- | What we know about a top-level name.
 data SymbolInfo
@@ -2412,6 +2416,62 @@ scanDataDecls src
                 TkRBracket -> skipToMatchingRBracket (depth - 1) cur'
                 TkEof      -> pure cur'
                 _          -> skipToMatchingRBracket depth cur'
+
+-- | Scan GADT constructor signatures into the declaration-aware field-type
+-- registry.  Unlike 'scanDataDecls', this retains the complete constructor
+-- result type, so refinements such as @Mk :: b -> G [b]@ survive into runtime
+-- expected-type dispatch. Traditional declarations remain unsupported here
+-- until their field boundaries can be parsed without kind-directed guessing.
+scanConstructorTypeMetadata :: Name -> Source -> IO ConstructorTypeRegistry
+scanConstructorTypeMetadata owner src = go Map.empty startCursor
+  where
+    go acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure acc
+            TkData | tkCol tok == 1 -> do
+                (isGadt, afterWhere) <- seekWhere cur'
+                if isGadt
+                    then scanCtors acc afterWhere >>= uncurry go
+                    else go acc afterWhere
+            _ -> go acc cur'
+
+    seekWhere cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkWhere -> pure (True, cur')
+            TkEof -> pure (False, cur)
+            TkEq -> pure (False, cur')
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (False, cur)
+              | otherwise -> seekWhere cur'
+
+    scanCtors acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (acc, cur)
+            TkNewline -> scanCtors acc cur'
+            TkConId ctor -> do
+                let (sep, afterSep) = nextToken src cur'
+                case tkKind sep of
+                    TkDColon -> do
+                        (typeToks, afterLine) <- collectSigLine [] afterSep
+                        let identity' = ConstructorIdentity owner ctor
+                            acc' = case parseScheme typeToks >>= constructorMetadataFromScheme identity' False of
+                                Just metadata -> Map.insert identity' metadata acc
+                                Nothing -> acc
+                        scanCtors acc' afterLine
+                    _ -> scanCtors acc cur'
+            _ | tkCol tok == 1 -> pure (acc, cur)
+              | otherwise -> scanCtors acc cur'
+
+    collectSigLine rev cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure (reverse rev, cur)
+            TkNewline -> pure (reverse rev, cur')
+            _ -> case tokenToTT tok of
+                Just tt -> collectSigLine (tt : rev) cur'
+                Nothing -> pure (reverse rev, cur)
 
 --------------------------------------------------------------------------------
 -- Deriving Functor synthesis

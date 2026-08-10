@@ -5,6 +5,7 @@ import Control.Monad (forM_)
 import Data.IORef
 import Data.List (isInfixOf, sort, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.Map.Strict as Map
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
@@ -15,11 +16,14 @@ import Test.Hspec
 
 import IHC.AST (Expr(..), Lit(..))
 import IHC.Classes (legacyHooks)
+import IHC.ConstructorMetadata
+    ( ConstructorIdentity(..), ConstructorTypeMetadata(..), constructorFieldTypeAt
+    , constructorFieldTypes )
 import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
 import IHC.Eval (eval, force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
-import IHC.Scan (emptyKnownSymbols, findBinding)
+import IHC.Scan (emptyKnownSymbols, findBinding, scanConstructorTypeMetadata)
 import IHC.Scheduler
     ( loadProgramFromSource, schemesHaveCommonInstance, resolveTypeSigMetadata )
 import IHC.Source (readSourceFile)
@@ -68,6 +72,116 @@ captureStdout action = do
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    describe "constructor-aware field type metadata" do
+        let n = BC.pack
+            a = TyVar (n "a")
+            b = TyVar (n "b")
+            int = TyCon (n "Int")
+            string = TyCon (n "String")
+            app2 h x y = TyApp (TyApp (TyCon (n h)) x) y
+            ident owner ctor = ConstructorIdentity (n owner) (n ctor)
+            ordinary owner ctor vars result fields =
+                ConstructorTypeMetadata (ident owner ctor) (map n vars) [] result fields False
+            registry = Map.fromList
+                [ (ident "Data.Either" "Left", ordinary "Data.Either" "Left" ["a", "b"]
+                      (app2 "Either" a b) [a])
+                , (ident "Data.Either" "Right", ordinary "Data.Either" "Right" ["a", "b"]
+                      (app2 "Either" a b) [b])
+                , (ident "GHC.Tuple" "(,)", ordinary "GHC.Tuple" "(,)" ["a", "b"]
+                      (app2 "(,)" a b) [a, b])
+                , (ident "PairMod" "Pair", ordinary "PairMod" "Pair" ["a", "b"]
+                      (app2 "Pair" a b) [a, b])
+                , (ident "TreeMod" "Leaf", ordinary "TreeMod" "Leaf" ["a"]
+                      (TyApp (TyCon (n "Tree")) a) [a])
+                , (ident "TreeMod" "Branch", ordinary "TreeMod" "Branch" ["a"]
+                      (TyApp (TyCon (n "Tree")) a)
+                      [TyApp (TyCon (n "Tree")) a, TyApp (TyCon (n "Tree")) a])
+                ]
+
+        it "maps Either parameters by constructor declaration" do
+            let expected = app2 "Either" int string
+            constructorFieldTypeAt registry (Just (n "Data.Either")) (n "Left") 0 expected
+                `shouldBe` Just int
+            constructorFieldTypeAt registry Nothing (n "Data.Either.Right") 0 expected
+                `shouldBe` Just string
+
+        it "instantiates tuple and multi-field constructors positionally" do
+            constructorFieldTypes registry Nothing (n "(,)") (app2 "(,)" int string)
+                `shouldBe` Just [int, string]
+            constructorFieldTypes registry Nothing (n "Pair") (app2 "Pair" string int)
+                `shouldBe` Just [string, int]
+
+        it "keeps alternate constructor field layouts distinct" do
+            let treeInt = TyApp (TyCon (n "Tree")) int
+            constructorFieldTypes registry Nothing (n "Leaf") treeInt
+                `shouldBe` Just [int]
+            constructorFieldTypes registry Nothing (n "Branch") treeInt
+                `shouldBe` Just [treeInt, treeInt]
+
+        it "fails closed for the wrong result type or field index" do
+            constructorFieldTypes registry Nothing (n "Left") (app2 "Pair" int string)
+                `shouldBe` Nothing
+            constructorFieldTypeAt registry Nothing (n "Right") 1 (app2 "Either" int string)
+                `shouldBe` Nothing
+
+        it "fails closed for absent, under-saturated, and over-saturated results" do
+            constructorFieldTypes registry Nothing (n "Missing") (TyCon (n "Either"))
+                `shouldBe` Nothing
+            constructorFieldTypes registry Nothing (n "Left")
+                (TyApp (TyCon (n "Either")) int) `shouldBe` Nothing
+            constructorFieldTypes registry Nothing (n "Left")
+                (TyApp (app2 "Either" int string) int) `shouldBe` Nothing
+
+        it "rejects unresolved constructor and qualified-head collisions" do
+            let other = ordinary "Other" "Left" ["a", "b"] (app2 "Either" a b) [b]
+                collided = Map.insert (ident "Other" "Left") other registry
+            constructorFieldTypes collided Nothing (n "Left") (app2 "Either" int string)
+                `shouldBe` Nothing
+            constructorFieldTypes registry (Just (n "Data.Either")) (n "Other.Left")
+                (app2 "Either" int string) `shouldBe` Nothing
+            constructorFieldTypes registry Nothing (n "Data.Either.Left")
+                (app2 "Other.Either" int string) `shouldBe` Nothing
+
+        it "unifies a GADT result before instantiating its field" do
+            let listB = TyApp (TyCon (n "[]")) b
+                gadt = ConstructorTypeMetadata (ident "GMod" "Mk") [n "b"] []
+                         (TyApp (TyCon (n "G")) listB) [b] False
+                reg = Map.singleton (ident "GMod" "Mk") gadt
+            constructorFieldTypes reg Nothing (n "Mk")
+                (TyApp (TyCon (n "G")) (TyApp (TyCon (n "[]")) int))
+                `shouldBe` Just [int]
+
+        it "freshens constructor quantifiers before unifying Swap" do
+            let swap = ordinary "SwapMod" "Swap" ["a", "b"]
+                         (app2 "Either" a b) [a, b]
+                reg = Map.singleton (ident "SwapMod" "Swap") swap
+            constructorFieldTypes reg Nothing (n "Swap") (app2 "Either" b a)
+                `shouldBe` Just [b, a]
+
+        it "explicitly rejects unresolved existential and data-family metadata" do
+            let ex = ConstructorTypeMetadata (ident "M" "Ex") [n "a"] [n "x"]
+                       (TyApp (TyCon (n "Ex")) a) [TyVar (n "x")] False
+                fam = ConstructorTypeMetadata (ident "M" "Fam") [n "a"] []
+                        (TyApp (TyCon (n "F")) a) [a] True
+            constructorFieldTypes (Map.singleton (ident "M" "Ex") ex) Nothing
+                (n "Ex") (TyApp (TyCon (n "Ex")) int) `shouldBe` Nothing
+            constructorFieldTypes (Map.singleton (ident "M" "Fam") fam) Nothing
+                (n "Fam") (TyApp (TyCon (n "F")) int) `shouldBe` Nothing
+
+        it "scans a real GADT declaration through registry lookup" do
+            src <- readSourceFile "test/Fixtures/ConstructorMetadataSig.hs"
+            reg <- scanConstructorTypeMetadata (n "GMod") src
+            constructorFieldTypes reg Nothing (n "Mk")
+                (TyApp (TyCon (n "G")) (TyApp (TyCon (n "[]")) int))
+                `shouldBe` Just [int]
+
+        it "rejects a registry key that disagrees with metadata identity" do
+            let metadata = ordinary "Actual" "Mk" ["a"]
+                             (TyApp (TyCon (n "Box")) a) [a]
+                bad = Map.singleton (ident "Claimed" "Mk") metadata
+            constructorFieldTypes bad (Just (n "Claimed")) (n "Mk")
+                (TyApp (TyCon (n "Box")) int) `shouldBe` Nothing
+
     it "EQuote antiquotation evaluates one Q Exp hole" do
         exp40 <- integerExpVal 40
         holeT <- newWHNFThunk (VIO (pure exp40))
@@ -580,6 +694,28 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         resolveTypeSigMetadata (Just "OwnerImportHiding") "pick" `shouldReturn` Nothing
         _ <- resolveTypeSigMetadata Nothing "OwnerAmbiguous.markerAmbiguous"
         resolveTypeSigMetadata (Just "OwnerAmbiguous") "pick" `shouldReturn` Nothing
+
+    it "elaborates a bare class-method callee from owner-scoped metadata" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/class_method_callee_metadata.hs")
+        n `shouldBe` 42
+        out `shouldBe` ""
+
+    it "elaborates a qualified imported class-method callee from its owner" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
+        runMainWithSiblings (root </> "MainQualified.hs") `shouldReturn` 73
+
+    it "does not treat an ordinary same-name binding as a class method" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
+        runMainWithSiblings (root </> "MainShadow.hs") `shouldReturn` 42
+
+    it "fails closed once when inferred class-method instance is missing" do
+        result <- try (runFile
+            "test/Fixtures/Coverage/class_method_callee_missing_instance.hs")
+            :: IO (Either SomeException Int)
+        case result of
+            Right n -> n `shouldBe` 0
+            Left err -> expectationFailure (displayException err)
 
     it "module: visible provider signatures with different constraints remain ambiguous" do
         let n = BC.pack

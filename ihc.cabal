@@ -35,6 +35,7 @@ library
       , IHC.CabalProject
       , IHC.Classes
       , IHC.Context
+      , IHC.ConstructorMetadata
       , IHC.Core
       , IHC.Cpp
       , IHC.Diagnostics
