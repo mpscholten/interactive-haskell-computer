@@ -2417,11 +2417,12 @@ scanDataDecls src
                 TkEof      -> pure cur'
                 _          -> skipToMatchingRBracket depth cur'
 
--- | Scan GADT constructor signatures into the declaration-aware field-type
--- registry.  Unlike 'scanDataDecls', this retains the complete constructor
--- result type, so refinements such as @Mk :: b -> G [b]@ survive into runtime
--- expected-type dispatch. Traditional declarations remain unsupported here
--- until their field boundaries can be parsed without kind-directed guessing.
+-- | Scan constructor signatures into the declaration-aware field-type
+-- registry.  GADT declarations carry their explicit result type.  For an
+-- ordinary Haskell-98 declaration we synthesize the equivalent signature
+-- from its data head and positional constructor fields; constructor fields
+-- are @atype@s, so their boundaries are syntactic and require no kind-directed
+-- guessing (applications must be parenthesised in this grammar).
 scanConstructorTypeMetadata :: Name -> Source -> IO ConstructorTypeRegistry
 scanConstructorTypeMetadata owner src = go Map.empty startCursor
   where
@@ -2429,21 +2430,104 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkEof -> pure acc
-            TkData | tkCol tok == 1 -> do
-                (isGadt, afterWhere) <- seekWhere cur'
-                if isGadt
-                    then scanCtors acc afterWhere >>= uncurry go
-                    else go acc afterWhere
+            kind | tkCol tok == 1, kind == TkData || kind == TkNewtype -> do
+                decl <- seekDeclHead cur'
+                case decl of
+                    Just (tyCon, vars, Left afterEq) -> do
+                        (acc', afterDecl) <- scanH98Ctors acc tyCon vars afterEq
+                        go acc' afterDecl
+                    Just (_, _, Right afterWhere) ->
+                        scanCtors acc afterWhere >>= uncurry go
+                    Nothing -> go acc cur'
             _ -> go acc cur'
 
-    seekWhere cur = do
+    seekDeclHead cur = do
+        let (nameTok, afterName) = nextToken src cur
+        case tkKind nameTok of
+            TkConId tyCon -> gatherVars tyCon [] afterName
+            _ -> pure Nothing
+
+    gatherVars tyCon revVars cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkWhere -> pure (True, cur')
-            TkEof -> pure (False, cur)
-            TkEq -> pure (False, cur')
-            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (False, cur)
-              | otherwise -> seekWhere cur'
+            TkIdent var -> gatherVars tyCon (var : revVars) cur'
+            TkEq -> pure (Just (tyCon, reverse revVars, Left cur'))
+            TkWhere -> pure (Just (tyCon, reverse revVars, Right cur'))
+            TkEof -> pure Nothing
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure Nothing
+              | otherwise -> gatherVars tyCon revVars cur'
+
+    scanH98Ctors acc tyCon vars = scanAlternative acc
+      where
+        result = foldl TyApp (TyCon tyCon) (map TyVar vars)
+
+        scanAlternative current cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkNewline -> scanAlternative current cur'
+                TkBar -> scanAlternative current cur'
+                TkConId ctor -> do
+                    (fieldToks, afterCtor) <- collectFields [] cur'
+                    let schemeType (Scheme _ _ ty) = ty
+                        fields = traverse (fmap schemeType . parseScheme) fieldToks
+                        identity' = ConstructorIdentity owner ctor
+                        metadata = fields >>= \fieldTypes ->
+                            constructorMetadataFromScheme identity' False
+                                (Scheme vars [] (foldr TyArrow result fieldTypes))
+                        current' = maybe current
+                            (\m -> Map.insert identity' m current) metadata
+                    continue current' afterCtor
+                TkEof -> pure (current, cur)
+                _ | tkCol tok == 1 -> pure (current, cur)
+                  | otherwise -> scanAlternative current cur'
+
+        continue current cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkBar -> scanAlternative current cur'
+                TkNewline -> continue current cur'
+                TkEof -> pure (current, cur)
+                _ | tkCol tok == 1 -> pure (current, cur)
+                  | otherwise -> continue current cur'
+
+        collectFields rev cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkBang -> collectFields rev cur'
+                TkBar -> pure (reverse rev, cur)
+                TkNewline -> pure (reverse rev, cur)
+                TkEof -> pure (reverse rev, cur)
+                TkConId _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
+                TkIdent _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
+                TkLParen -> balanced [TTLParen] 1 TkLParen TkRParen cur' >>= \(a, next) ->
+                    collectFields (a : rev) next
+                TkLBracket -> balanced [TTLBracket] 1 TkLBracket TkRBracket cur' >>= \(a, next) ->
+                    collectFields (a : rev) next
+                _ -> pure (reverse rev, cur)
+
+        atomFrom tok cur = case tokenToTT tok of
+            Nothing -> pure ([], cur)
+            Just first -> qualified [first] cur
+
+        qualified rev cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkDot ->
+                    let (seg, afterSeg) = nextToken src cur'
+                    in case tokenToTT seg of
+                        Just tt -> qualified (tt : TTDot : rev) afterSeg
+                        Nothing -> pure (reverse rev, cur)
+                _ -> pure (reverse rev, cur)
+
+        balanced rev depth open close cur = do
+            let (tok, cur') = nextToken src cur
+                depth' | tkKind tok == open = depth + 1
+                       | tkKind tok == close = depth - 1
+                       | otherwise = depth
+                rev' = maybe rev (: rev) (tokenToTT tok)
+            if tkKind tok == TkEof || depth' == 0
+                then pure (reverse rev', cur')
+                else balanced rev' depth' open close cur'
 
     scanCtors acc cur = do
         let (tok, cur') = nextToken src cur
