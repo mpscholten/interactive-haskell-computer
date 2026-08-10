@@ -421,7 +421,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "io: do-block bind of `return 42` then print" do
         (n, out) <- captureStdout (runFile "test/Fixtures/io_return.hs")
         n   `shouldBe` 0
-        out `shouldBe` "chosen\n"
+        out `shouldBe` "42\n"
 
     it "io: `let x = 100` inside a do-block scopes to the rest of the block" do
         (n, out) <- captureStdout (runFile "test/Fixtures/io_let_in_do.hs")
@@ -586,6 +586,22 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/Coverage/class_method_callee_metadata.hs")
         n `shouldBe` 42
         out `shouldBe` ""
+
+    it "elaborates a qualified imported class-method callee from its owner" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
+        runMainWithSiblings (root </> "MainQualified.hs") `shouldReturn` 73
+
+    it "does not treat an ordinary same-name binding as a class method" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
+        runMainWithSiblings (root </> "MainShadow.hs") `shouldReturn` 42
+
+    it "fails closed once when inferred class-method instance is missing" do
+        result <- try (runFile
+            "test/Fixtures/Coverage/class_method_callee_missing_instance.hs")
+            :: IO (Either SomeException Int)
+        case result of
+            Right n -> n `shouldBe` 0
+            Left err -> expectationFailure (displayException err)
 
     it "module: visible provider signatures with different constraints remain ambiguous" do
         let n = BC.pack

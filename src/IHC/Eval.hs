@@ -73,6 +73,11 @@ forceMethodVal :: IHCHooks -> Val -> IO Val
 forceMethodVal hooks (VLazyMethod t) = force hooks t
 forceMethodVal _     v               = pure v
 
+data CalleeElaboration
+    = CalleeNotAttempted
+    | CalleeElaborated !Expr
+    | CalleeAttemptFailed
+
 -- | If @x@ is a bare nullary 'Bounded' method (@maxBound@ / @minBound@) and
 -- @f@ is a variable whose registered type signature begins with a
 -- concrete type constructor (@Int -> …@), rewrite @x@ to @x :: T@ so
@@ -408,15 +413,21 @@ eval hooks env ipm = go
     -- @listArray (minBound, maxBound)@ for non-Int enums like StdMethod).
     go (EApp f x) = do
         mElaboratedCall <- elaborateClassMethodCallee (EApp f x)
+        let ordinaryApplication = do
+                fv <- go f
+                x0 <- annotateNullaryBoundedArg f x
+                owner <- currentOwner hooks env
+                x' <- elaborateExpectedArg hooks owner f x0
+                goApp fv x'
         case mElaboratedCall of
-          Just call' -> go call'
-          Nothing -> do
-            fv <- go f
-            x0 <- annotateNullaryBoundedArg f x
-            owner <- currentOwner hooks env
-            x' <- elaborateExpectedArg hooks owner f x0
-            goApp fv x'
+          CalleeElaborated call' -> go call'
+          CalleeAttemptFailed | isApplication f ->
+              go (suppressCalleeElaboration (EApp f x))
+          CalleeAttemptFailed -> ordinaryApplication
+          CalleeNotAttempted -> ordinaryApplication
       where
+        isApplication EApp{} = True
+        isApplication _ = False
         goApp fv x'' = do
           xt  <- newThunkIP env ipm x''          -- argument stays a thunk (lazy)
           case fv of
@@ -742,7 +753,7 @@ eval hooks env ipm = go
     -- failed inference, an unchanged/non-method head, or a missing instance
     -- all retain the ordinary evaluator path.
     elaborateClassMethodCallee call = case appHead call of
-        Nothing -> pure Nothing
+        Nothing -> pure CalleeNotAttempted
         Just method -> do
             methodNames <- readIORef globalClassMethodNamesRef
             let isMethod = Set.member (bareName method) methodNames
@@ -753,7 +764,7 @@ eval hooks env ipm = go
                 Just scheme@(Scheme _ preds _) | not (null preds) -> do
                     mReg <- getSharedClassReg legacyHooks
                     case mReg of
-                        Nothing -> pure Nothing
+                        Nothing -> pure CalleeNotAttempted
                         Just classReg -> do
                             sigs0 <- readIORef globalTypeSigsRef
                             syns <- readIORef globalTypeSynonymsRef
@@ -765,9 +776,10 @@ eval hooks env ipm = go
                                 Right (call', _)
                                     | hasTypedCallee call' -> do
                                         ok <- allTypedMethodsResolvable classReg call'
-                                        pure (if ok then Just call' else Nothing)
-                                _ -> pure Nothing
-                _ -> pure Nothing
+                                        pure (if ok then CalleeElaborated call'
+                                                    else CalleeAttemptFailed)
+                                _ -> pure CalleeAttemptFailed
+                _ -> pure CalleeNotAttempted
       where
         appHead (EApp h _) = appHead h
         appHead (ETyApp h _) = appHead h
@@ -778,6 +790,15 @@ eval hooks env ipm = go
         hasTypedCallee (ETyApp h _) = hasTypedCallee h
         hasTypedCallee ETypedMethod{} = True
         hasTypedCallee _ = False
+
+
+    -- Mark every application in a failed callee spine with an
+    -- operationally-transparent wrapper.  Re-entering 'go' can then use the
+    -- established value-directed fallback without retrying inference on
+    -- progressively shorter prefixes.
+    suppressCalleeElaboration (EApp h arg) =
+        EApp (EConstrainedValue (suppressCalleeElaboration h) []) arg
+    suppressCalleeElaboration other = other
 
     -- | True iff every 'ETypedMethod' node in @e@ has a real, non-placeholder
     -- registered instance for its resolved @(cls, tag, method)@. Used to
