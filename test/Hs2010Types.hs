@@ -3,19 +3,22 @@
 
 module Hs2010Types (spec) where
 
-import Control.Exception (SomeException, fromException, try)
+import Control.Exception (SomeException, finally, fromException, try)
 import Data.ByteString (ByteString)
+import Data.IORef (readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Test.Hspec
 
 import IHC.AST
 import IHC.Classes (newClassRegistry)
-import IHC.Elaborate (Expected(..), elaborate)
+import IHC.Elaborate (Expected(..), elaborate, elaborateWithScopedSigs)
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scan (scanTypeSigs)
 import IHC.Scheduler (schemesCompatible)
 import IHC.Source (Source, mkSource)
 import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
+import IHC.TypeGlobals (globalAmbiguousSigsRef)
 
 mkSrc :: ByteString -> Source
 mkSrc = mkSource "<test>"
@@ -160,6 +163,25 @@ spec = describe "Hs2010 — Types" $ do
             reg <- newClassRegistry
             (got, ty) <- elaborate reg (Map.singleton "alias" sig) Map.empty
                 (ExpectType (TyCon "Target")) expr
+            got `shouldBe`
+                EApp
+                    (EConstrainedValue (EVar "alias")
+                        [("Convert", ["[]", "Target"])])
+                    (ELit (LStr "x"))
+            ty `shouldBe` TyCon "Target"
+
+        it "trusts a lexically resolved scheme despite a flat-name collision" $ do
+            let sig = Scheme ["a", "b"]
+                    [Pred "Convert" [TyVar "a", TyVar "b"]]
+                    (TyArrow (TyVar "a") (TyVar "b"))
+                expr = EApp (EVar "alias") (ELit (LStr "x"))
+            reg <- newClassRegistry
+            saved <- readIORef globalAmbiguousSigsRef
+            let run = elaborateWithScopedSigs reg (Map.singleton "alias" sig)
+                    Map.empty (Set.singleton "alias")
+                    (ExpectType (TyCon "Target")) expr
+            (got, ty) <- (writeIORef globalAmbiguousSigsRef (Set.singleton "alias") >> run)
+                `finally` writeIORef globalAmbiguousSigsRef saved
             got `shouldBe`
                 EApp
                     (EConstrainedValue (EVar "alias")
