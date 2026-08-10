@@ -18,4 +18,4 @@ class Parsing a where
 main = do
     IO.withFile "/tmp/ihc_test_withfile_collision.txt" IO.WriteMode $ \h ->
         IO.hPutStr h "qualified ordinary function\n"
-    putStrLn "after"
+    IO.hPutStr IO.stdout "after\n"
