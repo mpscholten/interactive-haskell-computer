@@ -61,6 +61,14 @@
           # explicitly — this is a source bundle, not a cabal install.
           megaparsec
           parser-combinators
+          # HSX and Blaze remain ordinary interpreted Haskell.  Include their
+          # source tarballs in the installed bundle so the raw ihc binary can
+          # follow this path on a machine with an empty user source cache.
+          ihp-hsx
+          blaze-html
+          blaze-markup
+          blaze-builder
+          string-conversions
           case-insensitive
           auto-update
           http-types
@@ -531,6 +539,28 @@
             ${self.packages.${system}.default}/bin/ihc run \
             ${self}/test/Fixtures/PackagedSource/multi/Main.hs)
           test "$multi" = "clean multi"
+
+          # Keep the north-star dependency families in the executable-relative
+          # bundle.  This catches a package being accidentally dropped even if
+          # a developer's ~/.cache/ihc/sources happens to contain it.
+          source_root=${self.packages.${system}.default}/share/ihc/sources
+          for package in \
+            base ghc-internal template-haskell \
+            megaparsec blaze-builder blaze-markup blaze-html ihp-hsx \
+            network http-types wai warp; do
+            test -n "$(find -L "$source_root" -maxdepth 1 -type d \
+              -name "$package-*" -print -quit)"
+          done
+
+          th=$(env -i HOME="$clean_home" PATH=${pkgs.coreutils}/bin \
+            ${self.packages.${system}.default}/bin/ihc run \
+            ${self}/test/Fixtures/Coverage/qq_toy_string.hs)
+          test "$th" = "hello world"
+
+          blaze=$(env -i HOME="$clean_home" PATH=${pkgs.coreutils}/bin \
+            ${self.packages.${system}.default}/bin/ihc run \
+            ${self}/examples/blaze_hello/Main.hs)
+          test "$blaze" = "<h1>Hello world</h1>"
           touch $out
         '';
 
