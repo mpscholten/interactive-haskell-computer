@@ -2417,11 +2417,12 @@ scanDataDecls src
                 TkEof      -> pure cur'
                 _          -> skipToMatchingRBracket depth cur'
 
--- | Scan GADT constructor signatures into the declaration-aware field-type
--- registry.  Unlike 'scanDataDecls', this retains the complete constructor
--- result type, so refinements such as @Mk :: b -> G [b]@ survive into runtime
--- expected-type dispatch. Traditional declarations remain unsupported here
--- until their field boundaries can be parsed without kind-directed guessing.
+-- | Scan constructor signatures into the declaration-aware field-type
+-- registry.  GADT declarations carry their explicit result type.  For an
+-- ordinary Haskell-98 declaration we synthesize the equivalent signature
+-- from its data head and positional constructor fields; constructor fields
+-- are @atype@s, so their boundaries are syntactic and require no kind-directed
+-- guessing (applications must be parenthesised in this grammar).
 scanConstructorTypeMetadata :: Name -> Source -> IO ConstructorTypeRegistry
 scanConstructorTypeMetadata owner src = go Map.empty startCursor
   where
@@ -2429,21 +2430,131 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkEof -> pure acc
-            TkData | tkCol tok == 1 -> do
-                (isGadt, afterWhere) <- seekWhere cur'
-                if isGadt
-                    then scanCtors acc afterWhere >>= uncurry go
-                    else go acc afterWhere
+            kind | tkCol tok == 1, kind == TkData || kind == TkNewtype -> do
+                decl <- seekDeclHead cur'
+                case decl of
+                    Just (tyCon, vars, Left afterEq) -> do
+                        (metadata, afterDecl) <- scanH98Ctors tyCon vars afterEq
+                        go (maybe acc (`Map.union` acc) metadata) afterDecl
+                    Just (_, _, Right afterWhere) ->
+                        scanCtors acc afterWhere >>= uncurry go
+                    Nothing -> go acc cur'
             _ -> go acc cur'
 
-    seekWhere cur = do
+    seekDeclHead cur = do
+        let (nameTok, afterName) = nextToken src cur
+        case tkKind nameTok of
+            TkConId tyCon -> gatherVars tyCon [] afterName
+            _ -> pure Nothing
+
+    gatherVars tyCon revVars cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
-            TkWhere -> pure (True, cur')
-            TkEof -> pure (False, cur)
-            TkEq -> pure (False, cur')
-            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure (False, cur)
-              | otherwise -> seekWhere cur'
+            TkIdent var -> gatherVars tyCon (var : revVars) cur'
+            TkEq -> pure (Just (tyCon, reverse revVars, Left cur'))
+            TkWhere -> pure (Just (tyCon, reverse revVars, Right cur'))
+            TkEof -> pure Nothing
+            -- Parenthesised/kind-annotated heads and multiline heads need a
+            -- real declaration parser.  Do not manufacture partial metadata.
+            _ -> pure Nothing
+
+    -- Commit atomically: one unsupported constructor invalidates metadata for
+    -- the entire declaration.  A partial registry can select an instance for
+    -- one constructor while silently treating a sibling differently.
+    scanH98Ctors tyCon vars cur0 = do
+        parsed <- scanAlternative Map.empty cur0
+        case parsed of
+            Right result' -> pure result'
+            Left badCur -> do
+                after <- skipDeclaration badCur
+                pure (Nothing, after)
+      where
+        result = foldl TyApp (TyCon tyCon) (map TyVar vars)
+
+        scanAlternative current cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkBar -> scanAlternative current cur'
+                TkConId ctor -> do
+                    fieldsResult <- collectFields [] cur'
+                    case fieldsResult of
+                        Left badCur -> pure (Left badCur)
+                        Right (fieldToks, afterCtor, ended) -> do
+                            let schemeType (Scheme _ _ ty) = ty
+                                fields = traverse (fmap schemeType . parseScheme) fieldToks
+                                identity' = ConstructorIdentity owner ctor
+                                metadata = fields >>= \fieldTypes ->
+                                    constructorMetadataFromScheme identity' False
+                                        (Scheme vars [] (foldr TyArrow result fieldTypes))
+                            case metadata of
+                                Nothing -> pure (Left afterCtor)
+                                Just m -> case ended of
+                                    False -> scanAlternative (Map.insert identity' m current) afterCtor
+                                    True -> pure (Right
+                                        (Just (Map.insert identity' m current), afterCtor))
+                _ -> pure (Left cur)
+
+        collectFields rev cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkBang -> collectFields rev cur'
+                TkBar -> pure (Right (reverse rev, cur, False))
+                TkEof -> pure (Right (reverse rev, cur, True))
+                TkIdent "deriving" -> pure (Right (reverse rev, cur', True))
+                TkNewline -> do
+                    let (peek, _) = nextToken src cur'
+                    if tkKind peek == TkEof || tkCol peek == 1
+                        then pure (Right (reverse rev, cur', True))
+                        else pure (Left cur')
+                TkConId _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
+                TkIdent "forall" -> pure (Left cur)
+                TkIdent _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
+                TkLParen -> do
+                    atom <- balanced [TTLParen] 1 TkLParen TkRParen cur'
+                    case atom of
+                        Nothing -> pure (Left cur)
+                        Just (a, next) -> collectFields (a : rev) next
+                TkLBracket -> do
+                    atom <- balanced [TTLBracket] 1 TkLBracket TkRBracket cur'
+                    case atom of
+                        Nothing -> pure (Left cur)
+                        Just (a, next) -> collectFields (a : rev) next
+                -- Records, constructor contexts, infix constructors and any
+                -- other unparsed syntax fail the whole declaration closed.
+                _ -> pure (Left cur)
+
+        atomFrom tok cur = case tokenToTT tok of
+            Nothing -> pure ([], cur)
+            Just first -> qualified [first] cur
+
+        qualified rev cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkDot ->
+                    let (seg, afterSeg) = nextToken src cur'
+                    in case tokenToTT seg of
+                        Just tt -> qualified (tt : TTDot : rev) afterSeg
+                        Nothing -> pure (reverse rev, cur)
+                _ -> pure (reverse rev, cur)
+
+        balanced rev depth open close cur = do
+            let (tok, cur') = nextToken src cur
+                depth' | tkKind tok == open = depth + 1
+                       | tkKind tok == close = depth - 1
+                       | otherwise = depth
+                rev' = maybe rev (: rev) (tokenToTT tok)
+            if tkKind tok == TkEof
+                then pure Nothing
+                else if depth' == 0
+                then pure (Just (reverse rev', cur'))
+                else balanced rev' depth' open close cur'
+
+    skipDeclaration cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkEof -> pure cur
+            _ | tkCol tok == 1 && tkKind tok /= TkNewline -> pure cur
+              | otherwise -> skipDeclaration cur'
 
     scanCtors acc cur = do
         let (tok, cur') = nextToken src cur
@@ -4810,14 +4921,20 @@ parseTypeAtoms toks = do
 
 parseAtom :: [TTok] -> Maybe (Type, [TTok])
 parseAtom toks = case toks of
-    (TTCon q : TTDot : TTCon n : rest) -> Just (TyCon (q <> BC.pack "." <> n), rest)
-    (TTVar q : TTDot : TTCon n : rest) -> Just (TyCon (q <> BC.pack "." <> n), rest)
+    (TTCon q : TTDot : TTCon n : rest) -> qualifiedTyCon q n rest
+    (TTVar q : TTDot : TTCon n : rest) -> qualifiedTyCon q n rest
     (TTCon n : rest)      -> Just (TyCon n, rest)
     (TTVar n : rest)      -> Just (TyVar n, rest)
     (TTUnderscore : rest) -> Just (TyVar (BC.pack "_"), rest)
     (TTLParen : inner)    -> parseParenAtom inner
     (TTLBracket : inner)  -> parseListAtom inner
     _                     -> Nothing
+  where
+    qualifiedTyCon prefix segment rest =
+        let name = prefix <> BC.pack "." <> segment
+        in case rest of
+            TTDot : TTCon next : more -> qualifiedTyCon name next more
+            _ -> Just (TyCon name, rest)
 
 -- | @(type)@ — one element → drop parens.
 -- @(type, type, …)@ — tuple → @(,)@ type constructor application.
