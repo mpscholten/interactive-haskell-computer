@@ -1527,6 +1527,11 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "hello\n"
 
+    it "callee expected type: earlier arguments constrain later arguments" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/expected_arg_prior_substitution.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\n"
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------
