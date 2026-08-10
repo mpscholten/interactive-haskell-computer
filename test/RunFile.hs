@@ -302,6 +302,26 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         decoded `shouldSatisfy` either (const True) (const False)
         readIORef executions `shouldReturn` 0
 
+    it "decodes TH ProjectionE chains through record-dot projectors" do
+        firstT <- newWHNFThunk (VStr "outer")
+        secondT <- newWHNFThunk (VStr "inner")
+        nilT <- newWHNFThunk (VCon "[]" [])
+        tailT <- newWHNFThunk (VCon ":" [secondT, nilT])
+        fieldsT <- newWHNFThunk (VCon ":|" [firstT, tailT])
+        decoded <- thExpToExpr (VCon "ProjectionE" [fieldsT])
+        decoded `shouldBe`
+            ELam "$thProjection"
+                (EApp (EVar "$fldProj$inner")
+                    (EApp (EVar "$fldProj$outer") (EVar "$thProjection")))
+
+    it "decodes TH GetFieldE through a record-dot projector" do
+        nameT <- newWHNFThunk (VStr "row")
+        recordT <- newWHNFThunk (VCon "VarE" [nameT])
+        fieldT <- newWHNFThunk (VStr "answer")
+        decoded <- thExpToExpr (VCon "GetFieldE" [recordT, fieldT])
+        decoded `shouldBe`
+            EApp (EVar "$fldProj$answer") (EVar "row")
+
     -- Regression: the scheduler used to leak state between consecutive
     -- runFile calls in the same process.  After the first call,
     -- 'globalLoadedModulesRef' was populated with ~150 modules; the
@@ -1729,6 +1749,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/Coverage/qq_source_q_constructor.hs")
         n `shouldBe` 0
         out `shouldBe` "source Q\n"
+
+    it "Template Haskell: source GetFieldE constructor is source-loaded" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_get_field_exp.hs")
+        n `shouldBe` 0
+        out `shouldBe` "6\n"
 
     it "Template Haskell: failed provisional fallback leaves no cached closure" do
         let bad = "test/Fixtures/Coverage/Modules/th_transaction_failure/Main.hs"

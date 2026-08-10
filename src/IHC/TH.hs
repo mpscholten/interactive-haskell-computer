@@ -245,6 +245,21 @@ decodeTHExp (VCon "InfixE" [mLT, opT, mRT]) = do
         EVar n -> pure n
         _      -> throwTH "InfixE: operator must be VarE"
     pure (EApp (EApp (EVar opName) lE) rE)
+decodeTHExp (VCon "GetFieldE" [recordT, fieldT]) = do
+    recordV <- force legacyHooks recordT
+    fieldV <- force legacyHooks fieldT
+    recordE <- thExpToExpr recordV
+    field <- decodeTHString "GetFieldE" fieldV
+    pure (applyFieldProjection field recordE)
+decodeTHExp (VCon "ProjectionE" [fieldsT]) = do
+    fieldsV <- force legacyHooks fieldsT
+    fields <- decodeNonEmptyStrings "ProjectionE" fieldsV
+    -- TH's @(.a.b)@ applies fields from left to right.  The synthetic
+    -- binder cannot collide with a source name because '$' is not valid
+    -- at the start of an ordinary Haskell identifier.
+    let argument = BC.pack "$thProjection"
+    pure (ELam argument
+        (foldl (flip applyFieldProjection) (EVar argument) fields))
 decodeTHExp (VCon name _) =
     throwTH ("thExpToExpr: unsupported TH Exp constructor: " <> BC.unpack name)
 decodeTHExp v =
@@ -323,6 +338,29 @@ decodeList (VCon ":" [hT, tT]) f = do
     pure (x : xs)
 decodeList v _ =
     throwTH ("decodeList: expected list VCon, got: " <> showValForDebug v)
+
+decodeTHString :: String -> Val -> IO ByteString
+decodeTHString _ctx (VStr bs) = pure bs
+decodeTHString _ctx chars@(VCon "[]" []) =
+    BC.pack <$> extractChars chars
+decodeTHString _ctx chars@(VCon ":" _) =
+    BC.pack <$> extractChars chars
+decodeTHString ctx v =
+    throwTH (ctx <> ": expected String, got " <> showValForDebug v)
+
+decodeNonEmptyStrings :: String -> Val -> IO [ByteString]
+decodeNonEmptyStrings ctx (VCon ":|" [headT, tailT]) = do
+    headV <- force legacyHooks headT
+    tailV <- force legacyHooks tailT
+    headField <- decodeTHString ctx headV
+    tailFields <- decodeList tailV (decodeTHString ctx)
+    pure (headField : tailFields)
+decodeNonEmptyStrings ctx v =
+    throwTH (ctx <> ": expected NonEmpty String, got " <> showValForDebug v)
+
+applyFieldProjection :: ByteString -> Expr -> Expr
+applyFieldProjection field =
+    EApp (EVar (BC.pack "$fldProj$" <> field))
 
 extractChars :: Val -> IO String
 extractChars (VCon "[]" []) = pure []
