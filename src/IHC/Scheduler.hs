@@ -96,7 +96,8 @@ import IHC.MemDebug (dumpMemStats)
 import IHC.Classes
     ( ClassRegistry, newClassRegistry, registerInstance, registerInstanceMulti
     , lookupInstance
-    , lookupInstanceMethod, lookupInstanceMethodMulti, normalizeTyTag, typeTagOf
+    , lookupInstanceMethod, lookupInstanceMethodMulti, lookupInstanceMethodPattern
+    , normalizeTyTag, typeTagOf
     , setSharedClassReg, getSharedClassReg
     , unionInstanceScope, currentInstanceScope, clearInstanceScope
     , clearSuperclasses
@@ -3913,6 +3914,19 @@ lookupInstanceMethodMultiForced reg cls tags methodName = do
             Right v' -> pure v'
             Left  _  -> pure (identifyingPlaceholder cls methodName)
 
+lookupInstanceMethodPatternForced
+    :: ClassRegistry -> ByteString -> ByteString -> ByteString
+    -> IO (Maybe Val)
+lookupInstanceMethodPatternForced reg cls tag methodName = do
+    mv <- lookupInstanceMethodPattern reg cls tag methodName
+    traverse forceSafely mv
+  where
+    forceSafely v = do
+        r <- try (forceMethodVal legacyHooks v) :: IO (Either SomeException Val)
+        case r of
+            Right v' -> pure v'
+            Left  _  -> pure (identifyingPlaceholder cls methodName)
+
 -- | 'lookupInSharedReg' + 'forceMethodVal'.  Parallel to
 -- 'lookupInstanceMethodForced' for the REPL-level shared registry.
 lookupInSharedRegForced
@@ -3994,7 +4008,18 @@ classMethodDispatcher reg cls methodName = selfVal
         (firstTag:_) | isDispatchableTag firstTag -> do
             mM <- lookupInstanceMethodForced reg cls firstTag methodName
             mShared <- lookupInSharedRegForced cls firstTag methodName
-            case preferMethod mM mShared of
+            exactOrLegacy <- case preferMethod mM mShared of
+                Just methodVal
+                  | not (isMethodPlaceholder methodVal) -> pure (Just methodVal)
+                _ -> do
+                    patternM <- lookupInstanceMethodPatternForced reg cls firstTag methodName
+                    mSharedReg <- getSharedClassReg legacyHooks
+                    patternShared <- case mSharedReg of
+                        Just sharedReg -> lookupInstanceMethodPatternForced
+                            sharedReg cls firstTag methodName
+                        Nothing -> pure Nothing
+                    pure (preferMethod patternM patternShared)
+            case exactOrLegacy of
                 Just methodVal
                   | not (isMethodPlaceholder methodVal) -> do
                       argV <- force legacyHooks argT

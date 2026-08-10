@@ -171,7 +171,7 @@ spec = describe "Hs2010 — Types" $ do
             got `shouldBe`
                 EApp
                     (EConstrainedValue (EVar "alias")
-                        [("Convert", ["[]", "Target"])])
+                        [("Convert", ["[Char]", "Target"])])
                     (ELit (LStr "x"))
             ty `shouldBe` TyCon "Target"
 
@@ -190,9 +190,22 @@ spec = describe "Hs2010 — Types" $ do
             got `shouldBe`
                 EApp
                     (EConstrainedValue (EVar "alias")
-                        [("Convert", ["[]", "Target"])])
+                        [("Convert", ["[Char]", "Target"])])
                     (ELit (LStr "x"))
             ty `shouldBe` TyCon "Target"
+
+        it "does not encode multiple class dictionaries as one constrained value" $ do
+            let sig = Scheme ["a"]
+                    [ Pred "First" [TyVar "a"]
+                    , Pred "Second" [TyVar "a"]
+                    ]
+                    (TyArrow (TyVar "a") (TyCon "Int"))
+                expr = EApp (EVar "alias") (ELit (LStr "x"))
+            reg <- newClassRegistry
+            (got, ty) <- elaborate reg (Map.singleton "alias" sig) Map.empty
+                InferFreely expr
+            got `shouldBe` expr
+            ty `shouldBe` TyCon "Int"
 
         it "does not trust an ambiguous bare exact-map hit" $ do
             let sig = Scheme ["f", "a"]

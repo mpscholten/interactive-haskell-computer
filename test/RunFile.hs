@@ -835,6 +835,22 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         runFile "test/Fixtures/Coverage/class_method_competing_list_heads.hs"
             `shouldReturn` 20
 
+    it "preserves a structured instance head through a constrained alias" do
+        runFile "test/Fixtures/Coverage/class_method_competing_list_alias.hs"
+            `shouldReturn` 11
+
+    it "falls back from a structured alias key to a generic list instance" do
+        runFile "test/Fixtures/Coverage/class_method_generic_list_alias.hs"
+            `shouldReturn` 31
+
+    it "prefers an exact structured alias instance over a generic list instance" do
+        runFile "test/Fixtures/Coverage/class_method_overlapping_list_alias.hs"
+            `shouldReturn` 32
+
+    it "uses a generic list pattern when a different concrete list instance exists" do
+        runFile "test/Fixtures/Coverage/class_method_overlapping_list_alias_int.hs"
+            `shouldReturn` 30
+
     it "keeps same-named imported constructors isolated by their real owners" do
         let root = "test/Fixtures/Coverage/Modules/class_method_constructor_owner"
         runMainWithSiblings (root </> "Main.hs") `shouldReturn` 73
