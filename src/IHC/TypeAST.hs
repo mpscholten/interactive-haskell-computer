@@ -6,6 +6,7 @@ module IHC.TypeAST
     ( Type(..)
     , Pred(..)
     , Scheme(..)
+    , TypeSynonym(..)
     , Subst
     , emptySubst
     , applySubst
@@ -17,6 +18,8 @@ module IHC.TypeAST
     , tyHead
     , tyArrowArgs
     , tyApps
+    , typeDispatchTag
+    , expandTypeSynonyms
     , isMonoType
     ) where
 
@@ -24,6 +27,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
+import qualified Data.ByteString.Char8 as BC
 
 import IHC.AST (Name)
 
@@ -36,6 +40,67 @@ data Type
     | TyForall ![Name] ![Pred] !Type
         -- ^ polymorphic: @forall a. Eq a => a -> Bool@
     deriving (Eq, Show)
+
+-- | Type-synonym metadata with the declared LHS binder order preserved.
+-- Substitution must follow this order; deriving it from the RHS free-variable
+-- set is unsound for declarations such as @type Flip b a = Either a b@.
+data TypeSynonym = TypeSynonym ![Name] !Type
+    deriving (Eq, Show)
+
+-- | A stable, structural registry key for a class parameter.  In
+-- particular, applications retain their arguments: @[Char]@ and @[Markup]@
+-- must not both collapse to the runtime list-constructor tag @[]@.
+typeDispatchTag :: Type -> Name
+typeDispatchTag = go
+  where
+    go (TyVar n) = n
+    go (TyCon n) = n
+    go t@(TyApp _ _) =
+        let (h, args) = tyApps t
+        in case (h, args) of
+            (TyCon n, [a]) | n == BC.pack "[]" ->
+                BC.concat [BC.pack "[", go a, BC.pack "]"]
+            (TyCon n, as) | isTuple n ->
+                BC.concat [BC.pack "(", BC.intercalate (BC.pack ",") (map go as), BC.pack ")"]
+            _ -> BC.intercalate (BC.pack " ") (go h : map atom args)
+    go (TyArrow a b) = BC.concat [atom a, BC.pack "->", go b]
+    go (TyForall _ _ body) = go body
+
+    -- Keep applications unambiguous when nested in another application.
+    atom t@TyApp{} = BC.concat [BC.pack "(", go t, BC.pack ")"]
+    atom t@TyArrow{} = BC.concat [BC.pack "(", go t, BC.pack ")"]
+    atom t = go t
+
+    isTuple n = BC.length n >= 2 && BC.head n == '(' && BC.last n == ')'
+             && BC.all (== ',') (BC.init (BC.tail n))
+
+-- | Recursively expand saturated type synonyms for registry keys, substituting
+-- arguments in the declared LHS binder order retained by the scanner.
+expandTypeSynonyms :: Map Name TypeSynonym -> Type -> Type
+expandTypeSynonyms synonyms = expand Set.empty
+  where
+    expand seen t = case t of
+        TyApp _ _ ->
+            let (h, args0) = tyApps t
+                args = map (expand seen) args0
+            in case h of
+                TyCon n
+                    | Set.notMember n seen
+                    , Just (TypeSynonym binders rhs) <- Map.lookup n synonyms
+                    , let arity = length binders
+                    , length args >= arity ->
+                        let (used, extra) = splitAt arity args
+                            rhs' = applySubst (Map.fromList (zip binders used)) rhs
+                        in foldl TyApp (expand (Set.insert n seen) rhs') extra
+                _ -> foldl TyApp (expand seen h) args
+        TyCon n
+            | Set.notMember n seen
+            , Just (TypeSynonym [] rhs) <- Map.lookup n synonyms ->
+                expand (Set.insert n seen) rhs
+            | otherwise -> TyCon n
+        TyVar n -> TyVar n
+        TyArrow a b -> TyArrow (expand seen a) (expand seen b)
+        TyForall vs ps body -> TyForall vs ps (expand seen body)
 
 -- | Class constraint: @Monad m@ = @Pred "Monad" [TyVar "m"]@.
 -- Multi-parameter constraints retain their argument boundaries, e.g.

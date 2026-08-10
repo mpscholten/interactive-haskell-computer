@@ -831,6 +831,10 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         runFile "test/Fixtures/Coverage/class_method_mptc_structured_head.hs"
             `shouldReturn` 53
 
+    it "distinguishes competing unary list instance heads through synonyms" do
+        runFile "test/Fixtures/Coverage/class_method_competing_list_heads.hs"
+            `shouldReturn` 20
+
     it "keeps same-named imported constructors isolated by their real owners" do
         let root = "test/Fixtures/Coverage/Modules/class_method_constructor_owner"
         runMainWithSiblings (root </> "Main.hs") `shouldReturn` 73

@@ -78,5 +78,5 @@ data LoadedModule = LoadedModule
       -- | Top-level type synonyms (@type Name args = RHS@).  Used for
       -- one-hop expansion before unification.  Populated by
       -- 'scanTypeSynonyms'.
-    , lmTypeSynonyms :: !(Map ByteString (Int, IHC.TypeAST.Type))
+    , lmTypeSynonyms :: !(Map ByteString IHC.TypeAST.TypeSynonym)
     }

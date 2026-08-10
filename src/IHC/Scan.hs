@@ -85,7 +85,7 @@ import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
 import IHC.StringUtils (isAsciiSpace, trimAscii)
-import IHC.TypeAST (Type(..), Pred(..), Scheme(..))
+import IHC.TypeAST (Type(..), Pred(..), Scheme(..), TypeSynonym(..))
 import qualified IHC.TypeReduce as TR
 import IHC.ConstructorMetadata
     ( ConstructorIdentity(..), ConstructorTypeRegistry
@@ -5231,14 +5231,14 @@ peekOperatorSig src cur =
         Nothing -> Nothing
 
 -- | Walk a module's source, collecting every top-level type synonym
--- declaration: @type Name v1 v2 … = RHS@.  Returns @(name, (arity,
--- rhs))@ pairs.  We DO NOT apply the RHS substitution here; the
+-- declaration: @type Name v1 v2 … = RHS@.  Returns the name together with
+-- the declared binder order and RHS.  We DO NOT apply substitution here; the
 -- elaborator does one-hop expansion when it encounters the name in a
 -- type.  Type families, data types, and newtypes are skipped.
-scanTypeSynonyms :: Source -> IO [(ByteString, (Int, Type))]
+scanTypeSynonyms :: Source -> IO [(ByteString, TypeSynonym)]
 scanTypeSynonyms src = memoiseScan "typeSynonyms" src (scanTypeSynonymsRaw src)
 
-scanTypeSynonymsRaw :: Source -> IO [(ByteString, (Int, Type))]
+scanTypeSynonymsRaw :: Source -> IO [(ByteString, TypeSynonym)]
 scanTypeSynonymsRaw src
     | not (hasKeyword src (BC.pack "type")) = pure []
     | otherwise = go [] startCursor
@@ -5261,7 +5261,7 @@ scanTypeSynonymsRaw src
                                 (typeToks, curAfterType) <- collectTypeTokens src curAfterEq
                                 case parseType typeToks of
                                     Just rhs ->
-                                        go ((synName, (length argVars, rhs)) : acc) curAfterType
+                                        go ((synName, TypeSynonym argVars rhs) : acc) curAfterType
                                     Nothing -> go acc curAfterType
                             _ -> go acc cur'   -- type family / instance / etc.
                     _ -> go acc cur'

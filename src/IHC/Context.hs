@@ -144,7 +144,7 @@ data ClassRunState = ClassRunState
 -- 'IHC.TypeReduce'.
 data TypeRunState = TypeRunState
     { trsTypeSigs           :: !(IORef (Map ByteString IHC.TypeAST.Scheme))
-    , trsTypeSynonyms       :: !(IORef (Map ByteString (Int, IHC.TypeAST.Type)))
+    , trsTypeSynonyms       :: !(IORef (Map ByteString IHC.TypeAST.TypeSynonym))
     , trsClassMethodNames   :: !(IORef (Set ByteString))
     , trsMethodClass        :: !(IORef (Map ByteString [ByteString]))
     , trsTypeFamilyRegistry :: !(IORef TR.TypeFamilyRegistry)

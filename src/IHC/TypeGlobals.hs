@@ -27,7 +27,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import System.IO.Unsafe (unsafePerformIO)
 
-import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
+import IHC.TypeAST (Scheme(..), Pred(..), Type(..), TypeSynonym(..))
 
 -- | Bundle of the four module-level type registries that the
 -- elaborator and scheduler share: top-level signatures, type
@@ -41,7 +41,7 @@ import IHC.TypeAST (Scheme(..), Pred(..), Type(..))
 -- into one allocation.
 data LegacyTypeState = LegacyTypeState
     { ltsTypeSigs           :: !(IORef (Map ByteString Scheme))
-    , ltsTypeSynonyms       :: !(IORef (Map ByteString (Int, Type)))
+    , ltsTypeSynonyms       :: !(IORef (Map ByteString TypeSynonym))
     , ltsClassMethodNames   :: !(IORef (Set ByteString))
     , ltsMethodClass        :: !(IORef (Map ByteString [ByteString]))
     , ltsAmbiguousSigs      :: !(IORef (Set ByteString))
@@ -75,7 +75,7 @@ globalTypeSigsRef = ltsTypeSigs legacyTypeState
 -- RHS@).  One-hop expansion is all the elaborator does today:
 -- @State s a@ → @StateT s Identity a@ is expanded once during
 -- unification.  Multi-level chains would need a fixed-point pass.
-globalTypeSynonymsRef :: IORef (Map ByteString (Int, Type))
+globalTypeSynonymsRef :: IORef (Map ByteString TypeSynonym)
 globalTypeSynonymsRef = ltsTypeSynonyms legacyTypeState
 
 -- | Names that really appear as methods in a @class C where m1 :: ...@
