@@ -3,5 +3,5 @@ import TextConsumer (textResult)
 
 main :: IO ()
 main = do
-    putStrLn boolResult
-    putStrLn textResult
+    print boolResult
+    print textResult

@@ -12,7 +12,7 @@ import Test.Hspec
 
 import IHC.AST
 import IHC.Classes (newClassRegistry)
-import IHC.Elaborate (Expected(..), elaborate, elaborateWithScopedSigs)
+import IHC.Elaborate (Expected(..), elaborate, elaborateWithScopedSigs, lookupScopedScheme)
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scan (scanTypeSigs)
 import IHC.Scheduler (schemesCompatible)
@@ -155,6 +155,11 @@ spec = describe "Hs2010 — Types" $ do
             c `shouldBe` False
 
     describe "expected-type elaboration of constrained values" $ do
+        it "declines an unresolved ambiguous global callee scheme" $ do
+            wrong <- schemeOf "Int -> Bool -> String"
+            lookupScopedScheme (Set.singleton "consume") Set.empty
+                (Map.singleton "consume" wrong) "consume" `shouldBe` Nothing
+
         it "preserves and specializes every parameter of an arbitrary MPTC" $ do
             let sig = Scheme ["a", "b"]
                     [Pred "Convert" [TyVar "a", TyVar "b"]]

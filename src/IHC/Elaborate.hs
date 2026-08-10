@@ -16,6 +16,7 @@ module IHC.Elaborate
     , Expected(..)
     , elaborate
     , elaborateWithScopedSigs
+    , lookupScopedScheme
     , elaborateExpr
     , parseRawTypeExpr
     , resolveSynonymHop
@@ -37,6 +38,24 @@ import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import IHC.TypeUnify
+
+-- | Look up a scheme for expected-argument inference without consulting a
+-- process-global last-writer entry when lexical metadata could not resolve an
+-- ambiguous bare name.
+lookupScopedScheme
+    :: Set.Set ByteString
+    -> Set.Set ByteString
+    -> Map ByteString Scheme
+    -> Name
+    -> Maybe Scheme
+lookupScopedScheme ambiguous scoped sigs name
+    | Set.member bare ambiguous
+    , not (Set.member name scoped || Set.member bare scoped) = Nothing
+    | otherwise = Map.lookup name sigs `orElse` Map.lookup bare sigs
+  where
+    bare = bareName name
+    orElse (Just value) _ = Just value
+    orElse Nothing other = other
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
 data InferenceError

@@ -139,7 +139,7 @@ elaborateExpectedArg hooks owner f x = do
         then pure x
         else case appHeadAndArity f of
             Just (fn, supplied) ->
-                case Map.lookup fn sigs `orElse` Map.lookup (bareName fn) sigs of
+                case Elab.lookupScopedScheme ambiguousSigs scopedSigs sigs fn of
                     Just (Scheme _ _ body) ->
                         case tyArrowArgs body of
                             (args, _) | supplied < length args -> do
@@ -181,7 +181,12 @@ elaborateExpectedArg hooks owner f x = do
         | otherwise = do
             mScheme <- lookupTypeSigFallback hooks owner name
             pure $ case mScheme of
-                Nothing -> state
+                Nothing
+                    | Set.member (bareName name) ambiguous ->
+                        ( Map.delete name (Map.delete (bareName name) known)
+                        , scoped
+                        )
+                    | otherwise -> state
                 Just scheme ->
                     let bare = bareName name
                     in ( Map.insert name scheme (fst state)

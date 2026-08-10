@@ -1546,7 +1546,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         let root = "test/Fixtures/Coverage/Modules/expected_arg_owner_collision"
         (n, out) <- captureStdout (runMainWithSiblings (root </> "Main.hs"))
         n   `shouldBe` 0
-        out `shouldBe` "True\nowner\n"
+        out `shouldBe` "True\nTrue\n"
 
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)

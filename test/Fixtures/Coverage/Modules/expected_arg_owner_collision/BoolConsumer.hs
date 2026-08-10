@@ -1,7 +1,7 @@
 module BoolConsumer (consume, boolResult) where
 
-consume :: Int -> Bool -> String
-consume _ = show
+consume :: Int -> Bool -> Bool
+consume _ = id
 
-boolResult :: String
+boolResult :: Bool
 boolResult = consume 0 True
