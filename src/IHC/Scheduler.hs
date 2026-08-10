@@ -9185,6 +9185,14 @@ resolveFallbackSource mOwner name = do
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter", "sum" ] = Just (BC.pack "GHC.List")
+        -- Prelude publicly re-exports these simple output operations, and
+        -- System.IO publicly exports the same source-backed bindings.  Route
+        -- bare implicit-Prelude lookups through that facade directly: a
+        -- fresh process has no previously-loaded System.IO owner for the
+        -- generic Prelude fallback to find.  This is discovery metadata, not
+        -- a host implementation; discoverInModule still follows System.IO's
+        -- real source and its re-export chain.
+        | bareName `elem` [ "putStrLn", "print" ] = Just (BC.pack "System.IO")
         -- 'fromIntegral' is a Prelude re-export; after removing the
         -- host shim, demand discovery should go straight to its source
         -- owner instead of walking unrelated loaded imports first.

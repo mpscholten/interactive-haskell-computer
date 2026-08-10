@@ -52,6 +52,7 @@ import qualified Hs2010DataDecl
 import qualified LexerIhp
 import qualified NorthStarTest
 import qualified ParserBugs
+import qualified PreludeIOOwnerTest
 import qualified Properties.DoDesugar
 import qualified Properties.RoundTrip
 import qualified Properties.SectionDesugar
@@ -171,6 +172,7 @@ parseFailures line =
 allSpecs :: Spec
 allSpecs = do
     ParserBugs.spec
+    PreludeIOOwnerTest.spec
     Properties.Totality.spec
     Properties.RoundTrip.spec
     Properties.SectionDesugar.spec
