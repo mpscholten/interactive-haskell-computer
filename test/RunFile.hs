@@ -193,7 +193,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             reg <- scanConstructorTypeMetadata (n "Main") src
             constructorFieldTypes reg (Just (n "Main")) (n "Box")
                 (TyApp (TyCon (n "Box")) (TyCon (n "Text")))
-                `shouldBe` Just [TyCon (n "Text")]
+                `shouldBe` Just [TyCon (n "Text"), TyCon (n "Int")]
 
         it "scans complete H98 alternatives, strict fields, and type atoms" do
             src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Positive.hs"
@@ -214,13 +214,29 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 `shouldBe` Just [TyCon (n "Data.Int.Int")]
             constructorFieldTypes reg (Just (n "Positive")) (n "Single")
                 (TyApp (TyCon (n "Single")) int) `shouldBe` Just [maybeInt]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Record")
+                (TyApp (TyCon (n "Records")) int)
+                `shouldBe` Just [maybeInt, maybeInt, int]
+            constructorFieldTypes reg (Just (n "Positive")) (n "NoFields")
+                (TyApp (TyCon (n "Records")) int) `shouldBe` Just []
+            let nested = TyApp (TyCon (n "Maybe"))
+                    (TyApp (TyApp (TyCon (n "Either")) (TyCon (n "String"))) int)
+            constructorFieldTypes reg (Just (n "Positive")) (n "PosState")
+                (TyApp (TyCon (n "PosState")) (TyCon (n "Text")))
+                `shouldBe` Just
+                    [ TyCon (n "Text")
+                    , int
+                    , nested
+                    , nested
+                    , TyApp (TyCon (n "[]")) (TyCon (n "Char"))
+                    ]
 
         it "rejects unsupported H98 declarations atomically" do
             src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Rejected.hs"
             reg <- scanConstructorTypeMetadata (n "Rejected") src
             mapM_ (\ctor -> constructorScheme reg (Just (n "Rejected")) (n ctor)
                     `shouldBe` Nothing)
-                ["Record", "Existential", "Context", "Multiline", "Kinded"]
+                ["MalformedRecord", "Existential", "Context", "Multiline", "Kinded"]
 
         it "rejects a registry key that disagrees with metadata identity" do
             let metadata = ordinary "Actual" "Mk" ["a"]

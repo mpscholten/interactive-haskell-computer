@@ -2503,9 +2503,11 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                 TkIdent "deriving" -> pure (Right (reverse rev, cur', True))
                 TkNewline -> do
                     let (peek, _) = nextToken src cur'
-                    if tkKind peek == TkEof || tkCol peek == 1
-                        then pure (Right (reverse rev, cur', True))
-                        else pure (Left cur')
+                    case tkKind peek of
+                        TkLBrace | null rev -> collectFields rev cur'
+                        _ | tkKind peek == TkEof || tkCol peek == 1 ->
+                            pure (Right (reverse rev, cur', True))
+                          | otherwise -> pure (Left cur')
                 TkConId _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
                 TkIdent "forall" -> pure (Left cur)
                 TkIdent _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
@@ -2519,9 +2521,65 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                     case atom of
                         Nothing -> pure (Left cur)
                         Just (a, next) -> collectFields (a : rev) next
-                -- Records, constructor contexts, infix constructors and any
-                -- other unparsed syntax fail the whole declaration closed.
+                TkLBrace | null rev -> do
+                    record <- collectRecordTypeFields cur'
+                    case record of
+                        Left badCur -> pure (Left badCur)
+                        Right (fields, next) -> collectFields (reverse fields) next
+                -- Constructor contexts, mixed positional/record syntax,
+                -- infix constructors and other unparsed syntax fail closed.
                 _ -> pure (Left cur)
+
+        -- Record fields have runtime positions in label order.  Shared-label
+        -- declarations such as @{ x, y :: T }@ therefore contribute two
+        -- copies of @T@.  The parser commits only after the closing brace.
+        collectRecordTypeFields = fields []
+          where
+            fields rev cur = do
+                let (tok, cur') = nextToken src cur
+                case tkKind tok of
+                    TkNewline -> fields rev cur'
+                    TkRBrace -> pure (Right (reverse rev, cur'))
+                    TkIdent label -> labels [label] cur'
+                    _ -> pure (Left cur)
+              where
+                labels names at = do
+                    let (tok, next) = nextToken src at
+                    case tkKind tok of
+                        TkDColon -> do
+                            fieldTy <- collectRecordType [] 0 next
+                            case fieldTy of
+                                Left bad -> pure (Left bad)
+                                Right (tyToks, afterTy, ended) ->
+                                    let copies = replicate (length names) tyToks
+                                        rev' = reverse copies ++ rev
+                                    in if ended
+                                        then pure (Right (reverse rev', afterTy))
+                                        else fields rev' afterTy
+                        TkComma -> do
+                            let (labelTok, afterLabel) = nextToken src next
+                            case tkKind labelTok of
+                                TkIdent label -> labels (label : names) afterLabel
+                                _ -> pure (Left next)
+                        _ -> pure (Left at)
+
+            collectRecordType rev depth cur = do
+                let (tok, cur') = nextToken src cur
+                    descend tt = collectRecordType (tt : rev) (depth + 1) cur'
+                    ascend tt = collectRecordType (tt : rev) (depth - 1) cur'
+                case tkKind tok of
+                    TkEof -> pure (Left cur)
+                    TkNewline -> collectRecordType rev depth cur'
+                    TkComma | depth == 0 -> pure (Right (reverse rev, cur', False))
+                    TkRBrace | depth == 0 -> pure (Right (reverse rev, cur', True))
+                    TkBang -> collectRecordType rev depth cur'
+                    TkLParen -> descend TTLParen
+                    TkLBracket -> descend TTLBracket
+                    TkRParen | depth > 0 -> ascend TTRParen
+                    TkRBracket | depth > 0 -> ascend TTRBracket
+                    _ -> case tokenToTT tok of
+                        Just tt -> collectRecordType (tt : rev) depth cur'
+                        Nothing -> pure (Left cur)
 
         atomFrom tok cur = case tokenToTT tok of
             Nothing -> pure ([], cur)

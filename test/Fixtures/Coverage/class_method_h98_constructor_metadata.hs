@@ -1,5 +1,5 @@
 data Text = Text
-data Box a = Box a | Count Int
+data Box a = Box { boxValue :: a, boxCount :: Int } | Count Int
 
 class Choose a where
     first :: Int -> Box a -> Int
@@ -13,4 +13,4 @@ instance Choose Text where
     second _ _ = 42
 
 main :: Int
-main = first 0 (Box Text)
+main = first 0 (Box Text 9)
