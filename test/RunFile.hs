@@ -29,7 +29,7 @@ import IHC.Scheduler
 import IHC.Source (readSourceFile)
 import IHC.TypeAST (Scheme(..), Type(..), Pred(..))
 import IHC.TH (thExpToExpr)
-import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk)
+import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk, showValForDebug)
 
 -- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
 -- an explicit search path so imports like @import Foo@ can resolve to
@@ -1502,6 +1502,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "ap-io-effect\n7\n"
 
+    it "Applicative pure IO: source-loaded IO instance constructs an action" do
+        src <- readSourceFile "test/Fixtures/Coverage/elaborate_pure_io.hs"
+        (_env, mainT) <- loadProgramFromSource ["test/Fixtures/Coverage"] src
+        v <- force legacyHooks mainT
+        case v of
+            VIO io -> do
+                result <- io
+                case result of
+                    VInt 42 -> pure ()
+                    other -> expectationFailure ("expected VInt 42, got " <> showValForDebug other)
+            other -> expectationFailure ("expected VIO, got " <> showValForDebug other)
+
     it "Monad >> IO: source-loaded method sequences effects" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/elaborate_seq_io.hs")
         n   `shouldBe` 0
@@ -1567,6 +1579,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout (runMainWithSiblings (root </> "Main.hs"))
         n   `shouldBe` 0
         out `shouldBe` "True\nTrue\n"
+
+    it "expected result: pure uses the annotated Q instance generically" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_pure_expected_q.hs")
+        n   `shouldBe` 42
+        out `shouldBe` ""
 
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)

@@ -4288,8 +4288,25 @@ classMethodDispatcher reg cls methodName = selfVal
 
     resultPolymorphicMethodForArg mArgTag = do
         let tags = resultPolymorphicDefaultTagsForArg mArgTag cls methodName
-        when (prefersSTResultCarrier mArgTag cls methodName) $
+        -- Result-polymorphic calls have no runtime carrier value from
+        -- which the ordinary dispatcher can take its first-miss path.
+        -- Materialise the source-declared instances for the owning class
+        -- before probing the candidate tags.  This is the same generic
+        -- provider hook used by argument-directed dispatch, and is
+        -- especially important for nullary carrier constructors such as
+        -- source `instance Applicative IO`, whose `pure` argument is the
+        -- payload rather than evidence for the `IO` instance.
+        when (not (null tags) || prefersSTResultCarrier mArgTag cls methodName) $
             triggerCoreInstanceLoad legacyHooks cls
+        -- Loading provider modules only catalogues their instance
+        -- declarations.  Argument-directed lookup drains that catalogue
+        -- after a miss; result-directed lookup has no such miss-bearing
+        -- value, so perform the same generic stage-2 materialisation here.
+        case tags of
+            firstTag : _ -> do
+                _ <- lazyInstanceRetry cls firstTag
+                pure ()
+            []           -> pure ()
         tryTags tags
       where
         tryTags [] = pure Nothing

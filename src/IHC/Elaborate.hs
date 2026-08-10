@@ -381,13 +381,22 @@ elaborateVar ienv name =
     -- non-class-method like @map@ doesn't need a sig for the surrounding
     -- signature-directed resolution to succeed.
     lookupSig = pure $ case Map.lookup name (ieSigs ienv) of
-        -- An exact owner-qualified entry is authoritative even when its bare
-        -- spelling collides elsewhere.  The scheduler inserted this scheme
-        -- from the lexical owner's resolver.
-        Just s -> Just s
+        -- Only an owner-qualified spelling or a scheme explicitly proven to
+        -- come from the owner's lexical scope is authoritative when the bare
+        -- spelling collides.  The process-global table is also keyed by bare
+        -- names, so treating every exact hit as scoped would merely select its
+        -- last writer.
+        Just s
+            | isQualifiedName name
+           || not (isAmbiguousSig ienv (bareName name)) -> Just s
+            | otherwise -> Nothing
         Nothing
             | isAmbiguousSig ienv (bareName name) -> Nothing
             | otherwise -> Map.lookup (bareName name) (ieSigs ienv)
+
+    isQualifiedName n = case BC.elemIndexEnd '.' n of
+        Just i -> i > 0 && i + 1 < BC.length n
+        Nothing -> False
 
 -- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
 bareName :: Name -> Name
