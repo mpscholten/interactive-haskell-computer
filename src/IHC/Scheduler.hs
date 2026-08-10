@@ -6152,14 +6152,32 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
             , not (BC.elem '.' key)
             = do
                 allowed <- specAllowsLoaded tm (impSpec imp) key
-                pure (if allowed then Just key else Nothing)
+                visible <- importCanProvide tm key
+                pure (if allowed && visible then Just key else Nothing)
             | otherwise =
                 case (qualRef, splitQualified key) of
                     (Just p, Just (qual, bare))
                         | p == qual <> BC.pack "." -> do
                             allowed <- specAllowsLoaded tm (impSpec imp) bare
-                            pure (if allowed then Just bare else Nothing)
+                            visible <- importCanProvide tm bare
+                            pure (if allowed && visible then Just bare else Nothing)
                     _ -> pure Nothing
+
+        -- Filter before discovery. Previously every free variable in the
+        -- importing body was discovered against every ImportAll target, and
+        -- only directRewritePairs checked the target's export surface later.
+        -- Handle.FD's ~20 free variables times its dense import list caused
+        -- thousands of unrelated discovery calls on a cold withFile.
+        importCanProvide target n =
+            case mhExports (lmHeader target) of
+                ExportList _ -> pure (exportsName target n)
+                ExportAll -> do
+                    mLhs <- findOrResolveLhs (lmSource target) (lmKnown target) n
+                    isMethod <- exportsClassMethodDirect target n
+                    pure ( isJust mLhs
+                        || isMethod
+                        || Map.member n (lmFieldReg target)
+                        || Map.member n (lmDataReg target))
 
     requestedNamesForImportPure :: Set ByteString -> ImportDecl -> Maybe ByteString -> [ByteString]
     requestedNamesForImportPure needed imp qualRef =
