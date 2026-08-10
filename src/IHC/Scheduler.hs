@@ -593,6 +593,11 @@ loadProgramFromSource searchPath src0 = do
             (map lmTypeCtorReg loadedModules)
     mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg
         provisionalTypeCtors provisionalClassTable provisionalEnv) loadedModules
+    -- Result-directed methods inside a splice may require a provider that was
+    -- not in the initial module snapshot (for example the carrier selected by
+    -- a rank-polymorphic Q action). Give provisional evaluation its own
+    -- provider hook; the authoritative knot installs a fresh hook below.
+    installCoreInstanceLoadHook classReg provisionalEnv
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
@@ -725,7 +730,18 @@ loadProgramFromSource searchPath src0 = do
     -- 'loadedModules' snapshot at the top of this function) participate
     -- in the registration pass.
     regAfterSplices <- readIORef registry
-    let loadedModules' = [ lm | (_, Loaded lm) <- Map.toList regAfterSplices ]
+    globalAfterSplices <- readIORef globalLoadedModulesRef
+    scopedAfterSplices <- currentInstanceScope
+    let localAfterSplices = Map.fromList
+            [ (lmName lm, lm) | (_, Loaded lm) <- Map.toList regAfterSplices ]
+        -- Provider loading during provisional splice evaluation uses the
+        -- global catalogue. Include those source modules in authoritative
+        -- registration after restoring the class registry; otherwise the
+        -- provider loader remains marked done while its dictionaries vanish.
+        scopedGlobal = Map.filterWithKey
+            (\name _ -> Set.member name scopedAfterSplices)
+            globalAfterSplices
+        loadedModules' = Map.elems (Map.union localAfterSplices scopedGlobal)
     -- Rebuild 'unionedTypeCtors' from the post-splice module list.  The
     -- earlier 'unionedTypeCtors' at the top of this function was computed
     -- from a stale snapshot taken before 'expandSplicesInModule' and the
