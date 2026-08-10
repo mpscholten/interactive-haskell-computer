@@ -135,7 +135,7 @@ import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
-import IHC.TypeAST (Scheme(..), Type(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), TypeSynonym(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead, typeDispatchTag, expandTypeSynonyms)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -2278,10 +2278,11 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     let synonyms = Map.union (lmTypeSynonyms lm) globalSynonyms
         canonicalTag n
             | n == BC.pack "String" = BC.pack "[]"
-            | Just (0, rhs) <- Map.lookup n synonyms
+            | Just (TypeSynonym [] rhs) <- Map.lookup n synonyms
             , Just h <- tyHead rhs = normalizeTyTag h
             | otherwise = normalizeTyTag n
         canonicalTypeNames = map canonicalTag typeNames
+        structuredTypeNames = map (typeDispatchTag . expandTypeSynonyms synonyms) headTypes
     -- Method bodies are registered LAZILY: each method is a VLazyMethod
     -- thunk that defers free-var discovery, import-rewrite building,
     -- and body parsing to first dispatch.  This avoids the O(N*M)
@@ -2374,6 +2375,13 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- @StrictText@), for every multi-parameter class.
     when (length canonicalTypeNames > 1 && canonicalTypeNames /= typeNames) $
         registerInstanceMulti classReg cls canonicalTypeNames methodVals
+    -- Expected-type elaboration knows the complete class argument, not just
+    -- its runtime outer constructor.  Publish a structural key as well so
+    -- competing instances such as @C [Char]@ and @C [Markup]@ retain distinct
+    -- dictionaries.  Runtime value-directed dispatch continues to use the
+    -- legacy constructor keys below when no expected type is available.
+    when (not (null structuredTypeNames)) $
+        registerInstanceMulti classReg cls structuredTypeNames methodVals
     -- Also register under every runtime data constructor of that type so
     -- that 'typeTagOf (VCon n _) = n' lookups succeed.  For qualified type
     -- heads, resolve the qualifier through the owning module's imports and

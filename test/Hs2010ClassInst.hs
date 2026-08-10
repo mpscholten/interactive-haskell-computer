@@ -13,9 +13,9 @@ import Test.Hspec
 import IHC.Lexer (LexError)
 import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
-import IHC.Scan (ClassDecl(..), InstanceDecl(..), scanClassDecls, scanInstanceDecls)
+import IHC.Scan (ClassDecl(..), InstanceDecl(..), scanClassDecls, scanInstanceDecls, scanTypeSynonyms)
 import IHC.Source (Source, mkSource)
-import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
+import IHC.TypeAST (Pred(..), Scheme(..), Type(..), TypeSynonym(..), expandTypeSynonyms)
 import IHC.Val (Env, Thunk)
 
 mkSrc :: ByteString -> Source
@@ -59,6 +59,17 @@ mainStub = "\nmain :: IO ()\nmain = pure ()\n"
 
 spec :: Spec
 spec = describe "Hs2010 — Class & instance declarations" $ do
+
+    it "preserves declared synonym binder order during expansion" $ do
+        synonyms <- Map.fromList <$> scanTypeSynonyms (mkSrc
+            "type Flip b a = Either a b\n")
+        synonyms `shouldBe` Map.singleton "Flip"
+            (TypeSynonym ["b", "a"]
+                (TyApp (TyApp (TyCon "Either") (TyVar "a")) (TyVar "b")))
+        expandTypeSynonyms synonyms
+            (TyApp (TyApp (TyCon "Flip") (TyCon "LeftArg")) (TyCon "RightArg"))
+            `shouldBe`
+                TyApp (TyApp (TyCon "Either") (TyCon "RightArg")) (TyCon "LeftArg")
 
     it "retains variables, applications, and lists in instance heads" $ do
         [decl] <- scanInstanceDecls (mkSrc

@@ -88,7 +88,7 @@ data Expected
 data InferEnv = InferEnv
     { ieFresh    :: !FreshSource
     , ieSigs     :: !(Map ByteString Scheme)
-    , ieSynonyms :: !(Map ByteString (Int, Type))
+    , ieSynonyms :: !(Map ByteString TypeSynonym)
     , ieClassReg :: !ClassRegistry
     , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
     , ieClassMethodNames :: !(Set.Set ByteString)
@@ -107,7 +107,7 @@ data InferEnv = InferEnv
 elaborate
     :: ClassRegistry
     -> Map ByteString Scheme
-    -> Map ByteString (Int, Type)
+    -> Map ByteString TypeSynonym
     -> Expected
     -> Expr
     -> IO (Expr, Type)
@@ -120,7 +120,7 @@ elaborate classReg sigs synonyms =
 elaborateWithScopedSigs
     :: ClassRegistry
     -> Map ByteString Scheme
-    -> Map ByteString (Int, Type)
+    -> Map ByteString TypeSynonym
     -> Set.Set ByteString
     -> Expected
     -> Expr
@@ -131,7 +131,7 @@ elaborateWithScopedSigs classReg sigs synonyms scopedSigs expected e = do
 elaborateOwned
     :: ClassRegistry
     -> Map ByteString Scheme
-    -> Map ByteString (Int, Type)
+    -> Map ByteString TypeSynonym
     -> ConstructorTypeRegistry
     -> Maybe Name
     -> Expected
@@ -147,7 +147,7 @@ elaborateOwned classReg sigs synonyms constructorTypes owner expected e = do
 elaborateOwnedWithScopedSigs
     :: ClassRegistry
     -> Map ByteString Scheme
-    -> Map ByteString (Int, Type)
+    -> Map ByteString TypeSynonym
     -> ConstructorTypeRegistry
     -> Maybe Name
     -> Set.Set ByteString
@@ -158,7 +158,7 @@ elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner scope
     elaborateOwnedInternal False classReg sigs synonyms constructorTypes owner scopedSigs expected e
 
 elaborateOwnedMethod
-    :: ClassRegistry -> Map ByteString Scheme -> Map ByteString (Int, Type)
+    :: ClassRegistry -> Map ByteString Scheme -> Map ByteString TypeSynonym
     -> ConstructorTypeRegistry -> Maybe Name -> Expected -> Expr
     -> IO (Expr, Type)
 elaborateOwnedMethod classReg sigs synonyms constructorTypes owner expected e =
@@ -166,7 +166,7 @@ elaborateOwnedMethod classReg sigs synonyms constructorTypes owner expected e =
 
 elaborateOwnedInternal
     :: Bool -> ClassRegistry -> Map ByteString Scheme
-    -> Map ByteString (Int, Type) -> ConstructorTypeRegistry -> Maybe Name
+    -> Map ByteString TypeSynonym -> ConstructorTypeRegistry -> Maybe Name
     -> Set.Set ByteString -> Expected -> Expr -> IO (Expr, Type)
 elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
     fresh <- newFreshSource
@@ -605,7 +605,11 @@ applyMethodSubst sub = go
     -- reverts the node to a bare 'EVar' (see 'go').
     resolveTag :: Name -> Maybe Name
     resolveTag tag = case Map.lookup tag sub of
-        Just ty -> tyHead (applySubst sub ty)   -- Just head, or Nothing if still a tyvar/arrow
+        Just ty ->
+            let resolved = applySubst sub ty
+            in if Set.null (freeTyVars resolved)
+                   then Just (typeDispatchTag resolved)
+                   else Nothing
         Nothing
           | isHeadName tag -> Just tag           -- already a concrete head (direct rewrite)
           | otherwise      -> Nothing            -- unresolved placeholder type variable
@@ -653,8 +657,18 @@ applyMethodSubst sub = go
         _ -> e
 
     resolveConstraint (cls, tags) = do
-        resolved <- traverse resolveTag tags
+        resolved <- traverse resolveLegacyTag tags
         pure (cls, resolved)
+
+    -- Constrained aliases are consumed by the older value-directed MPTC
+    -- dispatcher, whose public key contract is one outer runtime tag per
+    -- class parameter.  Keep that representation additive and stable while
+    -- ETypedMethod uses the structural key above.
+    resolveLegacyTag tag = case Map.lookup tag sub of
+        Just ty -> tyHead (applySubst sub ty)
+        Nothing
+          | isHeadName tag -> Just tag
+          | otherwise -> Nothing
 
     goStmt (SExpr e)         = SExpr (go e)
     goStmt (SBind n e)       = SBind n (go e)
@@ -668,7 +682,7 @@ applySubstIenv sub ie = ie
     { ieLocals = Map.map (applySubstScheme sub) (ieLocals ie) }
 
 -- | One-hop type synonym expansion: @State s a@ → @StateT s Identity a@.
-expandSyn :: Map ByteString (Int, Type) -> Type -> Type
+expandSyn :: Map ByteString TypeSynonym -> Type -> Type
 expandSyn syns = go
   where
     go t = case t of
@@ -678,11 +692,11 @@ expandSyn syns = go
             in case head_ of
                 TyCon n ->
                     case Map.lookup n syns of
-                        Just (arity, rhs)
-                          | length argsExpanded >= arity ->
+                        Just (TypeSynonym binders rhs)
+                          | let arity = length binders
+                          , length argsExpanded >= arity ->
                               let (forArity, extra) = splitAt arity argsExpanded
-                                  subs = Map.fromList (zip (collectSynVars rhs arity)
-                                                           forArity)
+                                  subs = Map.fromList (zip binders forArity)
                                   expanded = applySubst subs rhs
                               in foldl TyApp expanded extra
                         _ -> foldl TyApp head_ argsExpanded
@@ -692,20 +706,10 @@ expandSyn syns = go
         TyArrow a b  -> TyArrow (go a) (go b)
         TyForall vs preds body -> TyForall vs preds (go body)
 
-    -- Type synonym LHS variables aren't captured by the scanner right
-    -- now (it only records arity + RHS).  For expansion we need names;
-    -- we use conventional single-letter names 'a', 'b', …, matching
-    -- the order the synonym scanner would have captured them.  This is
-    -- a known shortcut; extending 'scanTypeSynonyms' to record LHS
-    -- names would let this be exact.
-    collectSynVars _ arity =
-        take arity (map (BC.singleton . fst)
-                        (zip ['a' ..] (repeat ())))
-
 -- | One-hop synonym resolver.  Same as 'expandSyn' at the outer level
 -- only — used by the trigger-finder to check if an annotation's head
 -- is a synonym for something else.
-resolveSynonymHop :: Map ByteString (Int, Type) -> Type -> Type
+resolveSynonymHop :: Map ByteString TypeSynonym -> Type -> Type
 resolveSynonymHop = expandSyn
 
 -- | Parse raw type-argument bytes (as stored in 'ETyApp') into a
