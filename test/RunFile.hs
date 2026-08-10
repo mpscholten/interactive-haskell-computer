@@ -1704,6 +1704,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n1, out1) `shouldBe` (0, "42\n")
         (n2, out2) `shouldBe` (0, "42\n")
 
+    it "Template Haskell: source Q constructor crosses quasiquote boundary" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/qq_source_q_constructor.hs")
+        n `shouldBe` 0
+        out `shouldBe` "source Q\n"
+
     it "Template Haskell: failed provisional fallback leaves no cached closure" do
         let bad = "test/Fixtures/Coverage/Modules/th_transaction_failure/Main.hs"
         failed <- try (runMainWithSiblings bad) :: IO (Either SomeException Int)
