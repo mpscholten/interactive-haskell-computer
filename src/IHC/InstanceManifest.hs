@@ -39,7 +39,9 @@ module IHC.InstanceManifest
     , generatePackageManifest
       -- * Process-level index
     , manifestIndex
+    , buildIndex
     , providersForClass
+    , providersForClassHead
     , classForMethod
     , providerModulesForMethods
     ) where
@@ -95,6 +97,7 @@ data ClassEntry = ClassEntry
 
 data InstanceEntry = InstanceEntry
     { ieClassName :: !ByteString
+    , iePrincipalHead :: !ByteString
     , ieTypeNames :: ![ByteString]
     } deriving (Show)
 
@@ -108,6 +111,8 @@ data ManifestIndex = ManifestIndex
         -- ^ class name → list of head-type names appearing in instances
         --   (used to follow @instance Monad Maybe@ → load @Maybe@'s
         --   defining module via 'miTypeProviders').
+    , miClassHeadProviders :: !(Map (ByteString, ByteString) (Set ByteString))
+        -- ^ (class, normalized instance-head tag) → declaring modules
     , miMethodOwner    :: !(Map ByteString ByteString)
         -- ^ method name → owning class
     , miTypeProviders  :: !(Map ByteString ByteString)
@@ -120,7 +125,7 @@ data ManifestIndex = ManifestIndex
     } deriving (Show)
 
 emptyIndex :: ManifestIndex
-emptyIndex = ManifestIndex Map.empty Map.empty Map.empty Map.empty
+emptyIndex = ManifestIndex Map.empty Map.empty Map.empty Map.empty Map.empty
 
 --------------------------------------------------------------------------------
 -- Generation
@@ -220,6 +225,7 @@ scanModuleUnsafe fp = do
         }
     fromInstanceDecl i = InstanceEntry
         { ieClassName = Scan.instClassName i
+        , iePrincipalHead = Scan.instTypeName i
         , ieTypeNames = Scan.instTypeNames i
         }
 
@@ -283,6 +289,7 @@ buildIndex :: [ModuleManifest] -> ManifestIndex
 buildIndex ms = ManifestIndex
     { miClassProviders = providers
     , miClassHeads     = classHeads
+    , miClassHeadProviders = headProviders
     , miMethodOwner    = methodOwners
     , miTypeProviders  = typeProviders
     }
@@ -292,14 +299,18 @@ buildIndex ms = ManifestIndex
     addProv modName ie =
         Map.insertWith Set.union (ieClassName ie) (Set.singleton modName)
 
+    headProviders = foldr addHeadProviders Map.empty ms
+    addHeadProviders mm acc = foldr (addOne (mmName mm)) acc (mmInstances mm)
+    addOne modName ie =
+        Map.insertWith Set.union (ieClassName ie, iePrincipalHead ie)
+            (Set.singleton modName)
+
     classHeads = foldr addHeads Map.empty ms
     addHeads mm acc = foldr addHead acc (mmInstances mm)
     -- The instance head's first type name (the head constructor) is
     -- what dispatch ultimately tags on.  @instTypeNames@ may be longer
     -- for MPTC; the first slot is the principal head.
-    addHead ie acc = case ieTypeNames ie of
-        []      -> acc
-        (h : _) -> Map.insertWith (++) (ieClassName ie) [h] acc
+    addHead ie = Map.insertWith (++) (ieClassName ie) [iePrincipalHead ie]
 
     methodOwners = foldr addMethods Map.empty ms
     addMethods mm acc = foldr addClass acc (mmClasses mm)
@@ -331,6 +342,10 @@ buildIndex ms = ManifestIndex
 providersForClass :: ManifestIndex -> ByteString -> Set ByteString
 providersForClass idx cls =
     Map.findWithDefault Set.empty cls (miClassProviders idx)
+
+providersForClassHead :: ManifestIndex -> ByteString -> ByteString -> Set ByteString
+providersForClassHead idx cls headTag =
+    Map.findWithDefault Set.empty (cls, headTag) (miClassHeadProviders idx)
 
 -- | Class name a method belongs to, if known.  @Nothing@ if no
 -- 'class C ... where method ...' was scanned for this name.

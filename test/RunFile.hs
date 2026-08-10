@@ -6,6 +6,7 @@ import Data.IORef
 import Data.List (isInfixOf, sort, isSuffixOf)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
@@ -14,7 +15,7 @@ import System.Environment (lookupEnv)
 
 import Test.Hspec
 
-import IHC.AST (Expr(..), Lit(..))
+import IHC.AST (Expr(..), Lit(..), Alt(..), Pat(..))
 import IHC.Classes (legacyHooks)
 import IHC.ConstructorMetadata
     ( ConstructorIdentity(..), ConstructorTypeMetadata(..), constructorFieldTypeAt
@@ -23,12 +24,14 @@ import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
 import IHC.Eval (eval, force)
 import IHC.Parser (ParseError(..), defaultFixityTable, parseBodyExprWithFixity)
+import qualified IHC.InstanceManifest as Manifest
 import IHC.Scan (emptyKnownSymbols, findBinding, scanConstructorTypeMetadata)
 import IHC.Scheduler
-    ( loadProgramFromSource, schemesHaveCommonInstance, resolveTypeSigMetadata )
+    ( loadProgramFromSource, schemesHaveCommonInstance, resolveTypeSigMetadata
+    , containsTemplateHaskellSyntax )
 import IHC.Source (readSourceFile)
 import IHC.TypeAST (Scheme(..), Type(..), Pred(..))
-import IHC.TH (thExpToExpr)
+import IHC.TH (thBuiltinPairs, thExpToExpr)
 import IHC.Val (Val(..), emptyEnv, extendEnv, emptyIPMap, newWHNFThunk, showValForDebug)
 
 -- | Phase-2.5 multi-file entry point. Equivalent to 'runFile' but with
@@ -72,6 +75,26 @@ captureStdout action = do
 
 spec :: Spec
 spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
+    it "Template Haskell ordinary source symbols are not host-backed" do
+        length thBuiltinPairs `shouldBe` 0
+
+    it "Template Haskell bootstrap sees quotes nested in view patterns" do
+        let expr = ECase (ELit (LInt 1))
+                [Alt (PView (EQuote (ELit (LInt 42))) PWild) (ELit (LInt 0))]
+        containsTemplateHaskellSyntax expr `shouldBe` True
+
+    it "instance manifest indexes only the principal MPTC dispatch head" do
+        let cls = BC.pack "SyntheticMPTC"
+            provider = BC.pack "Synthetic.Provider"
+            entry = Manifest.InstanceEntry cls (BC.pack "Primary")
+                        [BC.pack "Primary", BC.pack "Secondary"]
+            modu = Manifest.ModuleManifest provider "Synthetic.hs" [] [] [entry] []
+            idx = Manifest.buildIndex [modu]
+        Manifest.providersForClassHead idx cls (BC.pack "Primary")
+            `shouldBe` Set.singleton provider
+        Manifest.providersForClassHead idx cls (BC.pack "Secondary")
+            `shouldBe` Set.empty
+
     describe "constructor-aware field type metadata" do
         let n = BC.pack
             a = TyVar (n "a")
@@ -1640,6 +1663,22 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/Coverage/th_pure_expected_q.hs")
         n   `shouldBe` 42
         out `shouldBe` ""
+
+    it "Template Haskell: source Applicative Q expands a pure quote splice" do
+        (n1, out1) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_pure_quote_splice.hs")
+        (n2, out2) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_pure_quote_splice.hs")
+        (n1, out1) `shouldBe` (0, "42\n")
+        (n2, out2) `shouldBe` (0, "42\n")
+
+    it "Template Haskell: failed provisional fallback leaves no cached closure" do
+        let bad = "test/Fixtures/Coverage/Modules/th_transaction_failure/Main.hs"
+        failed <- try (runMainWithSiblings bad) :: IO (Either SomeException Int)
+        failed `shouldSatisfy` either (const True) (const False)
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/th_pure_quote_splice.hs")
+        (n, out) `shouldBe` (0, "42\n")
 
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)

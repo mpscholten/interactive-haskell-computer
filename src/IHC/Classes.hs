@@ -42,6 +42,7 @@ module IHC.Classes
     , drainCataloguedInstancesForClass
     , resetInstanceCatalogue
     , catalogueHasClass
+    , runProvisionalClassTransaction
       -- * Demand-driven env fallback
     , EnvFallbackHook
     , setEnvFallback
@@ -53,6 +54,7 @@ module IHC.Classes
       -- * Core-instance load hook
     , setCoreInstanceLoadHook
     , triggerCoreInstanceLoad
+    , triggerCoreInstanceLoadForTag
       -- * Ctor -> type-name lookup (for source-loaded ADTs)
     , setCtorTypeHook
     , lookupCtorType
@@ -79,7 +81,7 @@ module IHC.Classes
     , resetSessionHooks
     ) where
 
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, mask, onException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.HashMap.Strict as HashMap
@@ -560,6 +562,29 @@ catalogueHasClass cls = do
         Just (_:_) -> pure True
         _          -> pure False
 
+-- | Run compile-time evaluation against temporary class state. Source modules
+-- loaded by the action remain reusable in the module caches, but dictionaries,
+-- lazy catalogue closures, instance scope and the core-provider hook are
+-- restored atomically on both success and failure. The returned set is the
+-- explicit list of provider modules discovered by the transaction; callers
+-- use it to rebuild authoritative post-expansion dictionaries.
+runProvisionalClassTransaction
+    :: IHCHooks -> ClassRegistry -> IO a -> IO (a, Set ByteString)
+runProvisionalClassTransaction hooks classReg action = mask $ \restore -> do
+    registry0 <- readIORef classReg
+    catalogue0 <- readIORef instanceCatalogueRef
+    scope0 <- readIORef instanceScopeRef
+    coreHook0 <- readIORef (hkCoreInstanceLoad hooks)
+    let rollback = do
+            writeIORef classReg registry0
+            writeIORef instanceCatalogueRef catalogue0
+            writeIORef instanceScopeRef scope0
+            writeIORef (hkCoreInstanceLoad hooks) coreHook0
+    result <- restore action `onException` rollback
+    scope1 <- readIORef instanceScopeRef
+    rollback
+    pure (result, Set.difference scope1 scope0)
+
 --------------------------------------------------------------------------------
 -- Demand-driven env fallback
 --
@@ -640,7 +665,7 @@ lookupClassMethodFallback hooks cls method = do
 -- 'IHC.InstanceManifest' says provide instances for that class.
 --------------------------------------------------------------------------------
 
-setCoreInstanceLoadHook :: IHCHooks -> (ByteString -> IO ()) -> IO ()
+setCoreInstanceLoadHook :: IHCHooks -> (ByteString -> Maybe ByteString -> IO ()) -> IO ()
 setCoreInstanceLoadHook hooks = writeIORef (hkCoreInstanceLoad hooks)
 
 -- | Trigger a core-instance load for the given class.  The hook tracks
@@ -649,7 +674,12 @@ setCoreInstanceLoadHook hooks = writeIORef (hkCoreInstanceLoad hooks)
 triggerCoreInstanceLoad :: IHCHooks -> ByteString -> IO ()
 triggerCoreInstanceLoad hooks cls = do
     hook <- readIORef (hkCoreInstanceLoad hooks)
-    hook cls
+    hook cls Nothing
+
+triggerCoreInstanceLoadForTag :: IHCHooks -> ByteString -> ByteString -> IO ()
+triggerCoreInstanceLoadForTag hooks cls tag = do
+    hook <- readIORef (hkCoreInstanceLoad hooks)
+    hook cls (Just tag)
 
 --------------------------------------------------------------------------------
 -- Ctor -> type-name lookup hook (Section: source-loaded ADT dispatch)
@@ -753,7 +783,7 @@ data IHCHooks = IHCHooks
     { hkEnvFallback         :: !(IORef EnvFallbackHook)
     , hkTypeSigFallback     :: !(IORef TypeSigFallbackHook)
     , hkClassMethodFallback :: !(IORef (ByteString -> ByteString -> IO (Maybe Val)))
-    , hkCoreInstanceLoad    :: !(IORef (ByteString -> IO ()))
+    , hkCoreInstanceLoad    :: !(IORef (ByteString -> Maybe ByteString -> IO ()))
     , hkCtorType            :: !(IORef (ByteString -> Maybe ByteString))
     , hkRegisterInstances   :: !(IORef RegisterInstancesHook)
     , hkScan                :: !(IORef (Maybe ScanHook))
@@ -809,7 +839,7 @@ legacyHooks = unsafePerformIO $ do
     envFb       <- newIORef (\_ _ -> pure Nothing)
     typeSigFb   <- newIORef (\_ _ -> pure Nothing)
     classMethFb <- newIORef (\_ _ -> pure Nothing)
-    coreLoad    <- newIORef (\_ -> pure ())
+    coreLoad    <- newIORef (\_ _ -> pure ())
     ctorType    <- newIORef (const Nothing)
     regInsts    <- newIORef (\_ -> pure ())
     scan        <- newIORef Nothing
@@ -848,7 +878,7 @@ resetSessionHooks hooks = do
     writeIORef (hkEnvFallback         hooks) (\_ _ -> pure Nothing)
     writeIORef (hkTypeSigFallback     hooks) (\_ _ -> pure Nothing)
     writeIORef (hkClassMethodFallback hooks) (\_ _ -> pure Nothing)
-    writeIORef (hkCoreInstanceLoad    hooks) (\_   -> pure ())
+    writeIORef (hkCoreInstanceLoad    hooks) (\_ _ -> pure ())
     writeIORef (hkCtorType            hooks) (const Nothing)
     writeIORef (hkRegisterInstances   hooks) (\_   -> pure ())
     writeIORef (hkScan                hooks) Nothing

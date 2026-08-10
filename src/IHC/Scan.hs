@@ -2191,10 +2191,21 @@ scanDataDecls src
                 case mInfix of
                     Just (dReg', curN) -> finishCtor dReg' fReg curN
                     Nothing -> do
+                        let skipNls c0 =
+                                let (t, c1) = nextToken src c0
+                                in case tkKind t of
+                                    TkNewline -> skipNls c1
+                                    _         -> (t, c1)
+                            (peek, curAfterPeek) = skipNls cur'
                         -- Check if this ConId is a class constraint (existential form).
                         -- If we eventually hit '=>' before any '|' or col-1, it was a
-                        -- constraint context; skip it and restart collectCtors.
-                        isConstraint <- checkIfConstraint cur'
+                        -- constraint context; skip it and restart collectCtors. A
+                        -- record constructor is authoritative before this lookahead:
+                        -- its field type may itself contain @forall m. C m => ...@,
+                        -- which must not misclassify the constructor as a context.
+                        isConstraint <- case tkKind peek of
+                            TkLBrace -> pure False
+                            _        -> checkIfConstraint cur'
                         if isConstraint
                             then do
                                 -- Skip through the constraint(s) and '=>'.
@@ -2208,12 +2219,6 @@ scanDataDecls src
                                 --       { f1 :: ... }
                                 -- so newlines between the ctor name and '{'
                                 -- must not prevent record-syntax detection.
-                                let skipNls c0 =
-                                        let (t, c1) = nextToken src c0
-                                        in case tkKind t of
-                                            TkNewline -> skipNls c1
-                                            _         -> (t, c1)
-                                    (peek, curAfterPeek) = skipNls cur'
                                 (arity, strict, fields, curN) <- case tkKind peek of
                                     TkLBrace -> do
                                         (a, fs, c) <- collectRecordFields 0 [] curAfterPeek

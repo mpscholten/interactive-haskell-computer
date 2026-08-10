@@ -1,5 +1,6 @@
 {-# LANGUAGE TemplateHaskell #-}
-import Language.Haskell.TH.Syntax (Q, runQ)
-import Prelude (Int, pure)
+import qualified Language.Haskell.TH.Syntax as TH
+import Language.Haskell.TH.Syntax (Q)
+import Prelude (IO, Int, pure)
 
-main = runQ (pure 42 :: Q Int)
+main = TH.runQ (pure 42 :: Q Int)
