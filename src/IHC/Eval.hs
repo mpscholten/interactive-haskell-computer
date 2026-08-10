@@ -49,7 +49,7 @@ import qualified Data.Set as Set
 import Control.Exception (try, SomeException)
 
 import IHC.AST
-import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag, lookupClassMethodFallback, runThExpToExpr)
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
@@ -241,7 +241,7 @@ resolveTypedMethod hooks reg cls method tag = do
             -- class are free. ('lookupInstanceMethod' inside @tryResolve@
             -- already drains the Stage-2 lazy-instance catalogue on
             -- miss, so a separate drain is unnecessary here.)
-            triggerCoreInstanceLoad legacyHooks cls
+            triggerCoreInstanceLoadForTag legacyHooks cls tag
             resolved2 <- tryResolve
             case resolved2 of
                 Just v  -> forceMethodVal hooks v

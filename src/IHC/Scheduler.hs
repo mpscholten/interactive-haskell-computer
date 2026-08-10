@@ -42,6 +42,7 @@ module IHC.Scheduler
     , schemesCompatible
     , schemesHaveCommonInstance
     , resolveTypeSigMetadata
+    , containsTemplateHaskellSyntax
       -- * User-defined class dispatch (used by the REPL)
     , classMethodDispatcher
     , defaultTypeTag
@@ -50,7 +51,7 @@ module IHC.Scheduler
     , desugarRecordPats
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try)
+import Control.Exception (throwIO, Exception, catch, SomeException, try, mask, onException)
 import Control.Applicative ((<|>))
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (nullPtr)
@@ -102,7 +103,7 @@ import IHC.Classes
     , setEnvFallback
     , setTypeSigFallback
     , setCtorTypeHook
-    , setCoreInstanceLoadHook, triggerCoreInstanceLoad
+    , setCoreInstanceLoadHook, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag
     , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
     , lookupClassMethodFallback
@@ -112,6 +113,7 @@ import IHC.Classes
     , addCataloguedInstance
     , drainCataloguedInstancesForClass
     , resetInstanceCatalogue
+    , runProvisionalClassTransaction
     , legacyHooks
     , IHCHooks(..)
     , resetSessionHooks
@@ -128,7 +130,7 @@ import IHC.Parser (FixityTable, defaultFixityTable, scanFixityDecls, ParseError)
 import qualified IHC.PatSyn as PatSyn
 import IHC.Scan
 import IHC.Source
-import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
+import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
@@ -456,9 +458,9 @@ loadProgramFromSource searchPath src0 = do
     -- quotation or splice syntax.  This is module bootstrapping, not a host
     -- implementation: every declaration and dictionary still comes from the
     -- package's .hs source.
-    let entryBytes = srcBytes (lmSource entry)
-        usesTemplateHaskell = BC.pack "[|" `BS.isInfixOf` entryBytes
-                           || BC.pack "$(" `BS.isInfixOf` entryBytes
+    entryBodiesForTH <- readIORef (lmBodies entry)
+    let usesTemplateHaskell = any containsTemplateHaskellSyntax
+            (Map.elems entryBodiesForTH)
     when usesTemplateHaskell $ do
         _ <- loadModule registry fullSearchPath includeMap
                     (BC.pack "Language.Haskell.TH.Syntax")
@@ -587,27 +589,38 @@ loadProgramFromSource searchPath src0 = do
         let closureEnv = HashMap.insert ownerSentinelKey ownerThunk
                 (HashMap.union ownerLocals provisionalEnv)
         writeIORef slot (Unevaluated (Closure closureEnv emptyIPMap rhs))
-    preSpliceRegistry <- readIORef classReg
     provisionalClassTable <- buildClassMethodTable loadedModules
     let provisionalTypeCtors = foldr Map.union Map.empty
             (map lmTypeCtorReg loadedModules)
-    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg
-        provisionalTypeCtors provisionalClassTable provisionalEnv) loadedModules
-    -- Result-directed methods inside a splice may require a provider that was
-    -- not in the initial module snapshot (for example the carrier selected by
-    -- a rank-polymorphic Q action). Give provisional evaluation its own
-    -- provider hook; the authoritative knot installs a fresh hook below.
-    installCoreInstanceLoadHook classReg provisionalEnv
-    -- Phase 2.11: expand TH splices in every loaded module's bodies.
-    -- Run AFTER all modules are discovered (so imports are resolved) but
-    -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
-    -- contains all builtins including the 'lift' function.
-    mapM_ (expandSplicesInModule registry fullSearchPath includeMap provisionalEnv) loadedModules
-    -- Discard every provisional closure, including dictionaries materialised
-    -- while a splice ran.  Final registration below is the sole authority for
-    -- the runtime environment.
-    writeIORef classReg preSpliceRegistry
-    resetInstanceCatalogue
+    fallbackBase0 <- readIORef envBaseForFallbackRef
+    fallbackCache0 <- readIORef envFallbackCache
+    fallbackNeg0 <- readIORef envFallbackNegCacheRef
+    fallbackGen0 <- readIORef envFallbackCacheGenRef
+    typeSigCache0 <- readIORef typeSigMetadataCacheRef
+    let restoreProvisionalFallbackState = do
+            writeIORef envBaseForFallbackRef fallbackBase0
+            writeIORef envFallbackCache fallbackCache0
+            writeIORef envFallbackNegCacheRef fallbackNeg0
+            writeIORef envFallbackCacheGenRef fallbackGen0
+            writeIORef typeSigMetadataCacheRef typeSigCache0
+        provisionalAction = runProvisionalClassTransaction legacyHooks classReg $ do
+            mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg
+                provisionalTypeCtors provisionalClassTable provisionalEnv) loadedModules
+            -- Result-directed methods inside a splice may require a provider that
+            -- was not in the initial snapshot. This temporary hook and every
+            -- dictionary it materialises are rolled back by the transaction.
+            installCoreInstanceLoadHook classReg provisionalEnv
+            -- Dynamic fallback slots created while the splice runs read the
+            -- provisional base above, so late-loaded provider bodies retain
+            -- builtins/constructors (e.g. returnIO's source IO constructor).
+            mapM_ (expandSplicesInModule registry fullSearchPath includeMap
+                provisionalEnv) loadedModules
+    (_, provisionalProviderModules) <- mask $ \restore -> do
+        writeIORef envBaseForFallbackRef provisionalEnv
+        result <- restore provisionalAction
+            `onException` restoreProvisionalFallbackState
+        restoreProvisionalFallbackState
+        pure result
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
@@ -739,7 +752,8 @@ loadProgramFromSource searchPath src0 = do
         -- registration after restoring the class registry; otherwise the
         -- provider loader remains marked done while its dictionaries vanish.
         scopedGlobal = Map.filterWithKey
-            (\name _ -> Set.member name scopedAfterSplices)
+            (\name _ -> Set.member name
+                (Set.union scopedAfterSplices provisionalProviderModules))
             globalAfterSplices
         loadedModules' = Map.elems (Map.union localAfterSplices scopedGlobal)
     -- Rebuild 'unionedTypeCtors' from the post-splice module list.  The
@@ -968,16 +982,17 @@ preloadReplNumInstances classReg baseEnv = do
 installCoreInstanceLoadHook :: ClassRegistry -> Env -> IO ()
 installCoreInstanceLoadHook classReg baseEnv = do
     doneRef <- newIORef Set.empty
-    let hook cls = do
+    let hook cls mTag = do
+            let request = (cls, mTag)
             done <- readIORef doneRef
-            if Set.member cls done
+            if Set.member request done
               then pure ()
               else do
                   -- Mark before the call so an exception inside the
                   -- load doesn't loop us back through retry.  Same
                   -- best-effort pattern the previous one-shot hook used.
-                  writeIORef doneRef (Set.insert cls done)
-                  r <- try (loadCoreInstanceModules classReg baseEnv cls)
+                  writeIORef doneRef (Set.insert request done)
+                  r <- try (loadCoreInstanceModules classReg baseEnv cls mTag)
                           :: IO (Either SomeException ())
                   case r of
                       Right () -> pure ()
@@ -1009,21 +1024,31 @@ installCoreInstanceLoadHook classReg baseEnv = do
 -- manifest, or empty source cache) → no-op.  The caller
 -- ('resolveTypedMethod') falls through to the value-directed
 -- 'lookupClassMethodFallback'.
-loadCoreInstanceModules :: ClassRegistry -> Env -> ByteString -> IO ()
-loadCoreInstanceModules classReg baseEnv cls = do
+loadCoreInstanceModules :: ClassRegistry -> Env -> ByteString -> Maybe ByteString -> IO ()
+loadCoreInstanceModules classReg baseEnv cls mTag = do
     let idx               = Manifest.manifestIndex
         ghcInternalPrefix = BC.pack "GHC.Internal."
         allProviders = Manifest.providersForClass idx cls
         coreProviders = Set.filter (ghcInternalPrefix `BC.isPrefixOf`) allProviders
+        exactProviders = maybe Set.empty
+            (Manifest.providersForClassHead idx cls . normalizeTyTag) mTag
         providers
+            | not (Set.null exactProviders) = exactProviders
             | Set.null coreProviders = allProviders
             | otherwise              = coreProviders
-        headTypeMods = Set.fromList
+        allHeadTypeMods = Set.fromList
             [ definingMod
             | tyName       <- Map.findWithDefault [] cls (Manifest.miClassHeads idx)
             , Just definingMod <- [Map.lookup tyName (Manifest.miTypeProviders idx)]
             , Set.null coreProviders || ghcInternalPrefix `BC.isPrefixOf` definingMod
             ]
+        headTypeMods = case mTag of
+            Just tag | not (Set.null exactProviders) -> Set.fromList
+                [ definingMod
+                | Just definingMod <-
+                    [Map.lookup (normalizeTyTag tag) (Manifest.miTypeProviders idx)]
+                ]
+            _ -> allHeadTypeMods
         toLoad = Set.toList (providers `Set.union` headTypeMods)
     case toLoad of
         [] -> pure ()                     -- nothing manifest-known; fall through
@@ -4376,27 +4401,24 @@ classMethodDispatcher reg cls methodName = selfVal
         let tags = resultPolymorphicDefaultTagsForArg mArgTag cls methodName
         -- Result-polymorphic calls have no runtime carrier value from
         -- which the ordinary dispatcher can take its first-miss path.
-        -- Materialise the source-declared instances for the owning class
-        -- before probing the candidate tags.  This is the same generic
-        -- provider hook used by argument-directed dispatch, and is
-        -- especially important for nullary carrier constructors such as
-        -- source `instance Applicative IO`, whose `pure` argument is the
-        -- payload rather than evidence for the `IO` instance.
-        when (not (null tags) || prefersSTResultCarrier mArgTag cls methodName) $
+        -- When inference cannot provide candidate tags, retain the broad
+        -- provider fallback used by the genuinely ambiguous path.  Known
+        -- candidates are loaded one at a time by 'tryTags' below; loading the
+        -- whole class here turns a result-directed @Applicative IO@ probe into
+        -- a walk over every Applicative provider in the source cache.
+        when (null tags && prefersSTResultCarrier mArgTag cls methodName) $
             triggerCoreInstanceLoad legacyHooks cls
-        -- Loading provider modules only catalogues their instance
-        -- declarations.  Argument-directed lookup drains that catalogue
-        -- after a miss; result-directed lookup has no such miss-bearing
-        -- value, so perform the same generic stage-2 materialisation here.
-        case tags of
-            firstTag : _ -> do
-                _ <- lazyInstanceRetry cls firstTag
-                pure ()
-            []           -> pure ()
         tryTags tags
       where
         tryTags [] = pure Nothing
         tryTags (tag:rest) = do
+            -- Provider selection is already ordered by the result-directed
+            -- candidate list (IO/ST/STM/ParsecT, etc.).  Preserve that order
+            -- through loading as well as lookup so a failed first candidate
+            -- does not materialise unrelated dictionaries or let a later
+            -- provider overwrite it.
+            triggerCoreInstanceLoadForTag legacyHooks cls tag
+            _ <- lazyInstanceRetry cls tag
             mConcrete <- lookupConcreteInstanceMethod cls tag methodName
             case mConcrete of
                 Just methodVal
@@ -7863,7 +7885,6 @@ resetPerRunGlobals = do
     FFI.clearOpenLibs
     FFI.clearSymbolCache
     PatSyn.clearPatSyns
-    resetNewNameCounter
     resetLocateModuleNegCache
     TR.setGlobalRegistry Map.empty
     -- Stage 2 of the lazy-registration plan: 'registerInstancesFrom'
@@ -11609,7 +11630,11 @@ syntheticClassMethodNames = goExpr
         ERecordUpdate e fields -> goExpr e ++ concatMap (goExpr . snd) fields
         EImplicitRef _   -> []
         EImplicitLet bs e -> concatMap (goExpr . snd) bs ++ goExpr e
-        ESplice e   -> goExpr e
+        -- Splice actions run during expansion, not when the resulting runtime
+        -- binding is evaluated.  TH performs its own (typed) provider loading;
+        -- including these methods here turns e.g. @pure [| ... |]@ into an
+        -- eager load of every Applicative provider in ghc-internal.
+        ESplice _   -> []
         EQuote _    -> []
         EQuasiQuote _ _ -> []
         ELabel _    -> []
@@ -11716,6 +11741,42 @@ freeVars e = HashSet.toList (goAll HashSet.empty e)
     patBound (PRecordWild _)     = []  -- resolved later; can't enumerate fields here
     patBound (PView _ p)         = patBound p
     patBound _                   = []
+
+-- | Parsed-AST test for TH syntax. Raw substring probes incorrectly treat
+-- comments and string literals containing @[|@ or @$(@ as language syntax.
+containsTemplateHaskellSyntax :: Expr -> Bool
+containsTemplateHaskellSyntax = go
+  where
+    go ESplice{} = True
+    go EQuote{} = True
+    go EQuasiQuote{} = True
+    go (EApp f x) = go f || go x
+    go (ELam _ e) = go e
+    go (ELet bs e) = any (go . snd) bs || go e
+    go (ECase s as) = go s || any (\(Alt p e) -> goPat p || go e) as
+    go (EIf c t e) = any go [c, t, e]
+    go (EDo ss) = any goStmt ss
+    go (ENeg e) = go e
+    go (ETuple es) = any go es
+    go (ERecordCon _ fs) = any (go . snd) fs
+    go (ERecordUpdate e fs) = go e || any (go . snd) fs
+    go (EImplicitLet bs e) = any (go . snd) bs || go e
+    go (ETyApp e _) = go e
+    go (EConstrainedValue e _) = go e
+    go _ = False
+    goStmt (SExpr e) = go e
+    goStmt (SBind _ e) = go e
+    goStmt (SBangBind _ e) = go e
+    goStmt (SLet bs) = any (go . snd) bs
+    goStmt (SImplicitLet bs) = any (go . snd) bs
+    goPat (PCon _ ps) = any goPat ps
+    goPat (PAs _ p) = goPat p
+    goPat (PBang p) = goPat p
+    goPat (PIrref p) = goPat p
+    goPat (PTuple ps) = any goPat ps
+    goPat (PRecord _ fs) = any (goPat . snd) fs
+    goPat (PView e p) = go e || goPat p
+    goPat _ = False
 
 needsRecordFields :: Expr -> Bool
 needsRecordFields = goExpr
@@ -11885,7 +11946,10 @@ discoveryFreeVars = go []
         EImplicitLet bs e ->
             let names = map fst bs
             in go (names ++ bound) e
-        ESplice inner  -> go bound inner
+        -- The splice expander discovers its action separately.  Keeping its
+        -- free variables out of the runtime provider seed avoids class-wide
+        -- provider fan-out before typed TH dispatch can select the head.
+        ESplice _      -> []
         EQuote _       -> []
         -- QuasiQuoter: make the QQ fn name a discovery free var so the
         -- scheduler pre-loads the defining module before eval fires.

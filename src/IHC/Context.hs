@@ -208,7 +208,7 @@ freshHooks = do
     envFb       <- newIORef (\_ _ -> pure Nothing)
     typeSigFb   <- newIORef (\_ _ -> pure Nothing)
     classMethFb <- newIORef (\_ _ -> pure Nothing)
-    coreLoad    <- newIORef (\_ -> pure ())
+    coreLoad    <- newIORef (\_ _ -> pure ())
     ctorType    <- newIORef (const Nothing)
     regInsts    <- newIORef (\_ -> pure ())
     scan        <- newIORef Nothing

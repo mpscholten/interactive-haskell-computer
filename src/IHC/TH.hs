@@ -1,45 +1,36 @@
--- | Phase 2.11 — Template Haskell Lift-splice subset.
+-- | Template Haskell quotation/splice evaluation and AST decoding.
 --
 -- This module provides:
 --
--- 1. Builtin 'Lift' instances for primitive types (Int, Char, String,
---    Bool, (), lists, tuples, Maybe, Either).  Each instance is a
---    'VFun' that maps a runtime 'Val' to a 'Val' encoding a TH 'Exp'
---    AST node (e.g. @VCon "LitE" [integerLVal]@).
---
--- 2. A synthetic @Language.Haskell.TH.Syntax@ / @Language.Haskell.TH@
---    module surface: 'lift' is the only exported function. The 'Q' monad
---    is not needed for Lift-only splices — we short-circuit it entirely.
---
--- 3. @thExpToExpr :: Val -> IO Expr@ — the anti-quoter that walks a
+-- 1. @thExpToExpr :: Val -> IO Expr@ — the anti-quoter that walks a
 --    TH 'Exp' value-tree and produces an 'IHC.AST.Expr'.
 --
--- 4. @expandSplicesInExpr :: Env -> Int -> Expr -> IO Expr@ — recursively
+-- 2. @expandSplicesInExpr :: Env -> Int -> Expr -> IO Expr@ — recursively
 --    replaces every 'ESplice' node with the 'Expr' it evaluates to.
 --    Hard-caps recursion at depth 16.
 --
--- NOT in scope: [| |] quotation, reify, Q IO, declaration/type splices.
+-- Ordinary template-haskell modules, functions, classes, instances, and AST
+-- constructors are source-loaded. This module exposes no host-backed TH names.
 module IHC.TH
-    ( liftBuiltin
-    , thExpToExpr
+    ( thExpToExpr
     , expandSplicesInExpr
     , thBuiltinPairs
     , exprToVal
     -- * Phase 2.13: top-level splice decl decoder
     , thDecsToBindings
     , thExpandSpliceDecl
-    , resetNewNameCounter
     ) where
 
 import Control.Exception (throwIO, Exception, SomeException, try)
-import Control.Monad ((<=<))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Int (Int64)
-import System.IO.Unsafe (unsafePerformIO)
+import qualified Data.Set as Set
 import IHC.AST
-import IHC.Classes (legacyHooks, getSharedClassReg)
+import IHC.Classes
+    ( legacyHooks, getSharedClassReg, triggerCoreInstanceLoadForTag
+    , drainCataloguedInstancesForClass )
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import qualified IHC.Elaborate as Elab
 import IHC.Eval (eval, force, currentOwner)
@@ -105,22 +96,9 @@ stringL listVal = do
 litE :: Thunk -> IO Thunk
 litE litT = newWHNFThunk (VCon "LitE" [litT])
 
--- | Build @ConE name@.
-conE :: ByteString -> IO Thunk
-conE n = do
-    nt <- thName n
-    newWHNFThunk (VCon "ConE" [nt])
-
 -- | Build @AppE f x@.
 appE :: Thunk -> Thunk -> IO Thunk
 appE fT xT = newWHNFThunk (VCon "AppE" [fT, xT])
-
--- | Build @ListE [e1, e2, ...]@ as a VCon "ListE" containing a [Thunk] list.
-listE :: [Thunk] -> IO Thunk
-listE ts = do
-    listVal <- buildThunkList ts
-    lt <- newWHNFThunk listVal
-    newWHNFThunk (VCon "ListE" [lt])
 
 -- | Build @TupE [e1, e2, ...]@ — same list encoding as ListE.
 tupE :: [Thunk] -> IO Thunk
@@ -140,103 +118,6 @@ buildThunkList (x:xs) = do
 --------------------------------------------------------------------------------
 -- Lift instances
 --------------------------------------------------------------------------------
-
--- | @lift :: Lift a => a -> Exp@ — the master dispatch function.
--- Takes a Val and returns a Val encoding a TH Exp.
-liftVal :: Val -> IO Val
-liftVal (VInt n)  = do
-    litT <- integerL n
-    force legacyHooks =<< litE litT
-liftVal (VChar c) = do
-    litT <- charL c
-    force legacyHooks =<< litE litT
-liftVal (VStr bs) = do
-    -- VStr is a raw ByteString; convert to [Char] list, then StringL
-    let chars = BC.unpack bs
-    charListVal <- buildCharList chars
-    litT <- stringL charListVal
-    force legacyHooks =<< litE litT
-  where
-    buildCharList []     = pure (VCon "[]" [])
-    buildCharList (c:cs) = do
-        h    <- newWHNFThunk (VChar c)
-        rest <- buildCharList cs
-        t    <- newWHNFThunk rest
-        pure (VCon ":" [h, t])
-liftVal VUnit = do
-    -- () -> ConE "()"
-    force legacyHooks =<< conE "()"
-liftVal (VCon "True" []) = force legacyHooks =<< conE "True"
-liftVal (VCon "False" []) = force legacyHooks =<< conE "False"
-liftVal (VCon "[]" []) = do
-    -- [] -> ListE []
-    force legacyHooks =<< listE []
-liftVal (VCon ":" [hT, tT]) = do
-    -- list: collect all elements and build ListE
-    hV <- force legacyHooks hT
-    tV <- force legacyHooks tT
-    elems <- collectList hV tV
-    elemTs <- mapM (newWHNFThunk <=< liftVal) elems
-    force legacyHooks =<< listE elemTs
-  where
-    collectList h (VCon "[]" []) = pure [h]
-    collectList h (VCon ":" [hT', tT']) = do
-        h' <- force legacyHooks hT'
-        t' <- force legacyHooks tT'
-        rest <- collectList h' t'
-        pure (h : rest)
-    collectList h other =
-        throwTH ("liftVal: unexpected list tail: " <> showValForDebug other)
-liftVal (VCon "Nothing" []) = force legacyHooks =<< conE "Nothing"
-liftVal (VCon "Just" [xT]) = do
-    xV <- force legacyHooks xT
-    xLifted <- liftVal xV
-    xE <- newWHNFThunk xLifted
-    jE <- conE "Just"
-    force legacyHooks =<< appE jE xE
-liftVal (VCon "Left" [xT]) = do
-    xV <- force legacyHooks xT
-    xLifted <- liftVal xV
-    xE <- newWHNFThunk xLifted
-    lE <- conE "Left"
-    force legacyHooks =<< appE lE xE
-liftVal (VCon "Right" [xT]) = do
-    xV <- force legacyHooks xT
-    xLifted <- liftVal xV
-    xE <- newWHNFThunk xLifted
-    rE <- conE "Right"
-    force legacyHooks =<< appE rE xE
-liftVal v@(VCon name args)
-    | isTupleName name = do
-        -- Tuple: TupE [lift a, lift b, ...]
-        argVals <- mapM (force legacyHooks) args
-        argLifted <- mapM liftVal argVals
-        argTs <- mapM newWHNFThunk argLifted
-        force legacyHooks =<< tupE argTs
-    | otherwise = do
-        -- User-defined constructor: AppE (AppE (ConE "Foo") arg1) arg2 ...
-        argVals <- mapM (force legacyHooks) args
-        argExprs <- mapM liftVal argVals
-        argTs <- mapM newWHNFThunk argExprs
-        baseT <- conE name
-        applyArgs baseT argTs
-  where
-    isTupleName n =
-        BC.length n >= 2 &&
-        BC.head n == '(' &&
-        BC.last n == ')' &&
-        BC.all (\c -> c == ',' || c == '(' || c == ')') n
-    applyArgs acc [] = force legacyHooks acc
-    applyArgs acc (t:ts) = do
-        newAcc <- appE acc t
-        applyArgs newAcc ts
-liftVal v = throwTH ("liftVal: unsupported value: " <> showValForDebug v)
-
--- | The builtin @lift@ VFun.
-liftBuiltin :: IO Val
-liftBuiltin = pure $ VFun $ \argThunk -> do
-    v <- force legacyHooks argThunk
-    liftVal v
 
 --------------------------------------------------------------------------------
 -- thExpToExpr — decode a TH Exp Val back into IHC.AST.Expr
@@ -338,7 +219,7 @@ decodeLit v =
 decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
 decodeName (VCon "Name" [nT]) = do
-    -- @VCon "Name" [VStr bs]@ — the shape produced by 'mkNameBuiltin'.
+    -- Source-loaded TH Name constructors retain their occurrence bytes here.
     nV <- force legacyHooks nT
     case nV of
         VStr bs    -> pure bs
@@ -492,7 +373,49 @@ expandSplicesInExpr env ipm depth expr
                 result <- try (Elab.elaborateOwned classReg sigs synonyms
                     constructorTypes owner (Elab.ExpectType expectedTy) inner)
                     :: IO (Either SomeException (Expr, Type))
-                pure (either (const inner) fst result)
+                case result of
+                    Left _ -> pure inner
+                    Right (elaborated, _) -> do
+                        -- Provider loading must happen before evaluation: a
+                        -- successful typed lookup can drain the current class
+                        -- catalogue without firing the miss hook, while its
+                        -- source method may need another instance of the same
+                        -- class (Q.pure's rank-polymorphic action is the
+                        -- canonical example). This is derived solely from
+                        -- elaborated class nodes, never from method names.
+                        mapM_ materializeClass
+                            (Set.toList (typedMethodClasses elaborated))
+                        pure elaborated
+
+    materializeClass (cls, tag) = do
+        triggerCoreInstanceLoadForTag legacyHooks cls tag
+        _ <- drainCataloguedInstancesForClass cls
+        pure ()
+
+    typedMethodClasses = goClasses
+      where
+        goClasses (ETypedMethod cls _ tag) = Set.singleton (cls, tag)
+        goClasses (EApp f x) = Set.union (goClasses f) (goClasses x)
+        goClasses (ELam _ e) = goClasses e
+        goClasses (ELet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
+        goClasses (ECase s as) = Set.unions (goClasses s : [goClasses e | Alt _ e <- as])
+        goClasses (EIf c t e) = Set.unions [goClasses c, goClasses t, goClasses e]
+        goClasses (EDo ss) = Set.unions (map stmtClasses ss)
+        goClasses (ENeg e) = goClasses e
+        goClasses (ETuple es) = Set.unions (map goClasses es)
+        goClasses (EImplicitLet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
+        goClasses (ERecordCon _ fs) = Set.unions (map (goClasses . snd) fs)
+        goClasses (ERecordUpdate e fs) = Set.unions (goClasses e : map (goClasses . snd) fs)
+        goClasses (ESplice e) = goClasses e
+        goClasses (ETyApp e _) = goClasses e
+        goClasses (EConstrainedValue e _) = goClasses e
+        goClasses _ = Set.empty
+
+        stmtClasses (SExpr e) = goClasses e
+        stmtClasses (SBind _ e) = goClasses e
+        stmtClasses (SBangBind _ e) = goClasses e
+        stmtClasses (SLet bs) = Set.unions (map (goClasses . snd) bs)
+        stmtClasses (SImplicitLet bs) = Set.unions (map (goClasses . snd) bs)
 
     goAlt (Alt p e) = Alt p <$> go e
 
@@ -513,7 +436,7 @@ expandSplicesInExpr env ipm depth expr
 
 -- | Convert an IHC 'Expr' (the body of a [| ... |] bracket) into
 -- a 'Val' encoding the corresponding TH 'Exp'. The result is the
--- same encoding as 'liftVal' / 'liftBuiltin' produces.
+-- same encoding as source-loaded TH constructors produce.
 exprToVal :: Expr -> IO Val
 exprToVal (EVar n)
     -- Capitalised name → ConE; lowercase/operator → VarE.
@@ -575,335 +498,15 @@ exprToVal _ =
 -- Builtin name pairs to register in the environment
 --------------------------------------------------------------------------------
 
--- | (name, IO Val) pairs for all TH-related builtins.
--- Registers under both short and fully-qualified paths.
+-- | No ordinary Template Haskell symbol is host-backed.
 thBuiltinPairs :: [(ByteString, IO Val)]
-thBuiltinPairs =
-    [ ("lift",                                liftBuiltin)
-    , ("TH.lift",                             liftBuiltin)
-    , ("Language.Haskell.TH.lift",            liftBuiltin)
-    , ("Language.Haskell.TH.Syntax.lift",     liftBuiltin)
-    , ("Language.Haskell.TH.Lib.lift",        liftBuiltin)
-    -- Phase 2.13: Q monad + Name primitives for top-level splices.
-    , ("mkName",                              mkNameBuiltin)
-    , ("Language.Haskell.TH.mkName",          mkNameBuiltin)
-    , ("Language.Haskell.TH.Syntax.mkName",   mkNameBuiltin)
-    , ("newName",                             newNameBuiltin)
-    , ("Language.Haskell.TH.newName",         newNameBuiltin)
-    , ("Language.Haskell.TH.Syntax.newName",  newNameBuiltin)
-    , ("runQ",                                runQBuiltin)
-    , ("Language.Haskell.TH.runQ",            runQBuiltin)
-    , ("Language.Haskell.TH.Syntax.runQ",     runQBuiltin)
-    , ("reify",                               reifyBuiltin)
-    , ("Language.Haskell.TH.reify",           reifyBuiltin)
-    , ("Language.Haskell.TH.Syntax.reify",    reifyBuiltin)
-    , ("location",                            locationBuiltin)
-    , ("TH.location",                         locationBuiltin)
-    , ("Language.Haskell.TH.location",        locationBuiltin)
-    , ("Language.Haskell.TH.Syntax.location", locationBuiltin)
-    , ("extsEnabled",                            extsEnabledBuiltin)
-    , ("TH.extsEnabled",                         extsEnabledBuiltin)
-    , ("Language.Haskell.TH.extsEnabled",        extsEnabledBuiltin)
-    , ("Language.Haskell.TH.Syntax.extsEnabled", extsEnabledBuiltin)
-    ]
-    ++ thLocPairs
-    -- Phase 2.13: TH AST constructors.  These have no Haskell source in
-    -- our cache (the template-haskell package isn't source-loaded) and
-    -- the decoder expects VCon-shaped values, so we auto-generate
-    -- curried constructor builtins for the shapes deriveJSON emits.
-    ++ thConstructorPairs
-
--- | Every @(name, arity)@ pair for the Template Haskell constructors we
--- support as builtin shims.  Registered under the bare name and the
--- fully-qualified @Language.Haskell.TH.*@ path so imports resolve.
-thConstructorCatalog :: [(ByteString, Int)]
-thConstructorCatalog =
-    -- Dec
-    [ ("ValD", 3)           -- pat, body, wheres
-    , ("FunD", 2)           -- name, clauses
-    , ("SigD", 2)           -- name, type
-    , ("InstanceD", 4)      -- overlap, ctx, typ, decs
-    , ("DataD", 6)
-    , ("NewtypeD", 6)
-    , ("ClassD", 4)
-    , ("PragmaD", 1)
-    -- Clause (fun body form: Clause [pat] body [dec])
-    , ("Clause", 3)
-    -- Body
-    , ("NormalB", 1)
-    , ("GuardedB", 1)
-    -- Exp
-    , ("VarE", 1)
-    , ("ConE", 1)
-    , ("LitE", 1)
-    , ("AppE", 2)
-    , ("AppTypeE", 2)
-    , ("InfixE", 3)
-    , ("UInfixE", 3)
-    , ("ParensE", 1)
-    , ("LamE", 2)
-    , ("LamCaseE", 1)
-    , ("TupE", 1)
-    , ("UnboxedTupE", 1)
-    , ("CondE", 3)
-    , ("MultiIfE", 1)
-    , ("LetE", 2)
-    , ("CaseE", 2)
-    , ("DoE", 2)
-    , ("CompE", 1)
-    , ("ArithSeqE", 1)
-    , ("ListE", 1)
-    , ("SigE", 2)
-    , ("RecConE", 2)
-    , ("RecUpdE", 2)
-    , ("StaticE", 1)
-    , ("UnboundVarE", 1)
-    , ("LabelE", 1)
-    , ("ImplicitParamVarE", 1)
-    -- Pat
-    , ("VarP", 1)
-    , ("ConP", 3)        -- name, [type], [pat] (modern) / (name, [pat])
-    , ("LitP", 1)
-    , ("TupP", 1)
-    , ("UnboxedTupP", 1)
-    , ("InfixP", 3)
-    , ("UInfixP", 3)
-    , ("ParensP", 1)
-    , ("TildeP", 1)
-    , ("BangP", 1)
-    , ("AsP", 2)
-    , ("RecP", 2)
-    , ("ListP", 1)
-    , ("SigP", 2)
-    , ("ViewP", 2)
-    , ("WildP", 0)
-    -- Lit
-    , ("IntegerL", 1)
-    , ("RationalL", 1)
-    , ("CharL", 1)
-    , ("StringL", 1)
-    , ("IntPrimL", 1)
-    , ("WordPrimL", 1)
-    , ("FloatPrimL", 1)
-    , ("DoublePrimL", 1)
-    , ("StringPrimL", 1)
-    , ("CharPrimL", 1)
-    -- Type
-    , ("ConT", 1)
-    , ("VarT", 1)
-    , ("AppT", 2)
-    , ("ArrowT", 0)
-    , ("ListT", 0)
-    , ("TupleT", 1)
-    , ("ForallT", 3)
-    , ("PromotedT", 1)
-    , ("LitT", 1)
-    , ("StarT", 0)
-    -- TyVarBndr
-    , ("PlainTV", 1)
-    , ("KindedTV", 2)
-    -- Info (returned by reify)
-    , ("TyConI", 1)
-    , ("ClassI", 2)
-    , ("ClassOpI", 3)
-    , ("VarI", 3)
-    , ("PrimTyConI", 3)
-    , ("FamilyI", 2)
-    -- Name wrapper
-    -- NOTE: @Name@ is used as VCon "Name" [VStr bytes] by mkName.
-    -- We don't register it here because the parser treats @Name@
-    -- uses as a type, and user code doesn't apply "Name" as a ctor.
-    ]
-
--- | Flatten the catalog into @(name, IO Val)@ pairs for 'thBuiltinPairs'.
-thConstructorPairs :: [(ByteString, IO Val)]
-thConstructorPairs =
-    concatMap oneCtor thConstructorCatalog
-  where
-    oneCtor (name, arity) =
-        let mkV = pure (buildTHCtor name arity)
-        in [ (name,                                    mkV)
-           , ("Language.Haskell.TH." <> name,          mkV)
-           , ("Language.Haskell.TH.Syntax." <> name,   mkV)
-           , ("Language.Haskell.TH.Lib." <> name,      mkV)
-           ]
-
--- | Build a curried constructor value that collects @arity@ lazy
--- arguments and returns the matching TH-shaped 'VCon'.
-buildTHCtor :: Name -> Int -> Val
-buildTHCtor name 0 = VCon name []
-buildTHCtor name n = buildLam n []
-  where
-    buildLam 0 acc    = VCon name (reverse acc)
-    buildLam left acc = VFun $ \t ->
-        pure (buildLam (left - 1) (t : acc))
-
--- | 'Loc' and its record selectors.  'Loc' is part of the synthetic TH
--- runtime surface: 'locationBuiltin' returns this exact 'VCon' shape,
--- and HSX reads it via qualified selectors like @TH.loc_filename@.
-thLocPairs :: [(ByteString, IO Val)]
-thLocPairs =
-    thSyntaxNames "Loc" (pure (buildTHCtor "Loc" 5))
-    ++ concatMap oneField thLocFieldCatalog
-  where
-    oneField (fieldName, idx) =
-        thSyntaxNames fieldName (locFieldBuiltin fieldName idx)
-
-thLocFieldCatalog :: [(ByteString, Int)]
-thLocFieldCatalog =
-    [ ("loc_filename", 0)
-    , ("loc_package",  1)
-    , ("loc_module",   2)
-    , ("loc_start",    3)
-    , ("loc_end",      4)
-    ]
-
-thSyntaxNames :: ByteString -> IO Val -> [(ByteString, IO Val)]
-thSyntaxNames name mkV =
-    [ (name, mkV)
-    , ("TH." <> name, mkV)
-    , ("Language.Haskell.TH." <> name, mkV)
-    , ("Language.Haskell.TH.Syntax." <> name, mkV)
-    ]
-
-locFieldBuiltin :: ByteString -> Int -> IO Val
-locFieldBuiltin fieldName idx = pure $ VFun $ \locT -> do
-    locV <- force legacyHooks locT
-    case locV of
-        VCon "Loc" fields
-            | idx < length fields -> force legacyHooks (fields !! idx)
-            | otherwise ->
-                throwTH
-                    (BC.unpack fieldName <> ": Loc has only "
-                     <> show (length fields) <> " fields")
-        other ->
-            throwTH
-                (BC.unpack fieldName <> ": expected Loc, got "
-                 <> showValForDebug other)
-
---------------------------------------------------------------------------------
--- Phase 2.13: Q monad + Name primitives
---
--- The @Q@ monad is represented as @VIO@ at the Val level.  It is simply a
--- suspended @IO Val@ action; the @return@/@>>=@ machinery is whatever the
--- interpreter uses for plain @IO@.  We encode Template Haskell Names as
--- @VCon "Name" [VStr bytes]@ to match the constructor that the decoder
--- expects.
---------------------------------------------------------------------------------
-
--- | Global counter for 'newName'. Reset once per load via
--- 'resetNewNameCounter'.
-{-# NOINLINE newNameCounterRef #-}
-newNameCounterRef :: IORef Int
-newNameCounterRef = unsafePerformIO (newIORef 0)
-
-resetNewNameCounter :: IO ()
-resetNewNameCounter = writeIORef newNameCounterRef 0
-
--- | @mkName :: String -> Name@.  Returns @VCon "Name" [VStr bytes]@.
-mkNameBuiltin :: IO Val
-mkNameBuiltin = pure $ VFun $ \argT -> do
-    v <- force legacyHooks argT
-    bs <- valToBytes v
-    bsT <- newWHNFThunk (VStr bs)
-    pure (VCon "Name" [bsT])
-
--- | @newName :: String -> Q Name@.  Gensym by appending @_N@.
-newNameBuiltin :: IO Val
-newNameBuiltin = pure $ VFun $ \argT -> do
-    v <- force legacyHooks argT
-    base <- valToBytes v
-    pure $ VIO $ do
-        n <- atomicModifyIORef' newNameCounterRef (\c -> (c + 1, c))
-        let unique = base <> BC.pack ("_" <> show n)
-        uT <- newWHNFThunk (VStr unique)
-        pure (VCon "Name" [uT])
-
--- | @runQ :: Quasi m => Q a -> m a@.  Identity on 'VIO' values.
-runQBuiltin :: IO Val
-runQBuiltin = pure $ VFun $ \argT -> do
-    v <- force legacyHooks argT
-    case v of
-        VIO _ -> pure v
-        other -> pure (VIO (pure other))
-
--- | @location :: Q Loc@.  Returns a stub 'Loc' with empty filename /
--- package / module / start / end.  Used by libraries like ihp-hsx for
--- source-position metadata in error messages — the precise values
--- don't matter for evaluation, only that the call returns a 'Loc'-shaped
--- 'VCon' rather than crashing.
---
--- 'Loc' from Language.Haskell.TH.Syntax has 5 fields:
---   loc_filename :: String
---   loc_package  :: String
---   loc_module   :: String
---   loc_start    :: CharPos  (= (Int, Int))
---   loc_end      :: CharPos
-locationBuiltin :: IO Val
-locationBuiltin = pure $ VIO $ do
-    filenameT <- newWHNFThunk =<< charListVal "<ihc-no-source-loc>"
-    packageT  <- newWHNFThunk =<< charListVal "<ihc>"
-    moduleT   <- newWHNFThunk =<< charListVal "<ihc>"
-    zeroT     <- newWHNFThunk (VInt 0)
-    posT      <- newWHNFThunk (VCon "(,)" [zeroT, zeroT])
-    pure (VCon "Loc" [filenameT, packageT, moduleT, posT, posT])
-  where
-    charListVal :: String -> IO Val
-    charListVal []     = pure (VCon "[]" [])
-    charListVal (c:cs) = do
-        cT <- newWHNFThunk (VChar c)
-        rest <- charListVal cs
-        restT <- newWHNFThunk rest
-        pure (VCon ":" [cT, restT])
-
--- | @extsEnabled :: Q [Extension]@.  Returns an empty list — IHC
--- doesn't track per-source-location extension state, and quasi-quoter
--- bodies that branch on extensions (e.g. ihp-hsx checks for
--- @OverloadedStrings@) just take the no-extension code path.
-extsEnabledBuiltin :: IO Val
-extsEnabledBuiltin = pure $ VIO $ pure (VCon "[]" [])
-
--- | @reify :: Name -> Q Info@.  Phase-2.13 stub.
-reifyBuiltin :: IO Val
-reifyBuiltin = pure $ VFun $ \argT -> do
-    _ <- force legacyHooks argT
-    pure $ VIO $ do
-        nameT  <- thName (BC.pack "<reify-stub>")
-        let nameV = VCon "Name" [nameT]
-        nameT2 <- newWHNFThunk nameV
-        emptyCtx <- newWHNFThunk (VCon "[]" [])
-        emptyTvs <- newWHNFThunk (VCon "[]" [])
-        nothing  <- newWHNFThunk (VCon "Nothing" [])
-        emptyCtors  <- newWHNFThunk (VCon "[]" [])
-        emptyDerivs <- newWHNFThunk (VCon "[]" [])
-        dataDT <- newWHNFThunk
-                    (VCon "DataD"
-                        [emptyCtx, nameT2, emptyTvs, nothing, emptyCtors, emptyDerivs])
-        pure (VCon "TyConI" [dataDT])
-
--- | Convert a String-shaped 'Val' into a 'ByteString'.
-valToBytes :: Val -> IO ByteString
-valToBytes (VStr bs) = pure bs
-valToBytes (VCon "Name" [nT]) = do
-    nV <- force legacyHooks nT
-    case nV of
-        VStr bs -> pure bs
-        _       -> valToBytes nV
-valToBytes v = do
-    cs <- collectChars v
-    pure (BC.pack cs)
-  where
-    collectChars (VCon "[]" []) = pure []
-    collectChars (VCon ":" [hT, tT]) = do
-        hV <- force legacyHooks hT
-        tV <- force legacyHooks tT
-        case hV of
-            VChar c -> (c :) <$> collectChars tV
-            _       -> throwTH ("valToBytes: expected VChar, got "
-                                 <> showValForDebug hV)
-    collectChars other =
-        throwTH ("valToBytes: expected string-shaped value, got "
-                 <> showValForDebug other)
+thBuiltinPairs = []
+-- Language.Haskell.TH.Syntax and Language.Haskell.TH.Lib have ordinary
+-- Haskell source in template-haskell. Their Q/runQ/lift/name helpers, Loc
+-- values, and TH AST constructors must therefore come from that source and
+-- the normal constructor environment. Host support belongs only beneath the
+-- source-defined Quasi IO methods; no such leaf is required by this module's
+-- quote/splice decoder yet. Tests assert that this runtime surface stays empty.
 
 --------------------------------------------------------------------------------
 -- Phase 2.13: TH Dec -> IHC binding decoder

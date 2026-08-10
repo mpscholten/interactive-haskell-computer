@@ -1,4 +1,4 @@
 {-# LANGUAGE TemplateHaskell #-}
 
-main :: Int
-main = $(pure [| 42 |])
+main :: IO ()
+main = print $(pure [| 42 |])
