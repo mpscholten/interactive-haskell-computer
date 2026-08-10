@@ -13,7 +13,7 @@ import Test.Hspec
 import IHC.Lexer (LexError)
 import IHC.Parser (ParseError)
 import IHC.Scheduler (loadProgramFromSource)
-import IHC.Scan (ClassDecl(..), scanClassDecls)
+import IHC.Scan (ClassDecl(..), InstanceDecl(..), scanClassDecls, scanInstanceDecls)
 import IHC.Source (Source, mkSource)
 import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
 import IHC.Val (Env, Thunk)
@@ -59,6 +59,28 @@ mainStub = "\nmain :: IO ()\nmain = pure ()\n"
 
 spec :: Spec
 spec = describe "Hs2010 — Class & instance declarations" $ do
+
+    it "retains variables, applications, and lists in instance heads" $ do
+        [decl] <- scanInstanceDecls (mkSrc
+            "instance MonadParsec e [Text] (ParsecT e [Text] Identity) where\n\
+            \    sibling x = x\n")
+        instHeadTypes decl `shouldBe`
+            [ TyVar "e"
+            , TyApp (TyCon "[]") (TyCon "Text")
+            , TyApp (TyApp (TyApp (TyCon "ParsecT") (TyVar "e"))
+                    (TyApp (TyCon "[]") (TyCon "Text"))) (TyCon "Identity")
+            ]
+
+    it "retains tuple and function constructor instance heads" $ do
+        decls <- scanInstanceDecls (mkSrc
+            "instance Functor ((,) a) where\n\
+            \    fmapPair = fmapPair\n\
+            \instance Arrow (->) where\n\
+            \    arrowId = arrowId\n")
+        map instHeadTypes decls `shouldBe`
+            [ [TyApp (TyCon "(,)") (TyVar "a")]
+            , [TyCon "(->)"]
+            ]
 
     --------------------------------------------------------------------
     -- 3.4 class declarations

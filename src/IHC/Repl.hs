@@ -452,7 +452,7 @@ tryInstanceDecl envRef classReg line = do
     case r of
         Left err -> pure (Left (show err))
         Right [] -> pure (Left "no instance declaration found (parse error?)")
-        Right (InstanceDecl cls typ typs methods : _) -> do
+        Right (InstanceDecl cls typ typs _headTypes methods : _) -> do
             env <- readIORef envRef
             r2 <- (try (evalInstanceMethods src env methods)
                     :: IO (Either SomeException (HashMap.HashMap BC.ByteString Val)))

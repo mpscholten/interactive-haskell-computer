@@ -799,6 +799,26 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         runFile "test/Fixtures/Coverage/class_method_h98_constructor_metadata.hs"
             `shouldReturn` 41
 
+    it "dispatches nested class parameters through a local constructor value" do
+        runFile "test/Fixtures/Coverage/class_method_h98_constructor_variable.hs"
+            `shouldReturn` 43
+
+    it "dispatches a PosState-shaped local without entering class defaults" do
+        runFile "test/Fixtures/Coverage/class_method_posstate_local.hs"
+            `shouldReturn` 47
+
+    it "elaborates sibling methods from an imported class declaration" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_imported_sibling"
+        runMainWithSiblings (root </> "Main.hs") `shouldReturn` 51
+
+    it "specializes every parameter of an MPTC sibling method" do
+        runFile "test/Fixtures/Coverage/class_method_mptc_local.hs"
+            `shouldReturn` 52
+
+    it "preserves variable and applied MPTC heads for sibling dispatch" do
+        runFile "test/Fixtures/Coverage/class_method_mptc_structured_head.hs"
+            `shouldReturn` 53
+
     it "keeps same-named imported constructors isolated by their real owners" do
         let root = "test/Fixtures/Coverage/Modules/class_method_constructor_owner"
         runMainWithSiblings (root </> "Main.hs") `shouldReturn` 73
