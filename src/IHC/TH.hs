@@ -31,7 +31,7 @@ module IHC.TH
     , resetNewNameCounter
     ) where
 
-import Control.Exception (throwIO, Exception)
+import Control.Exception (throwIO, Exception, SomeException, try)
 import Control.Monad ((<=<))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
@@ -39,8 +39,11 @@ import Data.IORef
 import Data.Int (Int64)
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
-import IHC.Classes (legacyHooks)
+import IHC.Classes (legacyHooks, getSharedClassReg)
+import qualified IHC.Elaborate as Elab
 import IHC.Eval (eval, force)
+import IHC.TypeAST (Type(..))
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import IHC.Val
 
 --------------------------------------------------------------------------------
@@ -392,7 +395,14 @@ expandSplicesInExpr env ipm depth expr
     go (ESplice inner) = do
         -- Evaluate the splice expression to a TH Exp value.
         innerExpanded <- recur inner
-        thVal <- eval legacyHooks env ipm innerExpanded >>= unwrapOneQ
+        -- A splice boundary supplies the language-level expectation @Q Exp@.
+        -- This lets the ordinary elaborator select source-defined class
+        -- methods such as Applicative.pure without recognizing their names.
+        -- Failure remains optimistic: unsupported TH/type syntax falls back
+        -- to the unchanged expression and the evaluator reports the real
+        -- runtime error.
+        elaborated <- elaborateQExp innerExpanded
+        thVal <- eval legacyHooks env ipm elaborated >>= unwrapOneQ
         -- Decode the TH Exp into an IHC Expr.
         resultExpr <- thExpToExpr thVal
         -- Re-traverse in case the result contains nested splices.
@@ -446,7 +456,41 @@ expandSplicesInExpr env ipm depth expr
     -- A splice consumes one Q layer.  Do not recursively execute a value of
     -- type @Q (Q Exp)@ as though it were @Q Exp@.
     unwrapOneQ (VIO action) = action
+    unwrapOneQ (VCon "Q" [actionT]) = runSourceQAction actionT
     unwrapOneQ value        = pure value
+
+    -- Source @Q a@ stores a rank-polymorphic @forall m. Quasi m => m a@.
+    -- A splice runner is entitled to choose its Quasi implementation; IHC
+    -- chooses its existing IO-backed runner.  When the action is still a
+    -- source closure, elaborate that whole action at @IO Exp@ before running
+    -- it.  This supplies the missing result-side dictionary information
+    -- without inspecting any function name (notably, no special case for
+    -- @pure@).  Exactly one Q/IO layer is consumed.
+    runSourceQAction actionT = do
+        state <- readIORef actionT
+        value <- case state of
+            Unevaluated (Closure actionEnv actionIpm actionExpr) -> do
+                actionExpr' <- elaborateAt
+                    (TyApp (TyCon "IO") (TyCon "Exp")) actionExpr
+                eval legacyHooks actionEnv actionIpm actionExpr'
+            _ -> force legacyHooks actionT
+        case value of
+            VIO action -> action
+            other      -> pure other
+
+    elaborateQExp = elaborateAt (TyApp (TyCon "Q") (TyCon "Exp"))
+
+    elaborateAt expectedTy inner = do
+        mClassReg <- getSharedClassReg legacyHooks
+        case mClassReg of
+            Nothing -> pure inner
+            Just classReg -> do
+                sigs <- readIORef globalTypeSigsRef
+                synonyms <- readIORef globalTypeSynonymsRef
+                result <- try (Elab.elaborate classReg sigs synonyms
+                    (Elab.ExpectType expectedTy) inner)
+                    :: IO (Either SomeException (Expr, Type))
+                pure (either (const inner) fst result)
 
     goAlt (Alt p e) = Alt p <$> go e
 

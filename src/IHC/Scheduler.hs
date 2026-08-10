@@ -449,6 +449,20 @@ loadProgramFromSource searchPath src0 = do
         _ <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
         pure ()
+    -- Template-Haskell syntax brings the source definition of Q and its
+    -- instances into scope in GHC even when the user does not explicitly
+    -- import Language.Haskell.TH.Syntax.  Mirror that implicit dependency by
+    -- source-loading the defining module whenever the entry source contains
+    -- quotation or splice syntax.  This is module bootstrapping, not a host
+    -- implementation: every declaration and dictionary still comes from the
+    -- package's .hs source.
+    let entryBytes = srcBytes (lmSource entry)
+        usesTemplateHaskell = BC.pack "[|" `BS.isInfixOf` entryBytes
+                           || BC.pack "$(" `BS.isInfixOf` entryBytes
+    when usesTemplateHaskell $ do
+        _ <- loadModule registry fullSearchPath includeMap
+                    (BC.pack "Language.Haskell.TH.Syntax")
+        pure ()
 
     -- Manifest-driven core load.
     --
@@ -533,11 +547,62 @@ loadProgramFromSource searchPath src0 = do
     let baseNoClass = HashMap.union builtins (HashMap.union fieldEnv (HashMap.union conEnv ffiEnv))
     classMethodEnv <- buildClassMethodEnv classReg baseNoClass loadedModules
     let base = HashMap.union classMethodEnv baseNoClass
+    -- Splices are ordinary source programs.  In particular, @pure [|e|]@
+    -- must obtain the source-defined @Applicative Q@ dictionary; evaluating
+    -- it against @base@ alone is too early because source instance methods do
+    -- not yet have an owner-aware recursive environment to close over.
+    --
+    -- Tie a provisional knot from the pre-expansion body snapshot and
+    -- catalogue source instances against it.  The class registry and lazy
+    -- catalogue are restored immediately after expansion, so no closure over
+    -- this provisional knot can escape into runtime.  The normal knot and
+    -- authoritative catalogue below are then built from post-splice bodies.
+    provisionalPairs <- concat <$> mapM
+        (exportBodies registry fullSearchPath includeMap
+            (Set.fromList (HashMap.keys builtins))) loadedModules
+    provisionalSlots <- mapM
+        (\_ -> newIORef (BlackHole Nothing "<splice-placeholder>"))
+        provisionalPairs
+    let provisional0 = extendEnvMany
+            (zip (map fst provisionalPairs) provisionalSlots) base
+        provisionalQual = preferClassMethodsExceptEntryBare
+            classMethodEnv provisionalPairs provisional0
+    provisionalAliases <- buildAliases registry fullSearchPath includeMap entry
+        provisionalSlots provisionalPairs
+    let provisionalEnv = HashMap.union
+            (HashMap.difference provisionalAliases base) provisionalQual
+        provisionalLocals = HashMap.fromListWith HashMap.union
+            [ (ownerName, HashMap.singleton bareName slot)
+            | (qualKey, slot) <- zip (map fst provisionalPairs) provisionalSlots
+            , Just idx <- [BC.elemIndexEnd (toEnum (fromEnum '.')) qualKey]
+            , let ownerName = BC.take idx qualKey
+                  bareName = BC.drop (idx + 1) qualKey
+            ]
+    forM_ (zip provisionalPairs provisionalSlots) $ \((fqn, rhs), slot) -> do
+        let ownerName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
+                Just idx -> BC.take idx fqn
+                Nothing -> lmName entry
+            ownerLocals = HashMap.lookupDefault HashMap.empty ownerName provisionalLocals
+        ownerThunk <- newWHNFThunk (VStr ownerName)
+        let closureEnv = HashMap.insert ownerSentinelKey ownerThunk
+                (HashMap.union ownerLocals provisionalEnv)
+        writeIORef slot (Unevaluated (Closure closureEnv emptyIPMap rhs))
+    preSpliceRegistry <- readIORef classReg
+    provisionalClassTable <- buildClassMethodTable loadedModules
+    let provisionalTypeCtors = foldr Map.union Map.empty
+            (map lmTypeCtorReg loadedModules)
+    mapM_ (registerInstancesFrom registry fullSearchPath includeMap classReg
+        provisionalTypeCtors provisionalClassTable provisionalEnv) loadedModules
     -- Phase 2.11: expand TH splices in every loaded module's bodies.
     -- Run AFTER all modules are discovered (so imports are resolved) but
     -- BEFORE knot-tying. Use 'base' as the splice evaluation env — it
     -- contains all builtins including the 'lift' function.
-    mapM_ (expandSplicesInModule registry fullSearchPath includeMap base) loadedModules
+    mapM_ (expandSplicesInModule registry fullSearchPath includeMap provisionalEnv) loadedModules
+    -- Discard every provisional closure, including dictionaries materialised
+    -- while a splice ran.  Final registration below is the sole authority for
+    -- the runtime environment.
+    writeIORef classReg preSpliceRegistry
+    resetInstanceCatalogue
     qualPairs <- concat <$> mapM (exportBodies registry fullSearchPath includeMap (Set.fromList (HashMap.keys builtins))) loadedModules
     -- Tie the knot for all bodies at once.
     slots <- mapM (\_ -> newIORef (BlackHole Nothing "<import-placeholder>")) qualPairs
@@ -9780,15 +9845,9 @@ isBuiltinBackedModule n =
     -- therefore compiler-intrinsic and must be host-backed; the builtin
     -- env provides it as identity-on-Val.
     || n == "Unsafe.Coerce"
-    -- Language.Haskell.TH.*: template-haskell package; IHC.TH provides synthetic
-    -- builtins for splice execution.  Most submodules are stubbed because
-    -- their content is replaced by IHC.TH's synthetic primops.
-    -- HOWEVER: 'Language.Haskell.TH.Quote' is a small pure module that
-    -- declares 'data QuasiQuoter = QuasiQuoter { quoteExp, … }'.  The
-    -- QQ-dispatch path needs that constructor (record-construction in
-    -- ihp-hsx etc.) and it has no primops backing it — interpret it
-    -- from source.
-    || ("Language.Haskell.TH" `BC.isPrefixOf` n && n /= BC.pack "Language.Haskell.TH.Quote")
+    -- All Language.Haskell.TH modules have real package source and are loaded
+    -- from it.  IHC.TH supplies only the compiler/runner operations at the
+    -- leaves; it must not turn ordinary template-haskell modules into stubs.
 
 -- | Emit a diagnostic to stderr when a missing module is being
 -- substituted with an empty stub. Keeps the first 3 search-path
