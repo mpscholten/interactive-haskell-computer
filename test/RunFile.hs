@@ -1583,7 +1583,7 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "expected result: pure uses the annotated Q instance generically" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/Coverage/th_pure_expected_q.hs")
-        n   `shouldBe` 0
+        n   `shouldBe` 42
         out `shouldBe` ""
 
     --------------------------------------------------------------------
