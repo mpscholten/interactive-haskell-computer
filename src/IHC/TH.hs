@@ -126,35 +126,114 @@ buildThunkList (x:xs) = do
 -- | Decode a TH 'Exp' value-tree into an 'Expr'. Partial — unsupported
 -- constructors throw a 'THError'.
 thExpToExpr :: Val -> IO Expr
-thExpToExpr (VCon "LitE" [litT]) = do
+thExpToExpr value = runOneQExp value >>= decodeTHExp
+
+-- | Consume exactly one source or host @Q Exp@ layer at the point where a
+-- Template Haskell expression enters the interpreter.  Quasiquoters and
+-- splices share this boundary: source @Q@ is a newtype around a
+-- rank-polymorphic @Quasi m => m a@ action, so merely applying 'runIOVal' to
+-- the outer constructor cannot execute it.  We choose the existing IO-backed
+-- Quasi runner and elaborate the stored action at @IO Exp@.
+--
+-- Deliberately do not recurse here: @Q (Q Exp)@ must retain its inner layer.
+runOneQExp :: Val -> IO Val
+runOneQExp (VIO action) = action
+runOneQExp (VCon "Q" [actionT]) = do
+    state <- readIORef actionT
+    value <- case state of
+        Unevaluated (Closure actionEnv actionIpm actionExpr) -> do
+            actionExpr' <- elaborateAt actionEnv
+                (TyApp (TyCon "IO") (TyCon "Exp")) actionExpr
+            eval legacyHooks actionEnv actionIpm actionExpr'
+        _ -> force legacyHooks actionT
+    case value of
+        VIO action -> action
+        other      -> pure other
+runOneQExp value = pure value
+
+-- Keep source-Q execution on the normal elaborator/provider path.  This is
+-- the same expected-type operation used while expanding a splice; it is not
+-- a catalogue of TH or library method names.
+elaborateAt :: Env -> Type -> Expr -> IO Expr
+elaborateAt targetEnv expectedTy inner = do
+    mClassReg <- getSharedClassReg legacyHooks
+    case mClassReg of
+        Nothing -> pure inner
+        Just classReg -> do
+            sigs <- readIORef globalTypeSigsRef
+            synonyms <- readIORef globalTypeSynonymsRef
+            constructorTypes <- readIORef globalConstructorTypeRegistryRef
+            owner <- currentOwner legacyHooks targetEnv
+            result <- try (Elab.elaborateOwned classReg sigs synonyms
+                constructorTypes owner (Elab.ExpectType expectedTy) inner)
+                :: IO (Either SomeException (Expr, Type))
+            case result of
+                Left _ -> pure inner
+                Right (elaborated, _) -> do
+                    mapM_ materializeClass
+                        (Set.toList (typedMethodClasses elaborated))
+                    pure elaborated
+  where
+    materializeClass (cls, tag) = do
+        triggerCoreInstanceLoadForTag legacyHooks cls tag
+        _ <- drainCataloguedInstancesForClass cls
+        pure ()
+
+    typedMethodClasses = goClasses
+      where
+        goClasses (ETypedMethod cls _ tag) = Set.singleton (cls, tag)
+        goClasses (EApp f x) = Set.union (goClasses f) (goClasses x)
+        goClasses (ELam _ e) = goClasses e
+        goClasses (ELet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
+        goClasses (ECase s as) = Set.unions (goClasses s : [goClasses e | Alt _ e <- as])
+        goClasses (EIf c t e) = Set.unions [goClasses c, goClasses t, goClasses e]
+        goClasses (EDo ss) = Set.unions (map stmtClasses ss)
+        goClasses (ENeg e) = goClasses e
+        goClasses (ETuple es) = Set.unions (map goClasses es)
+        goClasses (EImplicitLet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
+        goClasses (ERecordCon _ fs) = Set.unions (map (goClasses . snd) fs)
+        goClasses (ERecordUpdate e fs) = Set.unions (goClasses e : map (goClasses . snd) fs)
+        goClasses (ESplice e) = goClasses e
+        goClasses (ETyApp e _) = goClasses e
+        goClasses (EConstrainedValue e _) = goClasses e
+        goClasses _ = Set.empty
+
+        stmtClasses (SExpr e) = goClasses e
+        stmtClasses (SBind _ e) = goClasses e
+        stmtClasses (SBangBind _ e) = goClasses e
+        stmtClasses (SLet bs) = Set.unions (map (goClasses . snd) bs)
+        stmtClasses (SImplicitLet bs) = Set.unions (map (goClasses . snd) bs)
+
+decodeTHExp :: Val -> IO Expr
+decodeTHExp (VCon "LitE" [litT]) = do
     litV <- force legacyHooks litT
     decodeLit litV
-thExpToExpr (VCon "VarE" [nameT]) = do
+decodeTHExp (VCon "VarE" [nameT]) = do
     nameV <- force legacyHooks nameT
     n <- decodeName nameV
     pure (EVar n)
-thExpToExpr (VCon "ConE" [nameT]) = do
+decodeTHExp (VCon "ConE" [nameT]) = do
     nameV <- force legacyHooks nameT
     n <- decodeName nameV
     pure (EVar n)
-thExpToExpr (VCon "AppE" [fT, xT]) = do
+decodeTHExp (VCon "AppE" [fT, xT]) = do
     fV <- force legacyHooks fT
     xV <- force legacyHooks xT
     fE <- thExpToExpr fV
     xE <- thExpToExpr xV
     pure (EApp fE xE)
-thExpToExpr (VCon "ListE" [listT]) = do
+decodeTHExp (VCon "ListE" [listT]) = do
     listV <- force legacyHooks listT
     exprs <- decodeList listV thExpToExpr
     pure (buildListExpr exprs)
   where
     buildListExpr []     = EVar "[]"
     buildListExpr (e:es) = EApp (EApp (EVar ":") e) (buildListExpr es)
-thExpToExpr (VCon "TupE" [listT]) = do
+decodeTHExp (VCon "TupE" [listT]) = do
     listV <- force legacyHooks listT
     exprs <- decodeList listV (thMaybeExpToExpr "TupE")
     pure (ETuple exprs)
-thExpToExpr (VCon "InfixE" [mLT, opT, mRT]) = do
+decodeTHExp (VCon "InfixE" [mLT, opT, mRT]) = do
     -- InfixE (Just l) op (Just r) = l `op` r
     mLV <- force legacyHooks mLT
     opV <- force legacyHooks opT
@@ -166,9 +245,9 @@ thExpToExpr (VCon "InfixE" [mLT, opT, mRT]) = do
         EVar n -> pure n
         _      -> throwTH "InfixE: operator must be VarE"
     pure (EApp (EApp (EVar opName) lE) rE)
-thExpToExpr (VCon name _) =
+decodeTHExp (VCon name _) =
     throwTH ("thExpToExpr: unsupported TH Exp constructor: " <> BC.unpack name)
-thExpToExpr v =
+decodeTHExp v =
     throwTH ("thExpToExpr: expected a TH Exp VCon, got: " <> showValForDebug v)
 
 -- | Like 'thExpToExpr' but decodes a @Maybe Exp@ (used by TupE elements
@@ -337,85 +416,9 @@ expandSplicesInExpr env ipm depth expr
 
     -- A splice consumes one Q layer.  Do not recursively execute a value of
     -- type @Q (Q Exp)@ as though it were @Q Exp@.
-    unwrapOneQ (VIO action) = action
-    unwrapOneQ (VCon "Q" [actionT]) = runSourceQAction actionT
-    unwrapOneQ value        = pure value
-
-    -- Source @Q a@ stores a rank-polymorphic @forall m. Quasi m => m a@.
-    -- A splice runner is entitled to choose its Quasi implementation; IHC
-    -- chooses its existing IO-backed runner and elaborates the complete
-    -- action at @IO Exp@. The provisional provider hook materialises its
-    -- source instances; the splice boundary does not recognize any method
-    -- name. Exactly one Q/IO layer is consumed.
-    runSourceQAction actionT = do
-        state <- readIORef actionT
-        value <- case state of
-            Unevaluated (Closure actionEnv actionIpm actionExpr) -> do
-                actionExpr' <- elaborateAt actionEnv
-                    (TyApp (TyCon "IO") (TyCon "Exp")) actionExpr
-                eval legacyHooks actionEnv actionIpm actionExpr'
-            _ -> force legacyHooks actionT
-        case value of
-            VIO action -> action
-            other      -> pure other
+    unwrapOneQ = runOneQExp
 
     elaborateQExp = elaborateAt env (TyApp (TyCon "Q") (TyCon "Exp"))
-
-    elaborateAt targetEnv expectedTy inner = do
-        mClassReg <- getSharedClassReg legacyHooks
-        case mClassReg of
-            Nothing -> pure inner
-            Just classReg -> do
-                sigs <- readIORef globalTypeSigsRef
-                synonyms <- readIORef globalTypeSynonymsRef
-                constructorTypes <- readIORef globalConstructorTypeRegistryRef
-                owner <- currentOwner legacyHooks targetEnv
-                result <- try (Elab.elaborateOwned classReg sigs synonyms
-                    constructorTypes owner (Elab.ExpectType expectedTy) inner)
-                    :: IO (Either SomeException (Expr, Type))
-                case result of
-                    Left _ -> pure inner
-                    Right (elaborated, _) -> do
-                        -- Provider loading must happen before evaluation: a
-                        -- successful typed lookup can drain the current class
-                        -- catalogue without firing the miss hook, while its
-                        -- source method may need another instance of the same
-                        -- class (Q.pure's rank-polymorphic action is the
-                        -- canonical example). This is derived solely from
-                        -- elaborated class nodes, never from method names.
-                        mapM_ materializeClass
-                            (Set.toList (typedMethodClasses elaborated))
-                        pure elaborated
-
-    materializeClass (cls, tag) = do
-        triggerCoreInstanceLoadForTag legacyHooks cls tag
-        _ <- drainCataloguedInstancesForClass cls
-        pure ()
-
-    typedMethodClasses = goClasses
-      where
-        goClasses (ETypedMethod cls _ tag) = Set.singleton (cls, tag)
-        goClasses (EApp f x) = Set.union (goClasses f) (goClasses x)
-        goClasses (ELam _ e) = goClasses e
-        goClasses (ELet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
-        goClasses (ECase s as) = Set.unions (goClasses s : [goClasses e | Alt _ e <- as])
-        goClasses (EIf c t e) = Set.unions [goClasses c, goClasses t, goClasses e]
-        goClasses (EDo ss) = Set.unions (map stmtClasses ss)
-        goClasses (ENeg e) = goClasses e
-        goClasses (ETuple es) = Set.unions (map goClasses es)
-        goClasses (EImplicitLet bs e) = Set.unions (goClasses e : map (goClasses . snd) bs)
-        goClasses (ERecordCon _ fs) = Set.unions (map (goClasses . snd) fs)
-        goClasses (ERecordUpdate e fs) = Set.unions (goClasses e : map (goClasses . snd) fs)
-        goClasses (ESplice e) = goClasses e
-        goClasses (ETyApp e _) = goClasses e
-        goClasses (EConstrainedValue e _) = goClasses e
-        goClasses _ = Set.empty
-
-        stmtClasses (SExpr e) = goClasses e
-        stmtClasses (SBind _ e) = goClasses e
-        stmtClasses (SBangBind _ e) = goClasses e
-        stmtClasses (SLet bs) = Set.unions (map (goClasses . snd) bs)
-        stmtClasses (SImplicitLet bs) = Set.unions (map (goClasses . snd) bs)
 
     goAlt (Alt p e) = Alt p <$> go e
 

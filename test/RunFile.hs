@@ -290,6 +290,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             VIO _ -> pure ()
             _ -> expectationFailure "expected inner Q action to remain suspended"
 
+    it "TH Exp decoding consumes only one source Q layer" do
+        executions <- newIORef (0 :: Int)
+        exp40 <- integerExpVal 40
+        innerActionT <- newWHNFThunk
+            (VIO (modifyIORef' executions (+ 1) >> pure exp40))
+        let innerQ = VCon "Q" [innerActionT]
+        outerActionT <- newWHNFThunk (VIO (pure innerQ))
+        decoded <- try (thExpToExpr (VCon "Q" [outerActionT]))
+            :: IO (Either SomeException Expr)
+        decoded `shouldSatisfy` either (const True) (const False)
+        readIORef executions `shouldReturn` 0
+
     -- Regression: the scheduler used to leak state between consecutive
     -- runFile calls in the same process.  After the first call,
     -- 'globalLoadedModulesRef' was populated with ~150 modules; the
@@ -1691,6 +1703,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/Coverage/th_pure_quote_splice.hs")
         (n1, out1) `shouldBe` (0, "42\n")
         (n2, out2) `shouldBe` (0, "42\n")
+
+    it "Template Haskell: source Q constructor crosses quasiquote boundary" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/qq_source_q_constructor.hs")
+        n `shouldBe` 0
+        out `shouldBe` "source Q\n"
 
     it "Template Haskell: failed provisional fallback leaves no cached closure" do
         let bad = "test/Fixtures/Coverage/Modules/th_transaction_failure/Main.hs"
