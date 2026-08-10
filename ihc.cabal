@@ -199,6 +199,7 @@ test-suite ihc-test
       , RunFile
       , Unsupported
       , NetworkSocketAddrInfoRecordUpdateTest
+      , PreludeIOOwnerTest
       , TopLevelIOBindingTest
       , TopLevelWarpAliasTest
       , WarpHelloTest
