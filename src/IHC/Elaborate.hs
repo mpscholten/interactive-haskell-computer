@@ -268,6 +268,19 @@ elaborateExpr ienv expr = case expr of
                              , sub'
                              )
 
+    ELocalSig schemeBytes inner ->
+        case parseRawTypeExpr (localSchemeBody schemeBytes) of
+            Nothing -> do
+                (inner', t, preds, sub) <- elaborateExpr ienv inner
+                pure (ELocalSig schemeBytes inner', t, preds, sub)
+            Just declaredTy -> do
+                let expected = expandSyn (ieSynonyms ienv) declaredTy
+                (inner', innerTy, preds, sub) <- elaborateExpectedExpr ienv expected inner
+                sub' <- either (throwIO . UnificationFailure) pure
+                    (unify sub expected innerTy)
+                pure (ELocalSig schemeBytes inner', applySubst sub' expected,
+                      map (applySubstPred sub') preds, sub')
+
     ELam name body -> do
         argTy <- TyVar <$> freshVar (ieFresh ienv)
         let ienv' = ienv { ieLocals = Map.insert name (Scheme [] [] argTy)
@@ -656,6 +669,7 @@ applyMethodSubst synonyms sub = go
         ESplice inner -> ESplice (go inner)
         EQuote inner  -> EQuote (go inner)
         ETyApp inner ty -> ETyApp (go inner) ty
+        ELocalSig ty inner -> ELocalSig ty (go inner)
         EImplicitLet bs body ->
             EImplicitLet [(n, go b) | (n, b) <- bs] (go body)
         _ -> e
@@ -747,13 +761,19 @@ parseRawTypeExpr bs = do
     parseT toks = do
         (a, rest) <- parseAtom toks
         (as, rest') <- parseAtoms rest
-        pure (foldl TyApp a as, rest')
+        let lhs = foldl TyApp a as
+        case dropSpacesT rest' of
+            (TArrow : afterArrow) -> do
+                (rhs, final) <- parseT afterArrow
+                pure (TyArrow lhs rhs, final)
+            _ -> pure (lhs, rest')
 
     parseAtoms toks = case dropSpacesT toks of
         [] -> Just ([], toks)
         (TRParen : _)   -> Just ([], toks)
         (TRBracket : _) -> Just ([], toks)
         (TComma : _)    -> Just ([], toks)
+        (TArrow : _)    -> Just ([], toks)
         _ -> case parseAtom toks of
             Nothing -> Just ([], toks)
             Just (a, rest) -> do
@@ -807,6 +827,7 @@ data RTok
     | TLBracket
     | TRBracket
     | TComma
+    | TArrow
     deriving (Eq, Show)
 
 tokenize :: ByteString -> [RTok]
@@ -824,6 +845,8 @@ tokenize bs
             '['  -> TLBracket : tokenize rest
             ']'  -> TRBracket : tokenize rest
             ','  -> TComma : tokenize rest
+            '-' | not (BC.null rest), BC.head rest == '>' ->
+                    TArrow : tokenize (BC.tail rest)
             _
               | isIdentStart c ->
                     let (ident, rest') = BC.span isIdentChar bs
@@ -843,3 +866,16 @@ tokenize bs
                      || c == '.'
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
+
+-- | Drop the binder/context prefix of a retained local scheme. The lexical
+-- node keeps the full bytes for diagnostics and future dictionary passing;
+-- the current expected-type elaborator consumes its body type.
+localSchemeBody :: ByteString -> ByteString
+localSchemeBody raw =
+    let trimmed = BC.dropWhile isAsciiSpace raw
+        noForall
+            | BC.pack "forall " `BC.isPrefixOf` trimmed =
+                maybe trimmed (\i -> BC.drop (i + 1) trimmed) (BC.elemIndex '.' trimmed)
+            | otherwise = trimmed
+        (_ctx, afterCtx) = BC.breakSubstring (BC.pack "=>") noForall
+    in if BC.null afterCtx then noForall else BC.drop 2 afterCtx

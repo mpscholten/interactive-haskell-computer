@@ -54,6 +54,10 @@ data Expr
     -- pass-through on the inner expression. The type argument is retained
     -- as metadata for future @Typeable@ / dictionary-selection use.
     | ETyApp !Expr !Name
+    -- | A local @name :: scheme@ declaration attached to that binding's
+    -- RHS. Unlike 'ETyApp', this is lexical inference metadata only: it must
+    -- never accumulate runtime type-application dispatch tags.
+    | ELocalSig !ByteString !Expr
     -- | Class method resolved by the on-demand elaborator
     -- ('IHC.Elaborate') to a specific instance.  Three fields:
     -- class name, method name, resolved instance tag.  Evaluator

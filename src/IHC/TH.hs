@@ -195,6 +195,7 @@ elaborateAt targetEnv expectedTy inner = do
         goClasses (ERecordUpdate e fs) = Set.unions (goClasses e : map (goClasses . snd) fs)
         goClasses (ESplice e) = goClasses e
         goClasses (ETyApp e _) = goClasses e
+        goClasses (ELocalSig _ e) = goClasses e
         goClasses (EConstrainedValue e _) = goClasses e
         goClasses _ = Set.empty
 
@@ -446,6 +447,7 @@ expandSplicesInExpr env ipm depth expr
     go (ETyApp e ty) = do
         e' <- go e
         pure (ETyApp e' ty)
+    go (ELocalSig ty e) = ELocalSig ty <$> go e
     go (ETypedMethod cls method tag) = pure (ETypedMethod cls method tag)
     go (EConstrainedValue e constraints) = do
         e' <- go e
@@ -530,6 +532,7 @@ exprToVal (ENeg e) = do
 -- expression as the TH Exp; a future splice pass that cares about type
 -- applications can inspect the 'ETyApp' node before reaching here.
 exprToVal (ETyApp e _ty) = exprToVal e
+exprToVal (ELocalSig _ e) = exprToVal e
 exprToVal (EConstrainedValue e _constraints) = exprToVal e
 -- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
 exprToVal _ =

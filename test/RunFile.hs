@@ -3,7 +3,7 @@ module RunFile (spec) where
 import Control.Exception (bracket_, displayException, try, SomeException)
 import Control.Monad (forM_)
 import Data.IORef
-import Data.List (isInfixOf, sort, isSuffixOf)
+import Data.List (isInfixOf, isPrefixOf, sort, isSuffixOf, tails)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -1045,6 +1045,38 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         let rendered = show expr
         rendered `shouldSatisfy` isInfixOf "EVar \"!\""
         rendered `shouldSatisfy` isInfixOf "handle100Continue"
+
+    it "local constrained signatures remain attached to where bindings" do
+        src <- readSourceFile "test/Fixtures/Phase23/local_constrained_signature.hs"
+        known <- emptyKnownSymbols
+        Just lhs <- findBinding src known "outer"
+        expr <- parseBodyExprWithFixity src defaultFixityTable lhs
+        show expr `shouldSatisfy` isInfixOf
+            "ELocalSig \"Integral i => i -> i\" (ELam \"y\""
+
+    it "local constrained signatures guide nested operator evaluation" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Phase23/local_constrained_signature.hs")
+        n `shouldBe` 7
+        out `shouldBe` ""
+
+    it "local class-method aliases do not turn schemes into dispatch tags" do
+        n <- runFile "test/Fixtures/Phase23/local_class_alias_signature.hs"
+        n `shouldBe` 7
+
+    it "retains comma, braced, shadowed, multi-clause, and forall local signatures" do
+        src <- readSourceFile "test/Fixtures/Phase23/local_signature_forms.hs"
+        known <- emptyKnownSymbols
+        Just lhs <- findBinding src known "forms"
+        rendered <- show <$> parseBodyExprWithFixity src defaultFixityTable lhs
+        rendered `shouldSatisfy` isInfixOf "ELocalSig \"Int\""
+        rendered `shouldSatisfy` isInfixOf "ELocalSig \"Int -> Int\""
+        rendered `shouldSatisfy` isInfixOf
+            "ELocalSig \"forall a. Num a => a -> a\""
+        length (filter (isPrefixOf "ELocalSig") (tails rendered))
+            `shouldSatisfy` (>= 6)
+        runFile "test/Fixtures/Phase23/local_signature_forms.hs"
+            `shouldReturn` 12
 
     it "composition `.` via Pratt parser: ((*2) . (+3)) 4 = 14" do
         (n, out) <- captureStdout (runFile "test/Fixtures/Phase26/compose.hs")

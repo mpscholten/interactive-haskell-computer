@@ -658,6 +658,16 @@ eval hooks env ipm = go
             _ -> pure v
     go (EConstrainedValue inner _) = go inner
 
+    -- A local declaration signature guides elaboration but is erased before
+    -- runtime application. In particular, never route its complete scheme
+    -- through 'goTyApp': that path is for visible @f @T@ applications and
+    -- appends dispatch tags to VClassMethod values.
+    go (ELocalSig scheme e) = do
+        mElab <- tryElaborateTyAnn e (localSignatureBody scheme)
+        case mElab of
+            Just e' -> go e'
+            Nothing -> go e
+
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
         -- Try to reduce the raw type-argument bytes through the
@@ -738,9 +748,11 @@ eval hooks env ipm = go
         mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing -> pure Nothing
-            Just classReg -> case Elab.parseRawTypeExpr ty of
-                Nothing -> pure Nothing
-                Just annTy -> do
+            Just classReg -> do
+                let mAnnTy = Elab.parseRawTypeExpr (localSignatureBody ty)
+                case mAnnTy of
+                  Nothing -> pure Nothing
+                  Just annTy -> do
                     sigs <- readIORef globalTypeSigsRef
                     syns <- readIORef globalTypeSynonymsRef
                     ctorTypes <- readIORef globalConstructorTypeRegistryRef
@@ -781,6 +793,19 @@ eval hooks env ipm = go
                             ok <- allTypedMethodsResolvable classReg e'
                             if ok then pure (Just e') else pure Nothing
                         _ -> pure Nothing
+
+    -- Local declaration metadata may include an explicit forall and/or class
+    -- context. Expected-type elaboration needs the body type; constraints
+    -- remain available to ordinary value-directed dictionary dispatch.
+    localSignatureBody raw =
+        let noForall =
+                if BC.pack "forall " `BS.isPrefixOf` BC.dropWhile (== ' ') raw
+                    then case BC.elemIndex '.' raw of
+                        Just i  -> BC.drop (i + 1) raw
+                        Nothing -> raw
+                    else raw
+            (_ctx, afterCtx) = BC.breakSubstring (BC.pack "=>") noForall
+        in if BC.null afterCtx then noForall else BC.drop 2 afterCtx
 
     -- Elaborate a complete class-method application before evaluating its
     -- left-associated callee spine.  A method's dictionary parameter can be
@@ -913,6 +938,7 @@ eval hooks env ipm = go
         go (ESplice inner)       = go inner
         go (EQuote inner)        = go inner
         go (ETyApp inner _)      = go inner
+        go (ELocalSig _ inner)   = go inner
         go (EImplicitLet bs body) = (&&) <$> allM (\(_, b) -> go b) bs <*> go body
         go _                     = pure True
 
@@ -2781,6 +2807,7 @@ annotatePureLike e = case e of
                     (annotatePureLike f)
     EDo ss -> EDo (annotateParsecResult ss)
     ETyApp x ty -> ETyApp (annotatePureLike x) ty
+    ELocalSig ty x -> ELocalSig ty (annotatePureLike x)
     _ -> e
 
 bareName :: Name -> Name

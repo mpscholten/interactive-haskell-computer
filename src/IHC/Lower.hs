@@ -154,6 +154,7 @@ lower e = case e of
     -- 'Dict'; today, lower as a plain 'CVar'/'CApp' — semantically
     -- correct but doesn't yet exercise the dictionary path.
     ETyApp inner _      -> lower inner
+    ELocalSig _ inner   -> lower inner
 
     -- Class-method site already resolved by the elaborator to a
     -- specific instance.  This is where C.2.3 will emit
