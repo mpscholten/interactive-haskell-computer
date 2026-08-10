@@ -102,6 +102,7 @@ import IHC.Classes
     , clearSuperclasses
     , setEnvFallback
     , setTypeSigFallback
+    , lookupTypeSigFallback
     , setCtorTypeHook
     , setCoreInstanceLoadHook, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag
     , setRegisterInstancesHook, triggerRegisterInstances
@@ -120,6 +121,7 @@ import IHC.Classes
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
+import qualified IHC.Elaborate as Elab
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
 import IHC.Loader.Types (LoadedModule(..))
@@ -133,7 +135,7 @@ import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
-import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -2236,7 +2238,7 @@ registerInstancesFrom registry searchPath includeMap classReg typeCtors classTab
     decls <- scanInstanceDecls (lmSource lm)
     mapM_ catalogueOne decls
   where
-    catalogueOne decl@(InstanceDecl cls _ _ _) =
+    catalogueOne decl@(InstanceDecl cls _ _ _ _) =
         addCataloguedInstance cls
             (registerOne registry searchPath includeMap classReg
                          typeCtors classTable env lm decl)
@@ -2271,7 +2273,7 @@ registerOne
     -> LoadedModule
     -> InstanceDecl
     -> IO ()
-registerOne registry searchPath includeMap classReg typeCtors classTable env lm (InstanceDecl cls typ typeNames methods) = do
+registerOne registry searchPath includeMap classReg typeCtors classTable env lm (InstanceDecl cls typ typeNames headTypes methods) = do
     globalSynonyms <- readIORef globalTypeSynonymsRef
     let synonyms = Map.union (lmTypeSynonyms lm) globalSynonyms
         canonicalTag n
@@ -2306,7 +2308,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
                 -- rewritten to their real source module before eval.
                 methodFvs <- bindingLhsFreeVars registry searchPath includeMap lm lhs
                 rw <- buildImportRewritesForNames registry searchPath includeMap lm methodFvs
-                r <- try (evalMethodWithLazy registry searchPath includeMap classReg env lm rw (Just (cls, typ, mn)) (mn, lhs))
+                r <- try (evalMethodWithLazy registry searchPath includeMap classReg env lm rw (Just (cls, typ, typeNames, headTypes, mn)) (mn, lhs))
                         :: IO (Either SomeException Val)
                 case r of
                     Right (VLazyMethod innerT) -> force legacyHooks innerT
@@ -2532,7 +2534,7 @@ evalMethodWithLazy
     -> Env
     -> LoadedModule
     -> Map ByteString ByteString
-    -> Maybe (ByteString, ByteString, ByteString)
+    -> Maybe (ByteString, ByteString, [ByteString], [Type], ByteString)
     -> (ByteString, BindingLhs)
     -> IO Val
 evalMethodWithLazy registry searchPath includeMap classReg env lm rewrites methodCtx (methodName, lhs) = do
@@ -2541,7 +2543,8 @@ evalMethodWithLazy registry searchPath includeMap classReg env lm rewrites metho
                $ lowerHashDotCoerce methodName expr0
         expr1 = desugarRecordPats (lmFieldReg lm)
                  (desugarRecordCons (lmFieldReg lm) expr0')
-        expr  = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
+        expr2 = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
+    expr <- elaborateSelectedMethod classReg lm methodCtx methodName expr2
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
     typedNullaryEnv <- instanceTypedNullaryEnv classReg methodCtx
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
@@ -2549,12 +2552,63 @@ evalMethodWithLazy registry searchPath includeMap classReg env lm rewrites metho
     t <- newThunk envWithOwner expr
     pure (VLazyMethod t)
 
+elaborateSelectedMethod :: ClassRegistry -> LoadedModule
+    -> Maybe (ByteString, ByteString, [ByteString], [Type], ByteString)
+    -> ByteString -> Expr -> IO Expr
+elaborateSelectedMethod classReg lm methodCtx methodName expr = case methodCtx of
+    Nothing -> pure expr
+    Just (cls, _instanceTag, instanceTags, instanceTypes, _) -> do
+        let bodyNames = Set.toList (Set.fromList (freeVars expr))
+        resolved <- mapM (resolveClassMethod cls) bodyNames
+        let classSchemes = Map.fromList
+                [ (name, scheme) | (name, Just scheme) <- zip bodyNames resolved ]
+        if Map.null classSchemes
+          then pure expr
+          else do
+            fallback <- lookupTypeSigFallback legacyHooks (Just (lmName lm)) methodName
+            case fallback of
+                Nothing -> pure expr
+                Just scheme0 -> do
+                    let scheme@(Scheme _ _ methodTy) =
+                            specialize cls instanceTypes scheme0
+                    sigs0 <- readIORef globalTypeSigsRef
+                    syns0 <- readIORef globalTypeSynonymsRef
+                    ctors <- readIORef globalConstructorTypeRegistryRef
+                    let sigs = Map.insert methodName scheme
+                             $ Map.union classSchemes (Map.union (lmTypeSigs lm) sigs0)
+                        syns = Map.union (lmTypeSynonyms lm) syns0
+                    (rewritten, _) <- Elab.elaborateOwnedMethod classReg sigs syns ctors
+                        (Just (lmName lm)) (Elab.ExpectType methodTy) expr
+                    pure rewritten
+  where
+    resolveClassMethod cls name = do
+        candidate <- lookupTypeSigFallback legacyHooks (Just (lmName lm)) name
+        pure $ candidate >>= \scheme@(Scheme _ preds _) ->
+            if any (isClassPredicate cls) preds then Just scheme else Nothing
+
+    isClassPredicate cls (Pred cls' _) = cls == cls'
+    isClassPredicate _ QPred{} = False
+
+    specialize cls heads scheme@(Scheme vars preds body) =
+        case [args | Pred cls' args <- preds, cls' == cls] of
+            [args] | length args == length heads
+                   , Right sub <- foldMUnify Map.empty (zip args heads) ->
+                Scheme (filter (`Map.notMember` sub) vars)
+                    (map (applySubstPred sub) preds) (applySubst sub body)
+            _ -> scheme
+
+    foldMUnify sub [] = Right sub
+    foldMUnify sub ((arg, headTy) : rest) =
+        case TU.unify sub arg headTy of
+            Left err -> Left err
+            Right sub' -> foldMUnify sub' rest
+
 instanceTypedNullaryEnv
     :: ClassRegistry
-    -> Maybe (ByteString, ByteString, ByteString)
+    -> Maybe (ByteString, ByteString, [ByteString], [Type], ByteString)
     -> IO Env
 instanceTypedNullaryEnv _ Nothing = pure HashMap.empty
-instanceTypedNullaryEnv classReg (Just (_cls, typ, _methodName)) = do
+instanceTypedNullaryEnv classReg (Just (_cls, typ, _typeNames, _headTypes, _methodName)) = do
     -- Source instance methods can mention nullary class methods whose
     -- type is fixed by the instance head.  Example: Enum Int.succ has
     -- `x == maxBound`; with no typechecker, bare maxBound otherwise
@@ -5436,8 +5490,8 @@ lowerHashDotCoerce name expr
 -- @coerce (&&)@ / @coerce (||)@. A plain identity 'coerce' would feed
 -- wrapped @All@/@Any@ values to the Bool operators. Lower those exact
 -- instance methods to the wrapper/accessor form the tagged runtime needs.
-lowerInstanceCoerceMethod :: Maybe (ByteString, ByteString, ByteString) -> Expr -> Expr
-lowerInstanceCoerceMethod (Just (cls, typ, methodName)) expr
+lowerInstanceCoerceMethod :: Maybe (ByteString, ByteString, [ByteString], [Type], ByteString) -> Expr -> Expr
+lowerInstanceCoerceMethod (Just (cls, typ, _typeNames, _headTypes, methodName)) expr
     | cls == BC.pack "Semigroup"
     , methodName == BC.pack "<>"
     , baseName typ == BC.pack "All"

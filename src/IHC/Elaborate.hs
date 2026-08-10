@@ -18,6 +18,7 @@ module IHC.Elaborate
     , elaborateWithScopedSigs
     , lookupScopedScheme
     , elaborateOwned
+    , elaborateOwnedMethod
     , elaborateOwnedWithScopedSigs
     , elaborateExpr
     , parseRawTypeExpr
@@ -154,6 +155,20 @@ elaborateOwnedWithScopedSigs
     -> Expr
     -> IO (Expr, Type)
 elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
+    elaborateOwnedInternal False classReg sigs synonyms constructorTypes owner scopedSigs expected e
+
+elaborateOwnedMethod
+    :: ClassRegistry -> Map ByteString Scheme -> Map ByteString (Int, Type)
+    -> ConstructorTypeRegistry -> Maybe Name -> Expected -> Expr
+    -> IO (Expr, Type)
+elaborateOwnedMethod classReg sigs synonyms constructorTypes owner expected e =
+    elaborateOwnedInternal True classReg sigs synonyms constructorTypes owner Set.empty expected e
+
+elaborateOwnedInternal
+    :: Bool -> ClassRegistry -> Map ByteString Scheme
+    -> Map ByteString (Int, Type) -> ConstructorTypeRegistry -> Maybe Name
+    -> Set.Set ByteString -> Expected -> Expr -> IO (Expr, Type)
+elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
     fresh <- newFreshSource
     classMethodNames <- readIORef globalClassMethodNamesRef
     ambiguousSigs    <- readIORef globalAmbiguousSigsRef
@@ -169,7 +184,9 @@ elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner scope
             , ieConstructorTypes = constructorTypes
             , ieOwner            = owner
             }
-    (e', t, _preds, sub) <- elaborateExpr ienv e
+    (e', t, _preds, sub) <- case (seedMethodBinders, expected) of
+        (True, ExpectType want) -> elaborateExpectedExpr ienv (expandSyn synonyms want) e
+        _ -> elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
     finalSub <- case expected of
         InferFreely     -> pure sub
@@ -182,6 +199,19 @@ elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner scope
     let e''    = applyMethodSubst finalSub e'
         tFinal = applySubst finalSub t
     pure (e'', tFinal)
+
+elaborateExpectedExpr :: InferEnv -> Type -> Expr
+    -> IO (Expr, Type, [Pred], Subst)
+elaborateExpectedExpr ienv expected expr = case (expr, expected) of
+    (ELam name body, TyArrow argTy resultTy) -> do
+        let ie = ienv { ieLocals = Map.insert name (Scheme [] [] argTy)
+                                    (ieLocals ienv) }
+        (body', bodyTy, preds, sub) <- elaborateExpectedExpr ie resultTy body
+        sub' <- either (throwIO . UnificationFailure) pure
+            (unify sub (applySubst sub resultTy) (applySubst sub bodyTy))
+        pure (ELam name body', TyArrow (applySubst sub' argTy)
+            (applySubst sub' bodyTy), map (applySubstPred sub') preds, sub')
+    _ -> elaborateExpr ienv expr
 
 -- | Main inference walker.  Returns (rewritten Expr, inferred Type,
 -- deferred constraints, substitution-so-far).  Constraints are

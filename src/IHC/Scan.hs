@@ -3296,6 +3296,7 @@ data InstanceDecl = InstanceDecl
     { instClassName :: !ByteString
     , instTypeName  :: !ByteString
     , instTypeNames :: ![ByteString]
+    , instHeadTypes :: ![Type]
     , instMethods   :: ![(ByteString, BindingLhs)]
     } deriving (Eq, Show)
 
@@ -3345,9 +3346,9 @@ scanInstanceDeclsRaw src
     -- then scan the `where` body for method bindings.
     scanOneInstance cur0 = do
         -- Collect tokens up to `where`.
-        (mClassName, tyArgs, curWhere) <- parseInstanceHead cur0
-        case (mClassName, tyArgs) of
-            (Just cls, _ : _) -> do
+        (mClassName, tyArgs, headTypes, curWhere) <- parseInstanceHead cur0
+        case (mClassName, tyArgs, headTypes) of
+            (Just cls, _ : _, _ : _) -> do
                 methods <- parseInstanceBody curWhere
                 -- Pick the head type for single-tag registration.  For a
                 -- MPTC instance like @MonadParsec e s (ParsecT e s m)@
@@ -3359,7 +3360,7 @@ scanInstanceDeclsRaw src
                 let firstTyp = case filter isUpperHead tyArgs of
                                    (h : _) -> h
                                    []      -> head tyArgs
-                pure (Just (InstanceDecl cls firstTyp tyArgs methods))
+                pure (Just (InstanceDecl cls firstTyp tyArgs headTypes methods))
             _ -> pure Nothing
       where
         isUpperHead bs = case BC.uncons bs of
@@ -3374,56 +3375,61 @@ scanInstanceDeclsRaw src
     -- caller can pattern-match them if needed.  Each tag is normalised
     -- via 'IHC.Classes.normalizeTyTag' so registration and dispatch
     -- agree on the key.
-    parseInstanceHead cur0 = scanHead cur0 Nothing [] False
+    parseInstanceHead cur0 = scanHead cur0 Nothing [] [] False
       where
-        scanHead cur mCls acc seenArrow = do
+        scanHead cur mCls acc tys seenArrow = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
-                TkEof    -> pure (mCls, reverse acc, cur)
-                TkWhere  -> pure (mCls, reverse acc, cur')
-                TkNewline -> scanHead cur' mCls acc seenArrow
-                TkDArrow -> scanHead cur' mCls [] True  -- reset acc past context
+                TkEof    -> pure (mCls, reverse acc, reverse tys, cur)
+                TkWhere  -> pure (mCls, reverse acc, reverse tys, cur')
+                TkNewline -> scanHead cur' mCls acc tys seenArrow
+                TkDArrow -> scanHead cur' mCls [] [] True  -- reset past context
                 TkConId n ->
                     case mCls of
-                        Nothing -> scanHead cur' (Just n) acc seenArrow
+                        Nothing -> scanHead cur' (Just n) acc tys seenArrow
                         Just _  -> do
                             let (tag, curAfter) = qualifiedConHead n cur'
-                            scanHead curAfter mCls (normalize tag : acc) seenArrow
+                            scanHead curAfter mCls (normalize tag : acc) (TyCon tag : tys) seenArrow
                 TkStr s | isJust mCls ->
                     -- DataKinds Symbol literal used as a type arg, e.g.
                     -- @instance SetField "name" ...@. Store the string
                     -- contents verbatim (quotes already stripped by the
                     -- lexer — 'TkStr' holds the decoded bytes).
-                    scanHead cur' mCls (normalize s : acc) seenArrow
+                    scanHead cur' mCls (normalize s : acc) (TyCon (normalize s) : tys) seenArrow
                 TkInt i | isJust mCls ->
                     -- DataKinds Nat literal used as a type arg.
-                    scanHead cur' mCls (BC.pack (show i) : acc) seenArrow
+                    let n = BC.pack (show i) in scanHead cur' mCls (n : acc) (TyCon n : tys) seenArrow
                 TkChar c | isJust mCls ->
                     -- DataKinds Char literal used as a type arg.
-                    scanHead cur' mCls (BC.pack [c] : acc) seenArrow
+                    let n = BC.pack [c] in scanHead cur' mCls (n : acc) (TyCon n : tys) seenArrow
                 TkIdent n | isJust mCls ->
                     -- Lower-case identifier used as a type arg (rare —
                     -- typically a type variable in the context). Capture
                     -- it so the tag list has a sensible length; callers
                     -- use this for composite-key registration.
-                    scanHead cur' mCls (normalize n : acc) seenArrow
+                    scanHead cur' mCls (normalize n : acc) (TyVar n : tys) seenArrow
                 TkIdent _ ->
                     -- Lower-case type variable before the class name;
                     -- skip.
-                    scanHead cur' mCls acc seenArrow
+                    scanHead cur' mCls acc tys seenArrow
                 TkLParen -> do
                     (inner, curAfter) <- collectParens 1 [] cur'
-                    let acc' = case mCls of
-                            Nothing -> acc  -- still pre-class; ignore
-                            Just _  -> maybe acc (: acc) (parenHeadTag inner)
-                    scanHead curAfter mCls acc' seenArrow
+                    let parsed = parseInstanceParenType inner
+                        (acc', tys') = case (mCls, parenHeadTag inner, parsed) of
+                            (Just _, Just tag, Just ty) -> (tag : acc, ty : tys)
+                            _ -> (acc, tys)
+                    scanHead curAfter mCls acc' tys' seenArrow
                 TkLBracket -> do
-                    curAfter <- skipBrackets 1 cur'
-                    let acc' = case mCls of
-                            Nothing -> acc
-                            Just _  -> BC.pack "[]" : acc
-                    scanHead curAfter mCls acc' seenArrow
-                _ -> scanHead cur' mCls acc seenArrow
+                    (inner, curAfter) <- collectBrackets 1 [] cur'
+                    let parsed = case dropNoise inner of
+                            [] -> Just (TyCon (BC.pack "[]"))
+                            tokens -> TyApp (TyCon (BC.pack "[]"))
+                                <$> parseTypeKinds tokens
+                        (acc', tys') = case (mCls, parsed) of
+                            (Just _, Just ty) -> (BC.pack "[]" : acc, ty : tys)
+                            _ -> (acc, tys)
+                    scanHead curAfter mCls acc' tys' seenArrow
+                _ -> scanHead cur' mCls acc tys seenArrow
 
         isJust (Just _) = True
         isJust Nothing  = False
@@ -3442,6 +3448,48 @@ scanInstanceDeclsRaw src
                     | otherwise -> collectParens (d - 1) (TkRParen : acc) cur'
                 TkEof -> pure (reverse acc, cur')
                 k     -> collectParens d (k : acc) cur'
+
+    collectBrackets :: Int -> [TokenKind] -> Cursor -> IO ([TokenKind], Cursor)
+    collectBrackets !d !acc cur = do
+        let (tok, cur') = nextToken src cur
+        case tkKind tok of
+            TkLBracket -> collectBrackets (d + 1) (TkLBracket : acc) cur'
+            TkRBracket | d == 1 -> pure (reverse acc, cur')
+                       | otherwise -> collectBrackets (d - 1) (TkRBracket : acc) cur'
+            TkEof -> pure (reverse acc, cur')
+            k -> collectBrackets d (k : acc) cur'
+
+    -- The ordinary type parser handles grouped/tuple types when it sees the
+    -- delimiters, while the instance-head collector has already consumed the
+    -- outer pair. Restore that grouping, except for constructor sections such
+    -- as @(,)@ and @(->)@, which are atoms that may themselves be applied.
+    parseInstanceParenType :: [TokenKind] -> Maybe Type
+    parseInstanceParenType inner = case constructorSection inner of
+        Just (con, rest) -> applyRest (TyCon con) rest
+        Nothing -> parseTypeKinds (TkLParen : inner ++ [TkRParen])
+      where
+        constructorSection [TkArrow] = Just (BC.pack "(->)", [])
+        constructorSection toks
+            | not (null toks), all isComma toks =
+                Just (tupleName (length toks), [])
+        constructorSection (TkLParen : rest) =
+            case break (== TkRParen) rest of
+                ([TkArrow], _ : after) -> Just (BC.pack "(->)", after)
+                (commas, _ : after)
+                    | not (null commas), all isComma commas ->
+                        Just (tupleName (length commas), after)
+                _ -> Nothing
+        constructorSection _ = Nothing
+
+        applyRest con [] = Just con
+        applyRest con rest = do
+            toks <- traverse tokenKindToTT rest
+            args <- parseTypeAtoms toks
+            pure (foldl TyApp con args)
+
+        isComma TkComma = True
+        isComma _ = False
+        tupleName commas = BC.pack ("(" <> replicate commas ',' <> ")")
 
     parenHeadTag :: [TokenKind] -> Maybe ByteString
     parenHeadTag toks =
@@ -3515,17 +3563,6 @@ scanInstanceDeclsRaw src
     dropNoise = filter (\case
         TkNewline -> False
         _         -> True)
-
-    skipBrackets :: Int -> Cursor -> IO Cursor
-    skipBrackets !d cur
-        | d <= 0    = pure cur
-        | otherwise = do
-            let (tok, cur') = nextToken src cur
-            case tkKind tok of
-                TkLBracket -> skipBrackets (d + 1) cur'
-                TkRBracket -> skipBrackets (d - 1) cur'
-                TkEof      -> pure cur'
-                _          -> skipBrackets d cur'
 
     -- Parse the `where` body: a layout block of method bindings.
     -- Each binding is `methodName [pats] = body` (possibly multi-clause).
@@ -4850,7 +4887,10 @@ data TTok
     deriving (Eq, Show)
 
 tokenToTT :: Token -> Maybe TTok
-tokenToTT t = case tkKind t of
+tokenToTT = tokenKindToTT . tkKind
+
+tokenKindToTT :: TokenKind -> Maybe TTok
+tokenKindToTT kind = case kind of
     TkConId n       -> Just (TTCon n)
     -- 'forall' is now a soft keyword lexed as TkIdent — match by name
     -- before the generic ident case so it routes to TTForall.
@@ -4867,6 +4907,9 @@ tokenToTT t = case tkKind t of
     TkUnderscore    -> Just TTUnderscore
     TkSymOp n       -> Just (TTSymOp n)
     _               -> Nothing
+
+parseTypeKinds :: [TokenKind] -> Maybe Type
+parseTypeKinds kinds = traverse tokenKindToTT kinds >>= parseType
 
 -- | Scan tokens of a type expression until a stop condition.  Returns
 -- the accumulated tokens + the cursor past them.  Stops at EOF, at
