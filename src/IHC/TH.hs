@@ -40,8 +40,9 @@ import Data.Int (Int64)
 import System.IO.Unsafe (unsafePerformIO)
 import IHC.AST
 import IHC.Classes (legacyHooks, getSharedClassReg)
+import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import qualified IHC.Elaborate as Elab
-import IHC.Eval (eval, force)
+import IHC.Eval (eval, force, currentOwner)
 import IHC.TypeAST (Type(..))
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import IHC.Val
@@ -469,7 +470,7 @@ expandSplicesInExpr env ipm depth expr
         state <- readIORef actionT
         value <- case state of
             Unevaluated (Closure actionEnv actionIpm actionExpr) -> do
-                actionExpr' <- elaborateAt
+                actionExpr' <- elaborateAt actionEnv
                     (TyApp (TyCon "IO") (TyCon "Exp")) actionExpr
                 eval legacyHooks actionEnv actionIpm actionExpr'
             _ -> force legacyHooks actionT
@@ -477,17 +478,19 @@ expandSplicesInExpr env ipm depth expr
             VIO action -> action
             other      -> pure other
 
-    elaborateQExp = elaborateAt (TyApp (TyCon "Q") (TyCon "Exp"))
+    elaborateQExp = elaborateAt env (TyApp (TyCon "Q") (TyCon "Exp"))
 
-    elaborateAt expectedTy inner = do
+    elaborateAt targetEnv expectedTy inner = do
         mClassReg <- getSharedClassReg legacyHooks
         case mClassReg of
             Nothing -> pure inner
             Just classReg -> do
                 sigs <- readIORef globalTypeSigsRef
                 synonyms <- readIORef globalTypeSynonymsRef
-                result <- try (Elab.elaborate classReg sigs synonyms
-                    (Elab.ExpectType expectedTy) inner)
+                constructorTypes <- readIORef globalConstructorTypeRegistryRef
+                owner <- currentOwner legacyHooks targetEnv
+                result <- try (Elab.elaborateOwned classReg sigs synonyms
+                    constructorTypes owner (Elab.ExpectType expectedTy) inner)
                     :: IO (Either SomeException (Expr, Type))
                 pure (either (const inner) fst result)
 
