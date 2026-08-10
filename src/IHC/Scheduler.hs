@@ -717,6 +717,20 @@ loadProgramFromSource searchPath src0 = do
         localBareAliases ownerName =
             HashMap.lookupDefault HashMap.empty ownerName localAliasEnvByOwner
 
+    -- Private record selectors remain in unqualified scope inside their
+    -- defining module.  They are intentionally absent from the shared base
+    -- environment, where they could leak into unrelated modules, so restore
+    -- them only in closures owned by that module.
+    ownerFieldEnvByOwner <- HashMap.fromList <$> mapM
+        (\lm -> do
+            ownFields <- if lmNoFieldSelectors lm
+                then pure HashMap.empty
+                else buildFieldEnv (lmFieldReg lm)
+            pure (lmName lm, ownFields))
+        loadedModules
+    let ownerFields ownerName =
+            HashMap.lookupDefault HashMap.empty ownerName ownerFieldEnvByOwner
+
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
     -- the module that owns the binding (extracted from the FQN's
     -- module prefix), so 'IHC.Eval.currentOwner' can scope the
@@ -729,7 +743,11 @@ loadProgramFromSource searchPath src0 = do
                        Nothing  -> lmName entry
                ownerThunk <- newWHNFThunk (VStr ownerName)
                let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
-                                $ HashMap.union (localBareAliases ownerName) env
+                                $ HashMap.unions
+                                    [ ownerFields ownerName
+                                    , localBareAliases ownerName
+                                    , env
+                                    ]
                writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
           (zip qualPairs slots)
 
