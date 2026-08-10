@@ -5181,17 +5181,23 @@ buildClassMethodEnv classReg existing loadedModules = do
     pure (HashMap.fromList filtered)
   where
     buildModule lm decls =
-        concat <$> mapM (buildOne (lmName lm)) decls
-    buildOne ownerName (ClassDecl cls methodNames _defaults _supers _schemes) =
-        concat <$> mapM (mkMethodEntries ownerName cls) methodNames
-    mkMethodEntries ownerName cls methodName = do
+        concat <$> mapM (buildOne (lmName lm) (lmIsEntry lm)) decls
+    buildOne ownerName ownerIsEntry
+            (ClassDecl cls methodNames _defaults _supers _schemes) =
+        concat <$> mapM (mkMethodEntries ownerName ownerIsEntry cls) methodNames
+    mkMethodEntries ownerName ownerIsEntry cls methodName = do
         let v = classMethodDispatcher classReg cls methodName
         t <- newWHNFThunk v
         let qualifiedName = ownerName <> BC.pack "." <> methodName
-        pure
-            [ (False, methodName, t)
-            , (True,  qualifiedName, t)
-            ]
+            bareEntries
+                | ownerIsEntry = [(False, methodName, t)]
+                | otherwise = []
+        -- Imported declarations only provide their qualified identity here.
+        -- Header-aware aliases/fallback add a bare method in modules that
+        -- actually import it.  Publishing every loaded class method bare in
+        -- the process-wide base env let MonadParsec.try capture the ordinary
+        -- explicit import GHC.Internal.Control.Exception.try.
+        pure (bareEntries ++ [(True, qualifiedName, t)])
 
 -- | Stage 3 of the lazy-registration plan: defer class-default
 -- materialisation the same way Stage 2 deferred per-instance
@@ -8458,7 +8464,15 @@ resolveFallback mOwner name = do
     -- the caller sees @unbound variable `E.toException`@ when warp's
     -- @acceptNewConnection@ catches a non-recoverable accept errno.
     baseEnv <- readIORef envBaseForFallbackRef
+    methodClasses <- readIORef globalMethodClassRef
+    let ownerScopedBareMethod =
+            isJust mOwner && not (BC.elem '.' name) && Map.member name methodClasses
     case HashMap.lookup name baseEnv of
+        -- Bare class-method dispatchers in the process-wide base env are not
+        -- scope evidence.  Let owner-aware source/import resolution decide:
+        -- an explicit ordinary import such as Exception.try must beat an
+        -- unrelated loaded MonadParsec.try declaration.
+        Just _ | ownerScopedBareMethod -> resolveFallbackSource mOwner name
         Just t  -> pure (Just t)
         Nothing -> resolveFallbackSource mOwner name
 
@@ -8774,13 +8788,66 @@ resolveFallbackSource mOwner name = do
     -- the multi-class-overload case via tag-driven lookup.
     knownClassesForMethod bareName = do
         m <- readIORef globalMethodClassRef
-        let scanned = Map.findWithDefault [] bareName m
-            fromManifest =
-                maybe [] (:[]) (Manifest.classForMethod Manifest.manifestIndex bareName)
-            classes = nubBS (scanned ++ fromManifest)
-        when (null scanned && not (null fromManifest)) $
+        let scannedGlobal = Map.findWithDefault [] bareName m
+        (scanned, fromManifest) <- classesVisibleFromOwner scannedGlobal
+        let classes = nubBS (scanned ++ fromManifest)
+        -- Only cache provenance candidates that survived the owner's actual
+        -- import/export scope.  Caching a rejected global candidate here is
+        -- what made GHC.Internal.Control.Exception.try permanently become
+        -- MonadParsec.try while evaluating source-loaded withFile.
+        when (null scannedGlobal && not (null fromManifest)) $
             modifyIORef' globalMethodClassRef (Map.insert bareName classes)
         pure classes
+      where
+        classesVisibleFromOwner scannedGlobal =
+            case mOwner of
+                Nothing -> pure
+                    ( scannedGlobal
+                    , maybe [] (:[])
+                        (Manifest.classForMethod Manifest.manifestIndex bareName)
+                    )
+                Just ownerName -> do
+                    loaded <- readIORef globalLoadedModulesRef
+                    case Map.lookup ownerName loaded of
+                        Nothing -> pure ([], [])
+                        Just owner -> do
+                            let imports =
+                                    [ impModule imp
+                                    | imp <- mhImports (lmHeader owner)
+                                    , not (impQualified imp)
+                                    , specAllows (impSpec imp) bareName
+                                    ]
+                                visibleNames = Set.fromList
+                                    (ownerName : imports ++
+                                     [ "Prelude"
+                                     | not (hasNoImplicitPrelude (lmSource owner))
+                                     ])
+                                manifestClasses = Set.fromList
+                                    [ Manifest.moClassName provenance
+                                    | provenance <- Set.toList
+                                        (Manifest.methodOwnersFor
+                                            Manifest.manifestIndex bareName)
+                                    , Set.member (Manifest.moModuleName provenance)
+                                                 visibleNames
+                                    ]
+                            declaredClasses <- fmap Set.unions $ forM
+                                (Set.toList visibleNames) $ \modName ->
+                                    case Map.lookup modName loaded of
+                                        Nothing -> pure Set.empty
+                                        Just visibleModule -> do
+                                            decls <- scanClassDecls
+                                                (lmSource visibleModule)
+                                                `catch` (\(_ :: SomeException) -> pure [])
+                                            pure $ Set.fromList
+                                                [ cls
+                                                | ClassDecl cls methods _ _ _ <- decls
+                                                , bareName `elem` methods
+                                                ]
+                            let allowed = Set.union manifestClasses declaredClasses
+                            pure
+                                ( filter (`Set.member` allowed) scannedGlobal
+                                , Set.toList manifestClasses
+                                )
 
     knownScannedClassesForMethod bareName = do
         m <- readIORef globalMethodClassRef
@@ -9599,7 +9666,19 @@ resolveFallbackSource mOwner name = do
 
     tryClassMethodSlot owner bareName = do
         decls <- scanClassDecls (lmSource owner)
-        case [ cls | ClassDecl cls methods _ _ _ <- decls, bareName `elem` methods ] of
+        let manifestOwners = Manifest.methodOwnersFor
+                Manifest.manifestIndex bareName
+            provenanceMatches cls =
+                lmIsEntry owner || any
+                    (\provenance ->
+                        Manifest.moModuleName provenance == lmName owner &&
+                        Manifest.moClassName provenance == cls)
+                    (Set.toList manifestOwners)
+        case [ cls
+             | ClassDecl cls methods _ _ _ <- decls
+             , bareName `elem` methods
+             , provenanceMatches cls
+             ] of
             []      -> pure Nothing
             (cls:_) -> do
                 mSharedReg <- getSharedClassReg legacyHooks
@@ -10972,10 +11051,19 @@ resolveImport' registry searchPath includeMap lm name = do
 
     exportsClassMethod targetLm methodName = do
         decls <- scanClassDecls (lmSource targetLm)
-        let classes =
+        let manifestOwners = Manifest.methodOwnersFor
+                Manifest.manifestIndex methodName
+            hasProvenance className =
+                lmIsEntry targetLm || any
+                    (\provenance ->
+                        Manifest.moModuleName provenance == lmName targetLm &&
+                        Manifest.moClassName provenance == className)
+                    (Set.toList manifestOwners)
+            classes =
                 [ (className, methods)
                 | ClassDecl className methods _ _ _ <- decls
                 , methodName `elem` methods
+                , hasProvenance className
                 ]
             exportedBy className methods = case mhExports (lmHeader targetLm) of
                 ExportAll -> True
@@ -11041,7 +11129,15 @@ resolveImport' registry searchPath includeMap lm name = do
                     -- imports too — discovery is already demand-driven per
                     -- name, so there's no broad-load cost.
                     let viaImports = mhImports (lmHeader via)
-                        filteredImports = filter (\i ->
+                        -- Gateway modules conventionally place the specific
+                        -- implementation imports they re-export after broad
+                        -- foundational imports.  Search from the end so a
+                        -- targeted name such as System.IO.withFile reaches
+                        -- IO.StdHandles/Handle.FD without loading and probing
+                        -- every GHC.Internal base module first.  A valid
+                        -- unqualified export has a unique provider, so this
+                        -- changes search cost, not meaning.
+                        filteredImports = reverse $ filter (\i ->
                             impModule i /= BC.pack "Prelude" &&
                             specAllowsCheap (impSpec i) name) viaImports
                     tryViaImports filteredImports depth rest
@@ -11100,7 +11196,7 @@ resolveImport' registry searchPath includeMap lm name = do
                         r <- try (loadModule registry searchPath includeMap (impModule imp))
                                     :: IO (Either SomeException LoadedModule)
                         case r of
-                            Left  _     -> tryViaImports moreImps depth rest
+                            Left _ -> tryViaImports moreImps depth rest
                             Right srcLm -> do
                                 allowed <- specAllowsLoaded srcLm (impSpec imp) name
                                 if not allowed

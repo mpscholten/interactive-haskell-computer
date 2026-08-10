@@ -9,7 +9,13 @@ class Bits a where
 instance Bits Int where
     withFile _ = "bits"
 
+-- GHC.Internal.IO.Handle.FD implements source-loaded withFile in terms of
+-- Control.Exception.try.  This unrelated class method must not capture that
+-- explicit ordinary import either.
+class Parsing a where
+    try :: a -> a
+
 main = do
     IO.withFile "/tmp/ihc_test_withfile_collision.txt" IO.WriteMode $ \h ->
         IO.hPutStr h "qualified ordinary function\n"
-    putStrLn "after"
+    IO.hPutStr IO.stdout "after\n"
