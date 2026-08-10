@@ -4,16 +4,20 @@ module IHC.ConstructorMetadata
     , ConstructorTypeMetadata(..)
     , ConstructorTypeRegistry
     , constructorMetadataFromScheme
+    , constructorScheme
     , constructorFieldTypes
     , constructorFieldTypeAt
+    , globalConstructorTypeRegistryRef
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.IORef (IORef, newIORef)
 import qualified Data.Set as Set
 import Data.Set (Set)
+import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Name)
 import IHC.TypeAST (Scheme(..), Type(..), applySubst, freeTyVars, emptySubst, tyArrowArgs)
@@ -45,6 +49,10 @@ data ConstructorTypeMetadata = ConstructorTypeMetadata
 
 type ConstructorTypeRegistry = Map ConstructorIdentity ConstructorTypeMetadata
 
+{-# NOINLINE globalConstructorTypeRegistryRef #-}
+globalConstructorTypeRegistryRef :: IORef ConstructorTypeRegistry
+globalConstructorTypeRegistryRef = unsafePerformIO (newIORef Map.empty)
+
 -- | Convert a constructor signature produced by the source scanner into the
 -- runtime-neutral metadata contract.  Variables quantified by the signature
 -- but absent from its result are marked existential and therefore fail closed
@@ -65,6 +73,41 @@ constructorMetadataFromScheme identity' isDataFamily (Scheme vars preds body)
             , ctmFieldTypes = fields
             , ctmDataFamily = isDataFamily
             }
+
+-- | Recover the constructor's complete source signature for local inference.
+-- Qualified names are resolved only against their stated module.  A bare name
+-- prefers a constructor declared by the lexical owner and otherwise succeeds
+-- only when exactly one loaded module declares it.  This conservative rule is
+-- important: choosing the first of two same-named constructors can silently
+-- select a class instance for the wrong field type.
+constructorScheme
+    :: ConstructorTypeRegistry -> Maybe Name -> Name -> Maybe Scheme
+constructorScheme registry requestedOwner requestedCtor = do
+    identity' <- resolveIdentity
+    metadata <- Map.lookup identity' registry
+    if ctmIdentity metadata /= identity'
+        || ctmDataFamily metadata
+        || not (null (ctmExistentialVars metadata))
+      then Nothing
+      else Just (Scheme
+            (ctmQuantifiedVars metadata)
+            []
+            (foldr TyArrow (ctmResultType metadata) (ctmFieldTypes metadata)))
+  where
+    (ctorQualifier, bareCtor) = splitQualified requestedCtor
+    localIdentity = (`ConstructorIdentity` bareCtor) <$> requestedOwner
+    candidates =
+        [ identity'
+        | identity' <- Map.keys registry
+        , ciName identity' == bareCtor
+        ]
+    resolveIdentity = case ctorQualifier of
+        Just qualifier -> Just (ConstructorIdentity qualifier bareCtor)
+        Nothing -> case localIdentity of
+            Just identity' | Map.member identity' registry -> Just identity'
+            _ -> case candidates of
+                [identity'] -> Just identity'
+                _ -> Nothing
 
 constructorFieldTypes
     :: ConstructorTypeRegistry
