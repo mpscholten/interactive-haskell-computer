@@ -2503,9 +2503,11 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                 TkIdent "deriving" -> pure (Right (reverse rev, cur', True))
                 TkNewline -> do
                     let (peek, _) = nextToken src cur'
-                    if tkKind peek == TkEof || tkCol peek == 1
-                        then pure (Right (reverse rev, cur', True))
-                        else pure (Left cur')
+                    case tkKind peek of
+                        TkLBrace | null rev -> collectFields rev cur'
+                        _ | tkKind peek == TkEof || tkCol peek == 1 ->
+                            pure (Right (reverse rev, cur', True))
+                          | otherwise -> pure (Left cur')
                 TkConId _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
                 TkIdent "forall" -> pure (Left cur)
                 TkIdent _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
@@ -2536,7 +2538,7 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
             fields rev cur = do
                 let (tok, cur') = nextToken src cur
                 case tkKind tok of
-                    TkNewline -> pure (Left cur)
+                    TkNewline -> fields rev cur'
                     TkRBrace -> pure (Right (reverse rev, cur'))
                     TkIdent label -> labels [label] cur'
                     _ -> pure (Left cur)
@@ -2567,7 +2569,7 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                     ascend tt = collectRecordType (tt : rev) (depth - 1) cur'
                 case tkKind tok of
                     TkEof -> pure (Left cur)
-                    TkNewline -> pure (Left cur)
+                    TkNewline -> collectRecordType rev depth cur'
                     TkComma | depth == 0 -> pure (Right (reverse rev, cur', False))
                     TkRBrace | depth == 0 -> pure (Right (reverse rev, cur', True))
                     TkBang -> collectRecordType rev depth cur'

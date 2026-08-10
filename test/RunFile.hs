@@ -219,6 +219,17 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 `shouldBe` Just [maybeInt, maybeInt, int]
             constructorFieldTypes reg (Just (n "Positive")) (n "NoFields")
                 (TyApp (TyCon (n "Records")) int) `shouldBe` Just []
+            let nested = TyApp (TyCon (n "Maybe"))
+                    (TyApp (TyApp (TyCon (n "Either")) (TyCon (n "String"))) int)
+            constructorFieldTypes reg (Just (n "Positive")) (n "PosState")
+                (TyApp (TyCon (n "PosState")) (TyCon (n "Text")))
+                `shouldBe` Just
+                    [ TyCon (n "Text")
+                    , int
+                    , nested
+                    , nested
+                    , TyApp (TyCon (n "[]")) (TyCon (n "Char"))
+                    ]
 
         it "rejects unsupported H98 declarations atomically" do
             src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Rejected.hs"
