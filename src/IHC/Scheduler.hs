@@ -50,7 +50,7 @@ module IHC.Scheduler
     , desugarRecordPats
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try)
+import Control.Exception (throwIO, Exception, catch, finally, SomeException, try)
 import Control.Applicative ((<|>))
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (nullPtr)
@@ -7629,6 +7629,7 @@ data LegacySchedulerRunState = LegacySchedulerRunState
     , lsrsTypeSigMetadataCache :: !(IORef (Int, Map (Maybe ByteString, ByteString) (Maybe Scheme)))
     , lsrsDiscoverNegCache    :: !(IORef (Set (ByteString, ByteString)))
     , lsrsResolveImportCache  :: !(IORef (Map (ByteString, ByteString) (Maybe ModuleName)))
+    , lsrsResolveImportActive :: !(IORef (Set (ByteString, ByteString)))
     }
 
 -- | One-shot allocation of the scheduler per-run IORefs.  Same
@@ -7648,6 +7649,7 @@ legacySchedulerRunState = unsafePerformIO $ do
     typeSigCache <- newIORef (0, Map.empty)
     discoverNeg  <- newIORef Set.empty
     resolveCache <- newIORef Map.empty
+    resolveActive <- newIORef Set.empty
     pure LegacySchedulerRunState
         { lsrsLoadedModules       = loadedMods
         , lsrsSearchPath          = searchPath
@@ -7660,6 +7662,7 @@ legacySchedulerRunState = unsafePerformIO $ do
         , lsrsTypeSigMetadataCache = typeSigCache
         , lsrsDiscoverNegCache    = discoverNeg
         , lsrsResolveImportCache  = resolveCache
+        , lsrsResolveImportActive = resolveActive
         }
 
 -- | Global catalogue of every 'LoadedModule' we've ever built.  Used by
@@ -10841,14 +10844,25 @@ resolveImport
     -> IO (Maybe ModuleName)
 resolveImport registry searchPath includeMap lm name = do
     -- Cache: see comment block below.
+    let key = (lmName lm, name)
     cache <- readIORef resolveImportCacheRef
-    case Map.lookup (lmName lm, name) cache of
+    case Map.lookup key cache of
         Just cached -> pure cached
         Nothing -> do
-            r0 <- resolveImport' registry searchPath includeMap lm name
-            modifyIORef' resolveImportCacheRef
-                (Map.insert (lmName lm, name) r0)
-            pure r0
+            active <- readIORef resolveImportActiveRef
+            if Set.member key active
+                -- A named/module re-export cycle has re-entered the exact
+                -- lookup that is already walking.  Treat this edge as a miss;
+                -- the outer search continues through its remaining imports
+                -- and caches the eventual successful provider.
+                then pure Nothing
+                else do
+                    modifyIORef' resolveImportActiveRef (Set.insert key)
+                    (do r0 <- resolveImport' registry searchPath includeMap lm name
+                        modifyIORef' resolveImportCacheRef (Map.insert key r0)
+                        pure r0)
+                      `finally`
+                        modifyIORef' resolveImportActiveRef (Set.delete key)
 
 -- | Shallow import resolution for discovery free vars.  Only checks
 -- whether the name is locally defined in a direct (non-qualified)
@@ -10905,10 +10919,15 @@ _resolveImportShallow registry searchPath includeMap lm name = do
 -- 'lmName' from a prior run doesn't shadow a fresh resolution.  Wired
 -- alongside the other per-run resets in 'loadProgramFromSource'.
 resetResolveImportCache :: IO ()
-resetResolveImportCache = writeIORef resolveImportCacheRef Map.empty
+resetResolveImportCache = do
+    writeIORef resolveImportCacheRef Map.empty
+    writeIORef resolveImportActiveRef Set.empty
 
 resolveImportCacheRef :: IORef (Map (ByteString, ByteString) (Maybe ModuleName))
 resolveImportCacheRef = lsrsResolveImportCache legacySchedulerRunState
+
+resolveImportActiveRef :: IORef (Set (ByteString, ByteString))
+resolveImportActiveRef = lsrsResolveImportActive legacySchedulerRunState
 
 resolveImport'
     :: ModuleRegistry
