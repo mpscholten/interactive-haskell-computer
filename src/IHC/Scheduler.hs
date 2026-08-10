@@ -597,12 +597,14 @@ loadProgramFromSource searchPath src0 = do
             (map lmTypeCtorReg loadedModules)
     fallbackBase0 <- readIORef envBaseForFallbackRef
     fallbackCache0 <- readIORef envFallbackCache
+    fallbackCanonical0 <- readIORef envFallbackCanonicalCache
     fallbackNeg0 <- readIORef envFallbackNegCacheRef
     fallbackGen0 <- readIORef envFallbackCacheGenRef
     typeSigCache0 <- readIORef typeSigMetadataCacheRef
     let restoreProvisionalFallbackState = do
             writeIORef envBaseForFallbackRef fallbackBase0
             writeIORef envFallbackCache fallbackCache0
+            writeIORef envFallbackCanonicalCache fallbackCanonical0
             writeIORef envFallbackNegCacheRef fallbackNeg0
             writeIORef envFallbackCacheGenRef fallbackGen0
             writeIORef typeSigMetadataCacheRef typeSigCache0
@@ -7800,7 +7802,8 @@ data LegacySchedulerRunState = LegacySchedulerRunState
     { lsrsLoadedModules       :: !(IORef (Map ModuleName LoadedModule))
     , lsrsSearchPath          :: !(IORef [FilePath])
     , lsrsIncludeMap          :: !(IORef (Map FilePath [FilePath]))
-    , lsrsEnvFallbackCache    :: !(IORef (Map ByteString Thunk))
+    , lsrsEnvFallbackCache    :: !(IORef (Map (Maybe ByteString, ByteString) Thunk))
+    , lsrsEnvFallbackCanonical :: !(IORef (Map (ByteString, ByteString) Thunk))
     , lsrsEnvBaseForFallback  :: !(IORef Env)
     , lsrsEnvRawBuiltins      :: !(IORef Env)
     , lsrsEnvFallbackNegCache :: !(IORef (Int, Set (Maybe ByteString, ByteString)))
@@ -7820,6 +7823,7 @@ legacySchedulerRunState = unsafePerformIO $ do
     searchPath   <- newIORef []
     includeMap   <- newIORef Map.empty
     fbCache      <- newIORef Map.empty
+    fbCanonical  <- newIORef Map.empty
     fbBase       <- newIORef HashMap.empty
     fbRawBuiltins <- newIORef HashMap.empty
     fbNeg        <- newIORef (0, Set.empty)
@@ -7832,6 +7836,7 @@ legacySchedulerRunState = unsafePerformIO $ do
         , lsrsSearchPath          = searchPath
         , lsrsIncludeMap          = includeMap
         , lsrsEnvFallbackCache    = fbCache
+        , lsrsEnvFallbackCanonical = fbCanonical
         , lsrsEnvBaseForFallback  = fbBase
         , lsrsEnvRawBuiltins      = fbRawBuiltins
         , lsrsEnvFallbackNegCache = fbNeg
@@ -7927,6 +7932,7 @@ resetPerRunGlobals = do
     when (not keepCache) $
         writeIORef globalLoadedModulesRef Map.empty
     writeIORef envFallbackCache       Map.empty
+    writeIORef envFallbackCanonicalCache Map.empty
     writeIORef envFallbackNegCacheRef (0, Set.empty)
     writeIORef envFallbackCacheGenRef 0
     writeIORef typeSigMetadataCacheRef (0, Map.empty)
@@ -8203,11 +8209,16 @@ setGlobalSearchPath sp im = do
     writeIORef globalIncludeMapRef im
 
 
--- | Memoised slots produced by the env fallback hook.  Keeps one
--- 'Thunk' per FQN so successive demand-lookups share evaluation +
--- memoisation, matching the normal import-driven env layer.
-envFallbackCache :: IORef (Map ByteString Thunk)
+-- | Memoised slots produced by the env fallback hook.  The lexical owner is
+-- part of the key: alias rewrites and bare import resolution are owner-
+-- dependent, and a cached closure captures that owner's environment.
+-- Repeated lookups from the same owner still share evaluation.
+envFallbackCache :: IORef (Map (Maybe ByteString, ByteString) Thunk)
 envFallbackCache = lsrsEnvFallbackCache legacySchedulerRunState
+
+-- Provider-owned slots preserve CAF sharing across requester-scoped aliases.
+envFallbackCanonicalCache :: IORef (Map (ByteString, ByteString) Thunk)
+envFallbackCanonicalCache = lsrsEnvFallbackCanonical legacySchedulerRunState
 
 -- | Install the demand-driven env-fallback hook that 'IHC.Eval.eval'
 -- consults when an 'EVar' lookup misses.  Given a fully-qualified name
@@ -8281,7 +8292,7 @@ installEnvFallbackHook :: IO ()
 installEnvFallbackHook =
     setEnvFallback legacyHooks $ \mOwner name -> do
         cache <- readIORef envFallbackCache
-        case Map.lookup name cache of
+        case Map.lookup (mOwner, name) cache of
             Just t  -> pure (Just t)
             Nothing -> do
                 gen <- readIORef envFallbackCacheGenRef
@@ -9368,6 +9379,12 @@ resolveFallbackSource mOwner name = do
             | otherwise = b
 
     buildSlotFromOwner mods owner bareName = do
+        canonical <- readIORef envFallbackCanonicalCache
+        case Map.lookup (lmName owner, bareName) canonical of
+            Just slot -> pure (Just slot)
+            Nothing -> buildSlotFromOwnerFresh mods owner bareName
+
+    buildSlotFromOwnerFresh mods owner bareName = do
         registerSharedDerivedEnumBounded (Map.elems mods)
         bodies <- readIORef (lmBodies owner)
         mClassMethodEarly <- tryClassMethodSlot owner bareName
@@ -9466,31 +9483,33 @@ resolveFallbackSource mOwner name = do
                     (Unevaluated (Closure richEnv emptyIPMap
                         (wrapNullaryResultSig owner bareName expr')))
                 modifyIORef' envFallbackCache
-                    (Map.insert name slot . Map.insert selfKey slot)
+                    (Map.insert (mOwner, name) slot . Map.insert (mOwner, selfKey) slot)
+                modifyIORef' envFallbackCanonicalCache
+                    (Map.insert (lmName owner, bareName) slot)
                 pure (Just slot)
               _ -> do
                 mLocal <- refreshLocalBindingFromSource mods owner bareName
                 case mLocal of
                     Just slot -> do
-                        modifyIORef' envFallbackCache (Map.insert name slot)
+                        modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                         pure (Just slot)
                     Nothing -> do
                         mImport <- tryImportAliasSlot mods owner bareName
                         case mImport of
                             Just slot -> do
-                                modifyIORef' envFallbackCache (Map.insert name slot)
+                                modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                                 pure (Just slot)
                             Nothing -> do
                                 mBase <- tryBaseBareSlot bareName
                                 case mBase of
                                     Just slot -> do
-                                        modifyIORef' envFallbackCache (Map.insert name slot)
+                                        modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                                         pure (Just slot)
                                     Nothing -> do
                                         mCon <- tryConstructorSlot mods owner bareName
                                         case mCon of
                                             Just slot -> do
-                                                modifyIORef' envFallbackCache (Map.insert name slot)
+                                                modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                                                 pure (Just slot)
                                             Nothing -> do
                                                 mField <- tryFieldSlot mods owner bareName
@@ -9840,7 +9859,7 @@ resolveFallbackSource mOwner name = do
                          <> " slot=" <> show (isJust mSlot))
                 case mSlot of
                     Just slot -> do
-                        modifyIORef' envFallbackCache (Map.insert name slot)
+                        modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                         pure (Just slot)
                     Nothing -> pure Nothing
 
@@ -9877,7 +9896,7 @@ resolveFallbackSource mOwner name = do
         let fqn = lmName owner <> BC.pack "." <> bareName
         case HashMap.lookup fqn fieldEnvAll <|> HashMap.lookup bareName fieldEnvAll of
             Just slot -> do
-                modifyIORef' envFallbackCache (Map.insert name slot)
+                modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)
                 pure (Just slot)
             Nothing -> pure Nothing
 
