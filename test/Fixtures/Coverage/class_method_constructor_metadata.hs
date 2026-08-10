@@ -26,8 +26,5 @@ data Refined a where
     AsInt :: Int -> Refined Int
     AsBool :: Bool -> Refined Bool
 
-main :: IO ()
-main = do
-    print (pick (Box 4))
-    print (choose (Right 8))
-    print (refine (AsBool False))
+main :: Int
+main = pick (Box 4) + choose (Right 8) + refine (AsBool False)

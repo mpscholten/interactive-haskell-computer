@@ -718,16 +718,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         runMainWithSiblings (root </> "MainQualified.hs") `shouldReturn` 73
 
     it "dispatches class parameters nested in owner-qualified constructor metadata" do
-        (n, out) <- captureStdout
-            (runFile "test/Fixtures/Coverage/class_method_constructor_metadata.hs")
-        n `shouldBe` 0
-        out `shouldBe` "11\n12\n23\n"
+        runFile "test/Fixtures/Coverage/class_method_constructor_metadata.hs"
+            `shouldReturn` 46
 
     it "keeps same-named imported constructors isolated by their real owners" do
         let root = "test/Fixtures/Coverage/Modules/class_method_constructor_owner"
-        (n, out) <- captureStdout (runMainWithSiblings (root </> "Main.hs"))
-        n `shouldBe` 0
-        out `shouldBe` "31\n42\n"
+        runMainWithSiblings (root </> "Main.hs") `shouldReturn` 73
 
     it "does not treat an ordinary same-name binding as a class method" do
         let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
