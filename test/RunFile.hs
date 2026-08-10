@@ -195,6 +195,33 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 (TyApp (TyCon (n "Box")) (TyCon (n "Text")))
                 `shouldBe` Just [TyCon (n "Text")]
 
+        it "scans complete H98 alternatives, strict fields, and type atoms" do
+            src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Positive.hs"
+            reg <- scanConstructorTypeMetadata (n "Positive") src
+            let manyInt = TyApp (TyCon (n "Many")) int
+                maybeInt = TyApp (TyCon (n "Maybe")) int
+            constructorFieldTypes reg (Just (n "Positive")) (n "Empty") manyInt
+                `shouldBe` Just []
+            constructorFieldTypes reg (Just (n "Positive")) (n "Strict") manyInt
+                `shouldBe` Just [int]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Unpacked") manyInt
+                `shouldBe` Just [int]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Wrapped") manyInt
+                `shouldBe` Just [maybeInt]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Listed") manyInt
+                `shouldBe` Just [TyApp (TyCon (n "[]")) int]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Qualified") manyInt
+                `shouldBe` Just [TyCon (n "Data.Int.Int")]
+            constructorFieldTypes reg (Just (n "Positive")) (n "Single")
+                (TyApp (TyCon (n "Single")) int) `shouldBe` Just [maybeInt]
+
+        it "rejects unsupported H98 declarations atomically" do
+            src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Rejected.hs"
+            reg <- scanConstructorTypeMetadata (n "Rejected") src
+            mapM_ (\ctor -> constructorScheme reg (Just (n "Rejected")) (n ctor)
+                    `shouldBe` Nothing)
+                ["Record", "Existential", "Context", "Multiline", "Kinded"]
+
         it "rejects a registry key that disagrees with metadata identity" do
             let metadata = ordinary "Actual" "Mk" ["a"]
                              (TyApp (TyCon (n "Box")) a) [a]

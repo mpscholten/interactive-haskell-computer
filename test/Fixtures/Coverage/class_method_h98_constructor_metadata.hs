@@ -1,5 +1,5 @@
 data Text = Text
-data Box a = Box a
+data Box a = Box a | Count Int
 
 class Choose a where
     first :: Int -> Box a -> Int
