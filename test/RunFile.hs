@@ -1532,6 +1532,22 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "True\n"
 
+    it "callee expected type: substitutions survive three partial applications" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/expected_arg_three_args_cs_text.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "three\n"
+
+    it "callee expected type: mismatch falls back without forcing a lazy argument" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/expected_arg_mismatch_fallback.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "True\n"
+
+    it "callee expected type: owner-scoped metadata wins over a bare collision" do
+        let root = "test/Fixtures/Coverage/Modules/expected_arg_owner_collision"
+        (n, out) <- captureStdout (runMainWithSiblings (root </> "Main.hs"))
+        n   `shouldBe` 0
+        out `shouldBe` "True\nowner\n"
+
     --------------------------------------------------------------------
     -- QuickWins: small GHC2021/common extensions (IHP Tier-3)
     --------------------------------------------------------------------

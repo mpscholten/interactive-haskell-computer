@@ -15,6 +15,7 @@ module IHC.Elaborate
     ( InferenceError(..)
     , Expected(..)
     , elaborate
+    , elaborateWithScopedSigs
     , elaborateExpr
     , parseRawTypeExpr
     , resolveSynonymHop
@@ -68,6 +69,7 @@ data InferEnv = InferEnv
     , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
     , ieClassMethodNames :: !(Set.Set ByteString)
     , ieAmbiguousSigs    :: !(Set.Set ByteString)
+    , ieScopedSigs       :: !(Set.Set ByteString)
     }
 
 -- | Top-level entry point.  Elaborate a sub-expression under an
@@ -84,6 +86,20 @@ elaborate
     -> Expr
     -> IO (Expr, Type)
 elaborate classReg sigs synonyms expected e = do
+    elaborateWithScopedSigs classReg sigs synonyms Set.empty expected e
+
+-- | Elaborate with signatures resolved in a concrete lexical owner.  Names in
+-- this set are safe even when the process-global bare-name table records a
+-- collision: their schemes came from the owner's actual import scope.
+elaborateWithScopedSigs
+    :: ClassRegistry
+    -> Map ByteString Scheme
+    -> Map ByteString (Int, Type)
+    -> Set.Set ByteString
+    -> Expected
+    -> Expr
+    -> IO (Expr, Type)
+elaborateWithScopedSigs classReg sigs synonyms scopedSigs expected e = do
     fresh <- newFreshSource
     classMethodNames <- readIORef globalClassMethodNamesRef
     ambiguousSigs    <- readIORef globalAmbiguousSigsRef
@@ -95,6 +111,7 @@ elaborate classReg sigs synonyms expected e = do
             , ieLocals   = Map.empty
             , ieClassMethodNames = classMethodNames
             , ieAmbiguousSigs    = ambiguousSigs
+            , ieScopedSigs       = scopedSigs
             }
     (e', t, _preds, sub) <- elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
@@ -366,6 +383,7 @@ isActualClassMethod ienv name =
 isAmbiguousSig :: InferEnv -> Name -> Bool
 isAmbiguousSig ienv name =
     Set.member name (ieAmbiguousSigs ienv)
+        && not (Set.member name (ieScopedSigs ienv))
 
 -- | Walk a list of expressions sequentially, threading substitution.
 elaborateMany :: InferEnv -> [Expr] -> IO ([Expr], [Type], [Pred], Subst)

@@ -55,7 +55,7 @@ import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
 import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
-import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef)
+import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
 
@@ -129,16 +129,17 @@ annotateNullaryBoundedArg f x = case x of
 elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
 elaborateExpectedArg hooks owner f x = do
     initialSigs <- readIORef globalTypeSigsRef
+    ambiguousSigs <- readIORef globalAmbiguousSigsRef
     -- Include the partially-applied callee as well as the new argument.
     -- Owner-scoped metadata is what lets inference see a source-loaded
     -- method's real scheme without relying on the process-global flat map.
-    sigs <- foldM loadMissingSig initialSigs
+    (sigs, scopedSigs) <- foldM (loadPreferredSig ambiguousSigs) (initialSigs, Set.empty)
         (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
     if not (needsExpectedElaboration sigs x)
         then pure x
         else case appHeadAndArity f of
             Just (fn, supplied) ->
-                case Map.lookup (bareName fn) sigs `orElse` Map.lookup fn sigs of
+                case Map.lookup fn sigs `orElse` Map.lookup (bareName fn) sigs of
                     Just (Scheme _ _ body) ->
                         case tyArrowArgs body of
                             (args, _) | supplied < length args -> do
@@ -156,7 +157,7 @@ elaborateExpectedArg hooks owner f x = do
                                         -- @same True@, @same :: a -> a -> a@
                                         -- has residual domain @Bool@.
                                         residual <- try
-                                            (Elab.elaborate classReg sigs syns
+                                            (Elab.elaborateWithScopedSigs classReg sigs syns scopedSigs
                                                 Elab.InferFreely f)
                                             :: IO (Either SomeException (Expr, TA.Type))
                                         let expected = case residual of
@@ -165,7 +166,7 @@ elaborateExpectedArg hooks owner f x = do
                                                         (argTy : _, _) -> argTy
                                                         _ -> args !! supplied
                                                 Left _ -> args !! supplied
-                                        result <- try (Elab.elaborate classReg sigs syns
+                                        result <- try (Elab.elaborateWithScopedSigs classReg sigs syns scopedSigs
                                                         (Elab.ExpectType expected) x)
                                             :: IO (Either SomeException (Expr, TA.Type))
                                         pure (either (const x) fst result)
@@ -173,12 +174,19 @@ elaborateExpectedArg hooks owner f x = do
                     Nothing -> pure x
             Nothing -> pure x
   where
-    loadMissingSig sigs name
-        | Map.member name sigs || Map.member (bareName name) sigs = pure sigs
-        | bareName name `elem` map BC.pack [":", "[]"] = pure sigs
+    loadPreferredSig ambiguous state@(known, scoped) name
+        | bareName name `elem` map BC.pack [":", "[]"] = pure state
+        | not (Set.member (bareName name) ambiguous)
+        , Map.member name known || Map.member (bareName name) known = pure state
         | otherwise = do
             mScheme <- lookupTypeSigFallback hooks owner name
-            pure $ maybe sigs (\scheme -> Map.insert name scheme sigs) mScheme
+            pure $ case mScheme of
+                Nothing -> state
+                Just scheme ->
+                    let bare = bareName name
+                    in ( Map.insert name scheme (fst state)
+                       , Set.insert bare (Set.insert name scoped)
+                       )
 
     expressionHeadSet = go
       where
