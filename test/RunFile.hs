@@ -290,6 +290,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             VIO _ -> pure ()
             _ -> expectationFailure "expected inner Q action to remain suspended"
 
+    it "TH Exp decoding consumes only one source Q layer" do
+        executions <- newIORef (0 :: Int)
+        exp40 <- integerExpVal 40
+        innerActionT <- newWHNFThunk
+            (VIO (modifyIORef' executions (+ 1) >> pure exp40))
+        let innerQ = VCon "Q" [innerActionT]
+        outerActionT <- newWHNFThunk (VIO (pure innerQ))
+        decoded <- try (thExpToExpr (VCon "Q" [outerActionT]))
+            :: IO (Either SomeException Expr)
+        decoded `shouldSatisfy` either (const True) (const False)
+        readIORef executions `shouldReturn` 0
+
     -- Regression: the scheduler used to leak state between consecutive
     -- runFile calls in the same process.  After the first call,
     -- 'globalLoadedModulesRef' was populated with ~150 modules; the
