@@ -1,11 +1,22 @@
 # HSX hello-world: architecture & path to rendered HTML
 
-Status: **megaparsec Text path and `cs` conversion unblocked** (2026-08-09).
-Foundation (QQ plumbing, blaze render baseline) is green. The real HSX
-run now passes the former `takeWhile_` lazy-tuple failure: callee-signature
-expected-type propagation converts `(cs code)` to strict `Text` before
-calling `parseHsx`. The in-process sentinel advances to a module-loading
-nontermination before `EQuasiQuote` evaluation begins.
+Status: **source-loaded HSX reaches the `Q Exp` carrier boundary**.
+Verified 2026-08-10 with a fresh binary built from the PR #249 implementation
+(branch commit `7880e00`, merged as `ac577a5`), plus the exhaustive probe fix
+(`60f7878`) merged at
+`1348727` / PR #250. Foundation, structured list-instance
+dispatch, packaged source discovery, and direct Blaze rendering are green.
+With an empty `HOME` and the packaged Nix source root, the real
+`examples/hsx_hello` sentinel now enters quoter execution and fails with:
+
+```text
+IHC.TH: thExpToExpr: unsupported TH Exp constructor: ParsecT
+```
+
+This is no longer a module-loading hang. A `ParsecT`-shaped parser action is
+crossing the boundary where `runSourceQAction` must return a TH `Exp`; the
+remaining blocker is preserving/using the signed nested `Q` carrier rather
+than attempting to decode the parser carrier as an `Exp`.
 
 Sibling slices this batch: Unit 1 = cache-priming script, Unit 2 =
 smoke fixture, Unit 3 = parser `EQuasiQuote` wiring, Units 5/6/7 =
@@ -48,13 +59,16 @@ The project's `CLAUDE.md` (quoted verbatim):
 > **implement the missing feature**, not to add another shim.
 
 So: `IHP.HSX.QQ`, `IHP.HSX.Parser`, `Text.Blaze.*`, and every transitive
-dep must be loaded from their tarball in `~/.cache/ihc/sources/`. All
-source is already on disk (see §3); the work is feeding it through the
-existing loader and filling evaluator gaps that emerge.
+dep must be loaded from source. The installed Nix package now bundles
+`ihp-hsx`, Blaze, and `string-conversions` under
+`$out/share/ihc/sources`; the loader follows that executable-relative
+source root with an empty user cache. Developer caches remain optional.
 
-The `isBuiltinBackedModule` whitelist (`src/IHC/Scheduler.hs:4321-4344`)
-today contains only source-less `GHC.*` modules. No HSX-related module
-may be added to it.
+The `isBuiltinBackedModule` whitelist (`src/IHC/Scheduler.hs:9945`) is limited
+to documented compiler/RTS boundaries. It also contains the separately
+justified `Unsafe.Coerce` case even though that module has source; the
+whitelist is therefore not accurately described as source-less-only. No
+HSX-related module may be added to it.
 
 ---
 
@@ -78,24 +92,23 @@ rendering call. Cache check: `ls ~/.cache/ihc/sources/`.
 | `blaze-markup`     | `blaze-markup-0.8.3.0`            | `Text.Blaze.Internal` (the `MarkupM` GADT), `Text.Blaze`. |
 | `blaze-builder`    | `blaze-builder-0.4.4.1`           | Builder primitives under blaze. |
 
-**All deps are already in `~/.cache/ihc/sources/`** (verified 2026-04-25,
-96 packages cached). Transitive deps of deps (`hashable`, `primitive`,
-`dlist`, `pretty`, `ghc-prim`, …) likewise present. Unit 1's
-cache-priming script is the belt-and-braces path for cold environments
-(fresh CI, new developer).
+The Nix package contains the required HSX, Blaze, Megaparsec, Warp, boot-lib,
+and Template Haskell source families. The hermetic packaged-source check runs
+the raw installed binary under `env -i` with an empty `HOME`, including TH and
+Blaze probes. `scripts/cache-hsx-deps.sh` remains a convenience for non-Nix
+development, not a correctness prerequisite.
 
 ---
 
 ## 4. Lexer / parser status
 
 Lexer already tokenises `[hsx|…|]` correctly.
-`src/IHC/Lexer.hs:600-644` handles the `[<lowercase-ident>|` prefix: TH
+The quasiquote lexer handles the `[<lowercase-ident>|` prefix: TH
 short-forms `[e|` / `[d|` / `[t|` / `[p|` / `[e||` emit `TkOQuote*`;
 anything else (`[hsx|`, `[i|`, `[sql|`, …) emits `TkQQOpen <name>`. The
 body is not scanned — left as opaque bytes up to `|]`.
 
-Parser emits a real `EQuasiQuote` for `TkQQOpen`
-(`src/IHC/Parser.hs`, `TkQQOpen` branch):
+Parser emits a real `EQuasiQuote` for `TkQQOpen` in its `TkQQOpen` branch:
 
 ```haskell
 -- [name| ... |] — QuasiQuoter. Capture body bytes, emit EQuasiQuote.
@@ -114,7 +127,7 @@ projects `quoteExp` and expands the quote at run time.
 
 End-to-end for one `[hsx|<h1>Hello world</h1>|]`:
 
-1. **Lex** — `src/IHC/Lexer.hs:606-637` emits `TkQQOpen "hsx"`, then
+1. **Lex** — `IHC.Lexer` emits `TkQQOpen "hsx"`, then
    raw body bytes up to `|]`.
 2. **Parse** — produces `EQuasiQuote name body` (`name = "hsx"`,
    `body = "<h1>Hello world</h1>"`).
@@ -139,13 +152,13 @@ Key files:
 
 | File | Responsibility |
 |---|---|
-| `src/IHC/Lexer.hs:600-644` | `TkQQOpen` tokenisation. |
-| `src/IHC/Parser.hs:2867-2880` | Placeholder today, `EQuasiQuote` after Unit 3. |
+| `src/IHC/Lexer.hs` | `TkQQOpen` tokenisation. |
+| `src/IHC/Parser.hs` | Produces `EQuasiQuote` for a named quasiquote. |
 | `src/IHC/AST.hs` | New `EQuasiQuote` constructor lands with Unit 3. |
-| `src/IHC/Eval.hs:286-295` | Splice / quote expansion bridge. |
+| `src/IHC/Eval.hs` | Splice / quote expansion bridge. |
 | `src/IHC/TH.hs` | TH Exp encoding / decoding (`thExpToExpr`, `expandSplicesInExpr`). |
-| `~/.cache/ihc/sources/ihp-hsx-1.5.0/blaze/IHP/HSX/QQ.hs` | Interpreted `hsx`. |
-| `~/.cache/ihc/sources/blaze-html-0.9.2.0/src/Text/Blaze/Html/Renderer/String.hs` | Interpreted `renderHtml`. |
+| packaged `ihp-hsx-1.5.0/blaze/IHP/HSX/QQ.hs` | Interpreted `hsx`. |
+| packaged `blaze-html-0.9.2.0/src/Text/Blaze/Html/Renderer/String.hs` | Interpreted `renderHtml`. |
 
 ---
 
@@ -188,7 +201,7 @@ Key files:
 - **Blaze render baseline still green:** `examples/blaze_hello`.
 - **QQ foundation still green:** `qq_toy_string`.
 
-### Still open for full `[hsx|…]`
+### Still open for full `[hsx|…|]`
 
 - **Unannotated `pure` / `return` in ParsecT do-blocks.**
   Result-poly defaults pure to IO-first (required for warp). HSX's
@@ -198,15 +211,17 @@ Key files:
   breaks `pure` in IO after megaparsec is in the process. Non-IO do
   sequencing now retains the ParsecT carrier for nested final
   `pure`/`return` expressions (`megaparsec_do_final_pure`).
-- **Module-loading nontermination (current tip).** The focused `cs` → strict
-  `Text` regression is green, and the former `PTuple [ts,input']` failure is
-  fixed. The in-process HSX sentinel now stalls inside
-  `loadProgramFromSource`, before it returns `main` and before any
-  `EQuasiQuote` evaluator trace fires. The next diagnostic slice is to trace
-  individual entry imports, manifest-provider loading, and splice expansion.
-- **TH surface used by HSX `quoteHsxExpression`.** `location` /
-  `extsEnabled` stubs exist; nested brackets + `$(pure expr)` antiquotes,
-  `Lift Text` remain. See `docs/HSX-TH-NEEDS.md`.
+- **Nested source-carrier preservation (current tip).** Source-defined `Q`
+  actions and `pure` splices run through source instances, and `Q Exp` is run
+  at the TH expression boundary. The real sentinel nevertheless hands
+  `thExpToExpr` a `ParsecT` constructor. The next slice is to retain the
+  declared carrier through the rank-polymorphic constructor field and nested
+  parser action, then run only the enclosing signed `Q Exp` action.
+- **TH surface used by HSX `quoteHsxExpression`.** Source `Q`, source
+  `pure`, nested `$(pure expr)` splices, `location`/`extsEnabled`, and
+  record-dot `GetFieldE`/`ProjectionE` decoding have focused coverage.
+  `Lift Text` and the complete HSX-generated expression inventory still need
+  verification after the carrier boundary. See `docs/HSX-TH-NEEDS.md`.
 - **TH `reify`.** Not needed for hello-world.
 - **Class dispatch: `ToHtml` / `ToMarkup` / `ToValue`.** Unit 6.
 - **Renderer primops.** blaze-html pure Haskell; unverified under full HSX.
@@ -233,11 +248,15 @@ Ordered, one-PR-per-step:
    source-loaded `Language.Haskell.TH.Quote` (2.22).
 6. **(partial)** Megaparsec on Text: char/string/takeWhile + Applicative
    green; monadic do + unannotated `pure` still open (see §6).
-7. Enough of `Q` for full HSX `quoteHsxExpression` (nested brackets,
-   antiquotes) — still open.
-8. `ToHtml` / `ToMarkup` / `ToValue` registry entries for `String`,
-   `Text`, `Int`, `Html`.
-9. Interpret `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end;
+7. **(partial)** Source-defined `Q` and nested pure splices are green; fix the
+   signed nested-carrier boundary currently exposing `ParsecT` to
+   `thExpToExpr`.
+8. **(partial)** Structured instance keys distinguish `[Char]`, `[Markup]`,
+   and generic `[a]`; verify the remaining `ToHtml` / `ToMarkup` / `ToValue`
+   calls on the full HSX result.
+9. **(done directly)** Interpret
+   `Text.Blaze.Html.Renderer.String.renderHtml` end-to-end for
+   `examples/blaze_hello`; full HSX-produced markup remains gated by step 7.
    blaze_hello baseline already green without HSX.
 10. Green the Unit 2 / `hsx_hello` fixture (flip the expected-failure marker).
 11. Document surprises under §6 and open follow-ups for splices with
