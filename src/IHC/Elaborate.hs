@@ -17,6 +17,8 @@ module IHC.Elaborate
     , elaborate
     , elaborateWithScopedSigs
     , lookupScopedScheme
+    , elaborateOwned
+    , elaborateOwnedWithScopedSigs
     , elaborateExpr
     , parseRawTypeExpr
     , resolveSynonymHop
@@ -34,6 +36,8 @@ import qualified Data.Set as Set
 
 import IHC.AST
 import IHC.Classes (ClassRegistry)
+import IHC.ConstructorMetadata
+    ( ConstructorTypeRegistry, constructorScheme )
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
@@ -89,6 +93,8 @@ data InferEnv = InferEnv
     , ieClassMethodNames :: !(Set.Set ByteString)
     , ieAmbiguousSigs    :: !(Set.Set ByteString)
     , ieScopedSigs       :: !(Set.Set ByteString)
+    , ieConstructorTypes :: !ConstructorTypeRegistry
+    , ieOwner            :: !(Maybe Name)
     }
 
 -- | Top-level entry point.  Elaborate a sub-expression under an
@@ -104,8 +110,8 @@ elaborate
     -> Expected
     -> Expr
     -> IO (Expr, Type)
-elaborate classReg sigs synonyms expected e = do
-    elaborateWithScopedSigs classReg sigs synonyms Set.empty expected e
+elaborate classReg sigs synonyms =
+    elaborateOwnedWithScopedSigs classReg sigs synonyms Map.empty Nothing Set.empty
 
 -- | Elaborate with signatures resolved in a concrete lexical owner.  Names in
 -- this set are safe even when the process-global bare-name table records a
@@ -119,6 +125,35 @@ elaborateWithScopedSigs
     -> Expr
     -> IO (Expr, Type)
 elaborateWithScopedSigs classReg sigs synonyms scopedSigs expected e = do
+    elaborateOwnedWithScopedSigs classReg sigs synonyms Map.empty Nothing scopedSigs expected e
+
+elaborateOwned
+    :: ClassRegistry
+    -> Map ByteString Scheme
+    -> Map ByteString (Int, Type)
+    -> ConstructorTypeRegistry
+    -> Maybe Name
+    -> Expected
+    -> Expr
+    -> IO (Expr, Type)
+elaborateOwned classReg sigs synonyms constructorTypes owner expected e = do
+    elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner Set.empty expected e
+
+-- | Elaborate with both owner-qualified constructor metadata and signatures
+-- proven to come from the owner's lexical scope.  Keeping these inputs
+-- together prevents either constructor recovery or ambiguity hardening from
+-- being lost when expected types flow across partial applications.
+elaborateOwnedWithScopedSigs
+    :: ClassRegistry
+    -> Map ByteString Scheme
+    -> Map ByteString (Int, Type)
+    -> ConstructorTypeRegistry
+    -> Maybe Name
+    -> Set.Set ByteString
+    -> Expected
+    -> Expr
+    -> IO (Expr, Type)
+elaborateOwnedWithScopedSigs classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
     fresh <- newFreshSource
     classMethodNames <- readIORef globalClassMethodNamesRef
     ambiguousSigs    <- readIORef globalAmbiguousSigsRef
@@ -131,6 +166,8 @@ elaborateWithScopedSigs classReg sigs synonyms scopedSigs expected e = do
             , ieClassMethodNames = classMethodNames
             , ieAmbiguousSigs    = ambiguousSigs
             , ieScopedSigs       = scopedSigs
+            , ieConstructorTypes = constructorTypes
+            , ieOwner            = owner
             }
     (e', t, _preds, sub) <- elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
@@ -276,7 +313,10 @@ elaborateVar ienv name =
         Nothing -> do
             mSig <- case builtinConstructorSig (bareName name) of
                 Just sch -> pure (Just sch)
-                Nothing  -> lookupSig
+                Nothing -> case constructorScheme
+                    (ieConstructorTypes ienv) (ieOwner ienv) name of
+                        Just sch -> pure (Just sch)
+                        Nothing  -> lookupSig
             case mSig of
                 Just sch -> do
                     (preds, ty) <- instantiate (ieFresh ienv) sch
@@ -340,12 +380,14 @@ elaborateVar ienv name =
     -- rewrite.  Treating it as opaque (Nothing → fresh tyvar) is safe — a
     -- non-class-method like @map@ doesn't need a sig for the surrounding
     -- signature-directed resolution to succeed.
-    lookupSig = do
-        if isAmbiguousSig ienv (bareName name)
-            then pure Nothing
-            else pure $ case Map.lookup name (ieSigs ienv) of
-                Just s  -> Just s
-                Nothing -> Map.lookup (bareName name) (ieSigs ienv)
+    lookupSig = pure $ case Map.lookup name (ieSigs ienv) of
+        -- An exact owner-qualified entry is authoritative even when its bare
+        -- spelling collides elsewhere.  The scheduler inserted this scheme
+        -- from the lexical owner's resolver.
+        Just s -> Just s
+        Nothing
+            | isAmbiguousSig ienv (bareName name) -> Nothing
+            | otherwise -> Map.lookup (bareName name) (ieSigs ienv)
 
 -- | Strip a module qualifier: @GHC.Enum.minBound@ → @minBound@, @minBound@ → @minBound@.
 bareName :: Name -> Name

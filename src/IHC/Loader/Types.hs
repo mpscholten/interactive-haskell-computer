@@ -20,6 +20,7 @@ import Data.IORef (IORef)
 import Data.Map.Strict (Map)
 
 import IHC.AST (Expr)
+import IHC.ConstructorMetadata (ConstructorTypeRegistry)
 import qualified IHC.FFI as FFI
 import IHC.ModuleHeader (ModuleHeader, ModuleName)
 import IHC.Parser (FixityTable)
@@ -40,6 +41,9 @@ data LoadedModule = LoadedModule
       -- 'exportsName' so that @T(..)@ and @T(Ctor1, Ctor2)@ exports match
       -- the named constructors, not just the type head.
     , lmTypeCtorReg :: !TypeCtorRegistry
+      -- | Owner-qualified constructor schemes used by on-demand inference.
+      -- Unlike 'lmDataReg', this retains field and refined GADT result types.
+    , lmConstructorTypes :: !ConstructorTypeRegistry
       -- | Accumulated (local-name, parsed body) pairs for this module.
     , lmBodies      :: !(IORef (Map ByteString Expr))
       -- | Whether this is the entry module (its bindings stay unqualified

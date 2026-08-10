@@ -18,7 +18,7 @@ import IHC.AST (Expr(..), Lit(..))
 import IHC.Classes (legacyHooks)
 import IHC.ConstructorMetadata
     ( ConstructorIdentity(..), ConstructorTypeMetadata(..), constructorFieldTypeAt
-    , constructorFieldTypes )
+    , constructorFieldTypes, constructorScheme )
 import IHC.Diagnostics (memDebugEnabled)
 import IHC.Driver
 import IHC.Eval (eval, force)
@@ -141,6 +141,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 (app2 "Either" int string) `shouldBe` Nothing
             constructorFieldTypes registry Nothing (n "Data.Either.Left")
                 (app2 "Other.Either" int string) `shouldBe` Nothing
+
+        it "resolves constructor schemes by real owner and fails closed on bare collisions" do
+            let other = ordinary "Other" "Left" ["a", "b"]
+                            (app2 "OtherEither" a b) [b]
+                collided = Map.insert (ident "Other" "Left") other registry
+                leftScheme = Scheme [n "a", n "b"] []
+                    (TyArrow a (app2 "Either" a b))
+            constructorScheme collided Nothing (n "Left") `shouldBe` Nothing
+            constructorScheme collided Nothing (n "Data.Either.Left")
+                `shouldBe` Just leftScheme
+            constructorScheme collided (Just (n "Data.Either")) (n "Left")
+                `shouldBe` Just leftScheme
 
         it "unifies a GADT result before instantiating its field" do
             let listB = TyApp (TyCon (n "[]")) b
@@ -704,6 +716,18 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
     it "elaborates a qualified imported class-method callee from its owner" do
         let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"
         runMainWithSiblings (root </> "MainQualified.hs") `shouldReturn` 73
+
+    it "dispatches class parameters nested in owner-qualified constructor metadata" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/class_method_constructor_metadata.hs")
+        n `shouldBe` 0
+        out `shouldBe` "11\n12\n23\n"
+
+    it "keeps same-named imported constructors isolated by their real owners" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_constructor_owner"
+        (n, out) <- captureStdout (runMainWithSiblings (root </> "Main.hs"))
+        n `shouldBe` 0
+        out `shouldBe` "31\n42\n"
 
     it "does not treat an ordinary same-name binding as a class method" do
         let root = "test/Fixtures/Coverage/Modules/class_method_callee_owner"

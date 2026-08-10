@@ -50,6 +50,7 @@ import Control.Exception (try, SomeException)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, lookupClassMethodFallback, runThExpToExpr)
+import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
@@ -156,8 +157,10 @@ elaborateExpectedArg hooks owner f x = do
                                         -- list. For example, after
                                         -- @same True@, @same :: a -> a -> a@
                                         -- has residual domain @Bool@.
+                                        ctorTypes <- readIORef globalConstructorTypeRegistryRef
                                         residual <- try
-                                            (Elab.elaborateWithScopedSigs classReg sigs syns scopedSigs
+                                            (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                                ctorTypes owner scopedSigs
                                                 Elab.InferFreely f)
                                             :: IO (Either SomeException (Expr, TA.Type))
                                         let expected = case residual of
@@ -166,7 +169,8 @@ elaborateExpectedArg hooks owner f x = do
                                                         (argTy : _, _) -> argTy
                                                         _ -> args !! supplied
                                                 Left _ -> args !! supplied
-                                        result <- try (Elab.elaborateWithScopedSigs classReg sigs syns scopedSigs
+                                        result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                                        ctorTypes owner scopedSigs
                                                         (Elab.ExpectType expected) x)
                                             :: IO (Either SomeException (Expr, TA.Type))
                                         pure (either (const x) fst result)
@@ -739,7 +743,9 @@ eval hooks env ipm = go
                 Just annTy -> do
                     sigs <- readIORef globalTypeSigsRef
                     syns <- readIORef globalTypeSynonymsRef
-                    r <- try (Elab.elaborate classReg sigs syns
+                    ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                    owner <- currentOwner hooks env
+                    r <- try (Elab.elaborateOwned classReg sigs syns ctorTypes owner
                                 (Elab.ExpectType annTy) e)
                            :: IO (Either SomeException (Expr, TA.Type))
                     case r of
@@ -803,8 +809,9 @@ eval hooks env ipm = go
                         Just classReg -> do
                             sigs0 <- readIORef globalTypeSigsRef
                             syns <- readIORef globalTypeSynonymsRef
+                            ctorTypes <- readIORef globalConstructorTypeRegistryRef
                             let sigs = Map.insert method scheme sigs0
-                            result <- try (Elab.elaborate classReg sigs syns
+                            result <- try (Elab.elaborateOwned classReg sigs syns ctorTypes owner
                                             Elab.InferFreely call)
                                 :: IO (Either SomeException (Expr, TA.Type))
                             case result of

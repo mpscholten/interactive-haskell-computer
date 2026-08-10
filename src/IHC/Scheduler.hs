@@ -130,6 +130,7 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr, resetNewNameCounter)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
+import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import IHC.TypeAST (Scheme(..), Type(..), Pred, applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
@@ -7487,6 +7488,8 @@ loadModuleSlow registry searchPath includeMap name = do
                                       -- usual mirror site, but we don't
                                       -- call it on cache hits.
                                       mirrorTypeSigsGlobal (lmTypeSigs fresh)
+                                      modifyIORef' globalConstructorTypeRegistryRef
+                                          (Map.union (lmConstructorTypes fresh))
                                       modifyIORef' globalTypeSynonymsRef
                                           (Map.union (lmTypeSynonyms fresh))
                                       -- Catalogue instances against this
@@ -7721,6 +7724,7 @@ resetPerRunGlobals = do
     writeIORef globalTypeSynonymsRef  Map.empty
     writeIORef globalClassMethodNamesRef Set.empty
     writeIORef globalMethodClassRef   Map.empty
+    writeIORef globalConstructorTypeRegistryRef Map.empty
     clearInstanceScope
     clearSuperclasses
     clearCtorStrictness
@@ -7898,6 +7902,8 @@ registerGlobalLoadedModule lm = do
     -- recorded as ambiguous (see 'mirrorTypeSigsGlobal') so the
     -- elaborator won't guess the wrong one.
     mirrorTypeSigsGlobal (lmTypeSigs lm)
+    modifyIORef' globalConstructorTypeRegistryRef
+        (Map.union (lmConstructorTypes lm))
     modifyIORef' globalTypeSynonymsRef (Map.union (lmTypeSynonyms lm))
     -- Mirror per-module class declarations into the global
     -- method->class registry so the env-fallback's
@@ -9799,6 +9805,7 @@ buildEmptyStubModule name = do
         , lmDataReg     = Map.empty
         , lmFieldReg    = Map.empty
         , lmTypeCtorReg = Map.empty
+        , lmConstructorTypes = Map.empty
         , lmBodies      = bodies
         , lmIsEntry     = False
         , lmFixity      = defaultFixityTable
@@ -9813,6 +9820,7 @@ buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedMo
 buildLoadedModule name isEntry header src = do
     known               <- emptyKnownSymbols
     (dataR, fldR, tCtR) <- scanDataDecls src
+    constructorTypes     <- scanConstructorTypeMetadata name src
     tfReg               <- scanTypeFamilyDecls src
     foreigns            <- scanForeignImports src
     sigs                <- scanTypeSigs src
@@ -9846,6 +9854,7 @@ buildLoadedModule name isEntry header src = do
         , lmDataReg     = dataR
         , lmFieldReg    = fldR
         , lmTypeCtorReg = tCtR
+        , lmConstructorTypes = constructorTypes
         , lmBodies      = bodies
         , lmIsEntry     = isEntry
         , lmFixity      = fixity
