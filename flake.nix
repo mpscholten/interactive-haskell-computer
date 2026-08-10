@@ -291,11 +291,12 @@
         # MIN_VERSION_* macros: hsc2hs invokes the C pre-processor without
         # Cabal's version-macro header.  We inject a blanket definition for the
         # packages we know need it.  base-4.20.2.0 ships with GHC 9.10.
-        ihcSourceRootWithHsc = pkgs.runCommand "ihc-hackage-sources-hsc" {
-          # GHC provides hsc2hs; stdenv.cc provides the C compiler (clang on Darwin)
-          # that hsc2hs invokes to evaluate #size/#peek/#const expressions.
-          buildInputs = [ ghc pkgs.stdenv.cc ];
-        } ''
+        ihcSourceRootWithHsc = pkgs.runCommand "ihc-hackage-sources-hsc"
+          {
+            # GHC provides hsc2hs; stdenv.cc provides the C compiler (clang on Darwin)
+            # that hsc2hs invokes to evaluate #size/#peek/#const expressions.
+            buildInputs = [ ghc pkgs.stdenv.cc ];
+          } ''
           # ── 1. Copy source tree ─────────────────────────────────────────────
           cp -r ${ihcSourceRoot}/. "$out"
           chmod -R u+w "$out"
@@ -399,13 +400,15 @@
         # Linux ld, --unresolved-symbols=ignore-all does the same thing.
         # Without this, cbits libraries that reference Haskell RTS or
         # peer-package symbols would fail to link as shared objects.
-        undefinedSymbolsFlag = if pkgs.stdenv.isDarwin
+        undefinedSymbolsFlag =
+          if pkgs.stdenv.isDarwin
           then "-undefined dynamic_lookup"
           else "-Wl,--unresolved-symbols=ignore-all";
         hostIsAarch64 = pkgs.stdenv.hostPlatform.isAarch64;
-        ihcCbitsRoot = pkgs.runCommand "ihc-cbits-dylibs" {
-          buildInputs = [ pkgs.stdenv.cc ];
-        } ''
+        ihcCbitsRoot = pkgs.runCommand "ihc-cbits-dylibs"
+          {
+            buildInputs = [ pkgs.stdenv.cc ];
+          } ''
           mkdir -p $out/lib
 
           # GHC headers (HsFFI.h, HsBaseConfig.h, …) live outside the
@@ -492,9 +495,44 @@
           done
         '';
 
-      in {
+      in
+      {
+        # Keep runtime assets at paths derived from the executable prefix.
+        # The interpreter therefore works when invoked as the raw
+        # $out/bin/ihc binary with IHC_NIX_SOURCE_DIR unset; no wrapper or
+        # machine-specific Nix store path is embedded in the executable.
+        packages.default = (hp.callCabal2nix "ihc" self { }).overrideAttrs (old: {
+          # The dedicated checks below own test execution.  The package build
+          # itself cannot run binary-spawning tests before installation.
+          doCheck = false;
+          postInstall = (old.postInstall or "") + ''
+            mkdir -p $out/share/ihc
+            ln -s ${ihcSourceRootWithHsc} $out/share/ihc/sources
+          '';
+        });
+        packages.ihc = self.packages.${system}.default;
+
         # Expose as a package so `nix build .#cbits` works for debugging.
         packages.cbits = ihcCbitsRoot;
+
+        # Exercise the installed raw binary, not a dev-shell wrapper.  `env -i`
+        # proves Prelude/base are found through the executable-relative source
+        # bundle while a sibling project module still resolves normally.
+        checks.packaged-clean-source-discovery = pkgs.runCommand
+          "ihc-packaged-clean-source-discovery"
+          { } ''
+          clean_home=$(mktemp -d)
+          hello=$(env -i HOME="$clean_home" PATH=${pkgs.coreutils}/bin \
+            ${self.packages.${system}.default}/bin/ihc run \
+            ${self}/test/Fixtures/PackagedSource/hello.hs)
+          test "$hello" = "clean hello"
+
+          multi=$(env -i HOME="$clean_home" PATH=${pkgs.coreutils}/bin \
+            ${self.packages.${system}.default}/bin/ihc run \
+            ${self}/test/Fixtures/PackagedSource/multi/Main.hs)
+          test "$multi" = "clean multi"
+          touch $out
+        '';
 
         # `nix flake check` builds the project against the nix-pinned source
         # root and runs the pure-interpreter test suite hermetically.

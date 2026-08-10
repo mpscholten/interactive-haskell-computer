@@ -30,6 +30,7 @@ import IHC.CabalProject
     , cachedPackageSearchPath
     , cachedPackageSearchPathWithIncludes
     , cabalTarballSearchPath
+    , installedSourceDirForExecutable
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
 import IHC.PackageStore (buildSearchEnvWithRoot)
@@ -45,6 +46,13 @@ fakeStoreRoot = simpleRoot </> "fake-store"
 
 spec :: Spec
 spec = describe "Phase 2.7 — Cabal project loader" do
+    describe "installed source bundle" do
+        it "is derived portably from the executable prefix" do
+            installedSourceDirForExecutable
+                ("/nix/store/example-ihc" </> "bin" </> "ihc")
+                `shouldBe`
+                    ("/nix/store/example-ihc" </> "share" </> "ihc" </> "sources")
+
     describe "detectProjectRoot" do
         it "finds the project root from an entry file's directory" do
             root <- detectProjectRoot (simpleRoot </> "app")
