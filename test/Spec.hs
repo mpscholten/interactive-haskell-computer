@@ -22,6 +22,7 @@ import Text.Read (readMaybe)
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
+import qualified FreshProcessTest
 import qualified HsExtTypeFams
 import qualified HsExtMisc
 import qualified HsExtRecords
@@ -173,6 +174,7 @@ allSpecs :: Spec
 allSpecs = do
     ParserBugs.spec
     PreludeIOOwnerTest.spec
+    FreshProcessTest.spec
     Properties.Totality.spec
     Properties.RoundTrip.spec
     Properties.SectionDesugar.spec

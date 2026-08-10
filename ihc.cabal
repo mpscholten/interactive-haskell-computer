@@ -200,6 +200,7 @@ test-suite ihc-test
       , Unsupported
       , NetworkSocketAddrInfoRecordUpdateTest
       , PreludeIOOwnerTest
+      , FreshProcessTest
       , TopLevelIOBindingTest
       , TopLevelWarpAliasTest
       , WarpHelloTest
