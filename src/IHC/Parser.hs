@@ -39,6 +39,7 @@ module IHC.Parser
     ) where
 
 import Control.Exception (Exception(..), catch, throwIO, try)
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
@@ -1365,14 +1366,6 @@ parseBindingsIn src fx (start, end) = do
                     ((params, rhs) : acc)
             _ -> pure (reverse acc, cur)
 
-    -- | Try to skip a type signature at the current position.
-    -- Returns @Just curAfter@ if a @name[, name]* :: type@ sig was found
-    -- and skipped, or @Nothing@ if this is a regular value binding.
-    -- @bindCol@ is the binding column; the type body ends when a token
-    -- at column @<= bindCol@ is seen.
-    trySkipWhereSig ctx bindCol =
-        trySkipSigWith ctx (skipTypeSigBody ctx bindCol)
-
     braced ctx cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
@@ -1383,16 +1376,16 @@ parseBindingsIn src fx (start, end) = do
             -- delimited by @;@/@}@, not by indentation, so use the
             -- braced-aware sig skipper (stops at @;@ or @}@) instead of the
             -- column-aware one used in layout mode.
-            mSkip <- trySkipBracedSig ctx cur
-            case mSkip of
-                Just cur' -> do
+            mSig <- tryReadLocalSigWith ctx (skipTypeSigBodyBraced ctx) cur
+            case mSig of
+                Just (names, ty, cur') -> do
                     let (nextTok, curN) = nextSig ctx cur'
                     case tkKind nextTok of
-                        TkSemi   -> braced ctx curN acc
-                        TkRBrace -> pure (reverse acc)
-                        TkEof    -> pure (reverse acc)
-                        _ | cPos cur' < ctxEnd ctx -> braced ctx cur' acc
-                          | otherwise -> pure (reverse acc)
+                        TkSemi   -> annotateLocalBinds names ty <$> braced ctx curN acc
+                        TkRBrace -> pure (annotateLocalBinds names ty (reverse acc))
+                        TkEof    -> pure (annotateLocalBinds names ty (reverse acc))
+                        _ | cPos cur' < ctxEnd ctx -> annotateLocalBinds names ty <$> braced ctx cur' acc
+                          | otherwise -> pure (annotateLocalBinds names ty (reverse acc))
                 Nothing -> do
                     (bs, cur') <- parseOne ctx bindCol (length acc) cur
                     let acc' = reverse bs ++ acc
@@ -1410,16 +1403,16 @@ parseBindingsIn src fx (start, end) = do
             let bindCol = tkCol nameTok
             -- See note in 'braced' above: braced where-blocks use @;@/@}@
             -- delimiters, so the sig skipper terminates on those.
-            mSkip <- trySkipBracedSig ctx cur
-            case mSkip of
-                Just cur' -> do
+            mSig <- tryReadLocalSigWith ctx (skipTypeSigBodyBraced ctx) cur
+            case mSig of
+                Just (names, ty, cur') -> do
                     let (nextTok, curN) = nextSig ctx cur'
                     case tkKind nextTok of
-                        TkSemi   -> bracedCursor ctx curN acc
-                        TkRBrace -> pure (reverse acc, curN)
-                        TkEof    -> pure (reverse acc, cur')
-                        _ | cPos cur' < ctxEnd ctx -> bracedCursor ctx cur' acc
-                          | otherwise -> pure (reverse acc, cur')
+                        TkSemi   -> first (annotateLocalBinds names ty) <$> bracedCursor ctx curN acc
+                        TkRBrace -> pure (annotateLocalBinds names ty (reverse acc), curN)
+                        TkEof    -> pure (annotateLocalBinds names ty (reverse acc), cur')
+                        _ | cPos cur' < ctxEnd ctx -> first (annotateLocalBinds names ty) <$> bracedCursor ctx cur' acc
+                          | otherwise -> pure (annotateLocalBinds names ty (reverse acc), cur')
                 Nothing -> do
                     (bs, cur') <- parseOne ctx bindCol (length acc) cur
                     let acc' = reverse bs ++ acc
@@ -1433,17 +1426,17 @@ parseBindingsIn src fx (start, end) = do
     layout ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc)
         | otherwise = do
-            mSkip <- trySkipWhereSig ctx bindCol cur
-            case mSkip of
-                Just cur' -> do
+            mSig <- tryReadLocalSigWith ctx (skipTypeSigBody ctx bindCol) cur
+            case mSig of
+                Just (names, ty, cur') -> do
                     -- Type sig skipped; continue if next token is at same col.
                     let (nextTok, _) = nextSig ctx cur'
                     case tkKind nextTok of
-                        TkEof -> pure (reverse acc)
+                        TkEof -> pure (annotateLocalBinds names ty (reverse acc))
                         _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
-                               layout ctx bindCol cur' acc
+                               annotateLocalBinds names ty <$> layout ctx bindCol cur' acc
                           | otherwise ->
-                               pure (reverse acc)
+                               pure (annotateLocalBinds names ty (reverse acc))
                 Nothing -> do
                     (bs, cur') <- parseOne ctx bindCol (length acc) cur
                     let acc' = reverse bs ++ acc
@@ -1458,16 +1451,16 @@ parseBindingsIn src fx (start, end) = do
     layoutCursor ctx bindCol cur acc
         | cPos cur >= ctxEnd ctx = pure (reverse acc, cur)
         | otherwise = do
-            mSkip <- trySkipWhereSig ctx bindCol cur
-            case mSkip of
-                Just cur' -> do
+            mSig <- tryReadLocalSigWith ctx (skipTypeSigBody ctx bindCol) cur
+            case mSig of
+                Just (names, ty, cur') -> do
                     let (nextTok, _) = nextSig ctx cur'
                     case tkKind nextTok of
-                        TkEof -> pure (reverse acc, cur')
+                        TkEof -> pure (annotateLocalBinds names ty (reverse acc), cur')
                         _ | tkCol nextTok == bindCol && cPos cur' < ctxEnd ctx ->
-                               layoutCursor ctx bindCol cur' acc
+                               first (annotateLocalBinds names ty) <$> layoutCursor ctx bindCol cur' acc
                           | otherwise ->
-                               pure (reverse acc, cur')
+                               pure (annotateLocalBinds names ty (reverse acc), cur')
                 Nothing -> do
                     (bs, cur') <- parseOne ctx bindCol (length acc) cur
                     let acc' = reverse bs ++ acc
@@ -1657,6 +1650,49 @@ trySkipSigWith ctx skipBody cur = do
                         _ -> pure Nothing
             in skipNames cur1
         _ -> pure Nothing
+
+-- | Like 'trySkipSigWith', but retain the declaration as lexical metadata.
+-- The raw type bytes are attached to the matching local binding via
+-- 'ELocalSig';
+-- this keeps shadowing and recursive groups local instead of publishing a
+-- bare name in the process-global signature table.
+tryReadLocalSigWith
+    :: Ctx
+    -> (Cursor -> IO Cursor)
+    -> Cursor
+    -> IO (Maybe ([Name], ByteString, Cursor))
+tryReadLocalSigWith ctx skipBody cur = do
+    let (tok1, cur1) = nextSig ctx cur
+    case tkKind tok1 of
+        TkIdent firstName -> collect [firstName] cur1
+        _ -> pure Nothing
+  where
+    collect names c = do
+        let (tok, c') = nextSig ctx c
+        case tkKind tok of
+            TkComma -> do
+                let (nameTok, c'') = nextSig ctx c'
+                case tkKind nameTok of
+                    TkIdent name -> collect (name : names) c''
+                    _ -> pure Nothing
+            TkDColon -> do
+                end <- skipBody c'
+                let raw = BC.dropWhileEnd isSpace
+                        (BC.dropWhile isSpace
+                            (sliceBytes (ctxSrc ctx) (cPos c', cPos end)))
+                pure (Just (reverse names, raw, end))
+            _ -> pure Nothing
+
+annotateLocalBinds :: [Name] -> ByteString -> [Bind] -> [Bind]
+annotateLocalBinds names ty = map $ \(name, rhs) ->
+    if name `elem` names then (name, ELocalSig ty rhs) else (name, rhs)
+
+annotateLocalItems
+    :: [Name] -> ByteString -> [Either Bind (Pat, Expr)]
+    -> [Either Bind (Pat, Expr)]
+annotateLocalItems names ty = map $ \item -> case item of
+    Left (name, rhs) | name `elem` names -> Left (name, ELocalSig ty rhs)
+    _ -> item
 
 -- | Multi-way if: @if | g -> e | g -> e ...@. Assumes @if@ already
 -- consumed. Desugars to a nested 'EIf'. Standard @if c then t else e@
@@ -1994,6 +2030,7 @@ parseDo ctx cur0 = do
                 | otherwise      -> [n]
             ELabel  _          -> []
             ETyApp e _         -> fv bound e
+            ELocalSig _ e      -> fv bound e
             ETypedMethod {}    -> []
             EConstrainedValue e _ -> fv bound e
             EGuardFail         -> []
@@ -2652,11 +2689,6 @@ parseLet ctx cur0 = do
         (body, curBody) <- parseExpr ctx curIn
         pure (ELet binds body, curBody)
 
-    -- | Check whether the current position starts a type signature line
-    -- @name[, name]* :: type@. If so, skip the sig body and return @Just curAfter@.
-    -- Otherwise return @Nothing@ (caller should parse it as a value binding).
-    trySkipLetSig bindCol = trySkipSigWith ctx (skipTypeSigBody ctx bindCol)
-
     -- Parse one let-binding (name + params + = or | guards + body).
     -- @bindCol@ is the column at which every binding in the enclosing let-block
     -- starts; it is used as @ctxMinCol@ while parsing the RHS so the expression
@@ -2881,24 +2913,24 @@ parseLet ctx cur0 = do
     -- @let b = …; (is, as) = unzip … in …@.  After @;@ the next binding
     -- need not sit at @bindCol@ (it continues on the same line).
     layoutLetItems bindCol cur acc = do
-        mSkip <- trySkipLetSig bindCol cur
-        case mSkip of
-            Just cur' -> do
+        mSig <- tryReadLocalSigWith ctx (skipTypeSigBody ctx bindCol) cur
+        case mSig of
+            Just (names, ty, cur') -> do
                 -- Type sig skipped; continue if more bindings follow.
                 let (peek, curPeek) = nextSig ctx cur'
                 case tkKind peek of
-                    TkIn  -> pure (reverse acc, cur')
-                    TkEof -> pure (reverse acc, cur')
+                    TkIn  -> pure (annotateLocalItems names ty (reverse acc), cur')
+                    TkEof -> pure (annotateLocalItems names ty (reverse acc), cur')
                     TkSemi ->
                         -- Stray @;@ after a sig: eat it and continue/stop.
                         let (after, _) = nextSig ctx curPeek in
                         case tkKind after of
-                            TkIn  -> pure (reverse acc, curPeek)
-                            TkEof -> pure (reverse acc, curPeek)
-                            _     -> layoutLetItems bindCol curPeek acc
+                            TkIn  -> pure (annotateLocalItems names ty (reverse acc), curPeek)
+                            TkEof -> pure (annotateLocalItems names ty (reverse acc), curPeek)
+                            _     -> first (annotateLocalItems names ty) <$> layoutLetItems bindCol curPeek acc
                     _ | tkCol peek == bindCol ->
-                            layoutLetItems bindCol cur' acc
-                      | otherwise -> pure (reverse acc, cur')
+                            first (annotateLocalItems names ty) <$> layoutLetItems bindCol cur' acc
+                      | otherwise -> pure (annotateLocalItems names ty (reverse acc), cur')
             Nothing -> do
                 (item, cur') <- parseOneLetItem bindCol cur
                 let acc' = item : acc
@@ -2925,13 +2957,13 @@ parseLet ctx cur0 = do
     bracedLetBinds cur acc = do
         -- Skip a @name :: type@ signature line (no-op for the interpreter,
         -- which delays type-checking).  Recognised inside @let { … }@.
-        mSkip <- trySkipBracedSig ctx cur
-        case mSkip of
-            Just cur' -> do
+        mSig <- tryReadLocalSigWith ctx (skipTypeSigBodyBraced ctx) cur
+        case mSig of
+            Just (names, ty, cur') -> do
                 let (sep, curN) = nextSig ctx cur'
                 case tkKind sep of
-                    TkSemi   -> bracedLetBinds curN acc
-                    TkRBrace -> pure (reverse acc, curN)
+                    TkSemi   -> first (annotateLocalBinds names ty) <$> bracedLetBinds curN acc
+                    TkRBrace -> pure (annotateLocalBinds names ty (reverse acc), curN)
                     _        -> parseErr ctx "expected `;` or `}` in let-block" sep
             Nothing -> do
                 let (nameTok, cur1) = nextSig ctx cur

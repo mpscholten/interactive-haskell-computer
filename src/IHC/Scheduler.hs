@@ -6593,6 +6593,7 @@ rewriteExpr rw = go []
             | otherwise                 -> EQuasiQuote n b
         e@(ELabel _)    -> e   -- Phase 3.5: labels are self-contained
         ETyApp inner ty -> ETyApp (go bound inner) ty   -- value-level @T: recurse into inner expr
+        ELocalSig ty inner -> ELocalSig ty (go bound inner)
         e@ETypedMethod{} -> e   -- elaborator product; no name references to rewrite
         EConstrainedValue inner constraints ->
             EConstrainedValue (go bound inner) constraints
@@ -11734,6 +11735,7 @@ syntheticClassMethodNames = goExpr
         EQuasiQuote _ _ -> []
         ELabel _    -> []
         ETyApp e _  -> goExpr e
+        ELocalSig _ e -> goExpr e
         ETypedMethod{} -> []
         EConstrainedValue e _ -> goExpr e
         EGuardFail  -> []
@@ -11799,6 +11801,7 @@ freeVars e = HashSet.toList (goAll HashSet.empty e)
             | otherwise              -> HashSet.singleton n
         ELabel _        -> HashSet.empty   -- Phase 3.5: labels have no free variables
         ETyApp inner _  -> goAll bound inner   -- value-level @T: inner expr contributes free vars
+        ELocalSig _ inner -> goAll bound inner
         ETypedMethod{}  -> HashSet.empty   -- elaborator product; no EVar refs
         EConstrainedValue inner _ -> goAll bound inner
         EGuardFail      -> HashSet.empty
@@ -11897,6 +11900,7 @@ needsRecordFields = goExpr
         EQuasiQuote{} -> False   -- QQ body is opaque bytes, no record syntax to descend into
         ELabel _     -> False
         ETyApp e _   -> goExpr e
+        ELocalSig _ e -> goExpr e
         ETypedMethod{} -> False
         EConstrainedValue e _ -> goExpr e
         EGuardFail    -> False
@@ -11972,6 +11976,7 @@ recordSyntaxFieldNames localFldReg = fmap nubBS . goExpr
         EQuasiQuote{} -> Just []
         ELabel _     -> Just []
         ETyApp e _   -> goExpr e
+        ELocalSig _ e -> goExpr e
         ETypedMethod{} -> Just []
         EConstrainedValue e _ -> goExpr e
         EGuardFail    -> Just []
@@ -12053,6 +12058,7 @@ discoveryFreeVars = go []
             | otherwise      -> [n]
         ELabel _       -> []
         ETyApp inner _ -> go bound inner
+        ELocalSig _ inner -> go bound inner
         ETypedMethod{} -> []
         EConstrainedValue inner _ -> go bound inner
         EGuardFail     -> []
