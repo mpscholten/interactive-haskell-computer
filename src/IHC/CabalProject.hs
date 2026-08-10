@@ -33,6 +33,7 @@ module IHC.CabalProject
     , cachedPackageSearchPath
     , cachedPackageSearchPathWithIncludes
     , cabalTarballSearchPath
+    , installedSourceDirForExecutable
       -- * Per-package scoping
     , PackageTable
     , cachedPackageTable
@@ -66,13 +67,14 @@ import System.Directory
     , getModificationTime
     , listDirectory
     )
-import System.Environment (lookupEnv)
+import System.Environment (getExecutablePath, lookupEnv)
 import System.FilePath
     ( (</>)
     , takeDirectory
     , takeExtension
     , splitDirectories
     , isDrive
+    , normalise
     )
 import System.IO (hPutStrLn, stderr)
 
@@ -604,16 +606,35 @@ _resetSearchPathMemo = do
 newtype SearchPathFingerprint = SearchPathFingerprint [(FilePath, POSIXTime, [(FilePath, POSIXTime)])]
     deriving stock (Eq, Show)
 
--- | Compute a fingerprint for all three source roots (or the subset
+-- | Source bundle installed next to a packaged executable.  Nix places the
+-- bundle at @$out/share/ihc/sources@; deriving it from the executable keeps
+-- the raw binary usable under a clean environment, without embedding a
+-- machine-specific store path in the program.
+installedSourceDirForExecutable :: FilePath -> FilePath
+installedSourceDirForExecutable exe =
+    normalise (takeDirectory (takeDirectory exe) </> "share" </> "ihc" </> "sources")
+
+sourceBundleRoots :: IO [FilePath]
+sourceBundleRoots = do
+    mConfigured <- lookupEnv "IHC_NIX_SOURCE_DIR"
+    case mConfigured of
+        Just configured -> pure [configured]
+        Nothing -> do
+            exe <- getExecutablePath
+            let installed = installedSourceDirForExecutable exe
+            exists <- doesDirectoryExist installed
+            pure [installed | exists]
+
+-- | Compute a fingerprint for all available source roots (or the subset
 -- that exists).  Missing roots are elided, matching the semantics of
 -- 'cachedPackageSearchPathWithIncludes'.
 computeSearchPathFingerprint :: IO SearchPathFingerprint
 computeSearchPathFingerprint = do
     home <- getHomeDirectory
-    mNix <- lookupEnv "IHC_NIX_SOURCE_DIR"
+    bundles <- sourceBundleRoots
     let userCache = home </> ".cache" </> "ihc" </> "sources"
         cabalRoot = home </> ".cabal" </> "packages" </> "hackage.haskell.org"
-        roots = maybe id (:) mNix [userCache, cabalRoot]
+        roots = bundles ++ [userCache, cabalRoot]
     entries <- mapM fingerprintRoot roots
     pure (SearchPathFingerprint (mapMaybe id entries))
   where
@@ -825,18 +846,11 @@ computePackageTableFresh :: IO PackageTable
 computePackageTableFresh = do
     home <- getHomeDirectory
     let userCache = home </> ".cache" </> "ihc" </> "sources"
-    nixPairs   <- nixPairs
+    bundlePairs <- concat <$> (sourceBundleRoots >>= mapM enumeratePkg)
     userPairs  <- enumeratePkg userCache
     cabalPairs <- cabalTarballPairs
-    pure (nixPairs ++ userPairs ++ cabalPairs)
+    pure (bundlePairs ++ userPairs ++ cabalPairs)
   where
-    nixPairs :: IO PackageTable
-    nixPairs = do
-        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
-        case mDir of
-            Nothing  -> pure []
-            Just dir -> enumeratePkg dir
-
     enumeratePkg sourcesDir = do
         exists <- doesDirectoryExist sourcesDir
         if not exists
@@ -996,18 +1010,11 @@ computeSearchPathFresh :: IO [(FilePath, [FilePath])]
 computeSearchPathFresh = do
     home <- getHomeDirectory
     let userCache = home </> ".cache" </> "ihc" </> "sources"
-    nixPairs   <- nixIncludePairs
+    bundlePairs <- concat <$> (sourceBundleRoots >>= mapM enumerateWithIncludes)
     userPairs  <- enumerateWithIncludes userCache
     cabalPairs <- cabalTarballIncludePairs
-    pure (nixPairs ++ userPairs ++ cabalPairs)
+    pure (bundlePairs ++ userPairs ++ cabalPairs)
   where
-    nixIncludePairs :: IO [(FilePath, [FilePath])]
-    nixIncludePairs = do
-        mDir <- lookupEnv "IHC_NIX_SOURCE_DIR"
-        case mDir of
-            Nothing  -> pure []
-            Just dir -> enumerateWithIncludes dir
-
     enumerateWithIncludes :: FilePath -> IO [(FilePath, [FilePath])]
     enumerateWithIncludes sourcesDir = do
         exists <- doesDirectoryExist sourcesDir
