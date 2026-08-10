@@ -151,6 +151,14 @@ seedBuiltinClassMethodSigs = do
                     (TyVar a)
         -- maxBound :: Bounded a => a
         maxBoundSig = minBoundSig
+        -- String is a wired-in synonym exported by compiler-built GHC.Types;
+        -- there is no Haskell declaration for the source scanner to find.
+        -- Keep it in the ordinary synonym registry so every elaboration path
+        -- sees @String@ and @[Char]@ as the same type.
+        stringSyn = TypeSynonym []
+            (TyApp (TyCon (BC.pack "[]")) (TyCon (BC.pack "Char")))
+    modifyIORef' globalTypeSynonymsRef $ Map.insertWith
+        (\_ existing -> existing) (BC.pack "String") stringSyn
     modifyIORef' globalTypeSigsRef $ \s ->
         Map.unions
             [ Map.fromList

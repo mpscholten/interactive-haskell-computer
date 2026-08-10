@@ -797,12 +797,26 @@ eval hooks env ipm = go
         Nothing -> pure CalleeNotAttempted
         Just method -> do
             methodNames <- readIORef globalClassMethodNamesRef
-            let isMethod = Set.member (bareName method) methodNames
-            owner <- if isMethod then currentOwner hooks env else pure Nothing
-            mScheme <- if isMethod then lookupTypeSigFallback hooks owner method
-                                  else pure Nothing
+            sigs <- readIORef globalTypeSigsRef
+            -- A constrained top-level alias (for example @convert = method@)
+            -- needs the same whole-spine elaboration as the class method it
+            -- delegates to.  Its own name is deliberately absent from the
+            -- class-method catalogue.  The cheap global metadata check keeps
+            -- ordinary application evaluation off the fallback path.
+            let bare = bareName method
+                quickScheme = case Map.lookup method sigs of
+                    Just scheme -> Just scheme
+                    Nothing -> Map.lookup bare sigs
+                constrained = case quickScheme of
+                    Just (Scheme _ [TA.Pred _ (_ : _)] _) -> True
+                    Nothing -> False
+                    _ -> False
+                candidate = Set.member bare methodNames || constrained
+            owner <- if candidate then currentOwner hooks env else pure Nothing
+            mScheme <- if candidate then lookupTypeSigFallback hooks owner method
+                                    else pure Nothing
             case mScheme of
-                Just scheme@(Scheme _ preds _) | not (null preds) -> do
+                Just scheme@(Scheme _ [TA.Pred _ (_ : _)] _) -> do
                     mReg <- getSharedClassReg legacyHooks
                     case mReg of
                         Nothing -> pure CalleeNotAttempted
@@ -831,6 +845,7 @@ eval hooks env ipm = go
         hasTypedCallee (EApp h _) = hasTypedCallee h
         hasTypedCallee (ETyApp h _) = hasTypedCallee h
         hasTypedCallee ETypedMethod{} = True
+        hasTypedCallee (EConstrainedValue _ constraints) = not (null constraints)
         hasTypedCallee _ = False
 
 

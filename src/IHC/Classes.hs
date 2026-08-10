@@ -20,6 +20,7 @@ module IHC.Classes
     , lookupInstanceMulti
     , lookupInstanceMethod
     , lookupInstanceMethodMulti
+    , lookupInstanceMethodPattern
     , typeTagOf
     , normalizeTyTag
       -- * Phase 2.9.5: TypeRep helpers
@@ -306,6 +307,77 @@ lookupInstanceMethodMulti reg className typeTags methodName = do
                     mMethods' <- lookupInstanceMulti reg className typeTags
                     pure (mMethods' >>= HashMap.lookup methodName)
                 else pure Nothing
+
+-- | On an exact structural-key miss, select a genuinely polymorphic
+-- single-parameter instance pattern.  This is intentionally separate from
+-- the legacy outer-constructor registry: concrete @[Char]@ and @[Int]@
+-- instances both publish @[]@ for value-directed compatibility, so that key
+-- cannot safely answer a structurally typed call.  Scanner-produced patterns
+-- such as @[a]@ retain their variable and can be matched without depending on
+-- registration order.
+lookupInstanceMethodPattern
+    :: ClassRegistry -> ByteString -> ByteString -> ByteString -> IO (Maybe Val)
+lookupInstanceMethodPattern reg className concreteTag methodName = do
+    -- Materialise lazy providers before inspecting the registry.  The exact
+    -- miss performs the catalogue drain once; its result remains an exact
+    -- miss by construction here.
+    _ <- lookupInstanceMethod reg className concreteTag methodName
+    registry <- readIORef reg
+    let candidates =
+            [ (patternSpecificity patternTag, methodVal)
+            | ((cls, [patternTag]), methods) <- HashMap.toList registry
+            , cls == className
+            , patternTag /= concreteTag
+            , structuralPatternMatches patternTag concreteTag
+            , Just methodVal <- [HashMap.lookup methodName methods]
+            ]
+    pure $ case candidates of
+        [] -> Nothing
+        _  -> Just (snd (maximumBySpecificity candidates))
+  where
+    maximumBySpecificity = foldl1 $ \best@(bestScore, _) candidate@(score, _)
+        -> if score > bestScore then candidate else best
+
+-- Conservative structural matcher for the tags emitted by 'typeDispatchTag'.
+-- A lower-case identifier is a type variable; lists recurse into their
+-- element.  Other shapes require equality until the registry grows a parsed
+-- Type representation of instance heads.
+structuralPatternMatches :: ByteString -> ByteString -> Bool
+structuralPatternMatches patternTag concreteTag
+    | isTypeVariable patternTag = True
+    | Just p <- listElement patternTag
+    , Just c <- listElement concreteTag = structuralPatternMatches p c
+    | otherwise = patternTag == concreteTag
+  where
+    isTypeVariable tag = case BC.uncons tag of
+        Just (c, rest) -> c >= 'a' && c <= 'z'
+                       && BC.all isVarChar rest
+        Nothing -> False
+    isVarChar c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+               || (c >= '0' && c <= '9') || c == '_' || c == '\''
+    listElement tag
+        | BC.length tag >= 2
+        , BC.head tag == '['
+        , BC.last tag == ']' = Just (BC.init (BC.tail tag))
+        | otherwise = Nothing
+
+patternSpecificity :: ByteString -> Int
+patternSpecificity tag
+    | Just inner <- listElement tag = 1 + patternSpecificity inner
+    | isTypeVariable tag = 0
+    | otherwise = 2
+  where
+    isTypeVariable t = case BC.uncons t of
+        Just (c, rest) -> c >= 'a' && c <= 'z'
+                       && BC.all isVarChar rest
+        Nothing -> False
+    isVarChar c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+               || (c >= '0' && c <= '9') || c == '_' || c == '\''
+    listElement t
+        | BC.length t >= 2
+        , BC.head t == '['
+        , BC.last t == ']' = Just (BC.init (BC.tail t))
+        | otherwise = Nothing
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a

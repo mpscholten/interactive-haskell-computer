@@ -196,7 +196,7 @@ elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes
             in case unify sub wantResolved tCur of
                    Right s  -> pure s
                    Left ue  -> throwIO (UnificationFailure ue)
-    let e''    = applyMethodSubst finalSub e'
+    let e''    = applyMethodSubst synonyms finalSub e'
         tFinal = applySubst finalSub t
     pure (e'', tFinal)
 
@@ -376,8 +376,12 @@ elaborateVar ienv name =
                         Nothing ->
                             let constrained = constrainedValueHint preds ty
                                 valueExpr = case constrained of
-                                    [] -> EVar name
-                                    cs -> EConstrainedValue (EVar name) cs
+                                    [constraint] -> EConstrainedValue (EVar name) [constraint]
+                                    -- The evaluator carries one dictionary key
+                                    -- on a constrained value.  Multiple class
+                                    -- predicates need real dictionary passing;
+                                    -- silently keeping only one is unsound.
+                                    _ -> EVar name
                             in pure (valueExpr, ty, preds, emptySubst)
                 Nothing ->
                     -- No signature available.  Return a fresh tyvar — the
@@ -596,8 +600,8 @@ elaborateDo ienv stmts = do
 -- the placeholder in place; the evaluator's 'ETypedMethod' case will
 -- then throw a clear "no instance" error via
 -- 'IHC.Eval.lookupInstanceMethod'.
-applyMethodSubst :: Subst -> Expr -> Expr
-applyMethodSubst sub = go
+applyMethodSubst :: Map ByteString TypeSynonym -> Subst -> Expr -> Expr
+applyMethodSubst synonyms sub = go
   where
     -- Resolve a placeholder tag to its concrete head constructor.  Returns
     -- 'Nothing' when the class parameter is still ambiguous after inference
@@ -606,12 +610,12 @@ applyMethodSubst sub = go
     resolveTag :: Name -> Maybe Name
     resolveTag tag = case Map.lookup tag sub of
         Just ty ->
-            let resolved = applySubst sub ty
+            let resolved = expandTypeSynonyms synonyms (applySubst sub ty)
             in if Set.null (freeTyVars resolved)
                    then Just (typeDispatchTag resolved)
                    else Nothing
         Nothing
-          | isHeadName tag -> Just tag           -- already a concrete head (direct rewrite)
+          | isHeadName tag -> Just (typeDispatchTag (expandTypeSynonyms synonyms (TyCon tag)))
           | otherwise      -> Nothing            -- unresolved placeholder type variable
 
     -- A resolved type head is a constructor: an uppercase name, or the list /
@@ -660,14 +664,19 @@ applyMethodSubst sub = go
         resolved <- traverse resolveLegacyTag tags
         pure (cls, resolved)
 
-    -- Constrained aliases are consumed by the older value-directed MPTC
-    -- dispatcher, whose public key contract is one outer runtime tag per
-    -- class parameter.  Keep that representation additive and stable while
-    -- ETypedMethod uses the structural key above.
+    -- Constrained aliases are consumed by the value-directed MPTC dispatcher,
+    -- with one tag per class parameter.  Preserve a parameter's complete
+    -- concrete type in that slot: reducing @[Char]@ and @[Markup]@ to the same
+    -- outer @[]@ tag loses information when an alias delegates to a method.
+    -- Partially resolved parameters retain the older outer-head fallback.
     resolveLegacyTag tag = case Map.lookup tag sub of
-        Just ty -> tyHead (applySubst sub ty)
+        Just ty ->
+            let resolved = expandTypeSynonyms synonyms (applySubst sub ty)
+            in if Set.null (freeTyVars resolved)
+                   then Just (typeDispatchTag resolved)
+                   else tyHead resolved
         Nothing
-          | isHeadName tag -> Just tag
+          | isHeadName tag -> Just (typeDispatchTag (expandTypeSynonyms synonyms (TyCon tag)))
           | otherwise -> Nothing
 
     goStmt (SExpr e)         = SExpr (go e)
@@ -701,7 +710,9 @@ expandSyn syns = go
                               in foldl TyApp expanded extra
                         _ -> foldl TyApp head_ argsExpanded
                 _ -> foldl TyApp (go head_) argsExpanded
-        TyCon _      -> t
+        TyCon n
+            | Just (TypeSynonym [] rhs) <- Map.lookup n syns -> go rhs
+            | otherwise -> t
         TyVar _      -> t
         TyArrow a b  -> TyArrow (go a) (go b)
         TyForall vs preds body -> TyForall vs preds (go body)
