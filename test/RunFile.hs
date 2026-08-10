@@ -83,6 +83,14 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 [Alt (PView (EQuote (ELit (LInt 42))) PWild) (ELit (LInt 0))]
         containsTemplateHaskellSyntax expr `shouldBe` True
 
+    it "fallback cache isolates identical bare names by lexical owner" do
+        let root = "test/Fixtures/Coverage/Modules/fallback_owner_cache/Main.hs"
+        runMainWithSiblings root `shouldReturn` 60
+
+    it "fallback cache shares a provider CAF across lexical callers" do
+        let root = "test/Fixtures/Coverage/Modules/fallback_caf_sharing/Main.hs"
+        runMainWithSiblings root `shouldReturn` 1
+
     it "instance manifest indexes only the principal MPTC dispatch head" do
         let cls = BC.pack "SyntheticMPTC"
             provider = BC.pack "Synthetic.Provider"
