@@ -2103,9 +2103,14 @@ expandSplicesInModule
     -> LoadedModule
     -> IO ()
 expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
+    -- Splice expressions are evaluated as declarations of this module.  Carry
+    -- the same owner sentinel as ordinary body closures so owner-scoped type
+    -- signatures and imports remain unambiguous through the Q action.
+    ownerThunk <- newWHNFThunk (VStr (lmName lm))
+    let ownedSpliceEnv = HashMap.insert ownerSentinelKey ownerThunk spliceEnv
     -- Stage 1: expand ESplice nodes nested inside existing body exprs.
     bodies0 <- readIORef (lmBodies lm)
-    expanded0 <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) bodies0
+    expanded0 <- mapM (expandSplicesInExpr ownedSpliceEnv emptyIPMap 0) bodies0
     writeIORef (lmBodies lm) expanded0
 
     -- Stage 2 (Phase 2.13 wiring): evaluate top-level $(...) splices
@@ -2114,13 +2119,13 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
     case spans of
         [] -> pure ()
         _  -> do
-            newPairs <- concat <$> mapM evalOneSplice spans
+            newPairs <- concat <$> mapM (evalOneSplice ownedSpliceEnv) spans
             case newPairs of
                 [] -> pure ()
                 _  -> do
                     bodiesNow <- readIORef (lmBodies lm)
                     let merged = Map.union (Map.fromList newPairs) bodiesNow
-                    expanded1 <- mapM (expandSplicesInExpr spliceEnv emptyIPMap 0) merged
+                    expanded1 <- mapM (expandSplicesInExpr ownedSpliceEnv emptyIPMap 0) merged
                     writeIORef (lmBodies lm) expanded1
   where
     -- Build a let-wrapper over ALL bodies currently parsed into the
@@ -2134,8 +2139,8 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
             []    -> e
             binds -> ELet binds e
 
-    evalOneSplice :: Span -> IO [(Name, Expr)]
-    evalOneSplice sp@(start, end)
+    evalOneSplice :: Env -> Span -> IO [(Name, Expr)]
+    evalOneSplice ownedSpliceEnv sp@(start, end)
         | end <= start = pure []
         | otherwise = do
             let innerBytes = sliceBytes (lmSource lm) sp
@@ -2152,9 +2157,9 @@ expandSplicesInModule registry searchPath includeMap spliceEnv lm = do
                         Right () -> pure ()
                         Left _   -> pure ()
                 ) fvs
-            spliceExprExp <- expandSplicesInExpr spliceEnv emptyIPMap 0 spliceExpr
+            spliceExprExp <- expandSplicesInExpr ownedSpliceEnv emptyIPMap 0 spliceExpr
             wrapped <- wrapWithLocals spliceExprExp
-            thExpandSpliceDecl spliceEnv emptyIPMap wrapped
+            thExpandSpliceDecl ownedSpliceEnv emptyIPMap wrapped
 
 -- | Scan @instance C T where ...@ declarations in a module's source,
 -- parse each method body, evaluate it to a Val, and register the
