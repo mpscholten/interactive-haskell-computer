@@ -76,6 +76,19 @@ spec = describe "Hs2010 — Modules" $ do
             "module M((+)) where\n" `shouldParseHeaderTo`
                 mh "M" (ExportList [ExportName "+"]) []
 
+        it "keeps multi-token operators and following exports" $
+            "module M((.&.), (@?=), value) where\n" `shouldParseHeaderTo`
+                mh "M" (ExportList
+                    [ExportName ".&.", ExportName "@?=", ExportName "value"]) []
+
+        it "keeps multi-token class-child operators" $
+            "module M(C((.&.), (@?=), method), value) where\n"
+                `shouldParseHeaderTo`
+                    mh "M" (ExportList
+                        [ ExportType "C" (Just [".&.", "@?=", "method"])
+                        , ExportName "value"
+                        ]) []
+
         it "2.2.6 type only (T)" $
             "module M(T) where\n" `shouldParseHeaderTo`
                 mh "M" (ExportList [ExportType "T" Nothing]) []
@@ -125,6 +138,20 @@ spec = describe "Hs2010 — Modules" $ do
             "module M where\nimport N (x,y)\n" `shouldParseHeaderTo`
                 mh "M" ExportAll
                     [ImportDecl "N" False Nothing (ImportOnly ["x","y"])]
+
+        it "keeps multi-token operators and following selective imports" $
+            "module M where\nimport N ((.&.), (@?=), value)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "N" False Nothing
+                            (ImportOnly [".&.", "@?=", "value"])]
+
+        it "keeps multi-token operators and following hidden imports" $
+            "module M where\nimport N hiding ((.&.), (@?=), value)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "N" False Nothing
+                            (ImportHiding [".&.", "@?=", "value"])]
 
         it "2.3.6 import M (T(..))" $
             "module M where\nimport N (T(..))\n" `shouldParseHeaderTo`

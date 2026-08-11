@@ -13,7 +13,7 @@
 --   import qualified Foo as B
 --   import Foo (a, b, Tree(..))
 --   import Foo hiding (c, d)
---   import Foo ((.&.), (++))    -- operator imports are skipped (name ignored)
+--   import Foo ((.&.), (++))
 --
 -- Package-qualified imports (@import \"base\" Data.List@ and
 -- @import qualified \"base\" Data.List as L@, from the GHC
@@ -247,39 +247,9 @@ parseExportList src cur0 = go [] cur0
                     _ -> go (ExportType n Nothing : acc) cur1
             TkEof    -> pure (ExportList (reverse acc), cur1)
             -- Parenthesised operator export: @(++)@, @(!)@, @(@?=@), etc.
-            -- Peek inside the parens to extract the operator name so
-            -- that 'exportsName' can match it.  Only a single token is
-            -- expected inside; anything more complex is skipped safely.
             TkLParen -> do
-                let (inner, cur2) = nextSigTok src cur1
-                case operatorTokenName (tkKind inner) of
-                    Just op -> do
-                        -- Consume the closing paren if present.
-                        let (close, cur3) = nextSigTok src cur2
-                        case tkKind close of
-                            TkRParen -> go (ExportName op : acc) cur3
-                            _        -> go (ExportName op : acc) cur2
-                    Nothing -> case tkKind inner of
-                        -- '@'-prefixed operator: @?=, @=?, etc.
-                        -- '@' is TkAt (not isOpChar), so @?= is TkAt + TkSymOp "?=".
-                        -- Reconstruct the full operator name by prepending "@".
-                        TkAt -> do
-                            let (rest, cur3) = nextSigTok src cur2
-                            let fullOp = case tkKind rest of
-                                    TkSymOp suf -> BC.pack "@" <> suf
-                                    _           -> BC.pack "@"
-                            let curAfterOp = case tkKind rest of
-                                    TkSymOp _ -> cur3
-                                    _         -> cur2
-                            let (close, cur4) = nextSigTok src curAfterOp
-                            case tkKind close of
-                                TkRParen -> go (ExportName fullOp : acc) cur4
-                                _        -> go (ExportName fullOp : acc) curAfterOp
-                        -- Anything else (e.g. section or complex form): skip
-                        -- the whole group and continue.
-                        _ -> do
-                            curSkip <- skipToCloseParen src cur1 1
-                            go acc curSkip
+                (mOp, cur2) <- parseParenthesizedOperator src cur1
+                go (maybe acc (\op -> ExportName op : acc) mOp) cur2
             _        -> pure (ExportList (reverse acc), cur)
 
     parseExportSubs s c0 = do
@@ -313,28 +283,8 @@ parseExportList src cur0 = go [] cur0
                 -- Keep the operator name so class-method exports like
                 -- Bits((.&.), (.|.)) can be resolved through facade modules.
                 TkLParen  -> do
-                    let (inner, c2) = nextSigTok s c1
-                    case operatorTokenName (tkKind inner) of
-                        Just op -> do
-                            let (close, c3) = nextSigTok s c2
-                            let c' = case tkKind close of
-                                    TkRParen -> c3
-                                    _        -> c2
-                            loop (op : subs) dd c'
-                        Nothing -> case tkKind inner of
-                            TkAt -> do
-                                let (rest, c3) = nextSigTok s c2
-                                let (fullOp, cAfterOp) = case tkKind rest of
-                                        TkSymOp suf -> (BC.pack "@" <> suf, c3)
-                                        _           -> (BC.pack "@", c2)
-                                let (close, c4) = nextSigTok s cAfterOp
-                                let c' = case tkKind close of
-                                        TkRParen -> c4
-                                        _        -> cAfterOp
-                                loop (fullOp : subs) dd c'
-                            _ -> do
-                                cAfterOp <- skipToCloseParen s c1 1
-                                loop subs dd cAfterOp
+                    (mOp, c2) <- parseParenthesizedOperator s c1
+                    loop (maybe subs (: subs) mOp) dd c2
                 -- Bare operator (symbolic or backtick-wrapped): skip it.
                 TkSymOp _ -> loop subs dd c1
                 TkBacktick -> do
@@ -532,30 +482,8 @@ parseImportList src cur0 = go [] cur0
             -- Extract the operator name from the (op) group so that
             -- specAllows can match it during resolveImport.
             TkLParen -> do
-                let (inner, cur2) = nextSigTok src cur1
-                case operatorTokenName (tkKind inner) of
-                    Just op -> do
-                        let (close, cur3) = nextSigTok src cur2
-                        let cur' = case tkKind close of
-                                TkRParen -> cur3
-                                _        -> cur2
-                        go (op : acc) cur'
-                    Nothing -> case tkKind inner of
-                        -- '@'-prefixed operator: (@?=), (@=?), etc.
-                        TkAt -> do
-                            let (rest, cur3) = nextSigTok src cur2
-                            let (fullOp, curAfterOp) = case tkKind rest of
-                                    TkSymOp suf -> (BC.pack "@" <> suf, cur3)
-                                    _           -> (BC.pack "@", cur2)
-                            let (close, cur4) = nextSigTok src curAfterOp
-                            let cur' = case tkKind close of
-                                    TkRParen -> cur4
-                                    _        -> curAfterOp
-                            go (fullOp : acc) cur'
-                        -- Unknown/complex inner form: skip whole group.
-                        _ -> do
-                            curSkip <- skipToCloseParen src cur1 1
-                            go acc curSkip
+                (mOp, cur2) <- parseParenthesizedOperator src cur1
+                go (maybe acc (: acc) mOp) cur2
             _        -> pure (reverse acc, cur)
 
     -- After a name, check for a `(..)` or `(sub, sub)` tail, and skip it.
@@ -625,20 +553,8 @@ parseImportList src cur0 = go [] cur0
                 -- which silently dropped every @import GHC.ForeignPtr@
                 -- below it.
                 TkLParen -> do
-                    let (inner, cur2) = nextSigTok s cur1
-                    case operatorTokenName (tkKind inner) of
-                        Just op -> do
-                            let (close, cur3) = nextSigTok s cur2
-                            let cur' = case tkKind close of
-                                    TkRParen -> cur3
-                                    _        -> cur2
-                            sub (op : acc) cur'
-                        Nothing -> do
-                            -- Unknown inner form: balance-skip to
-                            -- matching @)@ so we don't bleed past
-                            -- the import list's terminator.
-                            curSkip <- skipToCloseParen s cur1 1
-                            sub acc curSkip
+                    (mOp, cur2) <- parseParenthesizedOperator s cur1
+                    sub (maybe acc (: acc) mOp) cur2
                 _     -> sub acc cur1
 
 operatorTokenName :: TokenKind -> Maybe ByteString
@@ -661,6 +577,28 @@ operatorTokenName = \case
     TkDollar   -> Just (BC.pack "$")
     TkSymOp n  -> Just n
     _          -> Nothing
+
+-- | Read the operator inside an already-open parenthesized operator name.
+-- The lexer gives punctuation with grammatical meaning its own tokens, so
+-- operators such as @(.>>.)@ and @(!<<.)@ span several tokens rather than a
+-- single 'TkSymOp'.  Stopping after the first token leaves the export parser
+-- inside the group and can discard the module's remaining exports/imports.
+parseParenthesizedOperator :: Source -> Cursor -> IO (Maybe ByteString, Cursor)
+parseParenthesizedOperator src = go []
+  where
+    go revParts cur = do
+        let (tok, cur') = nextSigTok src cur
+        case tkKind tok of
+            TkRParen
+                | null revParts -> pure (Nothing, cur')
+                | otherwise -> pure (Just (BC.concat (reverse revParts)), cur')
+            TkEof -> pure (Nothing, cur')
+            TkAt -> go (BC.pack "@" : revParts) cur'
+            kind -> case operatorTokenName kind of
+                Just part -> go (part : revParts) cur'
+                Nothing -> do
+                    curEnd <- skipToCloseParen src cur' 1
+                    pure (Nothing, curEnd)
 
 -- | Fast-forward through a balanced paren group. @depth@ is already 1.
 skipToCloseParen :: Source -> Cursor -> Int -> IO Cursor

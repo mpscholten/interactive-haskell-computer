@@ -821,6 +821,35 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         _ <- resolveTypeSigMetadata Nothing "OwnerAmbiguous.markerAmbiguous"
         resolveTypeSigMetadata (Just "OwnerAmbiguous") "pick" `shouldReturn` Nothing
 
+    it "module metadata: class-child signatures traverse explicit facades" do
+        let root = "test/Fixtures/Coverage/Modules/class_method_sig_reexport"
+            facadeScheme = Just
+                (Scheme ["a"] [Pred "FacadeClass" [TyVar "a"]] (TyVar "a"))
+        runMainWithSiblings (root </> "Main.hs") `shouldReturn` 0
+        resolveTypeSigMetadata (Just "OwnerFacade") "facadePick"
+            `shouldReturn` facadeScheme
+        resolveTypeSigMetadata (Just "OwnerAlias") "MF.facadePick"
+            `shouldReturn` facadeScheme
+        resolveTypeSigMetadata (Just "OwnerAlias") "facadePick"
+            `shouldReturn` Nothing
+        resolveTypeSigMetadata (Just "OwnerAmbiguous") "facadePick"
+            `shouldReturn` Nothing
+        resolveTypeSigMetadata (Just "OwnerHidden") "facadePick"
+            `shouldReturn` Nothing
+        resolveTypeSigMetadata (Just "OwnerClassOnly") "facadePick"
+            `shouldReturn` Nothing
+
+    it "module metadata: real Data.Bits facade exposes imported operator signatures" do
+        -- Loading the fixture establishes the package source search path and
+        -- materialises the facade metadata; the operator itself is declared
+        -- only in GHC.Internal.Bits.
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/real_data_bits_sig_facade.hs")
+        n `shouldBe` 0
+        out `shouldBe` "0\n"
+        scheme <- resolveTypeSigMetadata (Just "GHC.Internal.Data.Bits") ".&."
+        scheme `shouldSatisfy` (/= Nothing)
+
     it "elaborates a bare class-method callee from owner-scoped metadata" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/Coverage/class_method_callee_metadata.hs")
