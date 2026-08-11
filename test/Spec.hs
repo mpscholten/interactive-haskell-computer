@@ -66,6 +66,7 @@ import qualified Unsupported
 import qualified NetworkSocketAddrInfoRecordUpdateTest
 import qualified TopLevelIOBindingTest
 import qualified TopLevelWarpAliasTest
+import qualified TypeSchemeParserTest
 import qualified WarpHelloTest
 import qualified WarpRunStartupTest
 
@@ -192,6 +193,7 @@ allSpecs = do
     HsExtPatterns.spec
     Hs2010ClassInst.spec
     Hs2010Types.spec
+    TypeSchemeParserTest.spec
     HsExtGADTs.spec
     Hs2010Patterns.spec
     Hs2010LexIdent.spec
