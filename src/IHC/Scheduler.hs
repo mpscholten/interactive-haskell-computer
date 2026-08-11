@@ -8433,17 +8433,103 @@ resolveTypeSigMetadata mOwner requested = do
                 Left _ -> pure []
                 Right target -> do
                     allowed <- specAllowsLoaded target (impSpec imp) bare
-                    exportsMethod <- exportsClassMethodDirect target bare
-                    if not allowed || not (exportsName target bare || exportsMethod)
+                    if not allowed
                       then pure []
-                      else do
-                        (declaredThere, targetScheme) <- lookupOwnedSig target bare
-                        case (declaredThere, targetScheme) of
-                          (_, Just scheme) -> pure [scheme]
-                          (True, Nothing) -> pure []
-                          (False, Nothing) -> do
-                            nested <- resolveFromOwner registry searchPath includeMap seen' target bare
-                            pure (maybe [] pure nested)
+                      else collectExported seen' target bare
+
+        -- Resolve a name through a module's public surface.  In particular,
+        -- a facade can export @C(method)@ even though C and method are both
+        -- declared in an imported implementation module.  The old direct
+        -- declaration check stopped at that facade.  Carrying the resolved
+        -- scheme back across the boundary lets its class predicate identify
+        -- the exported class without flattening method names globally.
+        collectExported seen' target bare
+            | Set.member (lmName target) seen' = pure []
+            | otherwise = do
+                (declaredThere, targetScheme) <- lookupOwnedSig target bare
+                direct <- case targetScheme of
+                    Nothing -> pure []
+                    Just scheme -> do
+                        visible <- signatureExportedDirect target bare scheme
+                        pure [scheme | visible]
+                if declaredThere
+                  then pure direct
+                  else if not (mayReexportName target bare)
+                    then pure []
+                  else do
+                    let seen'' = Set.insert (lmName target) seen'
+                    nested <- concat <$> mapM (throughImport seen'' target bare)
+                        (mhImports (lmHeader target))
+                    selectCompatibleList (direct ++ nested)
+
+        throughImport seen' facade bare imp = do
+            let moduleExported = exportsImportModule facade imp
+            if impQualified imp && not moduleExported
+              then pure []
+              else do
+                loaded <- try (loadModule registry searchPath includeMap (impModule imp))
+                    :: IO (Either SomeException LoadedModule)
+                case loaded of
+                    Left _ -> pure []
+                    Right provider -> do
+                        allowed <- specAllowsLoaded provider (impSpec imp) bare
+                        if not allowed
+                          then pure []
+                          else do
+                            schemes <- collectExported seen' provider bare
+                            pure
+                                [ scheme
+                                | scheme <- schemes
+                                , moduleExported || signatureReexported facade bare scheme
+                                ]
+
+        selectCompatibleList [] = pure []
+        selectCompatibleList schemes@(scheme:_) = do
+            compatible <- schemesHaveCommonInstance schemes
+            pure [scheme | compatible]
+
+    signatureExportedDirect lm bare scheme = do
+        method <- exportsClassMethodDirect lm bare
+        pure (exportsNameDirect lm bare || method || signatureReexported lm bare scheme)
+
+    -- A class child exported by a facade is recoverable from the principal
+    -- class predicate of its method scheme.  Considering every predicate is
+    -- intentional: superclass/constrained methods need not put their owning
+    -- class first, and an explicit export item still supplies the fail-closed
+    -- name check.
+    signatureReexported lm bare (Scheme _ preds _) =
+        case mhExports (lmHeader lm) of
+            ExportAll -> False
+            ExportList items -> any exportsPred items
+      where
+        classes = [cls | Pred cls _ <- preds]
+        exportsPred (ExportName n) = n == bare
+        exportsPred (ExportType cls (Just subs)) =
+            cls `elem` classes && (null subs || bare `elem` subs)
+        exportsPred _ = False
+
+    exportsImportModule lm imp =
+        case mhExports (lmHeader lm) of
+            ExportAll -> False
+            ExportList items -> any matches items
+      where
+        names = impModule imp : maybe [] pure (impAlias imp)
+        matches (ExportModule n) = n `elem` names
+        matches _ = False
+
+    -- ExportAll never re-exports imported names.  Avoid walking the whole
+    -- Prelude/base import graph for an ordinary missing signature; explicit
+    -- facade syntax is the only reason to continue past a non-declaring
+    -- module.
+    mayReexportName lm bare =
+        case mhExports (lmHeader lm) of
+            ExportAll -> False
+            ExportList items -> any permits items
+      where
+        permits (ExportName n) = n == bare
+        permits (ExportType _ (Just subs)) = null subs || bare `elem` subs
+        permits (ExportModule _) = True
+        permits _ = False
 
     -- Import order must never decide between two incompatible visible names.
     -- Compatible re-exports/specialisations are safe: they agree on a common
