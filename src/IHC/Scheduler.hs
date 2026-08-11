@@ -135,7 +135,9 @@ import IHC.Scan
 import IHC.Source
 import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
-import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
+import IHC.ConstructorMetadata
+    ( ConstructorIdentity(..), ConstructorTypeMetadata(..)
+    , globalConstructorTypeRegistryRef )
 import IHC.TypeAST (Scheme(..), Type(..), TypeSynonym(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead, typeDispatchTag, expandTypeSynonyms)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
@@ -5663,6 +5665,10 @@ wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig lm n e =
     let e' = annotateBindInputTypes e
     in case e' of
+        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+          , hasRankPolyConstructorPattern lm e'
+          , Just tyBytes <- renderTypeForAnnotation body
+          -> ETyApp e' tyBytes
         -- RHS is literally a bare nullary class method
         -- (@x :: T; x = minBound@): annotate with the result-type tag.
         EVar v
@@ -6025,7 +6031,11 @@ renderTypeForAnnotation = top
         TyVar v   -> Just (bareTypeName v)
         TyCon c   -> Just (bareTypeName c)
         TyApp _ _ -> let (h, args) = tyApps t in renderApp h args
-        _         -> Nothing                  -- TyArrow / TyForall: unsupported
+        TyArrow a b -> do
+            ab <- atom a
+            bb <- top b
+            Just (BC.concat [ab, BC.pack " -> ", bb])
+        TyForall{} -> Nothing
 
     renderApp h args = case h of
         TyCon c
@@ -6053,7 +6063,10 @@ renderTypeForAnnotation = top
                 _ -> do
                     inner <- renderApp h args
                     Just (BC.concat [ BC.singleton '(', inner, BC.singleton ')' ])
-        _ -> Nothing
+        TyArrow{} -> do
+            inner <- top t
+            Just (BC.concat [BC.singleton '(', inner, BC.singleton ')'])
+        TyForall{} -> Nothing
 
     bareTypeName c =
         case BC.elemIndexEnd (toEnum (fromEnum '.')) c of
@@ -6066,6 +6079,58 @@ renderTypeForAnnotation = top
         && BC.all (== ',') (BC.init (BC.tail c))
 
     tupleArity c = BC.length (BC.filter (== ',') c) + 1
+
+hasRankPolyConstructorPattern :: LoadedModule -> Expr -> Bool
+hasRankPolyConstructorPattern lm = go
+  where
+    rankCtors = Set.fromList
+        [ lastNameComponent (ciName (ctmIdentity metadata))
+        | metadata <- Map.elems (lmConstructorTypes lm)
+        , any containsHigherRankType (ctmFieldTypes metadata)
+        ]
+    patHas pat = case pat of
+        PCon ctor ps -> Set.member (lastNameComponent ctor) rankCtors || any patHas ps
+        PTuple ps -> any patHas ps
+        PRecord ctor fs -> Set.member (lastNameComponent ctor) rankCtors
+            || any (patHas . snd) fs
+        PAs _ p -> patHas p
+        PBang p -> patHas p
+        PIrref p -> patHas p
+        PView view p -> go view || patHas p
+        _ -> False
+    go expr = case expr of
+        EApp f x -> go f || go x
+        ELam _ body -> go body
+        ELet bs body -> any (go . snd) bs || go body
+        ECase scrut alts -> go scrut || any (\(Alt p rhs) -> patHas p || go rhs) alts
+        EIf c t f -> go c || go t || go f
+        EDo stmts -> any stmtHas stmts
+        ETuple xs -> any go xs
+        ERecordCon _ fs -> any (go . snd) fs
+        ERecordUpdate base fs -> go base || any (go . snd) fs
+        ESplice x -> go x
+        EQuote x -> go x
+        ETyApp x _ -> go x
+        ELocalSig _ x -> go x
+        EImplicitLet bs body -> any (go . snd) bs || go body
+        _ -> False
+    stmtHas stmt = case stmt of
+        SExpr x -> go x
+        SBind _ x -> go x
+        SBangBind _ x -> go x
+        SLet bs -> any (go . snd) bs
+        SImplicitLet bs -> any (go . snd) bs
+    lastNameComponent name = case BC.elemIndexEnd '.' name of
+        Just idx -> BC.drop (idx + 1) name
+        Nothing -> name
+
+containsHigherRankType :: Type -> Bool
+containsHigherRankType TyForall{} = True
+containsHigherRankType (TyArrow a b) =
+    containsHigherRankType a || containsHigherRankType b
+containsHigherRankType (TyApp f x) =
+    containsHigherRankType f || containsHigherRankType x
+containsHigherRankType _ = False
 
 -- | Names of builtins that are FFI/primop-backed and should ALWAYS resolve
 -- to the host builtin, never to source definitions. These are excluded from
@@ -8914,8 +8979,16 @@ resolveFallbackSource mOwner name = do
                                 -- bogus slot.  Constructors live in
                                 -- 'lmDataReg' which is the authoritative
                                 -- source — check there first.
-                                mCtor <- tryAnyModuleCtorSlot mods bareName
-                                case mCtor of
+                                mScopedCtor <- case mOwner >>= (`Map.lookup` mods) of
+                                    Just owner -> tryConstructorSlot mods owner bareName
+                                    Nothing -> pure Nothing
+                                mCtor <- case mScopedCtor of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> tryAnyModuleCtorSlot mods bareName
+                                mCtor' <- case mCtor of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> tryPreludeConstructorSlot mods bareName
+                                case mCtor' of
                                   Just slot -> pure (Just slot)
                                   Nothing -> do
                                    -- When we know the owning module of the
@@ -9366,25 +9439,40 @@ resolveFallbackSource mOwner name = do
             then pure Nothing
             else case bestMatch Nothing (Map.elems mods) of
                 Nothing -> pure Nothing
-                Just arity -> Just <$> mkCtorSlot bareName arity
+                Just metadata -> do
+                    conEnv <- buildConEnv (Map.singleton bareName metadata)
+                    pure (HashMap.lookup bareName conEnv)
       where
         bestMatch acc [] = acc
         bestMatch acc (owner : rest) =
             case Map.lookup bareName (lmDataReg owner) of
-                Just (_tyName, arity, _idx) ->
+                Just metadata@(_tyName, arity, _idx) ->
                     let acc' = case acc of
-                            Just best | best >= arity -> acc
-                            _                         -> Just arity
+                            Just (_, bestArity, _) | bestArity >= arity -> acc
+                            _ -> Just metadata
                     in bestMatch acc' rest
                 Nothing -> bestMatch acc rest
 
-        mkCtorSlot name 0 = newWHNFThunk (VCon name [])
-        mkCtorSlot name arity =
-            newLazyBuiltinThunk (pure (buildLam name arity []))
+    tryPreludeConstructorSlot mods bareName
+        | not (couldBeCtorName bareName) = pure Nothing
+        | otherwise = do
+            searchPath <- readIORef globalSearchPathRef
+            includeMap <- readIORef globalIncludeMapRef
+            transientReg <- newIORef (Map.map Loaded mods)
+            findProvider transientReg searchPath includeMap preludeScope
+      where
+        findProvider _ _ _ [] = pure Nothing
+        findProvider registry searchPath includeMap (modName : rest) = do
+            loaded <- try (loadModule registry searchPath includeMap modName)
+                :: IO (Either SomeException LoadedModule)
+            case loaded of
+                Right lm | Map.member bareName (lmDataReg lm) -> do
+                    reg <- readIORef registry
+                    mergeGlobalLoadedModules (Map.fromList
+                        [ (n, loadedLm) | (n, Loaded loadedLm) <- Map.toList reg ])
+                    mkCtorSlotFromModule lm bareName
+                _ -> findProvider registry searchPath includeMap rest
 
-        buildLam name 0 acc = VCon name (reverse acc)
-        buildLam name left acc = VFun $ \t ->
-            pure (buildLam name (left - 1) (t : acc))
 
     preludeDirectOwner bareName
         | bareName `elem` [ "elem", "filter", "sum" ] = Just (BC.pack "GHC.List")
@@ -9779,16 +9867,10 @@ resolveFallbackSource mOwner name = do
 
     mkCtorSlotFromModule provider bareName =
         case Map.lookup bareName (lmDataReg provider) of
-            Just (_tyName, arity, _idx) -> Just <$> mkCtorSlot bareName arity
+            Just metadata -> do
+                conEnv <- buildConEnv (Map.singleton bareName metadata)
+                pure (HashMap.lookup bareName conEnv)
             Nothing                     -> pure Nothing
-      where
-        mkCtorSlot name 0 = newWHNFThunk (VCon name [])
-        mkCtorSlot name arity =
-            newLazyBuiltinThunk (pure (buildLam name arity []))
-
-        buildLam name 0 acc = VCon name (reverse acc)
-        buildLam name left acc = VFun $ \t ->
-            pure (buildLam name (left - 1) (t : acc))
 
     tryKnownDirectOwnerSlot mods owner bareName =
         case preludeDirectOwner bareName of

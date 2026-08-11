@@ -220,6 +220,7 @@ typeRepListEq _ _ = pure False
 forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
+forceThunkState (TypedField _ _ _) = pure (VStr (BC.pack "<typed-field>"))
 forceThunkState (BlackHole _ _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
@@ -492,6 +493,7 @@ typeTagOf (VCon n _) =
     -- whose instances are only keyed under the type name.
     n
 typeTagOf (VFun _)      = BC.pack "<function>"
+typeTagOf (VFieldAccessor _ _ _) = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
 typeTagOf (VLazyMethod _) = BC.pack "<function>"

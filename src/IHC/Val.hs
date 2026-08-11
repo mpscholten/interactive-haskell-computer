@@ -63,6 +63,7 @@ import System.IO (Handle)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Expr, Name)
+import IHC.TypeAST (Scheme)
 
 --------------------------------------------------------------------------------
 -- Values
@@ -85,6 +86,7 @@ data Val
                                        -- builtins still produce these;
                                        -- user-visible strings are [Char]
     | VFun  !(Thunk -> IO Val)         -- single-argument closure (builtins)
+    | VFieldAccessor !Name ![(Name, Int)] !(Thunk -> IO Val)
     -- Phase 3.6: user-defined lambda with implicit-param support.
     -- The function receives the caller's ImplicitParamMap so it can
     -- merge (lexically-bound ?params win over caller's).
@@ -167,6 +169,7 @@ showValForDebug (VFloat d)  = show d
 showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)      = "<function>"
+showValForDebug (VFieldAccessor n _ _) = "<fieldAccessor " <> BC.unpack n <> ">"
 showValForDebug (VFunIP _ _)  = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
@@ -197,6 +200,7 @@ type Thunk = IORef ThunkState
 
 data ThunkState
     = Unevaluated !Closure
+    | TypedField !Thunk !Scheme !Name
     | Evaluated   !Val
     -- entered, not yet returned. The 'Maybe ThreadId' is the thread that
     -- entered (set the black-hole) during evaluation; 'Nothing' for

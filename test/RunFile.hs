@@ -1813,6 +1813,31 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         (n, out) <- captureStdout
             (runFile "test/Fixtures/Coverage/th_pure_expected_q.hs")
         n   `shouldBe` 42
+
+    it "constructor fields retain generic constrained evidence" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/rank_poly_constructor_evidence.hs")
+        (n, out) `shouldBe` (37, "")
+
+    it "record projections retain generic constrained field evidence" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/rank_poly_record_field.hs")
+        (n, out) `shouldBe` (41, "")
+
+    it "source instance methods resolve imported result constructors" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/source_method_imported_constructor.hs")
+        (n, out) `shouldBe` (23, "")
+
+    it "source method aliases preserve constructor partial application" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/source_method_constructor_alias.hs")
+        (n, out) `shouldBe` (40, "")
+
+    it "loads GHC.Internal.Maybe constructors from bundled source" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/ghc_internal_maybe_source.hs")
+        (n, out) `shouldBe` (19, "")
         out `shouldBe` ""
 
     it "Template Haskell: source Applicative Q expands a pure quote splice" do
