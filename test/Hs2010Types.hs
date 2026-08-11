@@ -155,6 +155,51 @@ spec = describe "Hs2010 — Types" $ do
             c `shouldBe` False
 
     describe "expected-type elaboration of constrained values" $ do
+        it "instantiates a signed local polymorphically at each use" $ do
+            reg <- newClassRegistry
+            let localId = ELocalSig "forall a. a -> a" (ELam "x" (EVar "x"))
+                use value = EApp (EVar "localId") value
+                expr = ELet [("localId", localId)]
+                    (ETuple [use (ELit (LInt 7)), use (ELit (LStr "ok"))])
+            (_, ty) <- elaborate reg Map.empty Map.empty InferFreely expr
+            ty `shouldBe` foldl TyApp (TyCon "(,)")
+                [ TyCon "Int"
+                , TyApp (TyCon "[]") (TyCon "Char")
+                ]
+
+        it "retains a constrained local variable instead of fixing it to Int" $ do
+            reg <- newClassRegistry
+            let expr = ELocalSig "forall a. Num a => a -> a"
+                    (ELam "x" (EVar "x"))
+            (_, ty) <- elaborate reg Map.empty Map.empty InferFreely expr
+            case ty of
+                TyArrow a b -> do
+                    a `shouldBe` b
+                    a `shouldSatisfy` (\t -> case t of TyVar _ -> True; _ -> False)
+                other -> expectationFailure ("expected polymorphic arrow, got " <> show other)
+
+        it "checks a signed local RHS against an instantiated declaration body" $ do
+            reg <- newClassRegistry
+            let expr = ELet
+                    [("bad", ELocalSig "Int" (ELam "x" (EVar "x")))]
+                    (EVar "bad")
+            elaborate reg Map.empty Map.empty InferFreely expr
+                `shouldThrow` anyException
+
+        it "keeps a signed local authoritative over conflicting flat signatures" $ do
+            reg <- newClassRegistry
+            let localId = ELocalSig "forall a. a -> a" (ELam "x" (EVar "x"))
+                expr = ELet [("shadowed", localId)]
+                    (EApp (EVar "shadowed") (ELit (LInt 9)))
+                wrongA = Map.singleton "shadowed"
+                    (Scheme [] [] (TyArrow (TyCon "Bool") (TyCon "Bool")))
+                wrongB = Map.singleton "shadowed"
+                    (Scheme [] [] (TyArrow (TyCon "Char") (TyCon "Char")))
+            (_, tyA) <- elaborate reg wrongA Map.empty InferFreely expr
+            (_, tyB) <- elaborate reg wrongB Map.empty InferFreely expr
+            tyA `shouldBe` TyCon "Int"
+            tyB `shouldBe` TyCon "Int"
+
         it "declines an unresolved ambiguous global callee scheme" $ do
             wrong <- schemeOf "Int -> Bool -> String"
             lookupScopedScheme (Set.singleton "consume") Set.empty
