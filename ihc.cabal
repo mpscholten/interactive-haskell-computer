@@ -64,6 +64,7 @@ library
       , IHC.TypeDescribe
       , IHC.TypeGlobals
       , IHC.TypeReduce
+      , IHC.TypeSchemeParser
       , IHC.TypeUnify
       , IHC.Val
     build-depends:
@@ -203,6 +204,7 @@ test-suite ihc-test
       , FreshProcessTest
       , TopLevelIOBindingTest
       , TopLevelWarpAliasTest
+      , TypeSchemeParserTest
       , WarpHelloTest
       , WarpRunStartupTest
     build-depends:
