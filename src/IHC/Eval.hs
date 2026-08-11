@@ -668,7 +668,7 @@ eval hooks env ipm = go
     -- through 'goTyApp': that path is for visible @f @T@ applications and
     -- appends dispatch tags to VClassMethod values.
     go (ELocalSig scheme e) = do
-        mElab <- tryElaborateTyAnn e (localSignatureBody scheme)
+        mElab <- tryElaborateLocalSig scheme e
         case mElab of
             Just e' -> go e'
             Nothing -> go e
@@ -832,7 +832,7 @@ eval hooks env ipm = go
         case mReg of
             Nothing -> pure Nothing
             Just classReg -> do
-                let mAnnTy = Elab.parseRawTypeExpr (localSignatureBody ty)
+                let mAnnTy = Elab.parseRawTypeExpr ty
                 case mAnnTy of
                   Nothing -> pure Nothing
                   Just annTy -> do
@@ -894,18 +894,37 @@ eval hooks env ipm = go
         Just idx -> BC.drop (idx + 1) n
         Nothing -> n
 
-    -- Local declaration metadata may include an explicit forall and/or class
-    -- context. Expected-type elaboration needs the body type; constraints
-    -- remain available to ordinary value-directed dictionary dispatch.
-    localSignatureBody raw =
-        let noForall =
-                if BC.pack "forall " `BS.isPrefixOf` BC.dropWhile (== ' ') raw
-                    then case BC.elemIndex '.' raw of
-                        Just i  -> BC.drop (i + 1) raw
-                        Nothing -> raw
-                    else raw
-            (_ctx, afterCtx) = BC.breakSubstring (BC.pack "=>") noForall
-        in if BC.null afterCtx then noForall else BC.drop 2 afterCtx
+    -- Unlike visible type application, a declaration annotation is a complete
+    -- Scheme.  Let the elaborator parse and instantiate its forall/context as
+    -- one unit, then erase only the ELocalSig wrapper at runtime.
+    tryElaborateLocalSig scheme e = do
+        mReg <- getSharedClassReg legacyHooks
+        case mReg of
+            Nothing -> pure Nothing
+            Just classReg -> do
+                sigs0 <- readIORef globalTypeSigsRef
+                syns <- readIORef globalTypeSynonymsRef
+                ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                owner <- currentOwner hooks env
+                mHeadScheme <- case applicationHeadName e of
+                    Just method -> lookupTypeSigFallback hooks owner method
+                    Nothing -> pure Nothing
+                let (sigs, scoped) = case (applicationHeadName e, mHeadScheme) of
+                        (Just method, Just headScheme) ->
+                            ( Map.insert (bareName method) headScheme
+                                (Map.insert method headScheme sigs0)
+                            , Set.fromList [method, bareName method]
+                            )
+                        _ -> (sigs0, Set.empty)
+                r <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                            ctorTypes owner scoped Elab.InferFreely
+                            (ELocalSig scheme e))
+                       :: IO (Either SomeException (Expr, TA.Type))
+                case r of
+                    Right (ELocalSig _ e', _) | e' /= e -> do
+                        ok <- allTypedMethodsResolvable classReg e'
+                        if ok then pure (Just e') else pure Nothing
+                    _ -> pure Nothing
 
     -- Elaborate a complete class-method application before evaluating its
     -- left-associated callee spine.  A method's dictionary parameter can be

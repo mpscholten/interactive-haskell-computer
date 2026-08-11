@@ -42,6 +42,7 @@ import IHC.ConstructorMetadata
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
 import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
+import IHC.TypeSchemeParser (parseSchemeBytes)
 import IHC.TypeUnify
 
 -- | Look up a scheme for expected-argument inference without consulting a
@@ -363,17 +364,19 @@ elaborateExpr ienv expr = case expr of
                              )
 
     ELocalSig schemeBytes inner ->
-        case parseRawTypeExpr (localSchemeBody schemeBytes) of
+        case parseSchemeBytes schemeBytes of
             Nothing -> do
                 (inner', t, preds, sub) <- elaborateExpr ienv inner
                 pure (ELocalSig schemeBytes inner', t, preds, sub)
-            Just declaredTy -> do
-                let expected = expandSyn (ieSynonyms ienv) declaredTy
+            Just declaredScheme -> do
+                (declaredPreds, declaredTy) <- instantiate
+                    (ieFresh ienv) (expandScheme (ieSynonyms ienv) declaredScheme)
+                let expected = declaredTy
                 (inner', innerTy, preds, sub) <- elaborateExpectedExpr ienv expected inner
                 sub' <- either (throwIO . UnificationFailure) pure
                     (unify sub expected innerTy)
                 pure (ELocalSig schemeBytes inner', applySubst sub' expected,
-                      map (applySubstPred sub') preds, sub')
+                      map (applySubstPred sub') (declaredPreds ++ preds), sub')
 
     ELam name body -> do
         argTy <- TyVar <$> freshVar (ieFresh ienv)
@@ -607,17 +610,17 @@ elaborateMany ienv = go emptySubst [] [] []
         let sub' = composeSubst sub s'
         go sub' (e' : accE) (t : accT) (preds ++ accP) es
 
--- | Let-binding: infer each binding's type (monomorphic for MVP —
--- let-polymorphism could be added later via 'generalize').
+-- | Let-binding: explicit local signatures provide rank-1 polymorphism;
+-- unsigned recursive bindings keep their existing monomorphic seed.
 elaborateLet :: InferEnv -> [Bind] -> Expr -> IO (Expr, Type, [Pred], Subst)
 elaborateLet ienv bs body = do
-    -- Pre-seed each binding with a fresh tyvar for mutual recursion.
-    preseed <- mapM (\(n, _) -> do
-                        v <- freshVar (ieFresh ienv)
-                        pure (n, TyVar v))
-                    bs
+    -- An explicit local signature is the binding's lexical scheme, including
+    -- its forall binders and context.  Unsigned bindings retain the existing
+    -- monomorphic recursion seed.  In particular, never consult the flat
+    -- process-global signature table for a signed local that shadows it.
+    preseed <- mapM seedBinding bs
     let ienvSeeded = ienv
-            { ieLocals = foldr (\(n, t) m -> Map.insert n (Scheme [] [] t) m)
+            { ieLocals = foldr (\(n, sch) m -> Map.insert n sch m)
                                (ieLocals ienv) preseed
             }
     -- Infer each binding's body.
@@ -630,8 +633,18 @@ elaborateLet ienv bs body = do
          , composeSubst sub bSub
          )
   where
+    seedBinding (n, rhs) = case bindingScheme rhs of
+        Just sch -> pure (n, expandScheme (ieSynonyms ienv) sch)
+        Nothing -> do
+            v <- freshVar (ieFresh ienv)
+            pure (n, Scheme [] [] (TyVar v))
+
+    bindingScheme (ELocalSig raw _) = parseSchemeBytes raw
+    bindingScheme _ = Nothing
+
     inferBinds _ sub accE accP [] _ = pure (reverse accE, accP, sub)
-    inferBinds ie sub accE accP ((n, rhs) : rest) ((_, seeded) : preRest) = do
+    inferBinds ie sub accE accP ((n, rhs) : rest) ((_, seededScheme) : preRest) = do
+        (_seedPreds, seeded) <- instantiate (ieFresh ie) seededScheme
         (rhs', rhsT, preds, sub') <- elaborateExpr (applySubstIenv sub ie) rhs
         case unify sub' rhsT (applySubst sub' seeded) of
             Left ue -> throwIO (UnificationFailure ue)
@@ -865,6 +878,14 @@ expandSyn syns = go
 resolveSynonymHop :: Map ByteString TypeSynonym -> Type -> Type
 resolveSynonymHop = expandSyn
 
+expandScheme :: Map ByteString TypeSynonym -> Scheme -> Scheme
+expandScheme synonyms (Scheme vars preds body) =
+    Scheme vars (map expandPred preds) (expandSyn synonyms body)
+  where
+    expandPred (Pred cls args) = Pred cls (map (expandSyn synonyms) args)
+    expandPred (QPred vars' ctx body') =
+        QPred vars' (map expandPred ctx) (expandPred body')
+
 -- | Parse raw type-argument bytes (as stored in 'ETyApp') into a
 -- 'Type'.  Shares the same grammar as 'IHC.Scan.parseScheme' body
 -- parse.  Returns 'Nothing' on malformed input.
@@ -994,16 +1015,3 @@ tokenize bs
                      || c == '.'
     isUpper c = c >= 'A' && c <= 'Z'
     isLower c = c >= 'a' && c <= 'z'
-
--- | Drop the binder/context prefix of a retained local scheme. The lexical
--- node keeps the full bytes for diagnostics and future dictionary passing;
--- the current expected-type elaborator consumes its body type.
-localSchemeBody :: ByteString -> ByteString
-localSchemeBody raw =
-    let trimmed = BC.dropWhile isAsciiSpace raw
-        noForall
-            | BC.pack "forall " `BC.isPrefixOf` trimmed =
-                maybe trimmed (\i -> BC.drop (i + 1) trimmed) (BC.elemIndex '.' trimmed)
-            | otherwise = trimmed
-        (_ctx, afterCtx) = BC.breakSubstring (BC.pack "=>") noForall
-    in if BC.null afterCtx then noForall else BC.drop 2 afterCtx
