@@ -25,7 +25,7 @@ module IHC.Elaborate
     , resolveSynonymHop
     ) where
 
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, SomeException, throwIO, try)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -168,7 +168,7 @@ elaborateOwnedInternal
     :: Bool -> ClassRegistry -> Map ByteString Scheme
     -> Map ByteString TypeSynonym -> ConstructorTypeRegistry -> Maybe Name
     -> Set.Set ByteString -> Expected -> Expr -> IO (Expr, Type)
-elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
+elaborateOwnedInternal _seedMethodBinders classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
     fresh <- newFreshSource
     classMethodNames <- readIORef globalClassMethodNamesRef
     ambiguousSigs    <- readIORef globalAmbiguousSigsRef
@@ -184,9 +184,9 @@ elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes
             , ieConstructorTypes = constructorTypes
             , ieOwner            = owner
             }
-    (e', t, _preds, sub) <- case (seedMethodBinders, expected) of
-        (True, ExpectType want) -> elaborateExpectedExpr ienv (expandSyn synonyms want) e
-        _ -> elaborateExpr ienv e
+    (e', t, _preds, sub) <- case expected of
+        ExpectType want -> elaborateExpectedExpr ienv (expandSyn synonyms want) e
+        InferFreely -> elaborateExpr ienv e
     -- If we had an expected type, unify the result type.
     finalSub <- case expected of
         InferFreely     -> pure sub
@@ -203,6 +203,15 @@ elaborateOwnedInternal seedMethodBinders classReg sigs synonyms constructorTypes
 elaborateExpectedExpr :: InferEnv -> Type -> Expr
     -> IO (Expr, Type, [Pred], Subst)
 elaborateExpectedExpr ienv expected expr = case (expr, expected) of
+    (EVar name, _)
+      | Just (Scheme vars preds _) <- Map.lookup name (ieLocals ienv)
+      , not (null vars) || not (null preds)
+      , Just expectedBytes <- renderExpectedType expected -> do
+        (_, actual, actualPreds, sub) <- elaborateVar ienv name
+        sub' <- either (throwIO . UnificationFailure) pure
+            (unify sub expected actual)
+        pure (ETyApp (EVar name) expectedBytes, applySubst sub' expected,
+            map (applySubstPred sub') actualPreds, sub')
     (ELam name body, TyArrow argTy resultTy) -> do
         let ie = ienv { ieLocals = Map.insert name (Scheme [] [] argTy)
                                     (ieLocals ienv) }
@@ -211,7 +220,92 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
             (unify sub (applySubst sub resultTy) (applySubst sub bodyTy))
         pure (ELam name body', TyArrow (applySubst sub' argTy)
             (applySubst sub' bodyTy), map (applySubstPred sub') preds, sub')
+    (ELet bs body, _) -> elaborateLetExpected ienv bs expected body
+    (ECase scrut alts, _) -> do
+        (scrut', scrutTy, scrutPreds, scrutSub) <- elaborateExpr ienv scrut
+        (alts', altPreds, finalSub) <- elaborateExpectedAlts
+            (applySubstIenv scrutSub ienv) (applySubst scrutSub scrutTy)
+            expected scrutSub alts
+        pure (ECase scrut' alts', applySubst finalSub expected,
+            map (applySubstPred finalSub) (scrutPreds ++ altPreds), finalSub)
     _ -> elaborateExpr ienv expr
+
+renderExpectedType :: Type -> Maybe ByteString
+renderExpectedType ty = case ty of
+    TyVar n -> Just n
+    TyCon n -> Just n
+    TyApp f x -> do
+        fb <- renderExpectedType f
+        xb <- atom x
+        pure (BC.concat [fb, BC.singleton ' ', xb])
+    TyArrow a b -> do
+        ab <- atom a
+        bb <- renderExpectedType b
+        pure (BC.concat [ab, BC.pack " -> ", bb])
+    TyForall{} -> Nothing
+  where
+    atom t@TyApp{} = parens t
+    atom t@TyArrow{} = parens t
+    atom t = renderExpectedType t
+    parens t = do
+        inner <- renderExpectedType t
+        pure (BC.concat [BC.singleton '(', inner, BC.singleton ')'])
+
+elaborateExpectedAlts :: InferEnv -> Type -> Type -> Subst -> [Alt]
+    -> IO ([Alt], [Pred], Subst)
+elaborateExpectedAlts _ _ _ sub [] = pure ([], [], sub)
+elaborateExpectedAlts ienv scrutTy expected sub (Alt pat rhs : rest) = do
+    (patLocals, patSub) <- inferPatternLocals (applySubstIenv sub ienv)
+        (applySubst sub scrutTy) pat
+    let sub1 = composeSubst sub patSub
+        baseEnv = applySubstIenv sub1 ienv
+        rhsEnv = baseEnv { ieLocals = Map.union patLocals (ieLocals baseEnv) }
+    (rhs', rhsTy, rhsPreds, rhsSub) <- elaborateExpectedExpr
+        rhsEnv (applySubst sub1 expected) rhs
+    sub' <- either (throwIO . UnificationFailure) pure
+        (unify (composeSubst sub1 rhsSub) (applySubst rhsSub expected) rhsTy)
+    (rest', restPreds, finalSub) <- elaborateExpectedAlts
+        (applySubstIenv sub' ienv) (applySubst sub' scrutTy)
+        (applySubst sub' expected) sub' rest
+    pure (Alt pat rhs' : rest', rhsPreds ++ restPreds, finalSub)
+
+inferPatternLocals :: InferEnv -> Type -> Pat -> IO (Map Name Scheme, Subst)
+inferPatternLocals ienv expected pat = case pat of
+    PVar name -> pure (Map.singleton name (typeAsScheme expected), emptySubst)
+    PWild -> pure (Map.empty, emptySubst)
+    PBang inner -> inferPatternLocals ienv expected inner
+    PIrref inner -> inferPatternLocals ienv expected inner
+    PAs name inner -> do
+        (locals, sub) <- inferPatternLocals ienv expected inner
+        pure (Map.insert name (typeAsScheme (applySubst sub expected)) locals, sub)
+    PCon ctor fields -> inferConstructorFields ctor fields
+    PTuple fields -> inferConstructorFields
+        (BC.pack ("(" ++ replicate (length fields - 1) ',' ++ ")")) fields
+    PRecord{} -> pure (Map.empty, emptySubst)
+    PRecordWild{} -> pure (Map.empty, emptySubst)
+    _ -> pure (Map.empty, emptySubst)
+  where
+    inferConstructorFields ctor fields = case constructorScheme
+            (ieConstructorTypes ienv) (ieOwner ienv) ctor of
+        Nothing -> pure (Map.empty, emptySubst)
+        Just scheme -> do
+            (preds, ctorTy) <- instantiate (ieFresh ienv) scheme
+            let (fieldTys, resultTy) = tyArrowArgs ctorTy
+            if length fieldTys /= length fields || not (null preds)
+                then pure (Map.empty, emptySubst)
+                else case unify emptySubst resultTy expected of
+                    Left _ -> pure (Map.empty, emptySubst)
+                    Right resultSub -> foldFields resultSub Map.empty
+                        (zip fields fieldTys)
+    foldFields sub locals [] = pure (locals, sub)
+    foldFields sub locals ((fieldPat, fieldTy) : fields) = do
+        let concrete = applySubst sub fieldTy
+        (newLocals, fieldSub) <- inferPatternLocals
+            (applySubstIenv sub ienv) concrete fieldPat
+        let sub' = composeSubst sub fieldSub
+        foldFields sub' (Map.union newLocals locals) fields
+    typeAsScheme (TyForall vars preds body) = Scheme vars preds body
+    typeAsScheme ty = Scheme [] [] ty
 
 -- | Main inference walker.  Returns (rewritten Expr, inferred Type,
 -- deferred constraints, substitution-so-far).  Constraints are
@@ -544,6 +638,40 @@ elaborateLet ienv bs body = do
             Right sub'' ->
                 inferBinds ie (composeSubst sub sub'') ((n, rhs') : accE)
                            (preds ++ accP) rest preRest
+    inferBinds _ _ _ _ _ _ = pure ([], [], emptySubst)
+
+elaborateLetExpected :: InferEnv -> [Bind] -> Type -> Expr
+    -> IO (Expr, Type, [Pred], Subst)
+elaborateLetExpected ienv bs expected body = do
+    preseed <- mapM (\(n, _) -> do
+                        v <- freshVar (ieFresh ienv)
+                        pure (n, TyVar v)) bs
+    let seededEnv = ienv
+            { ieLocals = foldr (\(n, t) m -> Map.insert n (Scheme [] [] t) m)
+                               (ieLocals ienv) preseed }
+    (bs', bindPreds, bindSub) <- inferBinds seededEnv emptySubst [] [] bs preseed
+    let bodyEnv = applySubstIenv bindSub seededEnv
+        bodyExpected = applySubst bindSub expected
+    (body', bodyTy, bodyPreds, bodySub) <- elaborateExpectedExpr
+        bodyEnv bodyExpected body
+    finalSub <- either (throwIO . UnificationFailure) pure
+        (unify (composeSubst bindSub bodySub)
+            (applySubst bodySub bodyExpected) bodyTy)
+    pure (ELet bs' body', applySubst finalSub expected,
+        map (applySubstPred finalSub) (bindPreds ++ bodyPreds), finalSub)
+  where
+    inferBinds _ sub accE accP [] _ = pure (reverse accE, accP, sub)
+    inferBinds ie sub accE accP ((n, rhs) : rest) ((_, seeded) : preRest) = do
+        inferred <- try (elaborateExpr (applySubstIenv sub ie) rhs)
+            :: IO (Either SomeException (Expr, Type, [Pred], Subst))
+        case inferred of
+            Left _ -> inferBinds ie sub ((n, rhs) : accE) accP rest preRest
+            Right (rhs', rhsT, preds, rhsSub) ->
+                case unify rhsSub rhsT (applySubst rhsSub seeded) of
+                    Left _ -> inferBinds ie sub ((n, rhs) : accE) accP rest preRest
+                    Right unified ->
+                        inferBinds ie (composeSubst sub unified) ((n, rhs') : accE)
+                            (preds ++ accP) rest preRest
     inferBinds _ _ _ _ _ _ = pure ([], [], emptySubst)
 
 -- | Do-block: walk each statement and elaborate sub-expressions for

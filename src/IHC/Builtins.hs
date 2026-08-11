@@ -2375,6 +2375,7 @@ showVal (VCon name thunks)
             [] -> pure (BC.unpack name)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
+showVal (VFieldAccessor _ _ _) = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
 showVal (VClassMethod _ _ _ _) = pure "<function>"
 showVal (VLazyMethod _) = pure "<function>"
@@ -5856,7 +5857,8 @@ buildFieldEnv reg = do
     -- Defer VFun allocation for each record-field accessor. A program that
     -- never projects out that particular field never pays the cost.
     mkAccessor (fieldName, clauses) = do
-        t <- newLazyBuiltinThunk (pure (VFun (access fieldName clauses)))
+        t <- newLazyBuiltinThunk
+            (pure (VFieldAccessor fieldName clauses (access fieldName clauses)))
         pure (fieldName, t)
 
     -- Build a function that, given a VCon, extracts the right field.

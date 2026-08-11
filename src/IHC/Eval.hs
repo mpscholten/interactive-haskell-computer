@@ -45,17 +45,20 @@ import Foreign.Ptr (Ptr, castPtr, intPtrToPtr, nullPtr, ptrToIntPtr)
 import qualified Foreign.Storable as FStorable
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.HashMap.Strict as HashMap
 
 import Control.Exception (try, SomeException)
 
 import IHC.AST
 import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag, lookupClassMethodFallback, runThExpToExpr)
-import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
+import IHC.ConstructorMetadata
+    ( ConstructorTypeMetadata(..), ConstructorIdentity(..)
+    , constructorMetadata, globalConstructorTypeRegistryRef )
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
-import IHC.TypeAST (Scheme(..), tyArrowArgs, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyHead)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -342,6 +345,7 @@ force hooks t = do
             v <- eval hooks env ipm expr
             writeIORef t (Evaluated v)
             pure v
+        TypedField canonical _ _ -> force hooks canonical
         -- Lazy-init builtin: run the host @IO Val@ action exactly once,
         -- then memoise. Mirrors the 'Unevaluated' path (same black-hole
         -- protocol) so a concurrent forcer waits (foreign owner) or sees a
@@ -364,6 +368,7 @@ valKindTag = \case
     VStr _            -> "VStr"
     VUnit             -> "VUnit"
     VFun _            -> "VFun"
+    VFieldAccessor n _ _ -> "VFieldAccessor:" <> BC.unpack n
     VFunIP _ _        -> "VFunIP"
     VCon n _          -> "VCon:" <> BC.unpack n
     VIO _             -> "VIO"
@@ -680,14 +685,18 @@ eval hooks env ipm = go
         let ty = case TR.reduceTypeExpr reg ty0 of
                      Just reduced -> reduced
                      Nothing      -> ty0
-        mTypedPeek <- tryTypedPeek e ty
-        case mTypedPeek of
+        mTypedField <- tryTypedField e ty
+        case mTypedField of
             Just v -> pure v
             Nothing -> do
-                mTypedNullary <- tryTypedNullaryClassMethod e ty
-                case mTypedNullary of
+                mTypedPeek <- tryTypedPeek e ty
+                case mTypedPeek of
                     Just v  -> pure v
                     Nothing -> do
+                        mTypedNullary <- tryTypedNullaryClassMethod e ty
+                        case mTypedNullary of
+                          Just v -> pure v
+                          Nothing -> do
         -- Trigger on-demand elaboration: if the annotation parses to a
         -- concrete type AND the shared class registry is installed,
         -- run inference on @e@ with expected type @ty@.  The elaborator
@@ -696,10 +705,84 @@ eval hooks env ipm = go
         -- (or if inference doesn't change anything) we fall through to
         -- the original 'goTyApp' path — preserving all existing
         -- value-directed dispatch behaviour.
-                        mElab <- tryElaborateTyAnn e ty
-                        case mElab of
-                            Just e' -> goTyApp e' ty
-                            Nothing -> goTyApp e ty
+                            mElab <- tryElaborateTyAnn e ty
+                            case mElab of
+                                Just e' -> goTyApp e' ty
+                                Nothing -> goTyApp e ty
+
+    tryTypedField (EVar name) ty = case lookupEnv name env of
+        Just thunk -> specializeTypedField thunk ty
+        Nothing -> pure Nothing
+    tryTypedField (EApp selector recordExpr) ty = do
+        selectorVal <- go selector
+        case selectorVal of
+            VFieldAccessor _ clauses _ -> do
+                recordVal <- go recordExpr
+                case recordVal of
+                    VCon ctor fields
+                        | Just idx <- lookup ctor clauses
+                        , idx < length fields -> do
+                            owner <- currentOwner hooks env
+                            registry <- readIORef globalConstructorTypeRegistryRef
+                            case constructorMetadata registry owner ctor of
+                                Just metadata
+                                    | idx < length (ctmFieldTypes metadata)
+                                    , let fieldTy = ctmFieldTypes metadata !! idx
+                                    , containsForall fieldTy -> do
+                                        view <- newIORef (TypedField (fields !! idx)
+                                            (fieldScheme fieldTy)
+                                            (ciOwner (ctmIdentity metadata)))
+                                        specializeTypedField view ty
+                                _ -> pure Nothing
+                    _ -> pure Nothing
+            _ -> pure Nothing
+    tryTypedField _ _ = pure Nothing
+
+    specializeTypedField thunk ty = case Elab.parseRawTypeExpr ty of
+        Nothing -> pure Nothing
+        Just annTy -> do
+            state <- readIORef thunk
+            case state of
+                TypedField canonical _ fieldOwner -> do
+                    canonicalState <- readIORef canonical
+                    case canonicalState of
+                        Unevaluated (Closure closureEnv closureIpm closureExpr) -> do
+                            mReg <- getSharedClassReg legacyHooks
+                            case mReg of
+                                Nothing -> pure Nothing
+                                Just classReg -> do
+                                    sigs0 <- readIORef globalTypeSigsRef
+                                    syns <- readIORef globalTypeSynonymsRef
+                                    ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                                    mHeadScheme <- case applicationHeadName closureExpr of
+                                        Just method -> lookupTypeSigFallback hooks
+                                            (Just fieldOwner) method
+                                        Nothing -> pure Nothing
+                                    let sigs = case (applicationHeadName closureExpr,
+                                            mHeadScheme) of
+                                          (Just method, Just scheme) ->
+                                            Map.insert (bareName method) scheme
+                                                (Map.insert method scheme sigs0)
+                                          _ -> sigs0
+                                    result <- try (Elab.elaborateOwned classReg sigs syns
+                                        ctorTypes (Just fieldOwner) (Elab.ExpectType annTy)
+                                        closureExpr)
+                                        :: IO (Either SomeException (Expr, TA.Type))
+                                    case result of
+                                        Right (specialized, _) | specialized /= closureExpr ->
+                                            Just <$> eval hooks
+                                                (HashMap.union closureEnv env)
+                                                closureIpm specialized
+                                        _ -> pure Nothing
+                        _ -> pure Nothing
+                _ -> pure Nothing
+
+    fieldScheme (TyForall vars preds body) = Scheme vars preds body
+    fieldScheme ty = Scheme [] [] ty
+    containsForall TyForall{} = True
+    containsForall (TyArrow a b) = containsForall a || containsForall b
+    containsForall (TyApp f x) = containsForall f || containsForall x
+    containsForall _ = False
 
     tryTypedNullaryClassMethod e ty =
         case e of
@@ -753,10 +836,18 @@ eval hooks env ipm = go
                 case mAnnTy of
                   Nothing -> pure Nothing
                   Just annTy -> do
-                    sigs <- readIORef globalTypeSigsRef
+                    sigs0 <- readIORef globalTypeSigsRef
                     syns <- readIORef globalTypeSynonymsRef
                     ctorTypes <- readIORef globalConstructorTypeRegistryRef
                     owner <- currentOwner hooks env
+                    mHeadScheme <- case applicationHeadName e of
+                        Just method -> lookupTypeSigFallback hooks owner method
+                        Nothing -> pure Nothing
+                    let sigs = case (applicationHeadName e, mHeadScheme) of
+                            (Just method, Just scheme) ->
+                                Map.insert (bareName method) scheme
+                                    (Map.insert method scheme sigs0)
+                            _ -> sigs0
                     r <- try (Elab.elaborateOwned classReg sigs syns ctorTypes owner
                                 (Elab.ExpectType annTy) e)
                            :: IO (Either SomeException (Expr, TA.Type))
@@ -793,6 +884,15 @@ eval hooks env ipm = go
                             ok <- allTypedMethodsResolvable classReg e'
                             if ok then pure (Just e') else pure Nothing
                         _ -> pure Nothing
+
+    applicationHeadName (EApp f _) = applicationHeadName f
+    applicationHeadName (ETyApp f _) = applicationHeadName f
+    applicationHeadName (EVar n) = Just n
+    applicationHeadName _ = Nothing
+
+    bareName n = case BC.elemIndexEnd '.' n of
+        Just idx -> BC.drop (idx + 1) n
+        Nothing -> n
 
     -- Local declaration metadata may include an explicit forall and/or class
     -- context. Expected-type elaboration needs the body type; constraints
@@ -1553,13 +1653,54 @@ eval hooks env ipm = go
             m <- matchPat hooks pat v
             case m of
                 Just bindings -> do
-                    r <- try (eval hooks (extendEnvMany bindings env) ipm body)
+                    typedBindings <- attachPatternFieldEvidence pat bindings
+                    r <- try (eval hooks (extendEnvMany typedBindings env) ipm body)
                            :: IO (Either PatternMatchFail Val)
                     case r of
                         Right result -> pure result
                         Left (PatternMatchFail "guard failed") -> goAlts rest
                         Left err -> throwIO err
                 Nothing -> goAlts rest
+
+    attachPatternFieldEvidence pat bindings = do
+        registry <- readIORef globalConstructorTypeRegistryRef
+        owner <- currentOwner hooks env
+        let evidence = collectEvidence registry owner pat
+        traverse (wrapBinding evidence) bindings
+
+    wrapBinding evidence (name, canonical) = case Map.lookup name evidence of
+        Just (scheme, fieldOwner) -> do
+            state <- readIORef canonical
+            case state of
+                TypedField{} -> pure (name, canonical)
+                _ -> do
+                    view <- newIORef (TypedField canonical scheme fieldOwner)
+                    pure (name, view)
+        Nothing -> pure (name, canonical)
+
+    collectEvidence registry owner pat = case pat of
+        PCon ctor fields -> case constructorMetadata registry owner ctor of
+            Just metadata
+                | not (ctmDataFamily metadata)
+                , null (ctmExistentialVars metadata)
+                , length fields == length (ctmFieldTypes metadata) ->
+                    Map.unions (zipWith
+                        (fieldEvidence (ciOwner (ctmIdentity metadata)))
+                        fields (ctmFieldTypes metadata))
+            _ -> Map.empty
+        PAs _ inner -> collectEvidence registry owner inner
+        PBang inner -> collectEvidence registry owner inner
+        PIrref inner -> collectEvidence registry owner inner
+        _ -> Map.empty
+      where
+        fieldEvidence fieldOwner fieldPat fieldTy = case fieldPat of
+            PVar name | containsForall fieldTy ->
+                Map.singleton name (fieldScheme fieldTy, fieldOwner)
+            PAs name inner -> Map.insert name (fieldScheme fieldTy, fieldOwner)
+                (fieldEvidence fieldOwner inner fieldTy)
+            PBang inner -> fieldEvidence fieldOwner inner fieldTy
+            PIrref inner -> fieldEvidence fieldOwner inner fieldTy
+            _ -> Map.empty
 
     stringLiteralToListVal :: ByteString -> IO Val
     stringLiteralToListVal bs = goChars (BC.unpack bs)
@@ -2579,6 +2720,7 @@ matchFields hooks ((pat, t) : rest) acc = do
 
 apply :: IHCHooks -> Val -> Thunk -> IO Val
 apply _     (VFun f)                    arg = f arg
+apply _     (VFieldAccessor _ _ f)      arg = f arg
 apply _     (VFunIP _ f)                arg = f Map.empty arg
 apply _     (VClassMethod _ _ tags go)  arg = go tags arg
 -- Source may see the compiler/runtime state-token newtype constructors
@@ -2612,6 +2754,7 @@ apply _     v                           _   = error ("IHC.Eval.apply: not a func
 -- implicit params flow from the call site into the callee.
 applyIP :: IHCHooks -> ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _     _         (VFun f)                   arg = f arg
+applyIP _     _         (VFieldAccessor _ _ f)     arg = f arg
 applyIP _     callerIPM (VFunIP _ f)               arg = f callerIPM arg
 applyIP _     _         (VClassMethod _ _ tags go) arg = go tags arg
 applyIP _     _         (VCon n [])                arg

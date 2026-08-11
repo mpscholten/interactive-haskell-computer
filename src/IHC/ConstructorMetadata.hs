@@ -5,6 +5,7 @@ module IHC.ConstructorMetadata
     , ConstructorTypeRegistry
     , constructorMetadataFromScheme
     , constructorScheme
+    , constructorMetadata
     , constructorFieldTypes
     , constructorFieldTypeAt
     , globalConstructorTypeRegistryRef
@@ -83,16 +84,20 @@ constructorMetadataFromScheme identity' isDataFamily (Scheme vars preds body)
 constructorScheme
     :: ConstructorTypeRegistry -> Maybe Name -> Name -> Maybe Scheme
 constructorScheme registry requestedOwner requestedCtor = do
-    identity' <- resolveIdentity
-    metadata <- Map.lookup identity' registry
-    if ctmIdentity metadata /= identity'
-        || ctmDataFamily metadata
+    metadata <- constructorMetadata registry requestedOwner requestedCtor
+    if ctmDataFamily metadata
         || not (null (ctmExistentialVars metadata))
       then Nothing
       else Just (Scheme
             (ctmQuantifiedVars metadata)
             []
             (foldr TyArrow (ctmResultType metadata) (ctmFieldTypes metadata)))
+constructorMetadata
+    :: ConstructorTypeRegistry -> Maybe Name -> Name
+    -> Maybe ConstructorTypeMetadata
+constructorMetadata registry requestedOwner requestedCtor = do
+    identity' <- resolveIdentity
+    Map.lookup identity' registry
   where
     (ctorQualifier, bareCtor) = splitQualified requestedCtor
     localIdentity = (`ConstructorIdentity` bareCtor) <$> requestedOwner
