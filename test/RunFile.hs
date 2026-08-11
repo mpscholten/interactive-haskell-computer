@@ -226,6 +226,16 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
                 (TyApp (TyCon (n "Box")) (TyCon (n "Text")))
                 `shouldBe` Just [TyCon (n "Text"), TyCon (n "Int")]
 
+        it "preserves constrained forall evidence on record fields" do
+            src <- readSourceFile "test/Fixtures/ConstructorMetadataRankNRecord.hs"
+            reg <- scanConstructorTypeMetadata (n "RankNRecord") src
+            constructorFieldTypes reg (Just (n "RankNRecord")) (n "Packed")
+                (TyApp (TyCon (n "Packed")) int)
+                `shouldBe` Just
+                    [ TyForall [n "m"] [Pred (n "Choose") [TyVar (n "m")]]
+                        (TyApp (TyVar (n "m")) int)
+                    ]
+
         it "scans complete H98 alternatives, strict fields, and type atoms" do
             src <- readSourceFile "test/Fixtures/ConstructorMetadataH98Positive.hs"
             reg <- scanConstructorTypeMetadata (n "Positive") src
