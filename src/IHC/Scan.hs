@@ -2485,8 +2485,11 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                     case fieldsResult of
                         Left badCur -> pure (Left badCur)
                         Right (fieldToks, afterCtor, ended) -> do
-                            let schemeType (Scheme _ _ ty) = ty
-                                fields = traverse (fmap schemeType . parseScheme) fieldToks
+                            let schemeType toks (Scheme vars' preds ty) = case toks of
+                                    TTForall : _ -> TyForall vars' preds ty
+                                    _ -> ty
+                                fields = traverse (\toks -> schemeType toks <$> parseScheme toks)
+                                    fieldToks
                                 identity' = ConstructorIdentity owner ctor
                                 metadata = fields >>= \fieldTypes ->
                                     constructorMetadataFromScheme identity' False
