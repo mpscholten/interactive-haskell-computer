@@ -32,8 +32,10 @@ module IHC.Scan
       -- * Data declarations
     , DataRegistry
     , FieldRegistry
+    , FieldSchemeRegistry
     , TypeCtorRegistry
     , scanDataDecls
+    , scanRecordSelectorSchemes
     , scanConstructorTypeMetadata
       -- * Per-constructor strict-field bitmap (A.5)
     , lookupCtorStrictness
@@ -85,7 +87,7 @@ import IHC.FFI (FFIType(..), ForeignDecl(..), Safety(..), CallConv(..))
 import IHC.Lexer
 import IHC.Source
 import IHC.StringUtils (isAsciiSpace, trimAscii)
-import IHC.TypeAST (Type(..), Pred(..), Scheme(..), TypeSynonym(..))
+import IHC.TypeAST (Type(..), Pred(..), Scheme(..), TypeSynonym(..), tyApps)
 import IHC.TypeSchemeParser
     ( TTok(..), tokenKindToTT, parseScheme, parseType, parseTypeAtoms
     , parseTypeKinds )
@@ -1858,6 +1860,110 @@ type DataRegistry = Map ByteString (ByteString, Int, Int)
 -- constructor name — which is the observable type tag — to pick the
 -- right index.
 type FieldRegistry = Map ByteString [(ByteString, Int)]
+
+-- | Source-derived selector schemes, keyed by field name.  The constructor
+-- key keeps duplicate record fields unambiguous; the owning module is carried
+-- by 'LoadedModule', alongside this immutable registry.
+type FieldSchemeRegistry = Map ByteString [(ByteString, Scheme)]
+
+-- | Scan Haskell-98 record declarations and retain the type of each selector.
+-- Unlike 'FieldRegistry', this metadata is not an evaluator layout detail: it
+-- is lexical type evidence and therefore survives module-cache resets.
+scanRecordSelectorSchemes :: Source -> IO FieldSchemeRegistry
+scanRecordSelectorSchemes src = memoiseScan "recordSelectorSchemes" src (go Map.empty startCursor)
+  where
+    go acc cur =
+        let (tok, cur') = nextToken src cur
+        in case tkKind tok of
+            TkEof -> pure acc
+            k | tkCol tok == 1, k == TkData || k == TkNewtype ->
+                scanHead cur' >>= \case
+                    Nothing -> go acc cur'
+                    Just (tyCon, tyVars, tyPreds, afterEq) -> do
+                        (found, afterDecl) <- scanCtors tyCon tyVars tyPreds afterEq
+                        go (Map.unionWith (++) found acc) afterDecl
+            _ -> go acc cur'
+
+    scanHead = collectHead []
+    collectHead rev cur =
+        let (tok, cur') = nextToken src cur
+        in case tkKind tok of
+            TkEq -> pure $ do
+                Scheme vars preds body <- parseScheme (reverse rev)
+                (tyCon, tyVars) <- recordHead body
+                pure (tyCon, if null vars then tyVars else vars, preds, cur')
+            TkWhere -> pure Nothing -- GADT record syntax needs its signature parser.
+            TkEof -> pure Nothing
+            TkNewline -> collectHead rev cur'
+            _ -> case tokenKindToTT (tkKind tok) of
+                Just tt -> collectHead (tt : rev) cur'
+                Nothing -> pure Nothing
+
+    recordHead ty = case tyApps ty of
+        (TyCon tyCon, args)
+            | Just vars <- traverse asVar args -> Just (tyCon, vars)
+        _ -> Nothing
+    asVar (TyVar v) = Just v
+    asVar _ = Nothing
+
+    scanCtors tyCon tyVars tyPreds = seek Map.empty
+      where
+        recordTy = foldl TyApp (TyCon tyCon) (map TyVar tyVars)
+        seek acc cur =
+            let (tok, cur') = nextToken src cur
+            in case tkKind tok of
+                TkEof -> pure (acc, cur)
+                _ | tkCol tok == 1, tkKind tok /= TkNewline -> pure (acc, cur)
+                TkConId ctor -> seekBrace acc ctor cur'
+                TkPrimId ctor -> seekBrace acc ctor cur'
+                _ -> seek acc cur'
+        seekBrace acc ctor cur =
+            let (tok, cur') = nextToken src cur
+            in case tkKind tok of
+                TkLBrace -> fields acc ctor [] cur'
+                TkBar -> seek acc cur'
+                TkEof -> pure (acc, cur)
+                _ | tkCol tok == 1, tkKind tok /= TkNewline -> pure (acc, cur)
+                _ -> seekBrace acc ctor cur'
+        fields acc ctor pending cur =
+            let (tok, cur') = nextToken src cur
+            in case tkKind tok of
+                TkRBrace -> seek acc cur'
+                TkEof -> pure (acc, cur)
+                TkComma -> fields acc ctor pending cur'
+                TkNewline -> fields acc ctor pending cur'
+                TkBang -> fields acc ctor pending cur'
+                TkIdent field ->
+                    let (sep, afterSep) = nextToken src cur'
+                    in case tkKind sep of
+                        TkDColon -> do
+                            let (typeToks, afterTy) = collectType 0 [] afterSep
+                                add (Scheme qs ps fieldTy) =
+                                    let qs' = foldr (\v vs -> if v `elem` vs then vs else v:vs) qs tyVars
+                                        selector = Scheme qs' (tyPreds ++ ps)
+                                            (TyArrow recordTy fieldTy)
+                                    in foldr (\label -> Map.insertWith (++) label [(ctor, selector)])
+                                        acc (reverse (field : pending))
+                            fields (maybe acc add (parseScheme typeToks)) ctor [] afterTy
+                        TkComma -> fields acc ctor (field : pending) afterSep
+                        _ -> fields acc ctor [] cur'
+                _ -> fields acc ctor [] cur'
+
+    collectType depth rev cur =
+        let (tok, cur') = nextToken src cur
+            finish = (reverse rev, cur)
+            push = case tokenKindToTT (tkKind tok) of
+                Just tt -> collectType depth (tt:rev) cur'
+                Nothing -> collectType depth rev cur'
+        in case tkKind tok of
+            TkEof -> finish
+            TkComma | depth == 0 -> finish
+            TkRBrace | depth == 0 -> finish
+            TkLParen -> collectType (depth + 1) (TTLParen:rev) cur'
+            TkRParen -> collectType (max 0 (depth - 1)) (TTRParen:rev) cur'
+            TkLBracket -> collectType (depth + 1) (TTLBracket:rev) cur'
+            TkRBracket -> collectType (max 0 (depth - 1)) (TTRBracket:rev) cur'
+            _ -> push
 
 -- | Map from type-constructor name to the list of data-constructor names
 -- that type declares. Built by 'scanDataDecls' alongside 'DataRegistry'.
