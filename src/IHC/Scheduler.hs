@@ -10223,6 +10223,7 @@ buildEmptyStubModule name = do
         , lmKnown       = known
         , lmDataReg     = Map.empty
         , lmFieldReg    = Map.empty
+        , lmFieldSchemes = Map.empty
         , lmTypeCtorReg = Map.empty
         , lmConstructorTypes = Map.empty
         , lmBodies      = bodies
@@ -10239,6 +10240,7 @@ buildLoadedModule :: ModuleName -> Bool -> ModuleHeader -> Source -> IO LoadedMo
 buildLoadedModule name isEntry header src = do
     known               <- emptyKnownSymbols
     (dataR, fldR, tCtR) <- scanDataDecls src
+    fieldSchemes         <- scanRecordSelectorSchemes src
     constructorTypes     <- scanConstructorTypeMetadata name src
     tfReg               <- scanTypeFamilyDecls src
     foreigns            <- scanForeignImports src
@@ -10272,6 +10274,7 @@ buildLoadedModule name isEntry header src = do
         , lmKnown       = known
         , lmDataReg     = dataR
         , lmFieldReg    = fldR
+        , lmFieldSchemes = fieldSchemes
         , lmTypeCtorReg = tCtR
         , lmConstructorTypes = constructorTypes
         , lmBodies      = bodies
@@ -10280,9 +10283,18 @@ buildLoadedModule name isEntry header src = do
         , lmNoFieldSelectors = hasNoFieldSelectors src
         , lmTypeFamilies     = tfReg
         , lmForeignDecls     = foreigns
-        , lmTypeSigs         = Map.fromList sigs
+        -- Record selectors are ordinary source-defined top-level functions.
+        -- Make their schemes available to the same owner-scoped lookup path
+        -- as written signatures; explicit declarations win defensively.
+        , lmTypeSigs         = Map.union (Map.fromList sigs)
+            (Map.mapMaybe firstScheme fieldSchemes)
         , lmTypeSynonyms     = Map.fromList synonyms
         }
+  where
+    firstScheme ((_, scheme) : rest)
+        | all ((== scheme) . snd) rest = Just scheme
+        | otherwise = Nothing -- DuplicateRecordFields with incompatible types.
+    firstScheme [] = Nothing
 
 -- | Fork a cached 'LoadedModule' for use in a fresh
 -- 'loadProgramFromSource' run.  Returns a copy that shares all the

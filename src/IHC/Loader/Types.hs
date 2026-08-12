@@ -24,7 +24,7 @@ import IHC.ConstructorMetadata (ConstructorTypeRegistry)
 import qualified IHC.FFI as FFI
 import IHC.ModuleHeader (ModuleHeader, ModuleName)
 import IHC.Parser (FixityTable)
-import IHC.Scan (DataRegistry, FieldRegistry, KnownSymbols, TypeCtorRegistry)
+import IHC.Scan (DataRegistry, FieldRegistry, FieldSchemeRegistry, KnownSymbols, TypeCtorRegistry)
 import IHC.Source (Source)
 import qualified IHC.TypeAST
 import qualified IHC.TypeReduce as TR
@@ -36,6 +36,10 @@ data LoadedModule = LoadedModule
     , lmKnown       :: !KnownSymbols
     , lmDataReg     :: !DataRegistry
     , lmFieldReg    :: !FieldRegistry
+      -- | Selector schemes derived directly from source record declarations.
+      -- Immutable and owner-scoped by this 'LoadedModule', so unlike global
+      -- signature mirrors they survive per-run registry resets safely.
+    , lmFieldSchemes :: !FieldSchemeRegistry
       -- | Map from type-constructor name to the data constructors it
       -- declares. Built by 'scanDataDecls' alongside 'lmDataReg'. Used by
       -- 'exportsName' so that @T(..)@ and @T(Ctor1, Ctor2)@ exports match
