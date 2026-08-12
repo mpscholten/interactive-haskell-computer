@@ -24,6 +24,7 @@ module IHC.Eval
     , runIOVal
     , ownerSentinelKey
     , currentOwner
+    , hostQuasiMethodVal
     ) where
 
 import Control.Exception (throwIO)
@@ -225,13 +226,72 @@ elaborateExpectedArg hooks owner f x = do
     orElse (Just a) _ = Just a
     orElse Nothing  b = b
 
+-- | Compiler-intrinsic Quasi methods.
+--
+-- @location = Q qLocation@ and @instance Quasi Q where qLocation = location@
+-- are a source knot.  @instance Quasi IO@ stubs the same methods with
+-- @badIO@.  Neither can produce a 'Loc'.  GHC fills this dictionary in the
+-- compiler; IHC does the same when the method is forced, without replacing
+-- the source @location@ function.  The Q newtype still wraps the action so
+-- the enclosing carrier stays @Q a@.
+--
+-- @loc_start@ / @loc_filename@ stay source record selectors.  The Loc
+-- value uses the source constructor layout so owner-scoped schemes
+-- ('lmFieldSchemes') project the right fields.
+hostQuasiMethodVal :: Name -> Maybe Val
+hostQuasiMethodVal method
+    | method == BC.pack "qLocation" =
+        Just (VIO buildHostLoc)
+    | method == BC.pack "qExtsEnabled" =
+        Just (VIO (pure (VCon "[]" [])))
+    | method == BC.pack "qIsExtEnabled" =
+        Just (VFun $ \_extT -> pure (VIO (pure (VCon "False" []))))
+    | otherwise = Nothing
+
+isQuasiClass :: Name -> Bool
+isQuasiClass cls = bareMethodName cls == BC.pack "Quasi"
+
+bareMethodName :: Name -> Name
+bareMethodName n = case BC.elemIndexEnd '.' n of
+    Just idx -> BC.drop (idx + 1) n
+    Nothing  -> n
+
+-- | Dummy splice location.  Line/column are 1-based so megaparsec's
+-- @mkPos@ (used by HSX's @findHSXPosition@) does not throw
+-- 'InvalidPosException'.
+buildHostLoc :: IO Val
+buildHostLoc = do
+    filenameT <- newWHNFThunk =<< charListVal "<ihc-no-source-loc>"
+    packageT  <- newWHNFThunk =<< charListVal "main"
+    moduleT   <- newWHNFThunk =<< charListVal "Main"
+    startT    <- newWHNFThunk =<< charPosVal 1 1
+    endT      <- newWHNFThunk =<< charPosVal 1 1
+    pure (VCon "Loc" [filenameT, packageT, moduleT, startT, endT])
+
+charPosVal :: Int64 -> Int64 -> IO Val
+charPosVal line col = do
+    lineT <- newWHNFThunk (VInt line)
+    colT  <- newWHNFThunk (VInt col)
+    pure (VCon "(,)" [lineT, colT])
+
+charListVal :: String -> IO Val
+charListVal [] = pure (VCon "[]" [])
+charListVal (c:cs) = do
+    cT <- newWHNFThunk (VChar c)
+    restT <- newWHNFThunk =<< charListVal cs
+    pure (VCon ":" [cT, restT])
+
 -- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
 -- method in the class registry; if the instance registered a
 -- 'methodPlaceholder' (class default with no per-instance override),
 -- falls back to a known-equivalent method (e.g. Monad.return →
 -- Applicative.pure).
 resolveTypedMethod :: IHCHooks -> ClassRegistry -> Name -> Name -> Name -> IO Val
-resolveTypedMethod hooks reg cls method tag = do
+resolveTypedMethod hooks reg cls method tag
+    | isQuasiClass cls
+    , Just host <- hostQuasiMethodVal (bareMethodName method)
+    = pure host
+    | otherwise = do
     resolved <- tryResolve
     case resolved of
         Just v  -> forceMethodVal hooks v
@@ -3490,6 +3550,9 @@ evalQuote hooks env ipm (ESplice hole) = do
     unwrapOneQuoteSplice value
   where
     unwrapOneQuoteSplice (VIO action) = action
+    unwrapOneQuoteSplice (VCon "Q" [actionT]) = do
+        inner <- force hooks actionT
+        unwrapOneQuoteSplice inner
     unwrapOneQuoteSplice value        = pure value
 -- Unsupported forms: emit a VarE "<unsupported>" placeholder.
 evalQuote _hooks _env _ipm _ = do

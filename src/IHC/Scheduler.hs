@@ -122,7 +122,7 @@ import IHC.Classes
     , resetSessionHooks
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
-import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey)
+import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey, hostQuasiMethodVal)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
@@ -3988,8 +3988,17 @@ lookupInSharedRegMultiForced cls tags methodName = do
 -- Remaining arguments (if any) flow through naturally via
 -- the returned VFun's own arity.
 classMethodDispatcher :: ClassRegistry -> ByteString -> ByteString -> Val
-classMethodDispatcher reg cls methodName = selfVal
+classMethodDispatcher reg cls methodName
+    -- Compiler-intrinsic Quasi leaves (qLocation, qExtsEnabled, …).
+    -- Source Quasi Q is circular and Quasi IO stubs these with badIO.
+    | bareCls == BC.pack "Quasi"
+    , Just host <- hostQuasiMethodVal methodName
+    = host
+    | otherwise = selfVal
   where
+    bareCls = case BC.elemIndexEnd '.' cls of
+        Just idx -> BC.drop (idx + 1) cls
+        Nothing  -> cls
     -- We knot-tie `selfVal` so the closure can return it as a
     -- "not dispatched" marker when tag-path lookup misses — matchPat
     -- in Eval treats a returned VClassMethod as "no match".
