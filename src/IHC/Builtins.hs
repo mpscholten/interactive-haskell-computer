@@ -4536,6 +4536,15 @@ pokeByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VFun $ \c -> pure 
                                     pure VUnit
                                 _ -> error ("pokeByteOff: W8#/IS inner not Int: "
                                             <> showValForDebug inner)
+                    -- Default Storable.pokeByteOff = poke (ptr `plusPtr` off)
+                    -- lands here when instance Storable AddrInfo.poke is not
+                    -- selected (with hints → poke ptr hints). Same C
+                    -- struct-addrinfo layout as pokeB / pokeAddrInfoHintsVal.
+                    VCon c _
+                        | c == BC.pack "AddrInfo" -> do
+                            pokeAddrInfoHintsVal
+                                (p `plusPtr` fromIntegral off) cv
+                            pure VUnit
                     _ | off == 24 || off == 32 || off == 40 -> do
                         ptr <- ptrValToPtr cv
                         pokeByteOff (castPtr p :: Ptr Word64) (fromIntegral off)

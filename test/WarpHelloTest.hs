@@ -13,14 +13,15 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: post-accept hang (~100% CPU) with no HTTP body.\
-                    \ Fixed along the way: nested where on let (S.foldl'/\
-                    \ readInt64), Storable.peekElemOff default Int (http-date\
-                    \ month tables; was Char → fromIntegral+48 I# crash),\
-                    \ class-method single-tag apply, Natural NS/NB,\
-                    \ Category (->) baseDot, fromInteger∘toInteger recovery.\
-                    \ parseHeaderLines/composeHeader/packStatus green;\
-                    \ remaining spin likely date auto-update or response path."
+        pendingWith "Pending: run dies before listen with\
+                    \ PatternMatchFail I# I# args=8 Unknown.\
+                    \ GHC.Internal.Num.- is a VFun bound to\
+                    \ Data.Text.Internal.Fusion.Size.subtractSize (Settings\
+                    \ imports Text → Num Size). allocaBytesAligned\
+                    \ isPowerOfTwo does 8 .&. (8-1); Size (-) on Ints\
+                    \ yields Unknown. getAddrInfo/with-hints and alloca\
+                    \ after Size import are green; the Alloc.isPowerOfTwo\
+                    \ rewrite still sees the Size VFun."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle
