@@ -368,7 +368,7 @@ valKindTag = \case
     VStr _            -> "VStr"
     VUnit             -> "VUnit"
     VFun _            -> "VFun"
-    VFieldAccessor n _ _ -> "VFieldAccessor:" <> BC.unpack n
+    VFieldAccessor n _ _ _ -> "VFieldAccessor:" <> BC.unpack n
     VFunIP _ _        -> "VFunIP"
     VCon n _          -> "VCon:" <> BC.unpack n
     VIO _             -> "VIO"
@@ -716,24 +716,31 @@ eval hooks env ipm = go
     tryTypedField (EApp selector recordExpr) ty = do
         selectorVal <- go selector
         case selectorVal of
-            VFieldAccessor _ clauses _ -> do
+            VFieldAccessor _ clauses evidence _ -> do
                 recordVal <- go recordExpr
                 case recordVal of
                     VCon ctor fields
                         | Just idx <- lookup ctor clauses
                         , idx < length fields -> do
                             owner <- currentOwner hooks env
-                            registry <- readIORef globalConstructorTypeRegistryRef
-                            case constructorMetadata registry owner ctor of
-                                Just metadata
-                                    | idx < length (ctmFieldTypes metadata)
-                                    , let fieldTy = ctmFieldTypes metadata !! idx
-                                    , containsForall fieldTy -> do
+                            case agreedFieldEvidence ctor evidence of
+                                Just (scheme, fieldOwner)
+                                    | schemeNeedsElaboration scheme -> do
                                         view <- newIORef (TypedField (fields !! idx)
-                                            (fieldScheme fieldTy)
-                                            (ciOwner (ctmIdentity metadata)))
+                                            scheme fieldOwner)
                                         specializeTypedField view ty
-                                _ -> pure Nothing
+                                _ -> do
+                                    registry <- readIORef globalConstructorTypeRegistryRef
+                                    case constructorMetadata registry owner ctor of
+                                        Just metadata
+                                            | idx < length (ctmFieldTypes metadata)
+                                            , let fieldTy = ctmFieldTypes metadata !! idx
+                                            , containsForall fieldTy -> do
+                                                view <- newIORef (TypedField (fields !! idx)
+                                                    (fieldScheme fieldTy)
+                                                    (ciOwner (ctmIdentity metadata)))
+                                                specializeTypedField view ty
+                                        _ -> pure Nothing
                     _ -> pure Nothing
             _ -> pure Nothing
     tryTypedField _ _ = pure Nothing
@@ -2734,12 +2741,109 @@ matchFields hooks ((pat, t) : rest) acc = do
         Just subs -> matchFields hooks rest (reverse subs ++ acc)
 
 --------------------------------------------------------------------------------
+-- Record-selector scheme consumption
+--------------------------------------------------------------------------------
+
+-- | Fail-closed per-constructor evidence. Duplicate disagreeing schemes
+-- are treated as missing so we never elaborate with the wrong residual.
+agreedFieldEvidence :: Name -> [(Name, Scheme, Name)] -> Maybe (Scheme, Name)
+agreedFieldEvidence ctor evidence = case matches of
+    [] -> Nothing
+    first : rest
+        | all (== first) rest -> Just first
+        | otherwise -> Nothing
+  where
+    matches = [(scheme, owner) | (ctor', scheme, owner) <- evidence, ctor' == ctor]
+
+-- | Only function / quantified field types need residual-scheme
+-- elaboration. Ordinary payload projections stay on the cheap force path.
+schemeNeedsElaboration :: Scheme -> Bool
+schemeNeedsElaboration (Scheme _ _ ty) = go ty
+  where
+    go TyArrow{} = True
+    go TyForall{} = True
+    go (TyApp f x) = go f || go x
+    go _ = False
+
+projectedFieldHeadName :: Expr -> Maybe Name
+projectedFieldHeadName (EApp f _) = projectedFieldHeadName f
+projectedFieldHeadName (ETyApp f _) = projectedFieldHeadName f
+projectedFieldHeadName (EVar n) = Just n
+projectedFieldHeadName _ = Nothing
+
+-- | Project a record field and, when durable selector evidence exists,
+-- elaborate the residual field scheme before returning the payload.
+-- Canonical field thunks stay shared; elaboration only evaluates a view.
+applyFieldAccessor
+    :: IHCHooks
+    -> [(Name, Int)]
+    -> [(Name, Scheme, Name)]
+    -> (Thunk -> IO Val)
+    -> Thunk
+    -> IO Val
+applyFieldAccessor hooks clauses evidence fallback recordT = do
+    recordVal <- force hooks recordT
+    case recordVal of
+        VCon "SomeException" [innerT] ->
+            applyFieldAccessor hooks clauses evidence fallback innerT
+        VCon ctor fields
+            | Just idx <- lookup ctor clauses
+            , idx < length fields
+            , Just (scheme, fieldOwner) <- agreedFieldEvidence ctor evidence
+            , schemeNeedsElaboration scheme -> do
+                mElab <- tryElaborateProjectedField hooks (fields !! idx) scheme fieldOwner
+                case mElab of
+                    Just v -> pure v
+                    Nothing -> fallback recordT
+        _ -> fallback recordT
+
+tryElaborateProjectedField
+    :: IHCHooks
+    -> Thunk
+    -> Scheme
+    -> Name
+    -> IO (Maybe Val)
+tryElaborateProjectedField hooks fieldThunk scheme fieldOwner = do
+    state <- readIORef fieldThunk
+    case state of
+        TypedField canonical innerScheme innerOwner ->
+            tryElaborateProjectedField hooks canonical innerScheme innerOwner
+        Unevaluated (Closure closureEnv closureIpm closureExpr) -> do
+            mReg <- getSharedClassReg legacyHooks
+            case mReg of
+                Nothing -> pure Nothing
+                Just classReg -> do
+                    sigs0 <- readIORef globalTypeSigsRef
+                    syns <- readIORef globalTypeSynonymsRef
+                    ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                    mHeadScheme <- case projectedFieldHeadName closureExpr of
+                        Just method -> lookupTypeSigFallback hooks
+                            (Just fieldOwner) method
+                        Nothing -> pure Nothing
+                    let sigs = case (projectedFieldHeadName closureExpr, mHeadScheme) of
+                          (Just method, Just headScheme) ->
+                            Map.insert (bareName method) headScheme
+                                (Map.insert method headScheme sigs0)
+                          _ -> sigs0
+                        Scheme _ _ expected = scheme
+                    result <- try (Elab.elaborateOwned classReg sigs syns
+                        ctorTypes (Just fieldOwner)
+                        (Elab.ExpectType expected) closureExpr)
+                        :: IO (Either SomeException (Expr, TA.Type))
+                    case result of
+                        Right (specialized, _) ->
+                            Just <$> eval hooks closureEnv closureIpm specialized
+                        Left _ -> pure Nothing
+        _ -> pure Nothing
+
+--------------------------------------------------------------------------------
 -- apply
 --------------------------------------------------------------------------------
 
 apply :: IHCHooks -> Val -> Thunk -> IO Val
 apply _     (VFun f)                    arg = f arg
-apply _     (VFieldAccessor _ _ f)      arg = f arg
+apply hooks (VFieldAccessor _ clauses evidence f) arg =
+    applyFieldAccessor hooks clauses evidence f arg
 apply _     (VFunIP _ f)                arg = f Map.empty arg
 apply _     (VClassMethod _ _ tags go)  arg = go tags arg
 -- Source may see the compiler/runtime state-token newtype constructors
@@ -2773,7 +2877,8 @@ apply _     v                           _   = error ("IHC.Eval.apply: not a func
 -- implicit params flow from the call site into the callee.
 applyIP :: IHCHooks -> ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _     _         (VFun f)                   arg = f arg
-applyIP _     _         (VFieldAccessor _ _ f)     arg = f arg
+applyIP hooks _         (VFieldAccessor _ clauses evidence f) arg =
+    applyFieldAccessor hooks clauses evidence f arg
 applyIP _     callerIPM (VFunIP _ f)               arg = f callerIPM arg
 applyIP _     _         (VClassMethod _ _ tags go) arg = go tags arg
 applyIP _     _         (VCon n [])                arg
@@ -2926,13 +3031,11 @@ doMonadicSequence hooks env ipm mv mBind rest = do
     actT <- newWHNFThunk mv
     let actName = BC.pack "$doAct"
         envAct  = extendEnv actName actT env
-        -- Reaching this path with a function-shaped action currently means
-        -- the source-loaded ParsecT carrier (Maybe, ST, and IO have dedicated
-        -- representations above).  Preserve that result context for a final
-        -- unannotated pure/return.  Otherwise optimistic result defaulting
-        -- selects IO and feeds an IO state function into ParsecT's next
-        -- continuation, eventually corrupting the parser input.
-        restE   = EDo (annotateParsecResult rest)
+        -- Use the first action's runtime constructor as the result
+        -- carrier for a final unannotated pure/return.  Function-shaped
+        -- actions (newtype-transparent ParsecT) keep the historical
+        -- ParsecT default; a Q action must not be rewritten to ParsecT.
+        restE   = EDo (annotateCarrierResult (monadicCarrierTag mv) rest)
         bodyE   = case mBind of
             Nothing ->
                 EApp (EApp (EVar ">>") (EVar actName)) restE
@@ -2945,31 +3048,39 @@ doMonadicSequence hooks env ipm mv mBind rest = do
     eval hooks envAct ipm bodyE
 
 -- | Attach the carrier type to the result-polymorphic final action in a
--- source-shaped ParsecT do-block.  This is the small amount of expected-type
+-- source-shaped do-block.  This is the small amount of expected-type
 -- propagation needed for @do { x <- p; pure x }@ without globally changing
 -- the IO-first default used by warp and ordinary IO programs.
-annotateParsecResult :: [Stmt] -> [Stmt]
-annotateParsecResult [] = []
-annotateParsecResult [SExpr e] = [SExpr (annotatePureLike e)]
-annotateParsecResult (s:ss) = s : annotateParsecResult ss
+monadicCarrierTag :: Val -> Name
+monadicCarrierTag (VCon name _)
+    | name /= BC.pack ":"
+    , name /= BC.pack "[]"
+    , name /= BC.pack "(,)"
+    , name /= BC.pack "(#,#)" = name
+monadicCarrierTag _ = BC.pack "ParsecT"
 
-annotatePureLike :: Expr -> Expr
-annotatePureLike (EApp (EVar n) x)
+annotateCarrierResult :: Name -> [Stmt] -> [Stmt]
+annotateCarrierResult _ [] = []
+annotateCarrierResult carrier [SExpr e] = [SExpr (annotatePureLike carrier e)]
+annotateCarrierResult carrier (s:ss) = s : annotateCarrierResult carrier ss
+
+annotatePureLike :: Name -> Expr -> Expr
+annotatePureLike carrier (EApp (EVar n) x)
     | bareName n == BC.pack "pure" || bareName n == BC.pack "return" =
-        EApp (ETyApp (EVar n) (BC.pack "ParsecT")) (annotatePureLike x)
-annotatePureLike e = case e of
+        EApp (ETyApp (EVar n) carrier) (annotatePureLike carrier x)
+annotatePureLike carrier e = case e of
     -- Only propagate through result-position constructs. Rewriting arbitrary
     -- application arguments or let RHSs could retag a genuinely nested
-    -- Maybe/IO @pure@ as ParsecT.
-    ELam n b -> ELam n (annotatePureLike b)
-    ELet bs b -> ELet bs (annotatePureLike b)
-    ECase s as -> ECase (annotatePureLike s)
-        [Alt p (annotatePureLike rhs) | Alt p rhs <- as]
-    EIf c t f -> EIf (annotatePureLike c) (annotatePureLike t)
-                    (annotatePureLike f)
-    EDo ss -> EDo (annotateParsecResult ss)
-    ETyApp x ty -> ETyApp (annotatePureLike x) ty
-    ELocalSig ty x -> ELocalSig ty (annotatePureLike x)
+    -- Maybe/IO @pure@ as the surrounding carrier.
+    ELam n b -> ELam n (annotatePureLike carrier b)
+    ELet bs b -> ELet bs (annotatePureLike carrier b)
+    ECase s as -> ECase (annotatePureLike carrier s)
+        [Alt p (annotatePureLike carrier rhs) | Alt p rhs <- as]
+    EIf c t f -> EIf (annotatePureLike carrier c) (annotatePureLike carrier t)
+                    (annotatePureLike carrier f)
+    EDo ss -> EDo (annotateCarrierResult carrier ss)
+    ETyApp x ty -> ETyApp (annotatePureLike carrier x) ty
+    ELocalSig ty x -> ELocalSig ty (annotatePureLike carrier x)
     _ -> e
 
 bareName :: Name -> Name

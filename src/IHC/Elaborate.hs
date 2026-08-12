@@ -41,7 +41,8 @@ import IHC.ConstructorMetadata
     ( ConstructorTypeRegistry, constructorScheme )
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
-import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
+import IHC.TypeGlobals
+    ( globalClassMethodNamesRef, globalAmbiguousSigsRef, globalMethodClassRef )
 import IHC.TypeSchemeParser (parseSchemeBytes)
 import IHC.TypeUnify
 
@@ -213,6 +214,26 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
             (unify sub expected actual)
         pure (ETyApp (EVar name) expectedBytes, applySubst sub' expected,
             map (applySubstPred sub') actualPreds, sub')
+    -- Nullary class methods such as @location :: Quasi m => m Loc@ have
+    -- no standalone top-level signature (they live in the class decl).
+    -- When the do-block expected type is @Q t@, pin the method to that
+    -- monad instead of leaving a bare EVar for value-directed ParsecT.
+    (EVar name, _)
+      | Set.member (bareName name) (ieClassMethodNames ienv)
+      , Just (monadTy, _) <- splitMonadType expected
+      , let tag = typeDispatchTag (expandSyn (ieSynonyms ienv) monadTy)
+      , not (BC.null tag) -> do
+            clsMap <- readIORef globalMethodClassRef
+            case Map.lookup (bareName name) clsMap of
+                Just [cls] ->
+                    pure (ETypedMethod cls (bareName name) tag,
+                        expected, [], emptySubst)
+                _ -> do
+                    (e', t, preds, sub) <- elaborateExpr ienv (EVar name)
+                    sub' <- either (throwIO . UnificationFailure) pure
+                        (unify sub expected t)
+                    pure (e', applySubst sub' expected,
+                        map (applySubstPred sub') preds, sub')
     (ELam name body, TyArrow argTy resultTy) -> do
         let ie = ienv { ieLocals = Map.insert name (Scheme [] [] argTy)
                                     (ieLocals ienv) }
@@ -222,6 +243,7 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
         pure (ELam name body', TyArrow (applySubst sub' argTy)
             (applySubst sub' bodyTy), map (applySubstPred sub') preds, sub')
     (ELet bs body, _) -> elaborateLetExpected ienv bs expected body
+    (EDo stmts, _) -> elaborateDo ienv (Just expected) stmts
     (ECase scrut alts, _) -> do
         (scrut', scrutTy, scrutPreds, scrutSub) <- elaborateExpr ienv scrut
         (alts', altPreds, finalSub) <- elaborateExpectedAlts
@@ -229,7 +251,16 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
             expected scrutSub alts
         pure (ECase scrut' alts', applySubst finalSub expected,
             map (applySubstPred finalSub) (scrutPreds ++ altPreds), finalSub)
-    _ -> elaborateExpr ienv expr
+    -- Default: infer, then pin the result to the expected type so
+    -- @location@ / @pure x@ in a @Q a@ do-block unify their monad
+    -- variable with @Q@ instead of staying a free @m@ (which later
+    -- defaulted to ParsecT at eval).
+    _ -> do
+        (e', t, preds, sub) <- elaborateExpr ienv expr
+        sub' <- either (throwIO . UnificationFailure) pure
+            (unify sub expected t)
+        pure (e', applySubst sub' expected,
+            map (applySubstPred sub') preds, sub')
 
 renderExpectedType :: Type -> Maybe ByteString
 renderExpectedType ty = case ty of
@@ -391,7 +422,7 @@ elaborateExpr ienv expr = case expr of
 
     ELet bs body -> elaborateLet ienv bs body
 
-    EDo stmts -> elaborateDo ienv stmts
+    EDo stmts -> elaborateDo ienv Nothing stmts
 
     EIf c t e -> do
         (c', ct, pc, s1) <- elaborateExpr ienv c
@@ -694,47 +725,91 @@ elaborateLetExpected ienv bs expected body = do
 -- is out of MVP scope.  This partial pass still handles common cases
 -- like @do { x <- getLine; putStrLn (... :: String) }@ where the
 -- ambiguity is localised to a single sub-expression.
-elaborateDo :: InferEnv -> [Stmt] -> IO (Expr, Type, [Pred], Subst)
-elaborateDo ienv stmts = do
-    (stmts', preds, sub) <- goStmts ienv emptySubst [] [] stmts
-    t <- TyVar <$> freshVar (ieFresh ienv)
-    pure (EDo stmts', t, preds, sub)
-  where
-    goStmts _ sub accS accP [] = pure (reverse accS, reverse accP, sub)
-    goStmts ie sub accS accP (s : rest) = do
-        (s', ie', preds, sub') <- goStmt ie sub s
-        goStmts ie' sub' (s' : accS) (preds ++ accP) rest
+unsnocStmts :: [Stmt] -> Maybe ([Stmt], Stmt)
+unsnocStmts [] = Nothing
+unsnocStmts [s] = Just ([], s)
+unsnocStmts (s:ss) = do
+    (prefix, lastS) <- unsnocStmts ss
+    Just (s:prefix, lastS)
 
-    goStmt :: InferEnv -> Subst -> Stmt -> IO (Stmt, InferEnv, [Pred], Subst)
-    goStmt ie sub stmt = case stmt of
+-- | Split @m a@ / @ParsecT e s a@ into the monad constructor application
+-- and its result argument.
+splitMonadType :: Type -> Maybe (Type, Type)
+splitMonadType ty = case tyApps ty of
+    (h, args@(_:_)) -> Just (foldl TyApp h (init args), last args)
+    _ -> Nothing
+
+elaborateDo :: InferEnv -> Maybe Type -> [Stmt] -> IO (Expr, Type, [Pred], Subst)
+elaborateDo ienv mExpected stmts = case (mExpected, unsnocStmts stmts) of
+    (Just expected, Just (prefix, lastStmt)) -> do
+        let mMonad = fst <$> splitMonadType expected
+        (prefix', ie', preds, sub) <-
+            goStmtsPrefix ienv emptySubst [] [] prefix mMonad
+        (last', _, lastPreds, lastSub) <-
+            goStmt ie' sub lastStmt (Just (applySubst sub expected))
+        let sub' = lastSub
+        pure ( EDo (prefix' ++ [last'])
+             , applySubst sub' expected
+             , map (applySubstPred sub') (preds ++ lastPreds)
+             , sub'
+             )
+    _ -> do
+        (stmts', _, preds, sub) <- goStmtsPrefix ienv emptySubst [] [] stmts Nothing
+        t <- case mExpected of
+            Just expected -> pure (applySubst sub expected)
+            Nothing -> TyVar <$> freshVar (ieFresh ienv)
+        pure (EDo stmts', t, preds, sub)
+  where
+    goStmtsPrefix ie sub accS accP [] _ =
+        pure (reverse accS, ie, reverse accP, sub)
+    goStmtsPrefix ie sub accS accP (s : rest) mMonad = do
+        stmtExpected <- case mMonad of
+            Nothing -> pure Nothing
+            Just monadTy -> do
+                a <- TyVar <$> freshVar (ieFresh ie)
+                pure (Just (TyApp (applySubst sub monadTy) a))
+        (s', ie', preds, sub') <- goStmt ie sub s stmtExpected
+        goStmtsPrefix ie' sub' (s' : accS) (preds ++ accP) rest mMonad
+
+    goStmt :: InferEnv -> Subst -> Stmt -> Maybe Type
+           -> IO (Stmt, InferEnv, [Pred], Subst)
+    goStmt ie sub stmt mStmtExpected = case stmt of
         SExpr e -> do
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            pure (SExpr e', ie, preds, composeSubst sub s')
+            (e', _t, preds, s') <- inferRhs ie sub e mStmtExpected
+            pure (SExpr e', ie, preds, s')
         SBind name e -> do
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            -- Add `name` to locals with a fresh tyvar — we don't
-            -- unify the bind's result type with `m a` yet (MVP).
-            fresh <- TyVar <$> freshVar (ieFresh ie)
+            (e', eTy, preds, s') <- inferRhs ie sub e mStmtExpected
+            let boundTy = case splitMonadType eTy of
+                    Just (_, a) -> a
+                    Nothing -> eTy
             let ie' = ie { ieLocals = Map.insert name
-                                          (Scheme [] [] fresh)
+                                          (Scheme [] [] boundTy)
                                           (ieLocals ie) }
-            pure (SBind name e', ie', preds, composeSubst sub s')
+            pure (SBind name e', ie', preds, s')
         SBangBind name e -> do
-            -- Same shape as SBind; bang is a runtime-strictness annotation,
-            -- not a type-level concern.
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            fresh <- TyVar <$> freshVar (ieFresh ie)
+            (e', eTy, preds, s') <- inferRhs ie sub e mStmtExpected
+            let boundTy = case splitMonadType eTy of
+                    Just (_, a) -> a
+                    Nothing -> eTy
             let ie' = ie { ieLocals = Map.insert name
-                                          (Scheme [] [] fresh)
+                                          (Scheme [] [] boundTy)
                                           (ieLocals ie) }
-            pure (SBangBind name e', ie', preds, composeSubst sub s')
+            pure (SBangBind name e', ie', preds, s')
         SLet bs -> do
-            -- Elaborate each binding's RHS; add names to locals.
             (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
             pure (SLet bs', ie', preds, composeSubst sub s')
         SImplicitLet bs -> do
             (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
             pure (SImplicitLet bs', ie', preds, composeSubst sub s')
+
+    inferRhs ie sub e mStmtExpected = do
+        (e', t, preds, s') <- case mStmtExpected of
+            Just expected ->
+                elaborateExpectedExpr (applySubstIenv sub ie)
+                    (applySubst sub expected) e
+            Nothing ->
+                elaborateExpr (applySubstIenv sub ie) e
+        pure (e', applySubst s' t, preds, composeSubst sub s')
 
     goLet :: InferEnv -> [(Name, Expr)] -> IO ([(Name, Expr)], InferEnv, [Pred], Subst)
     goLet ie bs = goL ie emptySubst [] [] bs

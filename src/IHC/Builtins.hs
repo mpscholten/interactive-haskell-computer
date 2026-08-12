@@ -11,6 +11,7 @@ module IHC.Builtins
     ( builtinEnv
     , buildConEnv
     , buildFieldEnv
+    , buildFieldEnvWithSchemes
     , showValWith
     , stringToListValIO
     , clearCtorIndex
@@ -99,8 +100,9 @@ import IHC.Classes
     )
 import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal, runIOVal)
-import IHC.Scan (DataRegistry, FieldRegistry, lookupCtorStrictness)
+import IHC.Scan (DataRegistry, FieldRegistry, FieldSchemeRegistry, lookupCtorStrictness)
 import IHC.TH (thBuiltinPairs)
+import IHC.TypeAST (Scheme(..), Type(..))
 import IHC.Val
 
 mkForeignPtrVal :: ForeignPtr Word8 -> IO Val
@@ -2375,7 +2377,7 @@ showVal (VCon name thunks)
             [] -> pure (BC.unpack name)
             _  -> pure (BC.unpack name <> " " <> unwords parts)
 showVal (VFun _)    = pure "<function>"
-showVal (VFieldAccessor _ _ _) = pure "<function>"
+showVal (VFieldAccessor _ _ _ _) = pure "<function>"
 showVal (VFunIP _ _) = pure "<function>"
 showVal (VClassMethod _ _ _ _) = pure "<function>"
 showVal (VLazyMethod _) = pure "<function>"
@@ -5850,7 +5852,16 @@ tryIntegerCollapse name thunks = pure (VCon name thunks)
 --
 -- The accessor is a plain @VFun@ so it participates in lazy evaluation.
 buildFieldEnv :: FieldRegistry -> IO Env
-buildFieldEnv reg = do
+buildFieldEnv = buildFieldEnvWithSchemes []
+
+-- | Build field accessors carrying owner-scoped residual field schemes.
+-- @moduleSchemes@ is @(declaring module, source-scanned selector schemes)@;
+-- incompatible per-constructor alternatives are dropped (fail closed).
+buildFieldEnvWithSchemes
+    :: [(Name, FieldSchemeRegistry)]
+    -> FieldRegistry
+    -> IO Env
+buildFieldEnvWithSchemes moduleSchemes reg = do
     pairs <- mapM mkAccessor (Map.toList reg)
     pure (HashMap.fromList pairs)
   where
@@ -5858,7 +5869,9 @@ buildFieldEnv reg = do
     -- never projects out that particular field never pays the cost.
     mkAccessor (fieldName, clauses) = do
         t <- newLazyBuiltinThunk
-            (pure (VFieldAccessor fieldName clauses (access fieldName clauses)))
+            (pure (VFieldAccessor fieldName clauses
+                (selectorFieldEvidence fieldName clauses moduleSchemes)
+                (access fieldName clauses)))
         pure (fieldName, t)
 
     -- Build a function that, given a VCon, extracts the right field.
@@ -6008,6 +6021,39 @@ buildFieldEnv reg = do
     isCharConsList (VCon "[]" []) = True
     isCharConsList (VCon ":"  [_, _]) = True
     isCharConsList _ = False
+
+-- | Residual field scheme: drop the record argument from
+-- @record -> fieldTy@ so a later application of the projected field
+-- (e.g. @quoteExp qq :: String -> Q Exp@) still has type evidence.
+selectorFieldEvidence
+    :: Name
+    -> [(Name, Int)]
+    -> [(Name, FieldSchemeRegistry)]
+    -> [(Name, Scheme, Name)]
+selectorFieldEvidence fieldName clauses moduleSchemes =
+    [ (ctor, residual, owner)
+    | (ctor, _) <- clauses
+    , Just (residual, owner) <- [agreed ctor]
+    ]
+  where
+    agreed ctor = case candidates ctor of
+        [] -> Nothing
+        first : rest
+            | all (== first) rest -> Just first
+            | otherwise -> Nothing
+    candidates ctor =
+        [ (residual, owner)
+        | (owner, schemes) <- moduleSchemes
+        , alts <- maybeToList (Map.lookup fieldName schemes)
+        , (ctor', selector) <- alts
+        , ctor' == ctor
+        , Just residual <- [selectorResidual selector]
+        ]
+    selectorResidual (Scheme qs ps (TyArrow _ result)) = Just (Scheme qs ps result)
+    selectorResidual _ = Nothing
+    maybeToList = \case
+        Nothing -> []
+        Just x  -> [x]
 
 --------------------------------------------------------------------------------
 -- Phase 2.10a: concurrency - thread primitives

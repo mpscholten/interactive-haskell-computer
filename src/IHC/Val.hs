@@ -86,7 +86,13 @@ data Val
                                        -- builtins still produce these;
                                        -- user-visible strings are [Char]
     | VFun  !(Thunk -> IO Val)         -- single-argument closure (builtins)
-    | VFieldAccessor !Name ![(Name, Int)] !(Thunk -> IO Val)
+    -- | Record-field accessor. The extra evidence is owner-scoped and
+    -- per-constructor: @[(ctor, residual field scheme, declaring module)]@.
+    -- It is attached when the accessor is built from source-scanned
+    -- 'FieldSchemeRegistry' data so a later @quoteExp qq@ application
+    -- can elaborate its residual @String -> Q Exp@ scheme. Empty when
+    -- the accessor was synthesised without that metadata.
+    | VFieldAccessor !Name ![(Name, Int)] ![(Name, Scheme, Name)] !(Thunk -> IO Val)
     -- Phase 3.6: user-defined lambda with implicit-param support.
     -- The function receives the caller's ImplicitParamMap so it can
     -- merge (lexically-bound ?params win over caller's).
@@ -169,7 +175,7 @@ showValForDebug (VFloat d)  = show d
 showValForDebug (VChar c)   = show c
 showValForDebug (VStr s)    = show (BC.unpack s)
 showValForDebug (VFun _)      = "<function>"
-showValForDebug (VFieldAccessor n _ _) = "<fieldAccessor " <> BC.unpack n <> ">"
+showValForDebug (VFieldAccessor n _ _ _) = "<fieldAccessor " <> BC.unpack n <> ">"
 showValForDebug (VFunIP _ _)  = "<function>"
 showValForDebug (VCon n _)  = "<" <> BC.unpack n <> "...>"
 showValForDebug VUnit       = "()"
