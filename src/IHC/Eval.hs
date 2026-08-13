@@ -133,53 +133,60 @@ annotateNullaryBoundedArg f x = case x of
 elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
 elaborateExpectedArg hooks owner f x = do
     initialSigs <- readIORef globalTypeSigsRef
-    ambiguousSigs <- readIORef globalAmbiguousSigsRef
-    -- Include the partially-applied callee as well as the new argument.
-    -- Owner-scoped metadata is what lets inference see a source-loaded
-    -- method's real scheme without relying on the process-global flat map.
-    (sigs, scopedSigs) <- foldM (loadPreferredSig ambiguousSigs) (initialSigs, Set.empty)
-        (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
-    if not (needsExpectedElaboration sigs x)
+    methodNames <- readIORef globalClassMethodNamesRef
+    -- Cheap reject before any signature fallback walk.  Looking up
+    -- schemes from a large owner walks a huge re-export graph.
+    -- Elaborating a nested ordinary function at the callee's argument
+    -- type (because the arg tree mentions a constrained name) can
+    -- diverge or leave a leftover function.
+    if not (needsExpectedElaboration methodNames initialSigs x)
         then pure x
-        else case appHeadAndArity f of
-            Just (fn, supplied) ->
-                case Elab.lookupScopedScheme ambiguousSigs scopedSigs sigs fn of
-                    Just (Scheme _ _ body) ->
-                        case tyArrowArgs body of
-                            (args, _) | supplied < length args -> do
-                                mReg <- getSharedClassReg legacyHooks
-                                syns <- readIORef globalTypeSynonymsRef
-                                case mReg of
-                                    Nothing -> pure x
-                                    Just classReg -> do
-                                        -- Infer the residual type of the
-                                        -- partially-applied callee first. This
-                                        -- retains substitutions learned from
-                                        -- every earlier argument, unlike merely
-                                        -- indexing the original scheme's arrow
-                                        -- list. For example, after
-                                        -- @same True@, @same :: a -> a -> a@
-                                        -- has residual domain @Bool@.
-                                        ctorTypes <- readIORef globalConstructorTypeRegistryRef
-                                        residual <- try
-                                            (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
-                                                ctorTypes owner scopedSigs
-                                                Elab.InferFreely f)
-                                            :: IO (Either SomeException (Expr, TA.Type))
-                                        let expected = case residual of
-                                                Right (_, residualTy) ->
-                                                    case tyArrowArgs residualTy of
-                                                        (argTy : _, _) -> argTy
-                                                        _ -> args !! supplied
-                                                Left _ -> args !! supplied
-                                        result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
-                                                        ctorTypes owner scopedSigs
-                                                        (Elab.ExpectType expected) x)
-                                            :: IO (Either SomeException (Expr, TA.Type))
-                                        pure (either (const x) fst result)
-                            _ -> pure x
-                    Nothing -> pure x
-            Nothing -> pure x
+        else do
+            ambiguousSigs <- readIORef globalAmbiguousSigsRef
+            -- Include the partially-applied callee as well as the new argument.
+            -- Owner-scoped metadata is what lets inference see a source-loaded
+            -- method's real scheme without relying on the process-global flat map.
+            (sigs, scopedSigs) <- foldM (loadPreferredSig ambiguousSigs) (initialSigs, Set.empty)
+                (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
+            case appHeadAndArity f of
+                Just (fn, supplied) ->
+                    case Elab.lookupScopedScheme ambiguousSigs scopedSigs sigs fn of
+                        Just (Scheme _ _ body) ->
+                            case tyArrowArgs body of
+                                (args, _) | supplied < length args -> do
+                                    mReg <- getSharedClassReg legacyHooks
+                                    syns <- readIORef globalTypeSynonymsRef
+                                    case mReg of
+                                        Nothing -> pure x
+                                        Just classReg -> do
+                                            -- Infer the residual type of the
+                                            -- partially-applied callee first. This
+                                            -- retains substitutions learned from
+                                            -- every earlier argument, unlike merely
+                                            -- indexing the original scheme's arrow
+                                            -- list. For example, after
+                                            -- @same True@, @same :: a -> a -> a@
+                                            -- has residual domain @Bool@.
+                                            ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                                            residual <- try
+                                                (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                                    ctorTypes owner scopedSigs
+                                                    Elab.InferFreely f)
+                                                :: IO (Either SomeException (Expr, TA.Type))
+                                            let expected = case residual of
+                                                    Right (_, residualTy) ->
+                                                        case tyArrowArgs residualTy of
+                                                            (argTy : _, _) -> argTy
+                                                            _ -> args !! supplied
+                                                    Left _ -> args !! supplied
+                                            result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                                            ctorTypes owner scopedSigs
+                                                            (Elab.ExpectType expected) x)
+                                                :: IO (Either SomeException (Expr, TA.Type))
+                                            pure (either (const x) fst result)
+                                _ -> pure x
+                        Nothing -> pure x
+                Nothing -> pure x
   where
     loadPreferredSig ambiguous state@(known, scoped) name
         | bareName name `elem` map BC.pack [":", "[]"] = pure state
@@ -207,14 +214,24 @@ elaborateExpectedArg hooks owner f x = do
         go (ETyApp inner _) = go inner
         go _ = Set.empty
 
-    needsExpectedElaboration sigs = go
+    -- Only *applied class-method heads* need the callee's expected type
+    -- (@f (pure x)@). A nested ordinary function with a constraint
+    -- (@snd (runParser' p s)@) must not trigger — elaborating that at
+    -- @snd@'s argument type diverges or produces a leftover function.
+    needsExpectedElaboration methodNames sigs = goApplied
       where
-        go (EVar name) = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
-            Just (Scheme _ preds _) -> not (null preds)
-            Nothing -> False
-        go (EApp innerF innerX) = go innerF || go innerX
-        go (ETyApp inner _) = go inner
-        go _ = False
+        goApplied (EApp innerF _) = goHead innerF
+        goApplied (ETyApp inner _) = goApplied inner
+        goApplied _ = False
+
+        goHead (EVar name)
+            | not (Set.member (bareName name) methodNames) = False
+            | otherwise = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
+                Just (Scheme _ preds _) -> not (null preds)
+                Nothing -> True
+        goHead (EApp innerF _) = goHead innerF
+        goHead (ETyApp inner _) = goHead inner
+        goHead _ = False
 
     appHeadAndArity = go 0
       where
@@ -412,7 +429,7 @@ eval hooks env ipm = go
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
 
     go (EVar name) = case lookupEnv name env of
-        Just t  -> force hooks t
+        Just t -> force hooks t
         Nothing
             | Just ctor <- unboxedTupleCtorValue name -> pure ctor
             | otherwise -> do

@@ -693,9 +693,8 @@ loadProgramFromSource searchPath src0 = do
                 (\k _ -> Set.member (builtinBareName k) alwaysBuiltinNames)
                 builtins
         -- Import aliases should not overwrite base entries such as
-        -- class-method dispatchers.  Network.Socket.Info.getAddrInfo is a
-        -- class selector; replacing its bare dispatcher with an alias to the
-        -- fully-qualified selector creates a self-loop.
+        -- class-method dispatchers.  Replacing a bare dispatcher with an
+        -- alias to the fully-qualified selector creates a self-loop.
         aliasesWithoutBase = HashMap.difference aliases base
         aliasBuiltinOverrides =
             HashMap.mapMaybeWithKey
@@ -4311,6 +4310,17 @@ classMethodDispatcher reg cls methodName = selfVal
                                           -- per session.  Mirrors the same hook
                                           -- 'IHC.Eval.resolveTypedMethod' calls.
                                           triggerCoreInstanceLoad legacyHooks cls
+                                          -- Also load the provider for THIS tag.
+                                          -- Class-level load of Num brings
+                                          -- GHC.Internal.Num (Integer/Natural)
+                                          -- but not GHC.Internal.Int.  Without
+                                          -- the tag load, Num.- on an I#/Int
+                                          -- misses and falls through to a later
+                                          -- Num instance (Size.subtractSize)
+                                          -- — warp allocaBytesAligned's
+                                          -- isPowerOfTwo then dies with
+                                          -- args=8 Unknown.
+                                          triggerCoreInstanceLoadForTag legacyHooks cls tag
                                           -- Re-lookup after the core-load hook may
                                           -- have populated the registry.  If still
                                           -- nothing, fall through to lazyInstanceRetry
@@ -4573,8 +4583,10 @@ classMethodDispatcher reg cls methodName = selfVal
         && maybe False isSTResultCarrierTag mArgTag
 
     resultPolymorphicDefaultTags clsName method
-        | clsName == BC.pack "GetAddrInfo"
-        , method == BC.pack "getAddrInfo" = [BC.pack "[]"]
+        -- Result-polymorphic class: the type parameter lives only in
+        -- the result (IO (t a)), so argument tags never select an
+        -- instance.  Prefer the list instance when one exists.
+        | clsName == BC.pack "GetAddrInfo" = [BC.pack "[]"]
         -- Category.id has its category parameter only in the result
         -- type. In ordinary uses like `id x`, value-directed dispatch
         -- sees `x`, not the `(->)` dictionary choice, so route the
@@ -5629,21 +5641,19 @@ exportBodies registry searchPath includeMap builtinNames lm = do
     let transform e
             | lmIsEntry lm = rewriteExpr qualifiedRewrites e
             | otherwise    = rewriteExpr rewrites e
+    -- A sentinel is (n, EVar n): "resolved via import; no local body".
+    -- Rewrite first, then drop leftover self-loops.  Filtering before
+    -- rewrite threw away facade re-exports whose import rewrite already
+    -- names the defining module.  Entry-module sentinels still rewrite
+    -- only through qualified keys, so a bare (n, EVar n) stays a
+    -- self-loop and is skipped.
     pure
-        -- Filter out foreign-alias sentinels inserted by discoverInModule.
-        -- A sentinel is an entry (n, EVar n) meaning "n resolved via import;
-        -- no local body to export".
-        -- For the ENTRY module, sentinels would create self-referential
-        -- thunks (no rewrite applied), so we skip them.
-        -- For NON-ENTRY modules, sentinels are useful: the rewrite pass
-        -- transforms (EVar n) into (EVar "Fully.Qualified.n"), producing
-        -- valid re-export aliases like "Data.List.length" -> "GHC.Internal.Data.List.length".
         [ ( keyPrefix <> n
-          , wrapNullaryResultSig lm n
-                (maybe (transform e) EVar (specialSelfAliasTarget lm n e))
+          , wrapNullaryResultSig lm n e'
           )
         | (n, e) <- Map.toList bs
-        , not (isSelfAliasIn lm n e) || isJust (specialSelfAliasTarget lm n e)
+        , let e' = maybe (transform e) EVar (specialSelfAliasTarget lm n e)
+        , not (isSelfAliasIn lm n e')
         ]
 
 -- | If a binding is an arity-0 CAF whose signature is known and whose RHS
@@ -6896,27 +6906,28 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
     -- and throws 'LoopException').  Without this,
     -- @import qualified Foreign as F@ / @F.unsafeShiftR@ dies and
     -- warp's chunked encoder never runs.
-    resolveClassMethodOrDie bare targetKey = go classMethodClasses
-      where
-        go [] = error
-            ("import alias: unresolved target "
-             <> BC.unpack targetKey)
-        go (cls:rest) = do
-            m <- lookupClassMethodFallback legacyHooks (BC.pack cls) bare
-            case m of
-                Just v  -> pure v
-                Nothing -> go rest
-        -- Classes whose methods commonly arrive only via facade
-        -- re-exports (@module Data.Bits@ from Foreign, etc.).
-        classMethodClasses =
-            [ "Bits", "FiniteBits"
-            , "Num", "Integral", "Real", "Fractional", "Floating"
-            , "RealFrac", "RealFloat"
-            , "Eq", "Ord", "Show", "Read", "Enum", "Bounded", "Ix"
-            , "Functor", "Applicative", "Monad", "Alternative", "MonadPlus"
-            , "Foldable", "Traversable", "Monoid", "Semigroup"
-            , "Storable", "IsString", "IsList"
-            ]
+    resolveClassMethodOrDie bare targetKey = do
+        -- The class-method fallback hook always returns a dispatcher.
+        -- Only use it when this name is actually a method of a scanned
+        -- or manifest class.  A miss for an ordinary function that
+        -- merely shares a method name must not become some other
+        -- class's dispatcher.
+        m <- readIORef globalMethodClassRef
+        let scanned = Map.findWithDefault [] bare m
+            fromManifest =
+                maybe [] (:[]) (Manifest.classForMethod Manifest.manifestIndex bare)
+            classes = nubBS (scanned ++ fromManifest)
+        case classes of
+            [] -> error
+                ("import alias: unresolved target "
+                 <> BC.unpack targetKey)
+            (cls:_) -> do
+                mv <- lookupClassMethodFallback legacyHooks cls bare
+                case mv of
+                    Just v  -> pure v
+                    Nothing -> error
+                        ("import alias: unresolved target "
+                         <> BC.unpack targetKey)
 
     lazyAliasesForLoadedBroadImport needed concreteNames tm imp =
         case impSpec imp of
@@ -8768,13 +8779,6 @@ resolveFallback _mOwner name
     | name == BC.pack "Network.Socket.withSocketsDo"
     || name == BC.pack "withSocketsDo" =
         resolveFallback _mOwner (BC.pack "Network.Socket.Internal.withSocketsDo")
-    -- getAddrInfo is a class method on GetAddrInfo in Network.Socket.Info.
-    -- Routing to the bare method self-loops (lazy alias ↔ class dispatcher).
-    -- Warp's bind path wants the [] instance body; jump straight to the
-    -- concrete implementation (getAddrInfoList) that Info defines.
-    | name == BC.pack "Network.Socket.getAddrInfo"
-    || name == BC.pack "Network.Socket.Info.getAddrInfo" =
-        resolveFallback _mOwner (BC.pack "Network.Socket.Info.getAddrInfoList")
     -- network Info uses @import qualified Data.List.NonEmpty as NE@.
     | BC.pack "NE." `BC.isPrefixOf` name =
         resolveFallback _mOwner
@@ -9225,21 +9229,22 @@ resolveFallbackSource mOwner name = do
                             else pure Nothing
                     Nothing -> pure Nothing
 
+    ownerDeclaresClassMethod owner classes bareName = do
+        decls <- scanClassDecls (lmSource owner)
+            `catch` (\(_ :: SomeException) -> pure [])
+        pure (any (\(ClassDecl cls methods _ _ _) ->
+                    cls `elem` classes && bareName `elem` methods)
+                  decls)
+
     moduleExportsClassMethod owner classes bareName =
         do
-            declares <- declaresMethod
+            declares <- ownerDeclaresClassMethod owner classes bareName
             let exportsClassItem =
                     case mhExports (lmHeader owner) of
                         ExportAll -> declares
                         ExportList items -> any itemExportsClassMethod items
             pure (declares || exportsClassItem)
       where
-        declaresMethod = do
-            decls <- scanClassDecls (lmSource owner)
-                `catch` (\(_ :: SomeException) -> pure [])
-            pure (any (\(ClassDecl cls methods _ _ _) ->
-                        cls `elem` classes && bareName `elem` methods)
-                      decls)
 
         itemExportsClassMethod (ExportType cls (Just subs))
             | cls `elem` classes = null subs || bareName `elem` subs
@@ -9582,8 +9587,47 @@ resolveFallbackSource mOwner name = do
         mClassMethodEarly <- tryClassMethodSlot owner bareName
         case mClassMethodEarly of
             Just slot -> pure (Just slot)
-            Nothing -> case Map.lookup bareName bodies of
-              Just expr | not (isSelfAlias owner bareName expr) -> do
+            Nothing -> do
+                -- Instance modules bind class methods as ordinary
+                -- top-level names (@(-) = subtractSize@ in
+                -- @Data.Text.Internal.Fusion.Size@).  Those bodies are
+                -- one dictionary, not the class dispatcher.  After
+                -- Settings imports Text, unscoped @(-)@ in
+                -- @allocaBytesAligned@'s @isPowerOfTwo@ (@x .&. (x-1)@)
+                -- was served from that instance and returned
+                -- @Unknown@, so Bits Int @(.&.)@ died with
+                -- @args=8 Unknown@.  Only the module that *declares*
+                -- the class may supply a method body here; every
+                -- other owner — including instance modules — goes
+                -- through the generic dispatcher, which then picks
+                -- the instance from the argument tag.
+                classes <- knownClassesForMethod bareName
+                if null classes
+                    then continueFromOwnerBody bodies
+                    else do
+                        declares <- ownerDeclaresClassMethod owner classes bareName
+                        -- A class-method *name* on a non-declaring module
+                        -- is either an instance-dictionary alias
+                        -- (RHS is a bare EVar) or a real function that
+                        -- happens to share the name.  Only the alias
+                        -- should yield to the dispatcher; a real body
+                        -- (lambda / case / …) stays the value.  A
+                        -- missing body is not an alias — refresh from
+                        -- source instead of synthesising a dispatcher
+                        -- for whatever class happens to own the name.
+                        let instanceAlias =
+                                case Map.lookup bareName bodies of
+                                    Just (EVar _) -> True
+                                    _             -> False
+                        if not declares && instanceAlias
+                            then tryClassMethodFromRegistry bareName
+                            else continueFromOwnerBody bodies
+      where
+        continueFromOwnerBody bodies = case Map.lookup bareName bodies of
+              Just expr
+                | Just target <- specialSelfAliasTarget owner bareName expr ->
+                    resolveFallback (Just (lmName owner)) target
+                | not (isSelfAlias owner bareName expr) -> do
                 -- Synthesize a transient registry from the global
                 -- catalogue so 'buildImportRewrites' can walk the
                 -- owner's imports to resolve bare references inside
@@ -11109,16 +11153,6 @@ specialSelfAliasTarget lm n expr
     , lmName lm == BC.pack "Network.Socket.SockAddr"
     , n == BC.pack "bind"
     = Just (BC.pack "Network.Socket.Syscall.bind")
-    | isSelfAliasIn lm n expr
-    , lmName lm == BC.pack "Network.Socket.Info"
-    , n == BC.pack "getAddrInfo"
-    = Just (BC.pack "getAddrInfo")
-    -- Network.Socket re-exports getAddrInfo from Info; self-alias would
-    -- loop.  Point at the concrete []-instance body.
-    | isSelfAliasIn lm n expr
-    , lmName lm == BC.pack "Network.Socket"
-    , n == BC.pack "getAddrInfo"
-    = Just (BC.pack "Network.Socket.Info.getAddrInfoList")
     | isSelfAliasIn lm n expr
     , lmName lm == BC.pack "Network.Socket.BufferPool"
     , n `elem` map BC.pack ["newBufferPool", "withBufferPool", "mallocBS", "copy"]

@@ -470,6 +470,17 @@ typeTagOf (VCon "IN" _) = BC.pack "Integer"
 -- ghc-bignum Natural constructors (NS !Word# | NB !BigNat#).
 typeTagOf (VCon "NS" _) = BC.pack "Natural"
 typeTagOf (VCon "NB" _) = BC.pack "Natural"
+-- Boxed Int / fixed-width Int constructors.  Without I# → Int,
+-- allocaBytesAligned's isPowerOfTwo (x .&. (x-1)) dispatched Num.-
+-- on tag "I#" (no instance), fell through to the last Num instance
+-- (Data.Text.Internal.Fusion.Size, (-) = subtractSize) and died
+-- with Bits Int args=8 Unknown.  Same shape as the W8# → Word8
+-- special cases below.
+typeTagOf (VCon "I#" _)   = BC.pack "Int"
+typeTagOf (VCon "I8#" _)  = BC.pack "Int8"
+typeTagOf (VCon "I16#" _) = BC.pack "Int16"
+typeTagOf (VCon "I32#" _) = BC.pack "Int32"
+typeTagOf (VCon "I64#" _) = BC.pack "Int64"
 -- Fixed-width word boxing constructors — must not dispatch as Int.
 typeTagOf (VCon "W8#" _)  = BC.pack "Word8"
 typeTagOf (VCon "W16#" _) = BC.pack "Word16"
