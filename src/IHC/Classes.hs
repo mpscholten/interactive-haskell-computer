@@ -41,6 +41,7 @@ module IHC.Classes
       -- * Lazy instance catalogue (Stage 2 of lazy registration plan)
     , addCataloguedInstance
     , drainCataloguedInstancesForClass
+    , drainOneCataloguedInstance
     , resetInstanceCatalogue
     , catalogueHasClass
     , runProvisionalClassTransaction
@@ -298,16 +299,33 @@ lookupInstanceMethod reg className typeTag methodName =
 -- semantics — see that function's note.
 lookupInstanceMethodMulti :: ClassRegistry -> ByteString -> [ByteString] -> ByteString -> IO (Maybe Val)
 lookupInstanceMethodMulti reg className typeTags methodName = do
-    mMethods <- lookupInstanceMulti reg className typeTags
-    case mMethods >>= HashMap.lookup methodName of
+    found <- lookupNow
+    case found of
         Just v  -> pure (Just v)
         Nothing -> do
-            drained <- drainCataloguedInstancesForClass className
-            if drained
-                then do
-                    mMethods' <- lookupInstanceMulti reg className typeTags
-                    pure (mMethods' >>= HashMap.lookup methodName)
-                else pure Nothing
+            case typeTags of
+                [tag] -> triggerCoreInstanceLoadForTag legacyHooks className tag
+                _     -> triggerCoreInstanceLoad legacyHooks className
+            found2 <- lookupNow
+            case found2 of
+                Just v  -> pure (Just v)
+                Nothing -> drainUntilFound
+  where
+    lookupNow = do
+        mMethods <- lookupInstanceMulti reg className typeTags
+        pure (mMethods >>= HashMap.lookup methodName)
+    drainUntilFound = go (32 :: Int)
+      where
+        go 0 = pure Nothing
+        go n = do
+            drainedOne <- drainOneCataloguedInstance className
+            if not drainedOne
+                then pure Nothing
+                else do
+                    found3 <- lookupNow
+                    case found3 of
+                        Just v  -> pure (Just v)
+                        Nothing -> go (n - 1)
 
 -- | On an exact structural-key miss, select a genuinely polymorphic
 -- single-parameter instance pattern.  This is intentionally separate from
@@ -628,6 +646,22 @@ drainCataloguedInstancesForClass cls = do
             pure True
   where
     runOne action = action `catch` \(_ :: SomeException) -> pure ()
+
+drainOneCataloguedInstance :: ByteString -> IO Bool
+drainOneCataloguedInstance cls = do
+    mAction <- atomicModifyIORef' instanceCatalogueRef $ \cat ->
+        case Map.lookup cls cat of
+            Just (action:rest) ->
+                let cat' = if null rest
+                               then Map.delete cls cat
+                               else Map.insert cls rest cat
+                in (cat', Just action)
+            _ -> (cat, Nothing)
+    case mAction of
+        Nothing -> pure False
+        Just action -> do
+            action `catch` \(_ :: SomeException) -> pure ()
+            pure True
 
 -- | Discard every catalogued closure. Called once per
 -- 'loadProgramFromSource' run, alongside the 'globalLoadedModulesRef'

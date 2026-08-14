@@ -204,6 +204,16 @@ elaborateOwnedInternal _seedMethodBinders classReg sigs synonyms constructorType
 elaborateExpectedExpr :: InferEnv -> Type -> Expr
     -> IO (Expr, Type, [Pred], Subst)
 elaborateExpectedExpr ienv expected expr = case (expr, expected) of
+    -- OverloadedStrings: a string literal (or its desugared cons list)
+    -- whose expected type is not [Char]/String is `fromString` at that
+    -- result type.  The class method is result-polymorphic; the
+    -- expected type (constructor field, annotation) chooses the
+    -- instance.  No library or constructor name is special-cased.
+    (e, ty)
+      | not (isCharListType ty)
+      , isStringLiteralExpr e ->
+            elaborateExpectedExpr ienv ty
+                (EApp (EVar (BC.pack "fromString")) e)
     (EVar name, _)
       | Just (Scheme vars preds _) <- Map.lookup name (ieLocals ienv)
       , not (null vars) || not (null preds)
@@ -230,6 +240,27 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
         pure (ECase scrut' alts', applySubst finalSub expected,
             map (applySubstPred finalSub) (scrutPreds ++ altPreds), finalSub)
     _ -> elaborateExpr ienv expr
+
+-- | [Char] after synonym expansion.  String is expanded by the
+-- caller via 'expandSyn' before 'elaborateExpectedExpr'.
+isCharListType :: Type -> Bool
+isCharListType (TyApp (TyCon n) (TyCon e)) =
+    (n == BC.pack "[]" || n == BC.pack "List") && e == BC.pack "Char"
+isCharListType (TyCon n) = n == BC.pack "String"
+isCharListType _ = False
+
+-- | Parser-desugared @"…"@ is a cons-chain of 'ELit' 'LChar', or the
+-- original 'LStr' if desugar has not run.
+isStringLiteralExpr :: Expr -> Bool
+isStringLiteralExpr (ELit (LStr _)) = True
+isStringLiteralExpr (ELit (LChar _)) = False
+isStringLiteralExpr (EVar n) = n == BC.pack "[]"
+isStringLiteralExpr (EApp (EApp (EVar cons) (ELit (LChar _))) rest)
+    | cons == BC.pack ":" || cons == BC.pack "GHC.Types.:" =
+        isStringLiteralExpr rest
+isStringLiteralExpr (EApp (EApp (EVar cons) (ELit (LChar _))) rest)
+    | BC.isSuffixOf (BC.pack ".:") cons = isStringLiteralExpr rest
+isStringLiteralExpr _ = False
 
 renderExpectedType :: Type -> Maybe ByteString
 renderExpectedType ty = case ty of
@@ -448,7 +479,8 @@ elaborateVar :: InferEnv -> Name -> IO (Expr, Type, [Pred], Subst)
 elaborateVar ienv name =
     case Map.lookup name (ieLocals ienv) of
         Just sch -> do
-            (preds, ty) <- instantiate (ieFresh ienv) sch
+            (preds, ty) <- instantiate (ieFresh ienv)
+                (expandScheme (ieSynonyms ienv) sch)
             pure (EVar name, ty, preds, emptySubst)
         Nothing -> do
             mSig <- case builtinConstructorSig (bareName name) of
@@ -459,7 +491,8 @@ elaborateVar ienv name =
                         Nothing  -> lookupSig
             case mSig of
                 Just sch -> do
-                    (preds, ty) <- instantiate (ieFresh ienv) sch
+                    (preds, ty) <- instantiate (ieFresh ienv)
+                        (expandScheme (ieSynonyms ienv) sch)
                     -- Use the BARE (unqualified) name for class-method detection
                     -- and the emitted node.  In a non-entry module the binding's
                     -- RHS has had its free vars import-rewritten to FQNs (e.g.
@@ -513,6 +546,24 @@ elaborateVar ienv name =
                 listA = TyApp (TyCon (BC.pack "[]")) a
             in Just (Scheme [BC.pack "a"] []
                 (TyArrow a (TyArrow listA listA)))
+        -- Function composition.  Category (.) has type
+        --   cat b c -> cat a b -> cat a c
+        -- which does not unify with TyArrow, so a result-polymorphic
+        -- method in `toEnum . f` stays unconstrained and value-directed
+        -- dispatch defaults it to Enum Int (the identity).  The
+        -- function-arrow scheme lets the expected result type flow into
+        -- the first argument, matching runtime baseDot.
+        --
+        -- Non-entry modules rewrite @.@ to a FQN such as
+        -- @GHC.Internal.Base..@; bareName leaves that spelling intact
+        -- (the last '.' is the operator), so accept the @..@ suffix.
+        | n == BC.pack "." || BC.isSuffixOf (BC.pack "..") n =
+            let a = TyVar (BC.pack "a")
+                b = TyVar (BC.pack "b")
+                c = TyVar (BC.pack "c")
+            in Just (Scheme [BC.pack "a", BC.pack "b", BC.pack "c"] []
+                (TyArrow (TyArrow b c)
+                    (TyArrow (TyArrow a b) (TyArrow a c))))
         | otherwise = Nothing
 
     -- Try the name as written, then its bare last component, so FQNs from a
@@ -533,8 +584,17 @@ elaborateVar ienv name =
         Just s
             | isQualifiedName name
            || not (isAmbiguousSig ienv (bareName name)) -> Just s
+            -- Ambiguous last-writer is a red herring for result-
+            -- polymorphic class methods: the class scheme is unique
+            -- and the expected type picks the instance.
+            | isActualClassMethod ienv (bareName name)
+            , schemeIsResultPolymorphic s -> Just s
             | otherwise -> Nothing
         Nothing
+            | isAmbiguousSig ienv (bareName name)
+            , isActualClassMethod ienv (bareName name)
+            , Just s <- Map.lookup (bareName name) (ieSigs ienv)
+            , schemeIsResultPolymorphic s -> Just s
             | isAmbiguousSig ienv (bareName name) -> Nothing
             | otherwise -> Map.lookup (bareName name) (ieSigs ienv)
 

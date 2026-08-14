@@ -9,13 +9,16 @@ module IHC.ConstructorMetadata
     , constructorFieldTypes
     , constructorFieldTypeAt
     , globalConstructorTypeRegistryRef
+    , registerSelectorFieldTypes
+    , resetSelectorFieldTypes
+    , selectorFieldTypeAt
     ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
+import Data.IORef (IORef, newIORef, atomicModifyIORef', writeIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.IORef (IORef, newIORef)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
@@ -53,6 +56,55 @@ type ConstructorTypeRegistry = Map ConstructorIdentity ConstructorTypeMetadata
 {-# NOINLINE globalConstructorTypeRegistryRef #-}
 globalConstructorTypeRegistryRef :: IORef ConstructorTypeRegistry
 globalConstructorTypeRegistryRef = unsafePerformIO (newIORef Map.empty)
+
+-- | Field types recovered from record *selector* schemes when the
+-- constructor declaration cannot be scanned as a whole (rank-n /
+-- impredicative fields invalidate the atomic H98 scan).  Keyed by
+-- @(owner, constructor)@ then field index.  Lets expected-type
+-- elaboration see @settingsHost :: Settings -> HostPreference@
+-- without needing a complete Settings constructor scheme.
+type SelectorFieldTypes = Map ConstructorIdentity (Map Int Type)
+
+{-# NOINLINE globalSelectorFieldTypesRef #-}
+globalSelectorFieldTypesRef :: IORef SelectorFieldTypes
+globalSelectorFieldTypesRef = unsafePerformIO (newIORef Map.empty)
+
+resetSelectorFieldTypes :: IO ()
+resetSelectorFieldTypes = writeIORef globalSelectorFieldTypesRef Map.empty
+
+-- | Merge selector-derived field types for one owning module.
+-- @entries@ is @(constructor, fieldIndex, fieldType)@.
+registerSelectorFieldTypes :: Name -> [(Name, Int, Type)] -> IO ()
+registerSelectorFieldTypes owner entries =
+    atomicModifyIORef' globalSelectorFieldTypesRef $ \old ->
+        let grouped = Map.fromListWith Map.union
+                [ (ConstructorIdentity owner ctor, Map.singleton idx ty)
+                | (ctor, idx, ty) <- entries
+                ]
+        in (Map.unionWith Map.union grouped old, ())
+
+selectorFieldTypeAt
+    :: Maybe Name -> Name -> Int -> IO (Maybe Type)
+selectorFieldTypeAt requestedOwner requestedCtor fieldIndex = do
+    table <- readIORef globalSelectorFieldTypesRef
+    let (ctorQualifier, bareCtor) = splitQualified requestedCtor
+        localIdentity = (`ConstructorIdentity` bareCtor) <$> requestedOwner
+        candidates =
+            [ identity'
+            | identity' <- Map.keys table
+            , ciName identity' == bareCtor
+            ]
+        identity' = case ctorQualifier of
+            Just qualifier -> Just (ConstructorIdentity qualifier bareCtor)
+            Nothing -> case localIdentity of
+                Just ident | Map.member ident table -> Just ident
+                _ -> case candidates of
+                    [ident] -> Just ident
+                    _ -> Nothing
+    pure $ do
+        ident <- identity'
+        fields <- Map.lookup ident table
+        Map.lookup fieldIndex fields
 
 -- | Convert a constructor signature produced by the source scanner into the
 -- runtime-neutral metadata contract.  Variables quantified by the signature

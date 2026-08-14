@@ -151,6 +151,22 @@ seedBuiltinClassMethodSigs = do
                     (TyVar a)
         -- maxBound :: Bounded a => a
         maxBoundSig = minBoundSig
+        -- toEnum :: Enum a => Int -> a
+        -- Result-polymorphic: the instance lives only in the result, so
+        -- `toEnum . f` (GHC.Internal.Unicode.generalCategory) cannot be
+        -- specialised from the Int argument.  Seeding the scheme lets
+        -- expected-type elaboration emit ETypedMethod Enum toEnum T.
+        toEnumSig = Scheme [a]
+                    [Pred (BC.pack "Enum") [TyVar a]]
+                    (TyArrow (TyCon (BC.pack "Int")) (TyVar a))
+        -- fromString :: IsString a => String -> a
+        -- Result-polymorphic: the instance lives only in the result.
+        -- Seeding the class scheme keeps expected-type elaboration
+        -- (field type, annotation) from losing the method to a
+        -- monomorphic last-writer instance.
+        fromStringSig = Scheme [a]
+                    [Pred (BC.pack "IsString") [TyVar a]]
+                    (TyArrow (TyCon (BC.pack "String")) (TyVar a))
         -- String is a wired-in synonym exported by compiler-built GHC.Types;
         -- there is no Haskell declaration for the source scanner to find.
         -- Keep it in the ordinary synonym registry so every elaboration path
@@ -167,6 +183,8 @@ seedBuiltinClassMethodSigs = do
                 , (BC.pack "mempty",   memptySig)
                 , (BC.pack "minBound", minBoundSig)
                 , (BC.pack "maxBound", maxBoundSig)
+                , (BC.pack "toEnum",     toEnumSig)
+                , (BC.pack "fromString", fromStringSig)
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]
@@ -179,6 +197,8 @@ seedBuiltinClassMethodSigs = do
         , "mempty"
         , "minBound"
         , "maxBound"
+        , "toEnum"
+        , "fromString"
         ]
     -- Seed method→class for the builtin numeric/enum/float classes so
     -- the env-fallback can synthesise a 'classMethodDispatcher' on demand
@@ -205,6 +225,10 @@ seedBuiltinClassMethodSigs = do
             -- Bounded
             , ("minBound",   "Bounded")
             , ("maxBound",   "Bounded")
+            -- IsString.fromString is result-polymorphic.  Seed so
+            -- expected-type elaboration can emit ETypedMethod even
+            -- before GHC.Internal.Data.String has been scanned.
+            , ("fromString", "IsString")
             -- Integral.  These are seeded for first-call locality so
             -- bare references like @17 \`quot\` 5@ in the REPL hit a
             -- 1-step lookup instead of the 3-step probe→load→discover

@@ -1563,6 +1563,9 @@ skipTypeToBinding ctx cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
             TkSemi  | b == 0 && p == 0 && c == 0 -> pure cur
             TkIn    | b == 0 && p == 0 && c == 0 -> pure cur
             TkEq    | b == 0 && p == 0 && c == 0 -> pure cur
+            -- `n :: T <- action` is a PatternSignatures do-bind, not
+            -- an expression annotation whose type includes `<-`.
+            TkLArrow | b == 0 && p == 0 && c == 0 -> pure cur
             TkLParen   -> go cur' b (p + 1) c
             TkRParen   -> go cur' b (p - 1) c
             TkLBracket -> go cur' (b + 1) p c
@@ -2075,7 +2078,10 @@ parseStmt ctx cur0 = do
                 TkLArrow -> do
                     (e, cur3) <- parseExpr ctx cur2
                     pure ([SBind name e], cur3)
-                TkAt | hasTopLevelBindArrow cur0 -> parseDoPatBindStmt
+                -- PatternSignatures / as-pats / infix cons: `n :: T <- e`.
+                -- Without this, `n :: CInt <- getSockOpt` was parsed as
+                -- `SExpr` and `n` was never bound.
+                _ | hasTopLevelBindArrow cur0 -> parseDoPatBindStmt
                 _ -> do
                     (e, cur') <- parseExpr ctx cur0
                     pure ([SExpr e], cur')
@@ -2086,6 +2092,7 @@ parseStmt ctx cur0 = do
                 TkLArrow -> do
                     (e, cur3) <- parseExpr ctx cur2
                     pure ([SBind (BC.pack "_") e], cur3)
+                _ | hasTopLevelBindArrow cur0 -> parseDoPatBindStmt
                 _ -> do
                     (e, cur') <- parseExpr ctx cur0
                     pure ([SExpr e], cur')
@@ -2097,12 +2104,47 @@ parseStmt ctx cur0 = do
   where
     parseDoPatBindStmt = do
         (pat, curPat) <- parseTopPat ctx cur0
-        let (arrTok, curAfterArr) = nextSig ctx curPat
+        -- PatternSignatures: `n :: T <- action`.  parseTopPat stops
+        -- before `::`.  Keep `T` as ETyApp on the action.
+        (mTy, curAfterSig) <- takeOptionalPatSig curPat
+        let (arrTok, curAfterArr) = nextSig ctx curAfterSig
         case tkKind arrTok of
             TkLArrow -> do
-                (e, cur') <- parseExpr ctx curAfterArr
+                (e0, cur') <- parseExpr ctx curAfterArr
+                let e = case mTy of
+                        Just ty | not (BS.null ty) -> ETyApp e0 ty
+                        _                          -> e0
                 pure (lowerDoPatBind pat e, cur')
             _ -> parseErr ctx "expected `<-` after do pattern" arrTok
+
+    takeOptionalPatSig cur = do
+        let (tok, curAfter) = nextSig ctx cur
+        case tkKind tok of
+            TkDColon -> do
+                curEnd <- skipPatTypeToLArrow curAfter
+                let tyBytes = BC.dropWhile isAsciiSpace
+                                (BC.reverse
+                                    (BC.dropWhile isAsciiSpace
+                                        (BC.reverse
+                                            (sliceBytes (ctxSrc ctx)
+                                                (cPos curAfter, cPos curEnd)))))
+                pure (Just tyBytes, curEnd)
+            _ -> pure (Nothing, cur)
+
+    skipPatTypeToLArrow cur0 = go cur0 (0 :: Int) (0 :: Int) (0 :: Int)
+      where
+        go c par br brace =
+            let (t, c') = nextSig ctx c
+            in case tkKind t of
+                TkEof -> pure c
+                TkLArrow | par == 0 && br == 0 && brace == 0 -> pure c
+                TkLParen   -> go c' (par + 1) br brace
+                TkRParen   -> go c' (max 0 (par - 1)) br brace
+                TkLBracket -> go c' par (br + 1) brace
+                TkRBracket -> go c' par (max 0 (br - 1)) brace
+                TkLBrace   -> go c' par br (brace + 1)
+                TkRBrace   -> go c' par br (max 0 (brace - 1))
+                _          -> go c' par br brace
 
     hasTopLevelBindArrow cur = go cur (0 :: Int) (0 :: Int) (0 :: Int)
       where
@@ -4723,26 +4765,7 @@ parseRecordFields ctx conName cur acc = do
         _ -> parseErr ctx "expected field name or `}` in record literal" tok
 
 parseRecordFieldExpr :: Ctx -> Name -> Cursor -> IO (Expr, Cursor)
-parseRecordFieldExpr ctx fname cur
-    | fname == BC.pack "settingsHost" =
-        let (tok, cur1) = nextSig ctx cur in
-        case tkKind tok of
-            TkStr s ->
-                pure (hostPreferenceStringExpr (BC.unpack s), cur1)
-            _ -> parseExpr ctx cur
-    | otherwise = parseExpr ctx cur
-
-hostPreferenceStringExpr :: String -> Expr
-hostPreferenceStringExpr s =
-    case s of
-        "*"  -> EVar (hpCtor "HostAny")
-        "*4" -> EVar (hpCtor "HostIPv4")
-        "!4" -> EVar (hpCtor "HostIPv4Only")
-        "*6" -> EVar (hpCtor "HostIPv6")
-        "!6" -> EVar (hpCtor "HostIPv6Only")
-        _    -> EApp (EVar (hpCtor "Host")) (stringToConsList s)
-  where
-    hpCtor n = BC.pack "Data.Streaming.Network.Internal." <> BC.pack n
+parseRecordFieldExpr ctx _fname cur = parseExpr ctx cur
 
 parseUnboxedTuple :: Ctx -> Cursor -> IO (Expr, Cursor)
 parseUnboxedTuple ctx cur0 = do

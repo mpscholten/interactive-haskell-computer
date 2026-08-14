@@ -53,12 +53,13 @@ import IHC.AST
 import IHC.Classes (ClassRegistry, IHCHooks, legacyHooks, normalizeTyTag, lookupEnvFallback, lookupTypeSigFallback, lookupInstanceMethod, getSharedClassReg, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag, lookupClassMethodFallback, runThExpToExpr)
 import IHC.ConstructorMetadata
     ( ConstructorTypeMetadata(..), ConstructorIdentity(..)
-    , constructorMetadata, globalConstructorTypeRegistryRef )
+    , constructorMetadata, constructorScheme
+    , selectorFieldTypeAt, globalConstructorTypeRegistryRef )
 import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyHead)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyHead, schemeIsResultPolymorphic, freeTyVars)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalAmbiguousSigsRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -134,60 +135,92 @@ elaborateExpectedArg :: IHCHooks -> Maybe Name -> Expr -> Expr -> IO Expr
 elaborateExpectedArg hooks owner f x = do
     initialSigs <- readIORef globalTypeSigsRef
     methodNames <- readIORef globalClassMethodNamesRef
-    -- Cheap reject before any signature fallback walk.  Looking up
-    -- schemes from a large owner walks a huge re-export graph.
-    -- Elaborating a nested ordinary function at the callee's argument
-    -- type (because the arg tree mentions a constrained name) can
-    -- diverge or leave a leftover function.
-    if not (needsExpectedElaboration methodNames initialSigs x)
-        then pure x
-        else do
-            ambiguousSigs <- readIORef globalAmbiguousSigsRef
-            -- Include the partially-applied callee as well as the new argument.
-            -- Owner-scoped metadata is what lets inference see a source-loaded
-            -- method's real scheme without relying on the process-global flat map.
-            (sigs, scopedSigs) <- foldM (loadPreferredSig ambiguousSigs) (initialSigs, Set.empty)
-                (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
-            case appHeadAndArity f of
-                Just (fn, supplied) ->
-                    case Elab.lookupScopedScheme ambiguousSigs scopedSigs sigs fn of
-                        Just (Scheme _ _ body) ->
-                            case tyArrowArgs body of
-                                (args, _) | supplied < length args -> do
-                                    mReg <- getSharedClassReg legacyHooks
-                                    syns <- readIORef globalTypeSynonymsRef
-                                    case mReg of
-                                        Nothing -> pure x
-                                        Just classReg -> do
-                                            -- Infer the residual type of the
-                                            -- partially-applied callee first. This
-                                            -- retains substitutions learned from
-                                            -- every earlier argument, unlike merely
-                                            -- indexing the original scheme's arrow
-                                            -- list. For example, after
-                                            -- @same True@, @same :: a -> a -> a@
-                                            -- has residual domain @Bool@.
-                                            ctorTypes <- readIORef globalConstructorTypeRegistryRef
-                                            residual <- try
-                                                (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
-                                                    ctorTypes owner scopedSigs
-                                                    Elab.InferFreely f)
-                                                :: IO (Either SomeException (Expr, TA.Type))
-                                            let expected = case residual of
-                                                    Right (_, residualTy) ->
-                                                        case tyArrowArgs residualTy of
-                                                            (argTy : _, _) -> argTy
-                                                            _ -> args !! supplied
-                                                    Left _ -> args !! supplied
-                                            result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+    ctorTypes <- readIORef globalConstructorTypeRegistryRef
+    -- Constructor field types are independent of the cheap class-method
+    -- reject: an OverloadedStrings literal (or its desugared cons list)
+    -- must still see HostPreference / Pref from the field type.
+    mFieldTy <- case appHeadAndArity f of
+        Just (fn, supplied)
+          | Just (Scheme _ _ body) <- constructorScheme ctorTypes owner fn
+          , (args, _) <- tyArrowArgs body
+          , supplied < length args ->
+                pure (Just (args !! supplied))
+          | otherwise -> selectorFieldTypeAt owner fn supplied
+        Nothing -> pure Nothing
+    case mFieldTy of
+        Just fieldTy -> elaborateAtExpected fieldTy x
+        Nothing ->
+            -- Cheap reject before any signature fallback walk.  Looking up
+                -- schemes from a large owner walks a huge re-export graph.
+                -- Elaborating a nested ordinary function at the callee's argument
+                -- type (because the arg tree mentions a constrained name) can
+                -- diverge or leave a leftover function.
+                if not (needsExpectedElaboration methodNames initialSigs x)
+                then pure x
+                else do
+                    ambiguousSigs <- readIORef globalAmbiguousSigsRef
+                    -- Include the partially-applied callee as well as the new argument.
+                    -- Owner-scoped metadata is what lets inference see a source-loaded
+                    -- method's real scheme without relying on the process-global flat map.
+                    (sigs, scopedSigs) <- foldM (loadPreferredSig ambiguousSigs) (initialSigs, Set.empty)
+                        (Set.toList (Set.union (expressionHeadSet f) (expressionHeadSet x)))
+                    case appHeadAndArity f of
+                        Just (fn, supplied) ->
+                            case Elab.lookupScopedScheme ambiguousSigs scopedSigs sigs fn of
+                                Just (Scheme _ _ body) ->
+                                    case tyArrowArgs body of
+                                        (args, _) | supplied < length args -> do
+                                            mReg <- getSharedClassReg legacyHooks
+                                            syns <- readIORef globalTypeSynonymsRef
+                                            case mReg of
+                                                Nothing -> pure x
+                                                Just classReg -> do
+                                                    -- Infer the residual type of the
+                                                    -- partially-applied callee first. This
+                                                    -- retains substitutions learned from
+                                                    -- every earlier argument, unlike merely
+                                                    -- indexing the original scheme's arrow
+                                                    -- list. For example, after
+                                                    -- @same True@, @same :: a -> a -> a@
+                                                    -- has residual domain @Bool@.
+                                                    residual <- try
+                                                        (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
                                                             ctorTypes owner scopedSigs
-                                                            (Elab.ExpectType expected) x)
-                                                :: IO (Either SomeException (Expr, TA.Type))
-                                            pure (either (const x) fst result)
-                                _ -> pure x
+                                                            Elab.InferFreely f)
+                                                        :: IO (Either SomeException (Expr, TA.Type))
+                                                    let expected = case residual of
+                                                            Right (_, residualTy) ->
+                                                                case tyArrowArgs residualTy of
+                                                                    (argTy : _, _) -> argTy
+                                                                    _ -> args !! supplied
+                                                            Left _ -> args !! supplied
+                                                    result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                                                    ctorTypes owner scopedSigs
+                                                                    (Elab.ExpectType expected) x)
+                                                        :: IO (Either SomeException (Expr, TA.Type))
+                                                    pure (either (const x) fst result)
+                                        _ -> pure x
+                                Nothing -> pure x
                         Nothing -> pure x
-                Nothing -> pure x
   where
+    elaborateAtExpected expected x0 = do
+        mReg <- getSharedClassReg legacyHooks
+        case mReg of
+            Nothing -> pure x0
+            Just classReg -> do
+                sigs <- readIORef globalTypeSigsRef
+                syns <- readIORef globalTypeSynonymsRef
+                ctors <- readIORef globalConstructorTypeRegistryRef
+                -- OverloadedStrings inserts fromString; keep the class
+                -- scheme scoped so a leftover last-writer instance
+                -- cannot hide the result-polymorphic method.
+                let scoped = Set.singleton (BC.pack "fromString")
+                result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                ctors owner scoped
+                                (Elab.ExpectType expected) x0)
+                    :: IO (Either SomeException (Expr, TA.Type))
+                pure (either (const x0) fst result)
+
     loadPreferredSig ambiguous state@(known, scoped) name
         | bareName name `elem` map BC.pack [":", "[]"] = pure state
         | not (Set.member (bareName name) ambiguous)
@@ -214,20 +247,30 @@ elaborateExpectedArg hooks owner f x = do
         go (ETyApp inner _) = go inner
         go _ = Set.empty
 
-    -- Only *applied class-method heads* need the callee's expected type
-    -- (@f (pure x)@). A nested ordinary function with a constraint
-    -- (@snd (runParser' p s)@) must not trigger — elaborating that at
-    -- @snd@'s argument type diverges or produces a leftover function.
+    -- Only *result-polymorphic* applied class-method heads need the
+    -- callee's expected type (@f (pure x)@, @fromInteger n@).
+    -- Argument-directed methods (@sizeOf (0 :: Int)@, @show x@) must
+    -- not trigger: elaborating them at an outer callee's type drains
+    -- the class catalogue.
     needsExpectedElaboration methodNames sigs = goApplied
       where
         goApplied (EApp innerF _) = goHead innerF
         goApplied (ETyApp inner _) = goApplied inner
+        -- OverloadedStrings: a string literal at a non-[Char] expected
+        -- type (constructor field, annotated result) must elaborate.
+        goApplied (ELit (LStr _)) = True
         goApplied _ = False
 
         goHead (EVar name)
             | not (Set.member (bareName name) methodNames) = False
             | otherwise = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
-                Just (Scheme _ preds _) -> not (null preds)
+                Just scheme
+                    | schemeIsResultPolymorphic scheme -> True
+                    -- Last-writer may be a monomorphic instance method
+                    -- that hid the class scheme.  Class-method names
+                    -- still need the expected result type.
+                    | schemeIsArgumentDirected scheme -> False
+                    | otherwise -> True
                 Nothing -> True
         goHead (EApp innerF _) = goHead innerF
         goHead (ETyApp inner _) = goHead inner
@@ -241,6 +284,21 @@ elaborateExpectedArg hooks owner f x = do
         go _ _ = Nothing
     orElse (Just a) _ = Just a
     orElse Nothing  b = b
+
+    -- Class parameter lives only in the arguments (@sizeOf :: Storable a => a -> Int@).
+    schemeIsArgumentDirected (Scheme _ preds body) =
+        let (args, result) = tyArrowArgs body
+            resultVars = freeTyVars result
+            argVars = Set.unions (map freeTyVars args)
+            predVars = Set.unions (map predTyVars preds)
+        in not (Set.null (Set.intersection predVars argVars))
+           && Set.null (Set.intersection predVars resultVars)
+      where
+        predTyVars (TA.Pred _ ts) = Set.unions (map freeTyVars ts)
+        predTyVars (TA.QPred vs ctx p) =
+            Set.difference
+                (Set.unions (predTyVars p : map predTyVars ctx))
+                (Set.fromList vs)
 
 -- | Evaluate an 'ETypedMethod' node.  Looks up the resolved instance
 -- method in the class registry; if the instance registered a
@@ -860,12 +918,15 @@ eval hooks env ipm = go
                     mHeadScheme <- case applicationHeadName e of
                         Just method -> lookupTypeSigFallback hooks owner method
                         Nothing -> pure Nothing
-                    let sigs = case (applicationHeadName e, mHeadScheme) of
+                    let (sigs, scoped) = case (applicationHeadName e, mHeadScheme) of
                             (Just method, Just scheme) ->
-                                Map.insert (bareName method) scheme
+                                ( Map.insert (bareName method) scheme
                                     (Map.insert method scheme sigs0)
-                            _ -> sigs0
-                    r <- try (Elab.elaborateOwned classReg sigs syns ctorTypes owner
+                                , Set.fromList [method, bareName method]
+                                )
+                            _ -> (sigs0, Set.empty)
+                    r <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                ctorTypes owner scoped
                                 (Elab.ExpectType annTy) e)
                            :: IO (Either SomeException (Expr, TA.Type))
                     case r of
@@ -977,7 +1038,8 @@ eval hooks env ipm = go
             mScheme <- if candidate then lookupTypeSigFallback hooks owner method
                                     else pure Nothing
             case mScheme of
-                Just scheme@(Scheme _ [TA.Pred _ (_ : _)] _) -> do
+                Just scheme@(Scheme _ [TA.Pred _ (_ : _)] _)
+                  | schemeIsResultPolymorphic scheme -> do
                     mReg <- getSharedClassReg legacyHooks
                     case mReg of
                         Nothing -> pure CalleeNotAttempted
@@ -986,7 +1048,9 @@ eval hooks env ipm = go
                             syns <- readIORef globalTypeSynonymsRef
                             ctorTypes <- readIORef globalConstructorTypeRegistryRef
                             let sigs = Map.insert method scheme sigs0
-                            result <- try (Elab.elaborateOwned classReg sigs syns ctorTypes owner
+                                scoped = Set.fromList [method, bare]
+                            result <- try (Elab.elaborateOwnedWithScopedSigs classReg sigs syns
+                                            ctorTypes owner scoped
                                             Elab.InferFreely call)
                                 :: IO (Either SomeException (Expr, TA.Type))
                             case result of
@@ -2836,6 +2900,17 @@ applyIP hooks _         v                          arg  = do
 --                      recurse.
 --------------------------------------------------------------------------------
 
+-- Host VIO and source-constructed @IO $ \s -> …@ (VCon "IO" [stateFn]).
+-- Data.ByteString.Internal.create's wrapAction is withForeignPtr, which
+-- returns the latter.  evalDo must treat both as IO; otherwise the
+-- statement falls through to doMonadicSequence / @>>@ and the
+-- result-polymorphic fallback (ParsecT) runs the poke callback but
+-- never returns the ByteString (Warp composeHeader hang).
+isIODoAction :: Val -> Bool
+isIODoAction (VIO _) = True
+isIODoAction (VCon n _) = n == BC.pack "IO"
+isIODoAction _ = False
+
 evalDo :: IHCHooks -> Env -> ImplicitParamMap -> [Stmt] -> IO Val
 evalDo hooks _   _   []              = pure (VIO (pure VUnit))
 evalDo hooks env ipm [SExpr e]       = eval hooks env ipm e
@@ -2854,8 +2929,8 @@ evalDo hooks env ipm (SExpr e : rest) =
                 pure mv
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT Nothing rest
-            -- IO fast path: keep VIO sequencing (no class-dispatch hop).
-            VIO _ -> pure $ VIO $ do
+            -- IO fast path: host VIO and source VCon "IO" (see isIODoAction).
+            _ | isIODoAction mv -> pure $ VIO $ do
                 _  <- runIOVal hooks mv
                 restV <- evalDo hooks env ipm rest
                 runIOVal hooks restV
@@ -2874,7 +2949,7 @@ evalDo hooks env ipm (SBind name e : rest) =
                 pure mv
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT (Just (name, False)) rest
-            VIO _ -> pure $ VIO $ do
+            _ | isIODoAction mv -> pure $ VIO $ do
                 v  <- runIOVal hooks mv
                 vT <- newWHNFThunk v
                 let env' = extendEnv name vT env
@@ -2895,7 +2970,7 @@ evalDo hooks env ipm (SBangBind name e : rest) =
         case mv of
             VCon "ST" [stateFnT] ->
                 doSTSequence hooks env ipm stateFnT (Just (name, True)) rest
-            VIO _ -> pure $ VIO $ do
+            _ | isIODoAction mv -> pure $ VIO $ do
                 v  <- runIOVal hooks mv
                 vT <- newWHNFThunk v
                 _  <- force hooks vT  -- bang: force to WHNF before continuing

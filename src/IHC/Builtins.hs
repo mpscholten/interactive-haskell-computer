@@ -743,6 +743,17 @@ builtins reg =
     , ("noDuplicate#",            noDuplicateB)  -- GHC primop: no-op in interpreter
     , ("touch#",                  touchHashB)     -- GHC primop: keep-alive touch, no-op at Val level
     , ("runRW#",                   runRWB)
+    -- Cost-centre-stack primops (GHC.Prim, no .hs source).  Used by
+    -- source-loaded GHC.Internal.Stack.CCS.  IHC has no profiler CCS;
+    -- returning nullAddr# makes currentCallStack consume an empty
+    -- dummy stack instead of dying with unbound getCurrentCCS#.
+    -- getCurrentCCS## is the .hsc spelling (hsc escapes # as ##).
+    , ("getCurrentCCS#",           getCurrentCCSHashB)
+    , ("getCurrentCCS##",          getCurrentCCSHashB)
+    , ("getCCSOf#",                getCurrentCCSHashB)
+    , ("getCCSOf##",               getCurrentCCSHashB)
+    , ("clearCCS#",                clearCCSHashB)
+    , ("clearCCS##",               clearCCSHashB)
     -- 'lazy' / 'GHC.Magic.lazy' / 'GHC.Exts.lazy' resolve from source
     -- (ghc-prim GHC.Magic: @lazy x = x@; re-exported via Base / Exts).
     -- Demand-driven re-export discovery materialises the identity body.
@@ -3725,6 +3736,27 @@ runRWB = pure $ VFun $ \ft -> do
     -- the caller sees the concrete value / unboxed tuple.
     runIOVal legacyHooks resRaw
 
+-- | @getCurrentCCS# :: a -> State# RealWorld -> (# State# RealWorld, Addr# #)@
+-- GHC.Prim cost-centre primops with no Haskell source.  Without a
+-- profiler there is no CCS; GHC returns @nullAddr#@ without @-prof@.
+getCurrentCCSHashB :: IO Val
+getCurrentCCSHashB = pure $ VFun $ \_dummy -> pure $ VFun $ \sT -> do
+    addrT <- newWHNFThunk (VPrimObj (PrimPtr nullPtr))
+    pure (VCon "(#,#)" [sT, addrT])
+
+-- | @clearCCS#@ is identity on the state-passing action (no CCS).
+clearCCSHashB :: IO Val
+clearCCSHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
+    ioV  <- force legacyHooks ioT
+    rRaw <- apply legacyHooks ioV sT
+    v    <- runIOVal legacyHooks rRaw
+    case v of
+        VCon "(#,#)" _ -> pure v
+        _ -> do
+            sT' <- newWHNFThunk (VPrimObj PrimRealWorld)
+            vT  <- newWHNFThunk v
+            pure (VCon "(#,#)" [sT', vT])
+
 --------------------------------------------------------------------------------
 -- Phase 2.8: boxing/unboxing constructors
 --------------------------------------------------------------------------------
@@ -4457,39 +4489,43 @@ intField label t = do
 
 pokeB :: IO Val
 pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
-    av <- force legacyHooks a; bv <- force legacyHooks b
+    av <- force legacyHooks a; bv0 <- force legacyHooks b
     p <- ptrValToPtr av
-    case bv of
+    case bv0 of
         VCon "AddrInfo" _ -> do
-            pokeAddrInfoHintsVal p bv
+            pokeAddrInfoHintsVal p bv0
             pure VUnit
-        VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-        -- Boxed Word8 (after W8# carrier for Num Word8 dispatch).
-        VCon "W8#" [t] -> do
+        _ -> do
+            -- Unary newtype / boxed-unboxed spines (CInt, Int32, I#,
+            -- W8#, IS, …) are structural: walk any single-field VCon
+            -- until a machine integer or Char is visible.  setSockOpt
+            -- pokes a CInt; demanding a bare VInt here used to crash
+            -- Network.Socket.socket's setDontFragment.
+            bv <- unwrapUnarySpine 0 bv0
+            case bv of
+                VInt n  -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
+                -- Accept 'VChar' for the @Ptr Word8@ default.  ihc skips type
+                -- checking, so a 'VChar' can flow into a Word8-typed slot
+                -- when a user writes e.g. @Data.ByteString.pack "test"@ — a
+                -- type error in stock Haskell, but ihc's optimistic semantics
+                -- treats it as the Char8 path's @c2w = fromIntegral . ord@
+                -- coercion and lets it through.  Landing the conversion at
+                -- the FFI boundary lets source-loaded
+                -- 'Data.ByteString.Internal.Type.unsafePackLenBytes' work
+                -- without any Hackage-library shim (CLAUDE.md rule 4).
+                VChar c -> do { poke (p :: Ptr Word8) (fromIntegral (fromEnum c)); pure VUnit }
+                _ -> error ("poke: value not an Int or Char: " <> showValForDebug bv)
+
+-- | Force through a unary constructor spine.  Newtypes and boxed
+-- unboxed-sums (@I#@, @W8#@, @IS@, @CInt@, …) are all @VCon n [t]@.
+unwrapUnarySpine :: Int -> Val -> IO Val
+unwrapUnarySpine depth v
+    | depth > 8 = pure v
+    | otherwise = case v of
+        VCon _ [t] -> do
             inner <- force legacyHooks t
-            case inner of
-                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-                _      -> error ("poke: W8# inner not an Int: " <> showValForDebug inner)
-        -- Small-Integer 'IS' cross-rep: 'fromIntegral'-chained Word8
-        -- values reaching @poke@ via the Char8 path arrive as
-        -- 'VCon "IS" [VInt n]' rather than the bare 'VInt' the
-        -- type-correct path would land — accept both shapes.
-        VCon "IS" [t] -> do
-            inner <- force legacyHooks t
-            case inner of
-                VInt n -> do { poke (p :: Ptr Word8) (fromIntegral n); pure VUnit }
-                _      -> error ("poke: IS inner not an Int: " <> showValForDebug inner)
-        -- Accept 'VChar' for the @Ptr Word8@ default.  ihc skips type
-        -- checking, so a 'VChar' can flow into a Word8-typed slot
-        -- when a user writes e.g. @Data.ByteString.pack "test"@ — a
-        -- type error in stock Haskell, but ihc's optimistic semantics
-        -- treats it as the Char8 path's @c2w = fromIntegral . ord@
-        -- coercion and lets it through.  Landing the conversion at
-        -- the FFI boundary lets source-loaded
-        -- 'Data.ByteString.Internal.Type.unsafePackLenBytes' work
-        -- without any Hackage-library shim (CLAUDE.md rule 4).
-        VChar c -> do { poke (p :: Ptr Word8) (fromIntegral (fromEnum c)); pure VUnit }
-        _ -> error ("poke: value not an Int or Char: " <> showValForDebug bv)
+            unwrapUnarySpine (depth + 1) inner
+        _ -> pure v
 
 peekByteOffB :: IO Val
 peekByteOffB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do

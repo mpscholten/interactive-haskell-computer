@@ -2618,10 +2618,13 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                 TkBar -> pure (Right (reverse rev, cur, False))
                 TkEof -> pure (Right (reverse rev, cur, True))
                 TkIdent "deriving" -> pure (Right (reverse rev, cur', True))
+                TkDeriving -> pure (Right (reverse rev, cur, True))
                 TkNewline -> do
                     let (peek, _) = nextToken src cur'
                     case tkKind peek of
                         TkLBrace | null rev -> collectFields rev cur'
+                        TkDeriving -> pure (Right (reverse rev, cur, True))
+                        TkIdent "deriving" -> pure (Right (reverse rev, cur, True))
                         _ | tkKind peek == TkEof || tkCol peek == 1 ->
                             pure (Right (reverse rev, cur', True))
                           | otherwise -> pure (Left cur')

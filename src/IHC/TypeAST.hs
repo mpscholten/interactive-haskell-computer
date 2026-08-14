@@ -21,6 +21,7 @@ module IHC.TypeAST
     , typeDispatchTag
     , expandTypeSynonyms
     , isMonoType
+    , schemeIsResultPolymorphic
     ) where
 
 import Data.Map.Strict (Map)
@@ -233,3 +234,20 @@ tyApps = go []
 -- | True if the type contains no 'TyVar' nodes (monomorphic).
 isMonoType :: Type -> Bool
 isMonoType t = Set.null (freeTyVars t)
+
+-- | True when a constrained type variable appears in the *result*
+-- of a scheme (@fromInteger :: Num a => Integer -> a@, @fromIntegral
+-- :: (Integral a, Num b) => a -> b@).  @sizeOf :: Storable a => a -> Int@
+-- is the opposite: @a@ lives only in the argument.
+schemeIsResultPolymorphic :: Scheme -> Bool
+schemeIsResultPolymorphic (Scheme _ preds body) =
+    let (_, result) = tyArrowArgs body
+        resultVars  = freeTyVars result
+        predVars    = Set.unions (map predTyVars preds)
+    in not (Set.null (Set.intersection resultVars predVars))
+  where
+    predTyVars (Pred _ ts) = Set.unions (map freeTyVars ts)
+    predTyVars (QPred vs ctx p) =
+        Set.difference
+            (Set.unions (predTyVars p : map predTyVars ctx))
+            (Set.fromList vs)
