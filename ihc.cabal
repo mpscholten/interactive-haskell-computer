@@ -94,12 +94,18 @@ executable ihc
     import:           warnings, lang
     hs-source-dirs:   app
     main-is:          Main.hs
+    other-modules:    Daemon
     build-depends:
         base
       , bytestring
+      , containers
+      , directory
       , filepath
       , ihc
+      , network
+      , process
       , text
+      , unix
     -- -rdynamic exports the executable's own symbols (including the
     -- statically-linked GHC RTS) into the dynamic symbol table, so that
     -- interpreted FFI imports of RTS-exclusive symbols (rtsSupportsBoundThreads,

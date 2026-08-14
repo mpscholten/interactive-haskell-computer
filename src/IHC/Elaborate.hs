@@ -953,21 +953,39 @@ applyMethodSubst synonyms sub = go
     -- 'Nothing' when the class parameter is still ambiguous after inference
     -- (the tag is a type variable, not a real type head) — the caller then
     -- reverts the node to a bare 'EVar' (see 'go').
-    resolveTag :: Name -> Maybe Name
-    resolveTag tag = case Map.lookup tag sub of
+    --
+    -- Result-poly @pure@/@return@/@empty@ dispatch on the type constructor
+    -- after synonym expansion (@Parser Char@ → @Parsec Void Text Char@ →
+    -- @ParsecT e s Identity Char@ → @ParsecT@).  The closed
+    -- 'typeDispatchTag' (@ParsecT Void Text Identity@) has no instance
+    -- key.  Type-kind classes (IsString, Num) keep the structural tag.
+    -- No name list of @Parser@/@ParsecT@.
+    resolveTag :: Maybe Name -> Name -> Maybe Name
+    resolveTag mMethod tag = case Map.lookup tag sub of
         Just ty ->
             let resolved = expandTypeSynonyms synonyms (applySubst sub ty)
-            in if Set.null (freeTyVars resolved)
-                   then Just (typeDispatchTag resolved)
-                   -- Monad transformers keep free args (@ParsecT e s Identity@)
-                   -- after pinning the constructor.  Dispatch only needs the
-                   -- head; requiring a closed type reverted @pure@/@*>@ to
-                   -- bare EVar and lost the ParsecT instance.
-                   -- Same for TH @Q a@: do not treat ParsecT as Q/Exp.
-                   else tyHead resolved
+            in if isResultPolyCarrier mMethod
+                   then fmap bareName (tyHead resolved)
+                   else if Set.null (freeTyVars resolved)
+                       then Just (typeDispatchTag resolved)
+                       -- Monad transformers keep free args (@ParsecT e s Identity@)
+                       -- after pinning the constructor.  Dispatch only needs the
+                       -- head; requiring a closed type reverted @pure@/@*>@ to
+                       -- bare EVar and lost the ParsecT instance.
+                       -- Same for TH @Q a@: do not treat ParsecT as Q/Exp.
+                       else tyHead resolved
         Nothing
-          | isHeadName tag -> Just (typeDispatchTag (expandTypeSynonyms synonyms (TyCon tag)))
+          | isHeadName tag ->
+              let expanded = expandTypeSynonyms synonyms (TyCon tag)
+              in if isResultPolyCarrier mMethod
+                     then fmap bareName (tyHead expanded)
+                     else Just (typeDispatchTag expanded)
           | otherwise      -> Nothing            -- unresolved placeholder type variable
+
+    isResultPolyCarrier (Just n) =
+        let b = bareName n
+        in b == BC.pack "pure" || b == BC.pack "return" || b == BC.pack "empty"
+    isResultPolyCarrier Nothing = False
 
     -- A resolved type head is a constructor: an uppercase name, or the list /
     -- tuple constructors.  Type-variable placeholders (lowercase, or the
@@ -978,7 +996,7 @@ applyMethodSubst synonyms sub = go
 
     go e = case e of
         ETypedMethod cls method tag ->
-            case resolveTag tag of
+            case resolveTag (Just method) tag of
                 Just h  -> ETypedMethod cls method h
                 -- Tag stayed ambiguous (a type variable).  Revert to the bare
                 -- name rather than emitting a broken 'ETypedMethod' whose tag

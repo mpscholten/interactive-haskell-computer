@@ -14,6 +14,11 @@ import IHC.TypeAST (Type(..), Pred(..), Scheme(..))
 data TTok = TTCon !ByteString | TTVar !ByteString | TTArrow | TTDArrow
     | TTLParen | TTRParen | TTLBracket | TTRBracket | TTComma | TTDot
     | TTForall | TTUnderscore | TTSymOp !ByteString
+    -- Implicit-param constraints (`?settings :: T`) appear on type
+    -- synonym RHS (HSX `Parser a`) and on signatures.  `collectTypeTokens`
+    -- stops at the first unmapped token; dropping `?` / `::` truncated
+    -- the RHS so the synonym was never registered.
+    | TTImplicit !ByteString | TTColon
     deriving (Eq, Show)
 
 tokenKindToTT :: TokenKind -> Maybe TTok
@@ -23,7 +28,10 @@ tokenKindToTT kind = case kind of
     TkLParen -> Just TTLParen; TkRParen -> Just TTRParen
     TkLBracket -> Just TTLBracket; TkRBracket -> Just TTRBracket
     TkComma -> Just TTComma; TkDot -> Just TTDot; TkUnderscore -> Just TTUnderscore
-    TkSymOp n -> Just (TTSymOp n); _ -> Nothing
+    TkSymOp n -> Just (TTSymOp n)
+    TkImplicitRef n -> Just (TTImplicit n)
+    TkDColon -> Just TTColon
+    _ -> Nothing
 
 parseSchemeBytes :: ByteString -> Maybe Scheme
 parseSchemeBytes bytes = go startCursor >>= parseScheme
@@ -73,6 +81,12 @@ parsePred :: [TTok] -> Maybe Pred
 parsePred (TTCon cls : rest) = do
     args <- parseTypeAtoms rest
     if null args then Nothing else Just (Pred cls args)
+-- `(?name :: T)` — implicit-param constraint.  Not a class predicate
+-- for dispatch; stored so the context is stripped and the body type
+-- (Parsec / IO / …) remains the carrier.
+parsePred (TTImplicit n : TTColon : rest) = do
+    ty <- parseType rest
+    Just (Pred (BC.cons '?' n) [ty])
 parsePred _ = Nothing
 
 parseType :: [TTok] -> Maybe Type

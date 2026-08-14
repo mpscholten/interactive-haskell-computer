@@ -4,9 +4,9 @@ import qualified Data.ByteString.Char8 as BC
 import qualified Data.Map.Strict as Map
 import Test.Hspec
 
-import IHC.Scan (scanRecordSelectorSchemes, scanTypeSigs)
+import IHC.Scan (scanRecordSelectorSchemes, scanTypeSigs, scanTypeSynonyms)
 import IHC.Source (mkSource)
-import IHC.TypeAST (Pred(..), Scheme(..), Type(..))
+import IHC.TypeAST (Pred(..), Scheme(..), Type(..), TypeSynonym(..))
 import IHC.TypeSchemeParser (parseSchemeBytes)
 
 spec :: Spec
@@ -21,6 +21,29 @@ spec = describe "shared type-scheme parser" $ do
         ]
     it "rejects tokens outside the type grammar" $
         parseSchemeBytes "Int = Bool" `shouldBe` Nothing
+    it "strips implicit-param context from a scheme" $
+        parseSchemeBytes "(?ok :: Bool) => Parsec Void Text a" `shouldBe` Just
+            (Scheme ["a"]
+                [Pred "?ok" [TyCon "Bool"]]
+                (TyApp (TyApp (TyApp (TyCon "Parsec") (TyCon "Void"))
+                    (TyCon "Text")) (TyVar "a")))
+    it "strips two implicit-param constraints like HSX Parser" $
+        parseSchemeBytes
+            "(?extensions :: [()], ?settings :: Settings) => Parsec Void Text a"
+            `shouldBe` Just
+            (Scheme ["a"]
+                [ Pred "?extensions" [TyApp (TyCon "[]") (TyCon "()")]
+                , Pred "?settings" [TyCon "Settings"]
+                ]
+                (TyApp (TyApp (TyApp (TyCon "Parsec") (TyCon "Void"))
+                    (TyCon "Text")) (TyVar "a")))
+    it "registers a constrained type-synonym body as the carrier type" $ do
+        syns <- scanTypeSynonyms (mkSource "P.hs"
+            "type Parser a = (?ok :: Bool) => Parsec Void Text a\n")
+        lookup "Parser" syns `shouldBe` Just
+            (TypeSynonym ["a"]
+                (TyApp (TyApp (TyApp (TyCon "Parsec") (TyCon "Void"))
+                    (TyCon "Text")) (TyVar "a")))
     it "retains a QuasiQuoter-like record selector scheme" $ do
         fields <- scanRecordSelectorSchemes (mkSource "Q.hs"
             "data QuasiQuoter = QuasiQuoter { quoteExp :: String -> Q Exp, other :: Int }\n")

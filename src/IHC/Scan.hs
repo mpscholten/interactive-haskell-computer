@@ -89,7 +89,7 @@ import IHC.Source
 import IHC.StringUtils (isAsciiSpace, trimAscii)
 import IHC.TypeAST (Type(..), Pred(..), Scheme(..), TypeSynonym(..), tyApps)
 import IHC.TypeSchemeParser
-    ( TTok(..), tokenKindToTT, parseScheme, parseType, parseTypeAtoms
+    ( TTok(..), tokenKindToTT, parseScheme, parseTypeAtoms
     , parseTypeKinds )
 import qualified IHC.TypeReduce as TR
 import IHC.ConstructorMetadata
@@ -5134,8 +5134,14 @@ scanTypeSynonymsRaw src
                         case tkKind eqTok of
                             TkEq -> do
                                 (typeToks, curAfterType) <- collectTypeTokens src curAfterEq
-                                case parseType typeToks of
-                                    Just rhs ->
+                                -- Scheme, not a bare type: HSX
+                                --   type Parser a = (?settings :: S) => Parsec Void Text a
+                                -- has a context.  Storing only the body lets
+                                -- expandTypeSynonyms expose the Parsec/ParsecT
+                                -- constructor head (carrier pin).  parseType
+                                -- alone died at `?` / could not strip `=>`.
+                                case parseScheme typeToks of
+                                    Just (Scheme _ _ rhs) ->
                                         go ((synName, TypeSynonym argVars rhs) : acc) curAfterType
                                     Nothing -> go acc curAfterType
                             _ -> go acc cur'   -- type family / instance / etc.

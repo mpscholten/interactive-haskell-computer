@@ -61,7 +61,7 @@ import IHC.Diagnostics (noteBlackHoleWait, noteForceEval, noteForceKind)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.PatSyn as PatSyn
 import qualified IHC.TypeAST as TA
-import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyHead, schemeIsResultPolymorphic, freeTyVars)
+import IHC.TypeAST (Scheme(..), Type(..), tyArrowArgs, tyHead, schemeIsResultPolymorphic, freeTyVars, expandTypeSynonyms)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalAmbiguousSigsRef, globalMethodClassRef)
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -558,6 +558,97 @@ enterThunk hooks t restore msg compute = do
                     _ <- tryPutMVar w ()
                     throwIO e
 
+-- | Force a thunk in an implicit-param context.
+--
+-- GHC elaborates @(?x :: t) => a@ as a dictionary-passing function, so a
+-- nullary binding @f = ?x@ reads @?x@ from the *call site*, not from the
+-- empty definition-site map closed over the CAF.  Lambdas already do this
+-- via 'VFunIP' + 'applyIP'.  CAF / do-block bindings do not: 'force' evals
+-- them with the captured (usually empty) map and memoises the result.
+--
+-- When the caller has implicit params the thunk did not capture:
+--
+--   * Lambda-headed bindings stay on the 'force' path.  'ELam' must
+--     capture the *definition-site* map so 'applyIP' can merge the
+--     true call-site map (lexical wins).  Evaluating the lambda under
+--     the caller's map would bake that map in and shadow later sites.
+--   * Everything else is re-evaluated with @thunkIPM ∪ callerIPM@
+--     (lexical wins).  IP-dependent results are not memoised — they
+--     are functions of the call-site map, like GHC's dictionaries.
+forceWithIPM :: IHCHooks -> ImplicitParamMap -> Thunk -> IO Val
+forceWithIPM hooks callerIPM t
+    | Map.null callerIPM = force hooks t
+    | otherwise = do
+        st <- readIORef t
+        case st of
+            Unevaluated clo@(Closure env thunkIPM expr)
+                | Map.null (Map.difference callerIPM thunkIPM) ->
+                    force hooks t
+                | isLambdaHead expr ->
+                    force hooks t
+                | otherwise -> do
+                    let merged = Map.union thunkIPM callerIPM
+                    if exprHasFreeImplicitRefs expr
+                        then eval hooks env merged expr
+                        else
+                            enterThunk hooks t (Unevaluated clo) (take 500 (show expr)) $ do
+                                noteForceEval (show expr)
+                                eval hooks env merged expr
+            _ -> force hooks t
+
+-- | @\\x -> …@ (plus signature / type-app wrappers).  These become
+-- 'VFunIP' and receive the caller's implicit-param map at apply time.
+isLambdaHead :: Expr -> Bool
+isLambdaHead (ELam _ _)              = True
+isLambdaHead (ELocalSig _ e)         = isLambdaHead e
+isLambdaHead (ETyApp e _)            = isLambdaHead e
+isLambdaHead (EConstrainedValue e _) = isLambdaHead e
+isLambdaHead _                       = False
+
+-- | True when evaluating this expression (now or in a delayed subform)
+-- can read a free @?name@.  Used to refuse memoising IP-dependent CAF
+-- results so a later @let ?x = …@ sees its own binding.
+exprHasFreeImplicitRefs :: Expr -> Bool
+exprHasFreeImplicitRefs = go Set.empty
+  where
+    go bound = \case
+        EImplicitRef n -> n `Set.notMember` bound
+        EImplicitLet bs body ->
+            let bound' = bound <> Set.fromList (map fst bs)
+            in any (go bound . snd) bs || go bound' body
+        EApp f x             -> go bound f || go bound x
+        ELam _ body          -> go bound body
+        ELet bs body         -> any (go bound . snd) bs || go bound body
+        ECase s alts         -> go bound s || any (\(Alt _ e) -> go bound e) alts
+        EIf c th el          -> go bound c || go bound th || go bound el
+        EDo stmts            -> goStmts bound stmts
+        ENeg e               -> go bound e
+        ETuple es            -> any (go bound) es
+        ERecordCon _ fs      -> any (go bound . snd) fs
+        ERecordUpdate e fs   -> go bound e || any (go bound . snd) fs
+        ESplice e            -> go bound e
+        EQuote e             -> go bound e
+        ETyApp e _           -> go bound e
+        ELocalSig _ e        -> go bound e
+        EConstrainedValue e _ -> go bound e
+        EVar{}               -> False
+        ELit{}               -> False
+        ELabel{}             -> False
+        EGuardFail           -> False
+        ERecordWild{}        -> False
+        EQuasiQuote{}        -> False
+        ETypedMethod{}       -> False
+
+    goStmts _ [] = False
+    goStmts bound (s:ss) = case s of
+        SExpr e -> go bound e || goStmts bound ss
+        SBind _ e -> go bound e || goStmts bound ss
+        SBangBind _ e -> go bound e || goStmts bound ss
+        SLet bs -> any (go bound . snd) bs || goStmts bound ss
+        SImplicitLet bs ->
+            let bound' = bound <> Set.fromList (map fst bs)
+            in any (go bound . snd) bs || goStmts bound' ss
+
 -- | Cheap tag for WHNF force samples (no deep show).
 valKindTag :: Val -> String
 valKindTag = \case
@@ -612,7 +703,10 @@ eval hooks env ipm = go
     go EGuardFail        = throwIO (PatternMatchFail "guard failed")
 
     go (EVar name) = case lookupEnv name env of
-        Just t -> force hooks t
+        -- Thread the current implicit-param map into the force so a
+        -- nullary @f = ?x@ / @parser = do { let x = ?settings; … }@
+        -- CAF reads the *call-site* bindings (GHC dictionary passing).
+        Just t -> forceWithIPM hooks ipm t
         Nothing
             | Just ctor <- unboxedTupleCtorValue name -> pure ctor
             | otherwise -> do
@@ -633,7 +727,7 @@ eval hooks env ipm = go
             owner <- currentOwner hooks env
             mT    <- lookupEnvFallback legacyHooks owner name
             case mT of
-                Just t  -> force hooks t
+                Just t  -> forceWithIPM hooks ipm t
                 Nothing -> error ("IHC.Eval: unbound variable `"
                                   <> BC.unpack name <> "`")
 
@@ -778,7 +872,7 @@ eval hooks env ipm = go
         thunks <- mapM (newThunkIP env ipm) es
         pure (VCon name thunks)
 
-    go (EDo stmts) = evalDo hooks env ipm Nothing stmts
+    go (EDo stmts) = evalConstructedDo hooks env ipm Nothing stmts
 
     -- Phase 3.6: Implicit parameter reference.
     -- Look up ?name in the current ImplicitParamMap. Miss -> runtime error.
@@ -928,8 +1022,9 @@ eval hooks env ipm = go
                 Nothing     -> act
         case stripToDo e of
             Just stmts ->
-                withResultTag $
-                    evalDo hooks env ipm (Just (monadicCarrierFromType ty)) stmts
+                withResultTag $ do
+                    carrier <- monadicCarrierFromType ty
+                    evalConstructedDo hooks env ipm (Just carrier) stmts
             Nothing -> withResultTag (goTyAppBody e ty)
 
     goTyAppBody e ty = do
@@ -956,9 +1051,10 @@ eval hooks env ipm = go
                             mElab <- tryElaborateTyAnn e ty
                             case mElab of
                                 Just e' -> case stripToDo e' of
-                                    Just stmts' ->
-                                        evalDo hooks env ipm
-                                            (Just (monadicCarrierFromType ty))
+                                    Just stmts' -> do
+                                        carrier <- monadicCarrierFromType ty
+                                        evalConstructedDo hooks env ipm
+                                            (Just carrier)
                                             stmts'
                                     Nothing -> goTyApp e' ty
                                 Nothing -> goTyApp e ty
@@ -1080,7 +1176,17 @@ eval hooks env ipm = go
     -- | Helper: try to elaborate @e@ under the annotation @ty@.
     -- Returns 'Just' if elaboration rewrote something; 'Nothing'
     -- otherwise.
-    tryElaborateTyAnn e ty = do
+    tryElaborateTyAnn e ty
+        -- @>>@ / @>>=@ / @*>@ annotated with a transformer head
+        -- (@ParsecT@) must not go through ExpectType: inference can
+        -- treat @ParsecT e s Identity@ as @Identity (ParsecT …)@ and
+        -- rewrite the bind to Identity.  That is the
+        -- @do { space; pure () }@ leftover — @runIdentity@ on a
+        -- @ParsecT@.  Skip elaboration; goTyApp only appends the tag.
+        -- Do not treat ParsecT as Q/Exp.
+        | Just n <- applicationHeadName e
+        , isSequencingBindName (bareName n) = pure Nothing
+        | otherwise = do
         mReg <- getSharedClassReg legacyHooks
         case mReg of
             Nothing -> pure Nothing
@@ -2297,6 +2403,26 @@ intSizedPrimCons = ["I8#", "I16#", "I32#", "I64#"]
 wordSizedPrimCons :: [Name]
 wordSizedPrimCons = ["W8#", "W16#", "W32#", "W64#"]
 
+-- | @W#@ plus the fixed-width word prim wrappers.  Source Bits/Num
+-- instances pattern-match these; optimistic fromIntegral leaves a
+-- bare 'VInt'.  One predicate so matchPat does not grow a per-width
+-- name list (W16# / W32# / W64# used to miss the VInt bridge that
+-- W# / W8# already had).
+isWordPrimCon :: Name -> Bool
+isWordPrimCon n =
+    let b = bareConName n
+    in b == "W#" || b `elem` wordSizedPrimCons
+
+-- | Small Integers that can sit in the interpreter's VInt payload.
+wordPrimIntegerInRange :: Name -> Integer -> Bool
+wordPrimIntegerInRange c n
+    -- Preserve the existing W8# tight range; other widths accept any
+    -- Int64-sized Integer the way W# already does.
+    | bareConName c == "W8#" = n >= 0 && n <= 255
+    | otherwise =
+        n >= toInteger (minBound :: Int64)
+        && n <= toInteger (maxBound :: Int64)
+
 bareConName :: Name -> Name
 bareConName n = case BC.elemIndexEnd '.' n of
     Just idx -> BC.drop (idx + 1) n
@@ -2490,44 +2616,35 @@ matchPat hooks (PCon "I#" [p]) (VCon c [t])
 -- Int's @(I# x) + (I# y)@ must accept the W8#/W# payload so the digit
 -- packing path does not PatternMatchFail with args=<int> W8# 48.
 matchPat hooks (PCon "I#" [p]) (VCon c [t])
-    | bareConName c `elem` wordSizedPrimCons =
+    | isWordPrimCon c =
         matchFields hooks [(p, t)] []
-matchPat hooks (PCon "I#" [p]) (VCon "W#" [t]) =
-    matchFields hooks [(p, t)] []
-matchPat hooks (PCon "I#" [p]) (VCon "W8#" [t]) =
-    matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W#" [p]) (VCon "IS" [t]) =
-    matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W8#" [p]) (VCon "IS" [t]) =
-    matchFields hooks [(p, t)] []
-matchPat hooks pat@(PCon "W#" [_]) (VCon c [t])
-    | bareConName c `elem` numericNewtypeCons = do
-        inner <- force hooks t
-        matchPat hooks pat inner
-matchPat hooks (PCon "W#" [p]) (VCon c [t])
-    | bareConName c `elem` wordSizedPrimCons =
+matchPat hooks (PCon c [p]) (VInt n)
+    | bareConName c `elem` intSizedPrimCons = do
+        t <- newWHNFThunk (VInt n)
         matchFields hooks [(p, t)] []
-matchPat hooks pat@(PCon "W8#" [_]) (VCon c [t])
-    | bareConName c `elem` numericNewtypeCons = do
-        inner <- force hooks t
-        matchPat hooks pat inner
-matchPat hooks (PCon "W8#" [p]) (VCon c [t])
-    | bareConName c `elem` wordSizedPrimCons =
+-- Word-sized prim wrappers are representation-transparent over VInt
+-- the same way I# already is.  Optimistic fromIntegral / unannotated
+-- literals stay VInt; source Bits/Num instances still pattern-match
+-- @W32# x#@ / @I# i#@.  W# and W8# had this bridge; W16# / W32# /
+-- W64# did not — so @fromIntegral x `shiftL` i :: Word32@ (the
+-- Network.Socket.Types HostAddress pack helper) died as
+-- W32#/I# args=127 24.
+matchPat hooks pat@(PCon c [_]) (VCon inner [t])
+    | isWordPrimCon c
+    , bareConName inner `elem` numericNewtypeCons = do
+        innerV <- force hooks t
+        matchPat hooks pat innerV
+matchPat hooks (PCon c [p]) (VCon inner [t])
+    | isWordPrimCon c
+    , isWordPrimCon inner || inner == "IS" =
         matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W#" [p]) (VInt n) = do
-    t <- newWHNFThunk (VInt n)
-    matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W#" [p]) (VInteger n)
-    | n >= toInteger (minBound :: Int64)
-    , n <= toInteger (maxBound :: Int64) = do
-        t <- newWHNFThunk (VInt (fromInteger n))
+matchPat hooks (PCon c [p]) (VInt n)
+    | isWordPrimCon c = do
+        t <- newWHNFThunk (VInt n)
         matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W8#" [p]) (VInt n) = do
-    t <- newWHNFThunk (VInt n)
-    matchFields hooks [(p, t)] []
-matchPat hooks (PCon "W8#" [p]) (VInteger n)
-    | n >= 0
-    , n <= 255 = do
+matchPat hooks (PCon c [p]) (VInteger n)
+    | isWordPrimCon c
+    , wordPrimIntegerInRange c n = do
         t <- newWHNFThunk (VInt (fromInteger n))
         matchFields hooks [(p, t)] []
 matchPat hooks (PCon "C#" [p]) (VChar c) = do
@@ -3351,6 +3468,20 @@ isIODoAction True (VFunIP _ _) = True
 isIODoAction _ (VCon n _) = n == BC.pack "IO" || BC.isSuffixOf (BC.pack ".IO") n
 isIODoAction _ _ = False
 
+-- | Evaluate a source do-block that *constructs* a monadic value
+-- (a parser CAF, an IO action, …), then drop the leftover
+-- 'lastMonadicCarrier' tag.  Class dispatch of @>>=@ / @(<|>)@ / @void@
+-- (@fmap@) publishes that tag so a later result-poly @pure@ can stay
+-- on the same carrier; after the do-block has produced a value the
+-- tag must not leak into @runParser@'s Identity (@runIdentity@ on a
+-- @ParsecT@).
+evalConstructedDo
+    :: IHCHooks -> Env -> ImplicitParamMap -> Maybe Name -> [Stmt] -> IO Val
+evalConstructedDo hooks env ipm mCarrier stmts = do
+    v <- evalDo hooks env ipm mCarrier stmts
+    _ <- takeLastMonadicCarrier
+    pure v
+
 evalDo :: IHCHooks -> Env -> ImplicitParamMap -> Maybe Name -> [Stmt] -> IO Val
 evalDo hooks env ipm mCarrier stmts =
     case lookupEnv doCarrierKey env of
@@ -3468,9 +3599,12 @@ doMonadicSequence
 doMonadicSequence hooks env ipm mv mBind mCarrier rest = do
     actT <- newWHNFThunk mv
     let actName = BC.pack "$doAct"
-        carrier = case mCarrier of
+        carrier0 = case mCarrier of
             Just c | not (BC.null c) -> c
             _ -> monadicCarrierTag mv
+        -- @Parser@ / @Parsec e s@ collapse to the same instance head
+        -- as @ParsecT@.  No name list of user synonyms.
+        carrier = normalizeTyTag carrier0
     carrierT <- newWHNFThunk (VStr carrier)
     qWrapT <- newWHNFThunk $ VFun $ \innerT ->
         pure (VCon (BC.pack "Q") [innerT])
@@ -3481,17 +3615,30 @@ doMonadicSequence hooks env ipm mv mBind mCarrier rest = do
         restE   = case rest of
             [SExpr e] -> annotatePureLike carrier e
             _         -> ETyApp (EDo (annotateCarrierResult carrier rest)) carrier
-        bindOp name = ETyApp (EVar name) carrier
+        -- @>>=@ keeps the carrier pin (bind-then-pure is GREEN).
+        -- @>>@ must stay value-directed on the first action: annotating
+        -- it as @ETyApp (EVar ">>") carrier@ lets ExpectType treat
+        -- @ParsecT e s Identity@ as Identity and @runIdentity@ a
+        -- ParsecT.  @space@ / @void $ takeWhileP@ is a VCon ParsecT,
+        -- so @>>@ sees that constructor.  Same as the GREEN isolate.
         bodyE   = case mBind of
             Nothing ->
-                EApp (EApp (bindOp ">>") (EVar actName)) restE
+                EApp (EApp (EVar ">>") (EVar actName)) restE
             Just (n, False) ->
-                EApp (EApp (bindOp ">>=") (EVar actName))
+                EApp (EApp (ETyApp (EVar ">>=") carrier) (EVar actName))
                      (ELam n restE)
             Just (n, True) ->
-                EApp (EApp (bindOp ">>=") (EVar actName))
+                EApp (EApp (ETyApp (EVar ">>=") carrier) (EVar actName))
                      (ELam n (EApp (EApp (EVar "seq") (EVar n)) restE))
-    eval hooks envAct ipm bodyE
+        -- Publish the carrier while @>>@ / @pure@ are applied so
+        -- Identity (from @runParserT'@) is not the last writer.
+        runBody
+            | isQCarrier carrier || BC.null carrier =
+                eval hooks envAct ipm bodyE
+            | otherwise =
+                bracket_ (pushDoCarrier carrier) popDoCarrier $
+                    eval hooks envAct ipm bodyE
+    runBody
 
 -- | Attach the carrier type to the result-polymorphic final action in a
 -- source-shaped do-block.  This is the small amount of expected-type
@@ -3514,16 +3661,20 @@ stripToDo _ = Nothing
 
 -- | Head constructor of a result type used as a monadic carrier.
 -- Function types (BuildStep = BufferRange -> IO (BuildSignal a)) peel
--- to the result constructor.  No name list: any concrete head works.
-monadicCarrierFromType :: ByteString -> Name
-monadicCarrierFromType raw =
-    case Elab.parseRawTypeExpr raw of
+-- to the result constructor.  Expand type synonyms first so a local
+-- @type Parser = Parsec Void Text@ is the same carrier as @ParsecT@
+-- (no name list of user synonyms).  @normalizeTyTag@ then maps
+-- @Parsec@ → @ParsecT@.
+monadicCarrierFromType :: ByteString -> IO Name
+monadicCarrierFromType raw = do
+    syns <- readIORef globalTypeSynonymsRef
+    pure $ case Elab.parseRawTypeExpr raw of
         Just ty ->
-            let (_, result) = tyArrowArgs ty
+            let (_, result) = tyArrowArgs (expandTypeSynonyms syns ty)
             in case resultHead result of
-                Just n -> lastComponent n
+                Just n -> normalizeTyTag (lastComponent n)
                 Nothing -> BC.pack "ParsecT"
-        Nothing -> lastComponent raw
+        Nothing -> normalizeTyTag (lastComponent raw)
   where
     resultHead (TyCon n) = Just n
     resultHead (TyApp f _) = resultHead f
@@ -3535,6 +3686,13 @@ monadicCarrierFromType raw =
     lastComponent n = case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
         Just idx -> BC.drop (idx + 1) n
         Nothing  -> n
+
+-- | @>>@ / @>>=@ / @*>@ — sequencing whose result type is the
+-- continuation's carrier.  Not @pure@/@return@: those stay elaborable.
+isSequencingBindName :: Name -> Bool
+isSequencingBindName n =
+    n == BC.pack ">>" || n == BC.pack ">>=" || n == BC.pack "*>"
+    || n == BC.pack "(>>)" || n == BC.pack "(>>=)" || n == BC.pack "(*>)"
 
 annotateCarrierResult :: Name -> [Stmt] -> [Stmt]
 annotateCarrierResult _ [] = []

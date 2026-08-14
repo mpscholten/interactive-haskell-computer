@@ -204,7 +204,9 @@ freeTyVarsScheme (Scheme vs preds body) =
             (Set.fromList qvs)
 
 -- | Leftmost head constructor of a type application chain.  Returns
--- 'Nothing' if the head is a type variable or an arrow.
+-- 'Nothing' if the head is a type variable or an arrow.  Walks
+-- 'TyForall' so a leftover context (`forall. (?x :: T) => Parsec …`)
+-- still exposes the constructor head used as a do-carrier.
 --
 -- > tyHead (Maybe Int)                 = Just "Maybe"
 -- > tyHead (StateT s Identity)         = Just "StateT"
@@ -215,6 +217,7 @@ tyHead = go
   where
     go (TyCon n)   = Just n
     go (TyApp a _) = go a
+    go (TyForall _ _ b) = go b
     go _           = Nothing
 
 -- | Destructure @a -> b -> ... -> r@ into @([a, b, ...], r)@.

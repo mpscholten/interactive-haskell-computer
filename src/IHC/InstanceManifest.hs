@@ -20,14 +20,20 @@
 --   * 'miMethodOwner'    — method name → owning class
 --   * 'miTypeProviders'  — type-ctor name → defining module
 --
--- The index is built once per process and held in 'manifestIndexRef'.
--- No on-disk persistence: the scan takes ~1–2 s for the full source
--- cache, and the test suite (one process, 1596 fixtures) amortises
--- that cost into noise.  CLI invocations (a fresh process per file)
--- pay it on every cold start, but that's a 1–2 s regression vs the
--- previous force-load list, not the kind of cost a binary @.hi@
--- artefact would warrant.  If startup latency ever becomes a real
--- issue, persistence can come back as a pure optimisation layer.
+-- The index is built once per process and reused.  Two rules keep
+-- @main = putStrLn "ok"@ from walking Warp:
+--
+--   1. Only *boot* packages (ghc-internal, ghc-prim, ghc-bignum,
+--      ghc-boot*) are scanned.  The scheduler already filters eager
+--      providers to @GHC.Internal.*@; Hackage instances arrive via the
+--      regular import path ('triggerRegisterInstances'), not this
+--      index.  Scanning warp/megaparsec/ihp on every hello was a
+--      mistake, not a requirement.
+--   2. The resulting index is persisted under
+--      @~\/.cache\/ihc\/instance-manifest.bin@, keyed by a cheap
+--      mtime fingerprint of those boot package dirs.  A cache hit
+--      is a file read; a miss rebuilds and rewrites.  Disable with
+--      @IHC_NO_INSTANCE_MANIFEST_CACHE=1@.
 module IHC.InstanceManifest
     ( -- * Types
       PackageManifest (..)
@@ -47,22 +53,36 @@ module IHC.InstanceManifest
     ) where
 
 import Control.Exception (SomeException, try)
-import Control.Monad (filterM, foldM)
+import Control.Monad (filterM, foldM, unless, when)
+import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Lazy as BL
+import Data.List (sort)
 import qualified Data.List as List
-import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
+import qualified Data.Set as Set
+import Data.Time.Clock (UTCTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Data.Word (Word32)
 import System.Directory
     ( XdgDirectory (XdgCache)
+    , createDirectoryIfMissing
     , doesDirectoryExist
+    , doesFileExist
+    , getHomeDirectory
+    , getModificationTime
     , getXdgDirectory
     , listDirectory
+    , renameFile
     )
 import System.Environment (lookupEnv)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
 import System.IO.Unsafe (unsafePerformIO)
 
 import qualified IHC.Cpp as Cpp
@@ -241,20 +261,42 @@ scanModuleUnsafe fp = do
 -- 'Maybe'-wrapping, no @get-or-build@ ceremony — callers just use
 -- 'manifestIndex' as a value.
 --
--- The first reference triggers the source-cache scan (~1–2 s for
--- ~233 ghc-internal modules); subsequent references are constant-time
--- map lookups against the cached value.  The test suite's 1596
--- fixtures share one scan.
+-- First reference: on-disk cache hit (boot-package fingerprint match)
+-- or a scan of boot libraries only.  Subsequent references are
+-- constant-time map lookups.  The test suite's fixtures share one
+-- load; CLI processes share the on-disk file.
 {-# NOINLINE manifestIndex #-}
 manifestIndex :: ManifestIndex
-manifestIndex = unsafePerformIO buildIndexFromCache
+manifestIndex = unsafePerformIO loadOrBuildIndex
 
--- | Walk source-cache package directories, scan every @.hs@ file once,
--- and merge into a single index.
-buildIndexFromCache :: IO ManifestIndex
-buildIndexFromCache = do
+-- | Load the persisted index when the boot-package fingerprint still
+-- matches; otherwise scan boot libraries and rewrite the cache.
+loadOrBuildIndex :: IO ManifestIndex
+loadOrBuildIndex = do
+    disabled <- cacheDisabled
+    fp <- bootFingerprint
+    path <- cacheFilePath
+    if disabled
+        then rebuildAndMaybeStore False path fp
+        else do
+            cached <- tryReadCache path fp
+            case cached of
+                Just idx -> pure idx
+                Nothing  -> rebuildAndMaybeStore True path fp
+
+rebuildAndMaybeStore :: Bool -> FilePath -> ByteString -> IO ManifestIndex
+rebuildAndMaybeStore writeIt path fp = do
+    idx <- buildIndexFromBootSources
+    when writeIt $ writeCache path fp idx
+    pure idx
+
+-- | Walk *boot* package directories only, scan every @.hs@ file once,
+-- and merge into a single index.  Warp / megaparsec / IHP are not
+-- boot libraries and must not be scanned for @main = putStrLn "ok"@.
+buildIndexFromBootSources :: IO ManifestIndex
+buildIndexFromBootSources = do
     sourceDirs <- sourcesCacheDirs
-    packageDirs <- concat <$> mapM packagesUnder sourceDirs
+    packageDirs <- concat <$> mapM bootPackagesUnder sourceDirs
     case packageDirs of
         [] -> pure emptyIndex
         _  -> do
@@ -262,25 +304,268 @@ buildIndexFromCache = do
                 (\(pkg, dir) -> generatePackageManifest (BC.pack pkg) dir)
                 (List.sort packageDirs)
             pure (buildIndex (concatMap (Map.elems . pmModules) manifests))
-  where
-    packagesUnder sourcesDir = do
-        sourcesExist <- doesDirectoryExist sourcesDir
-        if not sourcesExist
-            then pure []
-            else do
-                entries <- listDirectory sourcesDir
-                let candidates = filter (not . isPrefixOfDot) entries
-                packages <- filterM (\p -> doesDirectoryExist (sourcesDir </> p)) candidates
-                pure [ (p, sourcesDir </> p) | p <- packages ]
 
-    isPrefixOfDot ('.' : _) = True
-    isPrefixOfDot _         = False
+-- | Package directories that define the instances hello-world actually
+-- needs (the ones 'loadProgramFromSource' eagerly filters to
+-- @GHC.Internal.*@).  Name prefixes, not a module-name list.
+isBootPackageName :: FilePath -> Bool
+isBootPackageName name =
+    any (`List.isPrefixOf` name)
+        [ "ghc-internal-"
+        , "ghc-prim-"
+        , "ghc-bignum-"
+        , "ghc-boot-th-"
+        , "ghc-boot-"
+        ]
+
+bootPackagesUnder :: FilePath -> IO [(String, FilePath)]
+bootPackagesUnder sourcesDir = do
+    sourcesExist <- doesDirectoryExist sourcesDir
+    if not sourcesExist
+        then pure []
+        else do
+            entries <- listDirectory sourcesDir
+            let candidates =
+                    [ e | e <- entries
+                    , not (isPrefixOfDot e)
+                    , isBootPackageName e
+                    ]
+            packages <- filterM (\p -> doesDirectoryExist (sourcesDir </> p)) candidates
+            pure [ (p, sourcesDir </> p) | p <- packages ]
+
+isPrefixOfDot :: FilePath -> Bool
+isPrefixOfDot ('.' : _) = True
+isPrefixOfDot _         = False
 
 sourcesCacheDirs :: IO [FilePath]
 sourcesCacheDirs = do
     h <- getXdgDirectory XdgCache ""
     mNix <- lookupEnv "IHC_NIX_SOURCE_DIR"
     pure (List.nub (maybe id (:) mNix [h </> "ihc" </> "sources"]))
+
+--------------------------------------------------------------------------------
+-- On-disk cache
+--------------------------------------------------------------------------------
+
+cacheDisabled :: IO Bool
+cacheDisabled = do
+    m <- lookupEnv "IHC_NO_INSTANCE_MANIFEST_CACHE"
+    pure $ case m of
+        Just s | not (null s) && s /= "0" -> True
+        _ -> False
+
+cacheFilePath :: IO FilePath
+cacheFilePath = do
+    m <- lookupEnv "IHC_INSTANCE_MANIFEST_CACHE"
+    case m of
+        Just p | not (null p) -> pure p
+        _ -> do
+            home <- getHomeDirectory
+            pure (home </> ".cache" </> "ihc" </> "instance-manifest.bin")
+
+-- | Cheap fingerprint: nix source dir + each boot package directory's
+-- name and mtime.  Adding/removing a boot package or pointing
+-- @IHC_NIX_SOURCE_DIR@ at a new store path invalidates the cache.
+-- Content hashing is avoided: stat of ~4 dirs is milliseconds.
+bootFingerprint :: IO ByteString
+bootFingerprint = do
+    nix <- fromMaybe "" <$> lookupEnv "IHC_NIX_SOURCE_DIR"
+    sourceDirs <- sourcesCacheDirs
+    pkgs <- concat <$> mapM bootPackagesUnder sourceDirs
+    bits <- mapM pkgBit (sort pkgs)
+    pure $ BC.pack $ List.intercalate ";" (nix : bits)
+  where
+    pkgBit (name, dir) = do
+        r <- try (getModificationTime dir) :: IO (Either SomeException UTCTime)
+        let t = case r of
+                Right u -> show (toRational (utcTimeToPOSIXSeconds u))
+                Left _  -> "missing"
+        pure (name <> "=" <> t)
+
+tryReadCache :: FilePath -> ByteString -> IO (Maybe ManifestIndex)
+tryReadCache path fp = do
+    exists <- doesFileExist path
+    if not exists
+        then pure Nothing
+        else do
+            r <- try (BS.readFile path) :: IO (Either SomeException ByteString)
+            case r of
+                Left _   -> pure Nothing
+                Right bs -> pure (decodeCache fp bs)
+
+writeCache :: FilePath -> ByteString -> ManifestIndex -> IO ()
+writeCache path fp idx = do
+    let payload = encodeCache fp idx
+        tmp     = path <> ".tmp"
+    r <- try (do
+            createDirectoryIfMissing True (takeDirectory path)
+            BS.writeFile tmp payload
+            renameFile tmp path) :: IO (Either SomeException ())
+    case r of
+        Right () -> pure ()
+        Left _   -> pure ()  -- cache is best-effort
+
+cacheMagic :: ByteString
+cacheMagic = BC.pack "IHCIM1\n"
+
+encodeCache :: ByteString -> ManifestIndex -> ByteString
+encodeCache fp idx =
+    cacheMagic <> fp <> BC.singleton '\n' <> encodeIndex idx
+
+decodeCache :: ByteString -> ByteString -> Maybe ManifestIndex
+decodeCache expectedFp bs = do
+    rest0 <- BS.stripPrefix cacheMagic bs
+    let (fp, rest1) = BS.break (== 10) rest0  -- '\n'
+    rest2 <- BS.stripPrefix (BC.singleton '\n') rest1
+    if fp /= expectedFp
+        then Nothing
+        else decodeIndex rest2
+
+encodeIndex :: ManifestIndex -> ByteString
+encodeIndex idx =
+    BL.toStrict $ BB.toLazyByteString $
+        putMapSet (miClassProviders idx)
+        <> putMapList (miClassHeads idx)
+        <> putPairMapSet (miClassHeadProviders idx)
+        <> putMapBS (miMethodOwner idx)
+        <> putMapBS (miTypeProviders idx)
+
+decodeIndex :: ByteString -> Maybe ManifestIndex
+decodeIndex bs0 = do
+    (providers, bs1) <- getMapSet bs0
+    (heads, bs2)     <- getMapList bs1
+    (headProvs, bs3) <- getPairMapSet bs2
+    (owners, bs4)    <- getMapBS bs3
+    (types, rest)    <- getMapBS bs4
+    unless (BS.null rest) Nothing
+    pure ManifestIndex
+        { miClassProviders = providers
+        , miClassHeads = heads
+        , miClassHeadProviders = headProvs
+        , miMethodOwner = owners
+        , miTypeProviders = types
+        }
+
+putWord32 :: Word32 -> BB.Builder
+putWord32 = BB.word32BE
+
+putBS :: ByteString -> BB.Builder
+putBS b = putWord32 (fromIntegral (BS.length b)) <> BB.byteString b
+
+putMapSet :: Map ByteString (Set ByteString) -> BB.Builder
+putMapSet m =
+    putWord32 (fromIntegral (Map.size m))
+    <> Map.foldMapWithKey
+        (\k s -> putBS k
+              <> putWord32 (fromIntegral (Set.size s))
+              <> foldMap putBS (Set.toAscList s))
+        m
+
+putMapList :: Map ByteString [ByteString] -> BB.Builder
+putMapList m =
+    putWord32 (fromIntegral (Map.size m))
+    <> Map.foldMapWithKey
+        (\k xs -> putBS k
+               <> putWord32 (fromIntegral (length xs))
+               <> foldMap putBS xs)
+        m
+
+putPairMapSet :: Map (ByteString, ByteString) (Set ByteString) -> BB.Builder
+putPairMapSet m =
+    putWord32 (fromIntegral (Map.size m))
+    <> Map.foldMapWithKey
+        (\(a, b) s -> putBS a <> putBS b
+                   <> putWord32 (fromIntegral (Set.size s))
+                   <> foldMap putBS (Set.toAscList s))
+        m
+
+putMapBS :: Map ByteString ByteString -> BB.Builder
+putMapBS m =
+    putWord32 (fromIntegral (Map.size m))
+    <> Map.foldMapWithKey (\k v -> putBS k <> putBS v) m
+
+getWord32 :: ByteString -> Maybe (Word32, ByteString)
+getWord32 bs
+    | BS.length bs < 4 = Nothing
+    | otherwise =
+        let w =  (fromIntegral (BS.index bs 0) :: Word32) `shiftL` 24
+             .|. (fromIntegral (BS.index bs 1) :: Word32) `shiftL` 16
+             .|. (fromIntegral (BS.index bs 2) :: Word32) `shiftL` 8
+             .|.  fromIntegral (BS.index bs 3)
+        in Just (w, BS.drop 4 bs)
+
+getBS :: ByteString -> Maybe (ByteString, ByteString)
+getBS bs = do
+    (n, rest) <- getWord32 bs
+    let i = fromIntegral n
+    if BS.length rest < i
+        then Nothing
+        else Just (BS.take i rest, BS.drop i rest)
+
+getCount :: ByteString -> Maybe (Int, ByteString)
+getCount bs = do
+    (n, rest) <- getWord32 bs
+    Just (fromIntegral n, rest)
+
+replicateGet :: Int -> (ByteString -> Maybe (a, ByteString))
+             -> ByteString -> Maybe ([a], ByteString)
+replicateGet n0 f = go n0
+  where
+    go 0 bs = Just ([], bs)
+    go n bs = do
+        (x, rest) <- f bs
+        (xs, rest') <- go (n - 1) rest
+        Just (x : xs, rest')
+
+getMapSet :: ByteString -> Maybe (Map ByteString (Set ByteString), ByteString)
+getMapSet bs = do
+    (n, rest) <- getCount bs
+    (kvs, rest') <- replicateGet n getEntry rest
+    Just (Map.fromList kvs, rest')
+  where
+    getEntry b = do
+        (k, b1) <- getBS b
+        (m, b2) <- getCount b1
+        (vs, b3) <- replicateGet m getBS b2
+        Just ((k, Set.fromList vs), b3)
+
+getMapList :: ByteString -> Maybe (Map ByteString [ByteString], ByteString)
+getMapList bs = do
+    (n, rest) <- getCount bs
+    (kvs, rest') <- replicateGet n getEntry rest
+    Just (Map.fromList kvs, rest')
+  where
+    getEntry b = do
+        (k, b1) <- getBS b
+        (m, b2) <- getCount b1
+        (vs, b3) <- replicateGet m getBS b2
+        Just ((k, vs), b3)
+
+getPairMapSet
+    :: ByteString
+    -> Maybe (Map (ByteString, ByteString) (Set ByteString), ByteString)
+getPairMapSet bs = do
+    (n, rest) <- getCount bs
+    (kvs, rest') <- replicateGet n getEntry rest
+    Just (Map.fromList kvs, rest')
+  where
+    getEntry b = do
+        (a, b1) <- getBS b
+        (c, b2) <- getBS b1
+        (m, b3) <- getCount b2
+        (vs, b4) <- replicateGet m getBS b3
+        Just (((a, c), Set.fromList vs), b4)
+
+getMapBS :: ByteString -> Maybe (Map ByteString ByteString, ByteString)
+getMapBS bs = do
+    (n, rest) <- getCount bs
+    (kvs, rest') <- replicateGet n getEntry rest
+    Just (Map.fromList kvs, rest')
+  where
+    getEntry b = do
+        (k, b1) <- getBS b
+        (v, b2) <- getBS b1
+        Just ((k, v), b2)
 
 -- | Fold a list of 'ModuleManifest' into the denormalised lookup
 -- tables.  Multiple modules can provide instances for the same class;

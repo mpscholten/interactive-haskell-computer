@@ -49,6 +49,8 @@ module IHC.Scheduler
       -- * Record-syntax desugaring (used by the REPL)
     , desugarRecordCons
     , desugarRecordPats
+      -- * Cross-run module-skeleton cache (daemon)
+    , enableKeepModuleCache
     ) where
 
 import Control.Exception (throwIO, Exception, catch, SomeException, try, mask, onException, bracket_)
@@ -4311,14 +4313,15 @@ classMethodDispatcher reg cls methodName
                       argV <- force legacyHooks argT
                       case argV of
                           -- matchPat feeds a dummy VUnit to select a
-                          -- nullary method (mempty, maxBound) without
-                          -- applying.  `pure ()` is a real value apply
-                          -- of unit: if the method is a function
-                          -- (Applicative.pure), apply it.  Returning
-                          -- the unapplied method made
-                          -- `pure @ParsecT ()` / `do { space; pure () }`
-                          -- a leftover function, then unParser saw
-                          -- IO's `(#,#)` State# shape.
+                          -- nullary method (mempty, maxBound, eof)
+                          -- without applying.  `pure ()` is a real
+                          -- value apply of unit: if the method is a
+                          -- function (Applicative.pure, a VFun), apply
+                          -- it.  A ParsecT *value* (eof, getParserState)
+                          -- must be returned unapplied — applying it to
+                          -- VUnit unwraps the newtype and feeds `()` to
+                          -- `\s@(State …)`, which is the setPosition *>
+                          -- eof leftover.
                           VUnit -> do
                               forced <- forceMethodVal legacyHooks methodVal
                               if methodTakesValueArg forced
@@ -5828,19 +5831,22 @@ classMethodDispatcher reg cls methodName
                 (sch:_) -> pure (Just sch)
                 []      -> findClassScheme rest
 
-    -- Nullary class methods (mempty, maxBound) are concrete values.
+    -- Nullary class methods (mempty, maxBound, eof) are concrete values.
     -- Unary+ methods (pure, return, succ) are functions and must be
-    -- applied even when the argument is VUnit (`pure ()`).  Newtype
-    -- carriers wrap that function; treat those as function-shaped
-    -- rather than as a constructor-name list for matchPat.
+    -- applied even when the argument is VUnit (`pure ()`).
+    --
+    -- A newtype carrier (ParsecT, IO, Identity, …) is the method
+    -- *result*, not a function waiting for a value argument.  Treating
+    -- `VCon "ParsecT" [fn]` as function-shaped made matchPat's dummy
+    -- VUnit apply `eof` / `getParserState` to `()`.  Newtype-transparent
+    -- apply then fed VUnit to `\s@(State …) -> …`, or leftover IO's
+    -- `(#,#)` to `cok`.  `pure` stays a VFun (`a -> ParsecT`), so
+    -- `pure ()` still applies.  No ParsecT/IO/ST/STM/Identity/Q name list.
     methodTakesValueArg :: Val -> Bool
     methodTakesValueArg VFun{} = True
     methodTakesValueArg VFunIP{} = True
     methodTakesValueArg VClassMethod{} = True
     methodTakesValueArg VIO{} = True
-    methodTakesValueArg (VCon n (_:_))
-        | n `elem` map BC.pack
-            ["ParsecT", "IO", "ST", "STM", "Identity", "Q"] = True
     methodTakesValueArg _ = False
 
     -- Apply a method Val to a list of pre-collected thunks, left-to-right.
@@ -6348,9 +6354,14 @@ exportBodies registry searchPath includeMap builtinNames lm = do
     -- names the defining module.  Entry-module sentinels still rewrite
     -- only through qualified keys, so a bare (n, EVar n) stays a
     -- self-loop and is skipped.
+    --
+    -- Union imported synonyms (e.g. @Parsec@) with the module's own
+    -- (@Parser@) so result-poly CAF wrap can expand the carrier.
+    globalSyns <- readIORef globalTypeSynonymsRef
+    let syns = Map.union (lmTypeSynonyms lm) globalSyns
     pure
         [ ( keyPrefix <> n
-          , wrapNullaryResultSig lm n e'
+          , wrapNullaryResultSig syns lm n e'
           )
         | (n, e) <- Map.toList bs
         , let e' = maybe (transform e) EVar (specialSelfAliasTarget lm n e)
@@ -6372,8 +6383,8 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 -- @methodArray@ through the latter, so wrapping only in 'exportBodies' left the
 -- imported methodArray with Int bounds (@Ix Int.index: non-Int index@ on the
 -- warp request path) even though the single-file repro worked.
-wrapNullaryResultSig :: LoadedModule -> ByteString -> Expr -> Expr
-wrapNullaryResultSig lm n e =
+wrapNullaryResultSig :: Map ByteString TypeSynonym -> LoadedModule -> ByteString -> Expr -> Expr
+wrapNullaryResultSig syns lm n e =
     let e' = annotateBindInputTypes e
     in case e' of
         _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
@@ -6400,16 +6411,26 @@ wrapNullaryResultSig lm n e =
           , Just tyBytes <- renderTypeForAnnotation resultTy
           -> ETyApp e' tyBytes
         -- Same wrap for result-polymorphic `pure` / `return` / `empty`
-        -- on a non-IO CAF (`p :: Parser Char; p = pure 'z'`).  IO is
-        -- already the result-poly default; wrapping it would re-elaborate
-        -- `main`.  Fail-closed at eval (tryElaborateTyAnn).
+        -- on a non-IO CAF (`p :: Parser Char; p = pure 'z'`).  Expand
+        -- type synonyms before choosing the carrier: @Parser@ is
+        -- @Parsec Void Text@ is @ParsecT e s Identity@, and dispatch
+        -- is by the constructor head (ParsecT), not the synonym.
+        -- No name list of @Parser@/@ParsecT@.  IO is already the
+        -- result-poly default; wrapping it would re-elaborate `main`.
+        -- Fail-closed at eval (tryElaborateTyAnn).
         _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
           , ([], resultTy) <- tyArrowArgs body
-          , Just headName <- tyHead resultTy
-          , lastNameComponent headName /= BC.pack "IO"
+          , let expanded = expandTypeSynonyms syns resultTy
+          , Just headName <- tyHead expanded
+          , let carrier = lastNameComponent headName
+          , carrier /= BC.pack "IO"
           , any (isResultPolyMethodName . lastNameComponent) (freeVars e')
-          , Just tyBytes <- renderTypeForAnnotation resultTy
-          -> ETyApp e' tyBytes
+          -> let pinned = pinResultPolyCarrier carrier e'
+             in if pinned /= e'
+                    then pinned
+                    else case renderTypeForAnnotation expanded of
+                        Just tyBytes -> ETyApp e' tyBytes
+                        Nothing      -> e'
         -- Composition of a result-polymorphic class method, e.g.
         --   generalCategory :: Char -> GeneralCategory
         --   generalCategory = toEnum . GC.generalCategory
@@ -6731,6 +6752,19 @@ wrapNullaryResultSig lm n e =
         nm == BC.pack "pure"
      || nm == BC.pack "return"
      || nm == BC.pack "empty"
+
+    -- Pin `pure x` / `return x` / bare `empty` to the expanded carrier
+    -- head, matching the GREEN do-carrier path (`pure @ParsecT x`).
+    -- Does not walk `$` / other spines; those keep the ETyApp wrap.
+    pinResultPolyCarrier carrier expr = case expr of
+        EApp (EVar nm) x
+            | isResultPolyMethodName (lastNameComponent nm) ->
+                EApp (ETyApp (EVar nm) carrier) x
+        EVar nm
+            | isResultPolyMethodName (lastNameComponent nm) ->
+                ETyApp (EVar nm) carrier
+        ETyApp inner ty -> ETyApp (pinResultPolyCarrier carrier inner) ty
+        _ -> expr
 
     -- RHS is itself a composition (`f . g` / `GHC.Internal.Base.. f g`).
     isCompositionSpine expr = case stripTyApps expr of
@@ -10710,9 +10744,11 @@ resolveFallbackSource mOwner name = do
                 -- binding through HERE (the lazy fallback), so without this an
                 -- imported @methodArray = listArray (minBound,maxBound) …@ keeps
                 -- Int bounds and dies with @Ix Int.index@ on the warp path.
+                globalSyns <- readIORef globalTypeSynonymsRef
+                let syns = Map.union (lmTypeSynonyms owner) globalSyns
                 writeIORef slot
                     (Unevaluated (Closure richEnv emptyIPMap
-                        (wrapNullaryResultSig owner bareName expr')))
+                        (wrapNullaryResultSig syns owner bareName expr')))
                 modifyIORef' envFallbackCache
                     (Map.insert (mOwner, name) slot . Map.insert (mOwner, selfKey) slot)
                 modifyIORef' envFallbackCanonicalCache
@@ -11484,6 +11520,14 @@ forkLoadedModuleForRun lm = do
 {-# NOINLINE keepModuleCacheRef #-}
 keepModuleCacheRef :: IORef (Maybe Bool)
 keepModuleCacheRef = unsafePerformIO (newIORef Nothing)
+
+-- | Force the cross-run module-skeleton cache on.  Used by the long-lived
+-- @ihc daemon@ so leftover probes reuse scanned 'LoadedModule' headers
+-- instead of re-tokenising every library file.  Must be called before
+-- the first 'loadProgramFromSource' in the process.
+enableKeepModuleCache :: IO ()
+enableKeepModuleCache =
+    atomicModifyIORef' keepModuleCacheRef $ \_ -> (Just True, ())
 
 keepModuleCacheAcrossRuns :: IO Bool
 keepModuleCacheAcrossRuns = do
