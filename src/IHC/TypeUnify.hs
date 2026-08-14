@@ -18,6 +18,7 @@ import Data.IORef
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
+import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Name)
 import IHC.TypeAST
@@ -74,13 +75,23 @@ unify s t1 t2 = do
 -- | Source of fresh type variable names for instantiation.
 newtype FreshSource = FreshSource (IORef Int)
 
+-- | Process-wide counter so separate 'newFreshSource' runs cannot
+-- reuse @$t0@ / @$t1@.  'elaborateExpectedArg' InferFreely's the
+-- callee (print :: Show a => a -> IO ()) then ExpectType's the
+-- argument at that @$t0@.  A second source starting at 0 named
+-- Ord.>='s class parameter @$t0@ too; unifying the expected @$t0@
+-- with Bool rewrote @a >= b@ (Int) to Ord Bool.
+globalFreshCounter :: IORef Int
+globalFreshCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE globalFreshCounter #-}
+
 newFreshSource :: IO FreshSource
 newFreshSource = FreshSource <$> newIORef 0
 
 freshVar :: FreshSource -> IO Name
 freshVar (FreshSource ref) = do
-    n <- readIORef ref
-    writeIORef ref (n + 1)
+    n <- atomicModifyIORef' globalFreshCounter (\i -> (i + 1, i))
+    modifyIORef' ref (+ 1)
     pure (BC.pack ("$t" ++ show n))
 
 -- | Instantiate a scheme by replacing all quantified vars with fresh

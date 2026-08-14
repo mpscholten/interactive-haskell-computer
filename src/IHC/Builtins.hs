@@ -309,11 +309,13 @@ builtinEnv reg = do
             let stok = VPrimObj PrimRealWorld
             stokT <- newWHNFThunk stok
             r <- apply legacyHooks f stokT
+            -- Force the state slot: side-effecting primops
+            -- (copyAddrToAddrNonOverlapping#, setAddrRange#) live there.
             case r of
-                VCon "(#,#)" [_stT, aT] -> do
-                    v <- force legacyHooks aT
-                    pure v
-                other                    -> pure other))))
+                VCon "(#,#)" [stT, aT] -> do
+                    _ <- force legacyHooks stT
+                    force legacyHooks aT
+                other                    -> runIOVal legacyHooks other))))
     -- Ptr smart constructor: `Ptr addr#` wraps an Addr# (PrimPtr) back into PrimPtr.
     ptrCtorT <- newLazyBuiltinThunk (pure ptrCtorV)
     -- Phase 2.9.5: Proxy and Dynamic constructors.
@@ -994,6 +996,19 @@ builtins reg =
     , ("eqWord#",   eqWordB)
     , ("gtWord#",   gtWordB)
     , ("geWord#",   geWordB)
+    -- Word64# shares representation with Word#; IHC stores both as VInt.
+    -- GHC.Prim, no .hs source.  integerFromWord64# guards with leWord64#.
+    , ("ltWord64#",   ltWordB)
+    , ("leWord64#",   leWordB)
+    , ("eqWord64#",   eqWordB)
+    , ("gtWord64#",   gtWordB)
+    , ("geWord64#",   geWordB)
+    , ("neWord64#",   neWord64B)
+    , ("plusWord64#", plusWordB)
+    , ("subWord64#",  minusWordB)
+    , ("timesWord64#", timesWordB)
+    , ("quotWord64#", quotWordB)
+    , ("remWord64#",  remWordB)
     -- Word8# comparison primops are compiler intrinsics used by
     -- source-loaded GHC.Internal.Word and text's UTF-8 paths.
     , ("ltWord8#",  ltWord8B)
@@ -3908,8 +3923,9 @@ setAddrRangeB = pure $ VFun $ \addrT -> pure $ VFun $ \sizeT -> pure $ VFun $ \b
     sizeV <- force legacyHooks sizeT
     byteV <- force legacyHooks byteT
     stV   <- force legacyHooks stT
-    case (addrV, sizeV, byteV) of
-        (VPrimObj (PrimPtr p), VInt size, VInt byte) -> do
+    p <- valToHostPtr addrV
+    case (sizeV, byteV) of
+        (VInt size, VInt byte) -> do
             fillBytes (p :: Ptr Word8) (fromIntegral byte) (fromIntegral size)
             pure stV
         _ -> error ("setAddrRange#: bad args: addr=" <> showValForDebug addrV
@@ -3929,11 +3945,16 @@ copyAddrToAddrNonOverlappingB =
         destV <- force legacyHooks destT
         sizeV <- force legacyHooks sizeT
         stV   <- force legacyHooks stT
-        case (srcV, destV, sizeV) of
-            (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
+        -- Addr# arriving from a ForeignPtr (ByteString PS / plusAddr#
+        -- keeping the finalizer) is PrimForeignPtr, not PrimPtr.
+        -- valToHostPtr is the same resolver plusAddr# already uses.
+        srcP <- valToHostPtr srcV
+        destP <- valToHostPtr destV
+        case sizeV of
+            VInt size -> do
                 let n = fromIntegral size
-                    destWord8 = dest :: Ptr Word8
-                copyBytes destWord8 (src :: Ptr Word8) n
+                    destWord8 = destP :: Ptr Word8
+                copyBytes destWord8 (srcP :: Ptr Word8) n
                 markWord8PtrRange destWord8 n
                 pure stV
             _ -> error ("copyAddrToAddrNonOverlapping#: bad args: src=" <> showValForDebug srcV
@@ -3952,11 +3973,13 @@ copyAddrToAddrB =
         destV <- force legacyHooks destT
         sizeV <- force legacyHooks sizeT
         stV   <- force legacyHooks stT
-        case (srcV, destV, sizeV) of
-            (VPrimObj (PrimPtr src), VPrimObj (PrimPtr dest), VInt size) -> do
+        srcP <- valToHostPtr srcV
+        destP <- valToHostPtr destV
+        case sizeV of
+            VInt size -> do
                 let n = fromIntegral size
-                    destWord8 = dest :: Ptr Word8
-                moveBytes destWord8 (src :: Ptr Word8) n
+                    destWord8 = destP :: Ptr Word8
+                moveBytes destWord8 (srcP :: Ptr Word8) n
                 markWord8PtrRange destWord8 n
                 pure stV
             _ -> error ("copyAddrToAddr#: bad args: src=" <> showValForDebug srcV
@@ -5232,8 +5255,9 @@ timesWord2B = pure $ VFun $ \a -> pure $ VFun $ \b -> do
 -- Phase 2.8: GHC.Exts Word# comparison + arithmetic primops
 --------------------------------------------------------------------------------
 
-ltWordB, leWordB, eqWordB, gtWordB, geWordB :: IO Val
+ltWordB, leWordB, eqWordB, gtWordB, geWordB, neWord64B :: IO Val
 ltWordB = makeWordCmpOp "ltWord#" (<)
+neWord64B = makeWordCmpOp "neWord64#" (/=)
 leWordB = makeWordCmpOp "leWord#" (<=)
 eqWordB = makeWordCmpOp "eqWord#" (==)
 gtWordB = makeWordCmpOp "gtWord#" (>)

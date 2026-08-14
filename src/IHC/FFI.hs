@@ -281,23 +281,23 @@ resolveSymbol sym = do
 -- @PrimPtr@ (host-allocated) or a data-constructor @Ptr addr#@.
 valToArg :: FFIType -> Val -> IO Arg
 valToArg ty v = case ty of
-    FFIInt    -> pure (argCInt   (fromIntegral (asInt v)))
-    FFIUInt   -> pure (argCUInt  (fromIntegral (asInt v)))
-    FFILong   -> pure (argCLong  (fromIntegral (asInt v)))
-    FFIULong  -> pure (argCULong (fromIntegral (asInt v)))
-    FFISize   -> pure (argCSize  (fromIntegral (asInt v)))
-    FFIChar   -> pure (argCChar  (fromIntegral (asInt v)))
-    FFIUChar  -> pure (argCUChar (fromIntegral (asInt v)))
-    FFIInt8   -> pure (argInt8   (fromIntegral (asInt v)))
-    FFIInt16  -> pure (argInt16  (fromIntegral (asInt v)))
-    FFIInt32  -> pure (argInt32  (fromIntegral (asInt v)))
-    FFIInt64  -> pure (argInt64  (fromIntegral (asInt v)))
-    FFIWord8  -> pure (argWord8  (fromIntegral (asInt v)))
-    FFIWord16 -> pure (argWord16 (fromIntegral (asInt v)))
-    FFIWord32 -> pure (argWord32 (fromIntegral (asInt v)))
-    FFIWord64 -> pure (argWord64 (fromIntegral (asInt v)))
-    FFIFloat  -> pure (argCFloat  (realToFrac (asFloat v)))
-    FFIDouble -> pure (argCDouble (realToFrac (asFloat v)))
+    FFIInt    -> argCInt   . fromIntegral <$> asIntIO v
+    FFIUInt   -> argCUInt  . fromIntegral <$> asIntIO v
+    FFILong   -> argCLong  . fromIntegral <$> asIntIO v
+    FFIULong  -> argCULong . fromIntegral <$> asIntIO v
+    FFISize   -> argCSize  . fromIntegral <$> asIntIO v
+    FFIChar   -> argCChar  . fromIntegral <$> asIntIO v
+    FFIUChar  -> argCUChar . fromIntegral <$> asIntIO v
+    FFIInt8   -> argInt8   . fromIntegral <$> asIntIO v
+    FFIInt16  -> argInt16  . fromIntegral <$> asIntIO v
+    FFIInt32  -> argInt32  . fromIntegral <$> asIntIO v
+    FFIInt64  -> argInt64  . fromIntegral <$> asIntIO v
+    FFIWord8  -> argWord8  . fromIntegral <$> asIntIO v
+    FFIWord16 -> argWord16 . fromIntegral <$> asIntIO v
+    FFIWord32 -> argWord32 . fromIntegral <$> asIntIO v
+    FFIWord64 -> argWord64 . fromIntegral <$> asIntIO v
+    FFIFloat  -> argCFloat  . realToFrac <$> asFloatIO v
+    FFIDouble -> argCDouble . realToFrac <$> asFloatIO v
     FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# requires an RTS-special foreign import")
     FFIVoid   -> throwIO (userError "IHC.FFI: void cannot appear as an argument")
     FFIPtr _      -> do p <- ptrFromVal v; pure (argPtr p)
@@ -314,16 +314,45 @@ valToArg ty v = case ty of
             bs <- byteStringFromVal v
             pure (argConstByteString bs)
 
-asInt :: Val -> Int64
-asInt (VInt n)    = n
-asInt (VChar c)   = fromIntegral (fromEnum c)
-asInt (VCon _ []) = 0    -- treat arity-0 constructors as 0 (e.g. False)
-asInt other       = error ("IHC.FFI: expected numeric value, got " <> showValForDebug other)
+-- | Unwrap a numeric FFI argument to a host 'Int64'.
+--
+-- Source-level C types are unary newtypes (@CInt = CInt Int32@,
+-- @Int32 = I32# Int#@, @Word32 = W32# Word#@).  The interpreter keeps
+-- that spine as nested @VCon@s; libffi wants the inner machine
+-- integer.  Walk any unary constructor chain — no type-name list —
+-- and force each field so a still-thunk inner is visible.
+asIntIO :: Val -> IO Int64
+asIntIO = go (0 :: Int)
+  where
+    go depth v
+        | depth > 8 = failAsInt v
+        | otherwise = case v of
+            VInt n      -> pure n
+            VInteger n  -> pure (fromInteger n)
+            VChar c     -> pure (fromIntegral (fromEnum c))
+            VCon _ []   -> pure 0    -- arity-0 constructors as 0 (e.g. False)
+            VCon _ [t]  -> do
+                inner <- force legacyHooks t
+                go (depth + 1) inner
+            _           -> failAsInt v
+    failAsInt other =
+        error ("IHC.FFI: expected numeric value, got " <> showValForDebug other)
 
-asFloat :: Val -> Double
-asFloat (VFloat d) = d
-asFloat (VInt   n) = fromIntegral n
-asFloat other      = error ("IHC.FFI: expected floating value, got " <> showValForDebug other)
+asFloatIO :: Val -> IO Double
+asFloatIO = go (0 :: Int)
+  where
+    go depth v
+        | depth > 8 = failAsFloat v
+        | otherwise = case v of
+            VFloat d   -> pure d
+            VInt n     -> pure (fromIntegral n)
+            VInteger n -> pure (fromInteger n)
+            VCon _ [t] -> do
+                inner <- force legacyHooks t
+                go (depth + 1) inner
+            _          -> failAsFloat v
+    failAsFloat other =
+        error ("IHC.FFI: expected floating value, got " <> showValForDebug other)
 
 -- | Unwrap a 'Val' to a raw host 'Ptr ()'.
 --
@@ -459,8 +488,10 @@ callForeign decl argVals
     | fdSymbol decl == BC.pack "memset"
     , [ptrV, byteV, lenV] <- argVals = do
           result <- dispatchResolved
-          let len = fromIntegral (asInt lenV) :: Int
-          when (asInt byteV == 0) $ do
+          lenN <- asIntIO lenV
+          byteN <- asIntIO byteV
+          let len = fromIntegral lenN :: Int
+          when (byteN == 0) $ do
               p <- ptrFromVal ptrV
               markSockAddrBuffer p len
           pure result

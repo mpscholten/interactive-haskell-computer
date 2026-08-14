@@ -81,8 +81,15 @@ module IHC.Classes
     , IHCHooks(..)
     , legacyHooks
     , resetSessionHooks
+      -- * Do-block carrier for result-poly `pure`/`return`
+    , pushDoCarrier
+    , popDoCarrier
+    , currentDoCarrier
+    , setLastMonadicCarrier
+    , takeLastMonadicCarrier
     ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Exception (SomeException, catch, mask, onException)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
@@ -222,7 +229,7 @@ forceThunkState :: ThunkState -> IO Val
 forceThunkState (Evaluated v) = pure v
 forceThunkState (Unevaluated _) = pure (VStr (BC.pack "<unevaluated>"))
 forceThunkState (TypedField _ _ _) = pure (VStr (BC.pack "<typed-field>"))
-forceThunkState (BlackHole _ _) = pure (VStr (BC.pack "<blackhole>"))
+forceThunkState (BlackHole _ _ _) = pure (VStr (BC.pack "<blackhole>"))
 forceThunkState (LazyBuiltin _) = pure (VStr (BC.pack "<lazy-builtin>"))
 
 -- | A class instance's method table. HashMap keyed by method name, so
@@ -909,6 +916,63 @@ data IHCHooks = IHCHooks
     , hkSharedClassReg      :: !(IORef (Maybe ClassRegistry))
     , hkThExpToExpr         :: !(IORef ThExpToExprHook)
     }
+
+-- | Per-thread stack of the surrounding do-block's monadic carrier
+-- (e.g. @ParsecT@).  @do { x <- takeWhile1P …; unless cond (fail …) }@
+-- evaluates source @unless p s = if p then pure () else s@ later, when
+-- the parser runs — not while the do-block is constructed.  Unannotated
+-- @pure ()@ is result-polymorphic and otherwise defaults to IO, so
+-- ParsecT bind then does @unParser@ on a @(# s, () #)@ State# function.
+-- The stack is consulted only by the @pure@/@return@ result-poly
+-- fallback; it does not force the unused @unless@/@when@ branch.
+{-# NOINLINE doCarrierStackRef #-}
+doCarrierStackRef :: IORef (Map ThreadId [ByteString])
+doCarrierStackRef = unsafePerformIO (newIORef Map.empty)
+
+pushDoCarrier :: ByteString -> IO ()
+pushDoCarrier tag = do
+    tid <- myThreadId
+    atomicModifyIORef' doCarrierStackRef $ \m ->
+        (Map.insertWith (++) tid [tag] m, ())
+
+popDoCarrier :: IO ()
+popDoCarrier = do
+    tid <- myThreadId
+    atomicModifyIORef' doCarrierStackRef $ \m ->
+        (Map.update strip tid m, ())
+  where
+    strip (_:rest@(_:_)) = Just rest
+    strip _              = Nothing
+
+currentDoCarrier :: IO (Maybe ByteString)
+currentDoCarrier = do
+    tid <- myThreadId
+    m <- readIORef doCarrierStackRef
+    pure $ case Map.lookup tid m of
+        Just (t:_) -> Just t
+        _          -> Nothing
+
+-- | Last concrete monadic instance tag chosen by class dispatch
+-- (ParsecT, …).  `(<|>)` applies the method to the left parser
+-- (push/pop around that apply) and only then thunks the right
+-- argument; `pure Nothing` is forced when the parser *runs*, after
+-- the stack is empty.  Eval consumes this tag once to pin that
+-- `pure` / `return` / `empty` to the same carrier.
+{-# NOINLINE lastMonadicCarrierRef #-}
+lastMonadicCarrierRef :: IORef (Map ThreadId ByteString)
+lastMonadicCarrierRef = unsafePerformIO (newIORef Map.empty)
+
+setLastMonadicCarrier :: ByteString -> IO ()
+setLastMonadicCarrier tag = do
+    tid <- myThreadId
+    atomicModifyIORef' lastMonadicCarrierRef $ \m ->
+        (Map.insert tid tag m, ())
+
+takeLastMonadicCarrier :: IO (Maybe ByteString)
+takeLastMonadicCarrier = do
+    tid <- myThreadId
+    atomicModifyIORef' lastMonadicCarrierRef $ \m ->
+        (Map.delete tid m, Map.lookup tid m)
 
 -- | Bundle of the three module-level per-run class-state IORefs:
 -- the in-scope module set for instance dispatch, the lazy instance

@@ -1511,13 +1511,43 @@ findBodyEndAtCol s minCol = scanBody
         Just 0x09 -> checkNext (q + 1) lastNl (col + 1)   -- treat tab as +1
         Just 0x0A -> checkNext (q + 1) q 1                -- blank line
         Just 0x0D -> checkNext (q + 1) q 1
+        -- Line comments are trivia, including at column 1.  A col-1
+        -- `--` used to terminate the body, so
+        --   _ | err == eINPROGRESS -> connectBlocked
+        -- --           _ | err == eAGAIN -> connectBlocked
+        --   connectBlocked = do ...
+        -- in Network.Socket.Syscall.connect dropped the where-binding
+        -- and left `connectBlocked` unbound.
+        Just 0x2D
+            | Just 0x2D <- peekByte s (q + 1) ->
+                skipLineComment q lastNl
         Just 0x7B
             | Just 0x2D <- peekByte s (q + 1)
             , Just 0x23 <- peekByte s (q + 2)
             -> scanBody (skipPragma (q + 3))
+            | Just 0x2D <- peekByte s (q + 1)
+            -> scanBody (skipBlockComment 1 (q + 2))
         Just _
             | col <= minCol -> lastNl                     -- sibling / top-level
             | otherwise     -> scanBody q                 -- deeper indent
+
+    skipLineComment p lastNl = case peekByte s p of
+        Nothing   -> lastNl
+        Just 0x0A -> checkNext (p + 1) p 1
+        Just 0x0D -> checkNext (p + 1) p 1
+        Just _    -> skipLineComment (p + 1) lastNl
+
+    skipBlockComment :: Int -> Pos -> Pos
+    skipBlockComment 0 p = p
+    skipBlockComment !d p = case peekByte s p of
+        Nothing -> p
+        Just 0x7B
+            | Just 0x2D <- peekByte s (p + 1) ->
+                skipBlockComment (d + 1) (p + 2)
+        Just 0x2D
+            | Just 0x7D <- peekByte s (p + 1) ->
+                skipBlockComment (d - 1) (p + 2)
+        Just _ -> skipBlockComment d (p + 1)
 
     skipPragma p = case peekByte s p of
         Nothing -> p
@@ -4959,6 +4989,11 @@ tyConToFFI c _ = case c of
     -- Haskell side interprets the return bits.
     "CSsize"   -> Just FFISize
     "CSSize"   -> Just FFISize
+    -- Foreign.C.Error: newtype Errno = Errno CInt.  errnoToString
+    -- calls c_strerror_r :: Errno -> Ptr CChar -> CSize -> IO CInt.
+    -- Without this the foreign import is skipped and socket error
+    -- paths die with unbound variable c_strerror_r.
+    "Errno"    -> Just FFIInt
     _          -> Nothing
 
 --------------------------------------------------------------------------------

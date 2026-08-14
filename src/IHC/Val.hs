@@ -26,6 +26,9 @@ module IHC.Val
     , clearWord8PtrRanges
     , markSockAddrBuffer
     , lookupSockAddrBuffer
+    , withExpectedResultTag
+    , readExpectedResultTag
+    , clearExpectedResultTag
       -- * Environments
     , Env
     , emptyEnv
@@ -208,7 +211,13 @@ data ThunkState
     -- that hits a black-hole owned by ANOTHER thread must wait for that
     -- thread to finish (concurrent evaluation of a shared thunk), not raise
     -- a spurious loop — see 'IHC.Eval.force'.
-    | BlackHole  !(Maybe ThreadId) !String
+    --
+    -- The optional 'MVar' is the wait-queue for foreign forcers. A tight
+    -- 'yield' loop holds the capability and starves the owner (often
+    -- parked on 'takeMVar#' / 'delay#' / a Handle lock), so 'forkIO's
+    -- parent never resumes. Owner publishes by 'tryPutMVar'; waiters
+    -- 'readMVar' then retry. Placeholders have no queue ('Nothing').
+    | BlackHole  !(Maybe ThreadId) !String !(Maybe (MVar ()))
     -- | Lazy-init for host @IO Val@ actions that should run once and memoise.
     -- Used by 'IHC.Builtins.builtinEnv' for primops/RTS boundaries, and by a
     -- few scheduler paths for deferred source-name resolution where there is no
@@ -268,6 +277,31 @@ markTypedHostPtr p ty =
 lookupTypedHostPtr :: Ptr a -> IO (Maybe ByteString)
 lookupTypedHostPtr p =
     Map.lookup (ptrToIntPtr p) <$> readIORef typedHostPtrsRef
+
+-- | Result type of an outer ascription that has not yet reached a
+-- result-polymorphic method.  @n :: CInt <- getSockOpt@ / @peek ptr@
+-- becomes @ETyApp action "CInt"@; getSockOpt's inner unannotated
+-- @peek ptr@ has no surviving @IO CInt@, so Storable.peek used to
+-- dispatch on the @Ptr@ tag and return a leftover function (or an
+-- unrelated registered Storable struct).  The ascription is scoped
+-- around the action so the inner peek can reuse typed peek.
+{-# NOINLINE lastExpectedResultTagRef #-}
+lastExpectedResultTagRef :: IORef (Maybe ByteString)
+lastExpectedResultTagRef = unsafePerformIO (newIORef Nothing)
+
+readExpectedResultTag :: IO (Maybe ByteString)
+readExpectedResultTag = readIORef lastExpectedResultTagRef
+
+clearExpectedResultTag :: IO ()
+clearExpectedResultTag = writeIORef lastExpectedResultTagRef Nothing
+
+withExpectedResultTag :: ByteString -> IO a -> IO a
+withExpectedResultTag ty action = do
+    old <- readIORef lastExpectedResultTagRef
+    writeIORef lastExpectedResultTagRef (Just ty)
+    r <- action
+    writeIORef lastExpectedResultTagRef old
+    pure r
 
 -- | Byte-buffer address ranges for Storable Word8 host peeks/pokes.
 -- plusForeignPtr advances the base; exact-address marks would miss

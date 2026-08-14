@@ -3342,7 +3342,37 @@ parseAltWhereBinds ctx cur0 = do
                             )
                     pure (tmpBind : map perVarBind vars, curE)
                 _ -> pure ([], curPat)
+        -- Pattern bindings the identifier/paren cases miss: `!l' = e`
+        -- (Set.insert's case-alt where), `~x = e`, `[x] = e`, etc.
+        -- Returning `([], curBefore)` here used to re-enter 'collect'
+        -- on the same cursor and hang discovery of Data.Set.insert.
+        _ | startsPat (tkKind nameTok) -> do
+            (pat, curPat) <- parseTopPat innerCtx curBefore
+            let (sepTok, curSep) = nextSig innerCtx curPat
+            case tkKind sepTok of
+                TkEq -> do
+                    (rhsE, curE) <- parseExpr innerCtx curSep
+                    let tmpName = BC.pack "$altwh0"
+                        tmpBind = (tmpName, rhsE)
+                        vars = patVarsAlt pat
+                        matchPat
+                            | isStrictAltWherePat pat = pat
+                            | otherwise               = PIrref pat
+                        perVarBind v =
+                            ( v
+                            , ECase (EVar tmpName)
+                                [ Alt matchPat (EVar v)
+                                , Alt PWild (EApp (EVar "error")
+                                              (stringToConsList
+                                                "Non-exhaustive pattern in alt-where"))
+                                ]
+                            )
+                    pure (tmpBind : map perVarBind vars, curE)
+                _ -> pure ([], curPat)
         _ -> pure ([], curBefore)
+
+    isStrictAltWherePat (PBang _) = True
+    isStrictAltWherePat _         = False
 
     patVarsAlt (PVar n)         = [n]
     patVarsAlt (PAs n p)        = n : patVarsAlt p

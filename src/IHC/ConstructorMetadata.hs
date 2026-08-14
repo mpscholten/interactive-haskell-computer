@@ -6,6 +6,7 @@ module IHC.ConstructorMetadata
     , constructorMetadataFromScheme
     , constructorScheme
     , constructorMetadata
+    , foreignConstructorCollision
     , constructorFieldTypes
     , constructorFieldTypeAt
     , globalConstructorTypeRegistryRef
@@ -161,10 +162,33 @@ constructorMetadata registry requestedOwner requestedCtor = do
     resolveIdentity = case ctorQualifier of
         Just qualifier -> Just (ConstructorIdentity qualifier bareCtor)
         Nothing -> case localIdentity of
-            Just identity' | Map.member identity' registry -> Just identity'
-            _ -> case candidates of
+            Just identity'
+                | Map.member identity' registry -> Just identity'
+                -- Known owner, undeclared here: do not pick a foreign Q.
+                | otherwise -> Nothing
+            Nothing -> case candidates of
                 [identity'] -> Just identity'
                 _ -> Nothing
+
+-- | True when some loaded module declares @ctor@ and the lexical owner
+-- either is unknown or does not declare it.  Used so signature lookup
+-- does not take a last-write global constructor type (Sequence's @Q@)
+-- for an owner-scoped name (TH's @Q@).
+foreignConstructorCollision
+    :: ConstructorTypeRegistry -> Maybe Name -> Name -> Bool
+foreignConstructorCollision registry requestedOwner requestedCtor =
+    not (null others) && not localHit
+  where
+    (_, bareCtor) = splitQualified requestedCtor
+    others =
+        [ identity'
+        | identity' <- Map.keys registry
+        , ciName identity' == bareCtor
+        , maybe True (/= ciOwner identity') requestedOwner
+        ]
+    localHit = case requestedOwner of
+        Just owner -> Map.member (ConstructorIdentity owner bareCtor) registry
+        Nothing -> False
 
 constructorFieldTypes
     :: ConstructorTypeRegistry

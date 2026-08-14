@@ -17,12 +17,14 @@ module IHC.Elaborate
     , elaborate
     , elaborateWithScopedSigs
     , lookupScopedScheme
+    , schemeBelongsToClassMethod
     , elaborateOwned
     , elaborateOwnedMethod
     , elaborateOwnedWithScopedSigs
     , elaborateExpr
     , parseRawTypeExpr
     , resolveSynonymHop
+    , foreignConstructorCollision
     ) where
 
 import Control.Exception (Exception, SomeException, throwIO, try)
@@ -38,10 +40,12 @@ import qualified Data.Set as Set
 import IHC.AST
 import IHC.Classes (ClassRegistry)
 import IHC.ConstructorMetadata
-    ( ConstructorTypeRegistry, constructorScheme )
+    ( ConstructorTypeRegistry, constructorScheme
+    , foreignConstructorCollision )
 import IHC.StringUtils (isAsciiSpace)
 import IHC.TypeAST
-import IHC.TypeGlobals (globalClassMethodNamesRef, globalAmbiguousSigsRef)
+import IHC.TypeGlobals
+    ( globalClassMethodNamesRef, globalAmbiguousSigsRef, globalMethodClassRef )
 import IHC.TypeSchemeParser (parseSchemeBytes)
 import IHC.TypeUnify
 
@@ -62,6 +66,30 @@ lookupScopedScheme ambiguous scoped sigs name
     bare = bareName name
     orElse (Just value) _ = Just value
     orElse Nothing other = other
+
+-- | A last-writer scheme is only safe for a class-method name when its
+-- constraint is a class that actually declares the method.
+-- @try@ is MonadParsec's method; @Exception e => IO a -> IO (Either e a)@
+-- is a different top-level function.  Using that scheme as @try@'s type
+-- pinned @Alternative (<|>)@ to IO, so @try p <|> q@ ran as IO and
+-- @unParser@ saw a State# @(#,#)@ applied to @cok@.
+schemeBelongsToClassMethod
+    :: Set.Set ByteString
+    -> Map ByteString [ByteString]
+    -> Name
+    -> Scheme
+    -> Bool
+schemeBelongsToClassMethod methodNames classMap name (Scheme _ preds _)
+    | not (Set.member bare methodNames) = True
+    | null preds = True
+    | otherwise =
+        let declared = map bareName (Map.findWithDefault [] bare classMap)
+            predCls  = concatMap predClassNames preds
+        in null declared || any (`elem` declared) predCls
+  where
+    bare = bareName name
+    predClassNames (Pred cls _) = [bareName cls]
+    predClassNames (QPred _ ctx p) = concatMap predClassNames (p : ctx)
 
 -- | Failure surfaced to the evaluator as an 'IhcException'.
 data InferenceError
@@ -93,6 +121,7 @@ data InferEnv = InferEnv
     , ieClassReg :: !ClassRegistry
     , ieLocals   :: !(Map Name Scheme)   -- lambda-bound + let-bound
     , ieClassMethodNames :: !(Set.Set ByteString)
+    , ieMethodClasses    :: !(Map ByteString [ByteString])
     , ieAmbiguousSigs    :: !(Set.Set ByteString)
     , ieScopedSigs       :: !(Set.Set ByteString)
     , ieConstructorTypes :: !ConstructorTypeRegistry
@@ -172,6 +201,7 @@ elaborateOwnedInternal
 elaborateOwnedInternal _seedMethodBinders classReg sigs synonyms constructorTypes owner scopedSigs expected e = do
     fresh <- newFreshSource
     classMethodNames <- readIORef globalClassMethodNamesRef
+    methodClasses    <- readIORef globalMethodClassRef
     ambiguousSigs    <- readIORef globalAmbiguousSigsRef
     let ienv = InferEnv
             { ieFresh    = fresh
@@ -180,20 +210,29 @@ elaborateOwnedInternal _seedMethodBinders classReg sigs synonyms constructorType
             , ieClassReg = classReg
             , ieLocals   = Map.empty
             , ieClassMethodNames = classMethodNames
+            , ieMethodClasses    = methodClasses
             , ieAmbiguousSigs    = ambiguousSigs
             , ieScopedSigs       = scopedSigs
             , ieConstructorTypes = constructorTypes
             , ieOwner            = owner
             }
-    (e', t, _preds, sub) <- case expected of
-        ExpectType want -> elaborateExpectedExpr ienv (expandSyn synonyms want) e
-        InferFreely -> elaborateExpr ienv e
+    (e', t, _preds, sub, mWant) <- case expected of
+        ExpectType want -> do
+            -- Residual types from a previous InferFreely call reuse
+            -- @$tN@ names.  A fresh source here also starts at @$t0@,
+            -- so unifying @f [Char]@ with @Parsec $t1 $t0 $t2@ would
+            -- occurs-check.  Freshen the expectation first.
+            want' <- freshenType fresh (expandSyn synonyms want)
+            (e0, t0, p0, s0) <- elaborateExpectedExpr ienv want' e
+            pure (e0, t0, p0, s0, Just want')
+        InferFreely -> do
+            (e0, t0, p0, s0) <- elaborateExpr ienv e
+            pure (e0, t0, p0, s0, Nothing)
     -- If we had an expected type, unify the result type.
-    finalSub <- case expected of
-        InferFreely     -> pure sub
-        ExpectType want ->
-            let wantResolved = expandSyn synonyms want
-                tCur         = applySubst sub t
+    finalSub <- case mWant of
+        Nothing -> pure sub
+        Just wantResolved ->
+            let tCur = applySubst sub t
             in case unify sub wantResolved tCur of
                    Right s  -> pure s
                    Left ue  -> throwIO (UnificationFailure ue)
@@ -223,6 +262,26 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
             (unify sub expected actual)
         pure (ETyApp (EVar name) expectedBytes, applySubst sub' expected,
             map (applySubstPred sub') actualPreds, sub')
+    -- Nullary class methods such as @location :: Quasi m => m Loc@ have
+    -- no standalone top-level signature (they live in the class decl).
+    -- When the do-block expected type is @Q t@, pin the method to that
+    -- monad instead of leaving a bare EVar for value-directed ParsecT.
+    (EVar name, _)
+      | Set.member (bareName name) (ieClassMethodNames ienv)
+      , Just (monadTy, _) <- splitMonadType expected
+      , let tag = typeDispatchTag (expandSyn (ieSynonyms ienv) monadTy)
+      , not (BC.null tag) -> do
+            clsMap <- readIORef globalMethodClassRef
+            case Map.lookup (bareName name) clsMap of
+                Just [cls] ->
+                    pure (ETypedMethod cls (bareName name) tag,
+                        expected, [], emptySubst)
+                _ -> do
+                    (e', t, preds, sub) <- elaborateExpr ienv (EVar name)
+                    sub' <- either (throwIO . UnificationFailure) pure
+                        (unify sub expected t)
+                    pure (e', applySubst sub' expected,
+                        map (applySubstPred sub') preds, sub')
     (ELam name body, TyArrow argTy resultTy) -> do
         let ie = ienv { ieLocals = Map.insert name (Scheme [] [] argTy)
                                     (ieLocals ienv) }
@@ -232,6 +291,7 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
         pure (ELam name body', TyArrow (applySubst sub' argTy)
             (applySubst sub' bodyTy), map (applySubstPred sub') preds, sub')
     (ELet bs body, _) -> elaborateLetExpected ienv bs expected body
+    (EDo stmts, _) -> elaborateDo ienv (Just expected) stmts
     (ECase scrut alts, _) -> do
         (scrut', scrutTy, scrutPreds, scrutSub) <- elaborateExpr ienv scrut
         (alts', altPreds, finalSub) <- elaborateExpectedAlts
@@ -239,6 +299,15 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
             expected scrutSub alts
         pure (ECase scrut' alts', applySubst finalSub expected,
             map (applySubstPred finalSub) (scrutPreds ++ altPreds), finalSub)
+    (EDo stmts, _) -> do
+        (e', t, preds, sub) <- elaborateDo ienv (Just expected) stmts
+        -- Keep the expected carrier on the do-block so evalDo does
+        -- not default a function-shaped first action to ParsecT.
+        case renderExpectedType expected of
+            Just tyBytes ->
+                pure (ETyApp e' tyBytes, expected, preds, sub)
+            Nothing ->
+                pure (e', t, preds, sub)
     _ -> elaborateExpr ienv expr
 
 -- | [Char] after synonym expansion.  String is expanded by the
@@ -422,7 +491,7 @@ elaborateExpr ienv expr = case expr of
 
     ELet bs body -> elaborateLet ienv bs body
 
-    EDo stmts -> elaborateDo ienv stmts
+    EDo stmts -> elaborateDo ienv Nothing stmts
 
     EIf c t e -> do
         (c', ct, pc, s1) <- elaborateExpr ienv c
@@ -488,7 +557,15 @@ elaborateVar ienv name =
                 Nothing -> case constructorScheme
                     (ieConstructorTypes ienv) (ieOwner ienv) name of
                         Just sch -> pure (Just sch)
-                        Nothing  -> lookupSig
+                        Nothing
+                            -- A foreign same-named constructor (Queue's Q)
+                            -- must not supply the scheme for this owner's
+                            -- use of the name (TH's Q).  Infer freely.
+                            -- Do not treat ParsecT as Q/Exp.
+                            | foreignConstructorCollision
+                                (ieConstructorTypes ienv) (ieOwner ienv) name
+                            -> pure Nothing
+                            | otherwise -> lookupSig
             case mSig of
                 Just sch -> do
                     (preds, ty) <- instantiate (ieFresh ienv)
@@ -582,11 +659,14 @@ elaborateVar ienv name =
         -- names, so treating every exact hit as scoped would merely select its
         -- last writer.
         Just s
+            | not (schemeMatchesMethod s) -> Nothing
             | isQualifiedName name
            || not (isAmbiguousSig ienv (bareName name)) -> Just s
             -- Ambiguous last-writer is a red herring for result-
             -- polymorphic class methods: the class scheme is unique
-            -- and the expected type picks the instance.
+            -- and the expected type picks the instance.  Not when the
+            -- last-writer is a different function that shares the
+            -- name (@Exception.try@ vs @MonadParsec.try@).
             | isActualClassMethod ienv (bareName name)
             , schemeIsResultPolymorphic s -> Just s
             | otherwise -> Nothing
@@ -594,9 +674,15 @@ elaborateVar ienv name =
             | isAmbiguousSig ienv (bareName name)
             , isActualClassMethod ienv (bareName name)
             , Just s <- Map.lookup (bareName name) (ieSigs ienv)
+            , schemeMatchesMethod s
             , schemeIsResultPolymorphic s -> Just s
             | isAmbiguousSig ienv (bareName name) -> Nothing
-            | otherwise -> Map.lookup (bareName name) (ieSigs ienv)
+            | otherwise -> case Map.lookup (bareName name) (ieSigs ienv) of
+                Just s | schemeMatchesMethod s -> Just s
+                _ -> Nothing
+    schemeMatchesMethod =
+        schemeBelongsToClassMethod (ieClassMethodNames ienv)
+            (ieMethodClasses ienv) (bareName name)
 
     isQualifiedName n = case BC.elemIndexEnd '.' n of
         Just i -> i > 0 && i + 1 < BC.length n
@@ -616,7 +702,10 @@ classMethodHint :: InferEnv -> Name -> [Pred] -> Type -> Maybe (Name, Name)
 classMethodHint ienv methodName preds body = case preds of
     [Pred cls [TyVar v]]
       | Set.member v (freeTyVars body)
-      , isActualClassMethod ienv methodName ->
+      , isActualClassMethod ienv methodName
+      , schemeBelongsToClassMethod (ieClassMethodNames ienv)
+            (ieMethodClasses ienv) methodName
+            (Scheme [] preds body) ->
             Just (cls, v)
     _ -> Nothing
 
@@ -747,54 +836,97 @@ elaborateLetExpected ienv bs expected body = do
                             (preds ++ accP) rest preRest
     inferBinds _ _ _ _ _ _ = pure ([], [], emptySubst)
 
--- | Do-block: walk each statement and elaborate sub-expressions for
--- class-method rewrites.  The do-block's outer type stays a fresh
--- tyvar — a full bidirectional elaborator (pushing the enclosing
--- expected-type into each stmt to force @m@ in @m s -> s -> (a, s)@)
--- is out of MVP scope.  This partial pass still handles common cases
--- like @do { x <- getLine; putStrLn (... :: String) }@ where the
--- ambiguity is localised to a single sub-expression.
-elaborateDo :: InferEnv -> [Stmt] -> IO (Expr, Type, [Pred], Subst)
-elaborateDo ienv stmts = do
-    (stmts', preds, sub) <- goStmts ienv emptySubst [] [] stmts
-    t <- TyVar <$> freshVar (ieFresh ienv)
-    pure (EDo stmts', t, preds, sub)
-  where
-    goStmts _ sub accS accP [] = pure (reverse accS, reverse accP, sub)
-    goStmts ie sub accS accP (s : rest) = do
-        (s', ie', preds, sub') <- goStmt ie sub s
-        goStmts ie' sub' (s' : accS) (preds ++ accP) rest
+unsnocStmts :: [Stmt] -> Maybe ([Stmt], Stmt)
+unsnocStmts [] = Nothing
+unsnocStmts [s] = Just ([], s)
+unsnocStmts (s:ss) = do
+    (prefix, lastS) <- unsnocStmts ss
+    Just (s:prefix, lastS)
 
-    goStmt :: InferEnv -> Subst -> Stmt -> IO (Stmt, InferEnv, [Pred], Subst)
-    goStmt ie sub stmt = case stmt of
+-- | Split @m a@ / @ParsecT e s a@ into the monad constructor application
+-- and its result argument.
+splitMonadType :: Type -> Maybe (Type, Type)
+splitMonadType ty = case tyApps ty of
+    (h, args@(_:_)) -> Just (foldl TyApp h (init args), last args)
+    _ -> Nothing
+
+-- | Do-block: when an enclosing expected type is available (@Q Exp@
+-- from a QuasiQuoter field, @ParsecT e s a@ from a parser signature)
+-- push the monad into each statement so @location@ / @pure@ unify
+-- with that carrier instead of staying a free @m@ that later
+-- defaults to ParsecT at eval.  Without an expected type the outer
+-- type stays a fresh tyvar (historical InferFreely path).
+elaborateDo :: InferEnv -> Maybe Type -> [Stmt] -> IO (Expr, Type, [Pred], Subst)
+elaborateDo ienv mExpected stmts = case (mExpected, unsnocStmts stmts) of
+    (Just expected, Just (prefix, lastStmt)) -> do
+        let mMonad = fst <$> splitMonadType expected
+        (prefix', ie', preds, sub) <-
+            goStmtsPrefix ienv emptySubst [] [] prefix mMonad
+        (last', _, lastPreds, lastSub) <-
+            goStmt ie' sub lastStmt (Just (applySubst sub expected))
+        let sub' = lastSub
+        pure ( EDo (prefix' ++ [last'])
+             , applySubst sub' expected
+             , map (applySubstPred sub') (preds ++ lastPreds)
+             , sub'
+             )
+    _ -> do
+        (stmts', _, preds, sub) <- goStmtsPrefix ienv emptySubst [] [] stmts Nothing
+        t <- case mExpected of
+            Just expected -> pure (applySubst sub expected)
+            Nothing -> TyVar <$> freshVar (ieFresh ienv)
+        pure (EDo stmts', t, preds, sub)
+  where
+    goStmtsPrefix ie sub accS accP [] _ =
+        pure (reverse accS, ie, reverse accP, sub)
+    goStmtsPrefix ie sub accS accP (s : rest) mMonad = do
+        stmtExpected <- case mMonad of
+            Nothing -> pure Nothing
+            Just monadTy -> do
+                a <- TyVar <$> freshVar (ieFresh ie)
+                pure (Just (TyApp (applySubst sub monadTy) a))
+        (s', ie', preds, sub') <- goStmt ie sub s stmtExpected
+        goStmtsPrefix ie' sub' (s' : accS) (preds ++ accP) rest mMonad
+
+    goStmt :: InferEnv -> Subst -> Stmt -> Maybe Type
+           -> IO (Stmt, InferEnv, [Pred], Subst)
+    goStmt ie sub stmt mStmtExpected = case stmt of
         SExpr e -> do
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            pure (SExpr e', ie, preds, composeSubst sub s')
+            (e', _t, preds, s') <- inferRhs ie sub e mStmtExpected
+            pure (SExpr e', ie, preds, s')
         SBind name e -> do
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            -- Add `name` to locals with a fresh tyvar — we don't
-            -- unify the bind's result type with `m a` yet (MVP).
-            fresh <- TyVar <$> freshVar (ieFresh ie)
+            (e', eTy, preds, s') <- inferRhs ie sub e mStmtExpected
+            let boundTy = case splitMonadType eTy of
+                    Just (_, a) -> a
+                    Nothing -> eTy
             let ie' = ie { ieLocals = Map.insert name
-                                          (Scheme [] [] fresh)
+                                          (Scheme [] [] boundTy)
                                           (ieLocals ie) }
-            pure (SBind name e', ie', preds, composeSubst sub s')
+            pure (SBind name e', ie', preds, s')
         SBangBind name e -> do
-            -- Same shape as SBind; bang is a runtime-strictness annotation,
-            -- not a type-level concern.
-            (e', _t, preds, s') <- elaborateExpr (applySubstIenv sub ie) e
-            fresh <- TyVar <$> freshVar (ieFresh ie)
+            (e', eTy, preds, s') <- inferRhs ie sub e mStmtExpected
+            let boundTy = case splitMonadType eTy of
+                    Just (_, a) -> a
+                    Nothing -> eTy
             let ie' = ie { ieLocals = Map.insert name
-                                          (Scheme [] [] fresh)
+                                          (Scheme [] [] boundTy)
                                           (ieLocals ie) }
-            pure (SBangBind name e', ie', preds, composeSubst sub s')
+            pure (SBangBind name e', ie', preds, s')
         SLet bs -> do
-            -- Elaborate each binding's RHS; add names to locals.
             (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
             pure (SLet bs', ie', preds, composeSubst sub s')
         SImplicitLet bs -> do
             (bs', ie', preds, s') <- goLet (applySubstIenv sub ie) bs
             pure (SImplicitLet bs', ie', preds, composeSubst sub s')
+
+    inferRhs ie sub e mStmtExpected = do
+        (e', t, preds, s') <- case mStmtExpected of
+            Just expected ->
+                elaborateExpectedExpr (applySubstIenv sub ie)
+                    (applySubst sub expected) e
+            Nothing ->
+                elaborateExpr (applySubstIenv sub ie) e
+        pure (e', applySubst s' t, preds, composeSubst sub s')
 
     goLet :: InferEnv -> [(Name, Expr)] -> IO ([(Name, Expr)], InferEnv, [Pred], Subst)
     goLet ie bs = goL ie emptySubst [] [] bs
@@ -827,7 +959,12 @@ applyMethodSubst synonyms sub = go
             let resolved = expandTypeSynonyms synonyms (applySubst sub ty)
             in if Set.null (freeTyVars resolved)
                    then Just (typeDispatchTag resolved)
-                   else Nothing
+                   -- Monad transformers keep free args (@ParsecT e s Identity@)
+                   -- after pinning the constructor.  Dispatch only needs the
+                   -- head; requiring a closed type reverted @pure@/@*>@ to
+                   -- bare EVar and lost the ParsecT instance.
+                   -- Same for TH @Q a@: do not treat ParsecT as Q/Exp.
+                   else tyHead resolved
         Nothing
           | isHeadName tag -> Just (typeDispatchTag (expandTypeSynonyms synonyms (TyCon tag)))
           | otherwise      -> Nothing            -- unresolved placeholder type variable
@@ -904,6 +1041,15 @@ applyMethodSubst synonyms sub = go
 applySubstIenv :: Subst -> InferEnv -> InferEnv
 applySubstIenv sub ie = ie
     { ieLocals = Map.map (applySubstScheme sub) (ieLocals ie) }
+
+-- | Replace every free type variable with a fresh name from 'fs'.
+-- Used so an expected type produced by a previous inference pass
+-- cannot collide with this pass's @$tN@ stream.
+freshenType :: FreshSource -> Type -> IO Type
+freshenType fs ty = do
+    let vs = Set.toList (freeTyVars ty)
+    fresh <- mapM (\_ -> freshVar fs) vs
+    pure (applySubst (Map.fromList (zip vs (map TyVar fresh))) ty)
 
 -- | One-hop type synonym expansion: @State s a@ → @StateT s Identity a@.
 expandSyn :: Map ByteString TypeSynonym -> Type -> Type
