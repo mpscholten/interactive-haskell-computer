@@ -9,6 +9,7 @@ module IHC.ConstructorMetadata
     , foreignConstructorCollision
     , constructorFieldTypes
     , constructorFieldTypeAt
+    , lookupDeclaredFieldTag
     , globalConstructorTypeRegistryRef
     , registerSelectorFieldTypes
     , resetSelectorFieldTypes
@@ -25,7 +26,7 @@ import Data.Set (Set)
 import System.IO.Unsafe (unsafePerformIO)
 
 import IHC.AST (Name)
-import IHC.TypeAST (Scheme(..), Type(..), applySubst, freeTyVars, emptySubst, tyArrowArgs)
+import IHC.TypeAST (Scheme(..), Type(..), applySubst, freeTyVars, emptySubst, tyArrowArgs, tyHead)
 import IHC.TypeUnify (unify)
 
 -- | A constructor is identified by its declaring module as well as its name.
@@ -249,6 +250,25 @@ constructorFieldTypeAt registry owner ctor fieldIndex expected = do
     if fieldIndex < 0 || fieldIndex >= length fields
         then Nothing
         else Just (fields !! fieldIndex)
+
+-- | Declared unary-constructor field head (CInt → Int32, local
+-- @newtype W = W Int32@ → Int32).  Used by GND so dispatch does not
+-- take 'typeTagOf' of the runtime payload (VInt → Int).  No type-name
+-- table: the scanner recorded the field when the newtype was loaded.
+lookupDeclaredFieldTag :: Name -> IO (Maybe Name)
+lookupDeclaredFieldTag ctor = do
+    registry <- readIORef globalConstructorTypeRegistryRef
+    let bare = snd (splitQualified ctor)
+        tags =
+            [ snd (splitQualified fieldHead)
+            | metadata <- Map.elems registry
+            , ciName (ctmIdentity metadata) == bare
+            , [fieldTy] <- [ctmFieldTypes metadata]
+            , Just fieldHead <- [tyHead fieldTy]
+            ]
+    case tags of
+        (t:rest) | all (== t) rest -> pure (Just t)
+        _ -> pure Nothing
 
 -- Only erase a result-head qualifier when it is the metadata's actual owner.
 -- Thus @A.G@ and @G@ can agree for A's constructor, while @B.G@ cannot.

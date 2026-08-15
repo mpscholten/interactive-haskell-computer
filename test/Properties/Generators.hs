@@ -392,7 +392,7 @@ identTailChars = ['a' .. 'z'] ++ ['A' .. 'Z'] ++ ['0' .. '9'] ++ "'_"
 reservedKeywords :: Set Name
 reservedKeywords = Set.fromList
     [ "if", "then", "else", "case", "of"
-    , "let", "in", "where", "do"
+    , "let", "in", "where", "do", "mdo", "rec"
     , "data", "module", "import", "qualified", "hiding"
     , "newtype", "type", "class", "instance", "deriving"
     , "infixl", "infixr", "infix"

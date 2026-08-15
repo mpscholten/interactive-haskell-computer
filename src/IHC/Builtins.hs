@@ -21,6 +21,7 @@ module IHC.Builtins
     , ordCmp
     , eqByteStringHost
     , peekHostWord8ByteOff
+    , peekHostMarkedElemOff
     , pokeHostWord8ByteOff
     , reapSpawnedThreads
     ) where
@@ -53,8 +54,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr, ord, toLower)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
-import Data.Int (Int8, Int64)
-import Data.List (intercalate)
+import Data.Int (Int8, Int16, Int32, Int64)
+import Data.List (intercalate, isInfixOf)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word16, Word32, Word64, byteSwap16, byteSwap32)
@@ -68,7 +69,7 @@ import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes, fillBytes, moveBytes)
 import Foreign.Ptr (Ptr, IntPtr, castPtr, plusPtr, nullPtr, minusPtr, intPtrToPtr, ptrToIntPtr)
 import qualified Foreign.Ptr as FP
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, peekElemOff, pokeElemOff, sizeOf)
 import qualified System.Info
 import System.IO.Unsafe (unsafePerformIO)
 import System.IO
@@ -96,6 +97,9 @@ import IHC.Classes
     , mkTypeRep, typeRepEq
     , drainCataloguedInstancesForClass
     , legacyHooks
+    , withClearedDoCarrier
+    , getSharedClassReg
+    , lookupCtorType
     )
 import qualified IHC.Classes
 import IHC.Eval (apply, force, forceMethodVal, runIOVal)
@@ -186,6 +190,122 @@ peekHostWord8ByteOff ptrV offV = do
             byte <- peekByteOff (p :: Ptr Word8) off :: IO Word8
             pure (VInt (fromIntegral byte))
 
+-- | Unannotated peekElemOff / peekByteOff on a buffer marked by FFI
+-- @Ptr CInt@ (socketPair's fdArr).  Class dispatch defaults to 8-byte
+-- Int; the mark supplies the real pointee width.
+peekHostMarkedElemOff :: Bool -> Val -> Val -> IO (Maybe Val)
+peekHostMarkedElemOff isElemOff ptrV offV = do
+    p <- ptrValToPtr ptrV
+    mTy <- lookupTypedHostPtr p
+    case mTy of
+        Just ty | Just sz <- markedPeekSize ty -> do
+            off <- byteOffsetFromVal "peekHostMarkedElemOff" offV
+            let byteOff = if isElemOff then off * sz else off
+            v <- readMarkedPeek ty p byteOff
+            Just <$> wrapMarkedPeek ty v
+        _ -> pure Nothing
+
+markedPeekSize :: ByteString -> Maybe Int
+markedPeekSize ty = case ty of
+    "CInt"     -> Just (sizeOf (undefined :: Int32))
+    "CUInt"    -> Just (sizeOf (undefined :: Word32))
+    "CLong"    -> Just (sizeOf (undefined :: Int64))
+    "CULong"   -> Just (sizeOf (undefined :: Word64))
+    "CSize"    -> Just (sizeOf (undefined :: Word))
+    "CChar"    -> Just (sizeOf (undefined :: Int8))
+    "CSChar"   -> Just (sizeOf (undefined :: Int8))
+    "CUChar"   -> Just (sizeOf (undefined :: Word8))
+    "Int8"     -> Just (sizeOf (undefined :: Int8))
+    "Int16"    -> Just (sizeOf (undefined :: Int16))
+    "Int32"    -> Just (sizeOf (undefined :: Int32))
+    "Int64"    -> Just (sizeOf (undefined :: Int64))
+    "Word8"    -> Just (sizeOf (undefined :: Word8))
+    "Word16"   -> Just (sizeOf (undefined :: Word16))
+    "Word32"   -> Just (sizeOf (undefined :: Word32))
+    "Word64"   -> Just (sizeOf (undefined :: Word64))
+    "Int"      -> Just (sizeOf (undefined :: Int))
+    "Word"     -> Just (sizeOf (undefined :: Word))
+    "Float"    -> Just (sizeOf (undefined :: Float))
+    "Double"   -> Just (sizeOf (undefined :: Double))
+    "Ptr"      -> Just (sizeOf (undefined :: Ptr Word8))
+    "FunPtr"   -> Just (sizeOf (undefined :: Ptr Word8))
+    _          -> Nothing
+
+readMarkedPeek :: ByteString -> Ptr Word8 -> Int -> IO Val
+readMarkedPeek ty p off = case ty of
+    "CInt"     -> readI32
+    "CUInt"    -> readW32
+    "CLong"    -> readI64
+    "CULong"   -> readW64
+    "CSize"    -> readW
+    "CChar"    -> readI8
+    "CSChar"   -> readI8
+    "CUChar"   -> readW8
+    "Int8"     -> readI8
+    "Int16"    -> readI16
+    "Int32"    -> readI32
+    "Int64"    -> readI64
+    "Word8"    -> readW8
+    "Word16"   -> readW16
+    "Word32"   -> readW32
+    "Word64"   -> readW64
+    "Int"      -> do
+        x <- peekByteOff (castPtr p :: Ptr Int) off :: IO Int
+        pure (VInt (fromIntegral x))
+    "Word"     -> readW
+    "Float"    -> do
+        x <- peekByteOff (castPtr p :: Ptr Float) off :: IO Float
+        pure (VFloat (realToFrac x))
+    "Double"   -> do
+        x <- peekByteOff (castPtr p :: Ptr Double) off :: IO Double
+        pure (VFloat x)
+    "Ptr"      -> readP
+    "FunPtr"   -> readP
+    _          -> readW8
+  where
+    readI8 = do
+        x <- peekByteOff (castPtr p :: Ptr Int8) off :: IO Int8
+        pure (VInt (fromIntegral x))
+    readI16 = do
+        x <- peekByteOff (castPtr p :: Ptr Int16) off :: IO Int16
+        pure (VInt (fromIntegral x))
+    readI32 = do
+        x <- peekByteOff (castPtr p :: Ptr Int32) off :: IO Int32
+        pure (VInt (fromIntegral x))
+    readI64 = do
+        x <- peekByteOff (castPtr p :: Ptr Int64) off :: IO Int64
+        pure (VInt (fromIntegral x))
+    readW8 = do
+        x <- peekByteOff (castPtr p :: Ptr Word8) off :: IO Word8
+        pure (VInt (fromIntegral x))
+    readW16 = do
+        x <- peekByteOff (castPtr p :: Ptr Word16) off :: IO Word16
+        pure (VInt (fromIntegral x))
+    readW32 = do
+        x <- peekByteOff (castPtr p :: Ptr Word32) off :: IO Word32
+        pure (VInt (fromIntegral x))
+    readW64 = do
+        x <- peekByteOff (castPtr p :: Ptr Word64) off :: IO Word64
+        pure (VInt (fromIntegral x))
+    readW = do
+        x <- peekByteOff (castPtr p :: Ptr Word) off :: IO Word
+        pure (VInt (fromIntegral x))
+    readP = do
+        raw <- peekByteOff (castPtr p :: Ptr Word64) off :: IO Word64
+        pure (VPrimObj (PrimPtr (castPtr (intPtrToPtr (fromIntegral raw)))))
+
+-- CInt / CUInt / … are unary newtypes.  Wrap so mkSocket / fromIntegral
+-- see the source constructor, not a bare VInt.
+wrapMarkedPeek :: ByteString -> Val -> IO Val
+wrapMarkedPeek ty v
+    | ty `elem` map BC.pack
+        [ "CInt", "CUInt", "CLong", "CULong", "CSize"
+        , "CChar", "CSChar", "CUChar"
+        ] = do
+            t <- newWHNFThunk v
+            pure (VCon ty [t])
+    | otherwise = pure v
+
 byteOffsetFromVal :: String -> Val -> IO Int
 byteOffsetFromVal who (VInt off) =
     pure (fromIntegral off)
@@ -196,7 +316,16 @@ byteOffsetFromVal who other =
 
 ptrValToPtr :: Val -> IO (Ptr Word8)
 ptrValToPtr (VPrimObj (PrimPtr p)) = pure p
+-- plusAddr# keeps a ForeignPtr-derived Addr# as PrimForeignPtr so the
+-- finalizer is not dropped.  pokeByteOff / isHostWord8PtrVal of a
+-- Word8 buffer must accept that shape the same way copyBytes already
+-- does via valToHostPtr — otherwise the Word8 poke intercept misses
+-- and Storable (Ptr b) / writeWord8OffAddr# (PrimPtr-only) leftover.
+ptrValToPtr (VPrimObj (PrimForeignPtr fp)) =
+    pure (castPtr (unsafeForeignPtrToPtr fp))
 ptrValToPtr (VCon "Ptr" [pT]) = force legacyHooks pT >>= ptrValToPtr
+ptrValToPtr (VCon n [pT])
+    | BC.isSuffixOf (BC.pack ".Ptr") n = force legacyHooks pT >>= ptrValToPtr
 ptrValToPtr other = error ("expected Ptr: " <> showValForDebug other)
 
 foreignPtrValToForeignPtr :: Val -> IO (ForeignPtr Word8)
@@ -807,6 +936,8 @@ builtins reg =
     -- these primops; there is no .hs implementation to interpret below them.
     , ("readIntOffAddr#",  readIntOffAddrHashB)
     , ("writeIntOffAddr#", writeIntOffAddrHashB)
+    , ("readInt32OffAddr#",  readInt32OffAddrHashB)
+    , ("writeInt32OffAddr#", writeInt32OffAddrHashB)
     , ("readWord8OffAddr#",  readWord8OffAddrHashB)
     , ("writeWord8OffAddr#", writeWord8OffAddrHashB)
     , ("readWideCharOffAddr#",  readWideCharOffAddrHashB)
@@ -1184,12 +1315,9 @@ builtins reg =
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
     , ("newCString",      newCStringB)
-    -- Foreign.Storable.sizeOf / alignment source-load for qualified module
-    -- entries.  Keep only the bare optimistic fallback for polymorphic
-    -- library code like alloca's sizeOf (undefined :: a), where IHC has no
-    -- typechecker dictionary to recover a concrete Storable instance.
-    , ("sizeOf",       sizeOfB)
-    , ("alignment",    alignmentB)
+    -- Foreign.Storable.sizeOf / alignment source-load through the
+    -- class.  Host sizeOfB (always 64) ate discovery so CInt/GND
+    -- Int32 never reached instance Storable Int32.
     -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
     -- import dispatches through the generic FFI path.
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
@@ -3740,12 +3868,17 @@ touchHashB = pure $ VFun $ \aT -> pure $ VFun $ \sT -> do
 -- Apply the function to the RealWorld token, run any bridged VIO layer,
 -- then extract and return the result component of the unboxed tuple.
 runRWB :: IO Val
-runRWB = pure $ VFun $ \ft -> do
+runRWB = pure $ VFun $ \ft -> withClearedDoCarrier $ do
     fv <- force legacyHooks ft
     rwT <- newWHNFThunk (VPrimObj PrimRealWorld)
     -- runRW# :: (State# RealWorld -> o) -> o
     -- Just apply the function to the RealWorld token and return the raw
     -- result.  The *caller* (e.g. runST) does any unboxed-tuple matching.
+    --
+    -- Source @unsafeDupablePerformIO (IO m) = case runRW# m of …@
+    -- is how @errorCallWithCallStackException@ runs its IO do-block.
+    -- Clear the surrounding ParsecT do-carrier so that IO's @return@
+    -- is not stolen (IhcException: ParsecT).
     resRaw <- apply legacyHooks fv rwT
     -- If the result is a VIO action (ST-VIO bridge), execute it so that
     -- the caller sees the concrete value / unboxed tuple.
@@ -4074,6 +4207,46 @@ writeIntOffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeIntOffAddr#: bad args: " <> showValForDebug addrV)
 
+-- | @readInt32OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Int# #)@.
+-- GHC.Prim-only; source 'readInt32OffPtr' bottoms out here (STORABLE Int32).
+readInt32OffAddrHashB :: IO Val
+readInt32OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                        pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    case (addrV, idxV) of
+        (VPrimObj (PrimPtr p), VInt i) -> do
+            n   <- peekElemOff (castPtr p :: Ptr Int32) (fromIntegral i)
+            stT <- newWHNFThunk (VPrimObj PrimRealWorld)
+            nT  <- newWHNFThunk (VInt (fromIntegral n))
+            pure (VCon "(#,#)" [stT, nT])
+        _ -> error ("readInt32OffAddr#: bad args: " <> showValForDebug addrV)
+
+-- | @writeInt32OffAddr# :: Addr# -> Int# -> Int# -> State# s -> State# s@.
+-- GHC.Prim-only; source 'writeInt32OffPtr' bottoms out here (STORABLE Int32).
+writeInt32OffAddrHashB :: IO Val
+writeInt32OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
+                         pure $ VFun $ \valT -> pure $ VFun $ \_stT -> do
+    addrV <- force legacyHooks addrT
+    idxV  <- force legacyHooks idxT
+    valV0 <- force legacyHooks valT
+    valV  <- unwrapUnaryInt valV0
+    case (addrV, idxV, valV) of
+        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
+            pokeElemOff (castPtr p :: Ptr Int32) (fromIntegral i)
+                        (fromIntegral n :: Int32)
+            pure (VPrimObj PrimRealWorld)
+        _ -> error ("writeInt32OffAddr#: bad args: " <> showValForDebug addrV)
+
+unwrapUnaryInt :: Val -> IO Val
+unwrapUnaryInt = go (0 :: Int)
+  where
+    go d v
+        | d > 8 = pure v
+        | otherwise = case v of
+            VCon _ [t] -> force legacyHooks t >>= go (d + 1)
+            _          -> pure v
+
 -- | @readWord8OffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Word8# #)@.
 -- GHC.Prim raw-address access used by source-loaded @Storable Word8@.
 readWord8OffAddrHashB :: IO Val
@@ -4081,8 +4254,11 @@ readWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
                         pure $ VFun $ \_stT -> do
     addrV <- force legacyHooks addrT
     idxV  <- force legacyHooks idxT
-    case (addrV, idxV) of
-        (VPrimObj (PrimPtr p), VInt i) -> do
+    -- Same Addr# resolver as copyBytes / plusAddr#: dest may be a
+    -- ForeignPtr-derived PrimForeignPtr, not a bare PrimPtr.
+    p <- valToHostPtr addrV
+    case idxV of
+        VInt i -> do
             n   <- peekElemOff (p :: Ptr Word8) (fromIntegral i)
             stT <- newWHNFThunk (VPrimObj PrimRealWorld)
             nT  <- newWHNFThunk (VInt (fromIntegral n))
@@ -4097,19 +4273,29 @@ writeWord8OffAddrHashB = pure $ VFun $ \addrT -> pure $ VFun $ \idxT ->
     addrV <- force legacyHooks addrT
     idxV  <- force legacyHooks idxT
     valV  <- force legacyHooks valT
-    case (addrV, idxV, valV) of
-        (VPrimObj (PrimPtr p), VInt i, VInt n) -> do
-            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
-                        (fromIntegral n :: Word8)
-            pure (VPrimObj PrimRealWorld)
-        (VPrimObj (PrimPtr p), VInt i, VInteger n) -> do
-            pokeElemOff (p :: Ptr Word8) (fromIntegral i)
-                        (fromInteger n :: Word8)
+    -- plusAddr# keeps ForeignPtr-derived Addr# as PrimForeignPtr.
+    -- Matching only PrimPtr left pokeByteOff of a Word8 buffer as a
+    -- leftover (formatHTTPDate / memcpyFp >> pokeFp).
+    p <- valToHostPtr addrV
+    mByte <- word8PrimVal valV
+    case (idxV, mByte) of
+        (VInt i, Just n) -> do
+            pokeElemOff (p :: Ptr Word8) (fromIntegral i) n
             pure (VPrimObj PrimRealWorld)
         _ -> error ("writeWord8OffAddr#: bad args: "
                     <> showValForDebug addrV <> ", "
                     <> showValForDebug idxV <> ", "
                     <> showValForDebug valV)
+  where
+    word8PrimVal (VInt n) = pure (Just (fromIntegral n :: Word8))
+    word8PrimVal (VInteger n) = pure (Just (fromInteger n :: Word8))
+    word8PrimVal (VCon c [t])
+        | c == BC.pack "W8#" || c == BC.pack "W#"
+          || BC.isSuffixOf (BC.pack ".W8#") c
+          || BC.isSuffixOf (BC.pack ".W#") c = do
+            inner <- force legacyHooks t
+            word8PrimVal inner
+    word8PrimVal _ = pure Nothing
 
 -- | @readWideCharOffAddr# :: Addr# -> Int# -> State# s -> (# State# s, Char# #)@.
 -- GHC.Prim raw-address access used by source-loaded @Storable Char@.
@@ -4240,7 +4426,24 @@ addForeignPtrFinalizerB = pure $ VFun $ \_finalizerT -> pure $ VFun $ \fpT -> pu
 --------------------------------------------------------------------------------
 
 peekB :: IO Val
-peekB = pure $ VFun $ \a -> pure $ VIO $ do
+peekB = pure $ VFun $ \a -> do
+    -- When a do-bind/ascription pinned an expected result (CInt n <-
+    -- peek p), use the class dispatcher so GND can unwrap.  Unannotated
+    -- peeks keep the host AddrInfo/Word8 leftover (do not restore
+    -- peekSockAddr; this is the existing peekB path).
+    mTag <- readExpectedResultTag
+    mDisp <- case mTag of
+        Just _ ->
+            IHC.Classes.lookupClassMethodFallback
+                legacyHooks (BC.pack "Storable") (BC.pack "peek")
+        Nothing ->
+            pure Nothing
+    case mDisp of
+        Just disp -> apply legacyHooks disp a
+        Nothing   -> hostPeekB a
+
+hostPeekB :: Thunk -> IO Val
+hostPeekB a = pure $ VIO $ do
     av <- force legacyHooks a
     p <- ptrValToPtr av
     mTyped <- lookupTypedHostPtr p
@@ -4511,7 +4714,15 @@ intField label t = do
         other  -> error (label <> " is not an Int: " <> showValForDebug other)
 
 pokeB :: IO Val
-pokeB = pure $ VFun $ \a -> pure $ VFun $ \b -> pure $ VIO $ do
+pokeB = pure $ VFun $ \a -> do
+    mDisp <- IHC.Classes.lookupClassMethodFallback
+                legacyHooks (BC.pack "Storable") (BC.pack "poke")
+    case mDisp of
+        Just disp -> apply legacyHooks disp a
+        Nothing   -> hostPokeB a
+
+hostPokeB :: Thunk -> IO Val
+hostPokeB a = pure $ VFun $ \b -> pure $ VIO $ do
     av <- force legacyHooks a; bv0 <- force legacyHooks b
     p <- ptrValToPtr av
     case bv0 of
@@ -5677,16 +5888,6 @@ newCStringB = pure $ VFun $ \sT -> pure $ VIO $ do
     poke (plusPtr cp len :: Ptr Word8) (0 :: Word8)
     pure (VPrimObj (PrimPtr cp))
 
-sizeOfB :: IO Val
-sizeOfB = pure $ VFun $ \a -> do
-    let _ = a
-    pure (VInt 64)
-
-alignmentB :: IO Val
-alignmentB = pure $ VFun $ \a -> do
-    let _ = a
-    pure (VInt 8)
-
 --------------------------------------------------------------------------------
 -- Phase 2.8: additional numeric / bit ops
 --------------------------------------------------------------------------------
@@ -5954,6 +6155,16 @@ buildFieldEnv reg = do
                              <> "` has only " <> show (length args)
                              <> " fields, index " <> show idx
                              <> " out of range"))
+                    -- Newtype selector, unknown single-field ctor: peel
+                    -- like SomeException.  A leftover wrapper (or an
+                    -- elided-newtype mixup) must not hide the payload
+                    -- the selector was built for.  Multi-ctor records
+                    -- keep the miss path — only a one-field newtype
+                    -- registry is transparent.
+                    Nothing
+                      | [innerT] <- args
+                      , [(_, 0)] <- clauses ->
+                            access fieldName clauses innerT
                     Nothing -> tryIsStringFallback fieldName clauses v conName
             -- Nullary class methods like @mempty@ need result-type
             -- evidence before a newtype field accessor can project them.
@@ -6356,34 +6567,78 @@ getSystemEventManagerB = pure $ VIO $ do
 getSystemTimerManagerB :: IO Val
 getSystemTimerManagerB = pure $ VIO $ pure (VCon "TimerManager" [])
 
+-- | Host-side cancel table for 'registerTimeoutB'.  Keyed by the
+-- 'TimeoutKey' cookie we hand back as @TK n@.  We do *not* delegate
+-- to the host @GHC.Event@ TimerManager: a TimeoutThread callback
+-- does @throwTo@, and the RTS timer-manager thread must not block
+-- in that @throwTo@ (see @GHC.Internal.Event.TimeOut@).  Forking a
+-- delay thread keeps delivery off the I/O manager.  @unregisterTimeout@
+-- must still cancel — Warp @TimeManager.cancel@ and
+-- @Event.threadDelay@'s @takeMVar `onException` unregisterTimeout@
+-- both depend on it.  A no-op unregister leaves the callback
+-- scheduled; if that callback @throwTo@s @TimeoutThread@, the timeout
+-- manager hangs after accept.
+{-# NOINLINE timeoutThreadsRef #-}
+timeoutThreadsRef :: IORef (Map.Map Int64 (ThreadId, IORef Bool))
+timeoutThreadsRef = unsafePerformIO (newIORef Map.empty)
+
 -- | @registerTimeout :: TimerManager -> Int -> IO () -> IO TimeoutKey@.
 -- Implemented as @forkIO $ threadDelay usec >> callback@ rather than
--- delegated to the host @GHC.Event@ TimerManager: warp's only use is
--- registering connection-idle/slowloris timeouts, which only need
--- "fire roughly N microseconds from now" semantics.  Limitations:
--- * 'unregisterTimeout' is a no-op (no cancellation),
--- * timing is via 'threadDelay', not the host monotonic-clock manager.
--- These are acceptable for the warp request-handling path; revisit if
--- a fixture starts depending on real cancellation.
+-- delegated to the host @GHC.Event@ TimerManager (see
+-- 'timeoutThreadsRef').  Timing is via 'threadDelay', not the host
+-- monotonic-clock manager — acceptable for warp idle/slowloris
+-- timeouts.
 registerTimeoutB :: IO Val
 registerTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \usecT -> pure $ VFun $ \cbT -> pure $ VIO $ do
     usecV <- force legacyHooks usecT
-    case usecV of
-        VInt usec -> do
+    case asInt64 usecV of
+        Just usec -> do
             cbV <- force legacyHooks cbT
-            _ <- forkIO $ do
-                threadDelay (fromIntegral usec)
-                _ <- runIOVal legacyHooks cbV
-                pure ()
+            cancelled <- newIORef False
+            -- Source @registerTimeout@ fires immediately when us <= 0.
+            let delayUs = if usec <= 0 then 0 else fromIntegral usec
+            tid <- forkIO $ do
+                threadDelay delayUs
+                done <- readIORef cancelled
+                if done
+                    then pure ()
+                    else do
+                        _ <- CE.try @SomeException $ runIOVal legacyHooks cbV
+                        pure ()
+            registerSpawnedThread tid
             n <- atomicModifyIORef' uniqueCounterRef $ \x ->
                 let x' = x + 1 in (x', x')
+            modifyIORef' timeoutThreadsRef (Map.insert n (tid, cancelled))
             nT <- newWHNFThunk (VInt n)
             pure (VCon "TK" [nT])
         _ -> error ("registerTimeout: timeout is not an Int: " <> showValForDebug usecV)
 
 unregisterTimeoutB :: IO Val
-unregisterTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT ->
-    pure $ VIO $ pure VUnit
+unregisterTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \keyT ->
+    pure $ VIO $ do
+        keyV <- force legacyHooks keyT
+        mn <- timeoutKeyId keyV
+        case mn of
+            Nothing -> pure VUnit
+            Just n -> do
+                ment <- atomicModifyIORef' timeoutThreadsRef $ \m ->
+                    (Map.delete n m, Map.lookup n m)
+                case ment of
+                    Nothing -> pure VUnit
+                    Just (tid, cancelled) -> do
+                        writeIORef cancelled True
+                        _ <- CE.try @SomeException $ killThread tid
+                        pure VUnit
+
+-- | Peel @TK n@ / a bare Int.  Source @TimeoutKey = TK Unique@; we
+-- mint @TK (VInt n)@.
+timeoutKeyId :: Val -> IO (Maybe Int64)
+timeoutKeyId (VCon _ [innerT]) = do
+    inner <- force legacyHooks innerT
+    case asInt64 inner of
+        Just n  -> pure (Just n)
+        Nothing -> timeoutKeyId inner
+timeoutKeyId v = pure (asInt64 v)
 
 updateTimeoutB :: IO Val
 updateTimeoutB = pure $ VFun $ \_mgrT -> pure $ VFun $ \_keyT -> pure $ VFun $ \usecT ->
@@ -6619,6 +6874,16 @@ extractExceptionMessage val = case val of
         loc <- tryValToString locT (BC.pack "")
         desc <- tryValToString descT (BC.pack "")
         pure (BC.pack "IOError: " <> loc <> BC.pack ": " <> desc)
+    -- Source `error` / function-clause fallbacks raise a [Char] (or
+    -- SomeException wrapping one). The generic VCon arm would otherwise
+    -- report just ":" and catch# could not recognise a desugared
+    -- constructor-pattern miss.
+    VCon ":" _ -> do
+        r <- CE.try @SomeException (valToString val)
+        pure $ case r of
+            Right s -> BC.pack s
+            Left  _ -> BC.pack ":"
+    VCon "[]" _ -> pure BC.empty
     VCon n _ -> pure n
     _        -> pure (BC.pack (showValForDebug val))
   where
@@ -6732,18 +6997,28 @@ tryShortcutMessage t = do
                         pure (v, msgT))
                     case r of
                         Right (v, msgT) -> case v of
-                            VStr s -> pure (Just (s, msgT))
+                            VStr s -> do
+                                payloadT <- errorCallPayloadThunk msgT
+                                pure (Just (s, payloadT))
                             _ -> do
                                 -- [Char] list → try to decode.
                                 r2 <- CE.try @SomeException (valToString v)
                                 case r2 of
                                     Right s -> do
-                                        payloadT <- newWHNFThunk (VStr (BC.pack s))
+                                        msgT' <- newWHNFThunk (VStr (BC.pack s))
+                                        payloadT <- errorCallPayloadThunk msgT'
                                         pure (Just (BC.pack s, payloadT))
                                     Left _ -> pure Nothing
                         Left _ -> pure Nothing
                 Nothing -> pure Nothing
         _ -> pure Nothing
+
+-- The shortcut bypasses evaluation of the source helper, but it must not
+-- bypass the helper's result constructor.  Keeping a raw String payload
+-- makes source `fromException` reject a typed `ErrorCall` handler (notably
+-- for `errorWithoutStackTrace`).
+errorCallPayloadThunk :: Thunk -> IO Thunk
+errorCallPayloadThunk msgT = newWHNFThunk (VCon "ErrorCall" [msgT])
 
 -- | Recognise an @error@-family application and return the message
 -- sub-expression.  Matches:
@@ -6825,12 +7100,12 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
             rawExcVal <- ihcExceptionToVal exc
             excVal <- ensureSomeExceptionVal rawExcVal
             excT   <- newWHNFThunk excVal
-            invokeHandler hV excT
+            invokeHandler (throwIO exc) hV excT
         Left se -> do
             -- Non-IhcException host error — wrap & hand to handler.
             excVal <- hostExceptionToSomeExceptionVal se
             excT <- newWHNFThunk excVal
-            invokeHandler hV excT
+            invokeHandler (throwIO se) hV excT
   where
     -- Ensure the result is shaped as (# State#, a #). If the IO action
     -- already returned a proper unboxed pair, pass through; otherwise wrap.
@@ -6841,18 +7116,77 @@ catchHashB = pure $ VFun $ \ioT -> pure $ VFun $ \hT -> pure $ VFun $ \sT -> do
             sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
             vT   <- newWHNFThunk v
             pure (VCon "(#,#)" [sT', vT])
-    invokeHandler hV excT = do
+    -- Source catch is:
+    --   handler' e = case fromException e of
+    --     Just e' -> unIO (handler e')
+    --     Nothing -> raiseIO# e
+    -- Val-level fromException is not type-directed: it returns
+    -- `Just (SomeException inner)` for every wrapper. matchPat can
+    -- recover a failed `Just (Concrete _)` / `Nothing` *case* downcast,
+    -- but `handle (\(TimeoutThread) -> …)` binds `e'` as a variable and
+    -- then applies a constructor-pattern function. The function
+    -- desugaring fallback is `error "Non-exhaustive patterns in
+    -- function: [[PCon …]] args=SomeException IOError …"` — Warp's
+    -- TimeManager leftover. That miss is a failed fromException, not a
+    -- new exception: re-raise the original.
+    invokeHandler rethrowOriginal hV excT = do
         -- Handler' signature: exc -> State# -> (# State#, a #)
-        r1 <- apply legacyHooks hV excT
-        case r1 of
-            VFun _ -> do
-                sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
-                rRaw <- apply legacyHooks r1 sT'
-                v    <- runIOVal legacyHooks rRaw
-                ensurePair v
-            _ -> do
-                v <- runIOVal legacyHooks r1
-                ensurePair v
+        rH <- CE.try @SomeException $ do
+            r1 <- apply legacyHooks hV excT
+            case r1 of
+                VFun _ -> do
+                    sT'  <- newWHNFThunk (VPrimObj PrimRealWorld)
+                    rRaw <- apply legacyHooks r1 sT'
+                    v    <- runIOVal legacyHooks rRaw
+                    ensurePair v
+                _ -> do
+                    v <- runIOVal legacyHooks r1
+                    ensurePair v
+        case rH of
+            Right v -> pure v
+            Left se -> do
+                miss <- isFailedExceptionDowncast se
+                if miss then rethrowOriginal else throwIO se
+
+-- | Constructor-pattern catch handler rejected the exception
+-- fromException had already committed to @Just@. Structural: the
+-- desugared function fallback message, not a constructor name list.
+--
+-- Source `error` raises the message as a [Char] Val. 'IhcException'
+-- display used to collapse that to ":", so a pure `show se` check
+-- missed the function-clause leftover (`ignore TimeoutThread = …`).
+-- Inspect the payload Val as well as 'show'.
+isFailedExceptionDowncast :: SomeException -> IO Bool
+isFailedExceptionDowncast se = do
+    payloadMsgs <- case CE.fromException se of
+        Just (IhcException msg t) -> do
+            v <- force legacyHooks t
+            decoded <- CE.try @SomeException (downcastPayloadString v)
+            let extra = case decoded of
+                    Right s -> s
+                    Left _  -> ""
+            pure [BC.unpack msg, extra, show se]
+        Nothing ->
+            pure [show se]
+    pure (any isDesugaredHandlerMiss payloadMsgs)
+
+isDesugaredHandlerMiss :: String -> Bool
+isDesugaredHandlerMiss msg =
+    "Non-exhaustive patterns in function:" `isInfixOf` msg
+    || "Non-exhaustive patterns in lambda:" `isInfixOf` msg
+
+downcastPayloadString :: Val -> IO String
+downcastPayloadString v = case v of
+    VCon "SomeException" [innerT] ->
+        force legacyHooks innerT >>= downcastPayloadString
+    VCon "ErrorCall" [msgT] ->
+        force legacyHooks msgT >>= downcastPayloadString
+    VCon "ErrorCallWithLocation" (msgT : _) ->
+        force legacyHooks msgT >>= downcastPayloadString
+    VStr s -> pure (BC.unpack s)
+    VCon ":" _ -> valToString v
+    VCon "[]" _ -> pure ""
+    _ -> BC.unpack <$> extractExceptionMessage v
 
 -- | Convert a host-thrown 'SomeException' into the Val shape that
 -- source-loaded exception code expects from the @catch#@ primop.
@@ -7060,49 +7394,153 @@ maskAsyncExceptionsHashB = pure $ VFun $ \ioT -> pure $ VFun $ \sT -> do
 -- already unwraps 'SomeException'.
 toExceptionWithBacktraceB :: IO Val
 toExceptionWithBacktraceB = pure $ VFun $ \eT -> pure $ VIO $ do
-    ev <- force legacyHooks eT
-    case ev of
-        VCon "SomeException" _ -> pure ev
-        _                       -> do
-            eT' <- newWHNFThunk ev
-            pure (VCon "SomeException" [eT'])
+    -- Source is `toException e` plus optional backtrace context.
+    -- The Exception instance's toException (SomeAsyncException wrap)
+    -- must run; the backtrace is cosmetic at the Val level.
+    toEx <- toExceptionB
+    apply legacyHooks toEx eT
 
--- | @toException :: Exception e => e -> SomeException@ — identity-with-wrap
--- at the Val level (we lack the Exception class dispatch; SomeException is
--- idempotent). Complements 'toExceptionWithBacktraceB' for the pure throw
--- path (@throwIO e = IO (raiseIO# (toException e))@).
+-- | @toException :: Exception e => e -> SomeException@.
+-- Source default is @SomeException e@. Instances may override
+-- (@toException = asyncExceptionToException@). Look up the source
+-- instance method; last resort is the class-default wrap.
 toExceptionB :: IO Val
 toExceptionB = pure $ VFun $ \eT -> do
     ev <- force legacyHooks eT
     case ev of
         VCon "SomeException" _ -> pure ev
-        _                       -> do
-            eT' <- newWHNFThunk ev
-            pure (VCon "SomeException" [eT'])
+        _ -> do
+            let tag = typeTagOf ev
+            mMethod <- lookupExceptionMethod tag (BC.pack "toException")
+            case mMethod of
+                Just methodVal -> do
+                    r <- CE.try @SomeException $
+                        apply legacyHooks methodVal eT
+                    case r of
+                        Right v | not (isExceptionMethodPlaceholder v) ->
+                            pure v
+                        _ -> wrapSomeException ev
+                Nothing -> wrapSomeException ev
 
 -- | @fromException :: Exception e => SomeException -> Maybe e@.
--- Real GHC is type-directed.  At the Val level we return @Just@ for
--- 'SomeException' inputs; 'matchPat' supplies the limited downcast
--- behavior we can infer from demanded constructor patterns.
+-- Result-polymorphic: instance selected by the expected @e@
+-- (handler type / expected-exception tag), not the argument.
 fromExceptionB :: IO Val
 fromExceptionB = pure $ VFun $ \eT -> do
-    -- 'fromException :: forall e. Exception e => SomeException -> Maybe e'
-    -- is type-driven in real Haskell: it returns 'Just' only if the
-    -- 'SomeException' wraps a value of type 'e'.  Without type info at
-    -- runtime our previous "always Just" implementation made guards
-    -- like @Just (ExceptionInsideResponseBody _) <- fromException e@
-    -- match every exception, and downcast queries like
-    -- @case fromException e of Just (SomeAsyncException _) -> True ;
-    -- Nothing -> False@ raise 'PatternMatchFail' when @e@ is a plain
-    -- IOError (@Just (IOError ...)@ doesn't match @Just
-    -- (SomeAsyncException _)@ AND doesn't match @Nothing@).
-    --
     ev <- force legacyHooks eT
     case ev of
         VCon "SomeException" _ -> do
-            evT <- newWHNFThunk ev
-            pure (VCon "Just" [evT])
+            busy <- readIORef fromExceptionBusyRef
+            mExpected <- readExpectedExceptionTag
+            let expectedTag = fmap normalizeExceptionTag mExpected
+            case expectedTag of
+                _
+                    | busy -> justSome
+                Nothing -> justSome
+                Just tag
+                    | isSomeExceptionTag tag -> justSome
+                    | otherwise -> do
+                        mMethod <- lookupExceptionMethod tag (BC.pack "fromException")
+                        case mMethod of
+                            Just methodVal ->
+                                applyFromExceptionMethod methodVal eT ev tag
+                            Nothing ->
+                                defaultFromExceptionCast ev tag
+          where
+            justSome = do
+                evT <- newWHNFThunk ev
+                pure (VCon "Just" [evT])
         _ -> pure (VCon "Nothing" [])
+
+{-# NOINLINE fromExceptionBusyRef #-}
+fromExceptionBusyRef :: IORef Bool
+fromExceptionBusyRef = unsafePerformIO (newIORef False)
+
+applyFromExceptionMethod :: Val -> Thunk -> Val -> ByteString -> IO Val
+applyFromExceptionMethod methodVal eT ev tag = do
+    r <- CE.try @SomeException $
+        bracketFromExceptionBusy $ apply legacyHooks methodVal eT
+    case r of
+        Right v | not (isExceptionMethodPlaceholder v) ->
+            pure v
+        _ -> defaultFromExceptionCast ev tag
+
+bracketFromExceptionBusy :: IO a -> IO a
+bracketFromExceptionBusy action = do
+    writeIORef fromExceptionBusyRef True
+    action `CE.finally` writeIORef fromExceptionBusyRef False
+
+defaultFromExceptionCast :: Val -> ByteString -> IO Val
+defaultFromExceptionCast ev tag = case ev of
+    VCon "SomeException" [innerT] -> do
+        inner <- force legacyHooks innerT
+        ok <- exceptionTypeMatches tag inner
+        if ok
+            then do
+                innerT' <- newWHNFThunk inner
+                pure (VCon "Just" [innerT'])
+            else pure (VCon "Nothing" [])
+    _ -> pure (VCon "Nothing" [])
+
+lookupExceptionMethod :: ByteString -> ByteString -> IO (Maybe Val)
+lookupExceptionMethod tag methodName = do
+    mReg <- getSharedClassReg legacyHooks
+    case mReg of
+        Nothing -> pure Nothing
+        Just reg ->
+            lookupForcedExceptionMethod reg (BC.pack "Exception")
+                tag methodName
+
+lookupForcedExceptionMethod
+    :: ClassRegistry -> ByteString -> ByteString -> ByteString
+    -> IO (Maybe Val)
+lookupForcedExceptionMethod reg cls tag methodName = do
+    mv <- lookupInstanceMethod reg cls tag methodName
+    case mv of
+        Nothing -> pure Nothing
+        Just v -> do
+            r <- CE.try @SomeException (forceMethodVal legacyHooks v)
+            pure $ case r of
+                Right v' | not (isExceptionMethodPlaceholder v') -> Just v'
+                _ -> Nothing
+
+isExceptionMethodPlaceholder :: Val -> Bool
+isExceptionMethodPlaceholder (VCon n []) =
+    BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` n
+isExceptionMethodPlaceholder _ = False
+
+isSomeExceptionTag :: ByteString -> Bool
+isSomeExceptionTag t =
+    t == BC.pack "SomeException"
+    || BC.isSuffixOf (BC.pack ".SomeException") t
+
+normalizeExceptionTag :: ByteString -> ByteString
+normalizeExceptionTag t =
+    case BC.elemIndexEnd '.' t of
+        Just i | i + 1 < BC.length t -> BC.drop (i + 1) t
+        _ -> t
+
+exceptionTypeMatches :: ByteString -> Val -> IO Bool
+exceptionTypeMatches expected inner = do
+    let innerTag = normalizeExceptionTag (typeTagOf inner)
+        want = normalizeExceptionTag expected
+    if want == innerTag
+        then pure True
+        else do
+            mTy <- lookupCtorType legacyHooks innerTag
+            let mTyBare = fmap normalizeExceptionTag mTy
+            if mTyBare == Just want
+                then pure True
+                else do
+                    mWantTy <- lookupCtorType legacyHooks want
+                    pure (fmap normalizeExceptionTag mWantTy == Just innerTag
+                          || mTyBare == fmap normalizeExceptionTag mWantTy
+                             && maybe False (const True) mTyBare)
+
+wrapSomeException :: Val -> IO Val
+wrapSomeException ev = do
+    eT' <- newWHNFThunk ev
+    pure (VCon "SomeException" [eT'])
 
 -- | @unIO :: IO a -> State# RealWorld -> (# State# RealWorld, a #)@
 --
@@ -7165,14 +7603,33 @@ typeOfB = pure $ VFun $ \dictT -> pure $ VFun $ \_valT -> do
     extractTypeRep dictV
 
 castB :: IO Val
-castB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> pure $ VFun $ \valT -> do
-    dictAV <- force legacyHooks dictAT
-    dictBV <- force legacyHooks dictBT
-    trA    <- extractTypeRep dictAV
-    trB    <- extractTypeRep dictBV
-    eq     <- typeRepEq trA trB
-    if eq then pure (VCon "Just" [valT])
-          else pure (VCon "Nothing" [])
+castB = pure $ VFun $ \firstT -> do
+    first <- force legacyHooks firstT
+    -- Phase 2.9.5 fixtures pass Typeable dicts explicitly.
+    -- Source Exception.fromException is `cast e` — dicts are implicit —
+    -- so a non-dict first argument is the value, compared against
+    -- the expected result type (handler / ETyApp tag).
+    if isTypeRepish first
+        then pure $ VFun $ \dictBT -> pure $ VFun $ \valT -> do
+            dictBV <- force legacyHooks dictBT
+            trA    <- extractTypeRep first
+            trB    <- extractTypeRep dictBV
+            eq     <- typeRepEq trA trB
+            if eq then pure (VCon "Just" [valT])
+                  else pure (VCon "Nothing" [])
+        else do
+            mExpected <- readExpectedExceptionTag
+            ok <- case mExpected of
+                Just expected -> exceptionTypeMatches expected first
+                Nothing       -> pure False
+            if ok
+                then pure (VCon "Just" [firstT])
+                else pure (VCon "Nothing" [])
+
+isTypeRepish :: Val -> Bool
+isTypeRepish (VCon "Dict_Typeable" _) = True
+isTypeRepish (VCon "TypeRep" _)       = True
+isTypeRepish _                        = False
 
 eqTB :: IO Val
 eqTB = pure $ VFun $ \dictAT -> pure $ VFun $ \dictBT -> do

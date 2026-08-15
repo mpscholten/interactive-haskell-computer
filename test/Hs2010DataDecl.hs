@@ -5,9 +5,11 @@ module Hs2010DataDecl (spec) where
 
 import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
+import qualified Data.Map.Strict as Map
 import Test.Hspec
 
 import IHC.Parser (ParseError)
+import IHC.Scan (scanDataDecls)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
 
@@ -76,3 +78,27 @@ spec = describe "Hs2010 — Data declarations" $ do
             pendingWith "known gap: datatype contexts on newtype"
         it "3.3.4 newtype with deriving `newtype T = T Int deriving Show`" $
             assertParses "newtype T = T Int deriving Show"
+
+    -- Warp / network leftover: CInt and Settings are the types that
+    -- `CInt n <- peek p` and `s@Settings{..} <-` must match against.
+    -- Pin the scanned constructor/field registry, not just "parses".
+    describe "leftover Parser: Warp/network data shapes" $ do
+        it "leftover: `newtype CInt = CInt Int32` is arity-1 CInt" $ do
+            (dReg, _, tReg) <- scanDataDecls
+                (mkSrc "newtype CInt = CInt Int32\n")
+            Map.lookup "CInt" dReg `shouldBe` Just ("CInt", 1, 0)
+            Map.lookup "CInt" tReg `shouldBe` Just ["CInt"]
+
+        it "leftover: Warp Settings record registers settingsPort / settingsHost" $ do
+            (dReg, fReg, _) <- scanDataDecls (mkSrc
+                "data Settings = Settings { settingsPort :: Int, settingsHost :: Host }\n")
+            Map.lookup "Settings" dReg `shouldBe` Just ("Settings", 2, 0)
+            Map.lookup "settingsPort" fReg `shouldBe` Just [("Settings", 0)]
+            Map.lookup "settingsHost" fReg `shouldBe` Just [("Settings", 1)]
+
+        it "leftover: Hints record with flags field (empty-list leftover twin)" $ do
+            (dReg, fReg, _) <- scanDataDecls (mkSrc
+                "data Hints = Hints { flags :: [Int], port :: Int }\n")
+            Map.lookup "Hints" dReg `shouldBe` Just ("Hints", 2, 0)
+            Map.lookup "flags" fReg `shouldBe` Just [("Hints", 0)]
+            Map.lookup "port" fReg `shouldBe` Just [("Hints", 1)]

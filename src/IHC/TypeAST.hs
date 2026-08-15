@@ -20,6 +20,10 @@ module IHC.TypeAST
     , tyApps
     , typeDispatchTag
     , expandTypeSynonyms
+    , expandScheme
+    , lookupTypeSynonym
+    , predsFromConstraintType
+    , implicitParamPreds
     , isMonoType
     , schemeIsResultPolymorphic
     ) where
@@ -87,7 +91,7 @@ expandTypeSynonyms synonyms = expand Set.empty
             in case h of
                 TyCon n
                     | Set.notMember n seen
-                    , Just (TypeSynonym binders rhs) <- Map.lookup n synonyms
+                    , Just (TypeSynonym binders rhs) <- lookupTypeSynonym synonyms n
                     , let arity = length binders
                     , length args >= arity ->
                         let (used, extra) = splitAt arity args
@@ -96,12 +100,71 @@ expandTypeSynonyms synonyms = expand Set.empty
                 _ -> foldl TyApp (expand seen h) args
         TyCon n
             | Set.notMember n seen
-            , Just (TypeSynonym [] rhs) <- Map.lookup n synonyms ->
+            , Just (TypeSynonym [] rhs) <- lookupTypeSynonym synonyms n ->
                 expand (Set.insert n seen) rhs
             | otherwise -> TyCon n
         TyVar n -> TyVar n
         TyArrow a b -> TyArrow (expand seen a) (expand seen b)
         TyForall vs ps body -> TyForall vs ps (expand seen body)
+
+lookupTypeSynonym :: Map Name TypeSynonym -> Name -> Maybe TypeSynonym
+lookupTypeSynonym syns n =
+    case Map.lookup n syns of
+        Just s -> Just s
+        Nothing -> case BC.elemIndexEnd (toEnum (fromEnum '.')) n of
+            Just i -> Map.lookup (BC.drop (i + 1) n) syns
+            Nothing -> Nothing
+
+-- | Predicates encoded in a constraint type: a leftover context
+-- @forall. (?x :: T) => body@, an IP-only synonym RHS
+-- @TyApp (TyCon "?name") T@, or a saturated class application
+-- @Show a@.  Dummy bodies used to encode IP-only synonyms
+-- (@Constraint@ / @()@) are not themselves class heads.
+predsFromConstraintType :: Type -> [Pred]
+predsFromConstraintType (TyForall _ ps _) | not (null ps) = ps
+predsFromConstraintType (TyApp (TyCon n) ty)
+    | not (BC.null n), BC.head n == '?' = [Pred n [ty]]
+predsFromConstraintType t =
+    case tyApps t of
+        (TyCon n, args)
+            | n /= BC.pack "Constraint" && n /= BC.pack "()" ->
+                [Pred n args]
+        _ -> []
+
+-- | Expand class / constraint-synonym heads in a scheme's context.
+-- @HasCallStack@ (nullary synonym for @(?callStack :: CallStack)@)
+-- becomes the implicit-param predicate so callers can publish it.
+expandScheme :: Map Name TypeSynonym -> Scheme -> Scheme
+expandScheme synonyms (Scheme vars preds body) =
+    Scheme vars (expandConstraintPreds synonyms preds)
+                (expandTypeSynonyms synonyms body)
+
+expandConstraintPreds :: Map Name TypeSynonym -> [Pred] -> [Pred]
+expandConstraintPreds synonyms = concatMap (go Set.empty)
+  where
+    go seen (Pred cls args) =
+        let args' = map (expandTypeSynonyms synonyms) args
+        in case lookupTypeSynonym synonyms cls of
+            Just (TypeSynonym binders rhs)
+              | Set.notMember cls seen
+              , length args' == length binders ->
+                let rhs' = applySubst (Map.fromList (zip binders args')) rhs
+                    expanded = expandTypeSynonyms synonyms rhs'
+                    seen' = Set.insert cls seen
+                in case predsFromConstraintType expanded of
+                    [] -> [Pred cls args']
+                    ps -> concatMap (go seen') ps
+            _ -> [Pred cls args']
+    go _ q@QPred{} = [q]
+
+-- | Implicit-param predicates (@?name :: T@) in a context.  The
+-- returned name is the IP map key (no leading @?@).
+implicitParamPreds :: [Pred] -> [(Name, Type)]
+implicitParamPreds = concatMap one
+  where
+    one (Pred n [ty])
+      | not (BC.null n), BC.head n == '?' = [(BC.drop 1 n, ty)]
+    one _ = []
 
 -- | Class constraint: @Monad m@ = @Pred "Monad" [TyVar "m"]@.
 -- Multi-parameter constraints retain their argument boundaries, e.g.

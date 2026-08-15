@@ -72,8 +72,8 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.List (isPrefixOf, nub, sortOn)
-import Control.Monad (filterM, forM, forM_, foldM, when)
-import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
+import Control.Monad (filterM, forM, forM_, foldM, unless, when)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, maybeToList)
 import System.Directory (doesFileExist)
 import qualified System.Environment as SysEnv
 import System.FilePath ((</>), takeDirectory)
@@ -85,7 +85,7 @@ import IHC.Builtins
     ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
-    , isHostWord8PtrVal, peekHostWord8ByteOff, pokeHostWord8ByteOff
+    , isHostWord8PtrVal, peekHostWord8ByteOff, peekHostMarkedElemOff, pokeHostWord8ByteOff
     , ordCmp
     , eqByteStringHost
     , reapSpawnedThreads
@@ -108,6 +108,7 @@ import IHC.Classes
     , setTypeSigFallback
     , lookupTypeSigFallback
     , setCtorTypeHook
+    , lookupCtorType
     , setCoreInstanceLoadHook, triggerCoreInstanceLoad, triggerCoreInstanceLoadForTag
     , setRegisterInstancesHook, triggerRegisterInstances
     , setClassMethodFallback
@@ -126,9 +127,10 @@ import IHC.Classes
     , pushDoCarrier
     , popDoCarrier
     , setLastMonadicCarrier
+    , peekLastMonadicCarrier
     )
 import IHC.Cpp (cppPreprocessWithIncludes, defaultCppContext)
-import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey, hostQuasiMethodVal)
+import IHC.Eval (force, apply, forceMethodVal, ownerSentinelKey, hostQuasiMethodVal, runIOVal, applyLeftoverStateFun, isLeftoverStateResult)
 import qualified IHC.Elaborate as Elab
 import qualified IHC.FFI as FFI
 import IHC.Lexer (startCursor)
@@ -144,9 +146,11 @@ import IHC.TH (expandSplicesInExpr, thExpandSpliceDecl, thExpToExpr)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalMethodClassRef, globalAmbiguousSigsRef, seedBuiltinClassMethodSigs)
 import IHC.ConstructorMetadata
     ( ConstructorIdentity(..), ConstructorTypeMetadata(..)
+    , constructorMetadata, constructorScheme
+    , lookupDeclaredFieldTag
     , globalConstructorTypeRegistryRef
     , registerSelectorFieldTypes, resetSelectorFieldTypes )
-import IHC.TypeAST (Scheme(..), Type(..), TypeSynonym(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead, typeDispatchTag, expandTypeSynonyms, schemeIsResultPolymorphic)
+import IHC.TypeAST (Scheme(..), Type(..), TypeSynonym(..), Pred(..), applySubst, applySubstPred, tyArrowArgs, tyApps, tyHead, typeDispatchTag, expandTypeSynonyms, lookupTypeSynonym, schemeIsResultPolymorphic, freeTyVars)
 import qualified IHC.TypeUnify as TU
 import qualified IHC.TypeReduce as TR
 import IHC.Val
@@ -461,9 +465,20 @@ loadProgramFromSource searchPath src0 = do
     -- whole load.
     let entryImports = map impModule (mhImports (lmHeader entry))
     forM_ entryImports $ \m -> do
-        _ <- try (loadModule registry fullSearchPath includeMap m)
+        loaded <- try (loadModule registry fullSearchPath includeMap m)
                 :: IO (Either SomeException LoadedModule)
-        pure ()
+        -- One extra hop: facades re-export type synonyms they do not
+        -- declare (`HTTP.Types` → `Header.type ResponseHeaders = [Header]`).
+        -- Without the defining module, `go :: H.ResponseHeaders -> Int`
+        -- leaves `[]` as fromString and Int+ leftovers as
+        -- `args=19 <function>` (Warp composeHeader).
+        case loaded of
+            Right lm ->
+                forM_ (map impModule (mhImports (lmHeader lm))) $ \m2 -> do
+                    _ <- try (loadModule registry fullSearchPath includeMap m2)
+                            :: IO (Either SomeException LoadedModule)
+                    pure ()
+            Left _ -> pure ()
     -- Template-Haskell syntax brings the source definition of Q and its
     -- instances into scope in GHC even when the user does not explicitly
     -- import Language.Haskell.TH.Syntax.  Mirror that implicit dependency by
@@ -477,7 +492,34 @@ loadProgramFromSource searchPath src0 = do
     when usesTemplateHaskell $ do
         _ <- loadModule registry fullSearchPath includeMap
                     (BC.pack "Language.Haskell.TH.Syntax")
+        -- QuasiQuoter field accessors (quoteExp / $fldProj$quoteExp) live
+        -- in Language.Haskell.TH.Quote.  GHC brings that module into
+        -- scope with the QuasiQuotes extension; without it here the
+        -- run-file field env has no quoteExp selector, EQuasiQuote /
+        -- record-dot falls into env-fallback, and tryImportedFieldSlot
+        -- walks the quoter library's Parser/blaze imports — the
+        -- quoteExp field-force hang.
+        _ <- loadModule registry fullSearchPath includeMap
+                    (BC.pack "Language.Haskell.TH.Quote")
         pure ()
+
+    -- A library that *defines* a QuasiQuoter (ihp-hsx) imports TH.Quote
+    -- even when the user program never writes [qq|…|] syntax.  Force-
+    -- load it from those imports so `quoteExp hsx` / `hsx.quoteExp`
+    -- see the selector in fieldEnv instead of hanging in fallback.
+    do
+        regAfterImports <- readIORef registry
+        let thQuote = BC.pack "Language.Haskell.TH.Quote"
+            needsQuote =
+                [ ()
+                | (_, Loaded lm) <- Map.toList regAfterImports
+                , imp <- mhImports (lmHeader lm)
+                , impModule imp == thQuote
+                ]
+        unless (null needsQuote) $ do
+            _ <- try (loadModule registry fullSearchPath includeMap thQuote)
+                    :: IO (Either SomeException LoadedModule)
+            pure ()
 
     -- Manifest-driven core load.
     --
@@ -531,6 +573,18 @@ loadProgramFromSource searchPath src0 = do
     -- Collect every loaded module.
     reg <- readIORef registry
     let loadedModules = [ lm | (_, Loaded lm) <- Map.toList reg ]
+
+    -- Same-module PAPs stored in record fields (e.g. IHP.HSX.QQ
+    -- @customHsx settings = QuasiQuoter { quoteExp = quoteHsxExpression
+    -- settings, … }@) are invisible to 'discoveryFreeVars' (lambda /
+    -- constructor fields).  Forcing that field then rebuilds the owner
+    -- module through the demand-driven fallback and hangs.  Discover
+    -- the surface free vars of already-loaded bodies so the PAP is an
+    -- ordinary exported lambda.  Do *not* use deep 'freeVars' here:
+    -- that would pull @knownElements@ (giant TH-quote HashMap) out of
+    -- @quoteHsxExpression@'s do-block.
+    chaseRecordSurfaceLocals earlyBuiltinNames registry fullSearchPath
+        includeMap loadedModules
 
     -- Union data registries and field registries across all modules.
     -- 'unionedTypeCtors' is rebuilt from the post-splice / post-discovery
@@ -1432,11 +1486,12 @@ localRuntimeNames :: LoadedModule -> IO [ByteString]
 localRuntimeNames lm = do
     topLevelNames <- scanAllTopLevelNames (lmSource lm)
     classDecls    <- scanClassDecls (lmSource lm)
+    patSyns       <- map psdName <$> scanPatternSynonyms (lmSource lm)
     let classMethods = concatMap classMethodNames classDecls
         ctors        = Map.keys (lmDataReg lm)
         fields       = Map.keys (lmFieldReg lm)
         foreignNames = map FFI.fdName (lmForeignDecls lm)
-    pure (nubBS (topLevelNames ++ classMethods ++ ctors ++ fields ++ foreignNames))
+    pure (nubBS (topLevelNames ++ classMethods ++ ctors ++ fields ++ foreignNames ++ patSyns))
 
 visibleExportName :: ByteString -> ByteString
 visibleExportName n =
@@ -1447,6 +1502,14 @@ visibleExportName n =
 typeLikeRuntimeNames :: LoadedModule -> ByteString -> [ByteString] -> IO [ByteString]
 typeLikeRuntimeNames lm ty subs = do
     classDecls <- scanClassDecls (lmSource lm)
+    -- @T(..)@ includes pattern synonyms declared in the same module
+    -- (exportsName already treats them as T(..) members).  Without
+    -- them here, `import M (T(..))` never installs the expression-
+    -- direction builder, so a use of the synonym in another module
+    -- falls through lookupEnvFallback and can hang on a mid-load
+    -- discovery cycle (bufferIO / PS + S.length).
+    patSyns <- map psdName <$> scanPatternSynonyms (lmSource lm)
+    imported <- importedTypeDotDotMembers lm ty
     let ctorsOfTy = Map.findWithDefault [] ty (lmTypeCtorReg lm)
         fieldsOfTy =
             [ field
@@ -1461,8 +1524,8 @@ typeLikeRuntimeNames lm ty subs = do
                 (methods:_) -> methods
                 []          -> []
     pure $ case subs of
-        -- @T(..)@: expand to local ctors / fields / methods.
-        [] -> nubBS (ctorsOfTy ++ fieldsOfTy ++ classMethods)
+        -- @T(..)@: expand to local ctors / fields / methods / patsyns.
+        [] -> nubBS (ctorsOfTy ++ fieldsOfTy ++ classMethods ++ patSyns ++ imported)
         -- @T(a,b,c)@ / @Class(meth1, meth2)@: the export list is
         -- authoritative.  Do NOT require the names to appear in this
         -- module's local class/data decls — re-export facades like
@@ -1471,6 +1534,30 @@ typeLikeRuntimeNames lm ty subs = do
         -- every method, so @import qualified Foreign as F@ never sees
         -- @F.unsafeShiftR@ / @F.countLeadingZeros@ (warp chunked path).
         _  -> nubBS subs
+
+-- | Local T(..) members of already-loaded modules imported as @T(..)@.
+-- Does not recurse: providers contribute their own scan results only.
+importedTypeDotDotMembers :: LoadedModule -> ByteString -> IO [ByteString]
+importedTypeDotDotMembers lm ty = do
+    mods <- readIORef globalLoadedModulesRef
+    let providers =
+            [ impModule imp
+            | imp <- mhImports (lmHeader lm)
+            , importBringsTypeDotDot imp ty
+            ]
+    concat <$> mapM (providerMembers mods) providers
+  where
+    providerMembers mods name = case Map.lookup name mods of
+        Nothing -> pure []
+        Just provider -> do
+            patSyns <- map psdName <$> scanPatternSynonyms (lmSource provider)
+            let ctors = Map.findWithDefault [] ty (lmTypeCtorReg provider)
+            pure (ctors ++ patSyns)
+
+    importBringsTypeDotDot imp want = case impSpec imp of
+        ImportOnly ns ->
+            want `elem` ns || (BC.pack "$dotdot:" <> want) `elem` ns
+        _ -> False
 
 -- | Load a single import declaration into an existing 'Env', as if the
 -- REPL user typed @import Foo@ at the prompt.
@@ -2319,7 +2406,7 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     let synonyms = Map.union (lmTypeSynonyms lm) globalSynonyms
         canonicalTag n
             | n == BC.pack "String" = BC.pack "[]"
-            | Just (TypeSynonym [] rhs) <- Map.lookup n synonyms
+            | Just (TypeSynonym [] rhs) <- lookupTypeSynonym synonyms n
             , Just h <- tyHead rhs = normalizeTyTag h
             | otherwise = normalizeTyTag n
         canonicalTypeNames = map canonicalTag typeNames
@@ -2406,8 +2493,38 @@ registerOne registry searchPath includeMap classReg typeCtors classTable env lm 
     -- keep their qualified key and still register (not in @ctors@ of
     -- the bare name, but @typ@ is qualified so it won't collide with
     -- bare @"Text"@ / @"ByteString"@).
+    sigsForPoly <- readIORef globalTypeSigsRef
+    let methodNamesForPoly =
+            nub (Map.findWithDefault [] cls classTable ++ map fst methods)
+        anyMethodResultPoly =
+            any (\mn -> maybe False schemeIsResultPolymorphic
+                            (Map.lookup mn sigsForPoly))
+                methodNamesForPoly
+        -- `IsString Pref` / `IsString HostPreference` / `IsString ByteString`
+        -- are nullary heads.  `IsString (CI a)` is not — registering
+        -- it under `CI` made `"Server" :: CI ByteString` a leftover.
+        instanceHeadIsNullary = case headTypes of
+            [t] -> case tyApps (expandTypeSynonyms synonyms t) of
+                (TyCon _, []) -> True
+                _             -> False
+            _ -> False
     when (shouldRegisterTypeNameKey typ ctors) $
         registerInstance classReg cls typ methodVals
+    -- Result-polymorphic methods (fromString, fromInteger, toEnum)
+    -- dispatch on the expected *type name*, not a runtime constructor.
+    -- `instance IsString Pref` has ctors Any/V4/Named, so the type-name
+    -- key was skipped and `fromString "*4" :: Pref` missed.  Publish
+    -- the type-name key only for a *nullary* head (`Pref`,
+    -- `HostPreference`, `ByteString`) — not `CI a`, whose dictionary
+    -- needs an inner IsString and is not `IsString CI`.  Do not
+    -- overwrite a prior occupant (strict Text/ByteString vs lazy
+    -- Empty/Chunk).  No HostPreference name list.
+    when (not (shouldRegisterTypeNameKey typ ctors)
+          && anyMethodResultPoly
+          && instanceHeadIsNullary) $ do
+        existing <- lookupInstance classReg cls typ
+        when (maybe True (const False) existing) $
+            registerInstance classReg cls typ methodVals
     -- Multi-parameter classes (e.g. @IsLabel "email" Wrap@,
     -- @SetField "name" User String@) need an additional registration
     -- under the full @[tag1, tag2, …]@ key so that callers like
@@ -2641,8 +2758,17 @@ evalMethodWithLazyBody registry searchPath includeMap classReg env lm rewrites m
     expr0 <- parseBodyExprInScope registry searchPath includeMap lm lhs
     let expr0' = lowerInstanceCoerceMethod methodCtx
                $ lowerHashDotCoerce methodName expr0
+    globalSyns <- readIORef globalTypeSynonymsRef
+    let syns = Map.union (lmTypeSynonyms lm) globalSyns
+        -- Instance methods take a separate lazy-loading path from ordinary
+        -- module bindings.  Apply the same do-bind/result annotations here;
+        -- otherwise Storable record peeks leave fields such as
+        -- AddrInfo.addrProtocol as unresolved method functions.
+        -- Run this while record construction still carries field names;
+        -- first-use inference can then recover each selector's declared type.
+        expr0'' = wrapNullaryResultSig syns lm methodName expr0'
         expr1 = desugarRecordPats (lmFieldReg lm)
-                 (desugarRecordCons (lmFieldReg lm) expr0')
+                 (desugarRecordCons (lmFieldReg lm) expr0'')
         expr2 = if Map.null rewrites then expr1 else rewriteExpr rewrites expr1
     expr <- elaborateSelectedMethod classReg lm methodCtx methodName expr2
     ownerThunk <- newWHNFThunk (VStr (lmName lm))
@@ -2656,8 +2782,16 @@ evalMethodWithLazyBody registry searchPath includeMap classReg env lm rewrites m
             dispT <- newWHNFThunk (classMethodDispatcher classReg cls methodName)
             pure (HashMap.insert methodName dispT env)
         Nothing -> pure env
+    -- Value-namespace data constructors must win over a last-writer
+    -- imported type of the same spelling.  Blaze's
+    -- `instance IsString ChoiceString where fromString = String`
+    -- would otherwise close over Prelude's type `String` and leave a
+    -- leftover function inside `Content`.
+    localConEnv <- buildConEnv (lmDataReg lm)
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
-                     $ HashMap.union typedNullaryEnv envWithoutSelf
+                     $ HashMap.union typedNullaryEnv
+                     $ HashMap.union localConEnv
+                     $ envWithoutSelf
     t <- newThunk envWithOwner expr
     pure (VLazyMethod t)
 
@@ -2714,6 +2848,8 @@ elaborateSelectedMethod classReg lm methodCtx methodName expr = case methodCtx o
                                   | exprMentionsTyHead instanceTag expr
                                   , not (exprMentionsTyHead instanceTag rewrittenFree) ->
                                         pure expr
+                                  | instanceRewritePinsResultCarrier
+                                        cls instanceTag methodTy rewrittenFree -> pure expr
                                   | otherwise -> pure rewrittenFree
                                 Left _ -> pure expr
                     rExpect <- run (Elab.ExpectType methodTy)
@@ -2734,24 +2870,27 @@ elaborateSelectedMethod classReg lm methodCtx methodName expr = case methodCtx o
                           | exprMentionsTyHead instanceTag expr
                           , not (exprMentionsTyHead instanceTag rewritten) ->
                                 keepFree
+                          | instanceRewritePinsResultCarrier
+                                cls instanceTag methodTy rewritten -> keepFree
                           | otherwise -> pure rewritten
                         Left _ -> keepFree
   where
-    resolveClassMethod cls name = do
+    resolveClassMethod _cls name = do
         methodNames <- readIORef globalClassMethodNamesRef
         -- Constructors such as @Hints@ in @mempty = Hints mempty@ are
         -- free vars of the instance body.  Looking their schemes up
         -- from a megaparsec owner walks that facade and never returns.
         -- Only class methods need a scheme here.
+        --
+        -- Do not require the FV to belong to THIS instance's class.
+        -- Source instances often forward to a superclass method
+        -- (`empty = mzero`, `(<|>) = mplus`, `return = pure`).  Those
+        -- names carry a different class predicate; filtering them out
+        -- skipped ExpectType pinning and left a leftover class-method
+        -- CAF.  No name list of empty / Alternative / ParsecT.
         if not (Set.member name methodNames)
             then pure Nothing
-            else do
-                candidate <- lookupTypeSigFallback legacyHooks (Just (lmName lm)) name
-                pure $ candidate >>= \scheme@(Scheme _ preds _) ->
-                    if any (isClassPredicate cls) preds then Just scheme else Nothing
-
-    isClassPredicate cls (Pred cls' _) = cls == cls'
-    isClassPredicate _ QPred{} = False
+            else lookupTypeSigFallback legacyHooks (Just (lmName lm)) name
 
     specialize cls heads scheme@(Scheme vars preds body) =
         case [args | Pred cls' args <- preds, cls' == cls] of
@@ -2766,6 +2905,45 @@ elaborateSelectedMethod classReg lm methodCtx methodName expr = case methodCtx o
         case TU.unify sub arg headTy of
             Left err -> Left err
             Right sub' -> foldMUnify sub' rest
+
+-- | Expected-type inference must not use an instance method's result carrier
+-- as the dictionary tag for a same-class call in its body.  In
+-- @Storable FLock.poke :: ... -> IO ()@ this otherwise turns @sizeOf x@
+-- into @Storable IO@.  The rule is structural: it compares the outer class,
+-- outer instance, and result head, without naming a package or method.
+instanceRewritePinsResultCarrier :: Name -> Name -> Type -> Expr -> Bool
+instanceRewritePinsResultCarrier outerClass outerTag methodTy = go
+  where
+    (_, resultTy) = tyArrowArgs methodTy
+    resultHead = baseName <$> tyHead resultTy
+    bad cls tag = baseName cls == baseName outerClass
+        && baseName tag /= baseName outerTag
+        && Just (baseName tag) == resultHead
+
+    go (ETypedMethod cls _ tag) = bad cls tag
+    go (EApp f x) = go f || go x
+    go (ELam _ body) = go body
+    go (ELet bs body) = any (go . snd) bs || go body
+    go (ECase s as) = go s || any (\(Alt _ body) -> go body) as
+    go (EIf c t e) = any go [c, t, e]
+    go (EDo stmts) = any goStmt stmts
+    go (ENeg e) = go e
+    go (ETuple es) = any go es
+    go (ERecordCon _ fs) = any (go . snd) fs
+    go (ERecordUpdate e fs) = go e || any (go . snd) fs
+    go (ESplice e) = go e
+    go (EQuote e) = go e
+    go (ETyApp e _) = go e
+    go (ELocalSig _ e) = go e
+    go (EImplicitLet bs body) = any (go . snd) bs || go body
+    go (EConstrainedValue e _) = go e
+    go _ = False
+
+    goStmt (SExpr e) = go e
+    goStmt (SBind _ e) = go e
+    goStmt (SBangBind _ e) = go e
+    goStmt (SLet bs) = any (go . snd) bs
+    goStmt (SImplicitLet bs) = any (go . snd) bs
 
 -- | True when an ExpectType rewrite mentions the same class method at
 -- the same instance tag.  Newtype instances such as
@@ -2922,7 +3100,15 @@ buildImportRewritesForNames registry searchPath includeMap lm needed = do
     reg <- readIORef registry
     let imports = mhImports (lmHeader lm)
     importPairs <- concat <$> mapM (rewritesForImport needed) imports
-    let filteredImportPairs = filter (\(n, _) -> not (Set.member n ffiBuiltinNames)) importPairs
+    -- Local data constructors occupy the value namespace.  Import
+    -- rewrites are last-writer and would map `String` in
+    -- `fromString = String` to Prelude's type String.  Haskell lets
+    -- the type and the constructor coexist; the ctor must win here.
+    let localCtorNames = Map.keysSet (lmDataReg lm)
+        filteredImportPairs = filter
+            (\(n, _) -> not (Set.member n ffiBuiltinNames)
+                     && not (Set.member n localCtorNames))
+            importPairs
     -- Self-rewrites: instance method bodies reference sibling top-level
     -- names in the OWNING module under their bare name; rewrite them
     -- to the module's FQN so the env fallback can resolve them lazily.
@@ -2932,16 +3118,29 @@ buildImportRewritesForNames registry searchPath includeMap lm needed = do
     -- the bare @concatMap@ misses both the caller's env AND the env
     -- fallback (which refuses bare names for namespace integrity), so
     -- the method body fails and the dispatcher falls through to IO.
+    --
+    -- `scanAllTopLevelNames` only walks value bindings, so a ctor
+    -- that shares a Prelude type name (`String`) would otherwise
+    -- stay un-self-rewritten and lose to the import last-writer.
     selfPairs <- if lmIsEntry lm
         then pure []
         else do
             let prefix = lmName lm <> BC.pack "."
             allScanned <- scanAllTopLevelNames (lmSource lm)
                             `catch` (\(_ :: SomeException) -> pure [])
-            pure [ (n, prefix <> n)
-                 | n <- allScanned
-                 , Set.member n needed
-                 ]
+            let scannedSet = Set.fromList allScanned
+                scannedPairs =
+                    [ (n, prefix <> n)
+                    | n <- allScanned
+                    , Set.member n needed
+                    ]
+                ctorPairs =
+                    [ (n, prefix <> n)
+                    | n <- Map.keys (lmDataReg lm)
+                    , Set.member n needed
+                    , Set.notMember n scannedSet
+                    ]
+            pure (scannedPairs ++ ctorPairs)
     -- H2010 §5.5.1 (same fix as in 'buildImportRewrites'): local
     -- bindings shadow imports.  Drop qualified names from selfPairs
     -- since those are foreign-alias sentinels, not real local defs.
@@ -3425,6 +3624,140 @@ compatibleIntSpines (csA, _) (csB, _) =
 -- structural and doesn't depend on the data declaration's field
 -- types.  Used by both 'registerOneEq' (in-line @data ... deriving
 -- Eq@) and 'registerOneStandaloneEq' (@deriving instance Eq T@).
+-- | Leftover unannotated integer literal next to a constructed Num
+-- value (Size == 0, Hint == 0).  Promote via that type's
+-- Num.fromInteger.  Primitive numeric tags are skipped so 3 == 4
+-- stays Eq Int.  No Size / Unknown / Text name list.
+tryPromoteIntViaFromInteger
+    :: ClassRegistry -> [ByteString] -> Val -> IO (Maybe Val)
+tryPromoteIntViaFromInteger classReg tags0 v = do
+    mTy <- case tags0 of
+        (t:_) -> lookupCtorType legacyHooks t
+        []    -> pure Nothing
+    mDo <- currentDoCarrier
+    let blocked t = case mDo of
+            Just c -> normalizeTyTag t == normalizeTyTag c
+            Nothing -> False
+        tags = nub
+            [ t
+            | t <- tags0 ++ maybe [] (:[]) mTy
+            , not (BC.null t)
+            , not (isDefaultNumTag t)
+            , not (blocked t)
+            ]
+    case (bareIntAsInteger v, tags) of
+        (Just n, _ : _) -> do
+            mFn <- lookupNumFromInteger classReg tags
+            case mFn of
+                Nothing -> pure Nothing
+                Just fn -> do
+                    forced <- forceMethodVal legacyHooks fn
+                    if isMethodPlaceholder forced
+                        then pure Nothing
+                        else do
+                            argT <- newWHNFThunk (VInteger n)
+                            r <- try (applyAllTop forced [argT])
+                                    :: IO (Either SomeException Val)
+                            case r of
+                                Right promoted
+                                  | not (isBareIntVal promoted) -> do
+                                        carrier <- isCarrierShapedVal promoted
+                                        if carrier
+                                            then pure Nothing
+                                            else pure (Just promoted)
+                                _ -> pure Nothing
+        _ -> pure Nothing
+
+-- | Parser / State# leftover: fromInteger = pure produced a function
+-- (or a newtype around one).  Nullary Num (Size / Hint / W8#) wraps
+-- ints, not functions.  Structural — no ParsecT name list.
+isCarrierShapedVal :: Val -> IO Bool
+isCarrierShapedVal = go (4 :: Int)
+  where
+    go _ (VFun _) = pure True
+    go _ (VFunIP _ _) = pure True
+    go _ (VIO _) = pure True
+    go n (VCon c [t])
+        | n > 0
+        , not (isDefaultNumTag c) =
+            force legacyHooks t >>= go (n - 1)
+    go _ _ = pure False
+
+isDefaultNumTag :: ByteString -> Bool
+isDefaultNumTag t =
+    t `elem` map BC.pack
+        [ "Int", "Integer", "Float", "Double", "Rational"
+        , "I#", "IS", "IP", "IN", "F#", "D#"
+        , "Word", "Word8", "Word16", "Word32", "Word64"
+        , "Int8", "Int16", "Int32", "Int64"
+        , "Natural", "NS", "NB"
+        , "W#", "W8#", "W16#", "W32#", "W64#"
+        , "I8#", "I16#", "I32#", "I64#"
+        ]
+
+isBareIntVal :: Val -> Bool
+isBareIntVal (VInt _)     = True
+isBareIntVal (VInteger _) = True
+isBareIntVal _            = False
+
+bareIntAsInteger :: Val -> Maybe Integer
+bareIntAsInteger (VInt n)     = Just (toInteger n)
+bareIntAsInteger (VInteger n) = Just n
+bareIntAsInteger _            = Nothing
+
+lookupNumFromInteger :: ClassRegistry -> [ByteString] -> IO (Maybe Val)
+lookupNumFromInteger classReg tags = do
+    found <- lookupAny tags
+    case found of
+        Just v -> pure (Just v)
+        Nothing -> do
+            _ <- drainCataloguedInstancesForClass (BC.pack "Num")
+            lookupAny tags
+  where
+    lookupAny [] = pure Nothing
+    lookupAny (t:ts) = do
+        a <- lookupInstanceMethod classReg (BC.pack "Num") t (BC.pack "fromInteger")
+        b <- lookupInSharedReg (BC.pack "Num") t (BC.pack "fromInteger")
+        case preferMethod a b of
+            Just v | not (isMethodPlaceholder v) -> pure (Just v)
+            _ -> lookupAny ts
+
+applyAllTop :: Val -> [Thunk] -> IO Val
+applyAllTop v []     = pure v
+applyAllTop v (t:ts) = do
+    v' <- apply legacyHooks v t
+    applyAllTop v' ts
+
+intLikePayload :: Val -> IO (Maybe Int64)
+intLikePayload (VInt n) = pure (Just n)
+intLikePayload (VInteger n)
+    | n >= toInteger (minBound :: Int64)
+    , n <= toInteger (maxBound :: Int64) = pure (Just (fromInteger n))
+    | otherwise = pure Nothing
+intLikePayload (VCon n [t])
+    | n == BC.pack "I#" || n == BC.pack "IS" =
+        force legacyHooks t >>= intLikePayload
+intLikePayload _ = pure Nothing
+
+promoteMixedNumLiteral
+    :: ClassRegistry -> ByteString -> Val -> Val -> IO (Maybe (Val, Val))
+promoteMixedNumLiteral classReg tyName xv yv
+    | isBareIntVal xv, isConstructedVal yv = do
+        m <- tryPromoteIntViaFromInteger classReg (promoteTags tyName yv) xv
+        pure $ fmap (\xv' -> (xv', yv)) m
+    | isBareIntVal yv, isConstructedVal xv = do
+        m <- tryPromoteIntViaFromInteger classReg (promoteTags tyName xv) yv
+        pure $ fmap (\yv' -> (xv, yv')) m
+    | otherwise = pure Nothing
+
+isConstructedVal :: Val -> Bool
+isConstructedVal (VCon _ _) = True
+isConstructedVal _          = False
+
+promoteTags :: ByteString -> Val -> [ByteString]
+promoteTags tyName (VCon n _) = [n, tyName]
+promoteTags tyName _          = [tyName]
+
 synthStructuralEq :: ClassRegistry -> ByteString -> Val
 synthStructuralEq classReg tyName =
     let eqDispatcher = classMethodDispatcher classReg (BC.pack "Eq") (BC.pack "==")
@@ -3468,10 +3801,28 @@ synthStructuralEq classReg tyName =
             (VUnit, VUnit) -> pure boolTrueV
             (VInt x, VInt y) ->
                 pure (if x == y then boolTrueV else boolFalseV)
-            _ -> error
-                ( "derived Eq for " <> BC.unpack tyName
-                  <> ": expected constructor values, got "
-                  <> shortShow xv <> " and " <> shortShow yv )
+            _ -> do
+                mx <- intLikePayload xv
+                my <- intLikePayload yv
+                case (mx, my) of
+                    (Just x, Just y) ->
+                        pure (if x == y then boolTrueV else boolFalseV)
+                    _ -> do
+                        mPromoted <- promoteMixedNumLiteral classReg tyName xv yv
+                        case mPromoted of
+                            Just (xv', yv') ->
+                                -- Re-enter via the same structural
+                                -- cases (now both constructors).
+                                do
+                                    xt <- newWHNFThunk xv'
+                                    f <- apply legacyHooks
+                                        (synthStructuralEq classReg tyName) xt
+                                    yt <- newWHNFThunk yv'
+                                    apply legacyHooks f yt
+                            Nothing -> error
+                                ( "derived Eq for " <> BC.unpack tyName
+                                  <> ": expected constructor values, got "
+                                  <> shortShow xv <> " and " <> shortShow yv )
   where
     boolTrueV  = VCon (BC.pack "True")  []
     boolFalseV = VCon (BC.pack "False") []
@@ -4328,7 +4679,46 @@ classMethodDispatcher reg cls methodName
                                   then applyAllWithCarrier cls firstTag forced [argT]
                                   else pure methodVal
                           _     -> applyAllWithCarrier cls firstTag methodVal [argT]
-                _ -> pure selfVal   -- no instance; tell caller "no match"
+                -- Typed-tag miss.  A type-variable tag (from
+                -- `toHtml :: ToMarkup a => a -> Html; toHtml = toMarkup`)
+                -- is not a concrete instance — fall through so the
+                -- argument's runtime tag can select String vs [Markup].
+                -- `String` / `[Char]` are the same Prelude synonym.
+                -- A facade-pinned result synonym (`Html`) is not an
+                -- instance head — expand one hop, then fall through.
+                _ | isTypeVarTag firstTag -> argDirectedDispatch argT
+                  | Just alt <- stringSynonymAlt firstTag -> do
+                      mAlt <- lookupInstanceMethodForced reg cls alt methodName
+                      mAltShared <- lookupInSharedRegForced cls alt methodName
+                      case preferMethod mAlt mAltShared of
+                          Just methodVal
+                            | not (isMethodPlaceholder methodVal) ->
+                                applyAllWithCarrier cls alt methodVal [argT]
+                          _ -> argDirectedDispatch argT
+                  | Just expanded <- synonymDispatchAlt firstTag -> do
+                      mAlt <- lookupInstanceMethodForced reg cls expanded methodName
+                      mAltShared <- lookupInSharedRegForced cls expanded methodName
+                      case preferMethod mAlt mAltShared of
+                          Just methodVal
+                            | not (isMethodPlaceholder methodVal) ->
+                                applyAllWithCarrier cls expanded methodVal [argT]
+                          _ -> argDirectedDispatch argT
+                  | otherwise -> do
+                    -- Tag-driven miss: a result-polymorphic method
+                    -- (`return @Payload False`) must still wrap the
+                    -- value argument with the default carrier (IO).
+                    -- Returning leftover selfVal dropped the Bool and
+                    -- leaked <classMethod return> into `if`.  matchPat
+                    -- still feeds VUnit — keep selfVal so that stays
+                    -- "no match".  Do not pin the missed tag.
+                    argV <- force legacyHooks argT
+                    case argV of
+                        VUnit -> pure selfVal
+                        _ -> do
+                            mResult <- resultPolymorphicMethod
+                            case mResult of
+                                Just resultVal -> applyAll resultVal [argT]
+                                Nothing -> pure selfVal
         _ -> argDirectedDispatch argT
     argDirectedDispatch argT0 = do
         let go = dispatch 4 []
@@ -4398,6 +4788,14 @@ classMethodDispatcher reg cls methodName
             -- or the last successful dispatch tag (Stream take1_ on
             -- Text feeds VisualStream.showTokens).
             tag <- recoverStreamProxyTag tag0 av
+            -- Int is a real dispatch key (Num/Eq/Enum/…).  Some methods
+            -- take a count/offset first and hide the class parameter in
+            -- a later argument (a stream, or a wrapper around one).
+            -- Looking up C Int then misses and the class defaults —
+            -- which can be mutually recursive — ping-pong forever.
+            -- Scheme: delay only when that first Int is not the class
+            -- parameter.  No method-name list.
+            delayIntFirst <- isIntPreClassParamArg tag accArgs
             if isCategoryArrowMethod tag && null accArgs
                 then do
                     -- Always use Base (.) / id for Category (->).  The
@@ -4467,6 +4865,41 @@ classMethodDispatcher reg cls methodName
                     -- the warp request path as integerToInt# args=<function>.
                     avFi <- force legacyHooks argT
                     case avFi of
+                        -- Already the default integral representation.
+                        -- Applying a last-writer Num.fromInteger (text
+                        -- Fusion.Size is `exactSize . fromInteger`) to a
+                        -- VInt re-enters this dispatcher and composes
+                        -- (.) forever — mallocBytes / C8.pack /
+                        -- settingsServerName after defaultSettings.
+                        -- Typed `fromInteger @Size` still uses
+                        -- ETypedMethod and the Size instance.
+                        VInt n -> pure (VInt n)
+                        VInteger n ->
+                            if n >= toInteger (minBound :: Int64)
+                               && n <= toInteger (maxBound :: Int64)
+                                then pure (VInt (fromInteger n))
+                                else do
+                                    mResult <- resultPolymorphicMethod
+                                    case mResult of
+                                        Just resultVal -> applyAll resultVal [argT]
+                                        Nothing ->
+                                            pure (dispatch (remaining - 1) (argT : accArgs))
+                        VCon c [innerT]
+                            | c == BC.pack "IS" || c == BC.pack "IP"
+                              || c == BC.pack "IN" -> do
+                                inner <- force legacyHooks innerT
+                                case inner of
+                                    VInt n -> pure (VInt n)
+                                    VInteger n
+                                        | n >= toInteger (minBound :: Int64)
+                                        , n <= toInteger (maxBound :: Int64)
+                                        -> pure (VInt (fromInteger n))
+                                    _ -> do
+                                        mResult <- resultPolymorphicMethod
+                                        case mResult of
+                                            Just resultVal -> applyAll resultVal [argT]
+                                            Nothing ->
+                                                pure (dispatch (remaining - 1) (argT : accArgs))
                         VFun{} -> pure $ VFun $ \xT -> do
                             intermediate <- apply legacyHooks avFi xT
                             iT <- newWHNFThunk intermediate
@@ -4496,12 +4929,16 @@ classMethodDispatcher reg cls methodName
                     case mBytePeek of
                         Just bytePeek -> pure bytePeek
                         Nothing -> do
-                            mResult <- resultPolymorphicMethod
-                            case mResult of
-                                Just resultVal ->
-                                    applyAll resultVal (reverse (argT : accArgs))
-                                Nothing ->
-                                    pure (dispatch (remaining - 1) (argT : accArgs))
+                            mMarked <- tryStorableMarkedPeek av accArgs
+                            case mMarked of
+                                Just markedPeek -> pure markedPeek
+                                Nothing -> do
+                                    mResult <- resultPolymorphicMethod
+                                    case mResult of
+                                        Just resultVal ->
+                                            applyAll resultVal (reverse (argT : accArgs))
+                                        Nothing ->
+                                            pure (dispatch (remaining - 1) (argT : accArgs))
             else if isStorablePreResultArg accArgs
                 then do
                     -- Storable.peekElemOff/peekByteOff have shape
@@ -4518,14 +4955,16 @@ classMethodDispatcher reg cls methodName
                     -- not the Foldable container.  Carry it forward and
                     -- let the next argument drive the instance lookup.
                     pure (dispatch (remaining - 1) (argT : accArgs))
-            else if isStreamPreDispatchArg tag accArgs
+            else if isStreamPreDispatchArg tag0 tag accArgs || delayIntFirst
                 then
                     -- Stream-style methods often carry a leading Proxy
-                    -- argument (or, for takeN_, an Int count) before the
-                    -- actual stream/chunk value that corresponds to the
-                    -- instance head.  Dispatching on Proxy would look for
-                    -- @Stream Proxy@; carry it forward and let the next
-                    -- value drive lookup.
+                    -- argument (or an Int count) before the stream /
+                    -- wrapper value that corresponds to the instance
+                    -- head.  Dispatching on Proxy or Int would look for
+                    -- @C Proxy@ / @C Int@; carry it forward and let the
+                    -- next value drive lookup.  The next value may be
+                    -- the stream itself or a constructor wrapping it
+                    -- (@F s@); the miss path then recovers @s@.
                     pure (dispatch (remaining - 1) (argT : accArgs))
             else if isFoldablePreContainerArg accArgs
                 then
@@ -4586,7 +5025,12 @@ classMethodDispatcher reg cls methodName
                                       Just methodVal
                                         | not (isMethodPlaceholder methodVal) ->
                                             pure (Just (tag, methodVal))
-                                      _ -> lookupUnaryWrapperMethod av tag
+                                      _ -> do
+                                          mWrap <- lookupUnaryWrapperMethod av tag
+                                          case mWrap of
+                                              Just _ -> pure mWrap
+                                              Nothing ->
+                                                  lookupNestedClassParamMethod av accArgs
                                   case mResolved of
                                     Just (resolvedTag, methodVal)
                                       | not (isMethodPlaceholder methodVal) ->
@@ -4641,7 +5085,12 @@ classMethodDispatcher reg cls methodName
                                               Just methodVal
                                                 | not (isMethodPlaceholder methodVal) ->
                                                     pure (Just (tag, methodVal))
-                                              _ -> lookupUnaryWrapperMethod av tag
+                                              _ -> do
+                                                  mWrap2 <- lookupUnaryWrapperMethod av tag
+                                                  case mWrap2 of
+                                                      Just _ -> pure mWrap2
+                                                      Nothing ->
+                                                          lookupNestedClassParamMethod av accArgs
                                           case mResolved2 of
                                               Just (resolvedTag, methodVal)
                                                 | not (isMethodPlaceholder methodVal) ->
@@ -4721,61 +5170,97 @@ classMethodDispatcher reg cls methodName
                                                 pure (dispatch (remaining - 1) (argT : accArgs))
                                     else
                                         pure (dispatch (remaining - 1) (argT : accArgs))
-                    else if isContainerFirstResultPolymorphicMethod cls methodName
-                         && null accArgs
-                    then do
-                        -- Methods like @Applicative.*>@ and @Monad.>>@
-                        -- have their class variable in the first value
-                        -- argument.  If that argument is represented as a
-                        -- host closure (notably parser/Q newtypes whose
-                        -- runtime wrapper has already been unwrapped), do
-                        -- not walk forward and accidentally dispatch on a
-                        -- later argument such as an @IO@ action.  Use the
-                        -- result-polymorphic defaults for parser-shaped
-                        -- calls instead.
-                        mResult <- resultPolymorphicMethod
-                        case mResult of
-                            Just resultVal ->
-                                applyAll resultVal [argT]
-                            Nothing -> do
-                                mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
-                                mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
-                                case preferMethod mDef0 mDefShared of
-                                    Just defVal | not (isMethodPlaceholder defVal) ->
-                                        applyAll defVal [argT]
-                                    _ -> error
-                                        ( "class-method dispatch: container-first `"
-                                         <> BC.unpack cls <> "." <> BC.unpack methodName
-                                         <> "` got non-dispatchable first arg of tag `"
-                                         <> BC.unpack tag
-                                         <> "` and no result-polymorphic / default instance" )
                     else do
-                        -- Non-dispatchable tag (function / primitive object
-                        -- / unit @()@).  First try narrow RTS-representation
-                        -- bridges such as Eq ForeignPtr; these are not general
-                        -- Hackage shims, but the host value shape that source
-                        -- methods like @unsafeForeignPtrToPtr p == ...@ bottom
-                        -- out on.  For @Show.show@ specifically, then try the
-                        -- host fallback: 'show ()' / 'show <function>' / etc.
-                        -- used to flow through the bare-name @showDispatch@
-                        -- shim before that shim was retired, and the
-                        -- source-loaded @class Show a@ has no dispatchable
-                        -- handle for these tags ('isDispatchableTag' excludes
-                        -- them precisely because they're singletons whose
-                        -- runtime shape can't drive a class lookup).
-                        mSpecialNonDisp <- specialClassApplication tag av argT accArgs
-                        case mSpecialNonDisp of
-                          Just specialVal -> pure specialVal
-                          Nothing -> do
-                            mHostNonDisp <- hostShowFallback reg cls tag methodName av
-                            case mHostNonDisp of
-                              Just hostVal -> pure hostVal
+                        containerFirst <-
+                            if not (null accArgs) then pure False
+                            else if isContainerFirstResultPolymorphicMethod cls methodName
+                                then pure True
+                                else firstArgMentionsClassParam
+                        if containerFirst then do
+                            -- Methods like @Applicative.*>@, @Monad.>>@,
+                            -- and scheme-shaped @lookAhead@ /
+                            -- @notFollowedBy@ (@m a -> …@) have their
+                            -- class variable in the first value
+                            -- argument.  If that argument is represented as a
+                            -- host closure (notably parser/Q newtypes whose
+                            -- runtime wrapper has already been unwrapped), do
+                            -- not walk forward and accidentally dispatch on a
+                            -- later argument such as an @IO@ action.  Use the
+                            -- result-polymorphic defaults for parser-shaped
+                            -- calls instead.
+                            --
+                            -- Value-directed lastMonadicCarrier ST (set
+                            -- while an ST do *runs*) keeps @>>@ on ST
+                            -- without pushing ST as every do-carrier —
+                            -- that regresses sequential writeArray
+                            -- (getBounds = return $! …).
+                            -- Leftover State# VFun (copyBytes after coerce
+                            -- drops the IO newtype) is the same shape as
+                            -- ST's leftover VFun.  Walking it as ParsecT
+                            -- applied RealWorld# and bound leftover
+                            -- <function> (BufferPool.copy / composeHeader
+                            -- `ptr1 <- copy ptr httpVer`).  An explicit
+                            -- non-IO do-carrier (ParsecT, ST, …) stays on
+                            -- the result-poly path.  Parser actions arrive
+                            -- as VCon "ParsecT" and never take this arm.
+                            mDo <- currentDoCarrier
+                            mLast <- peekLastMonadicCarrier
+                            let stBind = (methodName == BC.pack ">>"
+                                          || methodName == BC.pack "*>")
+                                         && (maybe False isSTCarrierTag mLast
+                                             || maybe False isSTCarrierTag mDo)
+                                leftoverStateFun = isStateFunVal av
+                                explicitOtherDo = case mDo of
+                                    Just c | isExplicitNonIOCarrier c -> True
+                                    _ -> False
+                            if stBind
+                                then stSeqMethod av
+                                else if leftoverStateFun && not explicitOtherDo
+                                    then ioSeqMethod av
+                                    else do
+                                        mResult <- resultPolymorphicMethod
+                                        case mResult of
+                                            Just resultVal ->
+                                                applyResultPolyWithCarrier resultVal [argT]
+                                            Nothing -> do
+                                                mDef0 <- lookupInstanceMethodForced reg cls defaultTypeTag methodName
+                                                mDefShared <- lookupInSharedRegForced cls defaultTypeTag methodName
+                                                case preferMethod mDef0 mDefShared of
+                                                    Just defVal | not (isMethodPlaceholder defVal) ->
+                                                        applyResultPolyWithCarrier defVal [argT]
+                                                    _ | leftoverStateFun ->
+                                                        ioSeqMethod av
+                                                    _ ->
+                                                        if methodName == BC.pack ">>="
+                                                            then pure (ioBindStateFun av)
+                                                            else pure (ioSeqStateFun av)
+                        else do
+                            -- Non-dispatchable tag (function / primitive object
+                            -- / unit @()@).  First try narrow RTS-representation
+                            -- bridges such as Eq ForeignPtr; these are not general
+                            -- Hackage shims, but the host value shape that source
+                            -- methods like @unsafeForeignPtrToPtr p == ...@ bottom
+                            -- out on.  For @Show.show@ specifically, then try the
+                            -- host fallback: 'show ()' / 'show <function>' / etc.
+                            -- used to flow through the bare-name @showDispatch@
+                            -- shim before that shim was retired, and the
+                            -- source-loaded @class Show a@ has no dispatchable
+                            -- handle for these tags ('isDispatchableTag' excludes
+                            -- them precisely because they're singletons whose
+                            -- runtime shape can't drive a class lookup).
+                            mSpecialNonDisp <- specialClassApplication tag av argT accArgs
+                            case mSpecialNonDisp of
+                              Just specialVal -> pure specialVal
                               Nothing -> do
-                                -- Stash and wait for the next arg so the
-                                -- dispatcher can look at a dispatchable
-                                -- argument later in the application chain.
-                                let v = dispatch (remaining - 1) (argT : accArgs)
-                                pure v
+                                mHostNonDisp <- hostShowFallback reg cls tag methodName av
+                                case mHostNonDisp of
+                                  Just hostVal -> pure hostVal
+                                  Nothing -> do
+                                    -- Stash and wait for the next arg so the
+                                    -- dispatcher can look at a dispatchable
+                                    -- argument later in the application chain.
+                                    let v = dispatch (remaining - 1) (argT : accArgs)
+                                    pure v
 
     -- All args consumed without finding an instance; fall back to
     -- the class's default body, or error if there is none.
@@ -4815,12 +5300,33 @@ classMethodDispatcher reg cls methodName
         tags0 <- do
             let base = resultPolymorphicDefaultTagsForArg mArgTag cls methodName
             mDo <- currentDoCarrier
-            pure $ case mDo of
-                Just c
-                  | isPureLikeResult cls methodName
-                  , not (BC.null c) ->
-                    c : filter (/= c) base
-                _ -> base
+            mLast <- peekLastMonadicCarrier
+            -- Do-carrier only pins result-poly @pure@/@return@.  Using
+            -- it for @>>@ forced ST onto writeArray's inner do and
+            -- broke @getBounds = return $! boundsSTArray@.  @>>@ of a
+            -- State# VFun consults lastMonadicCarrier instead (set
+            -- while an ST do runs, not on every constructed do).
+            let fromDo
+                    | Just c <- mDo
+                    , isPureLikeResult cls methodName
+                    , not (BC.null c) = [c]
+                    | otherwise = []
+                -- Bind of a leftover State# VFun (BuildStep fill /
+                -- nextBuffer) has no constructor tag.  The peeled
+                -- result head (IO from `BuildStep a = BufferRange ->
+                -- IO (BuildSignal a)`, ST from a running ST do) is
+                -- published on lastMonadicCarrier — use it.  Not
+                -- ST-only: restricting to ST left toLazyByteString
+                -- matching Finished/Yield1 against <function>.
+                fromLast
+                    | Just c <- mLast
+                    , isBindLikeResult cls methodName
+                    , not (BC.null c) = [c]
+                    | otherwise = []
+                extras = fromDo ++ filter (`notElem` fromDo) fromLast
+            pure $ case extras of
+                [] -> base
+                _  -> extras ++ filter (`notElem` extras) base
         -- Result-polymorphic calls have no runtime carrier value from
         -- which the ordinary dispatcher can take its first-miss path.
         -- When inference cannot provide candidate tags, retain the broad
@@ -5031,13 +5537,10 @@ classMethodDispatcher reg cls methodName
         -- only MonadParsec instance ihp-hsx and most users actually
         -- exercise — so the parser body resolves without proper type
         -- elaboration.
+        -- MonadParsec methods are parameterized by the parser monad
+        -- @m@.  The only instance ihp-hsx exercises is @ParsecT@ —
+        -- class-level, no method name list.
         | clsName == BC.pack "MonadParsec"
-        , method `elem` map BC.pack
-            [ "parseError", "label", "hidden", "try", "lookAhead"
-            , "notFollowedBy", "withRecovery", "observing", "eof"
-            , "token", "tokens", "takeWhileP", "takeWhile1P", "takeP"
-            , "getParserState", "updateParserState", "mkParsec"
-            ]
         = [BC.pack "ParsecT"]
         -- Applicative / Functor / Monad methods can have the same shape as
         -- MonadParsec methods: the carrier @m@ only appears in the result
@@ -5081,6 +5584,15 @@ classMethodDispatcher reg cls methodName
     isPureLikeResult clsName method =
         (clsName == BC.pack "Applicative" && method == BC.pack "pure")
      || (clsName == BC.pack "Monad"       && method == BC.pack "return")
+     || (clsName == BC.pack "Alternative" && method == BC.pack "empty")
+     || (clsName == BC.pack "MonadPlus"   && method == BC.pack "mzero")
+
+    isSTCarrierTag tag =
+        tag == BC.pack "ST" || BC.isSuffixOf (BC.pack ".ST") tag
+
+    isBindLikeResult clsName method =
+        (clsName == BC.pack "Monad" && method `elem` map BC.pack [">>=", ">>"])
+     || (clsName == BC.pack "Applicative" && method `elem` map BC.pack ["*>", "<*"])
 
     isSTResultCarrierTag tag =
         tag `elem` map BC.pack ["STArray", "STUArray"]
@@ -5098,6 +5610,24 @@ classMethodDispatcher reg cls methodName
     isContainerFirstResultPolymorphicMethod c m =
         (c == BC.pack "Applicative" && m `elem` map BC.pack ["*>", "<*", "<*>"])
      || (c == BC.pack "Monad"       && m `elem` map BC.pack [">>=", ">>"])
+
+    -- @lookAhead :: m a -> m a@ / @notFollowedBy :: m a -> m ()@: the
+    -- first value argument *is* the class parameter.  Scheme-directed
+    -- so these MonadParsec combinators do not need a method name list.
+    -- The *head* must be the class var (`m a`, `s`).  A nested mention
+    -- such as `Token s -> Bool` (Stream.takeWhile_) is not the carrier
+    -- — treating it as one sent the predicate through ioSeq and the
+    -- let `(ts, input') = takeWhile_ f input` saw leftover <IO>.
+    firstArgMentionsClassParam = do
+        mScheme <- lookupClassOwnedMethodScheme
+        pure $ case mScheme of
+            Just (Scheme _ preds ty) ->
+                let (args, _) = tyArrowArgs ty
+                    classVars = classParamVars preds
+                in case args of
+                    (a:_) -> firstArgIsClassCarrier classVars a
+                    []    -> False
+            Nothing -> False
 
     isFoldableElementArg =
         cls == BC.pack "Foldable"
@@ -5135,22 +5665,19 @@ classMethodDispatcher reg cls methodName
         , "Semigroup", "Monoid"  -- (a -> IO ()) Monoid via IO instance
         ]
 
+    -- Runtime [Char] lists have typeTagOf [].  Instance heads written
+    -- @String@ are stored under the structured key [Char]
+    -- ('typeDispatchTag' after expanding @type String = [Char]@).
+    -- Prefer that key when this class actually has such an instance
+    -- (ToMarkup String vs ToMarkup [Markup], Show String vs Show [a]).
+    -- Classes that only have [] / [a] (Foldable, Functor) keep [].
+    -- No ToMarkup / ToValue name list.
     classifyClassArg rawTag0 av
-        | rawTag0 == BC.pack "[]"
-        , cls `elem` map BC.pack ["ToMarkup", "ToValue"] =
-            case av of
-                VCon ":" (hT : _) -> do
-                    hv <- force legacyHooks hT
-                    pure $ case hv of
-                        VChar _ -> BC.pack "String"
-                        _       -> rawTag0
-                _ -> pure rawTag0
-        | rawTag0 == BC.pack "[]"
-        , cls == BC.pack "Monoid"
-        , methodName == BC.pack "mconcat" =
-            case av of
-                VCon ":" (hT : _) -> typeTagOf <$> force legacyHooks hT
-                _                 -> pure rawTag0
+        | rawTag0 == BC.pack "[]" = do
+            mStructured <- preferCharListInstance av
+            case mStructured of
+                Just structured -> pure structured
+                Nothing -> classifyListElementTag av rawTag0
         | rawTag0 `elem` map BC.pack ["ShareInput", "NoShareInput"]
         , cls `elem` map BC.pack ["Stream", "VisualStream", "TraversableStream"] =
             case av of
@@ -5158,6 +5685,38 @@ classMethodDispatcher reg cls methodName
                     inner <- force legacyHooks innerT
                     pure (wrapper <> BC.pack " " <> typeTagOf inner)
                 _ -> pure rawTag0
+        | otherwise = pure rawTag0
+
+    -- A cons list of 'VChar' is structurally [Char].  Use that
+    -- structured key only when this class actually registered one
+    -- (instance C String / instance C [Char]); otherwise keep [] so
+    -- Foldable/Functor [] and generic [a] instances still match.
+    preferCharListInstance (VCon ":" (hT : _)) = do
+        hv <- force legacyHooks hT
+        case hv of
+            VChar _ -> firstExactInstance
+                [BC.pack "[Char]", BC.pack "String"]
+            _ -> pure Nothing
+    preferCharListInstance _ = pure Nothing
+
+    firstExactInstance [] = pure Nothing
+    firstExactInstance (t:ts) = do
+        ok <- classHasExactInstance t
+        if ok then pure (Just t) else firstExactInstance ts
+
+    classHasExactInstance tag = do
+        a <- lookupInstanceMethodForced reg cls tag methodName
+        b <- lookupInSharedRegForced cls tag methodName
+        pure $ case preferMethod a b of
+            Just v | not (isMethodPlaceholder v) -> True
+            _ -> False
+
+    classifyListElementTag av rawTag0
+        | cls == BC.pack "Monoid"
+        , methodName == BC.pack "mconcat" =
+            case av of
+                VCon ":" (hT : _) -> typeTagOf <$> force legacyHooks hT
+                _                 -> pure rawTag0
         | otherwise = pure rawTag0
 
     specialClassApplication tag av argT accArgs
@@ -5245,12 +5804,29 @@ classMethodDispatcher reg cls methodName
                 ptrV <- force legacyHooks ptrT
                 isWord8 <- isHostWord8PtrVal ptrV
                     `catch` (\(_ :: SomeException) -> pure False)
-                if isWord8
+                -- Value-directed Word8 (W8#) must poke a byte even when
+                -- the dest mark missed (PrimForeignPtr leftover).
+                if isWord8 || isWord8PokeVal av tag
                     then pure (Just (VIO $ do
                         offV <- force legacyHooks offT
                         pokeHostWord8ByteOff ptrV offV av))
                     else pure Nothing
             _ -> pure Nothing
+        | cls == BC.pack "Storable"
+        , methodName == BC.pack "poke"
+        , null accArgs
+        = do
+            -- Dest is the first argument.  A marked Word8 buffer
+            -- (unsafeCreate / mallocByteString) must not first-miss to
+            -- Storable (Ptr b): that leaves formatHTTPDate as 29 NULs
+            -- with only the cpy3 weekday/month names visible.
+            isWord8 <- isHostWord8PtrVal av
+                `catch` (\(_ :: SomeException) -> pure False)
+            if isWord8
+                then pure (Just (VFun $ \valT -> do
+                    valV <- force legacyHooks valT
+                    pure (VIO (pokeHostWord8ByteOff av (VInt 0) valV))))
+                else pure Nothing
         | cls == BC.pack "Storable"
         , methodName == BC.pack "poke"
         , length accArgs == 1
@@ -5259,7 +5835,12 @@ classMethodDispatcher reg cls methodName
                 ptrV <- force legacyHooks ptrT
                 isWord8 <- isHostWord8PtrVal ptrV
                     `catch` (\(_ :: SomeException) -> pure False)
-                if isWord8
+                -- Newtype values (CInt, local GND wrappers) must reach
+                -- instance Storable <declared field>, not a Word8 host poke.
+                mNewtype <- case av of
+                    VCon n [_] -> lookupDeclaredFieldTag n
+                    _          -> pure Nothing
+                if (isWord8 || isWord8PokeVal av tag) && not (isJust mNewtype)
                     then pure (Just (VIO (pokeHostWord8ByteOff ptrV (VInt 0) av)))
                     else pure Nothing
             _ -> pure Nothing
@@ -5276,7 +5857,11 @@ classMethodDispatcher reg cls methodName
         = do
             isWord8 <- isHostWord8PtrVal av
                 `catch` (\(_ :: SomeException) -> pure False)
-            if isWord8
+            mExpected <- readExpectedResultTag
+            mNewtype <- case mExpected of
+                Just tag -> lookupDeclaredFieldTag tag
+                Nothing  -> pure Nothing
+            if isWord8 && not (isJust mNewtype)
                 then pure (Just (VIO (peekHostWord8ByteOff av (VInt 0))))
                 else pure Nothing
         | cls == BC.pack "Ix"
@@ -5332,13 +5917,43 @@ classMethodDispatcher reg cls methodName
             let compatible = case (ma, mb) of
                     (Just a, Just b) -> compatibleIntSpines a b
                     _ -> False
-                same = case (ma, mb) of
-                    (Just (_, a), Just (_, b)) | compatible -> a == b
-                    _ -> False
-                result
-                    | method == BC.pack "/=" = not same
-                    | otherwise              = same
-            pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
+            if compatible
+                then do
+                    let same = case (ma, mb) of
+                            (Just (_, a), Just (_, b)) -> a == b
+                            _ -> False
+                        result
+                            | method == BC.pack "/=" = not same
+                            | otherwise              = same
+                    pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
+                else do
+                    -- One side is a constructed Num value (Size / Hint).
+                    -- Promote the leftover VInt instead of returning False.
+                    mPromoted <- case (isBareIntVal left, isConstructedVal right) of
+                        (True, True) ->
+                            tryPromoteIntViaFromInteger
+                                reg (promoteTags (typeTagOf right) right) left
+                        _ -> case (isBareIntVal right, isConstructedVal left) of
+                            (True, True) ->
+                                tryPromoteIntViaFromInteger
+                                    reg (promoteTags (typeTagOf left) left) right
+                            _ -> pure Nothing
+                    case mPromoted of
+                        Just promoted -> do
+                            -- Re-dispatch through Eq on the *promoted* pair.
+                            -- Re-entering with the original VInt loops
+                            -- (`0 == None` forever).
+                            let eqD = classMethodDispatcher reg (BC.pack "Eq") method
+                                (lv, rv)
+                                    | isBareIntVal left = (promoted, right)
+                                    | otherwise         = (left, promoted)
+                            lT <- newWHNFThunk lv
+                            rT <- newWHNFThunk rv
+                            v1 <- apply legacyHooks eqD lT
+                            apply legacyHooks v1 rT
+                        Nothing ->
+                            let result = method == BC.pack "/="
+                            in pure (if result then VCon (BC.pack "True") [] else VCon (BC.pack "False") [])
 
     intSpineNumMethod method left =
         pure $ VFun $ \rightT -> do
@@ -5355,9 +5970,75 @@ classMethodDispatcher reg cls methodName
                                 "*" -> x * y
                                 _   -> x
                         in pure (VInt n)
-                _ -> error
-                    ( "int-spine Num." <> BC.unpack method
-                      <> ": right-hand side is not a compatible int spine" )
+                _ -> do
+                    -- Same family as intSpineEqMethod: leftover VInt
+                    -- next to a constructed Num (Size / Hint after
+                    -- takeWhile_ / takeN_).  Promote and re-dispatch.
+                    -- Homogeneous Size+Size never reaches this arm.
+                    mPromoted <- case (isBareIntVal left, isConstructedVal right) of
+                        (True, True) ->
+                            tryPromoteIntViaFromInteger
+                                reg (promoteTags (typeTagOf right) right) left
+                        _ -> case (isBareIntVal right, isConstructedVal left) of
+                            (True, True) ->
+                                tryPromoteIntViaFromInteger
+                                    reg (promoteTags (typeTagOf left) left) right
+                            _ -> pure Nothing
+                    case mPromoted of
+                        Just promoted -> do
+                            let numD = classMethodDispatcher reg (BC.pack "Num") method
+                                (lv, rv)
+                                    | isBareIntVal left = (promoted, right)
+                                    | otherwise         = (left, promoted)
+                            lT <- newWHNFThunk lv
+                            rT <- newWHNFThunk rv
+                            v1 <- apply legacyHooks numD lT
+                            apply legacyHooks v1 rT
+                        Nothing -> do
+                            -- Leftover RHS (chunkLength not fully
+                            -- applied).  Do not error — apply the
+                            -- source Num instance so ordinary Int/+#
+                            -- still runs.  parseHsx
+                            -- `space *> string <* eof` hit this on
+                            -- `o + len`.  No name list.
+                            mx <- intLikePayload left
+                            my <- intLikePayload right
+                            case (mx, my) of
+                                (Just x, Just y) ->
+                                    let n = case BC.unpack method of
+                                            "+" -> x + y
+                                            "-" -> x - y
+                                            "*" -> x * y
+                                            _   -> x
+                                    in pure (VInt n)
+                                _ -> sourceNumBinOp method left right
+
+    -- Source Num body for a leftover / constructed operand.  Lookup
+    -- is by the runtime tag; the registered instance is the source
+    -- method, not this host fast path, so apply does not loop.
+    sourceNumBinOp method left right = do
+        let tags = nub $ filter (not . BC.null)
+                [ typeTagOf left
+                , typeTagOf right
+                ]
+            go [] = error
+                ( "int-spine Num." <> BC.unpack method
+                  <> ": leftover "
+                  <> BC.unpack (typeTagOf left)
+                  <> " / "
+                  <> BC.unpack (typeTagOf right) )
+            go (tag:rest) = do
+                a <- lookupInstanceMethodForced reg (BC.pack "Num") tag method
+                b <- lookupInSharedRegForced (BC.pack "Num") tag method
+                case preferMethod a b of
+                    Just fn | not (isMethodPlaceholder fn) -> do
+                        forced <- forceMethodVal legacyHooks fn
+                        lT <- newWHNFThunk left
+                        rT <- newWHNFThunk right
+                        v1 <- apply legacyHooks forced lT
+                        apply legacyHooks v1 rT
+                    _ -> go rest
+        go tags
 
     eqDefaultWouldLoop tag
         | cls /= BC.pack "Eq" = pure False
@@ -5371,6 +6052,92 @@ classMethodDispatcher reg cls methodName
                     Just v | not (isMethodPlaceholder v) -> True
                     _ -> False
             pure (not hasSibling)
+
+    -- Leftover State# function (copyBytes / fillBytes after coerce).
+    -- Parser newtypes stay VCon "ParsecT"; only the dropped-IO
+    -- newtype payload arrives as VFun / VFunIP.
+    isStateFunVal :: Val -> Bool
+    isStateFunVal (VFun _) = True
+    isStateFunVal (VFunIP _ _) = True
+    isStateFunVal _ = False
+
+    -- Explicit do-carrier that is not IO / Q.  Structural: any
+    -- non-empty stamp other than those two (ST, ParsecT, ReaderT, …)
+    -- keeps result-poly / ST sequencing.  No parser-name list.
+    isExplicitNonIOCarrier :: ByteString -> Bool
+    isExplicitNonIOCarrier c =
+        not (BC.null c)
+        && c /= BC.pack "IO" && not (BC.isSuffixOf (BC.pack ".IO") c)
+        && c /= BC.pack "Q" && not (BC.isSuffixOf (BC.pack ".Q") c)
+
+    -- Wrap leftover State# VFun as @VCon "IO"@ so source
+    -- @thenIO (IO m) k@ matches.  GHC's IO newtype is representation-
+    -- transparent; coerce dropped the constructor.
+    wrapStateFunAsIO :: Val -> IO Val
+    wrapStateFunAsIO v@(VCon n _)
+        | n == BC.pack "IO" || BC.isSuffixOf (BC.pack ".IO") n = pure v
+    wrapStateFunAsIO (VIO io) = pure (VIO io)
+    wrapStateFunAsIO v@(VFun _) = wrapStateFunIfState v
+    wrapStateFunAsIO v@(VFunIP _ _) = wrapStateFunIfState v
+    wrapStateFunAsIO v = pure v
+
+    -- Probe: applying RealWorld to leftover memcpy yields `(# s, a #)`.
+    -- Applying it to a cons PAP yields `<:...>`.  Only the former is IO.
+    -- Replay the probed tuple so the side effect is not run twice.
+    wrapStateFunIfState fn = do
+        probed <- applyLeftoverStateFun leftoverHooks fn
+        if isLeftoverStateResult probed
+            then do
+                fnT <- newWHNFThunk $ VFun $ \_ -> pure probed
+                pure (VCon (BC.pack "IO") [fnT])
+            else pure fn
+
+    leftoverHooks = legacyHooks
+
+    -- IO counterpart of 'stSeqMethod': @>>@ / @>>=@ / @*>@ of a leftover
+    -- State# VFun (copyBytes after coerce) uses source Monad/Applicative
+    -- IO.  Defaulting that shape to ParsecT walked RealWorld# and left
+    -- the bound value as <function> (ptrToIntPtr / BufferPool.copy).
+    ioSeqMethod left = do
+        wrapped <- wrapStateFunAsIO left
+        let (cls', meth')
+                | cls == BC.pack "Applicative" = (BC.pack "Applicative", methodName)
+                | otherwise                    = (BC.pack "Monad", methodName)
+        triggerCoreInstanceLoad legacyHooks cls'
+        triggerCoreInstanceLoadForTag legacyHooks cls' (BC.pack "IO")
+        mMethod <- lookupInstanceMethodForced reg cls' (BC.pack "IO") meth'
+        mShared <- lookupInSharedRegForced cls' (BC.pack "IO") meth'
+        case preferMethod mMethod mShared of
+            Just methodVal | not (isMethodPlaceholder methodVal) -> do
+                leftT <- newWHNFThunk wrapped
+                applyAllWithCarrier cls' (BC.pack "IO") methodVal [leftT]
+            _ -> do
+                -- Source instance not yet loaded.  Sequence as VIO so
+                -- runIOVal still unwraps the leftover State# function.
+                pure $ VFun $ \rightT -> do
+                    right <- force legacyHooks rightT
+                    rightIO <- wrapStateFunAsIO right
+                    pure $ VIO $ do
+                        _ <- runIOVal legacyHooks wrapped
+                        runIOVal legacyHooks rightIO
+
+    -- State# VFun (copyBytes after coerce) sequenced as IO.  Walking
+    -- the later action skipped the memcpy (snoc / copy / C8.putStrLn).
+    ioSeqStateFun firstV =
+        VFun $ \secondT -> do
+            second <- force legacyHooks secondT
+            pure $ VIO $ do
+                _ <- runIOVal legacyHooks firstV
+                runIOVal legacyHooks second
+
+    ioBindStateFun firstV =
+        VFun $ \kT -> do
+            k <- force legacyHooks kT
+            pure $ VIO $ do
+                a <- runIOVal legacyHooks firstV
+                aT <- newWHNFThunk a
+                rest <- apply legacyHooks k aT
+                runIOVal legacyHooks rest
 
     -- ST (>>) that accepts IO-shaped right (return () defaulting to IO).
     -- When *both* sides are already VCon "ST", fall through to source
@@ -5496,6 +6263,15 @@ classMethodDispatcher reg cls methodName
         && methodName `elem` map BC.pack ["pokeElemOff", "pokeByteOff"]
         && length accArgs < 2
 
+    -- Word8 poke value: W8# / tagged Word8.  Bare VInt stays dest-mark
+    -- directed so Storable Int poke of a small literal is not stolen.
+    isWord8PokeVal av tag =
+        tag == BC.pack "Word8"
+        || case av of
+            VCon c _ ->
+                c == BC.pack "W8#" || BC.isSuffixOf (BC.pack ".W8#") c
+            _ -> False
+
     isStorablePreResultArg accArgs =
         cls == BC.pack "Storable"
         && methodName `elem` map BC.pack ["peekElemOff", "peekByteOff"]
@@ -5518,6 +6294,18 @@ classMethodDispatcher reg cls methodName
                         else Nothing
             _ -> pure Nothing
 
+    -- FFI @Ptr CInt@ marks the buffer (socketPair fdArr).  Unannotated
+    -- peekElemOff must use that width, not the result-poly Int default.
+    tryStorableMarkedPeek offV accArgs =
+        case reverse accArgs of
+            [ptrT] -> do
+                ptrV <- force legacyHooks ptrT
+                let isElem = methodName == BC.pack "peekElemOff"
+                mPeek <- peekHostMarkedElemOff isElem ptrV offV
+                    `catch` (\(_ :: SomeException) -> pure Nothing)
+                pure (VIO . pure <$> mPeek)
+            _ -> pure Nothing
+
     isNumFromIntegerArg accArgs =
         cls == BC.pack "Num"
         && methodName == BC.pack "fromInteger"
@@ -5535,9 +6323,12 @@ classMethodDispatcher reg cls methodName
             [ "Floating", "Fractional", "RealFrac", "RealFloat" ]
 
     -- Category (.) / id on the function arrow — see early dispatch branch.
+    -- typeTagOf VFun is "<function>", not "(->)".  Last-writer
+    -- Category (.) missed, so sortWith = sortBy . comparing closed
+    -- over compose-as-application and died as leftovers :/[] args=<function>.
     isCategoryArrowMethod tag =
         cls == BC.pack "Category"
-        && tag == functionArrowTag
+        && (tag == functionArrowTag || tag == functionValueTag)
         && (methodName == BC.pack "." || methodName == BC.pack "id")
 
     isBufferedIOHostHandleArg tag accArgs =
@@ -5546,14 +6337,208 @@ classMethodDispatcher reg cls methodName
         && tag == BC.pack "<Handle>"
         && null accArgs
 
-    isStreamPreDispatchArg tag accArgs =
-        (cls `elem` map BC.pack ["Stream", "VisualStream", "TraversableStream"]
-         && tag == BC.pack "Proxy"
-         && null accArgs)
-        || (cls == BC.pack "Stream"
-            && methodName == BC.pack "takeN_"
+    -- Delay a real Proxy even if recoverStreamProxyTag already
+    -- rewrote the tag to the last Stream key (Text).  Otherwise
+    -- showTokens applies with only the witness and leftover-returns
+    -- into (++).  Keep the recovered tag for Int / <function>.
+    isStreamPreDispatchArg rawTag tag accArgs =
+        (isStreamFamilyClass cls
+         && null accArgs
+         && (tag == BC.pack "Proxy" || rawTag == BC.pack "Proxy"))
+        || (isStreamFamilyClass cls
             && tag == BC.pack "Int"
             && null accArgs)
+        -- Predicate before the stream (`Token s -> Bool`).  Same
+        -- walk as Proxy / Int: the function is not the instance head.
+        || (isStreamFamilyClass cls
+            && tag == BC.pack "<function>"
+            && null accArgs)
+
+    -- Leading Int is not the class parameter (scheme first arg does
+    -- not mention it).  Same shape as a stream count before the
+    -- stream / wrapper: delay so the later argument can drive
+    -- lookup.  If the scheme is not visible, the Stream-family
+    -- Int arm above is the fallback.  Do not delay Num/Eq/Enum
+    -- methods whose first argument *is* the class parameter.
+    isIntPreClassParamArg tag accArgs
+        | tag == BC.pack "Int" && null accArgs
+        , not (isNumFromIntegerArg accArgs)
+        , not (isUnaryResultPolymorphicMethod cls methodName) = do
+            mScheme <- lookupClassOwnedMethodScheme
+            pure $ case mScheme of
+                Just sch@(Scheme _ preds ty)
+                    | schemeIsResultPolymorphic sch -> False
+                    | otherwise ->
+                        let (args, _) = tyArrowArgs ty
+                            classVars = classParamVars preds
+                        in case args of
+                            (a:_) -> not (typeMentionsClassParam classVars a)
+                            [] -> False
+                Nothing -> False
+        | otherwise = pure False
+
+    classParamVars preds =
+        [ v
+        | Pred c ts <- preds
+        , predIsThisClass c
+        , TyVar v <- ts
+        ]
+
+    predIsThisClass c =
+        c == cls || c == bareCls || schemeBareName c == bareCls
+
+    schemeBareName c = case BC.elemIndexEnd '.' c of
+        Just i | i + 1 < BC.length c -> BC.drop (i + 1) c
+        _ -> c
+
+    typeMentionsClassParam vars ty =
+        not (Set.null (Set.intersection (Set.fromList vars) (freeTyVars ty)))
+
+    -- First-arg carrier: @s@ or @m a@, not a nested mention such as
+    -- @Token s -> Bool@ (Stream.takeWhile_) or @Proxy s@.
+    firstArgIsClassCarrier vars (TyForall _ _ body) =
+        firstArgIsClassCarrier vars body
+    firstArgIsClassCarrier _ (TyArrow _ _) = False
+    firstArgIsClassCarrier vars (TyVar v) = v `elem` vars
+    firstArgIsClassCarrier vars (TyApp f _) = firstArgIsClassCarrier vars f
+    firstArgIsClassCarrier _ _ = False
+
+    isBareClassParam vars (TyVar v) = v `elem` vars
+    isBareClassParam _ _ = False
+
+    lookupClassOwnedMethodScheme = do
+        mods <- readIORef globalLoadedModulesRef
+        fromClass <- findOwnedClassScheme (Map.elems mods)
+        case fromClass of
+            Just s -> pure (Just s)
+            Nothing -> do
+                sigs <- readIORef globalTypeSigsRef
+                case Map.lookup methodName sigs of
+                    Just s@(Scheme _ preds _)
+                        | any thisClassPred preds -> pure (Just s)
+                    _ -> pure Nothing
+      where
+        thisClassPred (Pred c _) = predIsThisClass c
+        thisClassPred QPred{} = False
+
+        findOwnedClassScheme [] = pure Nothing
+        findOwnedClassScheme (lm:rest) = do
+            decls <- scanClassDecls (lmSource lm)
+                `catch` (\(_ :: SomeException) -> pure [])
+            case [ sch
+                 | decl <- decls
+                 , predIsThisClass (classClassName decl)
+                 , Just sch <- [Map.lookup methodName (classMethodSchemes decl)]
+                 ] of
+                (sch:_) -> pure (Just sch)
+                [] -> findOwnedClassScheme rest
+
+    -- After an Int/Proxy pre-arg, the next value is often a constructor
+    -- wrapping the class parameter (@F s@), not @s@ itself.  typeTagOf
+    -- is the wrapper; the instance is keyed by @s@.  Recover @s@ from
+    -- constructor fields whose scheme type is the class parameter.
+    -- After an Int/Proxy pre-arg, the next value is often a constructor
+    -- wrapping the class parameter (@F s@), not @s@ itself.  Peel only
+    -- when the remaining arg type is a *data* wrapper around the class
+    -- param.  Type families (`Tokens s`) and arrows (`Token s -> Bool`)
+    -- are not wrappers — peeling those used an inner tag (`R` / array)
+    -- as the instance key and leftover-returned that ctor as the next
+    -- newtype action (`unParser` on `R`).
+    lookupNestedClassParamMethod av accArgs = case av of
+        VCon ctor fields | not (null fields) -> do
+            mScheme <- lookupClassOwnedMethodScheme
+            case mScheme of
+                Just (Scheme _ preds ty) ->
+                    let (args, _) = tyArrowArgs ty
+                        classVars = classParamVars preds
+                    in case drop (length accArgs) args of
+                        (argTy:_) -> do
+                            wrap <- argIsDataWrapperAroundClassParam classVars argTy
+                            if wrap
+                                then recoverNestedParamTags classVars ctor fields
+                                         >>= lookupFirstNestedMethod
+                                else pure Nothing
+                        _ -> pure Nothing
+                Nothing -> pure Nothing
+        _ -> pure Nothing
+
+    -- @F s@ / @F (G s)@ where @F@ is a data constructor, not a type
+    -- family or an arrow.  'Tokens s' has the same application shape
+    -- but @Tokens@ has no constructors — do not peel that payload.
+    argIsDataWrapperAroundClassParam vars ty = case ty of
+        TyForall _ _ body -> argIsDataWrapperAroundClassParam vars body
+        TyApp f a
+            | isBareClassParam vars a
+              || wrapperArgCarriesClassParam vars a ->
+                case tyHead f of
+                    Just n -> typeHeadIsDataWrapper n
+                    Nothing -> pure False
+        _ -> pure False
+
+    wrapperArgCarriesClassParam vars (TyForall _ _ body) =
+        wrapperArgCarriesClassParam vars body
+    wrapperArgCarriesClassParam vars t = firstArgIsClassCarrier vars t
+
+    typeHeadIsDataWrapper headName = do
+        tfReg <- TR.getGlobalRegistry
+        let bare = schemeBareName headName
+            isFamily n =
+                Map.member n tfReg || Map.member (schemeBareName n) tfReg
+        if isFamily headName || isFamily bare
+            then pure False
+            else do
+                registry <- readIORef globalConstructorTypeRegistryRef
+                pure $ isJust (constructorMetadata registry Nothing headName)
+                    || (bare /= headName
+                        && isJust (constructorMetadata registry Nothing bare))
+
+    recoverNestedParamTags classVars ctor fields = do
+        registry <- readIORef globalConstructorTypeRegistryRef
+        let fts = case constructorMetadata registry Nothing ctor of
+                Just meta
+                    | length (ctmFieldTypes meta) == length fields ->
+                        ctmFieldTypes meta
+                _ -> []
+            exact =
+                [ i
+                | (i, ft) <- zip [0 :: Int ..] fts
+                , isBareClassParam classVars ft
+                ]
+            mentioned =
+                [ i
+                | (i, ft) <- zip [0 :: Int ..] fts
+                , typeMentionsClassParam classVars ft
+                ]
+            idxs = if null exact then mentioned else exact
+        tags <- fmap catMaybes $ forM (idxs ++ [0 | null idxs]) $ \i ->
+            if i < 0 || i >= length fields
+                then pure Nothing
+                else do
+                    inner <- force legacyHooks (fields !! i)
+                    let innerTag = typeTagOf inner
+                    if isDispatchableTag innerTag
+                        then pure (Just innerTag)
+                        else pure Nothing
+        pure (nub tags)
+
+    lookupFirstNestedMethod [] = pure Nothing
+    lookupFirstNestedMethod (t:ts) = do
+        hit <- lookupNestedMethodTag t
+        case hit of
+            Just _ -> pure hit
+            Nothing -> lookupFirstNestedMethod ts
+
+    lookupNestedMethodTag innerTag = do
+        -- Drain already-catalogued instances.  Do not trigger a
+        -- fresh core load here: loading the instance module can
+        -- re-enter this dispatcher on the class defaults while the
+        -- dict is still being registered.
+        _ <- lazyInstanceRetry cls innerTag
+        a <- lookupInstanceMethodForced reg cls innerTag methodName
+        b <- lookupInSharedRegForced cls innerTag methodName
+        pure $ case preferMethod a b of
+            Just v | not (isMethodPlaceholder v) -> Just (innerTag, v)
+            _ -> Nothing
 
     -- @VCon F [a]@ has typeTagOf @F@; instance heads are @F a@.
     -- Only used after a bare-@F@ miss so @Functor Identity@ (keyed
@@ -5598,8 +6583,7 @@ classMethodDispatcher reg cls methodName
         | otherwise = bs
 
     recoverStreamProxyTag tag0 av
-        | tag0 /= BC.pack "Proxy" = pure tag0
-        | otherwise = do
+        | tag0 == BC.pack "Proxy" = do
             mPayload <- proxyPayloadTag av
             mLast <- readIORef lastDispatchTagRef
             let fromPayload = case mPayload of
@@ -5609,6 +6593,45 @@ classMethodDispatcher reg cls methodName
                     Just t | usefulProxyPayloadTag t -> Just t
                     _ -> Nothing
             pure (fromMaybe tag0 (fromPayload <|> fromLast))
+        -- Stream Text takeWhile_ forwards to ShareInput Text.
+        -- recoverLastStreamTagOnMiss would rewrite that wrapper to
+        -- last=Text and re-enter Stream Text forever.  Same for a
+        -- leftover <function> / Int pre-dispatch tag (takeWhile_
+        -- predicate, reachOffset index).
+        | isStreamWrapperTag tag0 = pure tag0
+        | tag0 == BC.pack "<function>" || tag0 == BC.pack "Int" = pure tag0
+        -- After a leading Proxy is delayed, VisualStream.showTokens
+        -- sees NonEmpty tokens.  typeTagOf is :|, not the stream.
+        -- A miss leftover-returns a function into (++).  Reuse the
+        -- last Stream tag (unwrapped).  No pretty-function name list.
+        | isStreamFamilyClass cls = recoverLastStreamTagOnMiss tag0
+        | otherwise = pure tag0
+
+    recoverLastStreamTagOnMiss tag0 = do
+        mLast <- readIORef lastDispatchTagRef
+        case mLast of
+            Just lastTag0
+                | usefulProxyPayloadTag lastTag0 -> do
+                    let lastTag = unwrapStreamWrapperTag lastTag0
+                    if lastTag == tag0
+                        then pure tag0
+                        else do
+                            hitNow <- streamInstanceHit tag0
+                            if hitNow
+                                then pure tag0
+                                else do
+                                    triggerCoreInstanceLoadForTag
+                                        legacyHooks cls lastTag
+                                    hitLast <- streamInstanceHit lastTag
+                                    pure (if hitLast then lastTag else tag0)
+            _ -> pure tag0
+
+    streamInstanceHit t = do
+        a <- lookupInstanceMethodForced reg cls t methodName
+        b <- lookupInSharedRegForced cls t methodName
+        pure $ case preferMethod a b of
+            Just v | not (isMethodPlaceholder v) -> True
+            _ -> False
 
     tryProxyPayloadOrWalk av argT accArgs remaining = do
         mPayload <- proxyPayloadTag av
@@ -5739,23 +6762,73 @@ classMethodDispatcher reg cls methodName
                                 tryProxyPayloadOrWalk av argT accArgs remaining
 
     lookupNewtypeDerivedMethod av tag = case av of
+        -- ShareInput / NoShareInput are Stream wrappers, not GND
+        -- newtypes.  Unwrapping them to the inner stream re-enters
+        -- @Stream Text@ (@takeWhile_ p s = takeWhile_ p (ShareInput s)@)
+        -- and loops.  The applied key (@ShareInput Text@) is registered
+        -- separately.
+        VCon n [_]
+            | n `elem` map BC.pack ["ShareInput", "NoShareInput"]
+            , isStreamFamilyClass cls ->
+                pure Nothing
         VCon n [innerT]
             | tag == n || tag == normalizeTyTag n -> do
                 inner <- force legacyHooks innerT
-                let innerTag = typeTagOf inner
+                -- Storable sizeOf/poke must ignore the VInt payload tag
+                -- (Int) and use the declared field (Int32).  Integral/Bits
+                -- on CInt already GND via the payload; forcing Int32 there
+                -- demands int32ToInt# which is a separate primop slice.
+                mDecl <- if cls == BC.pack "Storable"
+                    then lookupDeclaredFieldTag n
+                    else pure Nothing
+                let innerTag = fromMaybe (typeTagOf inner) mDecl
                 if innerTag == tag || innerTag == n
                     then pure Nothing
-                    else do
-                        when (cls /= BC.pack "Storable") $
-                            triggerCoreInstanceLoadForTag legacyHooks cls innerTag
-                        a <- lookupRegisteredMethod reg cls innerTag methodName
-                        b <- lookupRegisteredShared cls innerTag methodName
-                        case preferMethod a b of
-                            Just v | not (isMethodPlaceholder v) -> do
-                                wrapped <- newtypeUnwrapWrap n v
-                                pure (Just (tag, wrapped))
-                            _ -> pure Nothing
+                    else lookupGndInner n tag innerTag
         _ -> pure Nothing
+
+    lookupGndInner wrapName tag innerTag = do
+        triggerCoreInstanceLoadForTag legacyHooks cls innerTag
+        aliasTags <- instanceTagAliases innerTag
+        found <- findFirstGndMethod (innerTag : filter (/= innerTag) aliasTags)
+        case found of
+            Just v | not (isMethodPlaceholder v) -> do
+                wrapped <- newtypeUnwrapWrap wrapName v
+                pure (Just (tag, wrapped))
+            _ -> pure Nothing
+
+    findFirstGndMethod [] = pure Nothing
+    findFirstGndMethod (t:ts) = do
+        a <- lookupRegisteredMethod reg cls t methodName
+        b <- lookupRegisteredShared cls t methodName
+        case preferMethod a b of
+            Just v | not (isMethodPlaceholder v) -> pure (Just v)
+            _ -> findFirstGndMethod ts
+
+    -- STORABLE(Int32, …) is registered under I32#, not Int32.
+    -- Invert constructor metadata and registered tags.  No CInt list.
+    instanceTagAliases declared = do
+        registry <- readIORef globalConstructorTypeRegistryRef
+        let bare = gndBareTag declared
+            fromMeta =
+                [ ciName (ctmIdentity metadata)
+                | metadata <- Map.elems registry
+                , Just h <- [tyHead (ctmResultType metadata)]
+                , gndBareTag h == bare
+                ]
+        registered <- registeredInstanceTagsForClass
+        let fromReg =
+                [ t
+                | t <- registered
+                , t /= declared
+                , let mapped = typeTagOf (VCon t [])
+                , mapped == declared || gndBareTag mapped == bare
+                ]
+        pure (nub (fromMeta ++ fromReg))
+
+    gndBareTag n = case BC.elemIndexEnd '.' n of
+        Just i  -> BC.drop (i + 1) n
+        Nothing -> n
 
     lookupRegisteredMethod r cls0 tag0 meth = do
         mt <- lookupInstance r cls0 tag0
@@ -5804,12 +6877,16 @@ classMethodDispatcher reg cls methodName
 
     methodResultIsClassParam = do
         mScheme <- lookupClassMethodScheme
-        pure $ maybe False (\(Scheme _ _ ty) -> resultIsTyVar ty) mScheme
+        pure $ maybe False (\(Scheme _ _ ty) -> resultCarriesClassParam ty) mScheme
       where
-        resultIsTyVar (TyArrow _ b)     = resultIsTyVar b
-        resultIsTyVar (TyForall _ _ t)  = resultIsTyVar t
-        resultIsTyVar (TyVar _)         = True
-        resultIsTyVar _                 = False
+        -- peek :: Ptr a -> IO a: the class param is the last app arg,
+        -- not a bare result tyvar.  sizeOf :: a -> Int and poke's
+        -- IO () stay False.  Structural — no IO/CInt name list.
+        resultCarriesClassParam (TyArrow _ b)    = resultCarriesClassParam b
+        resultCarriesClassParam (TyForall _ _ t) = resultCarriesClassParam t
+        resultCarriesClassParam (TyVar _)        = True
+        resultCarriesClassParam (TyApp _ x)      = resultCarriesClassParam x
+        resultCarriesClassParam _                = False
 
         lookupClassMethodScheme = do
             sigs <- readIORef globalTypeSigsRef
@@ -5856,6 +6933,27 @@ classMethodDispatcher reg cls methodName
         v' <- apply legacyHooks v t
         applyAll v' ts
 
+    -- Result-poly instance chosen without a dispatchable first-arg tag
+    -- (unwrapped parser newtype, leftover VClassMethod).  Publish the
+    -- selected carrier so a subsequent `pure` / `return` operand is
+    -- annotated after this combinator returns.  Prefer an enclosing
+    -- do-carrier; otherwise the first result-poly default tag (the
+    -- instance we just selected).  No combinator name list.
+    applyResultPolyWithCarrier :: Val -> [Thunk] -> IO Val
+    applyResultPolyWithCarrier v args = do
+        mDo <- currentDoCarrier
+        mExpected <- readExpectedResultTag
+        let defaults = resultPolymorphicDefaultTags cls methodName
+            usable c = not (BC.null c) && isConcreteTyTag c
+            tag = case mDo of
+                Just c | usable c -> c
+                _ -> case mExpected of
+                    Just c | usable (normalizeTyTag c) -> normalizeTyTag c
+                    _ -> case defaults of
+                        (t:_) -> t
+                        []    -> BC.empty
+        applyAllForTag tag v args
+
     -- While an Alternative/Monad/MonadParsec method runs on a concrete
     -- carrier (ParsecT, …), publish that tag as the do-carrier.  Source
     -- `many` / `(<|>)` close `\s cok … -> unParser n` over a lazy
@@ -5879,16 +6977,99 @@ classMethodDispatcher reg cls methodName
         Just (ch, _) -> (ch >= 'A' && ch <= 'Z') || ch == '[' || ch == '('
         Nothing      -> False
 
+    -- Stream-family only.  Every successful class dispatch used to
+    -- overwrite this (Int / Char / Bool after take1_), so a later
+    -- @Proxy :: Proxy s@ with no payload recovered the wrong tag
+    -- and VisualStream.showTokens leftover-returned a VFun.
+    -- parseErrorTextPretty then did @orList leftover <> "\n"@.
+    -- Same detector as 'isStreamPreDispatchArg'.
+    isStreamFamilyClass c =
+        c `elem` map BC.pack ["Stream", "VisualStream", "TraversableStream"]
+
+    -- ShareInput/NoShareInput are Stream wrappers (already peeled in
+    -- classifyClassArg).  VisualStream / TraversableStream instances
+    -- live on the inner stream.
+    unwrapStreamWrapperTag t
+        | BC.pack "ShareInput " `BC.isPrefixOf` t = BC.drop 11 t
+        | BC.pack "NoShareInput " `BC.isPrefixOf` t = BC.drop 13 t
+        | otherwise = t
+
+    isStreamWrapperTag t
+        | t == BC.pack "ShareInput" || t == BC.pack "NoShareInput" = True
+        | BC.pack "ShareInput " `BC.isPrefixOf` t = True
+        | BC.pack "NoShareInput " `BC.isPrefixOf` t = True
+        | otherwise = False
+
     applyAllForTag :: ByteString -> Val -> [Thunk] -> IO Val
     applyAllForTag tag v args = do
-        when (usefulProxyPayloadTag tag) $
-            writeIORef lastDispatchTagRef (Just tag)
+        -- Record the *user* stream (Text), not ShareInput/NoShareInput
+        -- wrappers.  take1_ on the wrapper overwrote last=Text and
+        -- VisualStream.showTokens then looked up the wrapper (no
+        -- instance) and leftover-returned.  Proxy s in
+        -- parseErrorTextPretty has no payload; last tag is s.
+        -- Only record a tag that this Stream-family class actually
+        -- has an instance for.  TraversableStream.reachOffset sees
+        -- PosState after the delayed Int; recording that would clobber
+        -- Text and VisualStream.showTokens / orList leftover-return
+        -- into :/[] .  No pretty / sortWith / (.) name list.
+        when (usefulProxyPayloadTag tag && isStreamFamilyClass cls) $ do
+            hit <- streamInstanceHit (unwrapStreamWrapperTag tag)
+            when hit $
+                writeIORef lastDispatchTagRef (Just (unwrapStreamWrapperTag tag))
         if shouldCoerceFloatArgs tag
             then do
                 args' <- mapM (coerceFloatArgThunk tag) args
                 applied <- applyAllWithCarrier cls tag v args'
                 pure (wrapFloatArgFunction tag applied)
-            else applyAllWithCarrier cls tag v args
+            else if shouldPromoteIntArgs tag
+                then do
+                    args' <- mapM (promoteIntArgThunk tag) args
+                    applied <- applyAllWithCarrier cls tag v args'
+                    pure (wrapIntLiteralFunction tag applied)
+                else applyAllWithCarrier cls tag v args
+
+    shouldPromoteIntArgs :: ByteString -> Bool
+    shouldPromoteIntArgs tag =
+        not (isDefaultNumTag tag)
+        && case BC.unpack cls of
+            "Eq" ->
+                methodName `elem` map BC.pack ["==", "/="]
+            "Ord" ->
+                methodName `elem` map BC.pack
+                    ["compare", "<", "<=", ">", ">="]
+            "Num" ->
+                methodName `elem` map BC.pack ["+", "-", "*"]
+            _ ->
+                False
+
+    promoteIntArgThunk :: ByteString -> Thunk -> IO Thunk
+    promoteIntArgThunk tag t = do
+        v <- force legacyHooks t
+        mDo <- currentDoCarrier
+        let blocked = case mDo of
+                Just c -> normalizeTyTag tag == normalizeTyTag c
+                Nothing -> False
+        if isBareIntVal v && not blocked
+            then do
+                mPromoted <- tryPromoteIntViaFromInteger reg [tag] v
+                case mPromoted of
+                    Just promoted -> newWHNFThunk promoted
+                    Nothing       -> newWHNFThunk v
+            else newWHNFThunk v
+
+    wrapIntLiteralFunction :: ByteString -> Val -> Val
+    wrapIntLiteralFunction tag (VFun f) =
+        VFun $ \nextT -> do
+            nextT' <- promoteIntArgThunk tag nextT
+            result <- f nextT'
+            pure (wrapIntLiteralFunction tag result)
+    wrapIntLiteralFunction tag (VFunIP ipm f) =
+        VFunIP ipm $ \callIpm nextT -> do
+            nextT' <- promoteIntArgThunk tag nextT
+            result <- f callIpm nextT'
+            pure (wrapIntLiteralFunction tag result)
+    wrapIntLiteralFunction _ other =
+        other
 
     -- Source-loaded primitive numeric instances pattern-match on F#/D# for
     -- every homogeneous argument.  In optimistic mode an integer literal in
@@ -5945,6 +7126,36 @@ classMethodDispatcher reg cls methodName
                        && t /= BC.pack "<IO>"
                        && t /= BC.pack "()"
                        && not (BC.pack "<" `BC.isPrefixOf` t)
+
+    isTypeVarTag :: ByteString -> Bool
+    isTypeVarTag t = case BC.uncons t of
+        Just (c, rest) -> c >= 'a' && c <= 'z'
+                       && BC.all isTyVarChar rest
+        Nothing -> False
+      where
+        isTyVarChar c = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                     || (c >= '0' && c <= '9') || c == '_' || c == '\''
+
+    stringSynonymAlt :: ByteString -> Maybe ByteString
+    stringSynonymAlt t
+        | t == BC.pack "String" = Just (BC.pack "[Char]")
+        | t == BC.pack "[Char]" = Just (BC.pack "String")
+        | otherwise = Nothing
+
+    -- A typed tag that is only a type synonym (Html = Markup) is not
+    -- an instance head.  Expand one hop through the global synonym
+    -- table so a facade-pinned result alias can still see the real
+    -- instance key.  Fail closed: unknown tags stay a miss.
+    synonymDispatchAlt :: ByteString -> Maybe ByteString
+    synonymDispatchAlt t = unsafePerformIO $ do
+        syns <- readIORef globalTypeSynonymsRef
+        case Map.lookup t syns of
+            Just (TypeSynonym [] rhs) -> do
+                let expanded = typeDispatchTag (expandTypeSynonyms syns rhs)
+                pure $ if BC.null expanded || expanded == t
+                    then Nothing
+                    else Just expanded
+            _ -> pure Nothing
 
     dispatchTagForValue :: ByteString -> ByteString
     dispatchTagForValue tag
@@ -6243,10 +7454,16 @@ evalDefaultMethodWith registry searchPath includeMap env lm rewrites lhs = do
 -- needs while still loading the binding from source.
 lowerHashDotCoerce :: ByteString -> Expr -> Expr
 lowerHashDotCoerce name expr
-    | name == BC.pack "#."
+    | isHashDotName name
     , isHashDotCoerceBody expr = hashDotCompositionExpr
     | otherwise = expr
   where
+    -- Bare @#.@, or a FQN such as @GHC.Internal.Data.Functor.Utils.#.@.
+    -- lastNameComponent splits on the last '.', so the FQN's last
+    -- component is empty and must be recognised by suffix.
+    isHashDotName n =
+        n == BC.pack "#." || BC.isSuffixOf (BC.pack ".#.") n
+
     isHashDotCoerceBody (ELam _ (EVar v)) = isCoerceName v
     isHashDotCoerceBody _                 = False
 
@@ -6386,7 +7603,7 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 wrapNullaryResultSig :: Map ByteString TypeSynonym -> LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig syns lm n e =
     let e' = annotateBindInputTypes e
-    in case e' of
+    in annotateMonadicCarrier syns lm n $ case e' of
         _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
           , hasRankPolyConstructorPattern lm e'
           , Just tyBytes <- renderTypeForAnnotation body
@@ -6411,26 +7628,48 @@ wrapNullaryResultSig syns lm n e =
           , Just tyBytes <- renderTypeForAnnotation resultTy
           -> ETyApp e' tyBytes
         -- Same wrap for result-polymorphic `pure` / `return` / `empty`
-        -- on a non-IO CAF (`p :: Parser Char; p = pure 'z'`).  Expand
-        -- type synonyms before choosing the carrier: @Parser@ is
-        -- @Parsec Void Text@ is @ParsecT e s Identity@, and dispatch
-        -- is by the constructor head (ParsecT), not the synonym.
-        -- No name list of @Parser@/@ParsecT@.  IO is already the
-        -- result-poly default; wrapping it would re-elaborate `main`.
-        -- Fail-closed at eval (tryElaborateTyAnn).
+        -- on a non-IO CAF (`p :: Parser Char; p = pure 'z'`).  Also
+        -- used-apply (`use _ = empty <|> pure 'z'`): the arity-0
+        -- restriction left leftover empty <|> leftover pure as a
+        -- function body that never dispatched.  Peel value arrows
+        -- and pin the *result* carrier inside the body (the walk
+        -- already enters ELam).  Expand type synonyms before choosing
+        -- the carrier: @Parser@ is @Parsec Void Text@ is
+        -- @ParsecT e s Identity@, and dispatch is by the constructor
+        -- head (ParsecT), not the synonym.  Skip tyvar heads
+        -- (`guard :: Alternative f => Bool -> f ()`) so a polymorphic
+        -- library body is not pinned to `f`.  No name list of
+        -- @Parser@/@ParsecT@.  IO is already the result-poly default;
+        -- wrapping it would re-elaborate `main`.  Fail-closed at eval
+        -- (tryElaborateTyAnn).
         _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
-          , ([], resultTy) <- tyArrowArgs body
+          , let (_, resultTy) = tyArrowArgs body
           , let expanded = expandTypeSynonyms syns resultTy
           , Just headName <- tyHead expanded
           , let carrier = lastNameComponent headName
           , carrier /= BC.pack "IO"
+          , isConcreteCarrierHead carrier
           , any (isResultPolyMethodName . lastNameComponent) (freeVars e')
-          -> let pinned = pinResultPolyCarrier carrier e'
-             in if pinned /= e'
-                    then pinned
-                    else case renderTypeForAnnotation expanded of
-                        Just tyBytes -> ETyApp e' tyBytes
-                        Nothing      -> e'
+            || exprHasDo e'
+            -- `p = updateParserState id`: last-writer scheme is the
+            -- instance method (not result-poly), so the free-var
+            -- check misses.  A direct unary class-method-shaped
+            -- apply at an applied carrier is the same shape as
+            -- `pure 'z'`.  Binary combinators stay unwrapped.
+            || isDirectUnaryClassApp e'
+          -> wrapResultPolyCAF expanded carrier e'
+        -- CAF whose RHS is a string literal (or *contains* one,
+        -- `parents = Set.fromList ["h1"]`) at a non-[Char] result
+        -- type: wrap so tryElaborateTyAnn can drive fromString from
+        -- the binding's result type.  `host :: Pref; host = "*4"`.
+        -- No HostPreference / Set / fromList name list.
+        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+          , ([], resultTy) <- tyArrowArgs body
+          , let expanded = expandTypeSynonyms syns resultTy
+          , not (Elab.isCharListType expanded)
+          , Elab.isStringLiteralExpr e' || exprHasStringLiteral e'
+          , Just tyBytes <- renderTypeForAnnotation expanded
+          -> ETyApp e' tyBytes
         -- Composition of a result-polymorphic class method, e.g.
         --   generalCategory :: Char -> GeneralCategory
         --   generalCategory = toEnum . GC.generalCategory
@@ -6449,8 +7688,192 @@ wrapNullaryResultSig syns lm n e =
           -> ETyApp e' tyBytes
         _ -> e'
   where
+    -- After the pin walk, keep an ETyApp stamp on every EDo so evalDo
+    -- sees the CAF carrier on the first statement (`guard False` =
+    -- leftover `empty`).  pinResultPolyCarrier walks into do to pin
+    -- `pure`, which used to skip the whole-expr wrap.
+    stampDoCarrier carrier expr = case expr of
+        EDo ss -> ETyApp (EDo (map stampStmt ss)) carrier
+        ETyApp inner ty -> ETyApp (stampDoCarrier carrier inner) ty
+        EApp f x ->
+            EApp (stampDoCarrier carrier f) (stampDoCarrier carrier x)
+        ELet bs body ->
+            ELet [(n, stampDoCarrier carrier rhs) | (n, rhs) <- bs]
+                 (stampDoCarrier carrier body)
+        ELam n body -> ELam n (stampDoCarrier carrier body)
+        ECase s as ->
+            ECase (stampDoCarrier carrier s)
+                [Alt p (stampDoCarrier carrier rhs) | Alt p rhs <- as]
+        EIf c t f ->
+            EIf (stampDoCarrier carrier c)
+                (stampDoCarrier carrier t)
+                (stampDoCarrier carrier f)
+        _ -> expr
+      where
+        stampStmt (SExpr e) = SExpr (stampDoCarrier carrier e)
+        stampStmt (SBind n e) = SBind n (stampDoCarrier carrier e)
+        stampStmt (SBangBind n e) = SBangBind n (stampDoCarrier carrier e)
+        stampStmt (SLet bs) =
+            SLet [(n, stampDoCarrier carrier rhs) | (n, rhs) <- bs]
+        stampStmt (SImplicitLet bs) =
+            SImplicitLet [(n, stampDoCarrier carrier rhs) | (n, rhs) <- bs]
+
+    exprHasDo expr = case expr of
+        EDo _ -> True
+        ETyApp inner _ -> exprHasDo inner
+        EApp f x -> exprHasDo f || exprHasDo x
+        ELet bs body -> any (exprHasDo . snd) bs || exprHasDo body
+        ELam _ body -> exprHasDo body
+        ECase s as ->
+            exprHasDo s || any (\(Alt _ rhs) -> exprHasDo rhs) as
+        EIf c t f -> exprHasDo c || exprHasDo t || exprHasDo f
+        ELocalSig _ inner -> exprHasDo inner
+        _ -> False
+
+    isSingleStmtDo (EDo [SExpr _]) = True
+    isSingleStmtDo (EDo [SBind _ _]) = True
+    isSingleStmtDo (EDo [SBangBind _ _]) = True
+    isSingleStmtDo (ETyApp inner _) = isSingleStmtDo inner
+    isSingleStmtDo (ELocalSig _ inner) = isSingleStmtDo inner
+    isSingleStmtDo _ = False
+
+    -- Walk pins `pure x` with the constructor head.  Leftover bare
+    -- nullary methods (`empty` next to a pinned `pure`) keep the
+    -- standalone-CAF wrap: the full result type, not the head.
+    -- Pinning those operands with only the head looped.  Single-stmt
+    -- `do { pure }` still gets an outer ETyApp so evalDo sees the
+    -- carrier.  No combinator name list — the CAF result type *is*
+    -- the annotation.
+    wrapResultPolyCAF expanded carrier e0 =
+        let pinned = pinResultPolyCarrier carrier e0
+            leftovers = stampDoCarrier carrier
+                            (pinLeftoverBareResultPoly expanded pinned)
+        in if isSingleStmtDo leftovers
+               then case leftovers of
+                   ETyApp _ _ -> leftovers
+                   _ -> case renderTypeForAnnotation expanded of
+                       Just tyBytes -> ETyApp leftovers tyBytes
+                       Nothing      -> leftovers
+               else if leftovers /= e0
+                   then leftovers
+                   else case renderTypeForAnnotation expanded of
+                       Just tyBytes -> ETyApp e0 tyBytes
+                       Nothing      -> e0
+
+    -- Leftover bare result-poly methods after the head-pin walk.
+    -- `empty <|> (pure @Head 'z')` still has a leftover `empty`; a
+    -- standalone `p = empty` CAF is GREEN because the walk does not
+    -- change it and the whole-expr wrap uses the full result type.
+    -- Apply that same wrap to leftover operands.  Already-pinned
+    -- `pure @Head x` is left alone.
+    pinLeftoverBareResultPoly resultTy expr =
+        case renderTypeForAnnotation resultTy of
+            Nothing -> expr
+            Just tyBytes -> go expr
+              where
+                go e = case e of
+                    EVar nm
+                        | isResultPolyMethodName (lastNameComponent nm) ->
+                            ETyApp (EVar nm) tyBytes
+                    ETyApp inner@(EVar nm) ty
+                        | isResultPolyMethodName (lastNameComponent nm) ->
+                            ETyApp inner ty
+                    EApp f@(ETyApp (EVar nm) _) x
+                        | isResultPolyMethodName (lastNameComponent nm) ->
+                            EApp f (go x)
+                    ETyApp inner ty -> ETyApp (go inner) ty
+                    EApp f x -> EApp (go f) (go x)
+                    ELet bs body ->
+                        ELet [(n, go rhs) | (n, rhs) <- bs] (go body)
+                    ELam n body -> ELam n (go body)
+                    ECase s as ->
+                        ECase (go s) [Alt p (go rhs) | Alt p rhs <- as]
+                    EIf c t f -> EIf (go c) (go t) (go f)
+                    EDo ss -> EDo (map goStmt ss)
+                    _ -> e
+                goStmt (SExpr e) = SExpr (go e)
+                goStmt (SBind n e) = SBind n (go e)
+                goStmt (SBangBind n e) = SBangBind n (go e)
+                goStmt (SLet bs) = SLet [(n, go rhs) | (n, rhs) <- bs]
+                goStmt (SImplicitLet bs) =
+                    SImplicitLet [(n, go rhs) | (n, rhs) <- bs]
+
+    -- BuildStep a = BufferRange -> IO (BuildSignal a).  Stamp do /
+    -- >>= / >> with the peeled result head when that head is a
+    -- known monad (IO/ST/STM/Q).  evalDo then keeps the fill
+    -- callback as IO instead of defaulting leftover State# VFun
+    -- to ParsecT.  Does not wrap the whole function.  Skip
+    -- tyvars / tuples / lists / Maybe / Either / ParsecT.
+    annotateMonadicCarrier syns' lm' name expr =
+        case Map.lookup name (lmTypeSigs lm') of
+            Just (Scheme _ _ body) ->
+                let expanded = expandTypeSynonyms syns' body
+                    (_, resultTy) = tyArrowArgs expanded
+                in case tyHead resultTy of
+                    Just h
+                      | let c = lastNameComponent h
+                      , isKnownMonadicCarrier c
+                      -> stampMonadicCarrier c expr
+                    _ -> expr
+            Nothing -> expr
+
+    isKnownMonadicCarrier c =
+        c == BC.pack "IO" || c == BC.pack "ST"
+     || c == BC.pack "STM" || c == BC.pack "Q"
+
+    stampMonadicCarrier carrier expr = case expr of
+        EDo ss -> ETyApp (EDo (map stampStmt ss)) carrier
+        -- Stamp the whole bind so Eval publishes lastMonadicCarrier
+        -- (BuildStep peel → IO).  Also pin the operator: ETyApp
+        -- (>>=) @IO is skipped by tryElaborateTyAnn (sequencing
+        -- binds) and tags the dispatcher, so `nextBuffer Nothing >>=
+        -- fill` does not walk a leftover State# VFun and return
+        -- <function> to Finished/Yield1.  Only known monad heads
+        -- (IO/ST/STM/Q) reach here — not ParsecT.
+        EApp (EApp op a) b
+            | isBindSeqHead op ->
+                ETyApp (EApp (EApp (ETyApp op carrier)
+                                   (stampMonadicCarrier carrier a))
+                             (stampMonadicCarrier carrier b))
+                       carrier
+        EApp f x ->
+            EApp (stampMonadicCarrier carrier f) (stampMonadicCarrier carrier x)
+        ELet bs body ->
+            ELet [(bn, stampMonadicCarrier carrier rhs) | (bn, rhs) <- bs]
+                 (stampMonadicCarrier carrier body)
+        ELam bn body -> ELam bn (stampMonadicCarrier carrier body)
+        ETyApp inner ty -> ETyApp (stampMonadicCarrier carrier inner) ty
+        -- Local `fill :: BuildStep a -> Buffer -> IO t` is ELocalSig
+        -- around the lambda.  Walk through so the inner do / >>= is
+        -- stamped; the peel already chose IO from the parent scheme.
+        ELocalSig ty inner ->
+            ELocalSig ty (stampMonadicCarrier carrier inner)
+        ECase s as ->
+            ECase (stampMonadicCarrier carrier s)
+                [Alt p (stampMonadicCarrier carrier rhs) | Alt p rhs <- as]
+        EIf c t f ->
+            EIf (stampMonadicCarrier carrier c)
+                (stampMonadicCarrier carrier t)
+                (stampMonadicCarrier carrier f)
+        _ -> expr
+      where
+        stampStmt (SExpr e) = SExpr (stampMonadicCarrier carrier e)
+        stampStmt (SBind n e) = SBind n (stampMonadicCarrier carrier e)
+        stampStmt (SBangBind n e) = SBangBind n (stampMonadicCarrier carrier e)
+        stampStmt (SLet bs) =
+            SLet [(n, stampMonadicCarrier carrier rhs) | (n, rhs) <- bs]
+        stampStmt (SImplicitLet bs) =
+            SImplicitLet [(n, stampMonadicCarrier carrier rhs) | (n, rhs) <- bs]
+
+        isBindSeqHead op = case stripTyApps op of
+            EVar nm ->
+                let b = lastNameComponent nm
+                in b == BC.pack ">>=" || b == BC.pack ">>"
+                    || b == BC.pack "=<<"
+            _ -> False
+
     annotateBindInputTypes :: Expr -> Expr
-    annotateBindInputTypes = go
+    annotateBindInputTypes expr0 = go expr0
       where
         go expr = case expr of
             EApp (EApp op f) action
@@ -6479,6 +7902,7 @@ wrapNullaryResultSig syns lm n e =
             ERecordUpdate base fs ->
                 ERecordUpdate (go base) [(fn, go rhs) | (fn, rhs) <- fs]
             ETyApp inner ty -> ETyApp (go inner) ty
+            ELocalSig ty inner -> ELocalSig ty (go inner)
             other -> other
 
         goStmt stmt = case stmt of
@@ -6495,7 +7919,7 @@ wrapNullaryResultSig syns lm n e =
                     | actionHasTypedPeekShape rhs
                     , Just argTy <- firstUseAsArgType bn (EDo rest)
                     , Just tyBytes <- renderTypeForAnnotation
-                        (TyApp (TyCon (BC.pack "IO")) argTy)
+                        (TyApp (TyCon (BC.pack "IO")) (expandTypeSynonyms syns argTy))
                     -> SBind bn (annotateAction tyBytes rhs) : goDoStmts rest
                     | Just elemTy <- firstPtrElemType bn (EDo rest)
                     , Just tyBytes <- renderTypeForAnnotation
@@ -6508,7 +7932,7 @@ wrapNullaryResultSig syns lm n e =
                     | actionHasTypedPeekShape rhs
                     , Just argTy <- firstUseAsArgType bn (EDo rest)
                     , Just tyBytes <- renderTypeForAnnotation
-                        (TyApp (TyCon (BC.pack "IO")) argTy)
+                        (TyApp (TyCon (BC.pack "IO")) (expandTypeSynonyms syns argTy))
                     -> SBangBind bn (annotateAction tyBytes rhs) : goDoStmts rest
                     | Just elemTy <- firstPtrElemType bn (EDo rest)
                     , Just tyBytes <- renderTypeForAnnotation
@@ -6520,20 +7944,105 @@ wrapNullaryResultSig syns lm n e =
                 other ->
                     goStmt other : goDoStmts rest
 
-        annotateAction _ action@ETyApp{} = go action
-        annotateAction tyBytes action    = ETyApp (go action) tyBytes
+        annotateAction tyBytes action@ETyApp{} =
+            ETyApp (pinInnerTypedPeek tyBytes (go (tyAppInner action))) (tyAppTy action)
+        annotateAction tyBytes action =
+            ETyApp (pinInnerTypedPeek tyBytes (go action)) tyBytes
+
+        tyAppInner (ETyApp inner _) = inner
+        tyAppInner other            = other
+        tyAppTy (ETyApp _ ty) = ty
+        tyAppTy _             = BC.empty
+
+        -- `n :: CInt <- alloca $ \p -> peek p` / `alloca $ \p -> do
+        -- poke; peek p`.  PatternSignatures stamp the alloca action;
+        -- dest-first Storable.peek still needs the inner peek
+        -- ascription.  Structural: wrap peek of the alloca binder.
+        pinInnerTypedPeek destTy expr = case expr of
+            EApp (ELam n body) arg ->
+                EApp (ELam n (pinPeekIn destTy n body)) (pinInnerTypedPeek destTy arg)
+            EApp f x ->
+                EApp (pinInnerTypedPeek destTy f) (pinInnerTypedPeek destTy x)
+            ELam n body ->
+                ELam n (pinInnerTypedPeek destTy body)
+            EDo stmts ->
+                EDo (map (pinPeekStmt destTy) stmts)
+            ELet bs body ->
+                ELet [(bn, pinInnerTypedPeek destTy rhs) | (bn, rhs) <- bs]
+                     (pinInnerTypedPeek destTy body)
+            ETyApp inner ty ->
+                ETyApp (pinInnerTypedPeek destTy inner) ty
+            other -> other
+
+        pinPeekIn destTy pName expr = case expr of
+            EApp fn (EVar v)
+                | v == pName, isAnyPeekHead fn ->
+                    wrapPeekAscription destTy expr
+            EApp (EApp fn (EVar v)) off
+                | v == pName, isAnyPeekHead fn ->
+                    wrapPeekAscription destTy expr
+            EDo stmts ->
+                EDo (map (pinPeekStmt destTy) stmts)
+            EApp f x ->
+                EApp (pinPeekIn destTy pName f) (pinPeekIn destTy pName x)
+            ELam n body
+                | n /= pName -> ELam n (pinPeekIn destTy pName body)
+            ELet bs body ->
+                ELet [(bn, pinPeekIn destTy pName rhs) | (bn, rhs) <- bs]
+                     (pinPeekIn destTy pName body)
+            ETyApp inner ty ->
+                ETyApp (pinPeekIn destTy pName inner) ty
+            other -> pinInnerTypedPeek destTy other
+
+        pinPeekStmt destTy stmt = case stmt of
+            SExpr rhs        -> SExpr (pinInnerTypedPeek destTy rhs)
+            SBind bn rhs     -> SBind bn (pinInnerTypedPeek destTy rhs)
+            SBangBind bn rhs -> SBangBind bn (pinInnerTypedPeek destTy rhs)
+            SLet bs          ->
+                SLet [(bn, pinInnerTypedPeek destTy rhs) | (bn, rhs) <- bs]
+            SImplicitLet bs  ->
+                SImplicitLet [(bn, pinInnerTypedPeek destTy rhs) | (bn, rhs) <- bs]
+
+        wrapPeekAscription destTy peekExpr =
+            case peekExpr of
+                ETyApp{} -> peekExpr
+                _        -> ETyApp peekExpr (ioDestAscription destTy)
+
+        ioDestAscription destTy
+            | BC.isPrefixOf (BC.pack "IO ") destTy = destTy
+            | destTy == BC.pack "IO"               = destTy
+            | otherwise                            = BC.append (BC.pack "IO ") destTy
 
     actionHasTypedPeekShape :: Expr -> Bool
     actionHasTypedPeekShape expr = case stripTyApps expr of
         EApp (EApp fn _) _
-            | isTypedPeekHead fn -> True
+            | isAnyPeekHead fn -> True
+        EApp fn _
+            | isAnyPeekHead fn -> True
         EApp (ELam n body) _ ->
-            case stripTyApps body of
-                EApp (EApp fn (EVar v)) _
-                    | v == n
-                    , isTypedPeekHead fn -> True
-                _ -> False
+            peekMentionsBinder n body
+        EDo stmts ->
+            any peekInStmt stmts
         _ -> False
+
+    peekMentionsBinder n body = case stripTyApps body of
+        EApp (EApp fn (EVar v)) _
+            | v == n, isAnyPeekHead fn -> True
+        EApp fn (EVar v)
+            | v == n, isAnyPeekHead fn -> True
+        EDo stmts -> any peekInStmt stmts
+        EApp f x -> peekMentionsBinder n f || peekMentionsBinder n x
+        ELam n' b | n' /= n -> peekMentionsBinder n b
+        ELet bs b ->
+            any (peekMentionsBinder n . snd) bs || peekMentionsBinder n b
+        _ -> False
+
+    peekInStmt stmt = case stmt of
+        SExpr rhs        -> actionHasTypedPeekShape rhs
+        SBind _ rhs      -> actionHasTypedPeekShape rhs
+        SBangBind _ rhs  -> actionHasTypedPeekShape rhs
+        SLet bs          -> any (actionHasTypedPeekShape . snd) bs
+        SImplicitLet bs  -> any (actionHasTypedPeekShape . snd) bs
 
     firstArgType :: Expr -> Maybe Type
     firstArgType expr = case expr of
@@ -6542,14 +8051,30 @@ wrapNullaryResultSig syns lm n e =
             case tyArrowArgs body of
                 (argTy : _, _) -> Just argTy
                 _              -> Nothing
+        EApp{} -> do
+            (fn, supplied) <- appliedVar expr
+            Scheme _ _ body <- lookupSig fn
+            let (args, _) = tyArrowArgs body
+            if supplied < length args then Just (args !! supplied) else Nothing
         ETyApp inner _ -> firstArgType inner
         ELam n body    -> firstUseAsArgType n body
         _ -> Nothing
+      where
+        appliedVar = goApplied 0
+        goApplied count (EApp f _) = goApplied (count + 1) f
+        goApplied count (ETyApp f _) = goApplied count f
+        goApplied count (EVar fn) = Just (fn, count)
+        goApplied _ _ = Nothing
 
     firstUseAsArgType :: ByteString -> Expr -> Maybe Type
     firstUseAsArgType n expr = case expr of
         EApp fn (EVar v)
-            | v == n -> firstArgType fn
+            | v == n -> firstArgType fn >>= concreteUseType
+        -- `case family :: CSaFamily of` / `fromIntegral (n :: CInt)`:
+        -- dest type is the ascription itself.  Walking through ETyApp
+        -- to EVar used to drop it (EVar → Nothing).
+        ETyApp (EVar v) tyBytes
+            | v == n -> Elab.parseRawTypeExpr tyBytes
         EApp f x ->
             firstUseAsArgType n f <|> firstUseAsArgType n x
         ELam n' body
@@ -6568,7 +8093,7 @@ wrapNullaryResultSig syns lm n e =
         ETuple xs ->
             firstInExprs xs
         ERecordCon _ fs ->
-            firstInExprs (map snd fs)
+            firstRecordFieldUse fs <|> firstInExprs (map snd fs)
         ERecordUpdate base fs ->
             firstUseAsArgType n base <|> firstInExprs (map snd fs)
         ESplice inner ->
@@ -6577,12 +8102,32 @@ wrapNullaryResultSig syns lm n e =
             firstUseAsArgType n inner
         ETyApp inner _ ->
             firstUseAsArgType n inner
+        ELocalSig _ inner ->
+            firstUseAsArgType n inner
         EImplicitLet bs body ->
             firstInBinds bs <|> if shadows bs then Nothing else firstUseAsArgType n body
         _ -> Nothing
       where
+        -- A polymorphic first use such as @ptr == nullPtr@ carries no
+        -- useful destination information.  Keep walking to the later
+        -- monomorphic use (e.g. recursive @go ptr@ where
+        -- @go :: Ptr AddrInfo -> ...@).
+        concreteUseType ty = case tyHead ty >>= BC.uncons . lastNameComponent of
+            Just (c, _) | c >= 'A' && c <= 'Z' -> Just ty
+            _ -> Nothing
         shadows bs = any ((== n) . fst) bs
         firstInExprs = foldr ((<|>) . firstUseAsArgType n) Nothing
+        firstRecordFieldUse [] = Nothing
+        firstRecordFieldUse ((field, EVar v) : rest)
+            | v == n = fieldResultType field <|> firstRecordFieldUse rest
+        firstRecordFieldUse (_ : rest) = firstRecordFieldUse rest
+        fieldResultType field = do
+            entries <- Map.lookup field (lmFieldSchemes lm)
+                <|> Map.lookup (lastNameComponent field) (lmFieldSchemes lm)
+            Scheme _ _ body <- case entries of
+                ((_, scheme) : _) -> Just scheme
+                _                 -> Nothing
+            pure (snd (tyArrowArgs body))
         firstInBinds = firstInExprs . map snd . filter ((/= n) . fst)
         firstInAlts = foldr ((<|>) . firstAlt) Nothing
         firstAlt (Alt pat rhs)
@@ -6617,9 +8162,60 @@ wrapNullaryResultSig syns lm n e =
                     firstInBinds bs <|>
                         if shadows bs then Nothing else firstInStmts rest
 
+    localSigTypes = collectLocalSigTypes e
+
+    collectLocalSigTypes expr = case expr of
+        ELet bs body -> Map.unions
+            (map bindingSig bs ++ map (collectLocalSigTypes . snd) bs
+             ++ [collectLocalSigTypes body])
+        ELam _ body -> collectLocalSigTypes body
+        EApp f x -> Map.union (collectLocalSigTypes f) (collectLocalSigTypes x)
+        ECase s as -> Map.unions (collectLocalSigTypes s
+            : [collectLocalSigTypes rhs | Alt _ rhs <- as])
+        EIf c t f -> Map.unions (map collectLocalSigTypes [c,t,f])
+        EDo ss -> Map.unions (map stmtSigs ss)
+        ELocalSig _ inner -> collectLocalSigTypes inner
+        ETyApp inner _ -> collectLocalSigTypes inner
+        _ -> Map.empty
+      where
+        bindingSig (bn, ELocalSig ty _) =
+            maybe Map.empty (Map.singleton bn) (Elab.parseRawTypeExpr ty)
+        bindingSig _ = Map.empty
+        stmtSigs (SExpr x) = collectLocalSigTypes x
+        stmtSigs (SBind _ x) = collectLocalSigTypes x
+        stmtSigs (SBangBind _ x) = collectLocalSigTypes x
+        stmtSigs (SLet bs) = Map.unions
+            (map bindingSig bs ++ map (collectLocalSigTypes . snd) bs)
+        stmtSigs (SImplicitLet bs) = Map.unions (map (collectLocalSigTypes . snd) bs)
+
     lookupSig fn =
         Map.lookup fn (lmTypeSigs lm)
         <|> Map.lookup (lastNameComponent fn) (lmTypeSigs lm)
+        <|> (Scheme [] [] <$> Map.lookup fn localSigTypes)
+        <|> (Scheme [] [] <$> Map.lookup (lastNameComponent fn) localSigTypes)
+        <|> recordConstructorScheme fn
+        <|> constructorScheme (lmConstructorTypes lm) (Just (lmName lm)) fn
+        <|> unsafePerformIO (do
+                registry <- readIORef globalConstructorTypeRegistryRef
+                pure (constructorScheme registry (Just (lmName lm)) fn))
+
+    recordConstructorScheme requested = do
+        let ctor = lastNameComponent requested
+            fields = sortOn (\(idx, _, _) -> idx)
+                [ (idx, fieldTy, recordTy)
+                | (field, ctorSlots) <- Map.toList (lmFieldReg lm)
+                , (slotCtor, idx) <- ctorSlots
+                , lastNameComponent slotCtor == ctor
+                , selectorEntries <- maybeToList (Map.lookup field (lmFieldSchemes lm))
+                , (_, Scheme _ _ selectorBody) <- selectorEntries
+                , let (selectorArgs, fieldTy) = tyArrowArgs selectorBody
+                , recordTy <- take 1 selectorArgs
+                ]
+        case fields of
+            [] -> Nothing
+            ((_, _, resultTy) : _) ->
+                Just (Scheme [] [] (foldr TyArrow resultTy
+                    [fieldTy | (_, fieldTy, _) <- fields]))
 
     firstPtrElemType :: ByteString -> Expr -> Maybe Type
     firstPtrElemType n expr = case expr of
@@ -6726,10 +8322,11 @@ wrapNullaryResultSig syns lm n e =
             ETyApp inner _ -> isBind inner
             _ -> False
 
-    isTypedPeekHead op =
+    isAnyPeekHead op =
         case op of
-            EVar name -> lastNameComponent name `elem` map BC.pack ["peekByteOff", "peekElemOff"]
-            ETyApp inner _ -> isTypedPeekHead inner
+            EVar name -> lastNameComponent name `elem`
+                map BC.pack ["peek", "peekByteOff", "peekElemOff"]
+            ETyApp inner _ -> isAnyPeekHead inner
             _ -> False
 
     isPokeElemOffHead op =
@@ -6743,6 +8340,25 @@ wrapNullaryResultSig syns lm n e =
             ETyApp inner _ -> stripTyApps inner
             other          -> other
 
+    -- `fromList ["h1", …]` contains string lits; the whole-expr
+    -- `isStringLiteralExpr` is only true for a bare `"…"` / `[]`.
+    exprHasStringLiteral expr = case expr of
+        e | Elab.isStringLiteralExpr e -> True
+        ETyApp inner _ -> exprHasStringLiteral inner
+        EApp f x -> exprHasStringLiteral f || exprHasStringLiteral x
+        ELet bs body ->
+            any (exprHasStringLiteral . snd) bs || exprHasStringLiteral body
+        ELam _ body -> exprHasStringLiteral body
+        ECase s as ->
+            exprHasStringLiteral s
+            || any (\(Alt _ rhs) -> exprHasStringLiteral rhs) as
+        EIf c t f ->
+            exprHasStringLiteral c || exprHasStringLiteral t
+            || exprHasStringLiteral f
+        ELocalSig _ inner -> exprHasStringLiteral inner
+        ETuple es -> any exprHasStringLiteral es
+        _ -> False
+
     isNullaryClassMethodName nm =
         nm == BC.pack "maxBound"
      || nm == BC.pack "minBound"
@@ -6752,19 +8368,72 @@ wrapNullaryResultSig syns lm n e =
         nm == BC.pack "pure"
      || nm == BC.pack "return"
      || nm == BC.pack "empty"
+     || nm == BC.pack "fromString"
 
-    -- Pin `pure x` / `return x` / bare `empty` to the expanded carrier
-    -- head, matching the GREEN do-carrier path (`pure @ParsecT x`).
-    -- Does not walk `$` / other spines; those keep the ETyApp wrap.
+    -- Pin `pure x` / `return x` to the expanded carrier head, matching
+    -- the GREEN do-carrier path (`pure @ParsecT x`).  Walk application
+    -- / result-position spines so a combinator operand (`pure 'a' <|>
+    -- pure 'b'`, `p *> pure ()`) is pinned too.  Without the walk the
+    -- CAF wrap became `ETyApp` of the whole `<|>` and the operands
+    -- defaulted to IO — `unParser` then saw `(#,#)`.  No combinator
+    -- name list: the CAF result type *is* the carrier.
+    -- Unary result-poly (`pure`/`return`/`fromString`) is pinned as
+    -- `EApp`; a bare `fromString` stays unpinned so first-class uses
+    -- (`map fromString`) keep their own result type.  Nullary
+    -- `empty` is pinned as `empty @carrier` so `empty <|> p` does
+    -- not stay a leftover class method.
+    isNullaryResultPolyMethodName nm = nm == BC.pack "empty"
+
+    -- Constructor-headed carrier after synonym expansion.  Tyvar
+    -- leftovers (`f` from `Alternative f => Bool -> f ()`) must not
+    -- pin a polymorphic library body.
+    isConcreteCarrierHead tag = case BC.uncons tag of
+        Just (c, _) -> (c >= 'A' && c <= 'Z') || c == '[' || c == '('
+        Nothing     -> False
+
+    -- Unary apply (`f x`, not `f x y`).  Binary combinators
+    -- (`space *> char`) stay unwrapped.  No method name list.
+    isDirectUnaryClassApp expr = case expr of
+        ETyApp inner _ -> isDirectUnaryClassApp inner
+        EApp (EVar _) x -> not (isAppHead x)
+        EApp (ETyApp (EVar _) _) x -> not (isAppHead x)
+        _ -> False
+      where
+        isAppHead (EApp _ _) = True
+        isAppHead (ETyApp inner _) = isAppHead inner
+        isAppHead _ = False
+
     pinResultPolyCarrier carrier expr = case expr of
         EApp (EVar nm) x
             | isResultPolyMethodName (lastNameComponent nm) ->
-                EApp (ETyApp (EVar nm) carrier) x
+                EApp (ETyApp (EVar nm) carrier) (pinResultPolyCarrier carrier x)
         EVar nm
-            | isResultPolyMethodName (lastNameComponent nm) ->
+            | isNullaryResultPolyMethodName (lastNameComponent nm) ->
                 ETyApp (EVar nm) carrier
         ETyApp inner ty -> ETyApp (pinResultPolyCarrier carrier inner) ty
+        EApp f x ->
+            EApp (pinResultPolyCarrier carrier f) (pinResultPolyCarrier carrier x)
+        ELet bs body ->
+            ELet [(n, pinResultPolyCarrier carrier rhs) | (n, rhs) <- bs]
+                 (pinResultPolyCarrier carrier body)
+        ELam n body -> ELam n (pinResultPolyCarrier carrier body)
+        ECase s as ->
+            ECase (pinResultPolyCarrier carrier s)
+                [Alt p (pinResultPolyCarrier carrier rhs) | Alt p rhs <- as]
+        EIf c t f ->
+            EIf (pinResultPolyCarrier carrier c)
+                (pinResultPolyCarrier carrier t)
+                (pinResultPolyCarrier carrier f)
+        EDo ss -> EDo (map pinStmt ss)
         _ -> expr
+      where
+        pinStmt (SExpr e) = SExpr (pinResultPolyCarrier carrier e)
+        pinStmt (SBind n e) = SBind n (pinResultPolyCarrier carrier e)
+        pinStmt (SBangBind n e) = SBangBind n (pinResultPolyCarrier carrier e)
+        pinStmt (SLet bs) =
+            SLet [(n, pinResultPolyCarrier carrier rhs) | (n, rhs) <- bs]
+        pinStmt (SImplicitLet bs) =
+            SImplicitLet [(n, pinResultPolyCarrier carrier rhs) | (n, rhs) <- bs]
 
     -- RHS is itself a composition (`f . g` / `GHC.Internal.Base.. f g`).
     isCompositionSpine expr = case stripTyApps expr of
@@ -6962,12 +8631,12 @@ ffiBuiltinNames = Set.fromList
     , "newAlignedPinnedByteArray#", "byteArrayContents#"
     -- Storable peek/poke methods source-load through the class.  The bare
     -- host fallbacks remain in the base env for optimistic raw-pointer cases.
-    , "socket"
-    , "setSocketOption"
-    , "listen"
-    , "accept"
-    , "getSocketName"
-    , "bind"
+    -- Network.Socket.socket / accept / bind / listen / setSocketOption /
+    -- getSocketName source-load from Syscall/Options/Name.  They must
+    -- NOT be pinned: a pin without a host builtin drops the facade
+    -- re-export sentinel and library NS.socket hangs (bindPortTCP,
+    -- Warp defaultAccept).
+
     -- Both 'plusForeignPtr' and 'minusForeignPtr' are pure Haskell
     -- definitions (data-ctor pattern match + 'plusAddr#' / 'minusAddr#').
     -- Source-loaded; round-tripped via 'foreignPtrValToForeignPtr'.
@@ -7223,7 +8892,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
       where
         neededBareName key
             | not (impQualified imp)
-            , not (BC.elem '.' key)
+            , not (nameIsModuleQualified key)
             = do
                 allowed <- specAllowsLoaded tm (impSpec imp) key
                 pure (if allowed then Just key else Nothing)
@@ -7245,7 +8914,7 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
       where
         neededBareName key
             | not (impQualified imp)
-            , not (BC.elem '.' key)
+            , not (nameIsModuleQualified key)
             , specAllows (impSpec imp) key
             = Just key
             | otherwise =
@@ -7482,7 +9151,9 @@ rewriteExpr rw = go []
                 bs'    = [(n, go bound' b) | (n, b) <- bs]
             in EImplicitLet bs' (go bound' e)
         ESplice inner   -> ESplice (go bound inner)
-        EQuote inner    -> EQuote inner   -- Phase 2.12: body is not evaluated; no free vars to rename
+        -- Quoted names stay as written; rewrite only evaluated splice holes
+        -- so `$element` sees the same renamed binding as the enclosing let.
+        EQuote inner    -> EQuote (rewriteQuoteHoles go bound inner)
         -- QuasiQuoter: rewrite the QQ function name like any free EVar;
         -- the body bytes are opaque.
         EQuasiQuote n b
@@ -7756,7 +9427,7 @@ buildAliases registry _searchPath _includeMap entry slots qualPairs = do
       where
         neededBareName key
             | not (impQualified imp)
-            , not (BC.elem '.' key)
+            , not (nameIsModuleQualified key)
             , specAllows (impSpec imp) key
             = Just key
             | otherwise =
@@ -8039,8 +9710,14 @@ hasNoFieldSelectors src =
 -- to work even when @{-# LANGUAGE NoFieldSelectors #-}@ suppresses the
 -- bare-name accessor.  The @$fldProj$@ prefix is non-parseable as a
 -- user identifier, so collision with user code is impossible.
+fieldProjPrefix :: ByteString
+fieldProjPrefix = BC.pack "$fldProj$"
+
 fieldProjName :: ByteString -> ByteString
-fieldProjName fname = BC.pack "$fldProj$" <> fname
+fieldProjName fname = fieldProjPrefix <> fname
+
+isFieldProjName :: ByteString -> Bool
+isFieldProjName n = fieldProjPrefix `BC.isPrefixOf` n
 
 -- | Partition a list of loaded modules' field registries into:
 --
@@ -8197,6 +9874,40 @@ visibleFieldRegistryFor registry searchPath includeMap lm mWanted = do
                             exported <- exportedFieldRegistry registry searchPath includeMap
                                             importedLm [lmName lm]
                             filterImportedFieldRegistry importedLm (impSpec imp) exported
+
+-- | Defining module of a field selector a facade exports via @T(..)@
+-- of an imported type.  @Network.HTTP.Types@ exports @Status(..)@
+-- (fields live in @Network.HTTP.Types.Status@); a qualified alias
+-- @H.statusCode@ must land on that provider so the normal field-accessor
+-- synthesis can run.  One hop, same walk as 'importedTypeFields'.
+findReexportedFieldDefiner
+    :: ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> LoadedModule
+    -> ByteString
+    -> IO (Maybe LoadedModule)
+findReexportedFieldDefiner registry searchPath includeMap facade bareName = do
+    exported <- exportedFieldRegistryForNames registry searchPath includeMap
+                    facade [] [bareName]
+    if Map.null exported
+        then pure Nothing
+        else go (mhImports (lmHeader facade))
+  where
+    go [] = pure Nothing
+    go (imp:rest)
+        | impQualified imp = go rest
+        | otherwise = do
+            r <- try (loadModule registry searchPath includeMap (impModule imp))
+                    :: IO (Either SomeException LoadedModule)
+            case r of
+                Left _ -> go rest
+                Right targetLm
+                    | Map.member bareName (lmFieldReg targetLm)
+                    , not (lmNoFieldSelectors targetLm)
+                    , exportsName targetLm bareName
+                    -> pure (Just targetLm)
+                    | otherwise -> go rest
 
 exportedFieldRegistryForNames
     :: ModuleRegistry
@@ -8856,6 +10567,8 @@ resetPerRunGlobals = do
     writeIORef globalConstructorTypeRegistryRef Map.empty
     resetSelectorFieldTypes
     clearExpectedResultTag
+    clearExpectedExceptionTag
+    writeIORef lastDispatchTagRef Nothing
     clearInstanceScope
     clearSuperclasses
     clearCtorStrictness
@@ -9333,30 +11046,57 @@ resolveTypeSigMetadata mOwner requested = do
                             | imp <- mhImports (lmHeader owner)
                             , case mQual of
                                 Nothing -> not (impQualified imp)
-                                Just q  -> q == fromMaybe (impModule imp) (impAlias imp)
+                                Just q  ->
+                                    q == impModule imp
+                                    || q == fromMaybe (impModule imp) (impAlias imp)
                             ]
-                    -- Class methods such as @*>@ / @>>=@ / @==@ live on
-                    -- boot-library class decls.  An entry that also
-                    -- imports a large facade (Text.Megaparsec, TH)
-                    -- would otherwise walk that facade's ExportModule
-                    -- graph for the same method and never return.
-                    -- Prefer a scheme already sitting on a loaded
-                    -- class declaration, then a bounded preludeScope
-                    -- probe, before any facade walk.
-                    mClassScheme <- lookupLoadedClassMethodScheme
-                        registry searchPath includeMap owner bare
-                    case mClassScheme of
-                        Just scheme -> pure (Just scheme)
-                        Nothing -> do
-                            -- Prefer a scheme declared in a direct import
-                            -- (Text.Megaparsec.Char.string) before walking
-                            -- an earlier facade's ExportModule graph
-                            -- (Text.Megaparsec → Combinators → …).
-                            locals <- concat <$> mapM (fromImportLocal seen' bare) imports
-                            candidates <- if null locals
-                                then concat <$> mapM (fromImport seen' bare) imports
-                                else pure locals
-                            selectCompatible candidates
+                    -- Prefer a scheme declared in a direct import
+                    -- (Text.Megaparsec.Char.string) before walking
+                    -- an earlier facade's ExportModule graph
+                    -- (Text.Megaparsec → Combinators → …).
+                    locals <- concat <$> mapM (fromImportLocal seen' bare) imports
+                    -- Qualified ordinary bindings (Data.Set.fromList)
+                    -- share a bare name with a result-poly class method
+                    -- (IsList.fromList).  A qualifier that provides a
+                    -- local scheme wins so InferFreely does not take
+                    -- the last-writer class scheme.  Bare class methods
+                    -- (@*>@ / @>>=@ / @pure@) still consult loaded
+                    -- class decls below.  No fromList name list.
+                    if not (null locals) && isJust mQual
+                        then selectCompatible locals
+                        else if isJust mQual || any ((/= ImportAll) . impSpec) imports
+                            then do
+                                -- An explicit/qualified import is a bounded,
+                                -- lexical route to the requested method.  Walk
+                                -- it before consulting process-global loaded
+                                -- class declarations: unrelated classes may
+                                -- legally use the same child name, and load
+                                -- order must not select one of them.
+                                candidates <- concat <$>
+                                    mapM (fromImport seen' bare) imports
+                                selected <- selectCompatible candidates
+                                case selected of
+                                    Just scheme -> pure (Just scheme)
+                                    Nothing -> lookupLoadedClassMethodScheme
+                                        registry searchPath includeMap owner bare
+                        else do
+                            -- Class methods such as @*>@ / @>>=@ / @==@ live on
+                            -- boot-library class decls.  An entry that also
+                            -- imports a large facade (Text.Megaparsec, TH)
+                            -- would otherwise walk that facade's ExportModule
+                            -- graph for the same method and never return.
+                            -- Prefer a scheme already sitting on a loaded
+                            -- class declaration, then a bounded preludeScope
+                            -- probe, before any facade walk.
+                            mClassScheme <- lookupLoadedClassMethodScheme
+                                registry searchPath includeMap owner bare
+                            case mClassScheme of
+                                Just scheme -> pure (Just scheme)
+                                Nothing -> do
+                                    candidates <- if null locals
+                                        then concat <$> mapM (fromImport seen' bare) imports
+                                        else pure locals
+                                    selectCompatible candidates
       where
         fromImportLocal _seen' bare imp = do
             loaded <- try (loadModule registry searchPath includeMap (impModule imp))
@@ -9729,14 +11469,6 @@ resolveFallback _mOwner name
     -- case-insensitive HTTP header keys.
     | BC.pack "CI." `BC.isPrefixOf` name =
         resolveFallback _mOwner (BC.pack "Data.CaseInsensitive." `BC.append` BC.drop 3 name)
-    -- warp imports Network.HTTP.Types as H and reaches Status field
-    -- accessors through that facade.  Route the record fields to their
-    -- defining module so the normal source field-accessor path can build
-    -- them from the Status data declaration.
-    | name == BC.pack "H.statusCode" =
-        resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusCode")
-    | name == BC.pack "H.statusMessage" =
-        resolveFallback _mOwner (BC.pack "Network.HTTP.Types.Status.statusMessage")
 resolveFallback mOwner name = do
     -- Builtins override the source-discovery path: an entry like
     -- @"Control.Exception.toException"@ in the base env (added by
@@ -9763,11 +11495,19 @@ resolveFallback mOwner name = do
             | BC.elem '.' name -> pure (Just t)
             | otherwise -> do
                 definedLocally <- ownerDefinesLocalBare mOwner name
-                if not definedLocally
-                    then pure (Just t)
-                    else do
+                noImplicit <- ownerHasNoImplicitPrelude mOwner
+                -- NoImplicitPrelude owners opted out of Prelude
+                -- last-writer.  After Stream/parse, baseEnv can hold a
+                -- leftover homonym: Foldable.toList's default
+                -- @toList t = build (\c n -> foldr c n t)@ printed
+                -- <function> because last-writer @build@ shadowed the
+                -- owner's @import GHC.Internal.Base hiding (foldr)@.
+                -- That blocked NE.sortWith / lift / parseErrorTextPretty.
+                if definedLocally || noImplicit
+                    then do
                         mSrc <- resolveFallbackSource mOwner name
                         pure (maybe (Just t) Just mSrc)
+                    else pure (Just t)
         Nothing -> resolveFallbackSource mOwner name
 
 -- | True when @name@ is a col-1 binding in the owning module.  Used
@@ -9785,6 +11525,17 @@ ownerDefinesLocalBare (Just ownerName) name = do
             topNames <- scanAllTopLevelNames (lmSource owner)
                 `catch` (\(_ :: SomeException) -> pure [])
             pure (name `elem` topNames)
+
+-- | True when the owning module declared @NoImplicitPrelude@.
+-- Those modules opted out of Prelude last-writer: a bare name
+-- must come from their explicit imports, not @envBaseForFallbackRef@.
+ownerHasNoImplicitPrelude :: Maybe ByteString -> IO Bool
+ownerHasNoImplicitPrelude Nothing = pure False
+ownerHasNoImplicitPrelude (Just ownerName) = do
+    mods <- readIORef globalLoadedModulesRef
+    pure $ case Map.lookup ownerName mods of
+        Just owner -> hasNoImplicitPrelude (lmSource owner)
+        Nothing    -> False
 
 -- | The ghc-bignum modules whose @bigNat*@ / @wordArray*@ helpers
 -- IHC host-shims (Natural-backed runtime, per
@@ -9942,11 +11693,27 @@ resolveFallbackSource mOwner name = do
                 mField <- tryGlobalFieldSlot mods bareName
                 case mField of
                     Just slot -> pure (Just slot)
-                    Nothing -> do
+                    Nothing
+                        -- `$fldProj$foo` is a synthetic record-dot key
+                        -- (see 'fieldProjName').  It is never a source
+                        -- binding.  Walking imported modules for that
+                        -- spelling loads a quoter's Parser/blaze graph
+                        -- and hangs (HSX `hsx.quoteExp` / EQuasiQuote).
+                        -- The accessor is installed by
+                        -- 'buildFieldAccessorEnv' once the record's
+                        -- module is loaded.
+                        | isFieldProjName bareName -> pure Nothing
+                        | otherwise -> do
                         mImportedField <- tryImportedFieldSlot mods bareName
                         case mImportedField of
                             Just slot -> pure (Just slot)
                             Nothing -> do
+                                -- Pattern-synonym builders before
+                                -- constructor / prelude walks: those
+                                -- walks load prelude modules and hung
+                                -- when the synonym was demanded from a
+                                -- ByteString consumer (bufferIO / PS).
+                                mPatSynEarly <- tryPatSynBuilderSlot mods bareName
                                 -- Constructors first: 'tryAnyModuleBareSlot'
                                 -- can spuriously match a constructor name
                                 -- via 'findOrResolveLhs' (it sees @TextNode
@@ -9956,9 +11723,11 @@ resolveFallbackSource mOwner name = do
                                 -- bogus slot.  Constructors live in
                                 -- 'lmDataReg' which is the authoritative
                                 -- source — check there first.
-                                mScopedCtor <- case mOwner >>= (`Map.lookup` mods) of
-                                    Just owner -> tryConstructorSlot mods owner bareName
-                                    Nothing -> pure Nothing
+                                mScopedCtor <- case mPatSynEarly of
+                                    Just slot -> pure (Just slot)
+                                    Nothing -> case mOwner >>= (`Map.lookup` mods) of
+                                        Just owner -> tryConstructorSlot mods owner bareName
+                                        Nothing -> pure Nothing
                                 mCtor <- case mScopedCtor of
                                     Just slot -> pure (Just slot)
                                     Nothing -> tryAnyModuleCtorSlot mods bareName
@@ -9977,6 +11746,11 @@ resolveFallbackSource mOwner name = do
                                    -- bootstrap, or builtins env-build —
                                    -- fall back to the unscoped global scan.
                                    mAny <- case mOwner of
+                                       Just _ | couldBeCtorName bareName ->
+                                           -- Already tried the declaring-
+                                           -- module patsyn builder.  Do
+                                           -- not walk imports/prelude.
+                                           pure Nothing
                                        Just o ->
                                            tryImportScopedBareSlot mods o bareName
                                        Nothing ->
@@ -10194,13 +11968,57 @@ resolveFallbackSource mOwner name = do
                                 pure (Just lm)
                 case mOwner of
                     Just owner -> do
-                        exported <- moduleExportsClassMethod owner classes bareName
-                        if exported
+                        -- FQN @Module.method@ must use the class this
+                        -- module declares or names in its export list
+                        -- when several classes share the name.
+                        -- 'knownClassesForMethod' is last-writer-first
+                        -- (@IsList@ prepended after Stream/parse), so
+                        -- taking @(cls:_)@ made @Data.Foldable.toList@
+                        -- / @Foldable.toList@ dispatch as IsList and
+                        -- leftover-return a function on Maybe/NonEmpty.
+                        -- Empty preferred means this FQN is an ordinary
+                        -- function of the owner (Data.Set.toList), not
+                        -- a class method — fall through to the body.
+                        preferred <- classesDeclaredOrExportedByOwner
+                                        owner classes bareName
+                        if not (null preferred)
                             then do
                                 triggerRegisterInstances legacyHooks (lmName owner)
-                                tryClassMethodFromRegistry bareName
+                                tryClassMethodFromClasses bareName preferred
                             else pure Nothing
                     Nothing -> pure Nothing
+
+    -- Classes @owner@ actually ties to @bareName@: a local @class@
+    -- declaration, or an export-list type item (@Foldable(..)@,
+    -- @IsList(toList)@).  No name list — the export/decl is the
+    -- detector.  Empty means this FQN is not a class method of
+    -- @owner@ (or only a last-writer homonym from another class).
+    classesDeclaredOrExportedByOwner owner classes bareName = do
+        decls <- scanClassDecls (lmSource owner)
+            `catch` (\(_ :: SomeException) -> pure [])
+        let declared =
+                [ cls
+                | ClassDecl cls methods _ _ _ <- decls
+                , cls `elem` classes
+                , bareName `elem` methods
+                ]
+        if not (null declared)
+            then pure declared
+            else pure exported
+      where
+        exported = case mhExports (lmHeader owner) of
+            ExportList items ->
+                [ cls
+                | ExportType cls msubs <- items
+                , cls `elem` classes
+                , case msubs of
+                      -- @C@ alone exports the class/type name, not
+                      -- methods.  @C(..)@ / @C(m)@ export methods.
+                      Nothing -> False
+                      Just [] -> True
+                      Just subs -> bareName `elem` subs
+                ]
+            ExportAll -> []
 
     ownerDeclaresClassMethod owner classes bareName = do
         decls <- scanClassDecls (lmSource owner)
@@ -10218,7 +12036,7 @@ resolveFallbackSource mOwner name = do
             `catch` (\(_ :: SomeException) -> pure [])
         pure (any (\(InstanceDecl cls _ _ _ _) -> cls `elem` classes) insts)
 
-    moduleExportsClassMethod owner classes bareName =
+    _moduleExportsClassMethod owner classes bareName =
         do
             declares <- ownerDeclaresClassMethod owner classes bareName
             let exportsClassItem =
@@ -10259,6 +12077,11 @@ resolveFallbackSource mOwner name = do
                     -- sets @NoImplicitPrelude@.
                     implicit
                         | hasNoImplicitPrelude (lmSource owner) = []
+                        -- Pattern-synonym / constructor-like names are
+                        -- not in implicit Prelude.  Walking preludeScope
+                        -- for them hung (bufferIO leftover: PS demanded
+                        -- while Data.ByteString.length was on the stack).
+                        | couldBeCtorName bareName = []
                         | otherwise = preludeScope
                     candidateNames = visibleViaImport ++ implicit
                 -- Load unresolved import targets on demand.
@@ -10599,9 +12422,14 @@ resolveFallbackSource mOwner name = do
                         -- for whatever class happens to own the name.
                         standalone <- hasScannedTopLevel owner bareName
                         hasInst <- ownerHasInstanceOfClasses owner classes
+                        -- Trailing-dot compose FQNs (`GHC.Internal.Base..`)
+                        -- must stay `.`.  `elemIndexEnd '.'` yields `""`
+                        -- and treats `(.) = (GHC.Internal.Base..)` as a
+                        -- rename alias of last-writer Category.
                         let evarBare (EVar t) =
-                                case BC.elemIndexEnd '.' t of
-                                    Just i -> BC.drop (i + 1) t
+                                case splitQualified t
+                                         <|> splitQualifiedDottedOperator t of
+                                    Just (_, bare) -> bare
                                     Nothing -> t
                             evarBare _ = bareName
                             -- A different-name EVar is a method alias only
@@ -10629,7 +12457,18 @@ resolveFallbackSource mOwner name = do
                             -- default (@foldr = foldr . toList@) and hangs.
                             -- Different-name aliases (@(-) = subtractSize@)
                             -- and instance-only full methods (@(==)@)
-                            -- still yield to the generic dispatcher.
+                            -- still yield to the generic dispatcher —
+                            -- except a *standalone* col-1 function
+                            -- (@toList = toAscList@ in Set.Internal).
+                            -- That is the ordinary export, not a
+                            -- dictionary alias.  Yielding it to
+                            -- last-writer IsList/Foldable made
+                            -- Data.Set.toList a leftover <function>
+                            -- after parse, and Set.map
+                            -- (@fromList . List.map f . toList@)
+                            -- died on map _ [] / map f (x:xs).
+                            -- No name list: 'standalone' is the
+                            -- detector (H2010 §5.5.1).
                             sameBareReexport =
                                 case Map.lookup bareName bodies of
                                     Just ev@(EVar _)
@@ -10637,9 +12476,20 @@ resolveFallbackSource mOwner name = do
                                     _ -> False
                             instanceOnly =
                                 hasInst && not standalone && not sameBareReexport
-                            instanceAlias = renameAlias || instanceOnly
+                            instanceAlias =
+                                (renameAlias && not standalone) || instanceOnly
                         if not declares && instanceAlias
-                            then tryClassMethodFromRegistry bareName
+                            then do
+                                -- Owner-scoped class pick, same
+                                -- discipline as the FQN path above.
+                                -- Last-writer first is IsList after
+                                -- Stream/parse; prefer a class this
+                                -- module actually declares or exports.
+                                preferred <- classesDeclaredOrExportedByOwner
+                                                owner classes bareName
+                                if not (null preferred)
+                                    then tryClassMethodFromClasses bareName preferred
+                                    else tryClassMethodFromRegistry bareName
                             else continueFromOwnerBody bodies
       where
         continueFromOwnerBody bodies = case Map.lookup bareName bodies of
@@ -10797,10 +12647,16 @@ resolveFallbackSource mOwner name = do
         n == bareName || n == lmName owner <> BC.pack "." <> bareName
     isSelfAlias _ _ _ = False
 
-    hasScannedTopLevel owner bareName = do
-        topNames <- scanAllTopLevelNames (lmSource owner)
-            `catch` (\(_ :: SomeException) -> pure [])
-        pure (bareName `elem` topNames)
+    hasScannedTopLevel owner bareName
+        -- Data constructors are not col-1 value bindings, so
+        -- 'scanAllTopLevelNames' misses them.  Treat a local ctor as
+        -- a local name so `fromString = String` is not rewritten to
+        -- the imported Prelude type.
+        | Map.member bareName (lmDataReg owner) = pure True
+        | otherwise = do
+            topNames <- scanAllTopLevelNames (lmSource owner)
+                `catch` (\(_ :: SomeException) -> pure [])
+            pure (bareName `elem` topNames)
 
     refreshLocalBindingFromSource mods owner bareName = do
         hasLocal <- hasScannedTopLevel owner bareName
@@ -10876,6 +12732,42 @@ resolveFallbackSource mOwner name = do
             [ (localName, slot)
             , (ownerName <> BC.pack "." <> localName, slot)
             ]
+
+    -- Expression-direction builder for a registered pattern synonym.
+    -- Parse the where-clause with the declaring module's local fixity
+    -- only — do not walk that module's imports (fixityInScope) or
+    -- every loaded ImportAll (tryGlobalImportScan).  Those walks hung
+    -- when the synonym was first demanded from a ByteString consumer.
+    tryPatSynBuilderSlot mods bareName
+        -- Uppercase / operator-ctor spelling only.  Pattern synonym
+        -- names look like constructors; scanning every lowercase
+        -- fallback would re-walk every loaded module.
+        | not (couldBeCtorName bareName) = pure Nothing
+        | otherwise = search (Map.elems mods)
+      where
+        search [] = pure Nothing
+        search (lm : rest) = do
+            decls <- scanPatternSynonyms (lmSource lm)
+                `catch` (\(_ :: SomeException) -> pure [])
+            if not (any ((== bareName) . psdName) decls)
+                then search rest
+                else do
+                    bodies <- readIORef (lmBodies lm)
+                    if Map.member bareName bodies
+                        then buildSlotFromOwner mods lm bareName
+                        else do
+                            mLhs <- findOrResolveLhs (lmSource lm) (lmKnown lm) bareName
+                            case mLhs of
+                                Nothing -> search rest
+                                Just lhs -> do
+                                    eExpr <- try (Parser.parseBodyExprWithFixity
+                                                    (lmSource lm) (lmFixity lm) lhs)
+                                                :: IO (Either SomeException Expr)
+                                    case eExpr of
+                                        Left _ -> search rest
+                                        Right expr -> do
+                                            insertLmBody lm bareName expr
+                                            buildSlotFromOwner mods lm bareName
 
     tryConstructorSlot mods owner bareName = do
         if not (couldBeCtorName bareName)
@@ -11122,19 +13014,24 @@ resolveFallbackSource mOwner name = do
                     , imp <- mhImports (lmHeader owner)
                     , not (impQualified imp)
                     , impModule imp /= BC.pack "Prelude"
-                    , specAllows (impSpec imp) bareName
+                    , specAllows (impSpec imp) fieldName
                     ]
         go transientReg searchPath includeMap candidateModules
       where
+        -- Record-dot desugars to `$fldProj$foo`; field registries store
+        -- the bare selector `foo`.  Match the owning module on the
+        -- bare name so a `$fldProj$quoteExp` miss can still find
+        -- TH.Quote's `quoteExp` without walking blaze/megaparsec.
+        fieldName = fromMaybe bareName (BC.stripPrefix fieldProjPrefix bareName)
         go _ _ _ [] = pure Nothing
         go transientReg searchPath includeMap (modName:rest) = do
             loaded <- try (loadModule transientReg searchPath includeMap modName)
                         :: IO (Either SomeException LoadedModule)
             case loaded of
                 Right lm
-                    | Map.member bareName (lmFieldReg lm)
+                    | Map.member fieldName (lmFieldReg lm)
                     , not (lmNoFieldSelectors lm)
-                    , exportsName lm bareName -> do
+                    , exportsName lm fieldName -> do
                         reg <- readIORef transientReg
                         let newMods = Map.fromList
                                 [ (n, loadedLm)
@@ -12235,9 +14132,45 @@ resolveQualifiedName registry searchPath includeMap lm qual bareName = do
             Left _ -> go rest
             Right targetLm -> do
                 provides <- qualifiedImportProvides targetLm bareName
-                if provides
-                    then pure (Just targetLm)
-                    else go rest
+                if not provides
+                    then go rest
+                    else do
+                        -- A facade that only `module Inner`-exports the
+                        -- name is not the defining module.  Chase the
+                        -- re-export so `import qualified Html5 as H`
+                        -- + `H.toHtml` resolves to `Html.toHtml`.
+                        bodies <- readIORef (lmBodies targetLm)
+                        hasLocal <- case Map.lookup bareName bodies of
+                            Just expr ->
+                                pure (not (isSelfAliasIn targetLm bareName expr))
+                            Nothing ->
+                                isJust <$> findOrResolveLhs
+                                    (lmSource targetLm) (lmKnown targetLm) bareName
+                        if hasLocal
+                            then pure (Just targetLm)
+                            else do
+                                mDefiner <- resolveImport registry searchPath includeMap
+                                                targetLm bareName
+                                            `catch` (\(_ :: SomeException) -> pure Nothing)
+                                case mDefiner of
+                                    Just defName | defName /= lmName targetLm -> do
+                                        loadedDef <- try (loadModule registry searchPath includeMap defName)
+                                                        :: IO (Either SomeException LoadedModule)
+                                        case loadedDef of
+                                            Right defLm -> pure (Just defLm)
+                                            Left _      -> chaseReexportedField
+                                    _ -> chaseReexportedField
+                      where
+                        -- Gateway `T(..)` re-exports field selectors of
+                        -- an imported type (Network.HTTP.Types exports
+                        -- Status(..) defined in Status).  resolveImport
+                        -- may skip an unloaded cache import; walk the
+                        -- exported field registry instead.  No H.statusCode
+                        -- name list.
+                        chaseReexportedField = do
+                            mFieldDef <- findReexportedFieldDefiner
+                                registry searchPath includeMap targetLm bareName
+                            pure (Just (fromMaybe targetLm mFieldDef))
 
     qualifiedImportProvides targetLm bareName = do
         bodies <- readIORef (lmBodies targetLm)
@@ -12248,13 +14181,24 @@ resolveQualifiedName registry searchPath includeMap lm qual bareName = do
                 , not (lmNoFieldSelectors targetLm) -> pure True
                 | otherwise ->
                     isJust <$> findOrResolveLhs (lmSource targetLm) (lmKnown targetLm) bareName
-        pure $ case mhExports (lmHeader targetLm) of
-            ExportAll -> local
+        case mhExports (lmHeader targetLm) of
+            ExportAll -> pure local
             -- An explicit export list may name a binding re-exported from
             -- the module's own imports (e.g. GHC.Arr.newSTArray from
             -- GHC.Internal.Arr). Accept it here; discoverInModule on the
             -- target will chase the named re-export and memoize the alias.
-            ExportList _ -> local || exportsName targetLm bareName
+            ExportList _
+                | local || exportsName targetLm bareName -> pure True
+                | otherwise -> do
+                    -- `Status(..)` on a facade has no local field
+                    -- registry.  exportedFieldRegistryForNames walks
+                    -- imported T(..) providers (same as record-update
+                    -- desugar).  That is how H.statusCode reaches
+                    -- Network.HTTP.Types.Status.statusCode.
+                    exported <- exportedFieldRegistryForNames
+                        registry searchPath includeMap targetLm
+                        [lmName lm] [bareName]
+                    pure (not (Map.null exported))
 
 importMatchesQual :: ByteString -> ImportDecl -> Bool
 importMatchesQual qual imp =
@@ -13125,6 +15069,18 @@ splitQualified bs =
 -- Reusable pieces from the old scheduler
 --------------------------------------------------------------------------------
 
+-- Bare operators that only contain '.' (`(.)`, `.&.`, `..`) are not
+-- FQNs.  Import rewrite used `BC.elem '.'`, so
+-- `sortWith = sortBy . comparing` never rewrote through the owner's
+-- Prelude import and closed over last-writer Category (.).  Module
+-- names start uppercase (H2010 §5.6.2).
+nameIsModuleQualified :: ByteString -> Bool
+nameIsModuleQualified name =
+    case BC.uncons name of
+        Just (c, rest)
+            | c >= 'A' && c <= 'Z' -> BC.elem '.' rest
+        _ -> False
+
 findOrResolveLhs :: Source -> KnownSymbols -> ByteString -> IO (Maybe BindingLhs)
 findOrResolveLhs src known name = do
     existing <- lookupSymbol known name
@@ -13213,7 +15169,7 @@ syntheticClassMethodNames = goExpr
         -- including these methods here turns e.g. @pure [| ... |]@ into an
         -- eager load of every Applicative provider in ghc-internal.
         ESplice _   -> []
-        EQuote _    -> []
+        EQuote e    -> quoteHoleFreeList (\_ inner -> goExpr inner) [] e
         EQuasiQuote _ _ -> []
         ELabel _    -> []
         ETyApp e _  -> goExpr e
@@ -13239,6 +15195,105 @@ syntheticClassMethodNames = goExpr
 -- Public type stays '[ByteString]'; the result is now deduplicated
 -- (callers that wrap with 'nubBS' don't need to anymore — the wraps
 -- are still correct, just no-ops).
+-- | Free variables of evaluated holes inside a quotation.  Quoted
+-- 'EVar's become TH names and are not free; only 'ESplice' holes run
+-- in the enclosing environment (HSX @$element@ / @$stringAttributes@).
+quoteHoleFreeVars
+    :: (HashSet ByteString -> Expr -> HashSet ByteString)
+    -> HashSet ByteString
+    -> Expr
+    -> HashSet ByteString
+quoteHoleFreeVars collect bound = go
+  where
+    go = \case
+        ESplice inner         -> collect bound inner
+        EApp f x              -> HashSet.union (go f) (go x)
+        ELam _ e              -> go e
+        ELet bs e             -> HashSet.union
+                                    (HashSet.unions (map (go . snd) bs))
+                                    (go e)
+        ECase s as            -> HashSet.union (go s)
+                                    (HashSet.unions [ go e | Alt _ e <- as ])
+        EIf c t e             -> HashSet.unions [go c, go t, go e]
+        EDo ss                -> HashSet.unions (map goStmt ss)
+        ENeg e                -> go e
+        ETuple es             -> HashSet.unions (map go es)
+        ERecordCon _ fs       -> HashSet.unions (map (go . snd) fs)
+        ERecordUpdate e fs    -> HashSet.union (go e)
+                                    (HashSet.unions (map (go . snd) fs))
+        EImplicitLet bs e     -> HashSet.union
+                                    (HashSet.unions (map (go . snd) bs))
+                                    (go e)
+        EQuote e              -> go e
+        ETyApp e _            -> go e
+        ELocalSig _ e         -> go e
+        EConstrainedValue e _ -> go e
+        _                     -> HashSet.empty
+    goStmt (SExpr e)         = go e
+    goStmt (SBind _ e)       = go e
+    goStmt (SBangBind _ e)   = go e
+    goStmt (SLet bs)         = HashSet.unions (map (go . snd) bs)
+    goStmt (SImplicitLet bs) = HashSet.unions (map (go . snd) bs)
+
+quoteHoleFreeList
+    :: ([ByteString] -> Expr -> [ByteString])
+    -> [ByteString]
+    -> Expr
+    -> [ByteString]
+quoteHoleFreeList collect bound = go
+  where
+    go = \case
+        ESplice inner         -> collect bound inner
+        EApp f x              -> go f ++ go x
+        ELam _ e              -> go e
+        ELet bs e             -> concatMap (go . snd) bs ++ go e
+        ECase s as            -> go s ++ concat [ go e | Alt _ e <- as ]
+        EIf c t e             -> go c ++ go t ++ go e
+        EDo ss                -> concatMap goStmt ss
+        ENeg e                -> go e
+        ETuple es             -> concatMap go es
+        ERecordCon _ fs       -> concatMap (go . snd) fs
+        ERecordUpdate e fs    -> go e ++ concatMap (go . snd) fs
+        EImplicitLet bs e     -> concatMap (go . snd) bs ++ go e
+        EQuote e              -> go e
+        ETyApp e _            -> go e
+        ELocalSig _ e         -> go e
+        EConstrainedValue e _ -> go e
+        _                     -> []
+    goStmt (SExpr e)         = go e
+    goStmt (SBind _ e)       = go e
+    goStmt (SBangBind _ e)   = go e
+    goStmt (SLet bs)         = concatMap (go . snd) bs
+    goStmt (SImplicitLet bs) = concatMap (go . snd) bs
+
+-- | Rewrite only evaluated splice holes inside a quotation.
+rewriteQuoteHoles :: ([ByteString] -> Expr -> Expr) -> [ByteString] -> Expr -> Expr
+rewriteQuoteHoles rewrite bound = go
+  where
+    go = \case
+        ESplice inner         -> ESplice (rewrite bound inner)
+        EApp f x              -> EApp (go f) (go x)
+        ELam n e              -> ELam n (go e)
+        ELet bs e             -> ELet [(n, go b) | (n, b) <- bs] (go e)
+        ECase s as            -> ECase (go s) [ Alt p (go e) | Alt p e <- as ]
+        EIf c t e             -> EIf (go c) (go t) (go e)
+        EDo ss                -> EDo (map goStmt ss)
+        ENeg e                -> ENeg (go e)
+        ETuple es             -> ETuple (map go es)
+        ERecordCon n fs       -> ERecordCon n [(fn, go e) | (fn, e) <- fs]
+        ERecordUpdate e fs    -> ERecordUpdate (go e) [(fn, go fe) | (fn, fe) <- fs]
+        EImplicitLet bs e     -> EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
+        EQuote e              -> EQuote (go e)
+        ETyApp e ty           -> ETyApp (go e) ty
+        ELocalSig ty e        -> ELocalSig ty (go e)
+        EConstrainedValue e c -> EConstrainedValue (go e) c
+        other                 -> other
+    goStmt (SExpr e)         = SExpr (go e)
+    goStmt (SBind n e)       = SBind n (go e)
+    goStmt (SBangBind n e)   = SBangBind n (go e)
+    goStmt (SLet bs)         = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
+
 freeVars :: Expr -> [ByteString]
 freeVars e = HashSet.toList (goAll HashSet.empty e)
   where
@@ -13275,7 +15330,9 @@ freeVars e = HashSet.toList (goAll HashSet.empty e)
                    (HashSet.unions [ goAll bound' rhs | (_, rhs) <- bs ])
                    (goAll bound' e')
         ESplice inner   -> goAll bound inner
-        EQuote _        -> HashSet.empty   -- Phase 2.12: quote body is not evaluated; treat as no free vars
+        -- Quote body is syntax (EVar becomes VarE/ConE) except ESplice
+        -- holes, which run in the enclosing environment.
+        EQuote inner    -> quoteHoleFreeVars goAll bound inner
         -- QuasiQuoter: the QQ function name is a free var that must be
         -- discovered so the dispatch sees the imported QuasiQuoter value.
         EQuasiQuote n _
@@ -13485,6 +15542,98 @@ recordSyntaxFieldNames localFldReg = fmap nubBS . goExpr
         PRecordWild conName -> wildFields conName
         PView e p     -> combine [goExpr e, goPat p]
 
+-- | After initial discovery, pull same-module names that appear only
+-- as PAPs in constructor / record fields into 'lmBodies'.  Without
+-- this, @mk settings = Rec { f = g settings }@ never seeds @g@.
+-- Forcing @f@ then hits 'buildSlotFromOwner', which rebuilds the
+-- owner module's import/constructor/local env and hangs on large
+-- modules (IHP.HSX.QQ).  Walking only the surface (lambda + record
+-- fields, not do-blocks or quotes) finds @g@ without materialising
+-- the function body's own lazy deps.
+chaseRecordSurfaceLocals
+    :: Set ByteString
+    -> ModuleRegistry
+    -> [FilePath]
+    -> Map FilePath [FilePath]
+    -> [LoadedModule]
+    -> IO ()
+chaseRecordSurfaceLocals builtins registry searchPath includeMap =
+    mapM_ chaseOne
+  where
+    chaseOne lm = do
+        top <- Set.fromList <$> scanAllTopLevelNames (lmSource lm)
+            `catch` (\(_ :: SomeException) -> pure [])
+        let discover n =
+                discoverInModuleWith builtins registry searchPath includeMap lm n
+                    `catch` (\(_ :: SomeException) -> pure ())
+            loop seen = do
+                bodies <- readIORef (lmBodies lm)
+                let fvs = Set.fromList
+                        [ bare
+                        | expr <- Map.elems bodies
+                        , fv   <- recordSurfaceFreeVars expr
+                        , let bare = lastDotComponent fv
+                        ]
+                    new = Set.toList
+                        (Set.intersection top fvs
+                           `Set.difference` (seen `Set.union` Map.keysSet bodies))
+                case new of
+                    [] -> pure ()
+                    _  -> do
+                        mapM_ discover new
+                        loop (Set.union seen (Set.fromList new))
+        loop Set.empty
+
+    lastDotComponent name = case BC.elemIndexEnd (toEnum (fromEnum '.')) name of
+        Just i  -> BC.drop (i + 1) name
+        Nothing -> name
+
+-- | Free variables visible when taking WHNF of a value, including
+-- expressions stored in constructor / record fields.  Unlike
+-- 'freeVars' this does not walk do-blocks, quotes, or case
+-- alternatives — those run only when a function is applied.  Unlike
+-- 'discoveryFreeVars' this *does* walk lambda bodies and record
+-- fields, so a same-module PAP stored in a record is discovered with
+-- the constructor function rather than waiting for a force-time
+-- fallback of the PAP's function.
+recordSurfaceFreeVars :: Expr -> [ByteString]
+recordSurfaceFreeVars = go []
+  where
+    go bound = \case
+        EVar n
+            | n `elem` bound -> []
+            | otherwise      -> [n]
+        ELit _      -> []
+        EApp f x    -> go bound f ++ go bound x
+        ELam n e    -> go (n : bound) e
+        ELet bs e   ->
+            let names = map fst bs
+                bound' = names ++ bound
+            in concatMap (go bound' . snd) bs ++ go bound' e
+        ECase s _   -> go bound s
+        EIf c _ _   -> go bound c
+        EDo _       -> []
+        ENeg e      -> go bound e
+        ETuple es   -> concatMap (go bound) es
+        ERecordCon _ fs -> concatMap (go bound . snd) fs
+        ERecordWild _   -> []
+        ERecordUpdate e fs -> go bound e ++ concatMap (go bound . snd) fs
+        EImplicitRef _ -> []
+        EImplicitLet bs e ->
+            let names = map fst bs
+            in go (names ++ bound) e
+        ESplice _   -> []
+        EQuote _    -> []
+        EQuasiQuote n _
+            | n `elem` bound -> []
+            | otherwise      -> [n]
+        ELabel _    -> []
+        ETyApp e _  -> go bound e
+        ELocalSig _ e -> go bound e
+        ETypedMethod{} -> []
+        EConstrainedValue e _ -> go bound e
+        EGuardFail  -> []
+
 -- | Free variables that must be available to start evaluating a binding.
 --
 -- This is intentionally narrower than 'freeVars'. The scheduler's first
@@ -13692,60 +15841,14 @@ desugarRecordCons fldReg = go
             -- Build positional list sorted by field index.
             args = map (\(fname, _) -> EVar fname) fieldPairs
         in foldl EApp (EVar conName) args
-    -- Record update: e { f1 = e1, f2 = e2, ... }
-    -- Desugar to a case expression that reconstructs the record with updated fields.
-    -- We look up all constructors that contain the updated field names in fldReg,
-    -- then generate one case alt per such constructor.
+    -- Record update: keep ERecordUpdate.  Case-desugar used the
+    -- unioned FieldRegistry under the bare constructor name; a
+    -- 2-field Outer plus a loaded 6-field homonym became one
+    -- arity-6 pattern and the value missed every alt
+    -- ("record update: unknown constructor").  Eval patches the
+    -- runtime VCon's slot (same as field accessors).
     go (ERecordUpdate baseExpr updates) =
-        let scrut = go baseExpr
-            updatesG = [(fn, go fe) | (fn, fe) <- updates]
-            -- Find all constructors that own any of the updated field names.
-            -- A constructor is included if it appears in the FieldRegistry for
-            -- at least one of the updated fields.
-            relevantCons :: [ByteString]
-            relevantCons =
-                nubBS
-                [ conName
-                | (fname, _) <- updatesG
-                , Just pairs <- [Map.lookup fname fldReg]
-                , (conName, _) <- pairs
-                ]
-            buildAlt conName =
-                let allFields = conFields fldReg conName   -- [(fname, idx)]
-                    arity     = length allFields
-                    -- Fresh variable names for the pattern: $ru0, $ru1, ...
-                    varNames  = [ BC.pack ("$ru" <> show i) | i <- [0 .. arity - 1] ]
-                    -- For each positional slot, use the updated expr if present,
-                    -- otherwise use the original field variable.
-                    updateMap  = Map.fromList updatesG
-                    args = [ case Map.lookup fname updateMap of
-                                 Just e' -> e'
-                                 Nothing -> EVar (varNames !! idx)
-                           | (fname, idx) <- allFields
-                           ]
-                    pat = PCon conName (map PVar varNames)
-                    body = foldl EApp (EVar conName) args
-                in Alt pat body
-            alts = map buildAlt relevantCons
-            -- If no relevant constructors found (e.g. unknown ADT), fall back to
-            -- a runtime error so we don't silently discard the update.
-            fallback = Alt PWild
-                         (EApp (EVar "error")
-                               (ELit (LStr "record update: unknown constructor")))
-            -- If none of the updated field names are in the FieldRegistry
-            -- (neither locally nor in any loaded module), we cannot desugar
-            -- this update — emit a runtime 'error' rather than silently
-            -- discarding the update (which would make the bug invisible).
-            missingFieldsErr =
-                let names = BC.intercalate (BC.pack ", ")
-                              [ fname | (fname, _) <- updatesG ]
-                in EApp (EVar "error")
-                        (ELit (LStr (BC.pack "record update: field(s) "
-                                  <> names
-                                  <> BC.pack " not in registry")))
-        in if null alts
-               then missingFieldsErr
-               else ECase scrut (alts ++ [fallback])
+        ERecordUpdate (go baseExpr) [(fn, go fe) | (fn, fe) <- updates]
 
     -- Recurse into all sub-expressions.
     go (EApp f x)       = EApp (go f) (go x)
@@ -13838,32 +15941,100 @@ desugarRecordPats fldReg = goExpr
         case pat of
             PView fn vp ->
                 -- Desugar: let $vp = fn scrut in case $vp of { vp -> body; _ -> rest }
+                -- goCase on the view result so a nested view in `vp` is
+                -- also rewritten (pattern-synonym `Empty <- (null -> True)`).
                 let vpn      = "$vp"
                     restExpr = buildAltChain scrut rest
-                    innerCase = ECase (EVar vpn)
-                        [ Alt (goPat vp) (goExpr body)
+                    innerCase = goCase (EVar vpn)
+                        [ Alt vp (goExpr body)
                         , Alt PWild restExpr
                         ]
                 in ELet [(vpn, EApp (goExpr fn) scrut)] innerCase
             _ ->
-                -- No view pattern: emit as a regular case, but fold remaining
-                -- alts into the same case expression to avoid redundant fallback.
-                -- Collect contiguous non-view alts together.
-                let (nonView, viewRest) = span (not . isViewAlt) (Alt pat body : rest)
-                    regularAlts = [Alt (goPat p) (goExpr b) | Alt p b <- nonView]
-                    -- If there are more view-pattern alts after, add a wildcard
-                    -- fallthrough alt that continues the chain.
-                    allAlts = case viewRest of
-                        [] -> regularAlts
-                        _  -> regularAlts ++
-                              [Alt PWild (buildAltChain scrut viewRest)]
-                in ECase scrut allAlts
+                let pat1 = goPat pat
+                in if hasViewAnywhere pat1
+                    then desugarNestedViewAlt scrut pat1 (goExpr body) rest
+                    else
+                        -- No view pattern: emit as a regular case, but fold
+                        -- remaining alts into the same case. Collect contiguous
+                        -- non-view alts together.
+                        let (nonView, viewRest) =
+                                span (not . isViewAlt) (Alt pat body : rest)
+                            regularAlts = [Alt (goPat p) (goExpr b) | Alt p b <- nonView]
+                            allAlts = case viewRest of
+                                [] -> regularAlts
+                                _  -> regularAlts ++
+                                      [Alt PWild (buildAltChain scrut viewRest)]
+                        in ECase scrut allAlts
 
-    isViewAlt (Alt (PView _ _) _) = True
-    isViewAlt _                   = False
+    -- @Con (f -> p)@ / @(f -> p, x)@: replace each nested view with a
+    -- temp, match the constructor, then @let $vr = f $vt in case $vr@.
+    desugarNestedViewAlt scrut pat1 body rest =
+        let restExpr = buildAltChain scrut rest
+            (pat', views, _) = extractViews 0 pat1
+            chained = foldr (wrapView restExpr) body views
+        in ECase scrut
+            [ Alt pat' chained
+            , Alt PWild restExpr
+            ]
 
-    -- Desugar record patterns recursively (no PView handling here — that
-    -- is handled above in goCase / buildAltChain).
+    wrapView restExpr (tmp, fn, vp) inner =
+        let rn = "$vr" <> tmp
+        in ELet [(rn, EApp (goExpr fn) (EVar tmp))]
+             (goCase (EVar rn) [Alt vp inner, Alt PWild restExpr])
+
+    -- Pull nested 'PView' out of constructor / tuple / as / bang /
+    -- irrefutable / record patterns. A top-level 'PView' is handled
+    -- above; this only runs on sub-patterns.
+    extractViews :: Int -> Pat -> (Pat, [(Name, Expr, Pat)], Int)
+    extractViews n (PView fn p) =
+        let tmp = BC.pack ("$vt" ++ show n)
+        in (PVar tmp, [(tmp, fn, p)], n + 1)
+    extractViews n (PCon c ps) =
+        let (ps', vs, n') = extractViewList n ps
+        in (PCon c ps', vs, n')
+    extractViews n (PTuple ps) =
+        let (ps', vs, n') = extractViewList n ps
+        in (PTuple ps', vs, n')
+    extractViews n (PAs name p) =
+        let (p', vs, n') = extractViews n p
+        in (PAs name p', vs, n')
+    extractViews n (PBang p) =
+        let (p', vs, n') = extractViews n p
+        in (PBang p', vs, n')
+    extractViews n (PIrref p) =
+        let (p', vs, n') = extractViews n p
+        in (PIrref p', vs, n')
+    extractViews n (PRecord c fps) =
+        let (fps', vs, n') = extractViewFields n fps
+        in (PRecord c fps', vs, n')
+    extractViews n p = (p, [], n)
+
+    extractViewList n [] = ([], [], n)
+    extractViewList n (p:ps) =
+        let (p', vs1, n1) = extractViews n p
+            (ps', vs2, n2) = extractViewList n1 ps
+        in (p':ps', vs1 ++ vs2, n2)
+
+    extractViewFields n [] = ([], [], n)
+    extractViewFields n ((f, p):rest) =
+        let (p', vs1, n1) = extractViews n p
+            (rest', vs2, n2) = extractViewFields n1 rest
+        in ((f, p'):rest', vs1 ++ vs2, n2)
+
+    hasViewAnywhere (PView _ _)      = True
+    hasViewAnywhere (PCon _ ps)      = any hasViewAnywhere ps
+    hasViewAnywhere (PTuple ps)      = any hasViewAnywhere ps
+    hasViewAnywhere (PAs _ p)        = hasViewAnywhere p
+    hasViewAnywhere (PBang p)        = hasViewAnywhere p
+    hasViewAnywhere (PIrref p)       = hasViewAnywhere p
+    hasViewAnywhere (PRecord _ fps)  = any (hasViewAnywhere . snd) fps
+    hasViewAnywhere _                = False
+
+    isViewAlt (Alt p _) = hasViewAnywhere p
+
+    -- Desugar record patterns recursively. Nested 'PView' is rewritten
+    -- above in buildAltChain / extractViews after this walk.
     goPat (PRecord conName fieldPats) =
         -- Build positional sub-pattern list using FieldRegistry order.
         let allFields = conFields fldReg conName

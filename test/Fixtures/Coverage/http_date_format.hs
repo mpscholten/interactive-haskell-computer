@@ -22,4 +22,4 @@ main = do
             }
         bs = formatHTTPDate hd
     print (BS.length bs)
-    BS.putStrLn (BS.drop 12 bs)
+    putStrLn (BS.unpack (BS.drop 12 bs))

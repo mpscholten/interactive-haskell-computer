@@ -71,6 +71,7 @@ import Foreign.LibFFI
 import Foreign.Marshal.Alloc (mallocBytes)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, nullFunPtr, castPtr, castFunPtrToPtr)
+import qualified Foreign.Storable as FStorable
 import qualified GHC.Conc.Sync as HostConc
 import System.Directory (doesDirectoryExist, listDirectory)
 import qualified System.Environment as Env
@@ -115,6 +116,7 @@ data FFIType
     | FFIWord64
     | FFIFloat
     | FFIDouble
+    | FFINamed    !ByteString -- pointee metadata, not a scalar ABI type
     | FFIThreadId           -- @ThreadId#@, only valid for RTS-special leaves
     | FFIPtr      !FFIType   -- @Ptr a@ — payload type is carried for clarity
     | FFIFunPtr   !FFIType   -- @FunPtr a@
@@ -298,9 +300,19 @@ valToArg ty v = case ty of
     FFIWord64 -> argWord64 . fromIntegral <$> asIntIO v
     FFIFloat  -> argCFloat  . realToFrac <$> asFloatIO v
     FFIDouble -> argCDouble . realToFrac <$> asFloatIO v
+    FFINamed name -> throwIO (userError ("IHC.FFI: named type `" <> BC.unpack name
+                                      <> "` cannot be a direct FFI argument"))
     FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# requires an RTS-special foreign import")
     FFIVoid   -> throwIO (userError "IHC.FFI: void cannot appear as an argument")
-    FFIPtr _      -> do p <- ptrFromVal v; pure (argPtr p)
+    FFIPtr payload -> do
+        p <- ptrFromVal v
+        -- socketPair leftover: c_socketpair :: ... -> Ptr CInt -> IO CInt
+        -- writes two CInts; unannotated peekArray then used 8-byte Int
+        -- unless the dest buffer is marked with the FFI pointee width.
+        case ffiPointeeTyName payload of
+            Just name -> markTypedHostPtr p name
+            Nothing   -> pure ()
+        pure (argPtr p)
     FFIFunPtr _   -> do p <- ptrFromVal v; pure (argPtr p)
     FFICString    -> case v of
         VPrimObj (PrimPtr _) -> do
@@ -313,6 +325,37 @@ valToArg ty v = case ty of
         _ -> do
             bs <- byteStringFromVal v
             pure (argConstByteString bs)
+
+-- | Haskell name for a concrete FFI pointee, used to mark host buffers
+-- so later unannotated peekElemOff / peekArray use the right width.
+-- @FFIInt@ is CInt (not Bool) at the FFI pointer layer.
+ffiPointeeTyName :: FFIType -> Maybe ByteString
+ffiPointeeTyName t = case t of
+    FFIVoid     -> Nothing
+    FFIInt      -> Just (BC.pack "CInt")
+    FFIUInt     -> Just (BC.pack "CUInt")
+    FFILong     -> Just (BC.pack "CLong")
+    FFIULong    -> Just (BC.pack "CULong")
+    FFISize     -> Just (BC.pack "CSize")
+    FFIChar     -> Just (BC.pack "CChar")
+    FFIUChar    -> Just (BC.pack "CUChar")
+    FFIInt8     -> Just (BC.pack "Int8")
+    FFIInt16    -> Just (BC.pack "Int16")
+    FFIInt32    -> Just (BC.pack "Int32")
+    FFIInt64    -> Just (BC.pack "Int64")
+    FFIWord8    -> Just (BC.pack "Word8")
+    FFIWord16   -> Just (BC.pack "Word16")
+    FFIWord32   -> Just (BC.pack "Word32")
+    FFIWord64   -> Just (BC.pack "Word64")
+    FFIFloat    -> Just (BC.pack "Float")
+    FFIDouble   -> Just (BC.pack "Double")
+    FFINamed n  -> Just n
+    FFIPtr payload -> case ffiPointeeTyName payload of
+        Just n  -> Just (BC.pack "Ptr " <> n)
+        Nothing -> Just (BC.pack "Ptr")
+    FFIFunPtr _ -> Just (BC.pack "FunPtr")
+    FFICString  -> Just (BC.pack "CChar")
+    FFIThreadId -> Nothing
 
 -- | Unwrap a numeric FFI argument to a host 'Int64'.
 --
@@ -437,6 +480,8 @@ dispatchRet ty fp args = case ty of
     FFIWord64  -> (VInt . fromIntegral) <$> callFFI fp retWord64  args
     FFIFloat   -> (VFloat . realToFrac)  <$> callFFI fp retCFloat  args
     FFIDouble  -> (VFloat . realToFrac)  <$> callFFI fp retCDouble args
+    FFINamed name -> throwIO (userError ("IHC.FFI: named type `" <> BC.unpack name
+                                      <> "` cannot be a direct FFI result"))
     FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# cannot be returned through generic libffi")
     FFIPtr _   -> do
         p <- callFFI fp (retPtr retCChar) args
@@ -507,7 +552,23 @@ callForeign decl argVals
                       msgT)
               Just fp -> do
                   argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
-                  dispatchRet (fdRetType decl) fp argsFfi
+                  result <- dispatchRet (fdRetType decl) fp argsFfi
+                  -- Preserve pointee metadata across C out-parameters.
+                  -- For @Ptr (Ptr T)@ the call writes a fresh native pointer
+                  -- into the destination buffer; mark that returned pointer
+                  -- as @T@ so source @peek@ can select @Storable T@.
+                  sequence_ (zipWith propagateOutPtr (fdArgTypes decl) argVals)
+                  pure result
+
+    propagateOutPtr (FFIPtr (FFIPtr payload)) value =
+        case ffiPointeeTyName payload of
+            Nothing -> pure ()
+            Just pointee -> do
+                dest <- ptrFromVal value
+                out <- FStorable.peek (castPtr dest :: Ptr (Ptr ()))
+                when (out /= nullPtr) (markTypedHostPtr out pointee)
+    propagateOutPtr _ _ = pure ()
+
 
 extractThreadId :: Val -> IO HostConc.ThreadId
 extractThreadId (VPrimObj (PrimThreadId tid)) = pure tid

@@ -141,9 +141,62 @@ spec = describe "HsExt — Records & overloading" $ do
                 \main = pure ()\n"
             shouldParseModule r
 
+    describe "RecordWildCards / record update leftovers" $ do
+        it "leftover: Foo {..} construction is ERecordWild" $
+            "Foo {..}" `shouldParseTo` ERecordWild "Foo"
+
+        it "leftover: defaultSettings { settingsPort = p } is ERecordUpdate" $
+            "defaultSettings { settingsPort = p }" `shouldParseTo`
+                ERecordUpdate (EVar "defaultSettings")
+                    [("settingsPort", EVar "p")]
+
+        it "leftover: QuasiQuoter { quoteExp = qe } is ERecordCon" $
+            "QuasiQuoter { quoteExp = qe }" `shouldParseTo`
+                ERecordCon "QuasiQuoter" [("quoteExp", EVar "qe")]
+
+        -- Warp Settings / http-types / OverloadedStrings leftovers.
+        it "leftover: warp compact `y{settingsHost = x}` is ERecordUpdate" $
+            "y{settingsHost = x}" `shouldParseTo`
+                ERecordUpdate (EVar "y") [("settingsHost", EVar "x")]
+
+        it "leftover: warp FileInfo { fileInfoName = path, fileInfoSize = size }" $
+            "FileInfo { fileInfoName = path, fileInfoSize = size }"
+                `shouldParseTo`
+                ERecordCon "FileInfo"
+                    [ ("fileInfoName", EVar "path")
+                    , ("fileInfoSize", EVar "size")
+                    ]
+
+        it "leftover: OverloadedStrings field `settingsHost = \"*4\"` is cons, not LStr" $
+            "Settings { settingsHost = \"*4\" }" `shouldParseTo`
+                ERecordCon "Settings"
+                    [("settingsHost",
+                        EApp (EApp (EVar ":") (ELit (LChar '*')))
+                             (EApp (EApp (EVar ":") (ELit (LChar '4')))
+                                   (EVar "[]")))]
+
+        it "leftover: NamedFieldPuns construction `Foo { x }` is { x = x }" $
+            "Foo { x }" `shouldParseTo` ERecordCon "Foo" [("x", EVar "x")]
+
+        it "leftover: NamedFieldPuns update `s { settingsPort }` is { settingsPort = settingsPort }" $
+            "s { settingsPort }" `shouldParseTo`
+                ERecordUpdate (EVar "s")
+                    [("settingsPort", EVar "settingsPort")]
+
+        it "leftover: OverloadedLists field `headers = []` is EVar \"[]\", not LStr" $
+            "Request { headers = [] }" `shouldParseTo`
+                ERecordCon "Request" [("headers", EVar "[]")]
+
+        it "leftover: http-types `Status { statusCode = 200, statusMessage = msg }`" $
+            "Status { statusCode = 200, statusMessage = msg }" `shouldParseTo`
+                ERecordCon "Status"
+                    [ ("statusCode", ELit (LInt 200))
+                    , ("statusMessage", EVar "msg")
+                    ]
+
     describe "RebindableSyntax" $ do
+        -- LANGUAGE pragma is accepted; parse-only (elaboration may fail).
         it "RebindableSyntax: module declares pragma" $ do
-            pendingWith "needs LANGUAGE RebindableSyntax support"
             r <- parseModule
                 "{-# LANGUAGE RebindableSyntax #-}\n\
                 \module M where\n\
@@ -152,7 +205,6 @@ spec = describe "HsExt — Records & overloading" $ do
             shouldParseModule r
 
         it "RebindableSyntax: local fromInteger override" $ do
-            pendingWith "needs LANGUAGE RebindableSyntax support"
             r <- parseModule
                 "{-# LANGUAGE RebindableSyntax #-}\n\
                 \module M where\n\
@@ -162,7 +214,6 @@ spec = describe "HsExt — Records & overloading" $ do
             shouldParseModule r
 
         it "RebindableSyntax: do-notation with local bind" $ do
-            pendingWith "needs LANGUAGE RebindableSyntax support"
             r <- parseModule
                 "{-# LANGUAGE RebindableSyntax #-}\n\
                 \module M where\n\

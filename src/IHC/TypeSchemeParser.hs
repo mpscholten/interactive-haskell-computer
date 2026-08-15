@@ -80,7 +80,10 @@ parseParenContext _ = []
 parsePred :: [TTok] -> Maybe Pred
 parsePred (TTCon cls : rest) = do
     args <- parseTypeAtoms rest
-    if null args then Nothing else Just (Pred cls args)
+    -- Nullary predicates are constraint synonyms (`HasCallStack`) or
+    -- nullary classes.  Dropping them discarded the implicit-param
+    -- synonym before expandScheme could publish `?callStack`.
+    Just (Pred cls args)
 -- `(?name :: T)` — implicit-param constraint.  Not a class predicate
 -- for dispatch; stored so the context is stripped and the body type
 -- (Parsec / IO / …) remains the carrier.
@@ -116,6 +119,15 @@ parseAtom toks = case toks of
     TTCon n : rest -> Just (TyCon n, rest)
     TTVar n : rest -> Just (TyVar n, rest)
     TTUnderscore : rest -> Just (TyVar "_", rest)
+    -- Implicit-param type, as in GHC.Stack:
+    --   type HasCallStack = (?callStack :: CallStack)
+    -- There is no `=>` carrier; the synonym RHS *is* the constraint.
+    -- Store it as `TyApp (TyCon "?callStack") (TyCon "CallStack")` so
+    -- `scanTypeSynonyms` registers the name instead of dropping the
+    -- whole synonym (parseScheme used to return Nothing at `?`).
+    TTImplicit n : TTColon : rest -> do
+        ty <- parseType rest
+        Just (TyApp (TyCon (BC.cons '?' n)) ty, [])
     TTLParen : inner -> parseParenAtom inner
     TTLBracket : inner -> parseListAtom inner
     _ -> Nothing

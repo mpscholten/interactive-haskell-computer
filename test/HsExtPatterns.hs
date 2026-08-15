@@ -7,6 +7,7 @@ import Control.Exception (SomeException, fromException, try)
 import Data.ByteString (ByteString)
 import Test.Hspec
 
+import IHC.AST
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (Source, mkSource)
@@ -18,6 +19,14 @@ parseExpr :: ByteString -> IO (Either SomeException ())
 parseExpr bs = try $ do
     _ <- parseExprAtEof (mkSrc bs) defaultFixityTable
     pure ()
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- try (parseExprAtEof (mkSrc bs) defaultFixityTable)
+    case r of
+        Right got -> got `shouldBe` expected
+        Left (e :: SomeException) -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
 
 -- | Parse-only check for declaration-level fixtures.  We only care that the
 -- parser doesn't reject the source with a ParseError; later elaboration can
@@ -104,3 +113,50 @@ spec = describe "HsExt — Pattern extensions" $ do
                 \pattern R {y} = T y\n\
                 \main = pure ()\n"
             shouldParse r
+
+    -- Warp / http-types leftovers: PatternSignatures do-binds,
+    -- NamedFieldPuns / RecordWildCards on Settings / Status /
+    -- Connection, and ViewPatterns on Warp exception filters.
+    describe "leftover Parser: PatternSignatures / Warp Settings patterns" $ do
+        it "leftover: PatternSignatures `n :: CInt <- peek p` binds n and tags CInt" $
+            "do { n :: CInt <- peek p; return n }" `shouldParseTo`
+                EDo [ SBind "n" (ETyApp (EApp (EVar "peek") (EVar "p")) "CInt")
+                    , SExpr (EApp (EVar "return") (EVar "n"))
+                    ]
+
+        it "leftover: warp `s@Settings{settingsAccept = accept'}` is PAs of PRecord" $
+            "case set of s@Settings{settingsAccept = accept'} -> accept'"
+                `shouldParseTo`
+                ECase (EVar "set")
+                    [ Alt (PAs "s" (PRecord "Settings"
+                            [("settingsAccept", PVar "accept'")]))
+                          (EVar "accept'")
+                    ]
+
+        it "leftover: http-types `Status { statusCode = a }` is PRecord" $
+            "case s of Status { statusCode = a } -> a" `shouldParseTo`
+                ECase (EVar "s")
+                    [ Alt (PRecord "Status" [("statusCode", PVar "a")])
+                          (EVar "a")
+                    ]
+
+        it "leftover: http-types NamedFieldPuns `Status { statusCode }`" $
+            "case s of Status { statusCode } -> statusCode" `shouldParseTo`
+                ECase (EVar "s")
+                    [ Alt (PRecord "Status"
+                            [("statusCode", PVar "statusCode")])
+                          (EVar "statusCode")
+                    ]
+
+        it "leftover: warp RecordWildCards `Connection{..}` is PRecordWild" $
+            "case c of Connection{..} -> connSendAll" `shouldParseTo`
+                ECase (EVar "c")
+                    [Alt (PRecordWild "Connection") (EVar "connSendAll")]
+
+        it "leftover: warp ViewPatterns `Just (ioeGetErrorType -> et)`" $
+            "case se of Just (ioeGetErrorType -> et) -> et" `shouldParseTo`
+                ECase (EVar "se")
+                    [ Alt (PCon "Just"
+                            [PView (EVar "ioeGetErrorType") (PVar "et")])
+                          (EVar "et")
+                    ]

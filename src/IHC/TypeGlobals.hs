@@ -167,6 +167,15 @@ seedBuiltinClassMethodSigs = do
         fromStringSig = Scheme [a]
                     [Pred (BC.pack "IsString") [TyVar a]]
                     (TyArrow (TyCon (BC.pack "String")) (TyVar a))
+        -- sizeOf / alignment :: Storable a => a -> Int
+        -- Argument-directed: `a` lives only in the dummy.  Seed so
+        -- `print (sizeOf …)` does not elaborate at `Show a` and drain
+        -- the Storable catalogue.  Not a type-name table.  Not added
+        -- to globalClassMethodNamesRef — that would change resolution
+        -- before Storable is loaded.
+        sizeOfSig = Scheme [a]
+                    [Pred (BC.pack "Storable") [TyVar a]]
+                    (TyArrow (TyVar a) (TyCon (BC.pack "Int")))
         -- String is a wired-in synonym exported by compiler-built GHC.Types;
         -- there is no Haskell declaration for the source scanner to find.
         -- Keep it in the ordinary synonym registry so every elaboration path
@@ -185,6 +194,8 @@ seedBuiltinClassMethodSigs = do
                 , (BC.pack "maxBound", maxBoundSig)
                 , (BC.pack "toEnum",     toEnumSig)
                 , (BC.pack "fromString", fromStringSig)
+                , (BC.pack "sizeOf",     sizeOfSig)
+                , (BC.pack "alignment",  sizeOfSig)
                 ]
             , s  -- existing sigs win over seed (scanner-provided sigs preferred)
             ]

@@ -16,10 +16,18 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Test.Hspec
 
-import IHC.AST (Expr(..))
+import IHC.AST (Expr(..), Lit(..))
 import IHC.Parser (ParseError, defaultFixityTable, parseExprAtEof)
 import IHC.Scheduler (loadProgramFromSource)
 import IHC.Source (mkSource)
+
+shouldParseTo :: ByteString -> Expr -> Expectation
+shouldParseTo bs expected = do
+    r <- try (parseExprAtEof (mkSource "<test>" bs) defaultFixityTable)
+    case r of
+        Right got -> got `shouldBe` expected
+        Left (e :: SomeException) -> expectationFailure
+            ("expected parse success on " <> show bs <> ", got " <> show e)
 
 isParseError :: SomeException -> Bool
 isParseError e = case fromException e of
@@ -82,6 +90,29 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
         it "TH: [e| e |] explicit expression bracket parses" $ do
             r <- parseExprStrict "[e| 1 + 2 |]"
             assertParses r
+
+        it "TH: [| x :: Int |] SigE inside quote parses" $ do
+            e <- parseExprAtEof (mkSource "<test>" "[| x :: Int |]")
+                                defaultFixityTable
+            e `shouldBe` EQuote (ETyApp (EVar "x") "Int")
+
+        it "TH: [| f $x |] glued $ident inside quote is a splice" $ do
+            e <- parseExprAtEof (mkSource "<test>" "[| f $x |]")
+                                defaultFixityTable
+            e `shouldBe` EQuote (EApp (EVar "f") (ESplice (EVar "x")))
+
+        it "TH: nested quotes [| [| 1 |] |] parse" $ do
+            e <- parseExprAtEof (mkSource "<test>" "[| [| 1 |] |]")
+                                defaultFixityTable
+            e `shouldBe` EQuote (EQuote (ELit (LInt 1)))
+
+        it "TH: quote of do-block [| do { return 1 } |] parses" $ do
+            e <- parseExprAtEof (mkSource "<test>" "[| do { return 1 } |]")
+                                defaultFixityTable
+            case e of
+                EQuote _ -> pure ()
+                other -> expectationFailure
+                    ("expected EQuote of do-block, got: " <> show other)
 
         it "TH: [d| ... |] declaration bracket parses" $ do
             r <- parseExprStrict "[d| x = 1 |]"
@@ -283,3 +314,49 @@ spec = describe "HsExt — TH, QQ, CPP, misc" $ do
         it "Arrows: a -<< x (higher-order arrow application)" $ do
             r <- parseExprStrict "proc x -> a -<< x"
             assertParsesOrPending "known gap: `proc` keyword and `-<<` not supported" r
+
+    -- Warp / HSX leftovers that started as extension parse failures:
+    -- ImplicitParams `?callStack` / `where ?ip = e`, and TH quotes
+    -- emitted by ihp-hsx compileToHaskell (`[| |]`, `$x`, `$(e)`).
+    describe "leftover Parser: ImplicitParams and HSX TH quotes" $ do
+        it "leftover: `?callStack` is EImplicitRef, not a leftover `?` op" $
+            "?callStack" `shouldParseTo` EImplicitRef "callStack"
+
+        it "leftover: `where ?callStack = stk` wraps the RHS in EImplicitLet" $
+            "let f = ?callStack where ?callStack = stk in f" `shouldParseTo`
+                ELet [("f", EImplicitLet [("callStack", EVar "stk")]
+                        (EImplicitRef "callStack"))]
+                     (EVar "f")
+
+        it "leftover: same-line `let f = x where x = 7 in f` keeps `in`" $
+            "let f = x where x = 7 in f" `shouldParseTo`
+                ELet [("f", ELet [("x", ELit (LInt 7))] (EVar "x"))]
+                     (EVar "f")
+
+        it "leftover: HSX `[| applyAttributes $element $stringAttributes |]` keeps glued splices" $
+            "[| applyAttributes $element $stringAttributes |]" `shouldParseTo`
+                EQuote (EApp (EApp (EVar "applyAttributes")
+                                  (ESplice (EVar "element")))
+                             (ESplice (EVar "stringAttributes")))
+
+        it "leftover: HSX `[| toHtml $(pure expression) |]` is quote of a splice" $
+            "[| toHtml $(pure expression) |]" `shouldParseTo`
+                EQuote (EApp (EVar "toHtml")
+                    (ESplice (EApp (EVar "pure") (EVar "expression"))))
+
+        it "leftover: `[t| Int -> Int |]` is consumed to eof (type quote placeholder)" $
+            "[t| Int -> Int |]" `shouldParseTo`
+                EQuote (ELit (LStr "<unsupported-quote>"))
+
+        it "leftover: HSX `[e| applyAttributes ($element (mconcat $renderedChildren)) $stringAttributes |]`" $
+            "[e| applyAttributes ($element (mconcat $renderedChildren)) $stringAttributes |]"
+                `shouldParseTo`
+                EQuote (EApp (EApp (EVar "applyAttributes")
+                    (EApp (ESplice (EVar "element"))
+                          (EApp (EVar "mconcat")
+                                (ESplice (EVar "renderedChildren")))))
+                    (ESplice (EVar "stringAttributes")))
+
+        it "leftover: typed splice `$$x` (TemplateHaskell typed splice)" $ do
+            r <- parseExprStrict "$$x"
+            assertParsesOrPending "known gap: typed splice $$x not yet supported" r

@@ -13,15 +13,7 @@ import Test.Hspec
 spec :: Spec
 spec = describe "Warp hello-world" do
     it "serves one HTTP response end-to-end" do
-        pendingWith "Pending: run dies before listen with\
-                    \ PatternMatchFail I# I# args=8 Unknown.\
-                    \ GHC.Internal.Num.- is a VFun bound to\
-                    \ Data.Text.Internal.Fusion.Size.subtractSize (Settings\
-                    \ imports Text → Num Size). allocaBytesAligned\
-                    \ isPowerOfTwo does 8 .&. (8-1); Size (-) on Ints\
-                    \ yields Unknown. getAddrInfo/with-hints and alloca\
-                    \ after Size import are green; the Alloc.isPowerOfTwo\
-                    \ rewrite still sees the Size VFun."
+        pendingWith "Pending: current Warp startup reaches the source memory-copy path, then exits with Non-exhaustive patterns in lambda: PCon I# [size#]."
         tmp <- getTemporaryDirectory
         (hsPath, hsHandle) <- openTempFile tmp "ihc-warp-hello.hs"
         hClose hsHandle

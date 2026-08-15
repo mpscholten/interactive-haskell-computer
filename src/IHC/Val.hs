@@ -29,6 +29,9 @@ module IHC.Val
     , withExpectedResultTag
     , readExpectedResultTag
     , clearExpectedResultTag
+    , withExpectedExceptionTag
+    , readExpectedExceptionTag
+    , clearExpectedExceptionTag
       -- * Environments
     , Env
     , emptyEnv
@@ -49,7 +52,7 @@ module IHC.Val
 import Control.Concurrent (ThreadId)
 import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM (TVar)
-import Control.Exception (Exception)
+import Control.Exception (Exception, finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
@@ -302,6 +305,31 @@ withExpectedResultTag ty action = do
     r <- action
     writeIORef lastExpectedResultTagRef old
     pure r
+
+-- Separate from 'lastExpectedResultTagRef' (Storable.peek / CInt).
+-- fromException is result-polymorphic on the Exception parameter, not
+-- on the IO/Either result of try/catch.
+{-# NOINLINE lastExpectedExceptionTagRef #-}
+lastExpectedExceptionTagRef :: IORef (Maybe ByteString)
+lastExpectedExceptionTagRef = unsafePerformIO (newIORef Nothing)
+
+readExpectedExceptionTag :: IO (Maybe ByteString)
+readExpectedExceptionTag = readIORef lastExpectedExceptionTagRef
+
+clearExpectedExceptionTag :: IO ()
+clearExpectedExceptionTag = writeIORef lastExpectedExceptionTagRef Nothing
+
+-- Must restore on exception: source catch stamps the handler type
+-- onto the IO action, fromException @e returns Nothing, raiseIO#
+-- re-throws IhcException. Without 'finally' that stamp leaks into
+-- the outer try's fromException, which then also returns Nothing
+-- and the leftover IhcException escapes instead of wrapping as
+-- SomeException.
+withExpectedExceptionTag :: ByteString -> IO a -> IO a
+withExpectedExceptionTag ty action = do
+    old <- readIORef lastExpectedExceptionTagRef
+    writeIORef lastExpectedExceptionTagRef (Just ty)
+    action `finally` writeIORef lastExpectedExceptionTagRef old
 
 -- | Byte-buffer address ranges for Storable Word8 host peeks/pokes.
 -- plusForeignPtr advances the base; exact-address marks would miss

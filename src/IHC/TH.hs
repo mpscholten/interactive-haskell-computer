@@ -23,6 +23,7 @@ module IHC.TH
 
 import Control.Exception (throwIO, Exception, SomeException, try)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.IORef
 import Data.Int (Int64)
@@ -33,7 +34,7 @@ import IHC.Classes
     , drainCataloguedInstancesForClass )
 import IHC.ConstructorMetadata (globalConstructorTypeRegistryRef)
 import qualified IHC.Elaborate as Elab
-import IHC.Eval (eval, force, currentOwner)
+import IHC.Eval (eval, force, currentOwner, thQuotedName, runLeftoverQAction)
 import IHC.TypeAST (Type(..))
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef)
 import IHC.Val
@@ -148,8 +149,8 @@ runOneQExp (VCon "Q" [actionT]) = do
         _ -> force legacyHooks actionT
     case value of
         VIO action -> action
-        other      -> pure other
-runOneQExp value = pure value
+        other      -> runLeftoverQAction legacyHooks other
+runOneQExp value = runLeftoverQAction legacyHooks value
 
 -- Keep source-Q execution on the normal elaborator/provider path.  This is
 -- the same expected-type operation used while expanding a splice; it is not
@@ -223,6 +224,15 @@ decodeTHExp (VCon "AppE" [fT, xT]) = do
     fE <- thExpToExpr fV
     xE <- thExpToExpr xV
     pure (EApp fE xE)
+decodeTHExp (VCon "SigE" [eT, tyT]) = do
+    -- `e :: T` quotes as SigE.  Recover the annotation as ETyApp so a
+    -- later splice of `[| e :: T |]` is the inner expression plus type
+    -- metadata (evaluator treats ETyApp as a pass-through).
+    eV <- force legacyHooks eT
+    e  <- thExpToExpr eV
+    tyV <- force legacyHooks tyT
+    ty <- decodeQuotedType tyV
+    if BS.null ty then pure e else pure (ETyApp e ty)
 decodeTHExp (VCon "ListE" [listT]) = do
     listV <- force legacyHooks listT
     exprs <- decodeList listV thExpToExpr
@@ -310,6 +320,16 @@ decodeLit (VCon name _) =
     throwTH ("decodeLit: unsupported TH Lit constructor: " <> BC.unpack name)
 decodeLit v =
     throwTH ("decodeLit: expected a TH Lit VCon, got: " <> showValForDebug v)
+
+-- | Decode the Type half of a SigE.  evalQuote stores simple annotations
+-- as ConT of the source bytes; accept a bare name as well.
+decodeQuotedType :: Val -> IO Name
+decodeQuotedType (VCon "ConT" [nT]) = do
+    nV <- force legacyHooks nT
+    decodeName nV
+decodeQuotedType (VStr bs) = pure bs
+decodeQuotedType (VCon n []) = pure n
+decodeQuotedType _ = pure BS.empty
 
 decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
@@ -481,14 +501,9 @@ expandSplicesInExpr env ipm depth expr
 -- a 'Val' encoding the corresponding TH 'Exp'. The result is the
 -- same encoding as source-loaded TH constructors produce.
 exprToVal :: Expr -> IO Val
-exprToVal (EVar n)
-    -- Capitalised name → ConE; lowercase/operator → VarE.
-    | not (BC.null n) && BC.head n >= 'A' && BC.head n <= 'Z' = do
-        nt <- thName n
-        force legacyHooks =<< newWHNFThunk (VCon "ConE" [nt])
-    | otherwise = do
-        nt <- thName n
-        force legacyHooks =<< newWHNFThunk (VCon "VarE" [nt])
+exprToVal (EVar n) = do
+    nt <- thName n
+    force legacyHooks =<< newWHNFThunk (VCon (thQuotedName n) [nt])
 exprToVal (ELit (LInt n)) = do
     litT <- integerL n
     force legacyHooks =<< litE litT
@@ -528,11 +543,14 @@ exprToVal (ENeg e) = do
     xV   <- exprToVal e
     xT   <- newWHNFThunk xV
     force legacyHooks =<< appE negT xT
--- Value-level @T: the type argument is opaque metadata. Encode the inner
--- expression as the TH Exp; a future splice pass that cares about type
--- applications can inspect the 'ETyApp' node before reaching here.
-exprToVal (ETyApp e _ty) = exprToVal e
-exprToVal (ELocalSig _ e) = exprToVal e
+-- `e :: T` / local signature → SigE, matching evalQuote.
+exprToVal (ETyApp e ty) = do
+    eV  <- exprToVal e
+    eT  <- newWHNFThunk eV
+    nt  <- thName ty
+    tyT <- newWHNFThunk (VCon "ConT" [nt])
+    force legacyHooks =<< newWHNFThunk (VCon "SigE" [eT, tyT])
+exprToVal (ELocalSig ty e) = exprToVal (ETyApp e ty)
 exprToVal (EConstrainedValue e _constraints) = exprToVal e
 -- For other unsupported forms, emit a VarE "<unsupported>" placeholder.
 exprToVal _ =

@@ -214,6 +214,27 @@ spec = describe "Hs2010 — Class & instance declarations" $ do
                  \instance C14 T14 where\n\
                  \    f14 x y = x" <> mainStub)
 
+        -- Warp / network leftover: Storable CInt is the type that
+        -- `CInt n <- peek p` must GND-unwrap to.  Pin the scanned
+        -- instance head so a later pass cannot drop the CInt tag.
+        it "leftover: `instance Storable CInt` retains class and type head" $ do
+            [decl] <- scanInstanceDecls (mkSrc
+                "instance Storable CInt where\n\
+                \    peek p = peek p\n\
+                \    poke p x = poke p x\n")
+            instClassName decl `shouldBe` "Storable"
+            instTypeName decl `shouldBe` "CInt"
+            instHeadTypes decl `shouldBe` [TyCon "CInt"]
+            map fst (instMethods decl) `shouldBe` ["peek", "poke"]
+
+        it "leftover: `instance Exception Timeout` retains Exception Timeout" $ do
+            [decl] <- scanInstanceDecls (mkSrc
+                "instance Exception Timeout where\n\
+                \    toException = toException\n")
+            instClassName decl `shouldBe` "Exception"
+            instTypeName decl `shouldBe` "Timeout"
+            instHeadTypes decl `shouldBe` [TyCon "Timeout"]
+
     --------------------------------------------------------------------
     -- 3.6 default declarations
     --------------------------------------------------------------------

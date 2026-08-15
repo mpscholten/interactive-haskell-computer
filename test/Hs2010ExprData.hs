@@ -110,9 +110,86 @@ spec = describe "Hs2010 — Expression collections & records" $ do
         it "5.11.2 record construction with fields `P{x=1, y=2}`" $
             "P{x=1, y=2}" `shouldParseTo`
                 ERecordCon "P" [("x", ELit (LInt 1)), ("y", ELit (LInt 2))]
+        it "leftover: empty list in constructor field is EVar \"[]\", not LStr" $
+            "Hints { flags = [] }" `shouldParseTo`
+                ERecordCon "Hints" [("flags", EVar "[]")]
+        it "leftover: positional empty list field is nil, not a string" $
+            "Hints [] 0" `shouldParseTo`
+                EApp (EApp (EVar "Hints") (EVar "[]")) (ELit (LInt 0))
+        it "leftover: empty string in constructor field desugars to EVar \"[]\"" $
+            "Hints { flags = \"\" }" `shouldParseTo`
+                ERecordCon "Hints" [("flags", EVar "[]")]
+        it "leftover: record update `r { flags = [] }` is nil, not LStr" $
+            "r { flags = [] }" `shouldParseTo`
+                ERecordUpdate (EVar "r") [("flags", EVar "[]")]
+        it "leftover: record update `r { flags = \"\" }` desugars to nil" $
+            "r { flags = \"\" }" `shouldParseTo`
+                ERecordUpdate (EVar "r") [("flags", EVar "[]")]
+        it "leftover: Warp defaultHints update keeps [] as EVar \"[]\"" $
+            "defaultHints { addrFlags = [] }" `shouldParseTo`
+                ERecordUpdate (EVar "defaultHints")
+                    [("addrFlags", EVar "[]")]
         it "5.11.3 record update `r{x=2}`" $
             "r{x=2}" `shouldParseTo`
                 ERecordUpdate (EVar "r") [("x", ELit (LInt 2))]
+        it "leftover: Warp Settings update `defaultSettings { settingsPort = p }`" $
+            "defaultSettings { settingsPort = p }" `shouldParseTo`
+                ERecordUpdate (EVar "defaultSettings")
+                    [("settingsPort", EVar "p")]
+        it "leftover: Warp glued Settings update `defaultSettings{settingsPort = p}`" $
+            "defaultSettings{settingsPort = p}" `shouldParseTo`
+                ERecordUpdate (EVar "defaultSettings")
+                    [("settingsPort", EVar "p")]
+        it "leftover: Warp setHost update `y{settingsHost = x}`" $
+            "y{settingsHost = x}" `shouldParseTo`
+                ERecordUpdate (EVar "y") [("settingsHost", EVar "x")]
+        it "leftover: QuasiQuoter record construction `QuasiQuoter { quoteExp = qe }`" $
+            "QuasiQuoter { quoteExp = qe }" `shouldParseTo`
+                ERecordCon "QuasiQuoter" [("quoteExp", EVar "qe")]
+        it "leftover: RecordWildCards construction `Foo {..}`" $
+            "Foo {..}" `shouldParseTo` ERecordWild "Foo"
+
+        -- megaparsec registerParseError / IHP.HSX.Parser setPosition:
+        -- record update of an *imported* constructor / State value.
+        -- Must stay ERecordUpdate (not ERecordCon, not a leftover FQN).
+        it "leftover: megaparsec `s {stateParseErrors = []}` is ERecordUpdate" $
+            "s {stateParseErrors = []}" `shouldParseTo`
+                ERecordUpdate (EVar "s") [("stateParseErrors", EVar "[]")]
+
+        it "leftover: megaparsec `s {stateParseErrors = e : stateParseErrors s}`" $
+            "s {stateParseErrors = e : stateParseErrors s}" `shouldParseTo`
+                ERecordUpdate (EVar "s")
+                    [("stateParseErrors",
+                        EApp (EApp (EVar ":") (EVar "e"))
+                             (EApp (EVar "stateParseErrors") (EVar "s")))]
+
+        it "leftover: IHP `pos { sourceLine = l, sourceColumn = c }`" $
+            "pos { sourceLine = l, sourceColumn = c }" `shouldParseTo`
+                ERecordUpdate (EVar "pos")
+                    [("sourceLine", EVar "l"), ("sourceColumn", EVar "c")]
+
+        -- `setPosition pos { sourceLine = l }` is fexp: setPosition
+        -- applied to the aexp `pos { sourceLine = l }` (Report §3.2).
+        it "leftover: IHP `setPosition pos { sourceLine = l }` is apply of update" $
+            "setPosition pos { sourceLine = l }" `shouldParseTo`
+                EApp (EVar "setPosition")
+                    (ERecordUpdate (EVar "pos") [("sourceLine", EVar "l")])
+
+        -- IHP setPosition body: NamedFieldPuns update of an imported
+        -- PosState: `(statePosState state) { pstateSourcePos }`.
+        it "leftover: IHP pun update `(statePosState state) { pstateSourcePos }`" $
+            "(statePosState state) { pstateSourcePos }" `shouldParseTo`
+                ERecordUpdate (EApp (EVar "statePosState") (EVar "state"))
+                    [("pstateSourcePos", EVar "pstateSourcePos")]
+
+        it "leftover: IHP nested `state { statePosState = inner { pstateSourcePos } }`" $
+            "state { statePosState = (statePosState state) { pstateSourcePos } }"
+                `shouldParseTo`
+                    ERecordUpdate (EVar "state")
+                        [("statePosState",
+                            ERecordUpdate
+                                (EApp (EVar "statePosState") (EVar "state"))
+                                [("pstateSourcePos", EVar "pstateSourcePos")])]
 
     describe "5.12 Expression type signature" $ do
         it "5.12.1 type-annotated expression `e :: Int`" $

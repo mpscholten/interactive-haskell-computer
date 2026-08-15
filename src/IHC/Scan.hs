@@ -1351,9 +1351,11 @@ findEqOrBarInBracedItem src cur0 = go cur0 (0 :: Int)
             TkLParen                 -> go cur' (depth + 1)
             TkLBracket               -> go cur' (depth + 1)
             TkLBrace                 -> go cur' (depth + 1)
+            TkLUnbox                 -> go cur' (depth + 1)
             TkRParen                 -> go cur' (max 0 (depth - 1))
             TkRBracket               -> go cur' (max 0 (depth - 1))
             TkRBrace                 -> go cur' (max 0 (depth - 1))
+            TkRUnbox                 -> go cur' (max 0 (depth - 1))
             _                        -> go cur' depth
 
 findBracedItemEnd :: Source -> Pos -> Pos
@@ -1368,9 +1370,11 @@ findBracedItemEnd src start = go (cursorAt src start) (0 :: Int)
             TkLParen                 -> go cur' (depth + 1)
             TkLBracket               -> go cur' (depth + 1)
             TkLBrace                 -> go cur' (depth + 1)
+            TkLUnbox                 -> go cur' (depth + 1)
             TkRParen                 -> go cur' (max 0 (depth - 1))
             TkRBracket               -> go cur' (max 0 (depth - 1))
             TkRBrace                 -> go cur' (max 0 (depth - 1))
+            TkRUnbox                 -> go cur' (max 0 (depth - 1))
             _                        -> go cur' depth
 
 skipBracedItem :: Source -> Cursor -> Cursor
@@ -1404,9 +1408,14 @@ findEqOrBarOnLine src cur0 = go cur0 (0 :: Int)
             TkLParen  -> go cur' (depth + 1)
             TkLBracket-> go cur' (depth + 1)
             TkLBrace  -> go cur' (depth + 1)
+            -- Unboxed tuple / sum `(# … #)` — `|` inside
+            -- `(# (# #) | v #)` is a sum slot, not a function-clause
+            -- guard.  HashMap.lookup# has exactly this signature.
+            TkLUnbox  -> go cur' (depth + 1)
             TkRParen  -> go cur' (max 0 (depth - 1))
             TkRBracket-> go cur' (max 0 (depth - 1))
             TkRBrace  -> go cur' (max 0 (depth - 1))
+            TkRUnbox  -> go cur' (max 0 (depth - 1))
             TkNewline ->
                 -- If the next significant token is at col 1, the LHS
                 -- never got its '=' — malformed. Stop.
@@ -2598,13 +2607,20 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
             TkEq -> pure (Just (tyCon, reverse revVars, Left cur'))
             TkWhere -> pure (Just (tyCon, reverse revVars, Right cur'))
             TkEof -> pure Nothing
+            -- `data SockAddr\n  = SockAddrInet\n        PortNumber`
+            TkNewline -> gatherVars tyCon revVars cur'
             -- Parenthesised/kind-annotated heads and multiline heads need a
             -- real declaration parser.  Do not manufacture partial metadata.
             _ -> pure Nothing
 
-    -- Commit atomically: one unsupported constructor invalidates metadata for
-    -- the entire declaration.  A partial registry can select an instance for
-    -- one constructor while silently treating a sibling differently.
+    -- Keep H98 constructors already committed when a later alternative
+    -- is unsupported (`forall` existential, constructor context, …).
+    -- Blaze `MarkupM` is `Parent | … | Content | forall b. Append | Empty`:
+    -- discarding the whole decl left `Content` with no field type, so
+    -- `fromString x = Content (fromString x) mempty` could not pin the
+    -- inner IsString to `ChoiceString` (leftover function).
+    -- A declaration whose *every* constructor is unsupported still
+    -- returns Nothing.
     scanH98Ctors tyCon vars cur0 = do
         parsed <- scanAlternative Map.empty cur0
         case parsed of
@@ -2615,6 +2631,39 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
       where
         result = foldl TyApp (TyCon tyCon) (map TyVar vars)
 
+        done current after =
+            Right (if Map.null current then Nothing else Just current, after)
+
+        -- Skip one unsupported alternative.  Stop before a sibling `|`
+        -- so `scanAlternative` can resume; stop at decl end otherwise.
+        skipAlternative = skipAlt 0
+        skipAlt depth cur = do
+            let (tok, cur') = nextToken src cur
+            case tkKind tok of
+                TkEof -> pure (cur, True)
+                TkLParen -> skipAlt (depth + 1) cur'
+                TkRParen -> skipAlt (max 0 (depth - 1)) cur'
+                TkLBrace -> skipAlt (depth + 1) cur'
+                TkRBrace -> skipAlt (max 0 (depth - 1)) cur'
+                TkLBracket -> skipAlt (depth + 1) cur'
+                TkRBracket -> skipAlt (max 0 (depth - 1)) cur'
+                TkBar | depth == 0 -> pure (cur, False)
+                TkDeriving | depth == 0 -> pure (cur, True)
+                TkIdent "deriving" | depth == 0 -> pure (cur, True)
+                TkNewline -> do
+                    let (peek, peekAt) = skipNewlines src cur'
+                    case tkKind peek of
+                        TkEof -> pure (peekAt, True)
+                        _ | tkCol peek == 1 -> pure (peekAt, True)
+                          | otherwise -> skipAlt depth cur'
+                _ -> skipAlt depth cur'
+
+        recover current cur = do
+            (after, ended) <- skipAlternative cur
+            if ended
+                then pure (done current after)
+                else scanAlternative current after
+
         scanAlternative current cur = do
             let (tok, cur') = nextToken src cur
             case tkKind tok of
@@ -2622,7 +2671,7 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                 TkConId ctor -> do
                     fieldsResult <- collectFields [] cur'
                     case fieldsResult of
-                        Left badCur -> pure (Left badCur)
+                        Left badCur -> recover current badCur
                         Right (fieldToks, afterCtor, ended) -> do
                             let schemeType toks (Scheme vars' preds ty) = case toks of
                                     TTForall : _ -> TyForall vars' preds ty
@@ -2634,12 +2683,29 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                                     constructorMetadataFromScheme identity' False
                                         (Scheme vars [] (foldr TyArrow result fieldTypes))
                             case metadata of
-                                Nothing -> pure (Left afterCtor)
+                                Nothing -> recover current afterCtor
                                 Just m -> case ended of
                                     False -> scanAlternative (Map.insert identity' m current) afterCtor
                                     True -> pure (Right
                                         (Just (Map.insert identity' m current), afterCtor))
-                _ -> pure (Left cur)
+                -- `forall b. Append …` starts with a soft keyword, not a
+                -- constructor.  Skip that alternative; keep siblings.
+                _ -> recover current cur
+
+        isCtorFieldStart k = case k of
+            TkConId _  -> True
+            TkIdent _  -> True
+            TkLParen   -> True
+            TkLBracket -> True
+            TkBang     -> True
+            TkBar      -> True
+            _          -> False
+
+        skipNewlines s c =
+            let (tok, c') = nextToken s c
+            in case tkKind tok of
+                TkNewline -> skipNewlines s c'
+                _         -> (tok, c)
 
         collectFields rev cur = do
             let (tok, cur') = nextToken src cur
@@ -2650,14 +2716,21 @@ scanConstructorTypeMetadata owner src = go Map.empty startCursor
                 TkIdent "deriving" -> pure (Right (reverse rev, cur', True))
                 TkDeriving -> pure (Right (reverse rev, cur, True))
                 TkNewline -> do
-                    let (peek, _) = nextToken src cur'
+                    -- Skip blank / haddock-only lines so
+                    -- `-- | … \n  | SockAddrUnix` does not fail the
+                    -- whole (atomic) data decl.
+                    let (peek, peekAt) = skipNewlines src cur'
                     case tkKind peek of
-                        TkLBrace | null rev -> collectFields rev cur'
-                        TkDeriving -> pure (Right (reverse rev, cur, True))
-                        TkIdent "deriving" -> pure (Right (reverse rev, cur, True))
+                        TkLBrace | null rev -> collectFields rev peekAt
+                        TkDeriving -> pure (Right (reverse rev, peekAt, True))
+                        TkIdent "deriving" -> pure (Right (reverse rev, peekAt, True))
                         _ | tkKind peek == TkEof || tkCol peek == 1 ->
-                            pure (Right (reverse rev, cur', True))
-                          | otherwise -> pure (Left cur')
+                            pure (Right (reverse rev, peekAt, True))
+                          -- Multiline H98 fields (`SockAddrInet` /
+                          -- PortNumber on the next indented line).
+                          | isCtorFieldStart (tkKind peek) ->
+                            collectFields rev peekAt
+                          | otherwise -> pure (Left peekAt)
                 TkConId _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
                 TkIdent "forall" -> pure (Left cur)
                 TkIdent _ -> atomFrom tok cur' >>= \(a, next) -> collectFields (a : rev) next
@@ -3527,6 +3600,17 @@ scanInstanceDeclsRaw src
             case tkKind tok of
                 TkEof    -> pure (mCls, reverse acc, reverse tys, cur)
                 TkWhere  -> pure (mCls, reverse acc, reverse tys, cur')
+                -- A following top-level declaration is not part of this
+                -- instance head.  Without this, `instance Exception Boom`
+                -- followed by `instance Exception Kill where toException = …`
+                -- swallowed Kill's methods onto Boom (scanHead's wildcard
+                -- skipped the next `instance` keyword and treated
+                -- Exception/Kill as extra type args, then parseInstanceBody
+                -- ate the where-clause).
+                TkInstance -> pure (mCls, reverse acc, reverse tys, cur)
+                TkClass    -> pure (mCls, reverse acc, reverse tys, cur)
+                TkData     -> pure (mCls, reverse acc, reverse tys, cur)
+                TkNewtype  -> pure (mCls, reverse acc, reverse tys, cur)
                 TkNewline -> scanHead cur' mCls acc tys seenArrow
                 TkDArrow -> scanHead cur' mCls [] [] True  -- reset past context
                 TkConId n ->
@@ -4926,22 +5010,62 @@ tokensToFFIFromKinds = go
     -- ByteArray# extensively).  Route them through tyConToFFI.
     go [TkPrimId c]           = tyConToFFI c Nothing
     go (TkPrimId c : _)       = tyConToFFI c Nothing
-    -- Ptr-like: @Ptr CChar@ / @Ptr a@ / @Ptr (Ptr a)@. We don't track
-    -- the payload precisely — libffi treats every pointer as a pointer.
-    go (TkConId "Ptr" : _)       = Just (FFIPtr FFIVoid)
-    go (TkConId "FunPtr" : _)    = Just (FFIFunPtr FFIVoid)
-    go (TkConId "ConstPtr" : _)  = Just (FFIPtr FFIVoid)
+    -- Ptr-like: @Ptr CInt@ / @Ptr a@ / @Ptr (Ptr a)@.  The payload is
+    -- kept so FFI can mark the host buffer (socketPair's @Ptr CInt@
+    -- fdArr); libffi still treats every pointer as a pointer.
+    go (TkConId "Ptr" : rest) =
+        Just (FFIPtr (ptrPayload rest))
+    go (TkConId "FunPtr" : rest) =
+        Just (FFIFunPtr (ptrPayload rest))
+    go (TkConId "ConstPtr" : rest) =
+        Just (FFIPtr (ptrPayload rest))
     -- Any longer sequence that starts with a recognised constructor
     -- probably applies it to type args we don't care about — treat as
     -- the constructor alone.
     go (TkConId c : _)           = tyConToFFI c Nothing
     go _                         = Nothing
 
+    ptrPayload rest = case go (dropKindParens rest) of
+        Just t  -> t
+        Nothing -> case dropKindParens rest of
+            [TkConId name] -> FFINamed name
+            _              -> FFIVoid
+
+-- | Strip one layer of matching outer @()@ from a kind stream so
+-- @Ptr (CInt)@ yields the same payload as @Ptr CInt@.
+dropKindParens :: [TokenKind] -> [TokenKind]
+dropKindParens ks@(TkLParen : _)
+    | Just inner <- stripOuterKindParens ks = dropKindParens inner
+dropKindParens ks = ks
+
+stripOuterKindParens :: [TokenKind] -> Maybe [TokenKind]
+stripOuterKindParens (TkLParen : rest) = go 1 [] rest
+  where
+    go 1 acc (TkRParen : leftover)
+        | null leftover = Just (reverse acc)
+    go n acc (TkLParen : ks) = go (n + 1) (TkLParen : acc) ks
+    go n acc (TkRParen : ks) = go (n - 1) (TkRParen : acc) ks
+    go n acc (k : ks)        = go n (k : acc) ks
+    go _ _   []              = Nothing
+stripOuterKindParens _ = Nothing
+
 -- | Map a Haskell type constructor name to its 'FFIType'.  The optional
 -- second argument is the head of any type-application (as a 'ConId' or
--- 'Ident' — we don't care which for this MVP).
+-- 'Ident').  @Ptr CInt@ keeps the CInt payload so FFI can mark the buffer.
 tyConToFFI :: ByteString -> Maybe (Either ByteString ByteString) -> Maybe FFIType
-tyConToFFI c _ = case c of
+tyConToFFI c mArg = case c of
+    "Ptr"      -> Just (FFIPtr (payloadFFI mArg))
+    "FunPtr"   -> Just (FFIFunPtr (payloadFFI mArg))
+    "ConstPtr" -> Just (FFIPtr (payloadFFI mArg))
+    _          -> tyConToFFI0 c
+  where
+    payloadFFI (Just (Left a)) = case tyConToFFI0 a of
+        Just t  -> t
+        Nothing -> FFINamed a
+    payloadFFI _ = FFIVoid
+
+tyConToFFI0 :: ByteString -> Maybe FFIType
+tyConToFFI0 c = case c of
     "CInt"     -> Just FFIInt
     "CUInt"    -> Just FFIUInt
     "CLong"    -> Just FFILong
@@ -5047,24 +5171,29 @@ scanTypeSigsRaw src
     | not (hasKeyword src (BC.pack "::")) = pure []
     | otherwise = go [] startCursor
   where
+    collectNamedSig acc name cur' = do
+        -- Collect additional comma-separated names, e.g.
+        -- @a, b :: Int@ → sigs for a + b.
+        (names, curAfterNames) <- collectMoreSigNames src [name] cur'
+        let (dcolon, curAfterDC) = nextToken src curAfterNames
+        case tkKind dcolon of
+            TkDColon -> do
+                (typeToks, curAfterType) <- collectTypeTokens src curAfterDC
+                case parseScheme typeToks of
+                    Just scheme ->
+                        go (map (\n -> (n, scheme)) names ++ acc) curAfterType
+                    Nothing -> go acc curAfterType
+            _ -> go acc cur'
     go !acc cur = do
         let (tok, cur') = nextToken src cur
         case tkKind tok of
             TkEof     -> pure (reverse acc)
             TkNewline -> go acc cur'
-            TkIdent name | tkCol tok == 1 -> do
-                -- Collect additional comma-separated names, e.g.
-                -- @a, b :: Int@ → sigs for a + b.
-                (names, curAfterNames) <- collectMoreSigNames src [name] cur'
-                let (dcolon, curAfterDC) = nextToken src curAfterNames
-                case tkKind dcolon of
-                    TkDColon -> do
-                        (typeToks, curAfterType) <- collectTypeTokens src curAfterDC
-                        case parseScheme typeToks of
-                            Just scheme ->
-                                go (map (\n -> (n, scheme)) names ++ acc) curAfterType
-                            Nothing -> go acc curAfterType
-                    _ -> go acc cur'
+            TkIdent name | tkCol tok == 1 ->
+                collectNamedSig acc name cur'
+            -- MagicHash value binders (`lookup# :: … -> (# (# #) | v #)`).
+            TkPrimId name | tkCol tok == 1 && primIdIsValueLevel name ->
+                collectNamedSig acc name cur'
             TkLParen | tkCol tok == 1 -> do
                 -- Operator signature: @(<>) :: ...@
                 case peekOperatorSig src cur' of

@@ -193,3 +193,50 @@ spec = describe "Hs2010 — Modules" $ do
                 `shouldParseHeaderTo`
                     mh "M" ExportAll
                         [ImportDecl "Data.Text" True (Just "T") (ImportOnly ["pack"])]
+
+        -- Leftover: parseSubNames used to return at the inner ')' of
+        -- `NonEmpty ((:|))`, leaving the cursor one paren shallow and
+        -- silently dropping every subsequent import (the plusForeignPtr
+        -- drop that forced a host shim).
+        it "leftover: NonEmpty ((:|)) does not drop later import lists" $
+            "module M where\n\
+            \import Data.List.NonEmpty (NonEmpty ((:|)))\n\
+            \import GHC.ForeignPtr (plusForeignPtr)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ ImportDecl "Data.List.NonEmpty" False Nothing
+                            (ImportOnly ["NonEmpty", ":|"])
+                        , ImportDecl "GHC.ForeignPtr" False Nothing
+                            (ImportOnly ["plusForeignPtr"])
+                        ]
+
+        it "leftover: operator-group sub-import keeps later names in the same list" $
+            "module M where\n\
+            \import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "Data.List.NonEmpty" False Nothing
+                            (ImportOnly ["NonEmpty", ":|", "nonEmpty"])]
+
+        -- HSX leftover: dropping `(.)` / `($)` from the Prelude import
+        -- list made compose / apply resolve as last-writer FQNs.
+        it "leftover: `import Prelude (($), (.), id)` keeps `$` and `.`" $
+            "module M where\nimport Prelude (($), (.), id)\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "Prelude" False Nothing
+                            (ImportOnly ["$", ".", "id"])]
+
+        it "leftover: `hiding ((<>))` keeps `<>` in the hiding list" $
+            "module M where\nimport GHC.Utils.Outputable hiding ((<>))\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "GHC.Utils.Outputable" False Nothing
+                            (ImportHiding ["<>"])]
+
+        it "leftover: `import Control.Category ((.))` is the bare compose op" $
+            "module M where\nimport Control.Category ((.))\n"
+                `shouldParseHeaderTo`
+                    mh "M" ExportAll
+                        [ImportDecl "Control.Category" False Nothing
+                            (ImportOnly ["."])]

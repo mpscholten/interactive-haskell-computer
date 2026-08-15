@@ -138,3 +138,40 @@ spec = describe "HsExt — Syntax sugar" $ do
 
         it "NondecreasingIndentation: nested do at same indent" $
             shouldParse "do\n  x <- foo\n  do\n   y <- bar\n   pure y"
+
+    -- megaparsec leftovers: Error.hs `\case` on ErrorItem / ErrorFancy,
+    -- Stream.hs MultiWayIf on newline/tab tokens, and BlockArguments
+    -- `lines >>> \case`.
+    describe "leftover Parser: megaparsec LambdaCase / MultiWayIf" $ do
+        it "leftover: megaparsec `showErrorItem = \\case { Tokens …; Label …; EndOfInput … }`" $
+            "\\case { Tokens ts -> showTokens pxy ts; Label label -> NE.toList label; EndOfInput -> eoi }"
+                `shouldParseTo`
+                ELam "$lc"
+                    (ECase (EVar "$lc")
+                        [ Alt (PCon "Tokens" [PVar "ts"])
+                              (EApp (EApp (EVar "showTokens") (EVar "pxy"))
+                                    (EVar "ts"))
+                        , Alt (PCon "Label" [PVar "label"])
+                              (EApp (EVar "NE.toList") (EVar "label"))
+                        , Alt (PCon "EndOfInput" []) (EVar "eoi")
+                        ])
+
+        it "leftover: megaparsec MultiWayIf `if | ch == nl -> a | ch == tab -> b | otherwise -> c`" $
+            "if | ch == newlineTok -> a | ch == tabTok -> b | otherwise -> c"
+                `shouldParseTo`
+                EIf (EApp (EApp (EVar "==") (EVar "ch")) (EVar "newlineTok"))
+                    (EVar "a")
+                    (EIf (EApp (EApp (EVar "==") (EVar "ch")) (EVar "tabTok"))
+                         (EVar "b")
+                         (EIf (EVar "otherwise") (EVar "c")
+                              multiWayIfFallback))
+
+        it "leftover: megaparsec `lines >>> \\case { [err] -> err; xs -> xs }`" $
+            "lines >>> \\case { [err] -> err; xs -> xs }" `shouldParseTo`
+                EApp (EApp (EVar ">>>") (EVar "lines"))
+                    (ELam "$lc"
+                        (ECase (EVar "$lc")
+                            [ Alt (PCon ":" [PVar "err", PCon "[]" []])
+                                  (EVar "err")
+                            , Alt (PVar "xs") (EVar "xs")
+                            ]))

@@ -85,8 +85,10 @@ module IHC.Classes
     , pushDoCarrier
     , popDoCarrier
     , currentDoCarrier
+    , withClearedDoCarrier
     , setLastMonadicCarrier
     , takeLastMonadicCarrier
+    , peekLastMonadicCarrier
     ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
@@ -373,7 +375,12 @@ structuralPatternMatches patternTag concreteTag
     | isTypeVariable patternTag = True
     | Just p <- listElement patternTag
     , Just c <- listElement concreteTag = structuralPatternMatches p c
-    | otherwise = patternTag == concreteTag
+    | otherwise =
+        let ps = typeAppAtoms patternTag
+            cs = typeAppAtoms concreteTag
+        in if length ps == length cs && length ps > 1
+            then and (zipWith structuralPatternMatches ps cs)
+            else patternTag == concreteTag
   where
     isTypeVariable tag = case BC.uncons tag of
         Just (c, rest) -> c >= 'a' && c <= 'z'
@@ -386,11 +393,26 @@ structuralPatternMatches patternTag concreteTag
         , BC.head tag == '['
         , BC.last tag == ']' = Just (BC.init (BC.tail tag))
         | otherwise = Nothing
+    -- `MarkupM a` vs `MarkupM ()`, `CI a` vs `CI ByteString`.
+    -- Space-split, keeping parenthesised / bracketed atoms whole.
+    -- No library or class name is special-cased.
+    typeAppAtoms = go (0 :: Int) [] [] . BC.unpack
+      where
+        go _ cur acc [] = reverse (flush cur acc)
+        go d cur acc (c:cs)
+            | c == ' ' && d == 0 = go 0 [] (flush cur acc) cs
+            | c == '(' || c == '[' = go (d + 1) (c:cur) acc cs
+            | c == ')' || c == ']' = go (max 0 (d - 1)) (c:cur) acc cs
+            | otherwise = go d (c:cur) acc cs
+        flush cur acc
+            | null cur = acc
+            | otherwise = BC.pack (reverse cur) : acc
 
 patternSpecificity :: ByteString -> Int
 patternSpecificity tag
     | Just inner <- listElement tag = 1 + patternSpecificity inner
     | isTypeVariable tag = 0
+    | parts@(_:_:_) <- typeAppAtoms tag = sum (map patternSpecificity parts)
     | otherwise = 2
   where
     isTypeVariable t = case BC.uncons t of
@@ -404,6 +426,17 @@ patternSpecificity tag
         , BC.head t == '['
         , BC.last t == ']' = Just (BC.init (BC.tail t))
         | otherwise = Nothing
+    typeAppAtoms = go (0 :: Int) [] [] . BC.unpack
+      where
+        go _ cur acc [] = reverse (flush cur acc)
+        go d cur acc (c:cs)
+            | c == ' ' && d == 0 = go 0 [] (flush cur acc) cs
+            | c == '(' || c == '[' = go (d + 1) (c:cur) acc cs
+            | c == ')' || c == ']' = go (max 0 (d - 1)) (c:cur) acc cs
+            | otherwise = go d (c:cur) acc cs
+        flush cur acc
+            | null cur = acc
+            | otherwise = BC.pack (reverse cur) : acc
 
 -- | Normalise a type-application source slice into a stable dispatch
 -- tag. The parser's 'captureTypeArg' stores the raw bytes of a
@@ -445,9 +478,16 @@ normalizeTyTag bs0 =
     --   * @Parsec@ is @type Parsec e s = ParsecT e s Identity@
     -- Preserve @ShareInput T@ / @NoShareInput T@ compound tags used by
     -- megaparsec Stream dispatch (see 'tryStreamWrappedChunkMethod').
+    -- Still normalise the *inner* type: scanned heads keep the import
+    -- qualifier (@ShareInput T.Text@) while runtime
+    -- @typeTagOf (VCon "Text" _)@ is the bare constructor.  Leaving
+    -- the qualifier made Stream takeWhile_ miss and leftover-return
+    -- IO / a function, so @~(ts, input') = takeWhile_ f input@ died.
     rewriteHeadSyn s
-        | BC.pack "ShareInput " `BC.isPrefixOf` s = s
-        | BC.pack "NoShareInput " `BC.isPrefixOf` s = s
+        | Just rest <- BC.stripPrefix (BC.pack "ShareInput ") s =
+            BC.pack "ShareInput " <> rewriteHeadSyn rest
+        | Just rest <- BC.stripPrefix (BC.pack "NoShareInput ") s =
+            BC.pack "NoShareInput " <> rewriteHeadSyn rest
         | otherwise =
             let headCon =
                     case BC.break (\c -> c == ' ' || c == '\t') s of
@@ -952,6 +992,28 @@ currentDoCarrier = do
         Just (t:_) -> Just t
         _          -> Nothing
 
+-- | Run an action with this thread's do-carrier stack and last-monadic
+-- tag cleared, then restore them.  Source @error@ builds
+-- @errorCallWithCallStackException@ via @unsafeDupablePerformIO@ of an
+-- IO do-block (@currentCallStack@, @return acc@).  A live ParsecT
+-- do-carrier (HSX/megaparsec @<|>@ / @>>=@ apply) steals that @return@
+-- and @raise#@ throws the @ParsecT@ constructor
+-- (@IhcException: ParsecT@).  IO / Identity runners are not the
+-- surrounding parser.  No Parser/ParsecT name list.
+withClearedDoCarrier :: IO a -> IO a
+withClearedDoCarrier action = do
+    tid <- myThreadId
+    savedStack <- atomicModifyIORef' doCarrierStackRef $ \m ->
+        (Map.delete tid m, Map.lookup tid m)
+    savedLast <- atomicModifyIORef' lastMonadicCarrierRef $ \m ->
+        (Map.delete tid m, Map.lookup tid m)
+    let restore = do
+            atomicModifyIORef' doCarrierStackRef $ \m ->
+                (maybe (Map.delete tid m) (\s -> Map.insert tid s m) savedStack, ())
+            atomicModifyIORef' lastMonadicCarrierRef $ \m ->
+                (maybe (Map.delete tid m) (\s -> Map.insert tid s m) savedLast, ())
+    action `onException` restore <* restore
+
 -- | Last concrete monadic instance tag chosen by class dispatch
 -- (ParsecT, …).  `(<|>)` applies the method to the left parser
 -- (push/pop around that apply) and only then thunks the right
@@ -973,6 +1035,16 @@ takeLastMonadicCarrier = do
     tid <- myThreadId
     atomicModifyIORef' lastMonadicCarrierRef $ \m ->
         (Map.delete tid m, Map.lookup tid m)
+
+-- | Read the last monadic instance tag without consuming it.
+-- @>>@ of a State# VFun (writeArray / mapM_) must keep seeing ST
+-- across several sequencing steps; 'takeLastMonadicCarrier' is only
+-- for one-shot result-poly @pure@ / @return@.
+peekLastMonadicCarrier :: IO (Maybe ByteString)
+peekLastMonadicCarrier = do
+    tid <- myThreadId
+    m <- readIORef lastMonadicCarrierRef
+    pure (Map.lookup tid m)
 
 -- | Bundle of the three module-level per-run class-state IORefs:
 -- the in-scope module set for instance dispatch, the lazy instance

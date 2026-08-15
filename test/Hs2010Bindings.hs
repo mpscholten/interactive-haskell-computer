@@ -138,3 +138,52 @@ spec = describe "Hs2010 — Bindings & guards" $ do
 
         it "4.4.4 comma-separated guard sequence `| a, b, c`" $
             assertParses "module M where\nf x | x > 0, x < 10 = x\n"
+
+    --------------------------------------------------------------------
+    -- Leftover: where-clause implicit params (base Exception /
+    -- errorCallWithCallStackException).  Discarding `where ?callStack
+    -- = stk` left the body on defaultUnboundImplicit.
+    --------------------------------------------------------------------
+    describe "leftover Parser: where implicit params" $ do
+        -- One-line form used to swallow `in` (findWhereBlockEndAt only
+        -- closed on column).  Pin the leftover AST, not just "parses".
+        it "leftover: `where ?callStack = stk` wraps the RHS in EImplicitLet" $
+            "let f = g where ?callStack = stk in f" `shouldParseTo`
+                ELet [("f", EImplicitLet [("callStack", EVar "stk")]
+                                          (EVar "g"))]
+                     (EVar "f")
+
+        it "leftover: body can mention the bound IP `?callStack`" $
+            "let f = ?callStack where ?callStack = stk in f" `shouldParseTo`
+                ELet [("f", EImplicitLet [("callStack", EVar "stk")]
+                                          (EImplicitRef "callStack"))]
+                     (EVar "f")
+
+        it "leftover: nested `let` in a where-block does not steal outer `in`" $
+            "let f = g where h = let x = 1 in x in f" `shouldParseTo`
+                ELet [("f", ELet [("h", ELet [("x", ELit (LInt 1))] (EVar "x"))]
+                                 (EVar "g"))]
+                     (EVar "f")
+
+        it "leftover: pattern-guard `Just x <- m` in a let-binding" $ do
+            r <- parseExpr "let f m | Just x <- m = x in f"
+            case r of
+                Left e -> expectationFailure
+                    ("expected parse success, got " <> show e)
+                Right (ELet [("f", rhs)] (EVar "f"))
+                    | hasJustPatGuard rhs -> pure ()
+                Right other -> expectationFailure
+                    ("expected let f = … with PCon Just, got "
+                     <> show other)
+
+hasJustPatGuard :: Expr -> Bool
+hasJustPatGuard (ECase _ alts) =
+    any (\(Alt p _) -> p == PCon "Just" [PVar "x"]) alts
+        || any (hasJustPatGuard . altBody) alts
+  where
+    altBody (Alt _ e) = e
+hasJustPatGuard (ELam _ e)   = hasJustPatGuard e
+hasJustPatGuard (ELet bs e)  = any (hasJustPatGuard . snd) bs || hasJustPatGuard e
+hasJustPatGuard (EIf _ t e)  = hasJustPatGuard t || hasJustPatGuard e
+hasJustPatGuard (EApp f a)   = hasJustPatGuard f || hasJustPatGuard a
+hasJustPatGuard _            = False

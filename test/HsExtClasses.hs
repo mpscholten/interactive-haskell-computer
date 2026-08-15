@@ -34,14 +34,6 @@ shouldParse bs = do
         ParseRejected pe              -> expectationFailure
             ("expected parser acceptance on fixture, got ParseError: " <> show pe)
 
-shouldParseOrPending :: String -> ByteString -> Expectation
-shouldParseOrPending reason bs = do
-    r <- parseModule bs
-    case r of
-        ParseAccepted                 -> pure ()
-        ParseAcceptedWithDownstream _ -> pure ()
-        ParseRejected _               -> pendingWith reason
-
 spec :: Spec
 spec = describe "HsExt — Type-class extensions" $ do
 
@@ -75,7 +67,7 @@ spec = describe "HsExt — Type-class extensions" $ do
 
     describe "FunctionalDependencies" $ do
         it "FunctionalDependencies: single fundep `a -> b`" $
-            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
@@ -84,7 +76,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FunctionalDependencies: multi fundeps `a -> b, b -> a`" $
-            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
@@ -94,7 +86,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "FunctionalDependencies: multi-LHS fundep `a b -> c`" $
-            shouldParseOrPending "needs LANGUAGE FunctionalDependencies support" $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE MultiParamTypeClasses #-}\n"
                 , "{-# LANGUAGE FunctionalDependencies #-}\n"
                 , "module M where\n"
@@ -161,7 +153,7 @@ spec = describe "HsExt — Type-class extensions" $ do
 
     describe "InstanceSigs" $ do
         it "InstanceSigs: method signature inside instance body" $
-            shouldParseOrPending "needs LANGUAGE InstanceSigs support" $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE InstanceSigs #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -173,7 +165,7 @@ spec = describe "HsExt — Type-class extensions" $ do
                 ]
 
         it "InstanceSigs: contextful method signature inside instance" $
-            shouldParseOrPending "needs LANGUAGE InstanceSigs support" $ mconcat
+            shouldParse $ mconcat
                 [ "{-# LANGUAGE InstanceSigs #-}\n"
                 , "module M where\n"
                 , "class C a where\n"
@@ -219,4 +211,18 @@ spec = describe "HsExt — Type-class extensions" $ do
                 , "  m :: a -> Bool\n"
                 , "instance C a => C [a] where\n"
                 , "  m _ = True\n"
+                ]
+
+    -- Warp / HSX leftover: HasCallStack is a nullary constraint synonym
+    -- (`type HasCallStack = (?callStack :: CallStack)`).  The class
+    -- head and the method context must parse, not leftover as a tyvar.
+    describe "leftover Parser: HasCallStack constraint synonym" $ do
+        it "leftover: `HasCallStack =>` on a method is accepted" $
+            shouldParse $ mconcat
+                [ "{-# LANGUAGE ConstraintKinds #-}\n"
+                , "{-# LANGUAGE ImplicitParams #-}\n"
+                , "module M where\n"
+                , "type HasCallStack = (?callStack :: CallStack)\n"
+                , "error :: HasCallStack => String -> a\n"
+                , "error s = s\n"
                 ]

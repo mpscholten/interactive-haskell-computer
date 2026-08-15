@@ -109,6 +109,43 @@ spec = describe "Hs2010 — Fixity & type signatures" $ do
         it "3.8 rejection: `infixr 10 ?` raises ParseError" $
             scanFixRejects "infixr 10 ?\n"
 
+        -- Warp / HSX leftover: these operators must keep their Prelude
+        -- fixities in the default table.  A missing seed defaults to
+        -- infixl 9 and mis-nests `prepend . (bs <>)`, `run p $ \r ->`,
+        -- `a <> b <> c`, and `p <|> q <|> r`.
+        describe "leftover Parser: Warp/HSX operator fixities" $ do
+            it "default `$` is infixr 0" $
+                Map.lookup "$" defaultFixityTable `shouldBe` Just (AssocR, 0)
+            it "default `.` is infixr 9" $
+                Map.lookup "." defaultFixityTable `shouldBe` Just (AssocR, 9)
+            it "default `<>` is infixr 6" $
+                Map.lookup "<>" defaultFixityTable `shouldBe` Just (AssocR, 6)
+            it "default `<|>` is infixl 3" $
+                Map.lookup "<|>" defaultFixityTable `shouldBe` Just (AssocL, 3)
+            it "`infixr 9 .` registers bare `.`" $
+                scanFixTo mempty "infixr 9 .\n"
+                    (fixities [(".", (AssocR, 9))])
+            it "`infixr 0 $` registers bare `$`" $
+                scanFixTo mempty "infixr 0 $\n"
+                    (fixities [("$", (AssocR, 0))])
+            it "`infixr 6 <>` registers bare `<>`" $
+                scanFixTo mempty "infixr 6 <>\n"
+                    (fixities [("<>", (AssocR, 6))])
+            it "`infixl 3 <|>` registers bare `<|>`" $
+                scanFixTo mempty "infixl 3 <|>\n"
+                    (fixities [("<|>", (AssocL, 3))])
+            -- Warp leftover: `return @Payload $! n == 0` and do-binds
+            -- `>>=` / `>>` mis-nest if these seed entries vanish.
+            it "default `$!` is infixr 0" $
+                Map.lookup "$!" defaultFixityTable `shouldBe` Just (AssocR, 0)
+            it "default `>>=` is infixl 1" $
+                Map.lookup ">>=" defaultFixityTable `shouldBe` Just (AssocL, 1)
+            it "default `>>` is infixl 1" $
+                Map.lookup ">>" defaultFixityTable `shouldBe` Just (AssocL, 1)
+            it "`infixr 0 $!` registers bang-dollar" $
+                scanFixTo mempty "infixr 0 $!\n"
+                    (fixities [("$!", (AssocR, 0))])
+
     describe "3.9 type signatures" $ do
 
         it "3.9.1 single-variable signature `f :: Int`" $ do

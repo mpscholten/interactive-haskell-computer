@@ -31,5 +31,5 @@ main :: IO ()
 main = do
   let thu = unsafeCreate 3 $ \ptr -> cpy3 ptr weekDays 12
       nov = unsafeCreate 3 $ \ptr -> cpy3 ptr months 33
-  BS.putStrLn thu
-  BS.putStrLn nov
+  putStrLn (BS.unpack thu)
+  putStrLn (BS.unpack nov)

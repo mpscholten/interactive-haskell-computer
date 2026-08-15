@@ -25,6 +25,9 @@ module IHC.Elaborate
     , parseRawTypeExpr
     , resolveSynonymHop
     , foreignConstructorCollision
+    , isStringLiteralExpr
+    , isCharListType
+    , fromStringResultTag
     ) where
 
 import Control.Exception (Exception, SomeException, throwIO, try)
@@ -38,7 +41,7 @@ import qualified Data.Set as Set
 
 
 import IHC.AST
-import IHC.Classes (ClassRegistry)
+import IHC.Classes (ClassRegistry, currentDoCarrier, normalizeTyTag)
 import IHC.ConstructorMetadata
     ( ConstructorTypeRegistry, constructorScheme
     , foreignConstructorCollision )
@@ -244,15 +247,155 @@ elaborateExpectedExpr :: InferEnv -> Type -> Expr
     -> IO (Expr, Type, [Pred], Subst)
 elaborateExpectedExpr ienv expected expr = case (expr, expected) of
     -- OverloadedStrings: a string literal (or its desugared cons list)
-    -- whose expected type is not [Char]/String is `fromString` at that
+    -- whose expected type is not a list / String is `fromString` at that
     -- result type.  The class method is result-polymorphic; the
     -- expected type (constructor field, annotation) chooses the
     -- instance.  No library or constructor name is special-cased.
+    --
+    -- Parser `[]` and desugared `""` share `EVar "[]"`.  Wrapping every
+    -- non-[Char] nil in fromString left a leftover IsString function in
+    -- `[Int]` / `[Flag]` constructor fields; `k \`elem\` xs` then died
+    -- as an if-condition.  A list expected type is the nil constructor.
     (e, ty)
-      | not (isCharListType ty)
+      | let ty' = expandSyn (ieSynonyms ienv) ty
+      , not (isListType ty' || isCharListType ty')
       , isStringLiteralExpr e ->
             elaborateExpectedExpr ienv ty
                 (EApp (EVar (BC.pack "fromString")) e)
+    -- Unannotated integer literals at a non-Int/Integer expected type
+    -- are `fromInteger` (GHC treats @0@ as @Num a => a@).  Derived Eq
+    -- of a multi-ctor Num type (text fusion Size, local Hint) must not
+    -- see a bare VInt.  No Size / Unknown / Text name list.
+    --
+    -- Skip when the expected head is the live do-carrier (ParsecT
+    -- after `char`, IO, ST, …).  GHC only inserts fromInteger when
+    -- `Num t` holds; there is no `Num (ParsecT e s m a)`, so a
+    -- leftover `0` / `+ 4` inside T.pack must stay Int.  Wrapping it
+    -- made int-spine Num.+ see (left=0 right=<ParsecT>).  Size / Hint
+    -- are not the do-carrier, so they still wrap.
+    (ELit (LInt n), ty)
+      | not (isIntOrIntegerType ty) -> do
+            skip <- expectedIsLiveCarrier ienv ty
+            if skip
+                then elaborateExpr ienv expr
+                else elaborateExpectedExpr ienv ty
+                    (EApp (EVar (BC.pack "fromInteger"))
+                          (ELit (LInteger (fromIntegral n))))
+    (ELit (LInteger _), ty)
+      | not (isIntOrIntegerType ty) -> do
+            skip <- expectedIsLiveCarrier ienv ty
+            if skip
+                then elaborateExpr ienv expr
+                else elaborateExpectedExpr ienv ty
+                    (EApp (EVar (BC.pack "fromInteger")) expr)
+    -- `fromString x` (explicit, or the wrap above) at a concrete
+    -- non-[Char] result type.  Pin the instance from the expected
+    -- type so a monomorphic last-writer scheme (`String -> Text`)
+    -- cannot leave the class-method dispatcher leftover.  Tag is the
+    -- result constructor head — not a HostPreference / Pref name list.
+    (EApp f x, ty)
+      | not (isCharListType ty)
+      , isFromStringExpr f
+      , Just tag <- fromStringResultTag ty -> do
+            (x', _xt, xPreds, xSub) <- elaborateExpr ienv x
+            pure ( EApp (ETypedMethod (BC.pack "IsString")
+                                      (BC.pack "fromString")
+                                      tag)
+                        x'
+                 , ty
+                 , xPreds
+                 , xSub
+                 )
+    -- OverloadedStrings list literal at expected [T] (T not Char).
+    -- `["h1"] :: [Text]` is `(:) "h1" []`, not a String.  The String
+    -- case above skips any list expected type (empty `[]` in a
+    -- `[Flag]` field is nil).  Push T onto each cons head so each
+    -- `"h1"` becomes `fromString "h1"` at T.  No Text / Set name list.
+    (e, ty)
+      | Just elemTy <- listElementType (expandSyn (ieSynonyms ienv) ty)
+      , not (isCharListType elemTy)
+      , Just (hd, tl) <- splitListCons e -> do
+            (hd', hdTy, hdPreds, hdSub) <-
+                elaborateExpectedExpr ienv elemTy hd
+            sHd <- either (throwIO . UnificationFailure) pure
+                (unify hdSub (applySubst hdSub elemTy)
+                             (applySubst hdSub hdTy))
+            let ienvTl = applySubstIenv sHd ienv
+                listTy = applySubst sHd ty
+            (tl', tlTy, tlPreds, tlSub) <-
+                elaborateExpectedExpr ienvTl listTy tl
+            sTl <- either (throwIO . UnificationFailure) pure
+                (unify tlSub (applySubst tlSub listTy)
+                             (applySubst tlSub tlTy))
+            let sFinal = composeSubst sHd sTl
+            pure ( rebuildCons e hd' tl'
+                 , applySubst sFinal ty
+                 , map (applySubstPred sFinal) (hdPreds ++ tlPreds)
+                 , sFinal
+                 )
+    -- `f ["h1", …] :: F T` — unary result `F T` (Set Text, not
+    -- Map k v) and a list-of-string argument.  The list is `[T]`.
+    -- IHP `parents = Set.fromList ["h1", …] :: Set Text` needs this:
+    -- fromList's result annotation is Set, not [Text], so the cons
+    -- case above never sees the elements.  `fail "tag"` is a String
+    -- argument, not a list of strings; it does not match.
+    -- Keep the callee as written.  Structural — no fromList / Set name list.
+    (EApp f x, ty)
+      | Just elemTy <- unaryTypeArg (expandSyn (ieSynonyms ienv) ty)
+      , not (isCharListType elemTy)
+      , isListOfStringLits x -> do
+            let listTy = TyApp (TyCon (BC.pack "[]")) elemTy
+            (x', xt, xPreds, xSub) <-
+                elaborateExpectedExpr ienv listTy x
+            sArg <- either (throwIO . UnificationFailure) pure
+                (unify xSub (applySubst xSub listTy)
+                            (applySubst xSub xt))
+            pure ( EApp f x'
+                 , applySubst sArg ty
+                 , map (applySubstPred sArg) xPreds
+                 , sArg
+                 )
+    -- Unary class-method application (`return ()`, `pure x`, `fail s`)
+    -- at a concrete `M t` field or annotation.  defaultSettings stores
+    -- `settingsBeforeMainLoop = return ()`; a last-writer monomorphic
+    -- scheme leaves a leftover function and runIO silent-exits.  Same
+    -- rule as the nullary class-method case below and as fromString at
+    -- a constructor field: the expected monad head is the instance tag.
+    -- Not a Settings / method name list.
+    (EApp f x, ty)
+      | Just method <- classMethodAppHead ienv f
+      , Just (monadTy, argTy) <- splitMonadType (expandSyn (ieSynonyms ienv) ty)
+      , Just headName <- tyHead (expandSyn (ieSynonyms ienv) monadTy)
+      , let tag = bareName headName
+      , not (BC.null tag) -> do
+            clsMap <- readIORef globalMethodClassRef
+            case Map.lookup method clsMap of
+                Just (cls:_) -> do
+                    (x', _xt, xPreds, xSub) <- elaborateExpectedExpr ienv argTy x
+                    pure ( EApp (ETypedMethod cls method tag) x'
+                         , ty
+                         , xPreds
+                         , xSub
+                         )
+                _ -> do
+                    (e', t, preds, sub) <- elaborateExpr ienv expr
+                    sub' <- either (throwIO . UnificationFailure) pure
+                        (unify sub ty t)
+                    pure (e', applySubst sub' ty,
+                        map (applySubstPred sub') preds, sub')
+    -- `const (return ())` at `IO () -> IO ()` (settingsInstallShutdownHandler).
+    -- The expected type is an arrow, not `M t`, so the case above misses
+    -- the inner `return ()`.  Push the monad carrier from either side of
+    -- the arrow into the argument.  Structural: any unary class-method
+    -- argument under an arrow whose components include `M t`.
+    (EApp f x, ty)
+      | Just _ <- classMethodAppHead ienv (appHeadExpr x)
+      , Just ioTy <- monadTypeIn (expandSyn (ieSynonyms ienv) ty) -> do
+            (x', _xt, xPreds, xSub) <- elaborateExpectedExpr ienv ioTy x
+            (f', _ft, fPreds, fSub) <- elaborateExpr (applySubstIenv xSub ienv) f
+            let sub = composeSubst fSub xSub
+            pure (EApp f' x', applySubst sub ty,
+                map (applySubstPred sub) (xPreds ++ fPreds), sub)
     (EVar name, _)
       | Just (Scheme vars preds _) <- Map.lookup name (ieLocals ienv)
       , not (null vars) || not (null preds)
@@ -266,10 +409,16 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
     -- no standalone top-level signature (they live in the class decl).
     -- When the do-block expected type is @Q t@, pin the method to that
     -- monad instead of leaving a bare EVar for value-directed ParsecT.
+    -- Dispatch is by the constructor head after synonym expansion
+    -- (`ParsecT e s m` / `Parser` → `ParsecT`), not the closed
+    -- 'typeDispatchTag' (no instance key).  Same structural rule as
+    -- 'applyMethodSubst' on an open transformer type.  No name list
+    -- of Parser / ParsecT.  Do not treat ParsecT as Q/Exp.
     (EVar name, _)
       | Set.member (bareName name) (ieClassMethodNames ienv)
       , Just (monadTy, _) <- splitMonadType expected
-      , let tag = typeDispatchTag (expandSyn (ieSynonyms ienv) monadTy)
+      , Just headName <- tyHead (expandSyn (ieSynonyms ienv) monadTy)
+      , let tag = bareName headName
       , not (BC.null tag) -> do
             clsMap <- readIORef globalMethodClassRef
             case Map.lookup (bareName name) clsMap of
@@ -308,7 +457,261 @@ elaborateExpectedExpr ienv expected expr = case (expr, expected) of
                 pure (ETyApp e' tyBytes, expected, preds, sub)
             Nothing ->
                 pure (e', t, preds, sub)
+    -- [| e |] evaluates to a raw TH Exp tree.  When the expected type
+    -- is Q t (runQ's argument, a `:: Q Exp` annotation), inhabit Q via
+    -- `$qWrap (pure quote)` — the same injection Q-do uses so we never
+    -- look up the name Q (Queue collision) and never pin `pure` to
+    -- Applicative Q (`pure x = Q (pure x)` re-enters).  Unconstrained
+    -- / Exp-expected quotes stay raw so `$(pure [| 42 |])` keeps
+    -- working.  Not a runQ shim; not ParsecT-as-Q.
+    (EQuote inner, ty)
+      | expectedCarrierIsQ ienv ty ->
+            pure ( EApp (EVar (BC.pack "$qWrap"))
+                        (EApp (EVar (BC.pack "pure")) (EQuote inner))
+                 , ty
+                 , []
+                 , emptySubst
+                 )
+    -- `listE` / `litE` / `appE` / `varE` already inhabit `m Exp` (the
+    -- source body defaults to IO).  Wrap the application as Q without
+    -- an extra `pure` — that would nest `Q (IO Exp)`.  Do not wrap
+    -- `pure` / `return` / `$qWrap` heads: those already inhabit Q
+    -- (`runQ (pure 42)`, `$qWrap (pure [| e |])`).  Not a combinator
+    -- name list; quotes stay on the `$qWrap (pure quote)` path above.
+    --
+    -- Unify the residual result with expected Q so `listE :: [m Exp]
+    -- -> m Exp` instantiates `m ~ Q` and the argument list is
+    -- `[Q Exp]`.  Cons-list elaboration then wraps each raw quote
+    -- (`sequenceA` of `[Exp]` is the leftover function).  If a quote
+    -- (or `[Q t]` of quotes) already inhabits Q, do not wrap the
+    -- application again — that nests `Q (Q a)` (`$(pure [| 42 |])`
+    -- must stay 42).
+    (EApp f x, ty)
+      | expectedCarrierIsQ ienv ty ->
+            elaborateQApp ienv ty (isQInhabitingHead f) f x
     _ -> elaborateExpr ienv expr
+
+-- | Elaborate @f x@ at expected @Q t@.  Infer @f@, unify its result
+-- with @Q t@, push the residual domain into @x@ (so a quote / list of
+-- quotes sees @Q@), then wrap the application only when the arguments
+-- did not already inhabit Q.
+elaborateQApp
+    :: InferEnv -> Type -> Bool -> Expr -> Expr
+    -> IO (Expr, Type, [Pred], Subst)
+elaborateQApp ienv ty alreadyQ f x = do
+    inferred <- try (elaborateExpr ienv f)
+        :: IO (Either SomeException (Expr, Type, [Pred], Subst))
+    case inferred of
+        Left _ -> fallback
+        Right (f', ft, fPreds, s1) -> do
+            let (doms, result) = tyArrowArgs (applySubst s1 ft)
+                sU = case unify s1 (applySubst s1 result) (applySubst s1 ty) of
+                    Right s -> s
+                    Left _  -> s1
+            case doms of
+                (argTy:_) -> do
+                    let argTy' = applySubst sU argTy
+                        ienvX  = applySubstIenv sU ienv
+                    elabX <- try (elaborateExpectedExpr ienvX argTy' x)
+                        :: IO (Either SomeException (Expr, Type, [Pred], Subst))
+                    case elabX of
+                        Left _ -> fallback
+                        Right (x', _xt, xPreds, s2) -> do
+                            let sub   = composeSubst sU s2
+                                preds = map (applySubstPred sub)
+                                    (fPreds ++ xPreds)
+                            -- `sequenceA` of `[Q Exp]` inside source
+                            -- `listE` is leftover (`pure []` in
+                            -- Traversable [] has no splice-root
+                            -- expected Q).  Explicit Q-do of the same
+                            -- quotes is GREEN.  A known `[Q Exp]` at
+                            -- expected `Q Exp` is that do: bind each
+                            -- action, `pure (ListE es)`.  Not a
+                            -- listE / sequenceA name.  Empty `[]` is
+                            -- the same do with no binds, but only
+                            -- when the unified domain is `[Q Exp]`.
+                            -- `runQ` only supplies `Q a`; after
+                            -- unifying `listE :: [m Exp] -> m Exp`
+                            -- the residual is `Q Exp`.  Check the
+                            -- substituted type so already-Q elements
+                            -- (`litE`) take this path.  `Q [Exp]`
+                            -- (sequenceA) still misses.
+                            case collectQActionList x' of
+                                Just qs
+                                  | not alreadyQ
+                                  , expectedIsQExp ienv (applySubst sub ty)
+                                  , not (null qs)
+                                    || expectedIsListOfQExp ienv argTy' ->
+                                    pure ( qDoListE qs, ty, preds, sub )
+                                _ -> do
+                                    let app = EApp f' x'
+                                        wrapped
+                                          | alreadyQ = app
+                                          | exprHasQWrap x' = app
+                                          | otherwise =
+                                                EApp (EVar (BC.pack "$qWrap")) app
+                                    pure (wrapped, ty, preds, sub)
+                [] -> fallback
+  where
+    fallback
+      | alreadyQ = elaborateExpr ienv (EApp f x)
+      | otherwise =
+            pure ( EApp (EVar (BC.pack "$qWrap")) (EApp f x)
+                 , ty
+                 , []
+                 , emptySubst
+                 )
+
+-- | Heads that already produce a Q value.  `pure` / `return` are the
+-- same result-poly injection Q-do uses; `$qWrap` is the synthetic
+-- constructor wrapper.  Matching them here avoids Q (Q a).
+isQInhabitingHead :: Expr -> Bool
+isQInhabitingHead (EVar n)
+    | n == BC.pack "$qWrap" = True
+    | isUpperHead (bareName n) = True  -- Q constructor (`pure x = Q (pure x)`)
+    | let b = bareName n
+    = b == BC.pack "pure" || b == BC.pack "return"
+isQInhabitingHead (ETyApp inner _) = isQInhabitingHead inner
+isQInhabitingHead (ELocalSig _ inner) = isQInhabitingHead inner
+isQInhabitingHead (ETypedMethod _ method _) =
+    method == BC.pack "pure" || method == BC.pack "return"
+isQInhabitingHead (EConstrainedValue inner _) = isQInhabitingHead inner
+isQInhabitingHead (EApp f _) = isQInhabitingHead f
+isQInhabitingHead _ = False
+
+-- | True when a sub-tree already injected Q via `$qWrap`.  Used so
+-- `listE [ $qWrap (pure [| e |]), … ]` is not wrapped again.
+exprHasQWrap :: Expr -> Bool
+exprHasQWrap (EApp (EVar n) _)
+    | n == BC.pack "$qWrap" = True
+exprHasQWrap (EApp f x) = exprHasQWrap f || exprHasQWrap x
+exprHasQWrap (ETyApp e _) = exprHasQWrap e
+exprHasQWrap (ELocalSig _ e) = exprHasQWrap e
+exprHasQWrap (EConstrainedValue e _) = exprHasQWrap e
+exprHasQWrap (ELam _ e) = exprHasQWrap e
+exprHasQWrap (ELet bs e) =
+    exprHasQWrap e || any (exprHasQWrap . snd) bs
+exprHasQWrap (ETuple es) = any exprHasQWrap es
+exprHasQWrap (EIf c t e) = exprHasQWrap c || exprHasQWrap t || exprHasQWrap e
+exprHasQWrap (ECase s as) =
+    exprHasQWrap s || any (\(Alt _ e) -> exprHasQWrap e) as
+exprHasQWrap (EDo ss) = any stmtHasQWrap ss
+exprHasQWrap _ = False
+
+stmtHasQWrap :: Stmt -> Bool
+stmtHasQWrap (SExpr e) = exprHasQWrap e
+stmtHasQWrap (SBind _ e) = exprHasQWrap e
+stmtHasQWrap (SBangBind _ e) = exprHasQWrap e
+stmtHasQWrap (SLet bs) = any (exprHasQWrap . snd) bs
+stmtHasQWrap (SImplicitLet bs) = any (exprHasQWrap . snd) bs
+
+-- | Expected type is `Q Exp` (qualified or not).  The splice / runQ
+-- result, not `Q [Exp]` (sequenceA's result) and not ParsecT.
+expectedIsQExp :: InferEnv -> Type -> Bool
+expectedIsQExp ienv ty =
+    expectedCarrierIsQ ienv ty
+    && case splitMonadType (expandSyn (ieSynonyms ienv) ty) of
+        Just (_, arg) ->
+            case tyHead (expandSyn (ieSynonyms ienv) arg) of
+                Just n -> bareName n == BC.pack "Exp"
+                Nothing -> False
+        Nothing -> False
+
+-- | Argument type is `[Q Exp]` (list of Q actions).  Empty `[]` at
+-- this type is nil of that list, so `f []` at expected `Q Exp` is
+-- the empty-list isolate of sequenceA — not a combinator name.
+expectedIsListOfQExp :: InferEnv -> Type -> Bool
+expectedIsListOfQExp ienv ty =
+    case listElementType (expandSyn (ieSynonyms ienv) ty) of
+        Just elemTy -> expectedIsQExp ienv elemTy
+        Nothing -> False
+
+-- | Variables that appear as splice holes (`$x` / `$(x)`), including
+-- inside quotes.  Their rhs is a Q action — splice of that action
+-- must run it.  Quotes themselves stay raw Exp.
+splicedVarNames :: Expr -> [Name]
+splicedVarNames = go
+  where
+    go (ESplice (EVar n)) = [n]
+    go (ESplice e) = go e
+    go (EQuote e) = go e
+    go (EApp f x) = go f ++ go x
+    go (ELam _ e) = go e
+    go (ELet bs e) = concatMap (go . snd) bs ++ go e
+    go (ECase s as) = go s ++ concat [go e | Alt _ e <- as]
+    go (EIf c t e) = go c ++ go t ++ go e
+    go (EDo ss) = concatMap goStmt ss
+    go (ENeg e) = go e
+    go (ETuple es) = concatMap go es
+    go (ETyApp e _) = go e
+    go (ELocalSig _ e) = go e
+    go (EConstrainedValue e _) = go e
+    go (EImplicitLet bs e) = concatMap (go . snd) bs ++ go e
+    go (ERecordCon _ fs) = concatMap (go . snd) fs
+    go (ERecordUpdate e fs) = go e ++ concatMap (go . snd) fs
+    go _ = []
+    goStmt (SExpr e) = go e
+    goStmt (SBind _ e) = go e
+    goStmt (SBangBind _ e) = go e
+    goStmt (SLet bs) = concatMap (go . snd) bs
+    goStmt (SImplicitLet bs) = concatMap (go . snd) bs
+
+-- | Body of `let x = rhs in x` (plus leftover @e \@T@ wrappers).
+letBodyVar :: Expr -> Maybe Name
+letBodyVar (EVar n) = Just n
+letBodyVar (ETyApp e _) = letBodyVar e
+letBodyVar (ELocalSig _ e) = letBodyVar e
+letBodyVar (EConstrainedValue e _) = letBodyVar e
+letBodyVar _ = Nothing
+
+-- | Cons spine whose every head already inhabits Q (`$qWrap` or
+-- `pure` / `return`).  Nil is `Just []`.
+collectQActionList :: Expr -> Maybe [Expr]
+collectQActionList (ETyApp e _) = collectQActionList e
+collectQActionList (ELocalSig _ e) = collectQActionList e
+collectQActionList (EVar n)
+    | bareName n == BC.pack "[]" = Just []
+collectQActionList e
+    | Just (h, t) <- splitListCons e
+    , isQInhabitingHead h || exprHasQWrap h
+    = (h :) <$> collectQActionList t
+collectQActionList _ = Nothing
+
+-- | Q-do of a known `[Q Exp]`: the GREEN isolate of `listE`'s
+-- `sequenceA`.  `$qWrap (pure (ListE es))` matches Q-do's last
+-- `pure`.  Empty has no binds — emit that last `pure` directly so
+-- evalDo does not default a carrier-less `pure` to leftover.
+qDoListE :: [Expr] -> Expr
+qDoListE [] =
+    EApp (EVar (BC.pack "$qWrap"))
+         (EApp (EVar (BC.pack "pure"))
+               (EApp (EVar (BC.pack "ListE")) (EVar (BC.pack "[]"))))
+qDoListE qs =
+    let ns = [ BC.pack ("$qel" <> show i) | i <- [1 :: Int .. length qs] ]
+        binds = zipWith SBind ns qs
+        list = foldr (\n acc -> EApp (EApp (EVar (BC.pack ":")) (EVar n)) acc)
+                     (EVar (BC.pack "[]")) ns
+        body = EApp (EVar (BC.pack "pure"))
+                    (EApp (EVar (BC.pack "ListE")) list)
+    in EDo (binds ++ [SExpr body])
+
+isUpperHead :: Name -> Bool
+isUpperHead n = case BC.uncons n of
+    Just (c, _) -> c >= 'A' && c <= 'Z'
+    Nothing -> False
+
+-- | True when the expected type's monadic head is TH's @Q@ (qualified
+-- or not).  Synonym expansion first, then the constructor head — not
+-- 'typeDispatchTag', and not a ParsecT/Parser name list.
+expectedCarrierIsQ :: InferEnv -> Type -> Bool
+expectedCarrierIsQ ienv ty =
+    case tyHead (expandSyn (ieSynonyms ienv) carrier) of
+        Just n -> bareName n == BC.pack "Q"
+        Nothing -> False
+  where
+    carrier = case splitMonadType (expandSyn (ieSynonyms ienv) ty) of
+        Just (monadTy, _) -> monadTy
+        Nothing -> ty
 
 -- | [Char] after synonym expansion.  String is expanded by the
 -- caller via 'expandSyn' before 'elaborateExpectedExpr'.
@@ -318,9 +721,104 @@ isCharListType (TyApp (TyCon n) (TyCon e)) =
 isCharListType (TyCon n) = n == BC.pack "String"
 isCharListType _ = False
 
+-- | Any list type @[] a@ / @List a@ (qualified or not).  Empty @[]@ at
+-- this expected type is the nil constructor, not @fromString ""@.
+isListType :: Type -> Bool
+isListType ty = case tyHead ty of
+    Just n ->
+        let b = bareName n
+        in b == BC.pack "[]" || b == BC.pack "List"
+    Nothing -> False
+
+-- | Element type of @[] a@ / @List a@.  @Set a@ / @F a@ is not a list.
+listElementType :: Type -> Maybe Type
+listElementType ty = case tyApps ty of
+    (TyCon n, [elemTy])
+      | let b = bareName n
+      , b == BC.pack "[]" || b == BC.pack "List" -> Just elemTy
+    _ -> Nothing
+
+-- | Single type argument of a unary constructor application
+-- (@Set Text@, @Maybe a@).  @Map k v@ / @ParsecT e s m a@ have more
+-- than one argument and are not this shape.
+unaryTypeArg :: Type -> Maybe Type
+unaryTypeArg ty = case tyApps ty of
+    (TyCon _, [arg]) -> Just arg
+    _ -> Nothing
+
+-- | Desugared @(:) h t@, including a leftover @e \@T@ wrapper and a
+-- qualified cons.  Not a String: @"h1"@ is a cons of 'LChar', which
+-- still matches — callers that want a list of strings must also
+-- require 'isListOfStringLits'.
+splitListCons :: Expr -> Maybe (Expr, Expr)
+splitListCons (ETyApp inner _) = splitListCons inner
+splitListCons (EApp (EApp (EVar cons) h) t)
+    | isConsName cons = Just (h, t)
+splitListCons _ = Nothing
+
+isConsName :: Name -> Bool
+isConsName cons =
+    let b = bareName cons
+    in b == BC.pack ":" || BC.isSuffixOf (BC.pack ".:") cons
+
+rebuildCons :: Expr -> Expr -> Expr -> Expr
+rebuildCons orig h t = case stripConsTy orig of
+    EApp (EApp cons _) _ -> EApp (EApp cons h) t
+    _ -> EApp (EApp (EVar (BC.pack ":")) h) t
+  where
+    stripConsTy (ETyApp inner _) = stripConsTy inner
+    stripConsTy e = e
+
+-- | @["h1", "div"]@ — cons chain whose heads are string literals.
+-- @"h1"@ itself is a String, not a list of strings: 'fail "tag"'
+-- must not look like a list argument of fromStrings.
+isListOfStringLits :: Expr -> Bool
+isListOfStringLits e
+    | isStringLiteralExpr e = False
+    | Just (h, t) <- splitListCons e =
+        isStringLiteralExpr h && isListOfStringLitsTail t
+    | otherwise = False
+
+isListOfStringLitsTail :: Expr -> Bool
+isListOfStringLitsTail (ETyApp inner _) = isListOfStringLitsTail inner
+isListOfStringLitsTail e
+    | isNilExpr e = True
+    | isListOfStringLits e = True
+    | otherwise = False
+
+isNilExpr :: Expr -> Bool
+isNilExpr (ETyApp inner _) = isNilExpr inner
+isNilExpr (EVar n) = bareName n == BC.pack "[]"
+isNilExpr _ = False
+
+-- | Boxed Int / Integer — the default type of an unannotated integer
+-- literal.  Any other expected head (Hint, Size, Word8, …) needs
+-- fromInteger.
+isIntOrIntegerType :: Type -> Bool
+isIntOrIntegerType ty = case tyHead ty of
+    Just n ->
+        let b = bareName n
+        in b == BC.pack "Int" || b == BC.pack "Integer"
+            || b == BC.pack "I#" || b == BC.pack "Int#"
+    Nothing -> False
+
+-- | True when the expected type's constructor head is the do-carrier
+-- currently published by eval (`ParsecT` after a parser bind, …).
+-- Structural: uses the live carrier tag, not a ParsecT/Parser name list.
+expectedIsLiveCarrier :: InferEnv -> Type -> IO Bool
+expectedIsLiveCarrier ienv ty = do
+    mDo <- currentDoCarrier
+    let expanded = expandSyn (ieSynonyms ienv) ty
+        headTag = fmap (normalizeTyTag . bareName) (tyHead expanded)
+    pure $ case (mDo, headTag) of
+        (Just c, Just t) ->
+            not (BC.null c) && normalizeTyTag c == t
+        _ -> False
+
 -- | Parser-desugared @"…"@ is a cons-chain of 'ELit' 'LChar', or the
 -- original 'LStr' if desugar has not run.
 isStringLiteralExpr :: Expr -> Bool
+isStringLiteralExpr (ETyApp inner _) = isStringLiteralExpr inner
 isStringLiteralExpr (ELit (LStr _)) = True
 isStringLiteralExpr (ELit (LChar _)) = False
 isStringLiteralExpr (EVar n) = n == BC.pack "[]"
@@ -330,6 +828,62 @@ isStringLiteralExpr (EApp (EApp (EVar cons) (ELit (LChar _))) rest)
 isStringLiteralExpr (EApp (EApp (EVar cons) (ELit (LChar _))) rest)
     | BC.isSuffixOf (BC.pack ".:") cons = isStringLiteralExpr rest
 isStringLiteralExpr _ = False
+
+-- | Head of a `fromString` application, including an already-pinned
+-- 'ETypedMethod' and a leftover @e \@T@ wrapper.
+isFromStringExpr :: Expr -> Bool
+isFromStringExpr (EVar n) = bareName n == BC.pack "fromString"
+isFromStringExpr (ETyApp inner _) = isFromStringExpr inner
+isFromStringExpr (ETypedMethod _ method _) = method == BC.pack "fromString"
+isFromStringExpr _ = False
+
+-- | Unary class-method head (`return`, `pure`, `fail`, …), including
+-- an already-pinned 'ETypedMethod' and a leftover @e \@T@ wrapper.
+classMethodAppHead :: InferEnv -> Expr -> Maybe Name
+classMethodAppHead ienv (EVar n)
+    | Set.member (bareName n) (ieClassMethodNames ienv) = Just (bareName n)
+    | otherwise = Nothing
+classMethodAppHead ienv (ETyApp inner _) = classMethodAppHead ienv inner
+classMethodAppHead _ (ETypedMethod _ method _) = Just method
+classMethodAppHead _ _ = Nothing
+
+appHeadExpr :: Expr -> Expr
+appHeadExpr (EApp f _) = appHeadExpr f
+appHeadExpr (ETyApp inner _) = appHeadExpr inner
+appHeadExpr e = e
+
+-- | A concrete `M t` anywhere in an expected type, including under
+-- arrows (`IO () -> IO ()`).  First-wins so the domain of a setter
+-- field is preferred when both sides match.
+monadTypeIn :: Type -> Maybe Type
+monadTypeIn ty = case splitMonadType ty of
+    Just (monadTy, argTy) -> Just (TyApp monadTy argTy)
+    Nothing -> case ty of
+        TyArrow a b -> monadTypeIn a `orElse` monadTypeIn b
+        TyApp f x -> monadTypeIn f `orElse` monadTypeIn x
+        _ -> Nothing
+  where
+    orElse (Just a) _ = Just a
+    orElse Nothing b = b
+
+-- | Instance tag for result-polymorphic 'fromString'.
+-- Nullary heads (`Pref`, `HostPreference`, `ByteString`) use the
+-- constructor name.  Applications (`CI ByteString`) keep the
+-- structural tag so they do not steal `instance IsString (CI a)`
+-- registered under the `CI` constructor — that dictionary needs an
+-- inner IsString and is leftover if selected here.
+fromStringResultTag :: Type -> Maybe Name
+fromStringResultTag ty = case tyApps ty of
+    (TyCon n, []) ->
+        let bare = bareName n
+        in if BC.null bare then Nothing else Just bare
+    (TyCon _, _ : _) ->
+        let tag = typeDispatchTag ty
+        in if BC.null tag then Nothing else Just tag
+    _ -> do
+        n <- tyHead ty
+        let bare = bareName n
+        if BC.null bare then Nothing else Just bare
 
 renderExpectedType :: Type -> Maybe ByteString
 renderExpectedType ty = case ty of
@@ -662,20 +1216,15 @@ elaborateVar ienv name =
             | not (schemeMatchesMethod s) -> Nothing
             | isQualifiedName name
            || not (isAmbiguousSig ienv (bareName name)) -> Just s
-            -- Ambiguous last-writer is a red herring for result-
-            -- polymorphic class methods: the class scheme is unique
-            -- and the expected type picks the instance.  Not when the
-            -- last-writer is a different function that shares the
-            -- name (@Exception.try@ vs @MonadParsec.try@).
-            | isActualClassMethod ienv (bareName name)
-            , schemeIsResultPolymorphic s -> Just s
             | otherwise -> Nothing
         Nothing
-            | isAmbiguousSig ienv (bareName name)
-            , isActualClassMethod ienv (bareName name)
-            , Just s <- Map.lookup (bareName name) (ieSigs ienv)
-            , schemeMatchesMethod s
-            , schemeIsResultPolymorphic s -> Just s
+            -- Qualified ordinary bindings share a class-method name
+            -- with last-writer (`Set.fromList` vs `IsList.fromList`).
+            -- InferFreely of that class scheme at @Set Text@ walks
+            -- @Item@ and hangs before main.  Exact scheme only —
+            -- the facade extra hop is the owner's scheme, not this
+            -- last-writer.  No fromList name list.
+            | isQualifiedName name -> Nothing
             | isAmbiguousSig ienv (bareName name) -> Nothing
             | otherwise -> case Map.lookup (bareName name) (ieSigs ienv) of
                 Just s | schemeMatchesMethod s -> Just s
@@ -811,7 +1360,10 @@ elaborateLetExpected ienv bs expected body = do
     let seededEnv = ienv
             { ieLocals = foldr (\(n, t) m -> Map.insert n (Scheme [] [] t) m)
                                (ieLocals ienv) preseed }
-    (bs', bindPreds, bindSub) <- inferBinds seededEnv emptySubst [] [] bs preseed
+        spliceNs = splicedVarNames body
+        bodyVar  = letBodyVar body
+    (bs', bindPreds, bindSub) <-
+        inferBinds seededEnv emptySubst [] [] bs preseed spliceNs bodyVar
     let bodyEnv = applySubstIenv bindSub seededEnv
         bodyExpected = applySubst bindSub expected
     (body', bodyTy, bodyPreds, bodySub) <- elaborateExpectedExpr
@@ -822,19 +1374,38 @@ elaborateLetExpected ienv bs expected body = do
     pure (ELet bs' body', applySubst finalSub expected,
         map (applySubstPred finalSub) (bindPreds ++ bodyPreds), finalSub)
   where
-    inferBinds _ sub accE accP [] _ = pure (reverse accE, accP, sub)
-    inferBinds ie sub accE accP ((n, rhs) : rest) ((_, seeded) : preRest) = do
-        inferred <- try (elaborateExpr (applySubstIenv sub ie) rhs)
+    -- Splice of a let-bound Q action (`let x = listE [] in [| $x |]`)
+    -- must elaborate the rhs at Q Exp.  A body that is just the
+    -- binding (`let x = listE [] in x`) inherits the let expected
+    -- type.  Infer freely otherwise — do not wrap every quote as Q.
+    qExpTy = TyApp (TyCon (BC.pack "Q")) (TyCon (BC.pack "Exp"))
+    inferBinds _ sub accE accP [] _ _ _ = pure (reverse accE, accP, sub)
+    inferBinds ie sub accE accP ((n, rhs) : rest) ((_, seeded) : preRest)
+            spliceNs bodyVar = do
+        let rhsWant
+                | n `elem` spliceNs = Just qExpTy
+                | bodyVar == Just n = Just expected
+                | otherwise         = Nothing
+            inferRhs = case rhsWant of
+                Just want ->
+                    elaborateExpectedExpr (applySubstIenv sub ie)
+                        (applySubst sub want) rhs
+                Nothing ->
+                    elaborateExpr (applySubstIenv sub ie) rhs
+        inferred <- try inferRhs
             :: IO (Either SomeException (Expr, Type, [Pred], Subst))
         case inferred of
             Left _ -> inferBinds ie sub ((n, rhs) : accE) accP rest preRest
+                spliceNs bodyVar
             Right (rhs', rhsT, preds, rhsSub) ->
                 case unify rhsSub rhsT (applySubst rhsSub seeded) of
-                    Left _ -> inferBinds ie sub ((n, rhs) : accE) accP rest preRest
+                    Left _ -> inferBinds ie sub ((n, rhs) : accE) accP rest
+                        preRest spliceNs bodyVar
                     Right unified ->
-                        inferBinds ie (composeSubst sub unified) ((n, rhs') : accE)
-                            (preds ++ accP) rest preRest
-    inferBinds _ _ _ _ _ _ = pure ([], [], emptySubst)
+                        inferBinds ie (composeSubst sub unified)
+                            ((n, rhs') : accE) (preds ++ accP) rest preRest
+                            spliceNs bodyVar
+    inferBinds _ _ _ _ _ _ _ _ = pure ([], [], emptySubst)
 
 unsnocStmts :: [Stmt] -> Maybe ([Stmt], Stmt)
 unsnocStmts [] = Nothing
@@ -1079,7 +1650,7 @@ expandSyn syns = go
                 argsExpanded  = map go args
             in case head_ of
                 TyCon n ->
-                    case Map.lookup n syns of
+                    case lookupTypeSynonym syns n of
                         Just (TypeSynonym binders rhs)
                           | let arity = length binders
                           , length argsExpanded >= arity ->
@@ -1090,7 +1661,7 @@ expandSyn syns = go
                         _ -> foldl TyApp head_ argsExpanded
                 _ -> foldl TyApp (go head_) argsExpanded
         TyCon n
-            | Just (TypeSynonym [] rhs) <- Map.lookup n syns -> go rhs
+            | Just (TypeSynonym [] rhs) <- lookupTypeSynonym syns n -> go rhs
             | otherwise -> t
         TyVar _      -> t
         TyArrow a b  -> TyArrow (go a) (go b)
@@ -1101,14 +1672,6 @@ expandSyn syns = go
 -- is a synonym for something else.
 resolveSynonymHop :: Map ByteString TypeSynonym -> Type -> Type
 resolveSynonymHop = expandSyn
-
-expandScheme :: Map ByteString TypeSynonym -> Scheme -> Scheme
-expandScheme synonyms (Scheme vars preds body) =
-    Scheme vars (map expandPred preds) (expandSyn synonyms body)
-  where
-    expandPred (Pred cls args) = Pred cls (map (expandSyn synonyms) args)
-    expandPred (QPred vars' ctx body') =
-        QPred vars' (map expandPred ctx) (expandPred body')
 
 -- | Parse raw type-argument bytes (as stored in 'ETyApp') into a
 -- 'Type'.  Shares the same grammar as 'IHC.Scan.parseScheme' body
