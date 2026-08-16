@@ -333,6 +333,17 @@ decodeQuotedType _ = pure BS.empty
 
 decodeName :: Val -> IO Name
 decodeName (VStr bs) = pure bs
+decodeName (VCon "Name" [occT, flavourT]) = do
+    occ <- force legacyHooks occT >>= decodeName
+    flavour <- force legacyHooks flavourT
+    case flavour of
+        VCon "NameQ" [modT] -> do
+            modu <- force legacyHooks modT >>= decodeName
+            pure (modu <> "." <> occ)
+        VCon "NameG" [_spaceT, _pkgT, modT] -> do
+            modu <- force legacyHooks modT >>= decodeName
+            pure (modu <> "." <> occ)
+        _ -> pure occ
 decodeName (VCon "Name" [nT]) = do
     -- Source-loaded TH Name constructors retain their occurrence bytes here.
     nV <- force legacyHooks nT
@@ -345,6 +356,8 @@ decodeName (VCon "NameU" [nT]) = do
 decodeName (VCon "NameS" [nT]) = do
     nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon "OccName" [nT]) = do
+    nV <- force legacyHooks nT; decodeName nV
+decodeName (VCon "ModName" [nT]) = do
     nV <- force legacyHooks nT; decodeName nV
 decodeName (VCon n _) = pure n   -- sometimes names are stored as VCon tag
 decodeName v = throwTH ("decodeName: expected VStr, got " <> showValForDebug v)
@@ -578,7 +591,7 @@ thBuiltinPairs = []
 -- a list of @(name, body)@ top-level bindings.
 thExpandSpliceDecl :: Env -> ImplicitParamMap -> Expr -> IO [(Name, Expr)]
 thExpandSpliceDecl env ipm spliceExpr = do
-    v0 <- eval legacyHooks env ipm spliceExpr
+    v0 <- eval legacyHooks env ipm (annotateQMethods spliceExpr)
     decsVal <- unwrapQ v0
     thDecsToBindings decsVal
 
@@ -586,6 +599,43 @@ thExpandSpliceDecl env ipm spliceExpr = do
 unwrapQ :: Val -> IO Val
 unwrapQ (VIO act) = act >>= unwrapQ
 unwrapQ v         = pure v
+
+-- | A splice has an implicit @Q@ result context even though optimistic mode
+-- does not typecheck it. Preserve that compiler-known fact by attaching the Q
+-- instance tag to otherwise ambiguous class methods, including inside local
+-- helper bindings wrapped around a top-level splice.
+annotateQMethods :: Expr -> Expr
+annotateQMethods = go
+  where
+    go (EVar "pure")   = ETypedMethod "Applicative" "pure" "Q"
+    go (EVar "<*>")    = ETypedMethod "Applicative" "<*>" "Q"
+    go (EVar "*>")     = ETypedMethod "Applicative" "*>" "Q"
+    go (EVar "fmap")   = ETypedMethod "Functor" "fmap" "Q"
+    go (EVar ">>=")    = ETypedMethod "Monad" ">>=" "Q"
+    go (EVar ">>")     = ETypedMethod "Monad" ">>" "Q"
+    go (EVar "return") = ETypedMethod "Monad" "return" "Q"
+    go (EApp f x) = EApp (go f) (go x)
+    go (ELam n e) = ELam n (go e)
+    go (ELet bs e) = ELet [(n, go b) | (n, b) <- bs] (go e)
+    go (ECase e alts) = ECase (go e) [Alt p (go b) | Alt p b <- alts]
+    go (EIf c t f) = EIf (go c) (go t) (go f)
+    go (EDo ss) = EDo (map goStmt ss)
+    go (ENeg e) = ENeg (go e)
+    go (ETuple es) = ETuple (map go es)
+    go (EImplicitLet bs e) = EImplicitLet [(n, go b) | (n, b) <- bs] (go e)
+    go (ERecordCon n fs) = ERecordCon n [(f, go e) | (f, e) <- fs]
+    go (ERecordUpdate e fs) = ERecordUpdate (go e) [(f, go x) | (f, x) <- fs]
+    go (ESplice e) = ESplice (go e)
+    go (EQuote e) = EQuote e
+    go (ETyApp e ty) = ETyApp (go e) ty
+    go (EConstrainedValue e cs) = EConstrainedValue (go e) cs
+    go e = e
+
+    goStmt (SExpr e) = SExpr (go e)
+    goStmt (SBind n e) = SBind n (go e)
+    goStmt (SBangBind n e) = SBangBind n (go e)
+    goStmt (SLet bs) = SLet [(n, go b) | (n, b) <- bs]
+    goStmt (SImplicitLet bs) = SImplicitLet [(n, go b) | (n, b) <- bs]
 
 -- | Decode @[Dec]@ → @[(Name, Expr)]@.
 thDecsToBindings :: Val -> IO [(Name, Expr)]

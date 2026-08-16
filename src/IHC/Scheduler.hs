@@ -53,7 +53,9 @@ module IHC.Scheduler
     , enableKeepModuleCache
     ) where
 
-import Control.Exception (throwIO, Exception, catch, SomeException, try, mask, onException, bracket_)
+import Control.Exception
+    ( throwIO, Exception, catch, SomeException, try, mask, onException
+    , bracket_ )
 import Control.Applicative ((<|>))
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Ptr (nullPtr)
@@ -82,7 +84,8 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import IHC.AST
 import IHC.Builtins
-    ( builtinEnv, buildConEnv, buildFieldEnv, showValWith, stringToListValIO
+    ( builtinEnv, buildConEnv, buildFieldEnv
+    , showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
     , isHostWord8PtrVal, peekHostWord8ByteOff, peekHostMarkedElemOff, pokeHostWord8ByteOff
@@ -374,7 +377,7 @@ loadProgramFromSource searchPath src0 = do
     writeIORef _prevEntryScanKeysRef [srcBytes src0, srcBytes src]
 
     -- Phase 2.3: class registry for type-class dispatch.
-    classReg <- newClassRegistry
+    classReg <- newClassRegistryWithTH
     -- Install as the shared reg so the ETypedMethod evaluator path +
     -- on-demand elaborator can consult it at runtime.
     setSharedClassReg legacyHooks classReg
@@ -956,7 +959,7 @@ buildBaseEnv = do
     -- allocating fresh slots, otherwise a previous session can hand out
     -- thunks captured against stale module/class state.
     resetPerRunGlobals
-    classReg <- newClassRegistry
+    classReg <- newClassRegistryWithTH
     -- Install this as the REPL's shared class registry.  Instances
     -- registered by subsequent imports are written here so the
     -- dispatcher's lookup fallback can see them (Haskell 2010 §4.3.2:
@@ -1319,7 +1322,7 @@ loadFileIntoEnv searchPath path existingEnv = do
         fullSearchPath = searchPath ++ cacheDirs
     src <- cppSource src0
     registry <- newIORef Map.empty
-    classReg <- newClassRegistry
+    classReg <- newClassRegistryWithTH
     -- Pre-build builtin name set so discovery can short-circuit names
     -- resolved by IHC.Builtins (see 'discoverInModuleWith' for why this
     -- matters for the implicit-Prelude walk).
@@ -1599,7 +1602,7 @@ loadImportIntoEnv searchPath imp existingEnv
         -- builtin env carries FQN-keyed bindings for this module (e.g.
         -- "Data.ByteString.length"), install them under the caller's
         -- chosen qualifier so `BS.length` resolves.
-        classReg <- newClassRegistry
+        classReg <- newClassRegistryWithTH
         builtins <- builtinEnv classReg
         let modName = impModule imp
             prefix  = modName <> BC.pack "."
@@ -1699,7 +1702,7 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
         fullSearchPath = searchPath ++ cacheDirs
         requested      = nubBS requested0
     registry <- newIORef Map.empty
-    classReg <- newClassRegistry
+    classReg <- newClassRegistryWithTH
     targetLm <- loadModule registry fullSearchPath includeMap (impModule imp)
     earlyBuiltins <- builtinEnv classReg
     let earlyBuiltinNames =
@@ -2374,11 +2377,66 @@ registerInstancesFrom :: ModuleRegistry -> [FilePath] -> Map FilePath [FilePath]
 registerInstancesFrom registry searchPath includeMap classReg typeCtors classTable env lm = do
     decls <- scanInstanceDecls (lmSource lm)
     mapM_ catalogueOne decls
+    when (lmName lm == BC.pack "Language.Haskell.TH.Syntax") $
+        registerTHQBridge classReg
   where
     catalogueOne decl@(InstanceDecl cls _ _ _ _) =
         addCataloguedInstance cls
             (registerOne registry searchPath includeMap classReg
                          typeCtors classTable env lm decl)
+
+-- | Runtime dictionary for the compiler boundary of the source-declared @Q@
+-- newtype. Syntax.hs remains authoritative for Q and its instances; these
+-- method implementations select the concrete host @Quasi IO@ carrier used to
+-- execute a splice. Compiler callbacks (reify, location, newName, …) enter as
+-- VIO leaves and ordinary Functor/Applicative/Monad composition stays inside
+-- this dictionary.
+registerTHQBridge :: ClassRegistry -> IO ()
+registerTHQBridge reg = do
+    registerInstance reg "Functor" "Q" (HashMap.fromList
+        [("fmap", qFmap)])
+    registerInstance reg "Applicative" "Q" (HashMap.fromList
+        [ ("pure", qPure)
+        , ("<*>", qAp)
+        , ("*>", qThen)
+        ])
+    registerInstance reg "Monad" "Q" (HashMap.fromList
+        [(">>=", qBind), (">>", qThen)])
+  where
+    qPure = VFun $ \xT -> pure $ VIO (force legacyHooks xT)
+    qFmap = VFun $ \fT -> pure $ VFun $ \qT -> pure $ VIO $ do
+        x <- runQCarrier qT
+        f <- force legacyHooks fT
+        xt <- newWHNFThunk x
+        apply legacyHooks f xt
+    qAp = VFun $ \qfT -> pure $ VFun $ \qxT -> pure $ VIO $ do
+        f <- runQCarrier qfT
+        x <- runQCarrier qxT
+        xt <- newWHNFThunk x
+        apply legacyHooks f xt
+    qThen = VFun $ \leftT -> pure $ VFun $ \rightT -> pure $ VIO $ do
+        _ <- runQCarrier leftT
+        runQCarrier rightT
+    qBind = VFun $ \qT -> pure $ VFun $ \kT -> pure $ VIO $ do
+        x <- runQCarrier qT
+        k <- force legacyHooks kT
+        xt <- newWHNFThunk x
+        next <- apply legacyHooks k xt
+        nextT <- newWHNFThunk next
+        runQCarrier nextT
+
+    runQCarrier t = do
+        v <- force legacyHooks t
+        case v of
+            VIO io -> io
+            VCon "Q" [innerT] -> runQCarrier innerT
+            other -> pure other
+
+newClassRegistryWithTH :: IO ClassRegistry
+newClassRegistryWithTH = do
+    reg <- newClassRegistry
+    registerTHQBridge reg
+    pure reg
 
 -- | Identifying placeholder used when an instance method can't be
 -- evaluated (parse error, unbound helper, etc.).  The dispatcher

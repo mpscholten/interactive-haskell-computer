@@ -203,6 +203,12 @@
           fi
           echo "ProjectVersionForLib=$project_version_for_lib" >&2
 
+          # ghc-boot-th uses a different configure token from the other boot
+          # libraries. Without expanding it, the source tree is indexed as
+          # ghc-boot-th-@ProjectVersionMunged@ and cannot satisfy the real
+          # package identity requested by template-haskell.
+          project_version_munged="${ghc.version}"
+
           ${pkgs.lib.concatMapStringsSep "\n" (pkg: ''
             if [ -d "${ghcSrc}/libraries/${pkg}" ]; then
               cabal_file=$(find "${ghcSrc}/libraries/${pkg}" -maxdepth 3 -name "${pkg}.cabal" -type f | head -1)
@@ -216,6 +222,7 @@
                 # Expand autoconf-style @ProjectVersionForLib@ in the version
                 # field (ghc-internal.cabal.in ships version: @ProjectVersionForLib@.0).
                 version=$(printf '%s' "$version" | sed "s/@ProjectVersionForLib@/$project_version_for_lib/g")
+                version=$(printf '%s' "$version" | sed "s/@ProjectVersionMunged@/$project_version_munged/g")
                 src_dir=$(dirname "$cabal_file")
                 target="$out/${pkg}-$version"
                 cp -r "$src_dir" "$target"
@@ -231,7 +238,9 @@
                 for f in "$target"/*.cabal "$target"/*.cabal.in; do
                   [ -f "$f" ] || continue
                   tmp="$f.tmp"
-                  sed "s/@ProjectVersionForLib@/$project_version_for_lib/g" "$f" > "$tmp"
+                  sed -e "s/@ProjectVersionForLib@/$project_version_for_lib/g" \
+                      -e "s/@ProjectVersionMunged@/$project_version_munged/g" \
+                      "$f" > "$tmp"
                   mv "$tmp" "$f"
                 done
               fi

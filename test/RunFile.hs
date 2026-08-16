@@ -1339,6 +1339,20 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
         n   `shouldBe` 0
         out `shouldBe` "Red\n"
 
+    it "source TH Q pure crosses the Quasi IO splice boundary" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_syntax_q_bridge.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "6\n"
+
+    it "TH CodeDo operators execute from package source" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/th_codedo_source.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "CodeDo\n"
+
+    it "erased newtype selector projects a constructor-shaped payload" do
+        (n, out) <- captureStdout (runFile "test/Fixtures/Coverage/newtype_selector_vcon.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "Just 3\n"
     --------------------------------------------------------------------
     -- Phase 2.9.5: GADTs + Typeable/cast/Dynamic
     --------------------------------------------------------------------
@@ -1938,6 +1952,12 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             (runFile "test/Fixtures/QuickWins/rts_flags_source_loaded.hs")
         n   `shouldBe` 0
         out `shouldBe` "rts flags ok\ngc flags ok\nprof flags ok\nticky flags ok\n"
+
+    it "Foreign.Storable sizeOf/alignment dispatch to source-loaded instances" do
+        (n, out) <- captureStdout
+            (runFile "test/Fixtures/Coverage/foreign_storable_size_align_source_ops.hs")
+        n   `shouldBe` 0
+        out `shouldBe` "8\n8\n"
 
     it "UserInfixOp: (|>) defined via section form `x |> f = f x`" do
         (n, out) <- captureStdout (runFile "test/Fixtures/QuickWins/user_infix_operator.hs")

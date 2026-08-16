@@ -19,6 +19,7 @@ import System.Process
 import Test.Hspec
 import Text.Read (readMaybe)
 
+import qualified BuiltinsAudit
 import qualified CabalLoader
 import qualified CoreLowerTest
 import qualified Coverage
@@ -173,6 +174,7 @@ parseFailures line =
 
 allSpecs :: Spec
 allSpecs = do
+    BuiltinsAudit.spec
     ParserBugs.spec
     PreludeIOOwnerTest.spec
     FreshProcessTest.spec

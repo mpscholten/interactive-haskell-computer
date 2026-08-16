@@ -94,7 +94,8 @@ import Control.Monad (when)
 import IHC.AST  (Name, Expr(..))
 import IHC.Classes
     ( ClassRegistry, lookupInstanceMethod, registerInstance, typeTagOf
-    , mkTypeRep, typeRepEq
+    , mkTypeRep
+    , typeRepEq
     , drainCataloguedInstancesForClass
     , legacyHooks
     , withClearedDoCarrier
@@ -1315,9 +1316,10 @@ builtins reg =
     -- with val f = alloca $ \ptr -> poke ptr val >> f ptr.
     , ("peekCString",     peekCStringB)
     , ("newCString",      newCStringB)
-    -- Foreign.Storable.sizeOf / alignment source-load through the
-    -- class.  Host sizeOfB (always 64) ate discovery so CInt/GND
-    -- Int32 never reached instance Storable Int32.
+    -- Foreign.Storable.sizeOf / alignment source-load through the Storable
+    -- class.  Signature-directed type applications select the source-loaded
+    -- instance dictionary; ordinary Haskell class methods must not be
+    -- shadowed by bare host fallbacks.
     -- Network.Socket.Syscall.socket source-loads; its socket(2) foreign
     -- import dispatches through the generic FFI path.
     -- Network.Socket.Options.setSocketOption source-loads; it bottoms out on
@@ -1716,7 +1718,13 @@ builtins reg =
     -- throwTo source-loads from GHC.Internal.Conc.Sync and bottoms out
     -- on the killThread# primop above.
     -- displayException is a source Exception class method.
-    -- Phase 2.9.5: Typeable / TypeRep / cast / Dynamic
+    -- Typeable dictionaries and equality witnesses are compiler-generated.
+    -- Keep this bridge until the evaluator synthesises modern Type.Reflection
+    -- dictionaries. The legacy mkTyCon3/mkTyConApp constructors below were
+    -- removed: current base no longer exports them at all. The remaining
+    -- observers still consume IHC's compiler-generated representation and can
+    -- move to source once that representation is integrated with normal
+    -- Typeable instance dispatch.
     , ("typeRep",        typeRepB)
     , ("typeOf",         typeOfB)
     , ("cast",           castB)
@@ -1725,8 +1733,6 @@ builtins reg =
     , ("fromDynamic",    fromDynamicB)
     , ("fromDyn",        fromDynB)
     , ("dynTypeRep",     dynTypeRepB)
-    , ("mkTyCon3",       mkTyCon3B)
-    , ("mkTyConApp",     mkTyConAppB)
     , ("tyConName",      tyConNameB)
     , ("typeRepTyCon",   typeRepTyConB)
     , ("typeRepArgs",    typeRepArgsB)
@@ -7709,20 +7715,6 @@ dynTypeRepB = pure $ VFun $ \dynT -> do
     case dynV of
         VCon "Dynamic" [trT, _] -> force legacyHooks trT
         _ -> mkTypeRep "Unknown"
-
-mkTyCon3B :: IO Val
-mkTyCon3B = pure $ VFun $ \_ -> pure $ VFun $ \_ -> pure $ VFun $ \nameT -> do
-    nameV    <- force legacyHooks nameT
-    nameStrT <- newWHNFThunk nameV
-    pure (VCon "TyCon" [nameStrT])
-
-mkTyConAppB :: IO Val
-mkTyConAppB = pure $ VFun $ \tyConT -> pure $ VFun $ \argsT -> do
-    tyConV     <- force legacyHooks tyConT
-    argsV      <- force legacyHooks argsT
-    tyConThunk <- newWHNFThunk tyConV
-    argsThunk  <- newWHNFThunk argsV
-    pure (VCon "TypeRep" [tyConThunk, argsThunk])
 
 tyConNameB :: IO Val
 tyConNameB = pure $ VFun $ \tyConT -> do
