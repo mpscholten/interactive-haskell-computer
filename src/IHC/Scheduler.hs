@@ -84,7 +84,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
 import IHC.AST
 import IHC.Builtins
-    ( builtinEnv, buildConEnv, buildFieldEnv
+    ( builtinEnv, buildConEnv, buildFieldEnv, buildFieldEnvWithSchemes
     , showValWith, stringToListValIO
     , clearCtorIndex, clearForeignPtrWord8Ranges, flushHostHandleBuffer
     , foreignPtrValToForeignPtr
@@ -791,7 +791,8 @@ loadProgramFromSource searchPath src0 = do
         (\lm -> do
             ownFields <- if lmNoFieldSelectors lm
                 then pure HashMap.empty
-                else buildFieldEnv (lmFieldReg lm)
+                else buildFieldEnvWithSchemes
+                    [(lmName lm, lmFieldSchemes lm)] (lmFieldReg lm)
             pure (lmName lm, ownFields))
         loadedModules
     let ownerFields ownerName =
@@ -7690,6 +7691,13 @@ exportBodies registry searchPath includeMap builtinNames lm = do
 -- @methodArray@ through the latter, so wrapping only in 'exportBodies' left the
 -- imported methodArray with Int bounds (@Ix Int.index: non-Int index@ on the
 -- warp request path) even though the single-file repro worked.
+isDoRhs :: Expr -> Bool
+isDoRhs (EDo _) = True
+isDoRhs (ELet _ body) = isDoRhs body
+isDoRhs (ELocalSig _ body) = isDoRhs body
+isDoRhs (ETyApp body _) = isDoRhs body
+isDoRhs _ = False
+
 wrapNullaryResultSig :: Map ByteString TypeSynonym -> LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig syns lm n e =
     let e' = annotateBindInputTypes e
@@ -7775,6 +7783,15 @@ wrapNullaryResultSig syns lm n e =
           , isCompositionSpine e'
           , compositionLeftNeedsResultTy e'
           , Just tyBytes <- renderTypeForAnnotation body
+          -> ETyApp e' tyBytes
+        -- Signed do-block CAFs such as @inner :: Q Int; inner = do ...@
+        -- need their declared result type at eval time. Otherwise the
+        -- first Quasi/pure in the block is value-directed and becomes
+        -- ParsecT, even when a later consumer has a Q scheme.
+        _ | Just (Scheme _ _ body) <- Map.lookup n (lmTypeSigs lm)
+          , ([], resultTy) <- tyArrowArgs body
+          , isDoRhs e'
+          , Just tyBytes <- renderTypeForAnnotation resultTy
           -> ETyApp e' tyBytes
         _ -> e'
   where
@@ -9925,10 +9942,11 @@ exportedFieldRegistryOwn lm = case mhExports (lmHeader lm) of
 -- name (so legacy @fname record@ application works).
 buildFieldAccessorEnv :: [LoadedModule] -> FieldRegistry -> FieldRegistry -> IO Env
 buildFieldAccessorEnv lms publicFields allFields = do
+    let moduleSchemes = [(lmName lm, lmFieldSchemes lm) | lm <- lms]
     -- Bare-name accessors only for non-NoFieldSelectors modules.
-    bareEnv <- buildFieldEnv publicFields
+    bareEnv <- buildFieldEnvWithSchemes moduleSchemes publicFields
     -- Internal record-dot accessors for every field.
-    projEnv <- buildFieldEnv allFields
+    projEnv <- buildFieldEnvWithSchemes moduleSchemes allFields
     -- Fully-qualified accessors for import rewrites and FQN fallback.
     qualEnv <- buildQualifiedFieldEnv lms
     let projKeyed = HashMap.fromList [ (fieldProjName k, v) | (k, v) <- HashMap.toList projEnv ]
@@ -9944,7 +9962,8 @@ buildFieldAccessorEnv lms publicFields allFields = do
         | lmNoFieldSelectors lm = pure HashMap.empty
         | Map.null (lmFieldReg lm) = pure HashMap.empty
         | otherwise = do
-            env <- buildFieldEnv (lmFieldReg lm)
+            env <- buildFieldEnvWithSchemes
+                [(lmName lm, lmFieldSchemes lm)] (lmFieldReg lm)
             let prefix = lmName lm <> BC.pack "."
             pure (HashMap.fromList [ (prefix <> k, v) | (k, v) <- HashMap.toList env ])
 

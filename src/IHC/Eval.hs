@@ -906,7 +906,7 @@ valKindTag = \case
     VStr _            -> "VStr"
     VUnit             -> "VUnit"
     VFun _            -> "VFun"
-    VFieldAccessor n _ _ -> "VFieldAccessor:" <> BC.unpack n
+    VFieldAccessor n _ _ _ -> "VFieldAccessor:" <> BC.unpack n
     VFunIP _ _        -> "VFunIP"
     VCon n _          -> "VCon:" <> BC.unpack n
     VIO _             -> "VIO"
@@ -1690,24 +1690,31 @@ eval hooks env ipm = go
     tryTypedField (EApp selector recordExpr) ty = do
         selectorVal <- go selector
         case selectorVal of
-            VFieldAccessor _ clauses _ -> do
+            VFieldAccessor _ clauses evidence _ -> do
                 recordVal <- go recordExpr
                 case recordVal of
                     VCon ctor fields
                         | Just idx <- lookup ctor clauses
                         , idx < length fields -> do
                             owner <- currentOwner hooks env
-                            registry <- readIORef globalConstructorTypeRegistryRef
-                            case constructorMetadata registry owner ctor of
-                                Just metadata
-                                    | idx < length (ctmFieldTypes metadata)
-                                    , let fieldTy = ctmFieldTypes metadata !! idx
-                                    , containsForall fieldTy -> do
+                            case agreedFieldEvidence ctor evidence of
+                                Just (scheme, fieldOwner)
+                                    | schemeNeedsElaboration scheme -> do
                                         view <- newIORef (TypedField (fields !! idx)
-                                            (fieldScheme fieldTy)
-                                            (ciOwner (ctmIdentity metadata)))
+                                            scheme fieldOwner)
                                         specializeTypedField view ty
-                                _ -> pure Nothing
+                                _ -> do
+                                    registry <- readIORef globalConstructorTypeRegistryRef
+                                    case constructorMetadata registry owner ctor of
+                                        Just metadata
+                                            | idx < length (ctmFieldTypes metadata)
+                                            , let fieldTy = ctmFieldTypes metadata !! idx
+                                            , containsForall fieldTy -> do
+                                                view <- newIORef (TypedField (fields !! idx)
+                                                    (fieldScheme fieldTy)
+                                                    (ciOwner (ctmIdentity metadata)))
+                                                specializeTypedField view ty
+                                        _ -> pure Nothing
                     _ -> pure Nothing
             _ -> pure Nothing
     tryTypedField _ _ = pure Nothing
@@ -3686,7 +3693,7 @@ resolveFieldClauses hooks env fname = firstClauses
     firstClauses (k:ks) = do
         mVal <- lookupForced k
         case mVal of
-            Just (VFieldAccessor _ clauses _) -> pure (Just clauses)
+            Just (VFieldAccessor _ clauses _ _) -> pure (Just clauses)
             _ -> firstClauses ks
 
     lookupForced k = case lookupEnv k env of
@@ -4633,6 +4640,102 @@ matchFields hooks ((pat, t) : rest) acc = do
         Just subs -> matchFields hooks rest (reverse subs ++ acc)
 
 --------------------------------------------------------------------------------
+-- Record-selector scheme consumption
+--------------------------------------------------------------------------------
+
+-- | Fail-closed per-constructor evidence. Duplicate disagreeing schemes
+-- are treated as missing so we never elaborate with the wrong residual.
+agreedFieldEvidence :: Name -> [(Name, Scheme, Name)] -> Maybe (Scheme, Name)
+agreedFieldEvidence ctor evidence = case matches of
+    [] -> Nothing
+    first : rest
+        | all (== first) rest -> Just first
+        | otherwise -> Nothing
+  where
+    matches = [(scheme, owner) | (ctor', scheme, owner) <- evidence, ctor' == ctor]
+
+-- | Only function / quantified field types need residual-scheme
+-- elaboration. Ordinary payload projections stay on the cheap force path.
+schemeNeedsElaboration :: Scheme -> Bool
+schemeNeedsElaboration (Scheme _ _ ty) = go ty
+  where
+    go TyArrow{} = True
+    go TyForall{} = True
+    go (TyApp f x) = go f || go x
+    go _ = False
+
+projectedFieldHeadName :: Expr -> Maybe Name
+projectedFieldHeadName (EApp f _) = projectedFieldHeadName f
+projectedFieldHeadName (ETyApp f _) = projectedFieldHeadName f
+projectedFieldHeadName (EVar n) = Just n
+projectedFieldHeadName _ = Nothing
+
+-- | Project a record field and, when durable selector evidence exists,
+-- elaborate the residual field scheme before returning the payload.
+-- Canonical field thunks stay shared; elaboration only evaluates a view.
+applyFieldAccessor
+    :: IHCHooks
+    -> [(Name, Int)]
+    -> [(Name, Scheme, Name)]
+    -> (Thunk -> IO Val)
+    -> Thunk
+    -> IO Val
+applyFieldAccessor hooks clauses evidence fallback recordT = do
+    recordVal <- force hooks recordT
+    case recordVal of
+        VCon "SomeException" [innerT] ->
+            applyFieldAccessor hooks clauses evidence fallback innerT
+        VCon ctor fields
+            | Just idx <- lookup ctor clauses
+            , idx < length fields
+            , Just (scheme, fieldOwner) <- agreedFieldEvidence ctor evidence
+            , schemeNeedsElaboration scheme -> do
+                mElab <- tryElaborateProjectedField hooks (fields !! idx) scheme fieldOwner
+                case mElab of
+                    Just v -> pure v
+                    Nothing -> fallback recordT
+        _ -> fallback recordT
+
+tryElaborateProjectedField
+    :: IHCHooks
+    -> Thunk
+    -> Scheme
+    -> Name
+    -> IO (Maybe Val)
+tryElaborateProjectedField hooks fieldThunk scheme fieldOwner = do
+    state <- readIORef fieldThunk
+    case state of
+        TypedField canonical innerScheme innerOwner ->
+            tryElaborateProjectedField hooks canonical innerScheme innerOwner
+        Unevaluated (Closure closureEnv closureIpm closureExpr) -> do
+            mReg <- getSharedClassReg legacyHooks
+            case mReg of
+                Nothing -> pure Nothing
+                Just classReg -> do
+                    sigs0 <- readIORef globalTypeSigsRef
+                    syns <- readIORef globalTypeSynonymsRef
+                    ctorTypes <- readIORef globalConstructorTypeRegistryRef
+                    mHeadScheme <- case projectedFieldHeadName closureExpr of
+                        Just method -> lookupTypeSigFallback hooks
+                            (Just fieldOwner) method
+                        Nothing -> pure Nothing
+                    let sigs = case (projectedFieldHeadName closureExpr, mHeadScheme) of
+                          (Just method, Just headScheme) ->
+                            Map.insert (bareName method) headScheme
+                                (Map.insert method headScheme sigs0)
+                          _ -> sigs0
+                        Scheme _ _ expected = scheme
+                    result <- try (Elab.elaborateOwned classReg sigs syns
+                        ctorTypes (Just fieldOwner)
+                        (Elab.ExpectType expected) closureExpr)
+                        :: IO (Either SomeException (Expr, TA.Type))
+                    case result of
+                        Right (specialized, _) ->
+                            Just <$> eval hooks closureEnv closureIpm specialized
+                        Left _ -> pure Nothing
+        _ -> pure Nothing
+
+--------------------------------------------------------------------------------
 -- apply
 --------------------------------------------------------------------------------
 
@@ -4760,7 +4863,8 @@ orderingVal GT = VCon (BC.pack "GT") []
 
 apply :: IHCHooks -> Val -> Thunk -> IO Val
 apply _     (VFun f)                    arg = f arg
-apply _     (VFieldAccessor _ _ f)      arg = f arg
+apply hooks (VFieldAccessor _ clauses evidence f) arg =
+    applyFieldAccessor hooks clauses evidence f arg
 apply _     (VFunIP _ f)                arg = f Map.empty arg
 apply hooks (VClassMethod name _ tags go) arg =
     applyClassMethodFast hooks name tags go arg
@@ -4805,7 +4909,8 @@ apply _     v                           _   = error ("IHC.Eval.apply: not a func
 -- implicit params flow from the call site into the callee.
 applyIP :: IHCHooks -> ImplicitParamMap -> Val -> Thunk -> IO Val
 applyIP _     _         (VFun f)                   arg = f arg
-applyIP _     _         (VFieldAccessor _ _ f)     arg = f arg
+applyIP hooks _         (VFieldAccessor _ clauses evidence f) arg =
+    applyFieldAccessor hooks clauses evidence f arg
 applyIP _     callerIPM (VFunIP _ f)               arg = f callerIPM arg
 applyIP hooks _         (VClassMethod name _ tags go) arg =
     applyClassMethodFast hooks name tags go arg

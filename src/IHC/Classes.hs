@@ -569,7 +569,7 @@ typeTagOf (VCon n _) =
     -- whose instances are only keyed under the type name.
     n
 typeTagOf (VFun _)      = BC.pack "<function>"
-typeTagOf (VFieldAccessor _ _ _) = BC.pack "<function>"
+typeTagOf (VFieldAccessor _ _ _ _) = BC.pack "<function>"
 typeTagOf (VFunIP _ _)  = BC.pack "<function>"
 typeTagOf (VClassMethod _ _ _ _) = BC.pack "<function>"
 typeTagOf (VLazyMethod _) = BC.pack "<function>"
