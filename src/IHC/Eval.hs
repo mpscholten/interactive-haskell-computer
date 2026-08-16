@@ -2759,9 +2759,9 @@ eval hooks env ipm = go
                     <|> lookupIPMap (dictionaryContextKey cls) inherited
             tagT <- case existing of
                 Just prior -> pure prior
-                Nothing -> do
+                Nothing -> newLazyIOThunk $ do
                     argV <- force hooks argT
-                    newWHNFThunk (VStr (normalizeTyTag (typeTagOf argV)))
+                    pure (VStr (normalizeTyTag (typeTagOf argV)))
             let dictionaries = Map.fromList
                     [ (dictionaryContextKey cls, tagT)
                     , (constraintVariableKey cls variable, tagT)
