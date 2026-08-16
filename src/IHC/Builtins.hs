@@ -27,7 +27,7 @@ module IHC.Builtins
     ) where
 
 import Control.Concurrent
-    ( ThreadId, forkIO, killThread, myThreadId, threadDelay
+    ( ThreadId, forkIO, killThread, myThreadId, threadDelay, yield
     , threadWaitRead, threadWaitWrite
     )
 import Control.Concurrent.MVar
@@ -1434,6 +1434,10 @@ builtins reg =
     -- is not selected.
     , ("delay#", delayHashB)
     , ("GHC.Prim.delay#", delayHashB)
+    -- Compiler-intrinsic scheduler handoff.  Source-loaded 'yield' in
+    -- GHC.Internal.Conc.Sync lowers directly to this GHC.Prim operation.
+    , ("yield#", yieldHashB)
+    , ("GHC.Prim.yield#", yieldHashB)
     -- closeFdWith coordinates with GHC's RTS event manager. IHC does not
     -- run that manager, so the compatible behavior is to run the supplied
     -- low-level close action directly.
@@ -3991,12 +3995,24 @@ plusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
     -- never holds and the fold diverges -> heap exhaustion.  Unwrap
     -- nested source-loaded @VCon "Ptr" [_]@ wrappers first; for any
     -- other shape resolve to a host Ptr and advance that.
-    go (VPrimObj (PrimForeignPtr f)) n =
-        pure (VPrimObj (PrimForeignPtr (plusForeignPtr f (fromIntegral n))))
+    go (VPrimObj (PrimForeignPtr f)) n = do
+        let oldP = castPtr (unsafeForeignPtrToPtr f) :: Ptr Word8
+            f' = plusForeignPtr f (fromIntegral n)
+            newP = castPtr (unsafeForeignPtrToPtr f') :: Ptr Word8
+        propagateTypedPtr oldP newP
+        pure (VPrimObj (PrimForeignPtr f'))
     go (VCon "Ptr" [t]) n = force legacyHooks t >>= \t' -> go t' n
     go other n = do
         p <- valToHostPtr other
-        pure (VPrimObj (PrimPtr (plusPtr p (fromIntegral n))))
+        let p' = plusPtr p (fromIntegral n)
+        propagateTypedPtr p p'
+        pure (VPrimObj (PrimPtr p'))
+
+    propagateTypedPtr oldP newP = do
+        mTy <- lookupTypedHostPtr oldP
+        case mTy of
+            Just ty -> markTypedHostPtr newP ty
+            Nothing -> pure ()
 
 minusAddrB :: IO Val
 minusAddrB = pure $ VFun $ \a -> pure $ VFun $ \b -> do
@@ -4887,6 +4903,7 @@ numericRuntimeNewtypes =
         , "CSsize", "CSSize", "CIntPtr", "CUIntPtr", "CPtrdiff"
         , "Int8", "Int16", "Int32", "Int64"
         , "Word", "Word8", "Word16", "Word32", "Word64"
+        , "I#", "IS", "W#", "W8#", "W16#", "W32#", "W64#"
         , "PortNum", "Family"
         ]
 
@@ -5116,6 +5133,11 @@ byteArrayContentsB = pure $ VFun $ \a -> do
             p <- mallocBytes (max 1 (BS.length bs))
             BS.useAsCStringLen bs $ \(src, len) ->
                 copyBytes (castPtr p) (castPtr src) len
+            -- byteArrayContents# exposes storage whose element unit is a
+            -- byte.  Preserve that fact across Ptr arithmetic so an
+            -- unboxed Word8 payload cannot be mistaken for Storable Int.
+            markWord8PtrRange (castPtr p) (max 1 (BS.length bs))
+            markTypedHostPtr p (BC.pack "Word8")
             pure (VPrimObj (PrimPtr p))
         _ -> error ("byteArrayContents#: not a ByteArray: " <> showValForDebug av)
 
@@ -6386,6 +6408,14 @@ delayHashB = pure $ VFun $ \nT -> pure $ VFun $ \sT -> do
             threadDelay (fromIntegral n)
             force legacyHooks sT
         _ -> error ("delay#: not an Int#: " <> showValForDebug nv)
+
+-- | @yield# :: State# RealWorld -> State# RealWorld@.  This is an RTS
+-- scheduler primitive with no Haskell implementation; delegate the handoff
+-- to the host runtime and preserve the incoming state token.
+yieldHashB :: IO Val
+yieldHashB = pure $ VFun $ \sT -> do
+    yield
+    force legacyHooks sT
 
 closeFdWithB :: IO Val
 closeFdWithB = pure $ VFun $ \closeT -> pure $ VFun $ \fdT -> pure $ VIO $ do

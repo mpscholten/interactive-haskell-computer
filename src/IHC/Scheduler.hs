@@ -71,7 +71,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Data.List (isPrefixOf, nub, sortOn)
+import Data.List (find, isPrefixOf, nub, sortOn)
 import Control.Monad (filterM, forM, forM_, foldM, unless, when)
 import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe, maybeToList)
 import System.Directory (doesFileExist)
@@ -793,6 +793,7 @@ loadProgramFromSource searchPath src0 = do
         loadedModules
     let ownerFields ownerName =
             HashMap.lookupDefault HashMap.empty ownerName ownerFieldEnvByOwner
+    closureGlobalSyns <- readIORef globalTypeSynonymsRef
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
     -- the module that owns the binding (extracted from the FQN's
@@ -804,6 +805,14 @@ loadProgramFromSource searchPath src0 = do
                let ownerName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
                        Just idx -> BC.take idx fqn
                        Nothing  -> lmName entry
+                   bindingName = case BC.elemIndexEnd (toEnum (fromEnum '.')) fqn of
+                       Just idx -> BC.drop (idx + 1) fqn
+                       Nothing  -> fqn
+                   rhs' = case find ((== ownerName) . lmName) loadedModules of
+                       Just ownerLm ->
+                           let syns = Map.union (lmTypeSynonyms ownerLm) closureGlobalSyns
+                           in wrapNullaryResultSig syns ownerLm bindingName rhs
+                       Nothing -> rhs
                ownerThunk <- newWHNFThunk (VStr ownerName)
                let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
                                 $ HashMap.unions
@@ -811,7 +820,7 @@ loadProgramFromSource searchPath src0 = do
                                     , localBareAliases ownerName
                                     , env
                                     ]
-               writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs)))
+               writeIORef slot (Unevaluated (Closure envWithOwner emptyIPMap rhs')))
           (zip qualPairs slots)
 
     -- Seed the env-fallback's base env so any 'resolveFallback'-built
@@ -2788,9 +2797,13 @@ evalMethodWithLazyBody registry searchPath includeMap classReg env lm rewrites m
     -- would otherwise close over Prelude's type `String` and leave a
     -- leftover function inside `Content`.
     localConEnv <- buildConEnv (lmDataReg lm)
+    localFieldEnv <- if lmNoFieldSelectors lm
+        then pure HashMap.empty
+        else buildFieldEnv (lmFieldReg lm)
     let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
                      $ HashMap.union typedNullaryEnv
                      $ HashMap.union localConEnv
+                     $ HashMap.union localFieldEnv
                      $ envWithoutSelf
     t <- newThunk envWithOwner expr
     pure (VLazyMethod t)
@@ -5804,9 +5817,16 @@ classMethodDispatcher reg cls methodName
                 ptrV <- force legacyHooks ptrT
                 isWord8 <- isHostWord8PtrVal ptrV
                     `catch` (\(_ :: SomeException) -> pure False)
+                mNewtype <- case av of
+                    VCon n [_] -> lookupDeclaredFieldTag n
+                    _          -> pure Nothing
                 -- Value-directed Word8 (W8#) must poke a byte even when
                 -- the dest mark missed (PrimForeignPtr leftover).
-                if isWord8 || isWord8PokeVal av tag
+                -- A byte-marked allocation can also hold a struct (IOVec,
+                -- sockaddr, ...); its Ptr/CSize fields must retain their
+                -- own Storable widths rather than being truncated to a byte.
+                if (isWord8 || isWord8PokeVal av tag)
+                        && isByteScalar av && not (isJust mNewtype)
                     then pure (Just (VIO $ do
                         offV <- force legacyHooks offT
                         pokeHostWord8ByteOff ptrV offV av))
@@ -5840,7 +5860,8 @@ classMethodDispatcher reg cls methodName
                 mNewtype <- case av of
                     VCon n [_] -> lookupDeclaredFieldTag n
                     _          -> pure Nothing
-                if (isWord8 || isWord8PokeVal av tag) && not (isJust mNewtype)
+                if (isWord8 || isWord8PokeVal av tag)
+                        && isByteScalar av && not (isJust mNewtype)
                     then pure (Just (VIO (pokeHostWord8ByteOff ptrV (VInt 0) av)))
                     else pure Nothing
             _ -> pure Nothing
@@ -6260,8 +6281,12 @@ classMethodDispatcher reg cls methodName
 
     isStorablePreValueArg accArgs =
         cls == BC.pack "Storable"
-        && methodName `elem` map BC.pack ["pokeElemOff", "pokeByteOff"]
-        && length accArgs < 2
+        && case methodName of
+            "poke"        -> null accArgs
+            "pokeElemOff" -> length accArgs < 2
+            "pokeByteOff" -> length accArgs < 2
+            _             -> False
+
 
     -- Word8 poke value: W8# / tagged Word8.  Bare VInt stays dest-mark
     -- directed so Storable Int poke of a small literal is not stolen.
@@ -6271,6 +6296,13 @@ classMethodDispatcher reg cls methodName
             VCon c _ ->
                 c == BC.pack "W8#" || BC.isSuffixOf (BC.pack ".W8#") c
             _ -> False
+
+    isByteScalar = \case
+        VInt _ -> True
+        VInteger _ -> True
+        VChar _ -> True
+        VCon c _ -> c == BC.pack "W8#" || BC.isSuffixOf (BC.pack ".W8#") c
+        _ -> False
 
     isStorablePreResultArg accArgs =
         cls == BC.pack "Storable"
@@ -7626,7 +7658,7 @@ wrapNullaryResultSig syns lm n e =
           , ([], resultTy) <- tyArrowArgs body
           , any (isNullaryClassMethodName . lastNameComponent) (freeVars e')
           , Just tyBytes <- renderTypeForAnnotation resultTy
-          -> ETyApp e' tyBytes
+          -> ETyApp (pinArrayIndexBounds resultTy e') tyBytes
         -- Same wrap for result-polymorphic `pure` / `return` / `empty`
         -- on a non-IO CAF (`p :: Parser Char; p = pure 'z'`).  Also
         -- used-apply (`use _ = empty <|> pure 'z'`): the arity-0
@@ -8364,6 +8396,33 @@ wrapNullaryResultSig syns lm n e =
      || nm == BC.pack "minBound"
      || nm == BC.pack "mempty"
 
+    -- @listArray (minBound,maxBound) ... :: Array i e@ fixes both nullary
+    -- Bounded methods to the array index type @i@.  Keep that information on
+    -- the nested nodes even if whole-CAF elaboration later fails because an
+    -- imported helper scheme is still lazy.  This is ordinary expected-type
+    -- propagation; Data.Array itself remains source-loaded.
+    pinArrayIndexBounds resultTy expr =
+        case expandTypeSynonyms syns resultTy of
+            TyApp (TyApp (TyCon arr) indexTy) _
+                | lastNameComponent arr == BC.pack "Array"
+                , Just indexBytes <- renderTypeForAnnotation indexTy ->
+                    go indexBytes expr
+            _ -> expr
+      where
+        go ty x = case x of
+            EVar v | lastNameComponent v `elem`
+                        map BC.pack ["minBound", "maxBound"] -> ETyApp x ty
+            EApp f a -> EApp (go ty f) (go ty a)
+            ETyApp inner ann -> ETyApp (go ty inner) ann
+            ELet bs body -> ELet [(bn, go ty rhs) | (bn, rhs) <- bs] (go ty body)
+            ELam arg body -> ELam arg (go ty body)
+            ECase scrut alts -> ECase (go ty scrut)
+                [Alt pat (go ty rhs) | Alt pat rhs <- alts]
+            EIf c t f -> EIf (go ty c) (go ty t) (go ty f)
+            ETuple xs -> ETuple (map (go ty) xs)
+            ELocalSig ann inner -> ELocalSig ann (go ty inner)
+            _ -> x
+
     isResultPolyMethodName nm =
         nm == BC.pack "pure"
      || nm == BC.pack "return"
@@ -8779,7 +8838,13 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                             reexportPairs <- concat <$>
                                 mapM (\m -> rewritePairsFromReexport regAfterDiscover m requestedNames)
                                      (moduleReexports (lmHeader tm))
-                            let allPairs = directPairs ++ reexportPairs
+                            -- A binding defined by the imported module is the
+                            -- canonical provider even when an export facade
+                            -- also exposes a homonym.  Map.fromList below keeps
+                            -- the last pair, so place direct definitions last
+                            -- (Data.ByteString.length must not become the
+                            -- re-exported list length).
+                            let allPairs = reexportPairs ++ directPairs
                                 visible  = filter (specAllows (impSpec imp) . fst) allPairs
                                 bare | impQualified imp = []
                                      | otherwise = filter (needsBare needed) visible
@@ -9050,8 +9115,18 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
         go (imp:rest) =
             let withLoaded srcLm = do
                     srcBodies <- readIORef (lmBodies srcLm)
+                    methodMap <- readIORef globalMethodClassRef
+                    let isKnownClassMethod = Map.member n methodMap
                     case Map.lookup n srcBodies of
-                      Just expr | not (isSelfAliasIn srcLm n expr) -> do
+                      Just expr
+                        | not (isSelfAliasIn srcLm n expr)
+                        -- A class-method facade can acquire a poisoned EVar
+                        -- alias from an unrelated ordinary homonym while its
+                        -- re-export graph is still loading (Data.Array's
+                        -- MArray.newArray vs Foreign.Marshal.Array.newArray).
+                        -- Follow the facade imports to the declaring class
+                        -- module instead of committing that alias.
+                        , not isKnownClassMethod || not (isBareAlias expr) -> do
                             let srcPrefix = lmName srcLm <> BC.pack "."
                             pure [(n, srcPrefix <> n)]
                       _ | Map.member n (lmFieldReg srcLm)
@@ -9075,6 +9150,9 @@ buildImportRewrites allowLoadImports registry searchPath includeMap lm builtinNa
                             Right srcLm -> withLoaded srcLm
                             Left _      -> go rest
                     | otherwise -> go rest
+
+        isBareAlias EVar{} = True
+        isBareAlias _ = False
 
     isSelfAliasIn tm n (EVar v) =
         v == n || v == lmName tm <> BC.pack "." <> n
@@ -11595,7 +11673,21 @@ resolveFallbackSource mOwner name = do
                     case mShim of
                         Just t  -> pure (Just t)
                         Nothing -> do
-                            mAliasSlot <- tryQualifiedImportAliasSlot mods modName bareName
+                            -- A canonical FQN names the module's own binding
+                            -- before any re-export/import alias of the same
+                            -- bare name.  Data.Array.Base.newArray otherwise
+                            -- drifted to Foreign.Marshal.Array.newArray,
+                            -- applying a bounds tuple as a list.
+                            mDirectLocal <- case Map.lookup modName mods of
+                                Just owner -> do
+                                    local <- hasScannedTopLevel owner bareName
+                                    if local
+                                        then buildSlotFromOwner mods owner bareName
+                                        else pure Nothing
+                                Nothing -> pure Nothing
+                            mAliasSlot <- case mDirectLocal of
+                                Just slot -> pure (Just slot)
+                                Nothing -> tryQualifiedImportAliasSlot mods modName bareName
                             case mAliasSlot of
                                 Just slot -> pure (Just slot)
                                 Nothing ->
@@ -12389,10 +12481,21 @@ resolveFallbackSource mOwner name = do
     buildSlotFromOwnerFresh mods owner bareName = do
         registerSharedDerivedEnumBounded (Map.elems mods)
         bodies <- readIORef (lmBodies owner)
-        mClassMethodEarly <- tryClassMethodSlot owner bareName
-        case mClassMethodEarly of
-            Just slot -> pure (Just slot)
-            Nothing -> do
+        case find ((== bareName) . FFI.fdName) (lmForeignDecls owner) of
+          Just decl -> do
+            -- Modules loaded after the initial environment knot was tied do
+            -- not occur in buildForeignEnv. Materialise their scanned FFI
+            -- declaration on demand instead of leaving its __ffi sentinel
+            -- unresolvable (e.g. Foreign.Marshal.Alloc.finalizerFree).
+            slot <- newLazyBuiltinThunk (FFI.makeForeignVal decl)
+            modifyIORef' envFallbackCanonicalCache
+                (Map.insert (lmName owner, bareName) slot)
+            pure (Just slot)
+          Nothing -> do
+            mClassMethodEarly <- tryClassMethodSlot owner bareName
+            case mClassMethodEarly of
+             Just slot -> pure (Just slot)
+             Nothing -> do
                 -- Instance modules bind class methods as ordinary
                 -- top-level names (@(-) = subtractSize@ in
                 -- @Data.Text.Internal.Fusion.Size@).  Those bodies are
@@ -12406,10 +12509,10 @@ resolveFallbackSource mOwner name = do
                 -- other owner — including instance modules — goes
                 -- through the generic dispatcher, which then picks
                 -- the instance from the argument tag.
-                classes <- knownClassesForMethod bareName
-                if null classes
-                    then continueFromOwnerBody bodies
-                    else do
+              classes <- knownClassesForMethod bareName
+              if null classes
+                  then continueFromOwnerBody bodies
+                  else do
                         declares <- ownerDeclaresClassMethod owner classes bareName
                         -- A class-method *name* on a non-declaring module
                         -- is either an instance-dictionary alias
@@ -12520,7 +12623,10 @@ resolveFallbackSource mOwner name = do
                 baseEnv <- readIORef envBaseForFallbackRef
                 extraRw <- buildTargetedImportRewrites
                                 transientReg searchPath includeMap owner baseEnv rw expr
-                let rwAll = Map.union rw extraRw
+                -- The targeted pass has the exact import declaration and
+                -- alias at the use site; let it correct a broad rewrite that
+                -- resolved a qualified homonym through a re-export facade.
+                let rwAll = Map.union extraRw rw
                     expr' = if Map.null rwAll
                               then expr
                               else rewriteExpr rwAll expr
@@ -12892,9 +12998,40 @@ resolveFallbackSource mOwner name = do
                 , not (HashMap.member fv baseEnv)
                 , not (Set.member fv localClassMethods)
                 ]
+            qualifiedCandidates =
+                [ (fv, bare,
+                    [ imp
+                    | imp <- mhImports (lmHeader owner)
+                    , qual == fromMaybe (impModule imp) (impAlias imp)
+                    , specAllows (impSpec imp) bare
+                    ])
+                | fv <- nubBS (freeVars expr)
+                , Just (qual, bare) <- [splitQualifiedFreeVar fv]
+                ]
+        qualifiedPairs <- catMaybes <$> mapM resolveQualified qualifiedCandidates
         pairs <- concat <$> mapM resolveOne candidates
-        pure (Map.fromList pairs)
+        pure (Map.fromList (qualifiedPairs ++ pairs))
       where
+        splitQualifiedFreeVar fv = case BC.elemIndexEnd '.' fv of
+            Just i | i > 0, i + 1 < BC.length fv ->
+                Just (BC.take i fv, BC.drop (i + 1) fv)
+            _ -> Nothing
+
+        -- Multiple modules may deliberately share one qualifier (base's
+        -- Backtrace module imports both ExecutionStack modules as
+        -- `ExecStack`). Select the module that actually exports the used
+        -- symbol instead of letting import order pick a homonym.
+        resolveQualified (fv, bare, imports) = choose imports
+          where
+            choose [] = pure Nothing
+            choose (imp : rest) = do
+                loaded <- try (loadModule transientReg searchPath includeMap (impModule imp))
+                            :: IO (Either SomeException LoadedModule)
+                case loaded of
+                    Right lm | exportsName lm bare ->
+                        pure (Just (fv, impModule imp <> BC.pack "." <> bare))
+                    _ -> choose rest
+
         resolveOne fv = do
             -- Local col-1 bindings shadow imports.  Without this,
             -- a free `insert` in Data.Set.Internal.fromList is
@@ -13071,10 +13208,6 @@ resolveFallbackSource mOwner name = do
         transientReg <- newIORef (Map.map Loaded mods)
         mProvider <- resolveImport transientReg searchPath includeMap owner bareName
                         `catch` (\(_ :: SomeException) -> pure Nothing)
-        when (bareName == BC.pack "lazy") $
-            System.IO.hPutStrLn System.IO.stderr
-                ("[debug tryImportAliasSlot] owner=" <> BC.unpack (lmName owner)
-                 <> " provider=" <> show (BC.unpack <$> mProvider))
         case mProvider of
             Nothing -> pure Nothing
             Just providerMod -> do
@@ -13084,10 +13217,6 @@ resolveFallbackSource mOwner name = do
                 mergeGlobalLoadedModules newMods
                 let providerName = providerMod <> BC.pack "." <> bareName
                 mSlot <- resolveFallback (Just (lmName owner)) providerName
-                when (bareName == BC.pack "lazy") $
-                    System.IO.hPutStrLn System.IO.stderr
-                        ("[debug tryImportAliasSlot] -> " <> BC.unpack providerName
-                         <> " slot=" <> show (isJust mSlot))
                 case mSlot of
                     Just slot -> do
                         modifyIORef' envFallbackCache (Map.insert (mOwner, name) slot)

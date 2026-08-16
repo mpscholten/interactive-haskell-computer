@@ -5056,6 +5056,7 @@ tyConToFFI :: ByteString -> Maybe (Either ByteString ByteString) -> Maybe FFITyp
 tyConToFFI c mArg = case c of
     "Ptr"      -> Just (FFIPtr (payloadFFI mArg))
     "FunPtr"   -> Just (FFIFunPtr (payloadFFI mArg))
+    "FinalizerPtr" -> Just (FFIFunPtr (payloadFFI mArg))
     "ConstPtr" -> Just (FFIPtr (payloadFFI mArg))
     _          -> tyConToFFI0 c
   where
@@ -5100,6 +5101,7 @@ tyConToFFI0 c = case c of
     "CStringLen" -> Just (FFIPtr FFIVoid)  -- CStringLen = (CString, Int) — tuple, deferred
     "Ptr"      -> Just (FFIPtr FFIVoid)
     "FunPtr"   -> Just (FFIFunPtr FFIVoid)
+    "FinalizerPtr" -> Just (FFIFunPtr FFIVoid)
     "ConstPtr" -> Just (FFIPtr FFIVoid)
     -- Unboxed GHC types that appear in text/bytestring/network foreign
     -- imports.  GHC's code generator passes a ByteArray# / MutableByteArray#

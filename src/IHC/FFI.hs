@@ -483,8 +483,11 @@ dispatchRet ty fp args = case ty of
     FFINamed name -> throwIO (userError ("IHC.FFI: named type `" <> BC.unpack name
                                       <> "` cannot be a direct FFI result"))
     FFIThreadId -> throwIO (userError "IHC.FFI: ThreadId# cannot be returned through generic libffi")
-    FFIPtr _   -> do
+    FFIPtr payload -> do
         p <- callFFI fp (retPtr retCChar) args
+        case ffiPointeeTyName payload of
+            Just name | p /= nullPtr -> markTypedHostPtr p name
+            _ -> pure ()
         pure (VPrimObj (PrimPtr (castPtr p)))
     FFIFunPtr _ -> do
         p <- callFFI fp (retPtr retCChar) args
@@ -551,7 +554,11 @@ callForeign decl argVals
                       ("FFI: symbol '" <> fdSymbol decl <> "' not found in any loaded library")
                       msgT)
               Just fp -> do
-                  argsFfi <- sequence (zipWith valToArg (fdArgTypes decl) argVals)
+                  argsFfi <- sequence
+                      [ valToArgAt i ty value
+                      | (i, (ty, value)) <- zip [0 :: Int ..]
+                            (zip (fdArgTypes decl) argVals)
+                      ]
                   result <- dispatchRet (fdRetType decl) fp argsFfi
                   -- Preserve pointee metadata across C out-parameters.
                   -- For @Ptr (Ptr T)@ the call writes a fresh native pointer
@@ -559,6 +566,13 @@ callForeign decl argVals
                   -- as @T@ so source @peek@ can select @Storable T@.
                   sequence_ (zipWith propagateOutPtr (fdArgTypes decl) argVals)
                   pure result
+
+    valToArgAt i ty value = case value of
+        VFun _ -> error
+            ("IHC.FFI: unapplied function passed to `"
+             <> BC.unpack (fdSymbol decl) <> "` argument " <> show i
+             <> " (expected " <> show ty <> ")")
+        _ -> valToArg ty value
 
     propagateOutPtr (FFIPtr (FFIPtr payload)) value =
         case ffiPointeeTyName payload of

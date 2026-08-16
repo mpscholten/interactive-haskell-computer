@@ -984,7 +984,17 @@ elaborateExpr ienv expr = case expr of
     EApp f x -> do
         (f', ft, fPreds, s1) <- elaborateExpr ienv f
         let ienvX = applySubstIenv s1 ienv
-        (x', xt, xPreds, s2) <- elaborateExpr ienvX x
+            ft' = applySubst s1 ft
+        -- Bidirectional application inference: when the callee already
+        -- exposes its argument type, use that as context for the argument.
+        -- In particular, @48 + nibble@ must keep the first literal
+        -- overloaded until @nibble :: Word8@ fixes the shared @Num a@;
+        -- defaulting the literal to Int here makes the otherwise valid
+        -- expression fail elaboration and later misdispatch Storable.poke.
+        (x', xt, xPreds, s2) <- case ft' of
+            TyArrow expectedArg _ ->
+                elaborateExpectedExpr ienvX expectedArg x
+            _ -> elaborateExpr ienvX x
         resultTy <- TyVar <$> freshVar (ieFresh ienv)
         let fShould = TyArrow (applySubst s2 xt) resultTy
             fIs     = applySubst s2 (applySubst s1 ft)

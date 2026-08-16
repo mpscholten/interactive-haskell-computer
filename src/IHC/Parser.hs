@@ -2361,6 +2361,12 @@ parseStmt ctx cur0 = do
                 in [SBind tmpName action', SLet (map project vars)]
 
     isPeekAction expr = case stripDoTyApps expr of
+        -- hsc2hs emits field reads as an immediately-applied eta wrapper:
+        -- `(\hsc_ptr -> peekByteOff hsc_ptr 8) p`.  The result type still
+        -- comes from the constructor pattern on the left of `<-`; look
+        -- through that wrapper so the evaluator receives the same ETyApp
+        -- pin as it does for a direct `peekByteOff p 8`.
+        EApp (ELam _ body) _ -> isPeekAction body
         EApp fn _
             | isPeekName fn -> True
         EApp (EApp fn _) _
@@ -2602,10 +2608,28 @@ parseDoLet ctx cur0 = do
 
     parseDoLetClauseRaw bindCol cur = do
         let (nameTok, cur1) = nextSig ctx cur
-        name <- case tkKind nameTok of
-            TkIdent n -> pure n
-            _         -> parseErr ctx "expected identifier in let-binding" nameTok
-        (params, cur2) <- collectLetParams ctx cur1 []
+        (name, params, cur2) <- case peekTopLevelVarOpBeforeEq ctx cur of
+            Just opName -> do
+                (leftPat, curL) <- parseTopPat ctx cur
+                let (opTok, curOp0) = nextSig ctx curL
+                curOp <- case tkKind opTok of
+                    TkBacktick ->
+                        case readBacktickName ctx curOp0 of
+                            Just (n, curAfterName) | n == opName -> do
+                                let (closeTok, curAfterClose) = nextSig ctx curAfterName
+                                case tkKind closeTok of
+                                    TkBacktick -> pure curAfterClose
+                                    _ -> parseErr ctx "expected closing backtick in do-let infix binding" closeTok
+                            _ -> parseErr ctx "expected operator name in do-let infix binding" opTok
+                    _ -> parseErr ctx "expected backtick operator in do-let infix binding" opTok
+                (rightPat, curR) <- parseTopPat ctx curOp
+                pure (opName, [leftPat, rightPat], curR)
+            Nothing -> do
+                name <- case tkKind nameTok of
+                    TkIdent n -> pure n
+                    _         -> parseErr ctx "expected identifier in let-binding" nameTok
+                (params, afterParams) <- collectLetParams ctx cur1 []
+                pure (name, params, afterParams)
         let (sepTok, cur3) = nextSig ctx cur2
             rhsCtx = ctx { ctxMinCol = bindCol }
         (rhs0, cur4) <- case tkKind sepTok of
@@ -2677,11 +2701,11 @@ parseDoLet ctx cur0 = do
                                 else pure (reverse acc', cur4)
                         | otherwise -> do
                         let _ = cur1
-                        (_, params0, rhs0, cur4a) <- parseDoLetClauseRaw bindCol cur
-                        (moreClauses, cur4) <- collectMoreDoLetClauses bindCol n cur4a []
+                        (bindName, params0, rhs0, cur4a) <- parseDoLetClauseRaw bindCol cur
+                        (moreClauses, cur4) <- collectMoreDoLetClauses bindCol bindName cur4a []
                         let clauses = (params0, rhs0) : moreClauses
                             e = desugarClauses clauses (length params0)
-                            bind = (n, e)
+                            bind = (bindName, e)
                         let (peek, _) = nextSig ctx cur4
                         if tkCol peek == bindCol && tkKind peek /= TkEof
                             then layoutBinds bindCol cur4 (bind : acc)

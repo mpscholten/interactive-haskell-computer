@@ -806,8 +806,8 @@ traceCache msg = do
 --
 -- Priority order (highest first):
 --
---   1. Nix-pinned source tree (@IHC_NIX_SOURCE_DIR@) — reproducible.
---   2. User-managed @~\/.cache\/ihc\/sources\/@ — @cabal get@ overrides.
+--   1. User-managed @~\/.cache\/ihc\/sources\/@ — @cabal get@ overrides.
+--   2. Nix-pinned source tree (@IHC_NIX_SOURCE_DIR@) — reproducible fallback.
 --   3. Cabal tarball cache @~\/.cabal\/packages\/hackage.haskell.org\/@ —
 --      already-extracted tarballs, broadest pool.
 --
@@ -822,7 +822,7 @@ cachedPackageSearchPath = map fst <$> cachedPackageSearchPathWithIncludes
 -- | Per-package table for scoped import resolution. Entries are
 -- @(sourceDir, PackageInfo)@ — one row per 'hs-source-dirs' entry
 -- per package, all rows for a package sharing the same 'PackageInfo'.
--- Ordered the same as 'cachedPackageSearchPath' (nix → user cache →
+-- Ordered the same as 'cachedPackageSearchPath' (user cache → nix →
 -- cabal tarball), which gives a stable precedence for duplicate package
 -- names across sources.
 type PackageTable = [(FilePath, PackageInfo)]
@@ -849,7 +849,11 @@ computePackageTableFresh = do
     bundlePairs <- concat <$> (sourceBundleRoots >>= mapM enumeratePkg)
     userPairs  <- enumeratePkg userCache
     cabalPairs <- cabalTarballPairs
-    pure (bundlePairs ++ userPairs ++ cabalPairs)
+    -- A user-resolved package must stay coherent across all its modules.
+    -- Putting the bundle first mixed its older Warp.Header with newer Warp
+    -- modules from `cabal get`; the two versions have incompatible runtime
+    -- representations.  The bundle remains the fallback for missing deps.
+    pure (userPairs ++ bundlePairs ++ cabalPairs)
   where
     enumeratePkg sourcesDir = do
         exists <- doesDirectoryExist sourcesDir
@@ -963,7 +967,7 @@ scopedSearchDirs table (Just owner) mQual =
 -- @include-dirs@ the list is empty (no overhead for callers).
 --
 -- Priority order matches 'cachedPackageSearchPath':
--- nix-pinned → user cache → cabal tarball cache.
+-- user cache → nix-pinned → cabal tarball cache.
 --
 -- Caching strategy (see the "Cache-wide search path" section header
 -- above for rationale):
@@ -1013,7 +1017,7 @@ computeSearchPathFresh = do
     bundlePairs <- concat <$> (sourceBundleRoots >>= mapM enumerateWithIncludes)
     userPairs  <- enumerateWithIncludes userCache
     cabalPairs <- cabalTarballIncludePairs
-    pure (bundlePairs ++ userPairs ++ cabalPairs)
+    pure (userPairs ++ bundlePairs ++ cabalPairs)
   where
     enumerateWithIncludes :: FilePath -> IO [(FilePath, [FilePath])]
     enumerateWithIncludes sourcesDir = do

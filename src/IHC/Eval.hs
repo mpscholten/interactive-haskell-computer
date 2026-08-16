@@ -153,7 +153,21 @@ elaborateExpectedArg hooks owner f x = do
           , (args, _) <- tyArrowArgs body
           , supplied < length args ->
                 pure (Just (args !! supplied))
-          | otherwise -> selectorFieldTypeAt owner fn supplied
+          | otherwise -> do
+                mSelector <- selectorFieldTypeAt owner fn supplied
+                pure $ mSelector <|> do
+                    Scheme _ _ body <- Map.lookup fn initialSigs
+                        `orElse` Map.lookup (bareName fn) initialSigs
+                    let (args, _) = tyArrowArgs body
+                    expected <- if supplied < length args
+                        then Just (args !! supplied) else Nothing
+                    case TA.tyApps expected of
+                        (TA.TyCon h, [elemTy])
+                            | bareName (normalizeTyTag h) == BC.pack "Ptr"
+                            , Just elemHead <- TA.tyHead elemTy
+                            , bareName (normalizeTyTag elemHead) == BC.pack "Word8" ->
+                                Just expected
+                        _ -> Nothing
         Nothing -> pure Nothing
     case mFieldTy of
         Just fieldTy -> elaborateAtExpected fieldTy x
@@ -169,12 +183,12 @@ elaborateExpectedArg hooks owner f x = do
             -- Q t (constructor head, not a name list), still
             -- elaborate so `$qWrap` can inhabit Q.
             needs <- if needsExpectedElaboration methodNames initialSigs x
-                then pure True
-                else case x of
-                    EApp{} -> calleeArgExpectsQ hooks owner initialSigs f
-                    _      -> pure False
+                        then pure True
+                        else case x of
+                            EApp{} -> calleeArgExpectsQ hooks owner initialSigs f
+                            _      -> pure False
             if not needs
-                then pure x
+                        then pure x
                 else do
                     ambiguousSigs <- readIORef globalAmbiguousSigsRef
                     -- Include the partially-applied callee as well as applied
@@ -233,12 +247,18 @@ elaborateExpectedArg hooks owner f x = do
                                                                             ctorTypes owner scopedSigs
                                                                             (Elab.ExpectType expected) x)
                                                                 :: IO (Either SomeException (Expr, TA.Type))
-                                                            pure (either (const x) fst result)
+                                                            let rewritten = either (const x) fst result
+                                                            pure (stampResultPolyExpected sigs expected x rewritten)
                                         _ -> pure x
                                 Nothing -> pure x
                         Nothing -> pure x
   where
     elaborateAtExpected expected x0
+        | (TA.TyCon h, [elemTy]) <- TA.tyApps expected
+        , bareName (normalizeTyTag h) == BC.pack "Ptr"
+        , Just elemHead <- TA.tyHead elemTy
+        , bareName (normalizeTyTag elemHead) == BC.pack "Word8" =
+            pure (ETyApp x0 (BC.pack "Ptr " <> elemHead))
         -- Same rule as the signature-fallback path below: a leftover
         -- tyvar (`a` in `Box a` / `ReaperSettings workload item`) is
         -- not an instance tag.  Rewriting `[]` (parser-shared with
@@ -262,7 +282,26 @@ elaborateExpectedArg hooks owner f x = do
                                 ctors owner scoped
                                 (Elab.ExpectType expected) x0)
                     :: IO (Either SomeException (Expr, TA.Type))
-                pure (either (const x0) fst result)
+                let rewritten = either (const x0) fst result
+                pure (stampResultPolyExpected sigs expected x0 rewritten)
+
+    -- Keep a concrete result annotation around an applied constrained alias
+    -- such as @fromIntegral n@.  Its runtime representation is otherwise a
+    -- bare VInt, so later FiniteBits/Storable dispatch cannot distinguish
+    -- Word32/Word8 from Int even though the callee supplied that expected
+    -- type.  The annotation reuses the normal ETyApp elaboration path.
+    stampResultPolyExpected sigs expected original rewritten
+        | Just headName <- appExprHead original
+        , Just scheme <- Map.lookup headName sigs
+                `orElse` Map.lookup (bareName headName) sigs
+        , schemeIsResultPolymorphic scheme
+        , Just tag <- TA.tyHead expected = ETyApp rewritten tag
+        | otherwise = rewritten
+
+    appExprHead (EApp h _) = appExprHead h
+    appExprHead (ETyApp h _) = appExprHead h
+    appExprHead (EVar n) = Just n
+    appExprHead _ = Nothing
 
     loadPreferredSig ambiguous state@(known, scoped) name
         | bareName name `elem` map BC.pack [":", "[]"] = pure state
@@ -358,9 +397,8 @@ elaborateExpectedArg hooks owner f x = do
         isQuoteExpr (ELocalSig _ inner) = isQuoteExpr inner
         isQuoteExpr _ = False
 
-        goHead (EVar name)
-            | not (Set.member (bareName name) methodNames) = False
-            | otherwise = case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
+        goHead (EVar name) =
+            case Map.lookup name sigs `orElse` Map.lookup (bareName name) sigs of
                 Just scheme
                     | schemeIsResultPolymorphic scheme -> True
                     -- Argument-directed class schemes (`toMarkup ::
@@ -384,6 +422,7 @@ elaborateExpectedArg hooks owner f x = do
                 -- InferFreely of the class scheme at @Set Text@
                 -- walks @Item@ and hangs before main.
                 Nothing
+                    | not (Set.member (bareName name) methodNames) -> False
                     | isQualifiedName name -> False
                     | otherwise -> True
         goHead (EApp innerF _) = goHead innerF
@@ -884,6 +923,112 @@ valKindTag = \case
 eval :: IHCHooks -> Env -> ImplicitParamMap -> Expr -> IO Val
 eval hooks env ipm = go
   where
+    hostTypedPokeMethod cls method ty
+        | cls /= BC.pack "Storable" = Nothing
+        | tyAnnotationHead ty `notElem` ["Ptr", "CSize"] = Nothing
+        | method == BC.pack "poke" = Just $ VFun $ \ptrT -> pure $ VFun $ \valT ->
+            pure $ VIO (runHostTypedPoke ty ptrT Nothing valT)
+        | method `elem` map BC.pack ["pokeByteOff", "pokeElemOff"] =
+            Just $ VFun $ \ptrT -> pure $ VFun $ \offT -> pure $ VFun $ \valT ->
+                pure $ VIO (runHostTypedPoke ty ptrT (Just (method, offT)) valT)
+        | otherwise = Nothing
+
+    runHostTypedPoke ty ptrT mOffset valT = do
+        ptrV <- force hooks ptrT
+        p <- valToHostPtr ptrV
+        value <- force hooks valT >>= unwrapHostPokeValue
+        off <- case mOffset of
+            Nothing -> pure 0
+            Just (method, offT) -> do
+                offV <- force hooks offT
+                let n = case offV of
+                        VInt x -> fromIntegral x
+                        VInteger x -> fromInteger x
+                        other -> error ("typed poke: offset is not an Int: "
+                            <> showValForDebug other)
+                pure $ if method == BC.pack "pokeElemOff"
+                    then n * hostTypedSize ty else n
+        writeHostTypedPoke ty p off value
+        pure VUnit
+
+    unwrapHostPokeValue (VCon _ [field]) = force hooks field >>= unwrapHostPokeValue
+    unwrapHostPokeValue value = pure value
+
+    hostTypedSize ty = case tyAnnotationHead ty of
+        "Word8" -> 1; "Int8" -> 1; "CChar" -> 1; "CUChar" -> 1
+        "Word16" -> 2; "Int16" -> 2; "CShort" -> 2; "CUShort" -> 2
+        "Word32" -> 4; "Int32" -> 4; "CInt" -> 4; "CUInt" -> 4
+        _ -> FStorable.sizeOf (undefined :: Word)
+
+    writeHostTypedPoke ty p off value = case (tyAnnotationHead ty, value) of
+        ("Ptr", v) -> valToHostPtr v >>= \q ->
+            FStorable.pokeByteOff (castPtr p) off (castPtr q :: Ptr Word8)
+        ("CInt", VInt n) -> pokeI32 n
+        ("Int32", VInt n) -> pokeI32 n
+        ("CUInt", VInt n) -> pokeW32 n
+        ("Word32", VInt n) -> pokeW32 n
+        ("CShort", VInt n) -> pokeI16 n
+        ("Int16", VInt n) -> pokeI16 n
+        ("CUShort", VInt n) -> pokeW16 n
+        ("Word16", VInt n) -> pokeW16 n
+        ("CChar", VInt n) -> pokeI8 n
+        ("Int8", VInt n) -> pokeI8 n
+        ("CUChar", VInt n) -> pokeW8 n
+        ("Word8", VInt n) -> pokeW8 n
+        ("Int", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Int)
+        ("Word", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word)
+        ("CSize", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word)
+        ("Int64", VInt n) -> FStorable.pokeByteOff p off (n :: Int64)
+        ("Word64", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word64)
+        _ -> error ("typed poke: unsupported " <> BC.unpack ty <> " value "
+            <> showValForDebug value)
+      where
+        pokeI8 n = FStorable.pokeByteOff p off (fromIntegral n :: Int8)
+        pokeW8 n = FStorable.pokeByteOff p off (fromIntegral n :: Word8)
+        pokeI16 n = FStorable.pokeByteOff p off (fromIntegral n :: Int16)
+        pokeW16 n = FStorable.pokeByteOff p off (fromIntegral n :: Word16)
+        pokeI32 n = FStorable.pokeByteOff p off (fromIntegral n :: Int32)
+        pokeW32 n = FStorable.pokeByteOff p off (fromIntegral n :: Word32)
+
+    typedNullaryTags = goTags Map.empty
+      where
+        goTags acc (ETyApp (EVar n) ty)
+            | bareName n `elem` map BC.pack ["minBound", "maxBound", "mempty"] =
+                Map.insertWith (\_ old -> old) (bareName n) ty acc
+        goTags acc (EApp f x) = goTags (goTags acc f) x
+        goTags acc (ETyApp inner _) = goTags acc inner
+        goTags acc (ELocalSig _ inner) = goTags acc inner
+        goTags acc (ETuple xs) = foldl goTags acc xs
+        goTags acc (ELet bs body) = foldl goTags (goTags acc body) (map snd bs)
+        goTags acc (ELam _ body) = goTags acc body
+        goTags acc (ECase scrut alts) = foldl goTags (goTags acc scrut)
+            [rhs | Alt _ rhs <- alts]
+        goTags acc (EIf c t e) = goTags (goTags (goTags acc c) t) e
+        goTags acc _ = acc
+
+    stampMatchingNullaries tags = stamp
+      where
+        stamp expr@(EVar n) = case Map.lookup (bareName n) tags of
+            Just ty -> ETyApp expr ty
+            Nothing
+                | bareName n `elem` map BC.pack ["minBound", "maxBound"]
+                , Just ty <- boundedTag ->
+                    ETyApp expr ty
+                | otherwise -> expr
+        stamp expr@ETyApp{} = expr
+        stamp (EApp f x) = EApp (stamp f) (stamp x)
+        stamp (ELocalSig ty inner) = ELocalSig ty (stamp inner)
+        stamp (ETuple xs) = ETuple (map stamp xs)
+        stamp (ELet bs body) = ELet [(n, stamp rhs) | (n, rhs) <- bs] (stamp body)
+        stamp (ELam n body) = ELam n (stamp body)
+        stamp (ECase scrut alts) = ECase (stamp scrut)
+            [Alt pat (stamp rhs) | Alt pat rhs <- alts]
+        stamp (EIf c t e) = EIf (stamp c) (stamp t) (stamp e)
+        stamp other = other
+        boundedTag = case Map.lookup (BC.pack "minBound") tags of
+            Just ty -> Just ty
+            Nothing -> Map.lookup (BC.pack "maxBound") tags
+
     go (ELit (LInt n))   = pure (VInt n)
     go (ELit (LInteger n)) = pure (VInteger n)
     go (ELit (LFloat d)) = pure (VFloat d)
@@ -947,6 +1092,13 @@ eval hooks env ipm = go
                                       <> BC.unpack name <> "`")
         pure (wrapPopEmptyCallStack hooks ipm name v)
 
+    go (EApp (EApp fn earlier) later)
+        | let tags = typedNullaryTags later
+        , not (Map.null tags)
+        , let earlier' = stampMatchingNullaries tags earlier
+        , earlier' /= earlier =
+            go (EApp (EApp fn earlier') later)
+
     go (EApp f x)
         | Just (method, ty) <- lazyStorableMethodTyArg f x =
             case storableSizeAlignLiteral method ty of
@@ -956,6 +1108,7 @@ eval hooks env ipm = go
                         pure (storableSizeAlignFallback method)
                     | otherwise ->
                         go (EApp (ETyApp f ty) x)
+
     -- Signature-directed specialisation of bare nullary Bounded methods.
     -- GHC specialises @measureOff maxBound@ to @maxBound :: Int@ from
     -- @measureOff :: Int -> Text -> Int@.  Without that, @Data.Text.length
@@ -1006,6 +1159,23 @@ eval hooks env ipm = go
               mMethod <- typedOrBareMethod headExpr
               case mMethod of
                Just (cls, method) -> do
+                numeric <- tryNumericComparison method args
+                case numeric of
+                  Just result -> pure (Just result)
+                  Nothing -> dispatchTypedMethod cls method args
+               Nothing -> pure Nothing
+
+        tryNumericComparison method args
+            | lastDottedMethod method `elem` map BC.pack ["==", "/=", "<", "<=", ">", ">="]
+            , [leftE, rightE] <- args = do
+                left <- eval hooks env ipm leftE >>= unwrapIntHash hooks
+                right <- eval hooks env ipm rightE >>= unwrapIntHash hooks
+                pure $ case (left, right) of
+                    (VInt x, VInt y) -> Just (intClassOp method x y)
+                    _ -> Nothing
+            | otherwise = pure Nothing
+
+        dispatchTypedMethod cls method args = do
                 owner <- currentOwner hooks env
                 ownerScheme <- lookupTypeSigFallback hooks owner method
                 neutralScheme <- lookupTypeSigFallback hooks Nothing method
@@ -1017,34 +1187,138 @@ eval hooks env ipm = go
                     Just idx | idx < length args -> do
                         targetV <- eval hooks env ipm (args !! idx)
                         let runtimeTag = normalizeTyTag (typeTagOf targetV)
-                        mReg <- getSharedClassReg legacyHooks
-                        case mReg of
-                            Just reg -> do
-                                direct <- lookupInstanceMethod reg cls runtimeTag methodKey
-                                patterned <- case usableMethod direct of
-                                    Just _ -> pure Nothing
-                                    Nothing -> lookupInstanceMethodPattern reg cls runtimeTag methodKey
-                                case usableMethod direct <|> usableMethod patterned of
-                                    Nothing -> pure Nothing
-                                    Just runtimeMethod -> do
-                                        thunks <- sequence
-                                            [ if i == idx then newWHNFThunk targetV
-                                              else newThunkIP env ipm arg
-                                            | (i, arg) <- zip [0..] args
-                                            ]
-                                        forcedMethod <- forceMethodVal hooks runtimeMethod
-                                        Just <$> foldM (applyIP hooks ipm) forcedMethod thunks
-                            _ -> pure Nothing
+                        do
+                          hostPoke <- tryHostStorablePoke
+                                cls methodKey runtimeTag targetV args
+                          case hostPoke of
+                            Just action -> pure (Just action)
+                            Nothing -> do
+                              mReg <- getSharedClassReg legacyHooks
+                              case mReg of
+                                Just reg -> do
+                                    direct <- lookupInstanceMethod reg cls runtimeTag methodKey
+                                    patterned <- case usableMethod direct of
+                                        Just _ -> pure Nothing
+                                        Nothing -> lookupInstanceMethodPattern reg cls runtimeTag methodKey
+                                    delegated <- storableNewtypeMethod
+                                        reg cls methodKey runtimeTag targetV
+                                    case delegated <|>
+                                         (\m -> (m, targetV)) <$>
+                                             (usableMethod direct <|> usableMethod patterned) of
+                                        Nothing -> pure Nothing
+                                        Just (runtimeMethod, dispatchTarget) -> do
+                                            thunks <- sequence
+                                                [ if i == idx then newWHNFThunk dispatchTarget
+                                                  else newThunkIP env ipm arg
+                                                | (i, arg) <- zip [0..] args
+                                                ]
+                                            forcedMethod <- forceMethodVal hooks runtimeMethod
+                                            Just <$> foldM (applyIP hooks ipm) forcedMethod thunks
+                                _ -> pure Nothing
                     _ -> pure Nothing
-               Nothing -> pure Nothing
+
+        -- GND Storable instances (CInt, CUInt, …) have no source method
+        -- bodies of their own: they coerce the representation instance.
+        -- Delegating poke-family calls to that field instance avoids falling
+        -- into Storable's mutually recursive default poke/pokeByteOff pair.
+        storableNewtypeMethod reg cls method runtimeTag targetV
+            | cls == BC.pack "Storable"
+            , method `elem` map BC.pack ["poke", "pokeByteOff", "pokeElemOff"]
+            , VCon _ [fieldThunk] <- targetV = do
+                mFieldTy <- lookupDeclaredFieldTag runtimeTag
+                case mFieldTy of
+                    Nothing -> pure Nothing
+                    Just fieldTy -> do
+                        let fieldTag = normalizeTyTag fieldTy
+                        direct <- lookupInstanceMethod reg cls fieldTag method
+                        patterned <- case usableMethod direct of
+                            Just _ -> pure Nothing
+                            Nothing -> lookupInstanceMethodPattern reg cls fieldTag method
+                        case usableMethod direct <|> usableMethod patterned of
+                            Nothing -> pure Nothing
+                            Just runtimeMethod -> do
+                                fieldV <- force hooks fieldThunk
+                                pure (Just (runtimeMethod, fieldV))
+            | otherwise = pure Nothing
+
+        tryHostStorablePoke cls method runtimeTag targetV args
+            | cls == BC.pack "Storable"
+            , method `elem` map BC.pack ["poke", "pokeByteOff", "pokeElemOff"]
+            , ptrE : rest <- args = do
+                primitive <- unwrapPokeValue targetV
+                ptrV <- go ptrE
+                p <- valToHostPtr ptrV
+                markedWord8 <- isMarkedWord8Ptr p
+                mPointee <- lookupTypedHostPtr p
+                let ptrIsWord8 = markedWord8 || mPointee `elem`
+                        map Just [BC.pack "Word8", BC.pack "CChar",
+                                  BC.pack "CSChar", BC.pack "CUChar"]
+                let effectiveTag
+                        | runtimeTag == BC.pack "Int" && ptrIsWord8 = BC.pack "Word8"
+                        | otherwise = runtimeTag
+                if knownPeekResultTy effectiveTag
+                    then pure (Just (VIO (do
+                        off <- case (method, rest) of
+                            (m, offE : _) | m /= BC.pack "poke" -> do
+                                offV <- go offE
+                                let n = case offV of
+                                        VInt x -> fromIntegral x
+                                        VInteger x -> fromInteger x
+                                        other -> error ("typed poke: offset is not an Int: "
+                                            <> showValForDebug other)
+                                pure $ if m == BC.pack "pokeElemOff"
+                                    then n * typedPeekElemSize effectiveTag else n
+                            _ -> pure 0
+                        writeTypedPoke effectiveTag p off primitive
+                        pure VUnit)))
+                    else pure Nothing
+            | otherwise = pure Nothing
+
+        unwrapPokeValue (VCon _ [field]) = force hooks field >>= unwrapPokeValue
+        unwrapPokeValue value = pure value
+
+        writeTypedPoke ty p off value = case (tyAnnotationHead ty, value) of
+            ("CInt", VInt n)  -> pokeI32 n
+            ("Int32", VInt n) -> pokeI32 n
+            ("CUInt", VInt n) -> pokeW32 n
+            ("Word32", VInt n) -> pokeW32 n
+            ("CShort", VInt n) -> pokeI16 n
+            ("Int16", VInt n) -> pokeI16 n
+            ("CUShort", VInt n) -> pokeW16 n
+            ("Word16", VInt n) -> pokeW16 n
+            ("CChar", VInt n) -> pokeI8 n
+            ("Int8", VInt n) -> pokeI8 n
+            ("CUChar", VInt n) -> pokeW8 n
+            ("Word8", VInt n) -> pokeW8 n
+            ("Int", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Int)
+            ("Word", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word)
+            ("Int64", VInt n) -> FStorable.pokeByteOff p off (n :: Int64)
+            ("Word64", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word64)
+            _ -> error ("typed poke: unsupported " <> BC.unpack ty <> " value "
+                <> showValForDebug value)
+          where
+            pokeI8 n = FStorable.pokeByteOff p off (fromIntegral n :: Int8)
+            pokeW8 n = FStorable.pokeByteOff p off (fromIntegral n :: Word8)
+            pokeI16 n = FStorable.pokeByteOff p off (fromIntegral n :: Int16)
+            pokeW16 n = FStorable.pokeByteOff p off (fromIntegral n :: Word16)
+            pokeI32 n = FStorable.pokeByteOff p off (fromIntegral n :: Int32)
+            pokeW32 n = FStorable.pokeByteOff p off (fromIntegral n :: Word32)
 
         typedOrBareMethod (ETypedMethod cls method _) = pure (Just (cls, method))
-        typedOrBareMethod (EVar method) = do
-            classes <- readIORef globalMethodClassRef
-            let bare = lastDottedMethod method
-            pure $ case Map.lookup bare classes of
-                Just [cls] -> Just (cls, method)
-                _ -> Nothing
+        -- `pred` is also a conventional predicate parameter name throughout
+        -- base (notably Foreign.C.Error).  Bare occurrences must retain
+        -- lexical shadowing; genuine Enum.pred calls are elaborated to
+        -- ETypedMethod and take the branch above.
+        typedOrBareMethod (EVar method)
+            | lastDottedMethod method == BC.pack "pred" = pure Nothing
+            | otherwise = lookupIndexed
+          where
+            lookupIndexed = do
+                classes <- readIORef globalMethodClassRef
+                let bare = lastDottedMethod method
+                pure $ case Map.lookup bare classes of
+                    Just [cls] -> Just (cls, method)
+                    _ -> Nothing
         typedOrBareMethod _ = pure Nothing
 
         flattenApps = collect []
@@ -1137,9 +1411,10 @@ eval hooks env ipm = go
         -- (lexical binding) takes priority over the caller's map.
         -- Do not snapshot the do-carrier onto every lambda: that leaked
         -- ParsecT into runParser's Identity (`runIdentity` on a ParsecT).
-        pure $ VFunIP ipm $ \callerIPM argThunk ->
+        pure $ VFunIP ipm $ \callerIPM argThunk -> do
             let mergedIPM = Map.union ipm callerIPM
-            in eval hooks (extendEnv name argThunk env) mergedIPM body
+                env' = extendEnv name argThunk env
+            eval hooks env' mergedIPM body
 
     go (ELet binds body) = do
         -- Recursive group: pre-allocate a thunk per binding holding a
@@ -1176,9 +1451,7 @@ eval hooks env ipm = go
             VCon "False" _ -> go e
             VCon "True"  _ -> go t
             other -> error ("IHC.Eval: if condition is not Int/Bool: "
-                            <> showValForDebug other
-                            <> " in "
-                            <> show c)
+                           <> showValForDebug other)
 
     go (ENeg e) = do
         v <- go e
@@ -1289,11 +1562,14 @@ eval hooks env ipm = go
     -- (class, tag, method) isn't in the shared class registry —
     -- that's a bug (elaborator shouldn't emit an unresolvable tag).
     go (ETypedMethod cls method tag) = do
-        mReg <- getSharedClassReg legacyHooks
-        case mReg of
-            Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
-                              <> "(elaborator fired before buildBaseEnv?)")
-            Just reg -> resolveTypedMethod hooks reg cls method tag
+        case hostTypedPokeMethod cls method tag of
+            Just host -> pure host
+            Nothing -> do
+                mReg <- getSharedClassReg legacyHooks
+                case mReg of
+                    Nothing  -> error ("IHC.Eval.ETypedMethod: no shared class registry installed "
+                                      <> "(elaborator fired before buildBaseEnv?)")
+                    Just reg -> resolveTypedMethod hooks reg cls method tag
 
     -- A constrained alias carries the full, elaborated instance key. For the
     -- currently supported single-dictionary form, attach every parameter tag
@@ -1320,6 +1596,14 @@ eval hooks env ipm = go
         case mElab of
             Just e' -> go e'
             Nothing -> go e
+
+    -- A concrete pointer ascription only carries host-memory metadata.  It
+    -- does not need the general type-application elaboration path.
+    go (ETyApp e ty)
+        | Just elemTy <- ptrPointeeHead ty = do
+            v <- go e
+            markTypedPtrVal elemTy v
+            pure v
 
     -- All other uses are the plain pass-through on the inner expression.
     go (ETyApp e ty0) = do
@@ -2043,10 +2327,25 @@ eval hooks env ipm = go
                 -- Host peekB is one byte; a bare VInt fails `CInt n <-`.
                 mField <- lookupDeclaredFieldTag (tyAnnotationHead resultTy')
                 case mField of
-                    Just fieldTy ->
-                        pure (Just (VIO (do
-                            v <- typedPeek isElemOff fieldTy ptrE offE
-                            wrapExpectedNewtype resultTy' v)))
+                    Just fieldTy -> do
+                        fieldTy' <- expandTypeAnnBytes fieldTy
+                        if knownPeekResultTy fieldTy'
+                            then pure (Just (VIO (do
+                                v <- typedPeek isElemOff fieldTy' ptrE offE
+                                wrapExpectedNewtype resultTy' v)))
+                            else do
+                                -- A unary newtype can have a representation
+                                -- that is not a primitive-sized host value
+                                -- (In6Addr wraps a four-word tuple). In that
+                                -- case its source Storable instance defines
+                                -- the layout and must run instead of falling
+                                -- through readTypedPeek's Word8 default.
+                                mStor <- lookupStorablePeekMethod resultTy'
+                                case mStor of
+                                    Just peekFn -> pure (Just (VIO
+                                        (runSourceStorablePeek peekFn isElemOff
+                                            fieldTy' ptrE offE)))
+                                    Nothing -> pure Nothing
                     Nothing -> do
                         resultTy'' <- expandNewtypeAnnBytes resultTy'
                         -- A newtype with its own Storable (PortNumber.peek =
@@ -2103,7 +2402,7 @@ eval hooks env ipm = go
                 case unwrapUnaryNewtype ctors t of
                     Just inner ->
                         case renderTypeAnnotation inner of
-                            Just bs -> expandNewtypeAnnBytes bs
+                            Just bs -> expandTypeAnnBytes bs >>= expandNewtypeAnnBytes
                             Nothing -> pure ann
                     Nothing -> pure ann
 
@@ -2168,8 +2467,19 @@ eval hooks env ipm = go
                 let stor = BC.pack "Storable"
                     peekN = BC.pack "peek"
                     headTag = lastNameComponent (normalizeTyTag tag)
-                mv <- lookupInstanceMethod classReg stor headTag peekN
-                mv' <- case mv of
+                    lookupPeek = do
+                        direct <- lookupInstanceMethod classReg stor headTag peekN
+                        patterned <- case direct of
+                            Just _ -> pure Nothing
+                            Nothing -> lookupInstanceMethodPattern classReg stor headTag peekN
+                        pure (direct <|> patterned)
+                found <- lookupPeek
+                found' <- case found of
+                    Just _ -> pure found
+                    Nothing -> do
+                        triggerCoreInstanceLoadForTag legacyHooks stor headTag
+                        lookupPeek
+                mv' <- case found' of
                     Just v -> pure (Just v)
                     Nothing -> do
                         ctors <- readIORef globalConstructorTypeRegistryRef
@@ -2651,17 +2961,23 @@ eval hooks env ipm = go
     isPeekHead :: Expr -> Bool
     isPeekHead (EVar n) =
         lastNameComponent n == BC.pack "peek"
+    isPeekHead (ETypedMethod _ n _) =
+        lastNameComponent n == BC.pack "peek"
     isPeekHead (ETyApp inner _) = isPeekHead inner
     isPeekHead _ = False
 
     isPeekByteOffHead :: Expr -> Bool
     isPeekByteOffHead (EVar n) =
         lastNameComponent n == BC.pack "peekByteOff"
+    isPeekByteOffHead (ETypedMethod _ n _) =
+        lastNameComponent n == BC.pack "peekByteOff"
     isPeekByteOffHead (ETyApp inner _) = isPeekByteOffHead inner
     isPeekByteOffHead _ = False
 
     isPeekElemOffHead :: Expr -> Bool
     isPeekElemOffHead (EVar n) =
+        lastNameComponent n == BC.pack "peekElemOff"
+    isPeekElemOffHead (ETypedMethod _ n _) =
         lastNameComponent n == BC.pack "peekElemOff"
     isPeekElemOffHead (ETyApp inner _) = isPeekElemOffHead inner
     isPeekElemOffHead _ = False
@@ -3879,8 +4195,9 @@ matchPat hooks (PCon "ByteArray" [p]) prim@(VPrimObj (PrimByteArray _)) = do
 matchPat hooks (PCon name pats) (VCon vname vthunks)
     | sameConName name (BC.pack "BS")
     , sameConName vname (BC.pack "BS")
-    , length pats == length vthunks =
-        matchFields hooks (zip pats vthunks) []
+    = if length pats == length vthunks
+        then matchFields hooks (zip pats vthunks) []
+        else pure Nothing
 matchPat hooks pat@(PCon name _) v
     | sameConName name (BC.pack "BS") = do
         mBs <- charListToByteStringVal hooks v
@@ -3891,6 +4208,8 @@ matchPat hooks (PCon "IO" [p]) v@(VCon name _)
     | name /= "IO" = matchPat hooks p (pureStateFn v)
 matchPat hooks (PCon "ST" [p]) v@(VCon name _)
     | name /= "ST" = matchPat hooks p (pureStateFn v)
+matchPat hooks (PCon "STM" [p]) v@(VCon name _)
+    | name /= "STM" = matchPat hooks p (pureStateFn v)
 -- bytestring-0.12 exposes PS as a pattern synonym over the real BS
 -- constructor. The parser represents the synonym as a constructor pattern, so
 -- model the synonym at match time.
@@ -4437,7 +4756,9 @@ applyClassMethodFast hooks name tags go arg
 unwrapIntHash :: IHCHooks -> Val -> IO Val
 unwrapIntHash hooks v = case v of
     VCon n [t]
-        | n == BC.pack "I#" || n == BC.pack "IS" ->
+        | bareConName n `elem` numericNewtypeCons
+          || isWordPrimCon n
+          || bareConName n `elem` intSizedPrimCons ->
             force hooks t >>= unwrapIntHash hooks
     _ -> pure v
 
@@ -4828,7 +5149,7 @@ evalDoAction hooks env ipm mCarrier e = do
     -- Only divert when the dest is actually marked / ascribed.
     marked <- destIsMarkedStorablePtr hooks env ipm e
     methodClasses <- readIORef globalMethodClassRef
-    mv <- if marked
+    mv <- if marked || hasLazyStorageHead e
               then eval hooks env ipm e
               else go methodClasses e
     pinDoCarrierMethod hooks mCarrier mv
@@ -4860,6 +5181,19 @@ evalDoAction hooks env ipm mCarrier e = do
         goHead (EVar method) = case Map.lookup (lastDottedMethod method) methodClasses of
             Just [_] -> True
             _ -> False
+        goHead _ = False
+
+    -- The do fast path normally forces application arguments to WHNF for
+    -- legacy Settings/socket calls.  Mutable-cell allocation is specified to
+    -- store its argument lazily: Warp relies on `newIORef (error ...)` being
+    -- overwritten before the value is ever demanded.
+    hasLazyStorageHead = goHead
+      where
+        goHead (EApp f _) = goHead f
+        goHead (ETyApp f _) = goHead f
+        goHead (ELocalSig _ f) = goHead f
+        goHead (EVar n) = lastDottedMethod n `elem`
+            map BC.pack ["newIORef", "newSTRef", "newMutVar#"]
         goHead _ = False
 
 -- | True when this do-statement is a peek/poke family application
