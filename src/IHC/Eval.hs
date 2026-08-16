@@ -70,7 +70,14 @@ import qualified IHC.TypeAST as TA
 import IHC.TypeAST (Scheme(..), Type(..), Pred(..), tyArrowArgs, tyHead, schemeIsResultPolymorphic, freeTyVars, expandTypeSynonyms)
 import IHC.TypeGlobals (globalTypeSigsRef, globalTypeSynonymsRef, globalClassMethodNamesRef, globalAmbiguousSigsRef, globalMethodClassRef)
 import qualified IHC.TypeReduce as TR
+import IHC.TypeSchemeParser (parseSchemeBytes)
 import IHC.Val
+
+dictionaryContextKey :: Name -> Name
+dictionaryContextKey cls = BC.pack "$$dict:" <> normalizeTyTag cls
+
+constraintVariableKey :: Name -> Name -> Name
+constraintVariableKey cls var = dictionaryContextKey cls <> BC.pack ":" <> var
 
 --------------------------------------------------------------------------------
 -- force
@@ -1090,7 +1097,47 @@ eval hooks env ipm = go
                     Just t  -> forceWithIPM hooks ipm t
                     Nothing -> error ("IHC.Eval: unbound variable `"
                                       <> BC.unpack name <> "`")
-        pure (wrapPopEmptyCallStack hooks ipm name v)
+        contextual <- resolveContextualClassMethod v
+        pure (wrapPopEmptyCallStack hooks ipm name contextual)
+      where
+        resolveContextualClassMethod v@(VClassMethod method slot tags dispatch)
+            | null tags = do
+                classes <- readIORef globalMethodClassRef
+                tryClasses v method slot dispatch
+                    (Map.findWithDefault [] (bareName method) classes)
+        resolveContextualClassMethod v = pure v
+
+        tryClasses original _ _ _ [] = pure original
+        tryClasses original method slot dispatch (cls:rest) =
+            case lookupIPMap (dictionaryContextKey cls) ipm of
+                Nothing -> tryClasses original method slot dispatch rest
+                Just tagT -> do
+                    tagV <- force hooks tagT
+                    case tagV of
+                        VStr tag
+                            | normalizeTyTag cls == BC.pack "Storable"
+                            , bareName method `elem` map BC.pack ["sizeOf", "alignment"] ->
+                                pure (VClassMethod method slot [tag] dispatch)
+                            | otherwise -> do
+                                mReg <- getSharedClassReg hooks
+                                case mReg of
+                                    Nothing -> pure original
+                                    Just reg -> do
+                                        found <- lookupInstanceMethod reg cls tag method
+                                        case found of
+                                            Just candidate -> do
+                                                forced <- forceMethodVal hooks candidate
+                                                if methodPlaceholder forced
+                                                    then pure original else pure forced
+                                            Nothing -> tryClasses original method slot dispatch rest
+                        _ -> tryClasses original method slot dispatch rest
+
+        methodPlaceholder (VCon label []) =
+            BC.pack "<ihc-method-placeholder>" `BS.isPrefixOf` label
+        methodPlaceholder _ = False
+        bareName n = case BC.elemIndexEnd '.' n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing -> n
 
     go (EApp (EApp fn earlier) later)
         | let tags = typedNullaryTags later
@@ -1584,6 +1631,9 @@ eval hooks env ipm = go
                 -- any tags inherited through a constrained alias instead of
                 -- duplicating them when aliases delegate to other aliases.
                 pure (VClassMethod m slot (map normalizeTyTag instanceTags) fn)
+            VFunIP{}
+                | variable:_ <- instanceTags ->
+                    captureConstraint _cls variable v
             _ -> pure v
     go (EConstrainedValue inner _) = go inner
 
@@ -1593,9 +1643,10 @@ eval hooks env ipm = go
     -- appends dispatch tags to VClassMethod values.
     go (ELocalSig scheme e) = do
         mElab <- tryElaborateLocalSig scheme e
-        case mElab of
+        value <- case mElab of
             Just e' -> go e'
             Nothing -> go e
+        captureConstrainedClosure scheme value
 
     -- A concrete pointer ascription only carries host-memory metadata.  It
     -- does not need the general type-application elaboration path.
@@ -2274,6 +2325,9 @@ eval hooks env ipm = go
                 -- Multi-key class dispatch: @setField \@\"name\" \@User \@String@
                 -- accumulates type-arg tags onto the dispatcher so the final
                 -- call can look up the instance by composite key.
+                VClassMethod _ _ tags _
+                    | not (null tags)
+                    , isRuntimeTypeVariableTag ty -> pure v
                 VClassMethod m slot tags fn -> do
                     -- IsString.fromString is result-polymorphic: keep the
                     -- synonym-expanded structural tag (`Html` → `Markup`
@@ -2319,6 +2373,10 @@ eval hooks env ipm = go
                         pure (VIO (withExpectedResultTag resultTy
                                      (action >>= applyIOResultAnnotation resultTy)))
                 _               -> applyNumericTyAnnotation ty v
+      where
+        isRuntimeTypeVariableTag tag = case BC.uncons (BC.strip tag) of
+            Just (c, _) -> (c >= 'a' && c <= 'z') || c == '$'
+            Nothing -> False
     tryTypedPeek :: Expr -> ByteString -> IO (Maybe Val)
     tryTypedPeek e ty = do
         -- CSaFamily = Word16, HostAddress = Word32: typed do-bind /
@@ -2682,6 +2740,34 @@ eval hooks env ipm = go
         -- wrapping it repeatedly.
         storableMethodHead (EVar method) = Just method
         storableMethodHead _             = Nothing
+
+    captureConstrainedClosure :: ByteString -> Val -> IO Val
+    captureConstrainedClosure raw value =
+        case (parseSchemeBytes raw, value) of
+            (Just (Scheme _ [Pred cls [dictTy]] _), _)
+                | Just variable <- constraintVariable dictTy ->
+                    captureConstraint cls variable value
+            _ -> pure value
+      where
+        constraintVariable (TyVar variable) = Just variable
+        constraintVariable _ = Nothing
+
+    captureConstraint cls variable (VFunIP lexical f) =
+        pure $ VFunIP lexical $ \caller argT -> do
+            let inherited = Map.union lexical caller
+                existing = lookupIPMap (constraintVariableKey cls variable) inherited
+                    <|> lookupIPMap (dictionaryContextKey cls) inherited
+            tagT <- case existing of
+                Just prior -> pure prior
+                Nothing -> do
+                    argV <- force hooks argT
+                    newWHNFThunk (VStr (normalizeTyTag (typeTagOf argV)))
+            let dictionaries = Map.fromList
+                    [ (dictionaryContextKey cls, tagT)
+                    , (constraintVariableKey cls variable, tagT)
+                    ]
+            f (Map.union dictionaries caller) argT
+    captureConstraint _ _ value = pure value
 
     typedPeek :: Bool -> ByteString -> Expr -> Expr -> IO Val
     typedPeek isElemOff resultTy ptrE offE = do

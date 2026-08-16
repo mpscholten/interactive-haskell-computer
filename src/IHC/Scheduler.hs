@@ -815,7 +815,8 @@ loadProgramFromSource searchPath src0 = do
                    rhs' = case find ((== ownerName) . lmName) loadedModules of
                        Just ownerLm ->
                            let syns = Map.union (lmTypeSynonyms ownerLm) closureGlobalSyns
-                           in wrapNullaryResultSig syns ownerLm bindingName rhs
+                           in captureBindingConstraints ownerLm bindingName
+                                (wrapNullaryResultSig syns ownerLm bindingName rhs)
                        Nothing -> rhs
                ownerThunk <- newWHNFThunk (VStr ownerName)
                let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
@@ -7710,7 +7711,8 @@ exportBodies registry searchPath includeMap builtinNames lm = do
     let syns = Map.union (lmTypeSynonyms lm) globalSyns
     pure
         [ ( keyPrefix <> n
-          , wrapNullaryResultSig syns lm n e'
+          , captureBindingConstraints lm n
+                (wrapNullaryResultSig syns lm n e')
           )
         | (n, e) <- Map.toList bs
         , let e' = maybe (transform e) EVar (specialSelfAliasTarget lm n e)
@@ -7738,6 +7740,17 @@ isDoRhs (ELet _ body) = isDoRhs body
 isDoRhs (ELocalSig _ body) = isDoRhs body
 isDoRhs (ETyApp body _) = isDoRhs body
 isDoRhs _ = False
+
+-- Preserve the single ordinary class predicate on a signed source binding.
+-- The evaluator turns this metadata into a dictionary-carrying closure; a
+-- nested constrained call can then inherit the same type variable even when
+-- its first runtime argument does not reveal that type (for example @alloca@).
+captureBindingConstraints :: LoadedModule -> ByteString -> Expr -> Expr
+captureBindingConstraints lm n body =
+    case Map.lookup n (lmTypeSigs lm) of
+        Just (Scheme _ [Pred cls [TyVar variable]] _) ->
+            EConstrainedValue body [(cls, [variable])]
+        _ -> body
 
 wrapNullaryResultSig :: Map ByteString TypeSynonym -> LoadedModule -> ByteString -> Expr -> Expr
 wrapNullaryResultSig syns lm n e =
@@ -12822,7 +12835,8 @@ resolveFallbackSource mOwner name = do
                 let syns = Map.union (lmTypeSynonyms owner) globalSyns
                 writeIORef slot
                     (Unevaluated (Closure richEnv emptyIPMap
-                        (wrapNullaryResultSig syns owner bareName expr')))
+                        (captureBindingConstraints owner bareName
+                            (wrapNullaryResultSig syns owner bareName expr'))))
                 modifyIORef' envFallbackCache
                     (Map.insert (mOwner, name) slot . Map.insert (mOwner, selfKey) slot)
                 modifyIORef' envFallbackCanonicalCache
