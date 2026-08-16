@@ -1253,6 +1253,7 @@ eval hooks env ipm = go
                                   BC.pack "CSChar", BC.pack "CUChar"]
                 let effectiveTag
                         | runtimeTag == BC.pack "Int" && ptrIsWord8 = BC.pack "Word8"
+                        | runtimeTag == BC.pack "Char" && ptrIsWord8 = BC.pack "Word8"
                         | otherwise = runtimeTag
                 if knownPeekResultTy effectiveTag
                     then pure (Just (VIO (do
@@ -1288,6 +1289,7 @@ eval hooks env ipm = go
             ("Int8", VInt n) -> pokeI8 n
             ("CUChar", VInt n) -> pokeW8 n
             ("Word8", VInt n) -> pokeW8 n
+            ("Word8", VChar c) -> pokeW8 (fromIntegral (ord c))
             ("Int", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Int)
             ("Word", VInt n) -> FStorable.pokeByteOff p off (fromIntegral n :: Word)
             ("Int64", VInt n) -> FStorable.pokeByteOff p off (n :: Int64)

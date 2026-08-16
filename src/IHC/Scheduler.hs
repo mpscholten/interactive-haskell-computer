@@ -2073,26 +2073,37 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
     discoverRequestedReexport builtinNames registry searchPath includeMap targetLm n
         | not (exportsMissingName targetLm n) = pure ()
         | otherwise = do
-            case builtinReexportTarget builtinNames targetLm n of
-                Just target ->
-                    insertLmBody targetLm n (EVar target)
-                Nothing -> do
-                    mProvider <- resolveImport registry searchPath includeMap targetLm n
-                                    `catch` (\(_ :: SomeException) -> pure Nothing)
-                    case mProvider of
-                        Nothing -> pure ()
-                        Just providerName -> do
-                            mProviderLm <- (Just <$> loadModule registry searchPath includeMap providerName)
-                                              `catch` (\(_ :: SomeException) -> pure Nothing)
-                            case mProviderLm of
-                                Nothing -> pure ()
-                                Just providerLm -> do
-                                    discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
-                                    -- Foreign-alias sentinel so exportBodies /
-                                    -- resolveRequestedPair / FQN env-fallback
-                                    -- see @targetLm.n@ → @provider.n@.
-                                    insertLmBody targetLm n
-                                        (EVar (providerName <> BC.pack "." <> n))
+            bodies <- readIORef (lmBodies targetLm)
+            -- The targeted discovery immediately above may have found a
+            -- genuine local definition even when the lightweight export
+            -- scan classified the name as missing.  Never replace that
+            -- source body with a same-named import (Data.ByteString.length
+            -- was overwritten by Foldable.length in the deferred REPL path).
+            case Map.lookup n bodies of
+                Just EVar{} -> chaseReexport
+                Just _ -> pure ()
+                Nothing -> chaseReexport
+      where
+        chaseReexport = case builtinReexportTarget builtinNames targetLm n of
+            Just target ->
+                insertLmBody targetLm n (EVar target)
+            Nothing -> do
+                mProvider <- resolveImport registry searchPath includeMap targetLm n
+                                `catch` (\(_ :: SomeException) -> pure Nothing)
+                case mProvider of
+                    Nothing -> pure ()
+                    Just providerName -> do
+                        mProviderLm <- (Just <$> loadModule registry searchPath includeMap providerName)
+                                          `catch` (\(_ :: SomeException) -> pure Nothing)
+                        case mProviderLm of
+                            Nothing -> pure ()
+                            Just providerLm -> do
+                                discoverInModuleWith builtinNames registry searchPath includeMap providerLm n
+                                -- Foreign-alias sentinel so exportBodies /
+                                -- resolveRequestedPair / FQN env-fallback
+                                -- see @targetLm.n@ → @provider.n@.
+                                insertLmBody targetLm n
+                                    (EVar (providerName <> BC.pack "." <> n))
 
     builtinReexportTarget builtinNames targetLm n =
         case [ fqn
