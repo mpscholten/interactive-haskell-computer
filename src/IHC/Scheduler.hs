@@ -4719,7 +4719,20 @@ classMethodDispatcher reg cls methodName
                 Just methodVal
                   | not (isMethodPlaceholder methodVal) ->
                       applyAll methodVal [argT]
-                _ -> argDirectedDispatch argT
+                _ -> do
+                    -- A visible type annotation can select a GND newtype
+                    -- dictionary even when its witness is bottom, as in
+                    -- @sizeOf (undefined :: CInt)@ used by @alloca@.  Value-
+                    -- directed fallback would force that witness before the
+                    -- ordinary source method gets a chance to ignore it.
+                    -- Follow the declared representation type instead; this
+                    -- is the same structural GND path used below for concrete
+                    -- newtype values and keeps the Storable implementation in
+                    -- Haskell source.
+                    mGnd <- lookupTypedStorableNewtypeMethod firstTag
+                    case mGnd of
+                        Just methodVal -> applyAll methodVal [argT]
+                        Nothing        -> argDirectedDispatch argT
         -- Type-tag-driven path: either matchPat synthesised a tag from a
         -- PCon pattern (argT is the VUnit sentinel), or ETyApp / type
         -- ascription attached a tag and the *next* apply is a real value
@@ -6905,6 +6918,15 @@ classMethodDispatcher reg cls methodName
             Just v | not (isMethodPlaceholder v) -> do
                 wrapped <- newtypeUnwrapWrap wrapName v
                 pure (Just (tag, wrapped))
+            _ -> pure Nothing
+
+    lookupTypedStorableNewtypeMethod tag = do
+        mFieldTag <- lookupDeclaredFieldTag tag
+        case normalizeTyTag <$> mFieldTag of
+            Just fieldTag | fieldTag /= normalizeTyTag tag -> do
+                triggerCoreInstanceLoadForTag legacyHooks cls fieldTag
+                aliases <- instanceTagAliases fieldTag
+                findFirstGndMethod (fieldTag : filter (/= fieldTag) aliases)
             _ -> pure Nothing
 
     findFirstGndMethod [] = pure Nothing
