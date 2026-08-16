@@ -2081,7 +2081,15 @@ loadImportOnlyIntoEnv searchPath imp requested0 existingEnv = do
             -- was overwritten by Foldable.length in the deferred REPL path).
             case Map.lookup n bodies of
                 Just EVar{} -> chaseReexport
-                Just _ -> pure ()
+                Just _ -> do
+                    -- Keep the old probe's dependency-loading side effect:
+                    -- a genuine local body may refer to a qualified import
+                    -- (Greet.greet -> Helper.surround).  We must load that
+                    -- provider graph, but must not replace the local body
+                    -- with a same-named import (Data.ByteString.length).
+                    _ <- resolveImport registry searchPath includeMap targetLm n
+                            `catch` (\(_ :: SomeException) -> pure Nothing)
+                    pure ()
                 Nothing -> chaseReexport
       where
         chaseReexport = case builtinReexportTarget builtinNames targetLm n of
