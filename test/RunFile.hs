@@ -11,7 +11,9 @@ import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.FilePath (takeDirectory, (</>))
 import System.IO
 import System.Directory (removeFile, getTemporaryDirectory, doesDirectoryExist, getHomeDirectory, listDirectory)
-import System.Environment (lookupEnv)
+import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
+import System.Exit (ExitCode(..))
+import System.Process (CreateProcess(..), createProcess, proc, waitForProcess)
 
 import Test.Hspec
 
@@ -850,15 +852,29 @@ spec = describe "Phase 1.0 — demand-driven single-pass JIT" do
             `shouldReturn` Nothing
 
     it "module metadata: real Data.Bits facade exposes imported operator signatures" do
-        -- Loading the fixture establishes the package source search path and
-        -- materialises the facade metadata; the operator itself is declared
-        -- only in GHC.Internal.Bits.
-        (n, out) <- captureStdout
-            (runFile "test/Fixtures/Coverage/real_data_bits_sig_facade.hs")
-        n `shouldBe` 0
-        out `shouldBe` "0\n"
-        scheme <- resolveTypeSigMetadata (Just "GHC.Internal.Data.Bits") ".&."
-        scheme `shouldSatisfy` (/= Nothing)
+        child <- lookupEnv "IHC_DATABITS_METADATA_CHILD"
+        case child of
+            Nothing -> do
+                -- This real-package metadata load retains several GiB of
+                -- immutable module state.  Keep it out of the long-lived
+                -- suite process so the following fixtures do not hit the
+                -- test binary's 8 GiB heap cap.
+                self <- getExecutablePath
+                env <- getEnvironment
+                (_, _, _, ph) <- createProcess
+                    (proc self ["--match", "module metadata: real Data.Bits facade exposes imported operator signatures"])
+                        { env = Just (("IHC_DATABITS_METADATA_CHILD", "1") : env) }
+                waitForProcess ph `shouldReturn` ExitSuccess
+            Just _ -> do
+                -- Loading the fixture establishes the package source search
+                -- path and materialises the facade metadata; the operator
+                -- itself is declared only in GHC.Internal.Bits.
+                (n, out) <- captureStdout
+                    (runFile "test/Fixtures/Coverage/real_data_bits_sig_facade.hs")
+                n `shouldBe` 0
+                out `shouldBe` "0\n"
+                scheme <- resolveTypeSigMetadata (Just "GHC.Internal.Data.Bits") ".&."
+                scheme `shouldSatisfy` (/= Nothing)
 
     it "elaborates a bare class-method callee from owner-scoped metadata" do
         (n, out) <- captureStdout

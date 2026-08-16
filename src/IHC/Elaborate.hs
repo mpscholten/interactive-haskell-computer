@@ -985,15 +985,31 @@ elaborateExpr ienv expr = case expr of
         (f', ft, fPreds, s1) <- elaborateExpr ienv f
         let ienvX = applySubstIenv s1 ienv
             ft' = applySubst s1 ft
-        -- Bidirectional application inference: when the callee already
-        -- exposes its argument type, use that as context for the argument.
-        -- In particular, @48 + nibble@ must keep the first literal
-        -- overloaded until @nibble :: Word8@ fixes the shared @Num a@;
-        -- defaulting the literal to Int here makes the otherwise valid
-        -- expression fail elaboration and later misdispatch Storable.poke.
-        (x', xt, xPreds, s2) <- case ft' of
-            TyArrow expectedArg _ ->
-                elaborateExpectedExpr ienvX expectedArg x
+            mMethod = classMethodAppHead ienvX (appHeadExpr f)
+            methodIsScoped method =
+                not (Set.member method (ieAmbiguousSigs ienvX))
+                    || Set.member method (ieScopedSigs ienvX)
+            expectedHasStructure (TyVar _) = False
+            expectedHasStructure _ = True
+            methodKeepsNumericLiteralOpen method =
+                any ((== BC.pack "Num") . bareName)
+                    (Map.findWithDefault [] method (ieMethodClasses ienvX))
+        -- Push argument types into applications whose callee is a
+        -- lexically unambiguous class method.  This is needed for
+        -- method parameters such as @select 0 [42]@ and @48 + nibble@,
+        -- but doing it for every function application rewrites ordinary
+        -- signed/constrained locals and their literals.
+        (x', xt, xPreds, s2) <- case (mMethod, ft') of
+            (Just method, TyArrow expectedArg@(TyVar _) _)
+              | methodIsScoped method
+              , not (methodKeepsNumericLiteralOpen method)
+              , ELit (LInt _) <- x ->
+                    pure (x, expectedArg, [], emptySubst)
+            (Just method, TyArrow expectedArg _)
+              | methodIsScoped method || methodKeepsNumericLiteralOpen method
+              , expectedHasStructure expectedArg
+                    || methodKeepsNumericLiteralOpen method ->
+                    elaborateExpectedExpr ienvX expectedArg x
             _ -> elaborateExpr ienvX x
         resultTy <- TyVar <$> freshVar (ieFresh ienv)
         let fShould = TyArrow (applySubst s2 xt) resultTy

@@ -592,6 +592,12 @@
               export IHC_NIX_SOURCE_DIR=${ihcSourceRootWithHsc}
               export IHC_GHC_INCLUDE_DIRS=${ghcIncludeDirs}
               export IHC_CBITS_DIR=${ihcCbitsRoot}/lib
+              export IHC_BIN=$PWD/dist/build/ihc/ihc
+              # The suite has grown past 1,000 examples and takes roughly
+              # 25-30 minutes on a cold CI runner.  Keep the watchdog well
+              # above healthy runtime while retaining protection against a
+              # genuinely wedged interpreter child.
+              export IHC_TEST_TIMEOUT_SECONDS=3600
               ${if pkgs.stdenv.isDarwin then ''
               export DYLD_LIBRARY_PATH=${ihcCbitsRoot}/lib
               export DYLD_FALLBACK_LIBRARY_PATH=${ihcCbitsRoot}/lib
