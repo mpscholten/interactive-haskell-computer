@@ -9,7 +9,7 @@
 -- Both sendResponse 200 and 204 hang; standalone composeHeader /
 -- toBufIOWith do not. Not Date cache (Date supplied). Not Warp.run.
 {-# LANGUAGE OverloadedStrings #-}
-import Data.Array (listArray)
+import Control.Concurrent.STM (newTVarIO)
 import Data.IORef
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy.Char8 as LC
@@ -26,6 +26,7 @@ main = do
     wb <- createWriteBuffer 16384
     wbRef <- newIORef wb
     h2 <- newIORef False
+    apps <- newTVarIO 0
     let conn = Connection
             { connSendMany = \_ -> return ()
             , connSendAll = \bs -> modifyIORef acc (`S.append` bs)
@@ -36,20 +37,19 @@ main = do
             , connWriteBuffer = wbRef
             , connHTTP2 = h2
             , connMySockAddr = SockAddrInet 0 0
+            , connAppsInProgress = apps
             }
         ii = InternalInfo
                 defaultManager
                 (return "Thu, 01 Jan 1970 00:00:00 GMT")
                 (\_ -> return (Nothing, return ()))
                 (\_ -> error "getFileInfo unused")
-        reqidx = listArray (0, requestMaxIndex)
-            (replicate (requestMaxIndex + 1) Nothing)
         resp = responseLBS status200
                 [ ("Date", "Thu, 01 Jan 1970 00:00:00 GMT")
                 , ("Content-Length", "12")
                 ]
                 (LC.pack "Hello, Warp!")
     _ <- sendResponse defaultSettings conn ii emptyHandle
-            defaultRequest reqidx (return S.empty) resp
+            defaultRequest defaultIndexRequestHeader (return S.empty) resp
     got <- readIORef acc
     print (S.length got)

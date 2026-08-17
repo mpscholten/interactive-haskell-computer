@@ -795,8 +795,22 @@ loadProgramFromSource searchPath src0 = do
                     [(lmName lm, lmFieldSchemes lm)] (lmFieldReg lm)
             pure (lmName lm, ownFields))
         loadedModules
+    -- Constructors share the value namespace, but their bare names are only
+    -- module-local/import-scoped.  The global constructor environment must
+    -- remain as a fallback for entry expressions; inside a source binding,
+    -- prefer the declaring module's own constructors.  Otherwise duplicate
+    -- names are collapsed by the unioned DataRegistry (typically to the
+    -- highest arity), e.g. bytestring Builder.Extra's nullary `Done` became
+    -- an unrelated constructor PAP and Warp received <function> as `Next`.
+    ownerConEnvByOwner <- HashMap.fromList <$> mapM
+        (\lm -> do
+            ownCons <- buildConEnv (lmDataReg lm)
+            pure (lmName lm, ownCons))
+        loadedModules
     let ownerFields ownerName =
             HashMap.lookupDefault HashMap.empty ownerName ownerFieldEnvByOwner
+        ownerCons ownerName =
+            HashMap.lookupDefault HashMap.empty ownerName ownerConEnvByOwner
     closureGlobalSyns <- readIORef globalTypeSynonymsRef
 
     -- Each body's closure gets the @"$$owner"@ sentinel pointing at
@@ -821,7 +835,8 @@ loadProgramFromSource searchPath src0 = do
                ownerThunk <- newWHNFThunk (VStr ownerName)
                let envWithOwner = HashMap.insert ownerSentinelKey ownerThunk
                                 $ HashMap.unions
-                                    [ ownerFields ownerName
+                                    [ ownerCons ownerName
+                                    , ownerFields ownerName
                                     , localBareAliases ownerName
                                     , env
                                     ]
