@@ -11128,9 +11128,17 @@ mergeGlobalLoadedModules :: Map ModuleName LoadedModule -> IO ()
 mergeGlobalLoadedModules newMods
     | Map.null newMods = pure ()
     | otherwise = do
-        modifyIORef' globalLoadedModulesRef (Map.union newMods)
-        bumpEnvFallbackGen
-        bumpTypeSigMetadataGen
+        oldMods <- readIORef globalLoadedModulesRef
+        writeIORef globalLoadedModulesRef (Map.union newMods oldMods)
+        -- Transient registries commonly hand this function the entire
+        -- already-loaded catalogue after discovering one body.  Body
+        -- insertion invalidates the value fallback separately via
+        -- 'insertLmBody'; treating identical module keys as new metadata
+        -- made every fallback rescan all derived Enum/Bounded instances.
+        let hasNewModule = any (`Map.notMember` oldMods) (Map.keys newMods)
+        when hasNewModule $ do
+            bumpEnvFallbackGen
+            bumpTypeSigMetadataGen
 
 -- | Insert a body into a module's 'lmBodies' and bump the env-fallback
 -- generation.  Centralised so the negative cache invalidates whenever
@@ -11810,6 +11818,8 @@ resolveFallbackSource mOwner name = do
                             -- drifted to Foreign.Marshal.Array.newArray,
                             -- applying a bounds tuple as a list.
                             mDirectLocal <- case Map.lookup modName mods of
+                                Just owner | Map.member bareName (lmDataReg owner) ->
+                                    mkCtorSlotFromModule owner bareName
                                 Just owner -> do
                                     local <- hasScannedTopLevel owner bareName
                                     if local
@@ -11837,7 +11847,9 @@ resolveFallbackSource mOwner name = do
                                             case loaded of
                                                 Left _ -> pure Nothing
                                                 Right owner -> do
-                                                    if Map.member bareName (lmFieldReg owner)
+                                                    if Map.member bareName (lmDataReg owner)
+                                                        then mkCtorSlotFromModule owner bareName
+                                                    else if Map.member bareName (lmFieldReg owner)
                                                        && not (lmNoFieldSelectors owner)
                                                         then tryFieldSlot (Map.insert modName owner mods) owner bareName
                                                         else do
@@ -11853,7 +11865,9 @@ resolveFallbackSource mOwner name = do
                                                                 (Map.findWithDefault owner modName mods')
                                                                 bareName
                                         Just owner -> do
-                                            if Map.member bareName (lmFieldReg owner)
+                                            if Map.member bareName (lmDataReg owner)
+                                                then mkCtorSlotFromModule owner bareName
+                                            else if Map.member bareName (lmFieldReg owner)
                                                && not (lmNoFieldSelectors owner)
                                                 then tryFieldSlot mods owner bareName
                                                 else do
@@ -12546,12 +12560,6 @@ resolveFallbackSource mOwner name = do
         | bareName == BC.pack "runIdentity" = Just (BC.pack "Data.Functor.Identity")
         | otherwise = Nothing
 
-    registerSharedDerivedEnumBounded loaded = do
-        mReg <- getSharedClassReg legacyHooks
-        case mReg of
-            Nothing  -> pure ()
-            Just reg -> registerDerivedEnumBoundedInstances reg loaded
-
     splitQualifiedByLoadedModule mods name =
         case candidates of
             []     -> Nothing
@@ -12610,7 +12618,6 @@ resolveFallbackSource mOwner name = do
             Nothing -> buildSlotFromOwnerFresh mods owner bareName
 
     buildSlotFromOwnerFresh mods owner bareName = do
-        registerSharedDerivedEnumBounded (Map.elems mods)
         bodies <- readIORef (lmBodies owner)
         case find ((== bareName) . FFI.fdName) (lmForeignDecls owner) of
           Just decl -> do

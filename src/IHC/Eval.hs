@@ -2761,13 +2761,26 @@ eval hooks env ipm = go
                 Just prior -> pure prior
                 Nothing -> newLazyIOThunk $ do
                     argV <- force hooks argT
-                    pure (VStr (normalizeTyTag (typeTagOf argV)))
+                    tag <- constraintArgumentTag argV
+                    pure (VStr (normalizeTyTag tag))
             let dictionaries = Map.fromList
                     [ (dictionaryContextKey cls, tagT)
                     , (constraintVariableKey cls variable, tagT)
                     ]
             f (Map.union dictionaries caller) argT
     captureConstraint _ _ value = pure value
+
+    -- A predicate @C a@ may be carried by a structured first argument such
+    -- as @[a]@.  Its outer runtime tag is @[]@, but nested constrained calls
+    -- need the element dictionary (newArray -> mallocArray -> malloc is the
+    -- source-backed Warp date-cache path).  Inspect only the demanded list
+    -- head; the tag computation itself remains behind a lazy thunk.
+    constraintArgumentTag (VCon cons (headT : _))
+        | lastName cons == BC.pack ":" = typeTagOf <$> force hooks headT
+    constraintArgumentTag value = pure (typeTagOf value)
+    lastName n = case BC.elemIndexEnd '.' n of
+            Just idx -> BC.drop (idx + 1) n
+            Nothing -> n
 
     typedPeek :: Bool -> ByteString -> Expr -> Expr -> IO Val
     typedPeek isElemOff resultTy ptrE offE = do
