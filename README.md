@@ -14,7 +14,7 @@ A from-scratch Haskell interpreter targeting **macOS / Apple Silicon only**. Goa
 
 The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns out to align cleanly with what agents do well: small steps, narrow blast radius, fixture-driven feedback. The project is as much a study of that alignment as it is a Haskell interpreter.
 
-## Status (2026-08-08)
+## Status (2026-08-18)
 
 - **~495 coverage fixtures** exercise the tree-walking lazy evaluator (up from 421 on 2026-08-02, 332 in May).
 - **Parser probe at 100% on the Hackage/IHP sample set.** `ihc-parse-probe` reports **zero parse errors** on top-level value-binding RHSs for: the representative IHP 50-file sample (**462/462** bindings OK), hasql, hasql-pool, servant, servant-server, lens `Control.Lens` (35-file core), and conduit. April baselines were ~79% (IHP) / ~69–94% (Hackage); residual gaps (dot-ops like `.=`/`.|`, char lits `'['`/`'{'`, comma/pattern guards, layout-`let` edges, TH name quotes / `$var` splices, `\\` as an operator) are closed. Re-run with `scripts/ihp-parse-probe.sh` / `scripts/hackage-parse-probe.sh` (or `exe:ihc-parse-probe`). Older gap notes in `ihp-parser-gaps.md` / `hackage-parser-gaps.md` are historical.
@@ -25,7 +25,7 @@ The runtime goal (Pascal-fast, source-on-demand, type-checking deferred) turns o
   - **`Num`/`Ord`/`RealFloat`/`Semigroup` methods**, `fromIntegral`, monad `>>=`/`>>`, `pure`/`return` — all source-loaded, dispatched through the generic class-method path.
   - **Full `ghc-bignum` `BigNat` pipeline** — word/array readers, comparisons, size predicates, index, `log`/`toWord`/`toInt`, square. All source-loaded; the shims are gone.
 - **STM reworked onto primops.** `atomically`/`retry`/`orElse`/`catchSTM`/`newTVar`/`readTVar`/`writeTVar` are source-loaded from `GHC.Conc.Sync` and bottom out on `atomically#`/`retry#`/`newTVar#`/… primops. STM collapses onto IO at the (single-threaded) eval level, mirroring the `ST s ≈ IO` bridge.
-- **Warp reaches request processing.** The full socket path source-loads; warp binds its port, accepts a connection, and receives + processes an HTTP request end-to-end. The remaining blocker to serving the first *response* is a post-receive CPU busy-spin in the interpreted response path (see below).
+- **Warp serves HTTP end to end.** The full socket and response paths source-load: Warp binds, accepts, parses a request, builds a chunked response, and serves `HTTP/1.1 200 OK` with `Hello, Warp!`. The former post-receive spin was a value-namespace collision: the global constructor union selected an unrelated higher-arity `Done` instead of `Data.ByteString.Builder.Extra.Done`. Source closures now prefer constructors from their defining module. The cold first response is correct but currently takes roughly 35–50 seconds on the development machine.
 - **HSX hello-world (Phase 2.14) foundation in progress** — caches primed, smoke fixture, `EQuasiQuote` parser wiring; route from `[hsx|…|]` → TH `Exp` → `renderHtml` mapped in `docs/HSX-PATH.md`. Binding-level parse of IHP/HSX sources is no longer the gate; the remaining work is TH `quoteExp` dispatch and evaluating the blaze/HSX pipeline.
 - **Lexer/parser surface** — package-qualified imports, Pratt fixity (including 2-char `.ops` like `.=`/`.|`/`.#`), layout `let` (semicolon multi-bind, `where` on bindings, local infix multiclause), comma/pattern guards, char lits for `'['`/`'('`/`'{'`, TH name quotes / id-splices, QuasiQuotes, record update/dot, MultiWayIf, `\case`, sections, backticks.
 - **ByteString fully source-loaded**; exception handling (`try`/`handle`/`bracket`/`finally`/`mask`) source-loaded from ghc-internal.
@@ -38,18 +38,18 @@ Everything via interpretation — **no JIT path on the runtime today**.
 
 ## What's next
 
-The socket-FFI chain that used to block all I/O is resolved — `Network.Socket` is source-loaded end to end, and warp now binds, accepts, and receives a request. The frontier is **serving the first HTTP response**:
+Warp now serves its first HTTP response entirely through interpreted Hackage source. The frontier is **first-response latency and repeatable benchmarking**:
 
 | Blocker | Where | Impact |
 |---------|-------|--------|
-| **Post-receive CPU busy-spin** — after `recv` completes, one interpreter thread burns a full core and the request never gets a response (curl times out). Ruled out: black-hole yield/retry, STM `retry`/`orElse` loops. It's a genuine CPU loop in interpreted code somewhere in warp's response-build/serialize path, still unlocated. | interpreted `warp` response path | Warp receives + processes the request but never replies. |
+| **Cold first response is slow** — the end-to-end Warp acceptance test succeeds, but a cold process currently takes roughly 35–50 seconds to return the first response on the development machine. Instrument discovery/loading, instance registration, request parsing, and response serialization before optimizing. | demand discovery + interpreted Warp request path | Correctness is green; interactive server startup is not yet competitive. |
 | **STM `retry` is collapse-only** — STM combinators source-load onto the `*#` primops but run as IO on a single-threaded evaluator, so a real blocking `retry`/`orElse` wait has no transactional scheduler behind it. Latent; will bite genuine STM-`retry` waits. | `Builtins.hs` STM primops | Blocks correct blocking-STM semantics. |
 
-Diagnostic recipe for the spin: sample the spinning thread or add an eval-counter probe in `IHC.Eval.force`; the loop is emergent from warp's full closure and hasn't reduced standalone.
+`WarpHelloTest` is the acceptance gate. It launches `ihc`, performs a real curl request, verifies status `200` and the response body, and reports cold process-to-first-response time.
 
 **HSX hello-world (Phase 2.14)** is the other active milestone: interpret `[hsx|<h1>Hello world</h1>|]` → TH `Exp` → `renderHtml` end-to-end, no shims. Foundation phase is in progress (`docs/HSX-PATH.md`). Value-binding parse of the IHP/HSX sample is green; the open work is TH/QQ expansion and runtime evaluation of the blaze pipeline.
 
-**Longer-term IHP readiness** is no longer gated on basic expression parsing for the packages above. Remaining work is mainly **semantic**: class dispatch at scale, full Template Haskell (`quoteExp`, quotation, `reify`), type families / DataKinds / OverloadedLabels / ImplicitParams elaboration, and the warp response-path spin. See the roadmap below and `ihp-unsupported-scan.md`.
+**Longer-term IHP readiness** is no longer gated on basic expression parsing or the Warp response path. Remaining work is mainly **performance and semantics**: cold first-response latency, class dispatch at scale, full Template Haskell (`quoteExp`, quotation, `reify`), type families / DataKinds / OverloadedLabels / ImplicitParams elaboration. See the roadmap below and `ihp-unsupported-scan.md`.
 
 ## Roadmap
 
@@ -64,7 +64,7 @@ Remaining slices (rough order):
 - 2.10a — STM + async exceptions — ✅ combinators source-loaded onto `*#` primops (blocking `retry` semantics still collapse-only; see What's next)
 - 2.11 — `Lift`-splice TH (subset of full TH)
 - 2.12 — tasty/QuickCheck/optparse-applicative source-load + end-to-end run (no shims; same rule as 2.10b) — designed
-- ⚙️ **warp listener path** — socket layer source-loaded; binds/accepts/receives; blocked on the post-receive spin (see What's next)
+- ✅ **warp HTTP path** — socket and response layers source-loaded; binds, accepts, receives, and serves a real `200 OK` response (see `WarpHelloTest`)
 - 2.13 — ⭐ bytestring test suite (north-star)
 - 2.14 — **HSX hello-world milestone**: interpret `[hsx|<h1>Hello world</h1>|]` end-to-end (lex → `EQuasiQuote` → `IHP.HSX.QQ.hsx.quoteExp` → TH `Exp` → `IHC.AST.Expr` → `renderHtml`). Foundation phase in progress — caches populated, smoke fixture, parser wiring, docs in `docs/HSX-PATH.md`.
 - 2.16 — **cold-start latency benchmark** vs `ghci :load` + `cabal run` on a real IHP project. Hypothesis: we win on first-request-served time because we skip type checking, Core pipeline, linking, and load sources on demand rather than eagerly.

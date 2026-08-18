@@ -14,6 +14,8 @@ module IHC.Driver
 
 import Control.Exception (SomeException, catch, finally, try)
 import Data.ByteString (ByteString)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.Environment (lookupEnv)
 import System.Exit (ExitCode(..))
 import System.FilePath (takeDirectory)
 import System.IO (hPutStrLn, stderr)
@@ -141,12 +143,27 @@ runWithSearchPath searchPath src =
       `finally` reapSpawnedThreads
   where
     runImpl = do
+        started <- getMonotonicTimeNSec
         (_env, mainT) <- loadProgramFromSource searchPath src
+        loaded <- getMonotonicTimeNSec
+        timingLine "load-program" started loaded
         v             <- force legacyHooks mainT
+        mainReady <- getMonotonicTimeNSec
+        timingLine "force-main" loaded mainReady
         final         <- runIO v
         case final of
             VInt n -> pure (fromIntegral n)
             _      -> pure 0
+
+    timingLine label before after = do
+        enabled <- lookupEnv "IHC_TIMING"
+        case enabled of
+            Just value | value `notElem` ["", "0", "false", "no", "off"] ->
+                hPutStrLn stderr
+                    ("[ihc:timing] " <> label <> "="
+                     <> show (fromIntegral (after - before) / 1e9 :: Double)
+                     <> "s")
+            _ -> pure ()
 
 -- | Recursively unwrap nested 'VIO's, executing each action in turn.
 -- Non-IO values pass through unchanged so the driver can extract a
